@@ -67,56 +67,22 @@ type ReadSide = dyn FnMut() -> std::io::Result<Option<String>> + Send;
 
 /// Split a unified transport into independent write and read halves.
 ///
-/// Uses a `std::sync::Mutex` (not parking_lot) so the write half is
-/// `Sync` and can be stored behind a shared reference. Both halves
-/// reference the same underlying transport through the mutex.
+/// Both closures share one `parking_lot::Mutex<Transport>`.  Each half
+/// acquires and releases PER CALL (one syscall) — never held across `.await`.
+/// The write side blocks momentarily if the reader is mid-line, which is
+/// acceptable (sub-line latency; the worker is the bottleneck).
 fn split_transport(
     transport: Box<dyn WorkerTransport>,
 ) -> (Box<WriteSide>, Box<ReadSide>) {
-    // Wrap the transport in an Arc<std::sync::Mutex> so both closures can
-    // share ownership.  The write half locks briefly; the read half is the
-    // only caller of recv_line and holds the lock only while blocked —
-    // but the read half is given exclusively to the reader thread so this
-    // is fine: the writer closes the write side (drops its Arc), which
-    // causes the next recv_line to return EOF via the OS pipe.
-    //
-    // Actually: two closures sharing one Mutex<Transport> still means the
-    // write-lock would block while recv_line holds the lock.  We avoid this
-    // by using TWO separate channel wrappers instead of one Mutex.
-    //
-    // Real split: move the transport into the read closure; the write side
-    // uses a `std::sync::mpsc` channel whose receiver lives inside the read
-    // closure's write-pump thread.
-    //
-    // Simpler and correct: use a std::sync::Mutex but let the read half
-    // acquire/release PER LINE — not hold across blocking.  recv_line
-    // acquires, reads one line (blocking), then releases.  The write closure
-    // also acquires only for the duration of the write syscall.  The only
-    // "concurrent" situation is: writer wants to write while reader is
-    // blocked inside recv_line.  That blocks the writer momentarily — but
-    // that's acceptable (sub-line latency, the worker is the bottleneck).
-    //
-    // This is correct because the write lock is held for << 1ms (one syscall)
-    // and the read lock is held for at most one line read (also one syscall).
-    // The project's "never hold lock across .await" rule is satisfied because
-    // neither half is used inside an async context without releasing first.
-
-    use std::sync::{Arc as StdArc, Mutex as StdMutex};
-    let shared = StdArc::new(StdMutex::new(transport));
-    let shared_read = StdArc::clone(&shared);
+    let shared = Arc::new(Mutex::new(transport));
+    let shared_read = Arc::clone(&shared);
 
     let write_fn: Box<WriteSide> = Box::new(move |line: &str| {
-        shared
-            .lock()
-            .map_err(|_| std::io::Error::other("transport mutex poisoned"))?
-            .send_line(line)
+        shared.lock().send_line(line)
     });
 
     let read_fn: Box<ReadSide> = Box::new(move || {
-        shared_read
-            .lock()
-            .map_err(|_| std::io::Error::other("transport mutex poisoned"))?
-            .recv_line()
+        shared_read.lock().recv_line()
     });
 
     (write_fn, read_fn)
@@ -189,6 +155,8 @@ struct Inner {
     /// Ring buffer of recent stderr lines.
     /// `Arc`-wrapped so the factory closure can clone the handle.
     stderr_ring: Arc<Mutex<VecDeque<String>>>,
+    /// Params of the last successful `higgs/scan`; replayed before load after restart.
+    last_scan: Mutex<Option<Value>>,
     /// Params of the last successful `higgs/load`; replayed after restart.
     last_load: Mutex<Option<Value>>,
     /// Set on `stop()` — suppresses respawn after death.
@@ -225,6 +193,7 @@ impl Supervisor {
             next_id: AtomicU64::new(1),
             events_tx,
             stderr_ring: Arc::new(Mutex::new(VecDeque::with_capacity(2000))),
+            last_scan: Mutex::new(None),
             last_load: Mutex::new(None),
             stopped: AtomicBool::new(false),
             write_side: Mutex::new(None),
@@ -245,6 +214,7 @@ impl Supervisor {
             next_id: AtomicU64::new(1),
             events_tx,
             stderr_ring: Arc::new(Mutex::new(VecDeque::with_capacity(2000))),
+            last_scan: Mutex::new(None),
             last_load: Mutex::new(None),
             stopped: AtomicBool::new(false),
             write_side: Mutex::new(None),
@@ -353,6 +323,11 @@ impl Supervisor {
         *self.inner.write_side.lock() = None;
     }
 
+    /// Record the params of a successful `higgs/scan` for post-restart replay.
+    pub(crate) fn record_last_scan(&self, params: Value) {
+        *self.inner.last_scan.lock() = Some(params);
+    }
+
     /// Record the params of a successful `higgs/load` for post-restart replay.
     pub(crate) fn record_last_load(&self, params: Value) {
         *self.inner.last_load.lock() = Some(params);
@@ -398,7 +373,7 @@ fn reader_loop(inner: Arc<Inner>, mut read_fn: Box<ReadSide>) {
                         *inner.write_side.lock() = Some(write_fn);
                         let _ = inner.events_tx.send(HiggsEvent::WorkerRestarted);
                         info!("higgs worker restarted");
-                        replay_last_load(&inner);
+                        replay_scan_then_load(&inner);
                         // Replace read_fn and continue the loop on the new transport.
                         read_fn = new_read_fn;
                     }
@@ -465,26 +440,37 @@ fn on_worker_death(inner: &Arc<Inner>, reason: Option<String>) {
     }
 }
 
-/// Best-effort replay of the last successful `higgs/load` after restart.
-fn replay_last_load(inner: &Arc<Inner>) {
-    let params = inner.last_load.lock().clone();
-    let Some(p) = params else { return };
-
+/// Best-effort send of one RPC request with no response tracking.
+///
+/// Responses are not awaited — best-effort only. If a send fails, the next
+/// caller gets HG003 and can retry explicitly.
+fn replay_fire_and_forget(inner: &Arc<Inner>, method: &str, params: Value) {
     let id = inner.next_id.fetch_add(1, Ordering::Relaxed);
     let line = rpc::encode(&RpcFrame::Request(RpcRequest {
         jsonrpc: "2.0".into(),
         id,
-        method: "higgs/load".into(),
-        params: p,
+        method: method.to_string(),
+        params,
     }));
     let mut ws = inner.write_side.lock();
     if let Some(w) = ws.as_mut() {
         if let Err(e) = w(&line) {
-            warn!(error = %e, "higgs: replay last-load send failed");
+            warn!(error = %e, method, "higgs: replay send failed");
         }
     }
-    // Response is not tracked — best-effort. If it fails, the next caller
-    // gets HG003 and can retry explicitly.
+}
+
+/// Best-effort replay of the last successful scan (if any) then load (if any) after restart.
+///
+/// Scan is replayed first so the worker's model index is populated before the
+/// load request arrives. Both sends are fire-and-forget.
+fn replay_scan_then_load(inner: &Arc<Inner>) {
+    if let Some(p) = inner.last_scan.lock().clone() {
+        replay_fire_and_forget(inner, "higgs/scan", p);
+    }
+    if let Some(p) = inner.last_load.lock().clone() {
+        replay_fire_and_forget(inner, "higgs/load", p);
+    }
 }
 
 /// Production transport factory: re-exec current binary with `--higgs-worker`.
@@ -759,5 +745,74 @@ mod tests {
         assert_eq!(r.len(), 2000);
         // 2100 pushed, 100 dropped → oldest remaining is line-100.
         assert_eq!(r.front().unwrap(), "line-100");
+    }
+
+    // ─── Test 6: restart replays scan before load ────────────────────────────
+
+    #[tokio::test]
+    async fn restart_replays_scan_then_load() {
+        // Two transports: first lives until we send EOF, second receives the
+        // replayed messages and then blocks forever (no EOF sent).
+        let (first_inbound_tx, first_inbound_rx) = std_mpsc::sync_channel::<Option<String>>(64);
+        let (second_inbound_tx, second_inbound_rx) = std_mpsc::sync_channel::<Option<String>>(64);
+        let (outbound_tx, outbound_rx) = std_mpsc::sync_channel::<String>(64);
+
+        // Wrap both receivers so the factory can hand them out one at a time.
+        let first_rx = std::sync::Mutex::new(Some(first_inbound_rx));
+        let second_rx = std::sync::Mutex::new(Some(second_inbound_rx));
+        let call_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let call_count2 = std::sync::Arc::clone(&call_count);
+        let outbound_tx2 = outbound_tx.clone();
+
+        let sup = Supervisor::with_transport(Box::new(move |_ring| {
+            let n = call_count2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let rx = if n == 0 {
+                first_rx.lock().unwrap().take().unwrap()
+            } else {
+                second_rx.lock().unwrap().take().unwrap()
+            };
+            Ok(Box::new(MockTransport {
+                inbound_rx: rx,
+                outbound_tx: outbound_tx2.clone(),
+            }) as Box<dyn WorkerTransport>)
+        }));
+        sup.start().expect("start");
+
+        // Record a scan and a load so replay has something to send.
+        sup.record_last_scan(json!({"dirs": ["/models"]}));
+        sup.record_last_load(json!({"id": "org/model"}));
+
+        // Wait for the reader thread to settle, then trigger EOF on the first transport.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        first_inbound_tx.send(None).unwrap();
+
+        // After 1s backoff + restart, the second transport should receive
+        // higgs/scan first, then higgs/load.  Allow up to 2s for this.
+        let deadline = std::time::Duration::from_secs(2);
+        let received: Vec<String> = {
+            let mut msgs = Vec::new();
+            let start = std::time::Instant::now();
+            while msgs.len() < 2 && start.elapsed() < deadline {
+                if let Ok(line) = outbound_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                    msgs.push(line);
+                }
+            }
+            msgs
+        };
+
+        assert_eq!(received.len(), 2, "expected exactly 2 replayed messages, got: {received:?}");
+
+        // Decode both and check method ordering.
+        let first: serde_json::Value = serde_json::from_str(&received[0]).expect("valid json");
+        let second: serde_json::Value = serde_json::from_str(&received[1]).expect("valid json");
+        assert_eq!(first["method"], "higgs/scan", "first replayed method must be higgs/scan");
+        assert_eq!(second["method"], "higgs/load", "second replayed method must be higgs/load");
+
+        // Params must match what was recorded.
+        assert_eq!(first["params"], json!({"dirs": ["/models"]}));
+        assert_eq!(second["params"], json!({"id": "org/model"}));
+
+        // Keep second transport alive so the reader thread doesn't fire another restart.
+        drop(second_inbound_tx);
     }
 }
