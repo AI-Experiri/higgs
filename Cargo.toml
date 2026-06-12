@@ -1,0 +1,26 @@
+[package]
+name = "higgs"
+version = "0.1.0"
+edition = "2021"
+description = "In-app local model runtime: OpenAI-compatible serving over llama.cpp with crash-isolated worker"
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8" }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+snafu = "0.8"
+miette = "7"
+tracing = "0.1"
+parking_lot = "0.12"
+ts-rs = { version = "10", features = ["serde-compat", "serde-json-impl"] }
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5" }
+http-body-util = "0.1"
+
+[lints]
+workspace = true
