@@ -8,5 +8,6 @@
 
 pub mod diagnostic;
 pub mod rpc;
+pub mod worker;
 
 pub use diagnostic::HiggsError;
