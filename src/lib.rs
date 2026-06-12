@@ -8,6 +8,8 @@
 
 pub mod diagnostic;
 pub mod rpc;
+pub mod supervisor;
 pub mod worker;
 
 pub use diagnostic::HiggsError;
+pub use supervisor::HiggsEvent;
