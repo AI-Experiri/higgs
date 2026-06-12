@@ -108,6 +108,25 @@ mod tests {
     }
 
     #[test]
+    fn response_roundtrip_both_arms() {
+        let ok = RpcFrame::Response(RpcResponse {
+            jsonrpc: "2.0".into(),
+            id: 9,
+            result: Some(json!({"loaded": true})),
+            error: None,
+        });
+        assert_eq!(decode(&encode(&ok)).unwrap(), ok);
+
+        let err = RpcFrame::Response(RpcResponse {
+            jsonrpc: "2.0".into(),
+            id: 10,
+            result: None,
+            error: Some(RpcError { code: -32601, message: "unknown method".into() }),
+        });
+        assert_eq!(decode(&encode(&err)).unwrap(), err);
+    }
+
+    #[test]
     fn garbage_is_hg008() {
         let err = decode("{not json").unwrap_err();
         assert!(err.to_string().starts_with("[HG008]"));
