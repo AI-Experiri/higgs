@@ -7,5 +7,6 @@
 //! over stdio (MCP wire). Spec: docs/superpowers/specs/2026-06-12-higgs-runtime-design.md
 
 pub mod diagnostic;
+pub mod rpc;
 
 pub use diagnostic::HiggsError;
