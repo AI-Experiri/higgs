@@ -22,6 +22,7 @@ pub enum HiggsModelSource {
 #[ts(export, export_to = "../../../frontend/src/lib/generated/")]
 pub struct HiggsModel {
     /// HuggingFace repo id, `org/model` — the identity used everywhere.
+    /// Ollama-sourced models currently use `ollama/{name}:{tag}` (PARKED: pending user decision).
     pub id: String,
     /// Absolute path to the GGUF file.
     pub path: String,
@@ -90,13 +91,16 @@ impl ModelStore {
 ///
 /// Two directory levels, then GGUF files. Id is `org/model`.
 fn scan_lmstudio(root: &Path, out: &mut Vec<HiggsModel>) -> Result<(), HiggsError> {
-    if !root.exists() {
-        return Ok(());
-    }
-
-    let org_entries = root
-        .read_dir()
-        .map_err(|e| HiggsError::ModelDirUnreadable { path: root.display().to_string(), source: e })?;
+    let org_entries = match std::fs::read_dir(root) {
+        Ok(it) => it,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(HiggsError::ModelDirUnreadable {
+                path: root.display().to_string(),
+                source: e,
+            })
+        }
+    };
 
     for org_entry in org_entries {
         let org_entry = org_entry.map_err(|e| HiggsError::ModelDirUnreadable {
@@ -107,12 +111,21 @@ fn scan_lmstudio(root: &Path, out: &mut Vec<HiggsModel>) -> Result<(), HiggsErro
         if !org_path.is_dir() {
             continue;
         }
-        let org_name = org_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let org_name = match org_path.file_name().and_then(|n| n.to_str()) {
+            Some(n) if !n.is_empty() => n.to_string(),
+            _ => continue,
+        };
 
-        let model_entries = org_path.read_dir().map_err(|e| HiggsError::ModelDirUnreadable {
-            path: org_path.display().to_string(),
-            source: e,
-        })?;
+        let model_entries = match std::fs::read_dir(&org_path) {
+            Ok(it) => it,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(HiggsError::ModelDirUnreadable {
+                    path: org_path.display().to_string(),
+                    source: e,
+                })
+            }
+        };
 
         for model_entry in model_entries {
             let model_entry = model_entry.map_err(|e| HiggsError::ModelDirUnreadable {
@@ -123,14 +136,22 @@ fn scan_lmstudio(root: &Path, out: &mut Vec<HiggsModel>) -> Result<(), HiggsErro
             if !model_path.is_dir() {
                 continue;
             }
-            let model_name =
-                model_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+            let model_name = match model_path.file_name().and_then(|n| n.to_str()) {
+                Some(n) if !n.is_empty() => n.to_string(),
+                _ => continue,
+            };
             let id = format!("{org_name}/{model_name}");
 
-            let file_entries = model_path.read_dir().map_err(|e| HiggsError::ModelDirUnreadable {
-                path: model_path.display().to_string(),
-                source: e,
-            })?;
+            let file_entries = match std::fs::read_dir(&model_path) {
+                Ok(it) => it,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(HiggsError::ModelDirUnreadable {
+                        path: model_path.display().to_string(),
+                        source: e,
+                    })
+                }
+            };
 
             for file_entry in file_entries {
                 let file_entry = file_entry.map_err(|e| HiggsError::ModelDirUnreadable {
@@ -138,8 +159,11 @@ fn scan_lmstudio(root: &Path, out: &mut Vec<HiggsModel>) -> Result<(), HiggsErro
                     source: e,
                 })?;
                 let file_path = file_entry.path();
-                let fname = file_path.file_name().unwrap_or_default().to_string_lossy();
-                if !fname.ends_with(".gguf") {
+                let fname = match file_path.file_name().and_then(|n| n.to_str()) {
+                    Some(n) if !n.is_empty() => n.to_string(),
+                    _ => continue,
+                };
+                if !fname.to_ascii_lowercase().ends_with(".gguf") {
                     continue;
                 }
                 let size_bytes = file_path.metadata().map(|m| m.len()).unwrap_or(0);
@@ -162,14 +186,16 @@ fn scan_lmstudio(root: &Path, out: &mut Vec<HiggsModel>) -> Result<(), HiggsErro
 ///
 /// Any revision directory is included. Id is `org/name`.
 fn scan_hf_cache(root: &Path, out: &mut Vec<HiggsModel>) -> Result<(), HiggsError> {
-    if !root.exists() {
-        return Ok(());
-    }
-
-    let repo_entries = root.read_dir().map_err(|e| HiggsError::ModelDirUnreadable {
-        path: root.display().to_string(),
-        source: e,
-    })?;
+    let repo_entries = match std::fs::read_dir(root) {
+        Ok(it) => it,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(HiggsError::ModelDirUnreadable {
+                path: root.display().to_string(),
+                source: e,
+            })
+        }
+    };
 
     for repo_entry in repo_entries {
         let repo_entry = repo_entry.map_err(|e| HiggsError::ModelDirUnreadable {
@@ -180,7 +206,10 @@ fn scan_hf_cache(root: &Path, out: &mut Vec<HiggsModel>) -> Result<(), HiggsErro
         if !repo_path.is_dir() {
             continue;
         }
-        let dir_name = repo_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let dir_name = match repo_path.file_name().and_then(|n| n.to_str()) {
+            Some(n) if !n.is_empty() => n.to_string(),
+            _ => continue,
+        };
 
         // Expect prefix "models--"
         let rest = match dir_name.strip_prefix("models--") {
@@ -199,10 +228,16 @@ fn scan_hf_cache(root: &Path, out: &mut Vec<HiggsModel>) -> Result<(), HiggsErro
             continue;
         }
 
-        let rev_entries = snapshots_path.read_dir().map_err(|e| HiggsError::ModelDirUnreadable {
-            path: snapshots_path.display().to_string(),
-            source: e,
-        })?;
+        let rev_entries = match std::fs::read_dir(&snapshots_path) {
+            Ok(it) => it,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(HiggsError::ModelDirUnreadable {
+                    path: snapshots_path.display().to_string(),
+                    source: e,
+                })
+            }
+        };
 
         for rev_entry in rev_entries {
             let rev_entry = rev_entry.map_err(|e| HiggsError::ModelDirUnreadable {
@@ -214,10 +249,16 @@ fn scan_hf_cache(root: &Path, out: &mut Vec<HiggsModel>) -> Result<(), HiggsErro
                 continue;
             }
 
-            let file_entries = rev_path.read_dir().map_err(|e| HiggsError::ModelDirUnreadable {
-                path: rev_path.display().to_string(),
-                source: e,
-            })?;
+            let file_entries = match std::fs::read_dir(&rev_path) {
+                Ok(it) => it,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(HiggsError::ModelDirUnreadable {
+                        path: rev_path.display().to_string(),
+                        source: e,
+                    })
+                }
+            };
 
             for file_entry in file_entries {
                 let file_entry = file_entry.map_err(|e| HiggsError::ModelDirUnreadable {
@@ -225,8 +266,11 @@ fn scan_hf_cache(root: &Path, out: &mut Vec<HiggsModel>) -> Result<(), HiggsErro
                     source: e,
                 })?;
                 let file_path = file_entry.path();
-                let fname = file_path.file_name().unwrap_or_default().to_string_lossy();
-                if !fname.ends_with(".gguf") {
+                let fname = match file_path.file_name().and_then(|n| n.to_str()) {
+                    Some(n) if !n.is_empty() => n.to_string(),
+                    _ => continue,
+                };
+                if !fname.to_ascii_lowercase().ends_with(".gguf") {
                     continue;
                 }
                 let size_bytes = file_path.metadata().map(|m| m.len()).unwrap_or(0);
@@ -251,32 +295,35 @@ fn scan_hf_cache(root: &Path, out: &mut Vec<HiggsModel>) -> Result<(), HiggsErro
 /// `layers[]` where `mediaType == "application/vnd.ollama.image.model"`.
 /// Blob lives at `<root>/blobs/sha256-<hex>`.
 fn scan_ollama(root: &Path, out: &mut Vec<HiggsModel>) -> Result<(), HiggsError> {
-    if !root.exists() {
-        return Ok(());
-    }
-
     let manifests_dir = root.join("manifests");
-    if !manifests_dir.exists() {
-        return Ok(());
+
+    // Probe manifests dir directly — NotFound = silently skip, other errors = HG001.
+    match std::fs::read_dir(root) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(HiggsError::ModelDirUnreadable {
+                path: root.display().to_string(),
+                source: e,
+            })
+        }
     }
 
     let blobs_dir = root.join("blobs");
     let mut manifest_files: Vec<PathBuf> = Vec::new();
-    collect_manifest_files(&manifests_dir, &mut manifest_files);
+    collect_manifest_files(&manifests_dir, &mut manifest_files)?;
 
     for manifest_path in manifest_files {
         // name = parent dir name, tag = file name
-        let tag = manifest_path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        let name = manifest_path
-            .parent()
-            .and_then(|p| p.file_name())
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
+        let tag = match manifest_path.file_name().and_then(|n| n.to_str()) {
+            Some(n) if !n.is_empty() => n.to_string(),
+            _ => continue,
+        };
+        let name = match manifest_path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str())
+        {
+            Some(n) if !n.is_empty() => n.to_string(),
+            _ => continue,
+        };
 
         let raw = std::fs::read_to_string(&manifest_path).map_err(|e| {
             HiggsError::OllamaManifestInvalid {
@@ -328,6 +375,17 @@ fn scan_ollama(root: &Path, out: &mut Vec<HiggsModel>) -> Result<(), HiggsError>
             continue;
         }
 
+        // Validate GGUF magic — corrupt/partial blobs are silently skipped,
+        // matching shimmy/LM Studio behavior.
+        let mut magic = [0u8; 4];
+        match std::fs::File::open(&blob_path).and_then(|mut f| {
+            use std::io::Read;
+            f.read_exact(&mut magic)
+        }) {
+            Ok(()) if &magic == b"GGUF" => {}
+            _ => continue,
+        }
+
         let size_bytes = blob_path.metadata().map(|m| m.len()).unwrap_or(0);
 
         // PARKED: identity form pending user decision (spec: HF repo id everywhere)
@@ -346,16 +404,33 @@ fn scan_ollama(root: &Path, out: &mut Vec<HiggsModel>) -> Result<(), HiggsError>
 }
 
 /// Recursively collect all regular files under `dir` into `out`.
-fn collect_manifest_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = dir.read_dir() else { return };
-    for entry in entries.flatten() {
+///
+/// Returns `Err([HG001])` if a directory cannot be read (other than NotFound,
+/// which is silently skipped).
+fn collect_manifest_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), HiggsError> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(it) => it,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(HiggsError::ModelDirUnreadable {
+                path: dir.display().to_string(),
+                source: e,
+            })
+        }
+    };
+    for entry in entries {
+        let entry = entry.map_err(|e| HiggsError::ModelDirUnreadable {
+            path: dir.display().to_string(),
+            source: e,
+        })?;
         let path = entry.path();
         if path.is_dir() {
-            collect_manifest_files(&path, out);
+            collect_manifest_files(&path, out)?;
         } else if path.is_file() {
             out.push(path);
         }
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -368,7 +443,7 @@ fn collect_manifest_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// checks whether it looks like a quantization tag (`Q…`, `IQ…`, `f16`,
 /// `bf16`, `f32`).
 fn quant_from_filename(name: &str) -> Option<String> {
-    let stem = name.strip_suffix(".gguf")?;
+    let stem = name.strip_suffix(".gguf").or_else(|| name.strip_suffix(".GGUF"))?;
     let tail = stem.rsplit(['-', '.']).next()?;
     let looks_quant = tail.starts_with('Q')
         || tail.starts_with("IQ")
@@ -439,8 +514,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let root = dir.path();
 
-        // blobs/sha256-deadbeef (16 bytes)
-        write_file(&root.join("blobs/sha256-deadbeef"), &[0u8; 16]);
+        // blobs/sha256-deadbeef — must start with GGUF magic (16 bytes total)
+        write_file(&root.join("blobs/sha256-deadbeef"), b"GGUFxxxxxxxxxxxx");
 
         // manifests/registry.ollama.ai/library/llama3/latest
         let manifest = r#"{"layers":[{"mediaType":"application/vnd.ollama.image.model","digest":"sha256:deadbeef"}]}"#;
@@ -458,6 +533,26 @@ mod tests {
             "path was: {}",
             models[0].path
         );
+    }
+
+    #[test]
+    fn ollama_blob_without_gguf_magic_skipped() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+
+        // Blob exists but has junk bytes — not a valid GGUF file.
+        write_file(&root.join("blobs/sha256-cafebabe"), &[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00]);
+
+        let manifest = r#"{"layers":[{"mediaType":"application/vnd.ollama.image.model","digest":"sha256:cafebabe"}]}"#;
+        write_file(
+            &root.join("manifests/registry.ollama.ai/library/phi3/latest"),
+            manifest.as_bytes(),
+        );
+
+        let mut store = ModelStore::default();
+        let models = store.scan(&[], &[], &[root.to_path_buf()]).unwrap();
+
+        assert_eq!(models.len(), 0, "blob without GGUF magic must be skipped");
     }
 
     #[test]
