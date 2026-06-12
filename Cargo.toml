@@ -6,6 +6,7 @@ description = "In-app local model runtime: OpenAI-compatible serving over llama.
 license = "MIT"
 
 [dependencies]
+# full: supervisor needs rt+sync+time+io, worker needs rt+process+io — Tasks 2-12 use all of it
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8" }
 futures = "0.3"
@@ -19,7 +20,7 @@ ts-rs = { version = "10", features = ["serde-compat", "serde-json-impl"] }
 
 [dev-dependencies]
 tempfile = "3"
-tower = { version = "0.5" }
+tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 
 [lints]
