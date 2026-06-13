@@ -82,6 +82,7 @@ fn worker_stdio_roundtrip() {
     // `--exact worker_stdio_roundtrip --nocapture` makes the child jump straight
     // into this test function, where it sees HIGGS_WORKER_TEST and calls worker_main().
     let exe = std::env::current_exe().expect("current_exe");
+    // child inherits parent env by design (stderr tracing visibility); worker reads no env vars today
     let mut child = Command::new(&exe)
         .args(["--exact", "worker_stdio_roundtrip", "--nocapture"])
         .env(SENTINEL, "1")
@@ -180,6 +181,7 @@ fn worker_stdio_roundtrip() {
     // ---- wait for child exit (max 5 s) -------------------------------------
     let done = {
         let (exit_tx, exit_rx) = mpsc::channel::<std::process::ExitStatus>();
+        // no kill-on-drop: stdin EOF (drop of child_stdin) ends the worker on any parent panic
         std::thread::spawn(move || {
             let status = child.wait().expect("wait");
             let _ = exit_tx.send(status);
