@@ -147,7 +147,6 @@ pub(crate) fn http_status(err: &HiggsError) -> StatusCode {
         HiggsError::WorkerSpawnFailed { .. } | HiggsError::WorkerDead { .. } => {
             StatusCode::SERVICE_UNAVAILABLE
         }
-        HiggsError::ChatBusy => StatusCode::CONFLICT,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -647,11 +646,17 @@ mod tests {
         stream.flush().await.unwrap();
     }
 
-    async fn write_chunk_notification(stream: &mut tokio::io::DuplexStream, delta: &str) {
+    async fn write_chunk_notification(
+        stream: &mut tokio::io::DuplexStream,
+        request_id: u64,
+        delta: &str,
+    ) {
         let line = encode(&RpcFrame::Notification(RpcNotification {
             jsonrpc: "2.0".into(),
             method: N_CHAT_CHUNK.into(),
-            params: json!({ "request_id": null, "delta": delta }),
+            // request_id matches the M_CHAT RPC id so route_notification
+            // delivers this delta to the correct keyed sink.
+            params: json!({ "request_id": request_id, "delta": delta }),
         }));
         stream
             .write_all(format!("{line}\n").as_bytes())
@@ -829,8 +834,9 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(30)).await;
             write_response(&mut test_write, 1, loaded_status_json()).await; // status gate
             tokio::time::sleep(Duration::from_millis(50)).await;
-            write_chunk_notification(&mut test_write, "hel").await;
-            write_chunk_notification(&mut test_write, "lo").await;
+            // Chunks tagged with request_id=2 (the M_CHAT RPC id, allocated after status id=1).
+            write_chunk_notification(&mut test_write, 2, "hel").await;
+            write_chunk_notification(&mut test_write, 2, "lo").await;
             tokio::time::sleep(Duration::from_millis(50)).await;
             write_response(
                 &mut test_write,

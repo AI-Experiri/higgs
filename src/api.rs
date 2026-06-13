@@ -274,9 +274,10 @@ impl Higgs {
     ///   consumers (`/v1` with `stream: false`).  Both are retained on purpose —
     ///   callers choose which representation they need.
     ///
-    /// v1 constraint: only one chat may be in flight at a time. Returns
-    /// `Err(ChatBusy)` [HG012] when a chat is already in flight; the caller
-    /// must wait for the current request to finish before issuing another.
+    /// Concurrent callers are each accepted and routed their own deltas via a
+    /// per-request keyed channel; the worker executes requests serially (single-
+    /// threaded stdin loop) so throughput is sequential but callers never clobber
+    /// each other's streams.
     pub async fn chat_stream(
         &self,
         messages: Vec<(String, String)>,
@@ -289,7 +290,14 @@ impl Higgs {
         ),
         HiggsError,
     > {
-        let rx = self.sup.take_chat_sink()?;
+        // Allocate the request id first so the same id is used for both:
+        //   (a) the M_CHAT RPC frame's `id` field (for response correlation), and
+        //   (b) the `request_id` in the M_CHAT params (for N_CHAT_CHUNK routing).
+        // The worker echoes params.request_id in every N_CHAT_CHUNK notification;
+        // `route_notification` looks up this id in `chat_sinks` to deliver each
+        // delta to the correct caller's receiver.
+        let request_id = self.sup.alloc_request_id();
+        let rx = self.sup.register_chat_sink(request_id);
         let sup = Arc::clone(&self.sup);
 
         let msgs: Vec<serde_json::Value> = messages
@@ -299,9 +307,11 @@ impl Higgs {
 
         let handle = tokio::spawn(async move {
             let result = sup
-                .request(
+                .request_with_id(
+                    request_id,
                     M_CHAT,
                     json!({
+                        "request_id": request_id,
                         "messages": msgs,
                         "max_tokens": max_tokens,
                         "temperature": temperature,
@@ -309,15 +319,11 @@ impl Higgs {
                 )
                 .await;
 
-            // On request failure, clear the stale chat sink so the next
-            // take_chat_sink call does not trip the debug_assert.
-            let result = match result {
-                Ok(v) => v,
-                Err(e) => {
-                    sup.clear_chat_sink();
-                    return Err(e);
-                }
-            };
+            // Remove the sink on any outcome: on success the sender is dropped
+            // (closing the receiver); on failure the receiver is also closed.
+            sup.remove_chat_sink(request_id);
+
+            let result = result?;
 
             let content = result
                 .get("content")
@@ -574,6 +580,11 @@ mod tests {
     }
 
     // ── Test 4: chat_stream delivers chunks and outcome ────────────────────────
+    //
+    // Verifies end-to-end: alloc_request_id allocates id=1; chat_stream registers
+    // the sink under that id and sends M_CHAT with request_id=1; the test injects
+    // N_CHAT_CHUNK notifications tagged request_id=1; route_notification delivers
+    // them to rx; the final response for RPC id=1 resolves the outcome handle.
 
     #[tokio::test]
     async fn chat_stream_delivers() {
@@ -588,13 +599,13 @@ mod tests {
             .await
             .expect("chat_stream should succeed");
 
-        // Inject chunk notifications before the final response.
+        // Inject chunk notifications tagged with request_id=1 (the first allocated id).
         use crate::rpc::{encode, RpcFrame, RpcNotification};
         for delta in &["hel", "lo"] {
             let notif = encode(&RpcFrame::Notification(RpcNotification {
                 jsonrpc: "2.0".into(),
                 method: N_CHAT_CHUNK.into(),
-                params: json!({ "request_id": null, "delta": delta }),
+                params: json!({ "request_id": 1u64, "delta": delta }),
             }));
             test_write
                 .write_all(format!("{notif}\n").as_bytes())
@@ -605,7 +616,7 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
 
-        // Final response for M_CHAT.
+        // Final response for M_CHAT (RPC id=1).
         write_response(
             &mut test_write,
             1,
@@ -629,47 +640,12 @@ mod tests {
         assert_eq!(chunk2, "lo");
     }
 
-    // ── Test 4-a: concurrent chat_stream returns ChatBusy ────────────────────
-    //
-    // F8: a second chat_stream while one is in flight must return Err(ChatBusy)
-    // [HG012]. The first request must not be disturbed.
-
-    #[tokio::test]
-    async fn chat_stream_concurrent_second_returns_busy() {
-        let (sup, _test_write, _test_read) = make_supervisor();
-        let higgs = Higgs {
-            sup: Arc::new(sup),
-            config: parking_lot::Mutex::new(HiggsConfig::default()),
-        };
-
-        // First chat_stream — succeeds (sink installed).
-        let (_rx1, _handle1) = higgs
-            .chat_stream(vec![("user".into(), "first".into())], 16, 0.7)
-            .await
-            .expect("first chat_stream must succeed");
-
-        // Second chat_stream while first is in flight — must fail with ChatBusy.
-        let result = higgs
-            .chat_stream(vec![("user".into(), "second".into())], 16, 0.7)
-            .await;
-        let err = result.expect_err("second concurrent chat_stream must fail");
-        assert!(
-            matches!(err, HiggsError::ChatBusy),
-            "must be ChatBusy [HG012], got: {err}"
-        );
-        assert!(
-            err.to_string().contains("[HG012]"),
-            "display must carry [HG012]: {err}"
-        );
-    }
-
-    // ── Test 5: chat_stream against dead worker clears sink ───────────────────
+    // ── Test 5: chat_stream against dead worker removes sink ─────────────────
 
     /// When the chat request fails (write_tx is None — worker not running), the
-    /// installed chat sink must be cleared so a subsequent `take_chat_sink` does
-    /// not trip the debug_assert.
+    /// spawned task removes the sink on the error path so the map stays clean.
     #[tokio::test]
-    async fn chat_stream_dead_worker_clears_sink() {
+    async fn chat_stream_dead_worker_removes_sink() {
         // Build a Supervisor with no worker halves — factory always fails.
         let sup = crate::supervisor::Supervisor::with_factory(Box::new(|_ring| {
             Err(HiggsError::WorkerSpawnFailed {
@@ -683,7 +659,7 @@ mod tests {
             config: parking_lot::Mutex::new(HiggsConfig::default()),
         };
 
-        // chat_stream installs the sink then the spawned task encounters dead worker.
+        // chat_stream registers the sink then the spawned task encounters dead worker.
         let (_rx, handle) = higgs
             .chat_stream(vec![("user".into(), "hi".into())], 8, 0.0)
             .await
@@ -696,11 +672,11 @@ mod tests {
             .expect("join error");
         assert!(result.is_err(), "chat against dead worker must fail");
 
-        // After the failed request, a subsequent take_chat_sink must succeed
-        // (sink was cleared on error path, not live → not ChatBusy).
-        let _rx2 = higgs
-            .sup
-            .take_chat_sink()
-            .expect("take_chat_sink must succeed after failed chat");
+        // After the failed request, the sink map must be empty (remove_chat_sink was called).
+        assert_eq!(
+            higgs.sup.chat_sinks_count(),
+            0,
+            "chat_sinks must be empty after failed request"
+        );
     }
 }

@@ -71,13 +71,6 @@ pub enum HiggsError {
     #[snafu(display("[HG011] generation failed at {stage}: {reason}"))]
     #[diagnostic(code(HG011))]
     GenerationFailed { stage: String, reason: String },
-
-    /// A second chat request arrived while one is already in flight (v1 single-in-flight invariant).
-    ///
-    /// v1 serves one chat at a time. The caller must wait for the current request to complete.
-    #[snafu(display("[HG012] chat already in flight — v1 serves one at a time"))]
-    #[diagnostic(code(HG012))]
-    ChatBusy,
 }
 
 #[cfg(test)]

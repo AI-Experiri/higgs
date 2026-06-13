@@ -94,13 +94,18 @@ struct Inner {
     /// Pending request id → oneshot reply channel.
     /// Lock held for insert/remove only — never across `.await`.
     pending: Mutex<HashMap<u64, oneshot::Sender<rpc::RpcResponse>>>,
-    /// Active chat-chunk sink (one in-flight chat at a time; worker serializes).
-    /// Lock held for swap/take only.
+    /// Per-request chat-chunk sinks keyed by the M_CHAT request id.
     ///
-    /// v1 invariant: only one chat request is in flight at a time because the
-    /// worker serialises chat; a `debug_assert!` in `take_chat_sink` catches
-    /// accidental clobbering of an active sink during development.
-    chat_sink: Mutex<Option<mpsc::UnboundedSender<String>>>,
+    /// When the worker emits an `N_CHAT_CHUNK` notification it echoes the
+    /// `request_id` from the original M_CHAT params.  Each concurrent caller
+    /// registers its own `mpsc::unbounded_channel` here before sending the
+    /// M_CHAT request; `route_notification` delivers each delta to the
+    /// matching sink.  Sinks are removed on completion or error.
+    ///
+    /// Worker execution is still serialised (single-threaded stdin loop); the
+    /// map just ensures each caller gets ONLY its own deltas with no clobber.
+    /// Lock held for insert/remove/lookup only — never across `.await`.
+    chat_sinks: Mutex<HashMap<u64, mpsc::UnboundedSender<String>>>,
     /// Monotonically increasing request id counter.
     next_id: AtomicU64,
     /// Broadcast channel for lifecycle events (cap 64).
@@ -127,12 +132,13 @@ struct Inner {
 /// Spawns the higgs worker by re-executing the current binary with
 /// `--higgs-worker`, speaks NDJSON JSON-RPC 2.0 over its stdio, correlates
 /// request/response pairs by id, routes `higgs/chat/chunk` notifications to
-/// the active chat receiver, and restarts the worker (1s backoff) on death
-/// (at most one attempt per death; factory failure → terminal `WorkerDied`,
-/// no retry loop).
+/// per-request receivers keyed by `request_id`, and restarts the worker (1s
+/// backoff) on death (at most one attempt per death; factory failure →
+/// terminal `WorkerDied`, no retry loop).
 ///
-/// One in-flight chat at a time: the worker serialises chat requests anyway;
-/// this is a documented v1 invariant.
+/// Concurrent callers are each routed their own deltas via the keyed sink map;
+/// the worker serialises execution (single-threaded stdin loop) so throughput
+/// is single-sequence but correctness is guaranteed for any number of callers.
 pub(crate) struct Supervisor {
     inner: Arc<Inner>,
 }
@@ -145,7 +151,7 @@ impl Supervisor {
         let (events_tx, _) = broadcast::channel(64);
         let inner = Arc::new(Inner {
             pending: Mutex::new(HashMap::new()),
-            chat_sink: Mutex::new(None),
+            chat_sinks: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             events_tx,
             stderr_ring: Arc::new(Mutex::new(VecDeque::with_capacity(2000))),
@@ -167,7 +173,7 @@ impl Supervisor {
         let (events_tx, _) = broadcast::channel(64);
         let inner = Arc::new(Inner {
             pending: Mutex::new(HashMap::new()),
-            chat_sink: Mutex::new(None),
+            chat_sinks: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             events_tx,
             stderr_ring: Arc::new(Mutex::new(VecDeque::with_capacity(2000))),
@@ -200,12 +206,114 @@ impl Supervisor {
         Ok(())
     }
 
+    /// Allocate a monotonically increasing request id.
+    ///
+    /// Used by callers that must register a chat sink BEFORE sending the
+    /// request — the same id is used for the RPC frame and for `request_id`
+    /// in the M_CHAT params so chunk routing matches.
+    pub(crate) fn alloc_request_id(&self) -> u64 {
+        self.inner.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
     /// Send a request to the worker and await its response.
     ///
     /// Returns `Err(WorkerDead)` [HG007] if the worker dies before replying.
     /// Returns `Err(WorkerRpc)` [HG009] if the worker replies with a JSON-RPC error.
     pub(crate) async fn request(&self, method: &str, params: Value) -> Result<Value, HiggsError> {
-        let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = self.alloc_request_id();
+        self.send_request(id, method, params).await
+    }
+
+    /// Send a request using a pre-allocated id.
+    ///
+    /// Used for M_CHAT so the caller can register the chat sink under the
+    /// SAME id before sending the request — ensuring chunk routing matches.
+    pub(crate) async fn request_with_id(
+        &self,
+        id: u64,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, HiggsError> {
+        self.send_request(id, method, params).await
+    }
+
+    /// Register a per-request chat-chunk receiver keyed by `request_id`.
+    ///
+    /// Creates a `(tx, rx)` pair, inserts `tx` into `chat_sinks[request_id]`,
+    /// and returns `rx`.  Infallible: concurrent callers each get their own
+    /// channel and their own deltas routed independently.  The caller must
+    /// call [`remove_chat_sink`](Self::remove_chat_sink) when done.
+    pub(crate) fn register_chat_sink(&self, request_id: u64) -> mpsc::UnboundedReceiver<String> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.inner.chat_sinks.lock().insert(request_id, tx);
+        rx
+    }
+
+    /// Remove the chat-chunk sink for `request_id`.
+    ///
+    /// Called on completion or error to release the map entry.  The dropped
+    /// sender closes the receiver, signalling end-of-stream to the consumer.
+    pub(crate) fn remove_chat_sink(&self, request_id: u64) {
+        self.inner.chat_sinks.lock().remove(&request_id);
+    }
+
+    /// Gracefully shut down the worker (2s timeout) then drop the write channel.
+    ///
+    /// Sets the deliberate-stop flag so death does not trigger respawn.
+    pub(crate) async fn stop(&self) {
+        self.inner.stopped.store(true, Ordering::Relaxed);
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.request(M_SHUTDOWN, Value::Null),
+        )
+        .await;
+        // Drop the sender — the writer task exits when its channel closes.
+        *self.inner.write_tx.lock() = None;
+    }
+
+    /// Record the params of a successful `higgs/scan` for post-restart replay.
+    pub(crate) fn record_last_scan(&self, params: Value) {
+        *self.inner.last_scan.lock() = Some(params);
+    }
+
+    /// Record the params of a successful `higgs/load` for post-restart replay.
+    pub(crate) fn record_last_load(&self, params: Value) {
+        *self.inner.last_load.lock() = Some(params);
+    }
+
+    /// Emit a lifecycle event on the broadcast channel.
+    ///
+    /// Used by the [`Higgs`](crate::api::Higgs) facade to publish
+    /// `ModelLoaded` / `ModelUnloaded` after the corresponding RPC succeeds.
+    pub(crate) fn emit(&self, event: HiggsEvent) {
+        let _ = self.inner.events_tx.send(event);
+    }
+
+    /// Return a clone of the last-recorded scan params (for test introspection).
+    #[cfg(test)]
+    pub(crate) fn last_scan_params(&self) -> Option<Value> {
+        self.inner.last_scan.lock().clone()
+    }
+
+    /// Return the number of active chat sinks (for test introspection).
+    #[cfg(test)]
+    pub(crate) fn chat_sinks_count(&self) -> usize {
+        self.inner.chat_sinks.lock().len()
+    }
+
+    // ── private ──────────────────────────────────────────────────────────────
+
+    /// Send a request frame with the given `id` and await its response.
+    ///
+    /// Shared implementation used by both [`request`](Self::request) (which
+    /// allocates a fresh id) and [`request_with_id`](Self::request_with_id)
+    /// (which uses a pre-allocated id from [`alloc_request_id`](Self::alloc_request_id)).
+    async fn send_request(
+        &self,
+        id: u64,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, HiggsError> {
         let (tx, rx) = oneshot::channel();
         {
             self.inner.pending.lock().insert(id, tx);
@@ -247,75 +355,6 @@ impl Supervisor {
             }),
         }
     }
-
-    /// Install a new chat-chunk receiver for the next in-flight chat request.
-    ///
-    /// Only one chat may be in flight at a time (v1 invariant: the worker
-    /// serialises). Returns `Err(ChatBusy)` [HG012] when a live sink is already
-    /// installed, enforcing the single-in-flight invariant as a real runtime
-    /// guard rather than a debug-only assert. The caller owns the returned
-    /// receiver and reads deltas until the sender is dropped (end of stream).
-    pub(crate) fn take_chat_sink(&self) -> Result<mpsc::UnboundedReceiver<String>, HiggsError> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let mut guard = self.inner.chat_sink.lock();
-        // Reject if a sender is present AND still open (live in-flight chat).
-        if guard
-            .as_ref()
-            .is_some_and(|s| !mpsc::UnboundedSender::is_closed(s))
-        {
-            return Err(HiggsError::ChatBusy);
-        }
-        *guard = Some(tx);
-        Ok(rx)
-    }
-
-    /// Clear the active chat-chunk sink.
-    ///
-    /// Called on the error path of a chat request to prevent a stale sender
-    /// from tripping the `debug_assert!` in the next `take_chat_sink` call.
-    pub(crate) fn clear_chat_sink(&self) {
-        *self.inner.chat_sink.lock() = None;
-    }
-
-    /// Gracefully shut down the worker (2s timeout) then drop the write channel.
-    ///
-    /// Sets the deliberate-stop flag so death does not trigger respawn.
-    pub(crate) async fn stop(&self) {
-        self.inner.stopped.store(true, Ordering::Relaxed);
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            self.request(M_SHUTDOWN, Value::Null),
-        )
-        .await;
-        // Drop the sender — the writer task exits when its channel closes.
-        *self.inner.write_tx.lock() = None;
-    }
-
-    /// Record the params of a successful `higgs/scan` for post-restart replay.
-    pub(crate) fn record_last_scan(&self, params: Value) {
-        *self.inner.last_scan.lock() = Some(params);
-    }
-
-    /// Record the params of a successful `higgs/load` for post-restart replay.
-    pub(crate) fn record_last_load(&self, params: Value) {
-        *self.inner.last_load.lock() = Some(params);
-    }
-
-    /// Emit a lifecycle event on the broadcast channel.
-    ///
-    /// Used by the [`Higgs`](crate::api::Higgs) facade to publish
-    /// `ModelLoaded` / `ModelUnloaded` after the corresponding RPC succeeds.
-    pub(crate) fn emit(&self, event: HiggsEvent) {
-        let _ = self.inner.events_tx.send(event);
-    }
-
-    /// Return a clone of the last-recorded scan params (for test introspection).
-    #[cfg(test)]
-    pub(crate) fn last_scan_params(&self) -> Option<Value> {
-        self.inner.last_scan.lock().clone()
-    }
-
-    // ── private ──────────────────────────────────────────────────────────────
 
     /// Build fresh I/O halves, spawn the writer and reader tasks, and install
     /// the mpsc sender in `Inner`.
@@ -458,17 +497,28 @@ fn correlate(inner: &Arc<Inner>, resp: rpc::RpcResponse) {
     }
 }
 
-/// Route a `higgs/chat/chunk` notification to the active chat sink.
+/// Route a `higgs/chat/chunk` notification to the matching per-request sink.
+///
+/// The notification params carry `request_id` (echoed from the M_CHAT request)
+/// and `delta`.  The sink map is looked up by `request_id`; if no entry exists
+/// (sink already removed or unknown id) the chunk is silently dropped.
 fn route_notification(inner: &Arc<Inner>, notif: &RpcNotification) {
     if notif.method != N_CHAT_CHUNK {
         return;
     }
+    let Some(request_id) = notif
+        .params
+        .get("request_id")
+        .and_then(serde_json::Value::as_u64)
+    else {
+        return;
+    };
     let Some(delta) = notif.params.get("delta").and_then(|v| v.as_str()) else {
         return;
     };
     let delta = delta.to_string();
-    let sink = inner.chat_sink.lock();
-    if let Some(tx) = sink.as_ref() {
+    let sinks = inner.chat_sinks.lock();
+    if let Some(tx) = sinks.get(&request_id) {
         let _ = tx.send(delta);
     }
 }
@@ -488,8 +538,8 @@ fn on_worker_death(inner: &Arc<Inner>, reason: Option<String>, deliberate: bool)
     }
     // Drop the write sender — the writer task exits when channel closes.
     *inner.write_tx.lock() = None;
-    // Clear chat sink.
-    *inner.chat_sink.lock() = None;
+    // Drop all chat sinks — closes each receiver, ending all in-flight streams.
+    inner.chat_sinks.lock().clear();
 
     if deliberate {
         // Clean stop: no event, no warn — the shutdown was requested.
@@ -778,13 +828,14 @@ mod tests {
         assert_eq!(r2.unwrap(), json!({"n": 2}));
     }
 
-    // ─── Test 2: chat-chunk routing ──────────────────────────────────────────
+    // ─── Test 2: chat-chunk routing (keyed) ──────────────────────────────────
 
     #[tokio::test]
     async fn chat_chunks_routed() {
         let (sup, mut test_write, _test_read) = make_supervisor();
 
-        let mut rx = sup.take_chat_sink().expect("first sink must succeed");
+        // Register a keyed sink; request_id=42 matches the notification.
+        let mut rx = sup.register_chat_sink(42);
 
         let deltas = ["hello", " world", "!"];
         for d in &deltas {
@@ -796,6 +847,46 @@ mod tests {
             let got = rx.try_recv().expect("delta expected");
             assert_eq!(got, *expected);
         }
+
+        sup.remove_chat_sink(42);
+    }
+
+    // ─── Test 2-b: two keyed sinks route independently ───────────────────────
+    //
+    // Registers sinks for request_id 1 and 2; feeds N_CHAT_CHUNK notifications
+    // for each; asserts each receiver gets ONLY its own deltas in order.
+
+    #[tokio::test]
+    async fn two_keyed_sinks_route_independently() {
+        let (sup, mut test_write, _test_read) = make_supervisor();
+
+        let mut rx1 = sup.register_chat_sink(1);
+        let mut rx2 = sup.register_chat_sink(2);
+
+        // Feed deltas for request_id 2 first, then request_id 1.
+        write_line(&mut test_write, &chunk_notif(2, "alpha")).await;
+        write_line(&mut test_write, &chunk_notif(1, "beta")).await;
+        write_line(&mut test_write, &chunk_notif(2, "gamma")).await;
+        write_line(&mut test_write, &chunk_notif(1, "delta")).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // rx1 must only see deltas tagged request_id=1.
+        let r1_a = rx1.try_recv().expect("rx1 first chunk");
+        let r1_b = rx1.try_recv().expect("rx1 second chunk");
+        assert_eq!(r1_a, "beta");
+        assert_eq!(r1_b, "delta");
+        assert!(rx1.try_recv().is_err(), "rx1 must have no more chunks");
+
+        // rx2 must only see deltas tagged request_id=2.
+        let r2_a = rx2.try_recv().expect("rx2 first chunk");
+        let r2_b = rx2.try_recv().expect("rx2 second chunk");
+        assert_eq!(r2_a, "alpha");
+        assert_eq!(r2_b, "gamma");
+        assert!(rx2.try_recv().is_err(), "rx2 must have no more chunks");
+
+        sup.remove_chat_sink(1);
+        sup.remove_chat_sink(2);
     }
 
     // ─── Test 3: EOF fails pending + emits WorkerDied ────────────────────────
@@ -927,34 +1018,6 @@ mod tests {
         assert_eq!(r.len(), 2000);
         // 2100 pushed, 100 dropped → oldest remaining is line-100.
         assert_eq!(r.front().unwrap(), "line-100");
-    }
-
-    // ─── Test 6-a: concurrent take_chat_sink returns ChatBusy ────────────────
-    //
-    // F8: the second take_chat_sink while one is live must return Err(ChatBusy)
-    // rather than clobbering the first sink.
-
-    #[tokio::test]
-    async fn concurrent_chat_sink_returns_busy() {
-        let (sup, _test_write, _test_read) = make_supervisor();
-
-        // First sink — succeeds.
-        let rx1 = sup.take_chat_sink().expect("first sink must succeed");
-
-        // Second sink while first is still open — must fail with ChatBusy.
-        let result = sup.take_chat_sink();
-        assert!(
-            matches!(result, Err(HiggsError::ChatBusy)),
-            "second take_chat_sink must return ChatBusy, got: {result:?}"
-        );
-
-        // Drop the first receiver — its sender in the lock becomes closed.
-        drop(rx1);
-
-        // Now a third take_chat_sink must succeed (sink was closed).
-        let _rx3 = sup
-            .take_chat_sink()
-            .expect("third sink must succeed after first is dropped");
     }
 
     // ─── Test 6: restart replays scan before load and emits ModelLoaded ─────────
