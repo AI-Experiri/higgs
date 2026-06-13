@@ -36,6 +36,8 @@ memmap2 = "0.9"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# For the standalone `serve` example (test harness only): structured logs.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [lints]
 workspace = true
