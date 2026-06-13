@@ -17,6 +17,9 @@ miette = "7"
 tracing = "0.1"
 parking_lot = "0.12"
 ts-rs = { version = "10", features = ["serde-compat", "serde-json-impl"] }
+llama-cpp-2 = "0.1"
+# token_to_piece (the crate's non-deprecated detokenizer) takes &mut encoding_rs::Decoder
+encoding_rs = "0.8"
 
 [dev-dependencies]
 tempfile = "3"

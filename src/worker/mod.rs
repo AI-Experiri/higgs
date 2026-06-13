@@ -1,14 +1,16 @@
 //! Worker role: runs inside the re-exec'd process. Owns the ModelStore and
-//! (from Task 6) the engine. Speaks NDJSON JSON-RPC on stdin/stdout; logs to
-//! stderr. The supervisor is the ONLY client.
+//! the engine. Speaks NDJSON JSON-RPC on stdin/stdout; logs to stderr. The
+//! supervisor is the ONLY client.
 
+pub mod engine;
 pub mod models;
 
 use std::io::{BufRead, Write};
 
 use serde_json::{json, Value};
 
-use crate::rpc::{decode, encode, RpcError, RpcFrame, RpcRequest, RpcResponse};
+use crate::diagnostic::HiggsError;
+use crate::rpc::{decode, encode, RpcError, RpcFrame, RpcNotification, RpcRequest, RpcResponse};
 use models::ModelStore;
 
 /// Method names — the only vocabulary on the supervisor↔worker wire.
@@ -30,8 +32,12 @@ pub fn worker_main() {
 }
 
 /// IO-generic server loop (unit-testable with in-memory buffers).
-fn serve(reader: impl BufRead, mut writer: impl Write) {
-    let mut state = WorkerState::default();
+fn serve(reader: impl BufRead, writer: impl Write) {
+    serve_state(WorkerState::new(), reader, writer);
+}
+
+/// Server loop over caller-supplied state — the test seam for engine injection.
+fn serve_state(mut state: WorkerState, reader: impl BufRead, mut writer: impl Write) {
     for line in reader.lines() {
         let Ok(line) = line else { break };
         if line.trim().is_empty() {
@@ -63,14 +69,36 @@ fn respond(writer: &mut impl Write, id: u64, out: Result<Value, RpcError>) {
     let _ = writeln!(writer, "{}", encode(&RpcFrame::Response(resp)));
 }
 
-/// Worker-held state: catalog + (Task 6) the loaded engine.
-#[derive(Default)]
+/// Worker-held state: catalog, engine, and load bookkeeping.
 struct WorkerState {
     store: ModelStore,
+    engine: Box<dyn engine::HiggsEngine>,
+    /// (model id, load params) of the resident model — reported by M_STATUS.
+    loaded: Option<(String, engine::LoadParams)>,
 }
 
 impl WorkerState {
-    fn dispatch(&mut self, req: &RpcRequest, _writer: &mut impl Write) -> Result<Value, RpcError> {
+    /// Production state: llama.cpp engine, empty catalog.
+    fn new() -> Self {
+        Self {
+            store: ModelStore::default(),
+            engine: Box::new(engine::llamacpp::LlamaCppEngine::default()),
+            loaded: None,
+        }
+    }
+
+    /// Test seam: same state shape with an injected engine.
+    #[cfg(test)]
+    fn with_engine(engine: Box<dyn engine::HiggsEngine>) -> Self {
+        Self { store: ModelStore::default(), engine, loaded: None }
+    }
+
+    fn dispatch(
+        &mut self,
+        req: &RpcRequest,
+        // M_CHAT streams N_CHAT_CHUNK notifications through this writer mid-request
+        writer: &mut impl Write,
+    ) -> Result<Value, RpcError> {
         match req.method.as_str() {
             M_SCAN => {
                 let dirs = |k: &str| {
@@ -91,16 +119,88 @@ impl WorkerState {
                     .map_err(|e| to_rpc_error(&e))
             }
             M_STATUS => {
-                Ok(json!({"loaded": Value::Null, "models_scanned": self.store.models().len()}))
+                let loaded = self.loaded.as_ref().map(|(id, p)| {
+                    json!({
+                        "id": id,
+                        "ctx_len": p.ctx_len,
+                        "gpu_layers": p.gpu_layers,
+                        "threads": p.threads,
+                    })
+                });
+                Ok(json!({"loaded": loaded, "models_scanned": self.store.models().len()}))
             }
-            M_LOAD | M_UNLOAD | M_CHAT => {
-                Err(RpcError { code: -32601, message: "engine lands in Task 6".into() })
+            M_LOAD => {
+                let id = req.params.get("id").and_then(Value::as_str).unwrap_or_default();
+                let params = engine::LoadParams {
+                    ctx_len: u32_param(&req.params, "ctx_len", 4096),
+                    gpu_layers: u32_param(&req.params, "gpu_layers", u32::MAX),
+                    threads: u32_param(&req.params, "threads", 4),
+                };
+                let model = self
+                    .store
+                    .get(id)
+                    .ok_or_else(|| to_rpc_error(&HiggsError::ModelNotFound { id: id.into() }))?;
+                let path = model.path.clone();
+                self.engine.load(&path, &params).map_err(|e| to_rpc_error(&e))?;
+                self.loaded = Some((id.to_string(), params));
+                Ok(json!({"id": id}))
+            }
+            M_UNLOAD => {
+                self.engine.unload();
+                self.loaded = None;
+                Ok(json!({}))
+            }
+            M_CHAT => {
+                if self.loaded.is_none() {
+                    return Err(to_rpc_error(&HiggsError::ModelNotLoaded {
+                        id: "(none)".into(),
+                    }));
+                }
+                let request_id = req.params.get("request_id").cloned().unwrap_or(Value::Null);
+                let messages: Vec<engine::EngineMessage> = serde_json::from_value(
+                    req.params.get("messages").cloned().unwrap_or(Value::Null),
+                )
+                .map_err(|e| RpcError { code: -32602, message: format!("invalid messages: {e}") })?;
+                let gen = engine::GenParams {
+                    max_tokens: req
+                        .params
+                        .get("max_tokens")
+                        .and_then(Value::as_u64)
+                        .map_or(1024, |v| usize::try_from(v).unwrap_or(usize::MAX)),
+                    temperature: req
+                        .params
+                        .get("temperature")
+                        .and_then(Value::as_f64)
+                        .map_or(0.7, |v| v as f32),
+                };
+                let mut sink = |delta: &str| {
+                    let note = RpcNotification {
+                        jsonrpc: "2.0".into(),
+                        method: N_CHAT_CHUNK.into(),
+                        params: json!({"request_id": request_id.clone(), "delta": delta}),
+                    };
+                    let _ = writeln!(writer, "{}", encode(&RpcFrame::Notification(note)));
+                };
+                let (content, finish_reason) = self
+                    .engine
+                    .chat(&messages, &gen, &mut sink)
+                    .map_err(|e| to_rpc_error(&e))?;
+                Ok(json!({"content": content, "finish_reason": finish_reason}))
             }
             other => {
                 Err(RpcError { code: -32601, message: format!("unknown method {other}") })
             }
         }
     }
+}
+
+/// Read an optional u32 field from request params, falling back to `default`.
+fn u32_param(params: &Value, key: &str, default: u32) -> u32 {
+    params
+        .get(key)
+        .and_then(Value::as_u64)
+        .and_then(|v| u32::try_from(v).ok())
+        .unwrap_or(default)
 }
 
 fn to_rpc_error(e: &crate::diagnostic::HiggsError) -> RpcError {
@@ -122,6 +222,71 @@ mod tests {
     // ---------------------------------------------------------------------------
     // Test helpers
     // ---------------------------------------------------------------------------
+
+    /// Shared record of engine calls, inspectable after `serve_state` consumes
+    /// the [`FakeEngine`].
+    type CallLog = std::sync::Arc<parking_lot::Mutex<Vec<String>>>;
+
+    /// Scripted [`engine::HiggsEngine`]: records load/unload/chat calls; chat
+    /// streams "he" then "llo" and returns ("hello", "stop").
+    struct FakeEngine {
+        calls: CallLog,
+        loaded: bool,
+    }
+
+    impl FakeEngine {
+        fn new(calls: CallLog) -> Self {
+            Self { calls, loaded: false }
+        }
+    }
+
+    impl engine::HiggsEngine for FakeEngine {
+        fn load(&mut self, path: &str, _params: &engine::LoadParams) -> Result<(), HiggsError> {
+            self.calls.lock().push(format!("load {path}"));
+            self.loaded = true;
+            Ok(())
+        }
+
+        fn unload(&mut self) {
+            self.calls.lock().push("unload".into());
+            self.loaded = false;
+        }
+
+        fn is_loaded(&self) -> bool {
+            self.loaded
+        }
+
+        fn chat(
+            &mut self,
+            _messages: &[engine::EngineMessage],
+            _params: &engine::GenParams,
+            sink: &mut dyn FnMut(&str),
+        ) -> Result<(String, &'static str), HiggsError> {
+            self.calls.lock().push("chat".into());
+            sink("he");
+            sink("llo");
+            Ok(("hello".into(), "stop"))
+        }
+    }
+
+    /// Run `input` through a worker whose engine is a [`FakeEngine`]; returns
+    /// (output frames, engine call log).
+    fn serve_with_fake(input: &str) -> (Vec<RpcFrame>, CallLog) {
+        let calls = CallLog::default();
+        let state = WorkerState::with_engine(Box::new(FakeEngine::new(calls.clone())));
+        let mut out: Vec<u8> = Vec::new();
+        serve_state(state, Cursor::new(input.as_bytes()), &mut out);
+        (parse_responses(&out), calls)
+    }
+
+    /// Write an LM Studio-layout fixture and return (tempdir, scan request line).
+    fn scan_fixture() -> (TempDir, String) {
+        let dir = TempDir::new().unwrap();
+        write_file(&dir.path().join("google/gemma-4-12b/gemma-4-12b-Q4_K_M.gguf"), b"dummy");
+        let root = dir.path().to_str().unwrap().to_string();
+        let line = req_line(1, M_SCAN, json!({"lmstudio": [root], "hf": [], "ollama": []}));
+        (dir, line)
+    }
 
     /// Build a single NDJSON line from a request value.
     fn req_line(id: u64, method: &str, params: serde_json::Value) -> String {
@@ -199,22 +364,93 @@ mod tests {
     }
 
     #[test]
-    fn engine_methods_not_ready() {
-        let input = req_line(3, M_LOAD, json!({"id": "google/gemma-4-12b"}));
-        let mut out: Vec<u8> = Vec::new();
-        serve(Cursor::new(input.as_bytes()), &mut out);
+    fn load_then_chat_streams() {
+        let (_dir, scan) = scan_fixture();
+        let mut input = scan;
+        input.push_str(&req_line(2, M_LOAD, json!({"id": "google/gemma-4-12b"})));
+        input.push_str(&req_line(
+            3,
+            M_CHAT,
+            json!({"request_id": 7, "messages": [{"role": "user", "content": "hi"}]}),
+        ));
 
-        let frames = parse_responses(&out);
+        let (frames, calls) = serve_with_fake(&input);
+        assert_eq!(frames.len(), 5, "scan + load responses, 2 chunks, chat response: {frames:?}");
+
+        let RpcFrame::Response(load) = &frames[1] else { panic!("expected load response") };
+        assert_eq!(load.id, 2);
+        assert_eq!(load.result.as_ref().unwrap()["id"], "google/gemma-4-12b");
+
+        // The two chunk notifications arrive in order, BEFORE the final response.
+        for (idx, delta) in [(2, "he"), (3, "llo")] {
+            let RpcFrame::Notification(note) = &frames[idx] else {
+                panic!("frame {idx} should be a notification: {:?}", frames[idx])
+            };
+            assert_eq!(note.method, N_CHAT_CHUNK);
+            assert_eq!(note.params["request_id"], 7);
+            assert_eq!(note.params["delta"], delta);
+        }
+
+        let RpcFrame::Response(chat) = &frames[4] else { panic!("expected chat response") };
+        assert_eq!(chat.id, 3);
+        let result = chat.result.as_ref().unwrap();
+        assert_eq!(result["content"], "hello");
+        assert_eq!(result["finish_reason"], "stop");
+
+        let calls = calls.lock();
+        assert_eq!(calls.len(), 2, "calls: {calls:?}");
+        assert!(calls[0].starts_with("load ") && calls[0].ends_with(".gguf"), "calls: {calls:?}");
+        assert_eq!(calls[1], "chat");
+    }
+
+    #[test]
+    fn chat_before_load_is_hg003() {
+        let input = req_line(2, M_CHAT, json!({"request_id": 1, "messages": []}));
+        let (frames, calls) = serve_with_fake(&input);
+
         assert_eq!(frames.len(), 1);
         let RpcFrame::Response(resp) = &frames[0] else { panic!("expected response") };
-        assert_eq!(resp.id, 3);
+        assert_eq!(resp.id, 2);
         let err = resp.error.as_ref().expect("expected error");
-        assert_eq!(err.code, -32601);
-        assert!(
-            err.message.contains("engine lands in Task 6"),
-            "message was: {}",
-            err.message,
-        );
+        assert!(err.message.contains("[HG003]"), "message was: {}", err.message);
+        assert!(calls.lock().is_empty(), "engine must not be touched");
+    }
+
+    #[test]
+    fn unload_then_status() {
+        let (_dir, scan) = scan_fixture();
+        let mut input = scan;
+        input.push_str(&req_line(2, M_LOAD, json!({"id": "google/gemma-4-12b", "ctx_len": 2048})));
+        input.push_str(&req_line(3, M_STATUS, json!(null)));
+        input.push_str(&req_line(4, M_UNLOAD, json!(null)));
+        input.push_str(&req_line(5, M_STATUS, json!(null)));
+
+        let (frames, calls) = serve_with_fake(&input);
+        assert_eq!(frames.len(), 5);
+
+        let RpcFrame::Response(loaded_status) = &frames[2] else { panic!("expected response") };
+        let loaded = &loaded_status.result.as_ref().unwrap()["loaded"];
+        assert_eq!(loaded["id"], "google/gemma-4-12b");
+        assert_eq!(loaded["ctx_len"], 2048);
+        assert_eq!(loaded["threads"], 4, "default threads");
+
+        let RpcFrame::Response(final_status) = &frames[4] else { panic!("expected response") };
+        assert_eq!(final_status.result.as_ref().unwrap()["loaded"], Value::Null);
+        assert!(calls.lock().contains(&"unload".to_string()));
+    }
+
+    #[test]
+    fn load_unknown_id_is_hg002() {
+        let (_dir, scan) = scan_fixture();
+        let mut input = scan;
+        input.push_str(&req_line(2, M_LOAD, json!({"id": "nope/nope"})));
+
+        let (frames, calls) = serve_with_fake(&input);
+        assert_eq!(frames.len(), 2);
+        let RpcFrame::Response(resp) = &frames[1] else { panic!("expected response") };
+        let err = resp.error.as_ref().expect("expected error");
+        assert!(err.message.contains("[HG002]"), "message was: {}", err.message);
+        assert!(calls.lock().is_empty(), "engine must not load anything");
     }
 
     #[test]
