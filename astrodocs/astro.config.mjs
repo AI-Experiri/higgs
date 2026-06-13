@@ -14,6 +14,7 @@ export default defineConfig({
 					label: 'Architecture',
 					items: [
 						{ label: 'System Design', slug: 'system-design' },
+						{ label: 'Concurrency model', slug: 'concurrency' },
 					],
 				},
 				{
