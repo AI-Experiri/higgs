@@ -1,0 +1,328 @@
+---
+title: Endpoints
+description: Every route exposed by higgs — /v1 OpenAI-compatible and /api/higgs/* control.
+---
+
+## Overview
+
+higgs exposes two route groups:
+
+| Group | Purpose |
+|-------|---------|
+| `/v1/*` | OpenAI-compatible inference — chat clients, OpenAI SDK drop-ins |
+| `/api/higgs/*` | Control plane — scan, load, unload, status, logs, worker lifecycle |
+
+All routes are mounted by `higgs::serve::router(Arc<Higgs>)`.
+
+---
+
+## Error Mapping
+
+The same status table applies to both surfaces:
+
+| HiggsError | HTTP status |
+|------------|-------------|
+| HG002 ModelNotFound | 404 |
+| HG003 ModelNotLoaded | 404 |
+| HG005 ContextOverflow | 400 |
+| HG006 WorkerSpawnFailed | 503 |
+| HG007 WorkerDead | 503 |
+| anything else | 500 |
+
+**`/v1` error envelope:**
+
+```json
+{
+  "error": {
+    "message": "[HG003] model not loaded: org/model — load it explicitly first",
+    "type": "invalid_request_error",
+    "code": "model_not_found"
+  }
+}
+```
+
+`type` is `invalid_request_error` for 4xx, `server_error` otherwise.
+`code` is `model_not_found` on 404; absent on other statuses.
+
+**Control error envelope:**
+
+```json
+{ "error": "[HG003] model not loaded: org/model — load it explicitly first" }
+```
+
+---
+
+## /v1 Routes
+
+### GET /v1/models
+
+Returns the **loaded** model only. An empty list means no model is currently loaded.
+Use `GET /api/higgs/models` for the full on-disk catalog.
+
+**Response (200):**
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "org/model-name",
+      "object": "model",
+      "created": 1718000000,
+      "owned_by": "higgs"
+    }
+  ]
+}
+```
+
+**curl:**
+
+```sh
+curl http://localhost:8081/v1/models
+```
+
+---
+
+### POST /v1/chat/completions
+
+Chat with the loaded model. Requires a model to be loaded first (`POST /api/higgs/models/load`).
+
+v1 is **text-only** — image, audio, and file content parts are rejected with 400.
+Both `max_tokens` (deprecated) and `max_completion_tokens` are accepted; the newer field wins.
+
+**Request body (OpenAI wire):**
+
+```json
+{
+  "model": "org/model-name",
+  "messages": [
+    { "role": "system", "content": "You are a helpful assistant." },
+    { "role": "user", "content": "What is 2 + 2?" }
+  ],
+  "stream": false,
+  "max_completion_tokens": 256,
+  "temperature": 0.7
+}
+```
+
+**Non-streaming response (200):**
+
+```json
+{
+  "id": "chatcmpl-abc123",
+  "object": "chat.completion",
+  "created": 1718000001,
+  "model": "org/model-name",
+  "choices": [
+    {
+      "index": 0,
+      "message": { "role": "assistant", "content": "4." },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": { "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0 }
+}
+```
+
+Note: token counts are zeros in v1; the worker protocol does not yet carry usage stats.
+
+**Streaming response (200, `stream: true`):**
+
+```
+data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1718000001,"model":"org/model-name","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1718000001,"model":"org/model-name","choices":[{"index":0,"delta":{"content":"4"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1718000001,"model":"org/model-name","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+```
+
+The stream always ends with `data: [DONE]`. On mid-stream errors the OpenAI error envelope is emitted as a `data:` event before `[DONE]`.
+
+**curl (streaming):**
+
+```sh
+curl -N -H "Content-Type: application/json" \
+  -d '{"model":"org/model","messages":[{"role":"user","content":"hi"}],"stream":true}' \
+  http://localhost:8081/v1/chat/completions
+```
+
+---
+
+## /api/higgs/* Control Routes
+
+### GET /api/higgs/models
+
+Live scan of all configured model directories plus the currently loaded model id.
+
+**Response (200):**
+
+```json
+{
+  "models": [
+    {
+      "id": "org/model-name",
+      "path": "/home/user/.cache/lm-studio/models/org/model-name/model-Q4_K_M.gguf",
+      "size_bytes": 4200000000,
+      "quant": "Q4_K_M",
+      "source": "LmStudio",
+      "arch": "llama",
+      "ctx_train": 131072,
+      "has_chat_template": true
+    }
+  ],
+  "loaded_id": "org/model-name"
+}
+```
+
+`source` is one of `"LmStudio"`, `"HfCache"`, `"Ollama"`.
+`quant`, `arch`, `ctx_train` are omitted when unreadable from the GGUF header.
+
+**curl:**
+
+```sh
+curl http://localhost:8081/api/higgs/models
+```
+
+---
+
+### POST /api/higgs/models/load
+
+Load a model by HuggingFace repo id. Load parameters fall back to `HiggsConfig.default_load` when absent.
+
+**Request body:**
+
+```json
+{
+  "id": "org/model-name",
+  "ctx_len": 4096,
+  "gpu_layers": 4294967295,
+  "threads": 4
+}
+```
+
+All fields except `id` are optional.
+`gpu_layers: 4294967295` (`u32::MAX`) means "offload all layers" (LM Studio "max" semantics).
+
+**Response (200):**
+
+```json
+{ "status": "ok", "id": "org/model-name" }
+```
+
+**curl:**
+
+```sh
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"id":"org/model-name"}' \
+  http://localhost:8081/api/higgs/models/load
+```
+
+---
+
+### POST /api/higgs/models/unload
+
+Unload the current model.
+
+**Response (200):**
+
+```json
+{ "status": "ok" }
+```
+
+**curl:**
+
+```sh
+curl -X POST http://localhost:8081/api/higgs/models/unload
+```
+
+---
+
+### GET /api/higgs/status
+
+Live status snapshot. `worker_alive` is true iff an RPC round-trip to the worker succeeded.
+
+**Response (200):**
+
+```json
+{
+  "worker_alive": true,
+  "loaded": {
+    "id": "org/model-name",
+    "ctx_len": 4096,
+    "gpu_layers": 4294967295,
+    "threads": 4
+  },
+  "models_on_disk": 3
+}
+```
+
+`loaded` is absent when no model is loaded. `models_on_disk` is the count from the last scan.
+
+**curl:**
+
+```sh
+curl http://localhost:8081/api/higgs/status
+```
+
+---
+
+### GET /api/higgs/logs
+
+Worker stderr tail. Useful for diagnosing load failures and llama.cpp output.
+
+**Query:** `?n=200` (default 200 lines)
+
+**Response (200):**
+
+```json
+{
+  "lines": [
+    "llama_model_load: loading model from /path/to/model.gguf",
+    "llama_model_load: model size = 4.20 GB"
+  ]
+}
+```
+
+**curl:**
+
+```sh
+curl "http://localhost:8081/api/higgs/logs?n=50"
+```
+
+---
+
+### POST /api/higgs/worker/start
+
+Spawn the worker process if it is not already running.
+
+**Response (200):**
+
+```json
+{ "status": "ok" }
+```
+
+**curl:**
+
+```sh
+curl -X POST http://localhost:8081/api/higgs/worker/start
+```
+
+---
+
+### POST /api/higgs/worker/stop
+
+Gracefully shut down the worker (2 second timeout).
+
+**Response (200):**
+
+```json
+{ "status": "ok" }
+```
+
+**curl:**
+
+```sh
+curl -X POST http://localhost:8081/api/higgs/worker/stop
+```

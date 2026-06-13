@@ -1,0 +1,36 @@
+---
+title: higgs
+description: jigglebot's in-app local model runtime
+template: splash
+hero:
+  tagline: OpenAI-compatible local inference over llama.cpp, crash-isolated in a worker process.
+  actions:
+    - text: System Design
+      link: /system-design/
+      icon: right-arrow
+    - text: Endpoints
+      link: /endpoints/
+      icon: document
+      variant: minimal
+    - text: How to Use
+      link: /how-to-use/
+      icon: open-book
+      variant: minimal
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+<CardGrid stagger>
+  <Card title="Standalone crate" icon="puzzle">
+    higgs imports nothing from any jigglebot crate. Mount it in any Axum app with one call.
+  </Card>
+  <Card title="Crash-isolated worker" icon="warning">
+    The llama.cpp engine runs in a re-exec'd subprocess. A crash restarts automatically, replaying the last scan and load.
+  </Card>
+  <Card title="OpenAI-compatible" icon="approve-check">
+    `/v1/chat/completions` speaks the OpenAI wire protocol verbatim — stream or non-stream.
+  </Card>
+  <Card title="Three model stores" icon="list-format">
+    Discovers GGUF files from LM Studio, HuggingFace cache, and Ollama layouts automatically.
+  </Card>
+</CardGrid>
