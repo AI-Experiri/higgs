@@ -1,11 +1,45 @@
 # higgs Configuration
 
 ## Table of Contents
+- [config.toml — \[higgs\] Section](#configtoml--higgs-section)
 - [HiggsConfig Fields](#higgsconfig-fields)
 - [Model Directory Layouts](#model-directory-layouts)
 - [Build Note: LIBCLANG_PATH](#build-note-libclang_path)
 - [Non-Configurable Defaults](#non-configurable-defaults)
 - [Links](#links)
+
+---
+
+## config.toml — [higgs] Section
+
+higgs is configured through the `[higgs]` table in `~/.jigglebot/config.toml`.
+The server reads it at boot and maps it onto `HiggsConfig` before passing `Arc<Higgs>`
+into `AppState`. All fields have serde defaults via `HiggsConfig::default()` so the
+table may be omitted entirely.
+
+```toml
+[higgs]
+# Each field below is optional — the Default impl fills in the right value
+# when the key is absent.
+
+# LM Studio model directories (both pre-0.3 and post-0.3 paths by default)
+lmstudio_dirs = [
+  "~/.lmstudio/models",
+  "~/.cache/lm-studio/models",
+]
+
+# HuggingFace Hub cache (always ~/.cache/huggingface/hub — NOT dirs::cache_dir())
+hf_dirs = ["~/.cache/huggingface/hub"]
+
+# Ollama model store
+ollama_dirs = ["~/.ollama/models"]
+
+# Default load parameters (used when no params are supplied to /api/higgs/load)
+[higgs.default_load]
+ctx_len    = 4096     # context window tokens
+gpu_layers = 4294967295  # u32::MAX → all layers on GPU
+threads    = 0        # 0 = auto (available_cpus - 2, min 1)
+```
 
 ---
 

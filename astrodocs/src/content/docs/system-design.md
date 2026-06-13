@@ -132,24 +132,129 @@ ModelStore::scan(lmstudio_roots, hf_roots, ollama_roots)
 
 ## How higgs works with jigglebot
 
-> **Phase 2 integration — not yet wired.** The description below reflects the planned
-> integration layer. Phase 1 (this crate) is fully standalone.
+The integration is live. jigglebot holds `Arc<Higgs>` in `AppState` and wires it
+at three points in the server startup sequence.
+
+### Boot sequence
 
 ```
-jigglebot host app (phase 2)
+lib.rs  init_app()
   │
-  ├── boot.rs mounts higgs::serve::router() alongside the main gateway
+  ├─ Higgs::new(config.higgs)     ← constructs facade, no worker yet
   │
-  ├── HiggsProviderAdapter (planned) converts HiggsEvent → ProviderConfig upsert
-  │     ModelLoaded  → register higgs as a provider in ProviderRegistry
-  │     ModelUnloaded → mark provider stale or remove
+  ├─ higgs.start().await          ← spawns worker subprocess + initial scan
+  │    non-fatal: if worker can't start (llama.cpp missing)
+  │    jigglebot continues without local model support
   │
-  └── frontend WS bridge (planned) relays HiggsEvent to the UI via SessionEvent
-        so the model selector reflects loaded/unloaded state in real time
+  └─ AppState { …, higgs }        ← Arc<Higgs> stored in shared state
+
+server.rs  run()  (after TCP bind — actual port now known)
+  │
+  ├─ spawn_higgs_provider_sync(&higgs, provider_registry, base_url)
+  │    base_url = "http://127.0.0.1:{actual_port}"
+  │    higgs_sync appends /v1 before storing as provider's base_url
+  │
+  └─ app.merge(higgs::serve::router(Arc<Higgs>))
+       mounts /v1/*         (OpenAI-compatible chat completions, models list)
+       mounts /api/higgs/*  (scan, load, unload, status, logs control routes)
+
+main.rs
+  │
+  └─ Commands::HiggsWorker → higgs::worker::worker_main()
+       dispatched BEFORE building the tokio runtime (worker_main is sync)
+       this is the re-exec target: supervisor spawns the same binary with
+       --higgs-worker and communicates via stdio NDJSON JSON-RPC 2.0
 ```
 
-The crate is designed so the host integration is entirely additive — higgs itself
-changes nothing.
+### Provider sync — HiggsEvent → ProviderRegistry
+
+`spawn_higgs_provider_sync` subscribes to `higgs.events()` (a `broadcast::Receiver`)
+and translates worker lifecycle events into `ProviderRegistry` mutations:
+
+```
+HiggsEvent::ModelLoaded { id }
+  → ProviderConfig {
+        backend:  ProviderBackend::Higgs,
+        api_key:  "" (empty — no key for local inference),
+        model:    id  (HuggingFace repo id verbatim),
+        base_url: Some("http://127.0.0.1:{port}/v1"),
+        max_concurrent: DEFAULT_MAX_CONCURRENT_LOCAL,
+        …
+    }
+  → registry.add(config)      — runtime-only, NEVER persisted to disk
+  → slug_map.insert(id, slug) — track for later removal
+
+HiggsEvent::ModelUnloaded { id }
+  → slug_map.remove(id) → registry.remove_provider(slug)
+  (LM Studio eject semantics — provider disappears from the list entirely)
+
+HiggsEvent::WorkerDied
+  → for each tracked slug: registry.remove_provider(slug)
+  → slug_map.drain()
+
+HiggsEvent::WorkerRestarted
+  → no-op (ModelLoaded events follow for each re-loaded model)
+```
+
+### Local = just a provider URL
+
+Because higgs serves OpenAI wire at `/v1`, agents consume loaded models through the
+standard `GenaiProvider` path — the same code path used for any OpenAI-compatible
+cloud provider. The only difference is `ProviderBackend::Higgs`, which signals
+`adapter_kind = OpenAI`, `no api_key`, and `base_url = gateway /v1`.
+
+```
+Agent actor (provider phase)
+  │
+  ▼
+ProviderPool → GenaiProvider { backend: Higgs, base_url: "http://127.0.0.1:{port}/v1" }
+  │
+  ▼
+POST /v1/chat/completions          ← higgs::serve handles this
+  │
+  ▼
+llama.cpp worker (via stdio RPC)
+```
+
+---
+
+### Design decisions
+
+Two deliberate choices that could have gone differently:
+
+**1. ModelUnloaded = remove_provider, not retire**
+
+When a model is unloaded (or the worker dies), `remove_provider` is called — the
+provider entry disappears from the registry entirely. An alternative was `retire`,
+which marks the provider stale but leaves a ghost entry. `retire` was rejected
+because repeated load/unload cycles accumulate ghost entries: the provider list
+grows unboundedly and stale-provider cleanup machinery (`check_all`, health polling)
+runs on entries that can never recover until restart. `remove_provider` matches
+LM Studio's eject semantics (the model is gone — its provider should be too) and
+keeps the registry clean across arbitrary load/unload cycles.
+
+**2. Higgs providers excluded from check_all() health polling**
+
+`ProviderRegistry::check_all()` (the periodic health-check loop) does not poll
+higgs-backed providers. Liveness is event-driven via `higgs_sync`: the supervisor
+emits `WorkerDied` / `ModelUnloaded` when the model stops being available, and
+`higgs_sync` removes the provider at that point. If `check_all` were to poll higgs
+providers, genai's `all_model_names` call would hit `api.openai.com` instead of
+the local endpoint (genai resolves OpenAI model names from a static list for the
+`OpenAI` adapter kind). The higgs provider would be marked stale spuriously.
+Event-driven removal is both correct and cheaper.
+
+---
+
+### Known limitation
+
+`broadcast::Receiver` has a finite channel capacity (64). Under sustained rapid
+model churn, a `RecvError::Lagged` could cause `higgs_sync` to miss a
+`ModelUnloaded` event. If that happens, the provider lingers in the registry until
+the next `WorkerDied` event clears the entire map. This is logged at `warn` level
+(`higgs_sync lagged — some model events were missed`) but not yet reconciled: there
+is no periodic re-sync between registry state and actual worker state.
+Normal usage (one model loaded at a time, infrequent swaps) cannot trigger the lag.
 
 ---
 
