@@ -29,9 +29,6 @@
 //! serialises concurrent callers onto the single writer task — same pattern as
 //! rmcp's `TokioChildProcess` / LSP client writers.
 
-// Task 8 (Higgs facade) is not yet written; suppress dead-code noise until
-// then so clippy stays clean on this crate in isolation.
-#![allow(dead_code)]
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -81,9 +78,9 @@ type ReadHalf = Box<dyn tokio::io::AsyncRead + Unpin + Send + 'static>;
 /// callers never see process plumbing directly.
 pub(crate) struct WorkerHalves {
     /// Write half (supervisor writes requests here).
-    write: WriteHalf,
+    pub(crate) write: WriteHalf,
     /// Read half (supervisor reads responses/notifications here).
-    read: ReadHalf,
+    pub(crate) read: ReadHalf,
 }
 
 /// Factory: produces fresh I/O halves on each (re)spawn.
@@ -169,6 +166,7 @@ impl Supervisor {
     ///
     /// The factory is called once per (re)spawn.  A test that wants to simulate
     /// EOF-then-factory-failure returns `Err(WorkerSpawnFailed)` on the second call.
+    #[cfg(test)]
     pub(crate) fn with_factory(factory: HalvesFactory) -> Self {
         let (events_tx, _) = broadcast::channel(64);
         let inner = Arc::new(Inner {
@@ -300,6 +298,20 @@ impl Supervisor {
     /// Record the params of a successful `higgs/load` for post-restart replay.
     pub(crate) fn record_last_load(&self, params: Value) {
         *self.inner.last_load.lock() = Some(params);
+    }
+
+    /// Emit a lifecycle event on the broadcast channel.
+    ///
+    /// Used by the [`Higgs`](crate::api::Higgs) facade to publish
+    /// `ModelLoaded` / `ModelUnloaded` after the corresponding RPC succeeds.
+    pub(crate) fn emit(&self, event: HiggsEvent) {
+        let _ = self.inner.events_tx.send(event);
+    }
+
+    /// Return a clone of the last-recorded scan params (for test introspection).
+    #[cfg(test)]
+    pub(crate) fn last_scan_params(&self) -> Option<Value> {
+        self.inner.last_scan.lock().clone()
     }
 
     // ── private ──────────────────────────────────────────────────────────────

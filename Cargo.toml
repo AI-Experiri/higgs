@@ -8,6 +8,8 @@ license = "MIT"
 [dependencies]
 # full: supervisor needs rt+sync+time+io, worker needs rt+process+io — Tasks 2-12 use all of it
 tokio = { version = "1", features = ["full"] }
+# Default OS-specific directories (home, config, cache, data). 246M downloads.
+dirs = "5"
 axum = { version = "0.8" }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }

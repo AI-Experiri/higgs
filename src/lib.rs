@@ -6,10 +6,12 @@
 //! `--higgs-worker` (Chromium model), speaking newline-delimited JSON-RPC 2.0
 //! over stdio (MCP wire). Spec: docs/superpowers/specs/2026-06-12-higgs-runtime-design.md
 
+pub mod api;
 pub mod diagnostic;
 pub mod rpc;
 pub mod supervisor;
 pub mod worker;
 
+pub use api::{Higgs, HiggsConfig};
 pub use diagnostic::HiggsError;
 pub use supervisor::HiggsEvent;
