@@ -55,7 +55,14 @@ fn serve_state(mut state: WorkerState, reader: impl BufRead, mut writer: impl Wr
             Ok(_) => {} // worker never receives responses/notifications
             Err(e) => {
                 // Decode failure has no id: JSON-RPC null-id convention, we use 0.
-                respond(&mut writer, 0, Err(RpcError { code: -32700, message: e.to_string() }));
+                respond(
+                    &mut writer,
+                    0,
+                    Err(RpcError {
+                        code: -32700,
+                        message: e.to_string(),
+                    }),
+                );
             }
         }
     }
@@ -63,8 +70,18 @@ fn serve_state(mut state: WorkerState, reader: impl BufRead, mut writer: impl Wr
 
 fn respond(writer: &mut impl Write, id: u64, out: Result<Value, RpcError>) {
     let resp = match out {
-        Ok(result) => RpcResponse { jsonrpc: "2.0".into(), id, result: Some(result), error: None },
-        Err(error) => RpcResponse { jsonrpc: "2.0".into(), id, result: None, error: Some(error) },
+        Ok(result) => RpcResponse {
+            jsonrpc: "2.0".into(),
+            id,
+            result: Some(result),
+            error: None,
+        },
+        Err(error) => RpcResponse {
+            jsonrpc: "2.0".into(),
+            id,
+            result: None,
+            error: Some(error),
+        },
     };
     let _ = writeln!(writer, "{}", encode(&RpcFrame::Response(resp)));
 }
@@ -90,7 +107,11 @@ impl WorkerState {
     /// Test seam: same state shape with an injected engine.
     #[cfg(test)]
     fn with_engine(engine: Box<dyn engine::HiggsEngine>) -> Self {
-        Self { store: ModelStore::default(), engine, loaded: None }
+        Self {
+            store: ModelStore::default(),
+            engine,
+            loaded: None,
+        }
     }
 
     fn dispatch(
@@ -130,7 +151,11 @@ impl WorkerState {
                 Ok(json!({"loaded": loaded, "models_scanned": self.store.models().len()}))
             }
             M_LOAD => {
-                let id = req.params.get("id").and_then(Value::as_str).unwrap_or_default();
+                let id = req
+                    .params
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
                 let params = engine::LoadParams {
                     ctx_len: u32_param(&req.params, "ctx_len", 4096),
                     gpu_layers: u32_param(&req.params, "gpu_layers", u32::MAX),
@@ -141,7 +166,9 @@ impl WorkerState {
                     .get(id)
                     .ok_or_else(|| to_rpc_error(&HiggsError::ModelNotFound { id: id.into() }))?;
                 let path = model.path.clone();
-                self.engine.load(&path, &params).map_err(|e| to_rpc_error(&e))?;
+                self.engine
+                    .load(&path, &params)
+                    .map_err(|e| to_rpc_error(&e))?;
                 self.loaded = Some((id.to_string(), params));
                 Ok(json!({"id": id}))
             }
@@ -160,7 +187,10 @@ impl WorkerState {
                 let messages: Vec<engine::EngineMessage> = serde_json::from_value(
                     req.params.get("messages").cloned().unwrap_or(Value::Null),
                 )
-                .map_err(|e| RpcError { code: -32602, message: format!("invalid messages: {e}") })?;
+                .map_err(|e| RpcError {
+                    code: -32602,
+                    message: format!("invalid messages: {e}"),
+                })?;
                 let gen = engine::GenParams {
                     max_tokens: req
                         .params
@@ -193,9 +223,10 @@ impl WorkerState {
                 }
                 Ok(json!({"content": content, "finish_reason": finish_reason}))
             }
-            other => {
-                Err(RpcError { code: -32601, message: format!("unknown method {other}") })
-            }
+            other => Err(RpcError {
+                code: -32601,
+                message: format!("unknown method {other}"),
+            }),
         }
     }
 }
@@ -210,7 +241,10 @@ fn u32_param(params: &Value, key: &str, default: u32) -> u32 {
 }
 
 fn to_rpc_error(e: &crate::diagnostic::HiggsError) -> RpcError {
-    RpcError { code: -32000, message: e.to_string() }
+    RpcError {
+        code: -32000,
+        message: e.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -242,7 +276,10 @@ mod tests {
 
     impl FakeEngine {
         fn new(calls: CallLog) -> Self {
-            Self { calls, loaded: false }
+            Self {
+                calls,
+                loaded: false,
+            }
         }
     }
 
@@ -288,9 +325,17 @@ mod tests {
     /// Write an LM Studio-layout fixture and return (tempdir, scan request line).
     fn scan_fixture() -> (TempDir, String) {
         let dir = TempDir::new().unwrap();
-        write_file(&dir.path().join("google/gemma-4-12b/gemma-4-12b-Q4_K_M.gguf"), b"dummy");
+        write_file(
+            &dir.path()
+                .join("google/gemma-4-12b/gemma-4-12b-Q4_K_M.gguf"),
+            b"dummy",
+        );
         let root = dir.path().to_str().unwrap().to_string();
-        let line = req_line(1, M_SCAN, json!({"lmstudio": [root], "hf": [], "ollama": []}));
+        let line = req_line(
+            1,
+            M_SCAN,
+            json!({"lmstudio": [root], "hf": [], "ollama": []}),
+        );
         (dir, line)
     }
 
@@ -337,14 +382,20 @@ mod tests {
         );
 
         let root_str = root.to_str().unwrap();
-        let input = req_line(1, M_SCAN, json!({"lmstudio": [root_str], "hf": [], "ollama": []}));
+        let input = req_line(
+            1,
+            M_SCAN,
+            json!({"lmstudio": [root_str], "hf": [], "ollama": []}),
+        );
 
         let mut out: Vec<u8> = Vec::new();
         serve(Cursor::new(input.as_bytes()), &mut out);
 
         let frames = parse_responses(&out);
         assert_eq!(frames.len(), 1);
-        let RpcFrame::Response(resp) = &frames[0] else { panic!("expected response") };
+        let RpcFrame::Response(resp) = &frames[0] else {
+            panic!("expected response")
+        };
         assert_eq!(resp.id, 1);
         assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
 
@@ -362,11 +413,17 @@ mod tests {
 
         let frames = parse_responses(&out);
         assert_eq!(frames.len(), 1);
-        let RpcFrame::Response(resp) = &frames[0] else { panic!("expected response") };
+        let RpcFrame::Response(resp) = &frames[0] else {
+            panic!("expected response")
+        };
         assert_eq!(resp.id, 2);
         let err = resp.error.as_ref().expect("expected error");
         assert_eq!(err.code, -32601);
-        assert!(err.message.contains("unknown method"), "message was: {}", err.message);
+        assert!(
+            err.message.contains("unknown method"),
+            "message was: {}",
+            err.message
+        );
     }
 
     #[test]
@@ -381,9 +438,15 @@ mod tests {
         ));
 
         let (frames, calls) = serve_with_fake(&input);
-        assert_eq!(frames.len(), 5, "scan + load responses, 2 chunks, chat response: {frames:?}");
+        assert_eq!(
+            frames.len(),
+            5,
+            "scan + load responses, 2 chunks, chat response: {frames:?}"
+        );
 
-        let RpcFrame::Response(load) = &frames[1] else { panic!("expected load response") };
+        let RpcFrame::Response(load) = &frames[1] else {
+            panic!("expected load response")
+        };
         assert_eq!(load.id, 2);
         assert_eq!(load.result.as_ref().unwrap()["id"], "google/gemma-4-12b");
 
@@ -397,7 +460,9 @@ mod tests {
             assert_eq!(note.params["delta"], delta);
         }
 
-        let RpcFrame::Response(chat) = &frames[4] else { panic!("expected chat response") };
+        let RpcFrame::Response(chat) = &frames[4] else {
+            panic!("expected chat response")
+        };
         assert_eq!(chat.id, 3);
         let result = chat.result.as_ref().unwrap();
         assert_eq!(result["content"], "hello");
@@ -405,7 +470,10 @@ mod tests {
 
         let calls = calls.lock();
         assert_eq!(calls.len(), 2, "calls: {calls:?}");
-        assert!(calls[0].starts_with("load ") && calls[0].ends_with(".gguf"), "calls: {calls:?}");
+        assert!(
+            calls[0].starts_with("load ") && calls[0].ends_with(".gguf"),
+            "calls: {calls:?}"
+        );
         assert_eq!(calls[1], "chat");
     }
 
@@ -415,10 +483,16 @@ mod tests {
         let (frames, calls) = serve_with_fake(&input);
 
         assert_eq!(frames.len(), 1);
-        let RpcFrame::Response(resp) = &frames[0] else { panic!("expected response") };
+        let RpcFrame::Response(resp) = &frames[0] else {
+            panic!("expected response")
+        };
         assert_eq!(resp.id, 2);
         let err = resp.error.as_ref().expect("expected error");
-        assert!(err.message.contains("[HG003]"), "message was: {}", err.message);
+        assert!(
+            err.message.contains("[HG003]"),
+            "message was: {}",
+            err.message
+        );
         assert!(calls.lock().is_empty(), "engine must not be touched");
     }
 
@@ -426,7 +500,11 @@ mod tests {
     fn unload_then_status() {
         let (_dir, scan) = scan_fixture();
         let mut input = scan;
-        input.push_str(&req_line(2, M_LOAD, json!({"id": "google/gemma-4-12b", "ctx_len": 2048})));
+        input.push_str(&req_line(
+            2,
+            M_LOAD,
+            json!({"id": "google/gemma-4-12b", "ctx_len": 2048}),
+        ));
         input.push_str(&req_line(3, M_STATUS, json!(null)));
         input.push_str(&req_line(4, M_UNLOAD, json!(null)));
         input.push_str(&req_line(5, M_STATUS, json!(null)));
@@ -434,13 +512,17 @@ mod tests {
         let (frames, calls) = serve_with_fake(&input);
         assert_eq!(frames.len(), 5);
 
-        let RpcFrame::Response(loaded_status) = &frames[2] else { panic!("expected response") };
+        let RpcFrame::Response(loaded_status) = &frames[2] else {
+            panic!("expected response")
+        };
         let loaded = &loaded_status.result.as_ref().unwrap()["loaded"];
         assert_eq!(loaded["id"], "google/gemma-4-12b");
         assert_eq!(loaded["ctx_len"], 2048);
         assert_eq!(loaded["threads"], 4, "default threads");
 
-        let RpcFrame::Response(final_status) = &frames[4] else { panic!("expected response") };
+        let RpcFrame::Response(final_status) = &frames[4] else {
+            panic!("expected response")
+        };
         assert_eq!(final_status.result.as_ref().unwrap()["loaded"], Value::Null);
         assert!(calls.lock().contains(&"unload".to_string()));
     }
@@ -453,9 +535,15 @@ mod tests {
 
         let (frames, calls) = serve_with_fake(&input);
         assert_eq!(frames.len(), 2);
-        let RpcFrame::Response(resp) = &frames[1] else { panic!("expected response") };
+        let RpcFrame::Response(resp) = &frames[1] else {
+            panic!("expected response")
+        };
         let err = resp.error.as_ref().expect("expected error");
-        assert!(err.message.contains("[HG002]"), "message was: {}", err.message);
+        assert!(
+            err.message.contains("[HG002]"),
+            "message was: {}",
+            err.message
+        );
         assert!(calls.lock().is_empty(), "engine must not load anything");
     }
 
@@ -471,7 +559,11 @@ mod tests {
 
         let frames = parse_responses(&out);
         // Only responses for id=4 and id=5; loop stopped before processing id=6.
-        assert_eq!(frames.len(), 2, "expected exactly 2 responses, got: {frames:?}");
+        assert_eq!(
+            frames.len(),
+            2,
+            "expected exactly 2 responses, got: {frames:?}"
+        );
 
         let ids: Vec<u64> = frames
             .iter()
@@ -482,7 +574,10 @@ mod tests {
             .collect();
         assert!(ids.contains(&4));
         assert!(ids.contains(&5));
-        assert!(!ids.contains(&6), "response for id=6 must not appear after shutdown");
+        assert!(
+            !ids.contains(&6),
+            "response for id=6 must not appear after shutdown"
+        );
     }
 
     #[test]
@@ -498,14 +593,25 @@ mod tests {
         assert_eq!(frames.len(), 2);
 
         // First response: id=0, code=-32700 (parse error).
-        let RpcFrame::Response(first) = &frames[0] else { panic!("expected response") };
+        let RpcFrame::Response(first) = &frames[0] else {
+            panic!("expected response")
+        };
         assert_eq!(first.id, 0);
-        let err = first.error.as_ref().expect("expected error on garbage line");
+        let err = first
+            .error
+            .as_ref()
+            .expect("expected error on garbage line");
         assert_eq!(err.code, -32700);
 
         // Second response: id=7, success.
-        let RpcFrame::Response(second) = &frames[1] else { panic!("expected response") };
+        let RpcFrame::Response(second) = &frames[1] else {
+            panic!("expected response")
+        };
         assert_eq!(second.id, 7);
-        assert!(second.error.is_none(), "id=7 should succeed, got: {:?}", second.error);
+        assert!(
+            second.error.is_none(),
+            "id=7 should succeed, got: {:?}",
+            second.error
+        );
     }
 }

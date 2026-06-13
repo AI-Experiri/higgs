@@ -29,7 +29,6 @@
 //! serialises concurrent callers onto the single writer task — same pattern as
 //! rmcp's `TokioChildProcess` / LSP client writers.
 
-
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -85,11 +84,8 @@ pub(crate) struct WorkerHalves {
 ///
 /// Receives the stderr ring so the production impl can wire its drain task.
 /// Test factories receive the ring too but may ignore it.
-type HalvesFactory = Box<
-    dyn Fn(Arc<Mutex<VecDeque<String>>>) -> Result<WorkerHalves, HiggsError>
-        + Send
-        + Sync,
->;
+type HalvesFactory =
+    Box<dyn Fn(Arc<Mutex<VecDeque<String>>>) -> Result<WorkerHalves, HiggsError> + Send + Sync>;
 
 /// Shared supervisor state.
 struct Inner {
@@ -206,11 +202,7 @@ impl Supervisor {
     ///
     /// Returns `Err(WorkerDead)` [HG007] if the worker dies before replying.
     /// Returns `Err(WorkerRpc)` [HG009] if the worker replies with a JSON-RPC error.
-    pub(crate) async fn request(
-        &self,
-        method: &str,
-        params: Value,
-    ) -> Result<Value, HiggsError> {
+    pub(crate) async fn request(&self, method: &str, params: Value) -> Result<Value, HiggsError> {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         {
@@ -343,10 +335,7 @@ impl Supervisor {
 /// Exits when the sender is dropped (channel closed) or a write fails.
 /// Write failure is silent here — the reader will observe the corresponding
 /// EOF or error and drive the death / restart path.
-async fn writer_task(
-    mut write: WriteHalf,
-    mut rx: mpsc::UnboundedReceiver<String>,
-) {
+async fn writer_task(mut write: WriteHalf, mut rx: mpsc::UnboundedReceiver<String>) {
     while let Some(line) = rx.recv().await {
         let bytes = line.as_bytes();
         if write.write_all(bytes).await.is_err() {
@@ -667,18 +656,20 @@ mod tests {
         let sup_read_cell = Arc::new(Mutex::new(Some(sup_read)));
 
         let sup = Supervisor::with_factory(Box::new(move |_ring| {
-            let write = sup_write_cell
-                .lock()
-                .take()
-                .ok_or_else(|| HiggsError::WorkerSpawnFailed {
-                    source: std::io::Error::other("mock: no more write halves"),
-                })?;
-            let read = sup_read_cell
-                .lock()
-                .take()
-                .ok_or_else(|| HiggsError::WorkerSpawnFailed {
-                    source: std::io::Error::other("mock: no more read halves"),
-                })?;
+            let write =
+                sup_write_cell
+                    .lock()
+                    .take()
+                    .ok_or_else(|| HiggsError::WorkerSpawnFailed {
+                        source: std::io::Error::other("mock: no more write halves"),
+                    })?;
+            let read =
+                sup_read_cell
+                    .lock()
+                    .take()
+                    .ok_or_else(|| HiggsError::WorkerSpawnFailed {
+                        source: std::io::Error::other("mock: no more read halves"),
+                    })?;
             Ok(WorkerHalves {
                 write: Box::new(write),
                 read: Box::new(read),
@@ -704,7 +695,10 @@ mod tests {
             jsonrpc: "2.0".into(),
             id,
             result: None,
-            error: Some(rpc::RpcError { code, message: message.into() }),
+            error: Some(rpc::RpcError {
+                code,
+                message: message.into(),
+            }),
         }))
     }
 
@@ -780,16 +774,20 @@ mod tests {
         let sup_read_cell = Arc::new(Mutex::new(Some(sup_read_1)));
 
         let sup = Supervisor::with_factory(Box::new(move |_ring| {
-            let write = sup_write_cell.lock().take().ok_or_else(|| {
-                HiggsError::WorkerSpawnFailed {
-                    source: std::io::Error::other("mock: no more halves"),
-                }
-            })?;
-            let read = sup_read_cell.lock().take().ok_or_else(|| {
-                HiggsError::WorkerSpawnFailed {
-                    source: std::io::Error::other("mock: no more halves"),
-                }
-            })?;
+            let write =
+                sup_write_cell
+                    .lock()
+                    .take()
+                    .ok_or_else(|| HiggsError::WorkerSpawnFailed {
+                        source: std::io::Error::other("mock: no more halves"),
+                    })?;
+            let read =
+                sup_read_cell
+                    .lock()
+                    .take()
+                    .ok_or_else(|| HiggsError::WorkerSpawnFailed {
+                        source: std::io::Error::other("mock: no more halves"),
+                    })?;
             Ok(WorkerHalves {
                 write: Box::new(write),
                 read: Box::new(read),
@@ -813,11 +811,7 @@ mod tests {
         drop(test_read_1);
 
         // The pending oneshot should be dropped (channel closed → Err).
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            reply_rx,
-        )
-        .await;
+        let result = tokio::time::timeout(std::time::Duration::from_millis(500), reply_rx).await;
         assert!(
             matches!(result, Ok(Err(_))),
             "pending request should fail on EOF"
@@ -834,7 +828,10 @@ mod tests {
             }
         })
         .await;
-        assert!(matches!(first_died, Ok(true)), "first WorkerDied event expected (EOF)");
+        assert!(
+            matches!(first_died, Ok(true)),
+            "first WorkerDied event expected (EOF)"
+        );
 
         // After the 1s respawn backoff, the factory fails (no more halves) →
         // a second terminal WorkerDied must be broadcast before the reader task exits.
@@ -848,7 +845,10 @@ mod tests {
             }
         })
         .await;
-        assert!(matches!(second_died, Ok(true)), "second WorkerDied event expected (factory failure)");
+        assert!(
+            matches!(second_died, Ok(true)),
+            "second WorkerDied event expected (factory failure)"
+        );
     }
 
     // ─── Test 4: worker RPC error maps to HG009 ──────────────────────────────
@@ -859,7 +859,11 @@ mod tests {
 
         let fut = sup.request(M_LOAD, json!({"id": "org/bad"}));
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        write_line(&mut test_write, &err_response(1, -32000, "model file corrupt")).await;
+        write_line(
+            &mut test_write,
+            &err_response(1, -32000, "model file corrupt"),
+        )
+        .await;
 
         let err = fut.await.expect_err("should be an error");
         let display = err.to_string();
@@ -918,26 +922,37 @@ mod tests {
         let call_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let call_count2 = Arc::clone(&call_count);
 
-        let sup = Supervisor::with_factory(Box::new(move |_ring| {
-            let n = call_count2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if n == 0 {
-                let write = cell_sup_write_1.lock().take().unwrap();
-                let read = cell_sup_read_1.lock().take().unwrap();
-                Ok(WorkerHalves { write: Box::new(write), read: Box::new(read) })
-            } else {
-                let write = cell_sup_write_2.lock().take().ok_or_else(|| {
-                    HiggsError::WorkerSpawnFailed {
-                        source: std::io::Error::other("mock: second factory call after cells exhausted"),
-                    }
-                })?;
-                let read = cell_sup_read_2.lock().take().ok_or_else(|| {
-                    HiggsError::WorkerSpawnFailed {
-                        source: std::io::Error::other("mock: second factory call after cells exhausted"),
-                    }
-                })?;
-                Ok(WorkerHalves { write: Box::new(write), read: Box::new(read) })
-            }
-        }));
+        let sup =
+            Supervisor::with_factory(Box::new(move |_ring| {
+                let n = call_count2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    let write = cell_sup_write_1.lock().take().unwrap();
+                    let read = cell_sup_read_1.lock().take().unwrap();
+                    Ok(WorkerHalves {
+                        write: Box::new(write),
+                        read: Box::new(read),
+                    })
+                } else {
+                    let write = cell_sup_write_2.lock().take().ok_or_else(|| {
+                        HiggsError::WorkerSpawnFailed {
+                            source: std::io::Error::other(
+                                "mock: second factory call after cells exhausted",
+                            ),
+                        }
+                    })?;
+                    let read = cell_sup_read_2.lock().take().ok_or_else(|| {
+                        HiggsError::WorkerSpawnFailed {
+                            source: std::io::Error::other(
+                                "mock: second factory call after cells exhausted",
+                            ),
+                        }
+                    })?;
+                    Ok(WorkerHalves {
+                        write: Box::new(write),
+                        read: Box::new(read),
+                    })
+                }
+            }));
         sup.start().expect("start");
 
         let mut events = sup.events();
@@ -971,18 +986,30 @@ mod tests {
         .await
         .expect("timeout waiting for replayed messages");
 
-        assert_eq!(received.len(), 2, "expected exactly 2 replayed messages, got: {received:?}");
+        assert_eq!(
+            received.len(),
+            2,
+            "expected exactly 2 replayed messages, got: {received:?}"
+        );
 
         let first: serde_json::Value = serde_json::from_str(&received[0]).expect("valid json");
         let second: serde_json::Value = serde_json::from_str(&received[1]).expect("valid json");
-        assert_eq!(first["method"], M_SCAN, "first replayed method must be higgs/scan");
-        assert_eq!(second["method"], M_LOAD, "second replayed method must be higgs/load");
+        assert_eq!(
+            first["method"], M_SCAN,
+            "first replayed method must be higgs/scan"
+        );
+        assert_eq!(
+            second["method"], M_LOAD,
+            "second replayed method must be higgs/load"
+        );
         assert_eq!(first["params"], json!({"dirs": ["/models"]}));
         assert_eq!(second["params"], json!({"id": "org/model"}));
 
         // Reply to the replayed higgs/load with an OK response so the await
         // path resolves and ModelLoaded is emitted.
-        let load_id = second["id"].as_u64().expect("load request must carry an id");
+        let load_id = second["id"]
+            .as_u64()
+            .expect("load request must carry an id");
         let ok_line = ok_response(load_id, json!({"id": "org/model"}));
         write_line(&mut test_tx_2, &ok_line).await;
 

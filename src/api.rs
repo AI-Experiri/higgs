@@ -81,7 +81,11 @@ impl Default for HiggsConfig {
             lmstudio_dirs,
             hf_dirs,
             ollama_dirs,
-            default_load: LoadParams { ctx_len: 4096, gpu_layers: u32::MAX, threads },
+            default_load: LoadParams {
+                ctx_len: 4096,
+                gpu_layers: u32::MAX,
+                threads,
+            },
         }
     }
 }
@@ -184,12 +188,11 @@ impl Higgs {
         };
         let params = json!({ "lmstudio": lmstudio, "hf": hf, "ollama": ollama });
         let result = self.sup.request(M_SCAN, params.clone()).await?;
-        let models: Vec<HiggsModel> = serde_json::from_value(result).map_err(|e| {
-            HiggsError::WorkerRpc {
+        let models: Vec<HiggsModel> =
+            serde_json::from_value(result).map_err(|e| HiggsError::WorkerRpc {
                 method: M_SCAN.into(),
                 message: format!("response parse failed: {e}"),
-            }
-        })?;
+            })?;
         self.sup.record_last_scan(params);
         Ok(models)
     }
@@ -253,7 +256,11 @@ impl Higgs {
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0) as u32;
 
-        Ok(HiggsStatus { worker_alive, loaded, models_on_disk })
+        Ok(HiggsStatus {
+            worker_alive,
+            loaded,
+            models_on_disk,
+        })
     }
 
     /// Stream a chat completion.
@@ -322,7 +329,10 @@ impl Higgs {
                 .unwrap_or("stop")
                 .to_owned();
 
-            Ok(ChatOutcome { content, finish_reason })
+            Ok(ChatOutcome {
+                content,
+                finish_reason,
+            })
         });
 
         Ok((rx, handle))
@@ -352,14 +362,21 @@ impl Higgs {
     /// access to this module's private fields.
     #[cfg(test)]
     pub(crate) fn with_supervisor(sup: Arc<Supervisor>, config: HiggsConfig) -> Self {
-        Self { sup, config: parking_lot::Mutex::new(config) }
+        Self {
+            sup,
+            config: parking_lot::Mutex::new(config),
+        }
     }
 
     // ── private ───────────────────────────────────────────────────────────────
 
     /// Best-effort: ask the worker for the currently loaded model id.
     async fn loaded_id(&self) -> Option<String> {
-        let v = self.sup.request(M_STATUS, serde_json::Value::Null).await.ok()?;
+        let v = self
+            .sup
+            .request(M_STATUS, serde_json::Value::Null)
+            .await
+            .ok()?;
         v.get("loaded")?.get("id")?.as_str().map(ToOwned::to_owned)
     }
 }
@@ -390,13 +407,24 @@ mod tests {
         let sup_read_cell = Arc::new(Mutex::new(Some(sup_read)));
 
         let sup = Supervisor::with_factory(Box::new(move |_ring| {
-            let write = sup_write_cell.lock().take().ok_or_else(|| HiggsError::WorkerSpawnFailed {
-                source: std::io::Error::other("mock: no more write halves"),
-            })?;
-            let read = sup_read_cell.lock().take().ok_or_else(|| HiggsError::WorkerSpawnFailed {
-                source: std::io::Error::other("mock: no more read halves"),
-            })?;
-            Ok(WorkerHalves { write: Box::new(write), read: Box::new(read) })
+            let write =
+                sup_write_cell
+                    .lock()
+                    .take()
+                    .ok_or_else(|| HiggsError::WorkerSpawnFailed {
+                        source: std::io::Error::other("mock: no more write halves"),
+                    })?;
+            let read =
+                sup_read_cell
+                    .lock()
+                    .take()
+                    .ok_or_else(|| HiggsError::WorkerSpawnFailed {
+                        source: std::io::Error::other("mock: no more read halves"),
+                    })?;
+            Ok(WorkerHalves {
+                write: Box::new(write),
+                read: Box::new(read),
+            })
         }));
 
         sup.start().expect("mock start");
@@ -415,7 +443,10 @@ mod tests {
             result: Some(result),
             error: None,
         }));
-        stream.write_all(format!("{line}\n").as_bytes()).await.unwrap();
+        stream
+            .write_all(format!("{line}\n").as_bytes())
+            .await
+            .unwrap();
         stream.flush().await.unwrap();
     }
 
@@ -430,23 +461,26 @@ mod tests {
 
         let cfg = HiggsConfig::default();
 
-        let has_suffix = |dirs: &[PathBuf], suffix: &str| {
-            dirs.iter().any(|p| p.ends_with(suffix))
-        };
+        let has_suffix = |dirs: &[PathBuf], suffix: &str| dirs.iter().any(|p| p.ends_with(suffix));
 
         assert!(
             has_suffix(&cfg.lmstudio_dirs, ".lmstudio/models")
-                || cfg.lmstudio_dirs.iter().any(|p| p.ends_with("lm-studio/models")),
+                || cfg
+                    .lmstudio_dirs
+                    .iter()
+                    .any(|p| p.ends_with("lm-studio/models")),
             "lmstudio_dirs should contain .lmstudio/models or lm-studio/models"
         );
         assert!(
-            cfg.hf_dirs.iter().any(|p| {
-                p == &home.join(".cache").join("huggingface").join("hub")
-            }),
+            cfg.hf_dirs
+                .iter()
+                .any(|p| { p == &home.join(".cache").join("huggingface").join("hub") }),
             "hf_dirs must use ~/.cache/huggingface/hub (not XDG cache_dir)"
         );
         assert!(
-            cfg.ollama_dirs.iter().any(|p| p.ends_with(".ollama/models")),
+            cfg.ollama_dirs
+                .iter()
+                .any(|p| p.ends_with(".ollama/models")),
             "ollama_dirs should contain .ollama/models"
         );
     }
@@ -510,13 +544,10 @@ mod tests {
         load_fut.await.expect("load should succeed");
 
         // ModelLoaded event must arrive.
-        let ev = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            events_rx.recv(),
-        )
-        .await
-        .expect("timeout")
-        .expect("recv");
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(100), events_rx.recv())
+            .await
+            .expect("timeout")
+            .expect("recv");
         assert!(matches!(ev, HiggsEvent::ModelLoaded { id } if id == "org/model"));
 
         // Issue status — mock responds with loaded info.
@@ -552,11 +583,7 @@ mod tests {
         };
 
         let (mut rx, handle) = higgs
-            .chat_stream(
-                vec![("user".into(), "hi".into())],
-                256,
-                0.7,
-            )
+            .chat_stream(vec![("user".into(), "hi".into())], 256, 0.7)
             .await
             .expect("chat_stream should succeed");
 
@@ -585,14 +612,11 @@ mod tests {
         )
         .await;
 
-        let outcome = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            handle,
-        )
-        .await
-        .expect("join timeout")
-        .expect("join error")
-        .expect("chat outcome error");
+        let outcome = tokio::time::timeout(std::time::Duration::from_millis(500), handle)
+            .await
+            .expect("join timeout")
+            .expect("join error")
+            .expect("chat outcome error");
 
         assert_eq!(outcome.content, "hello");
         assert_eq!(outcome.finish_reason, "stop");
@@ -631,13 +655,10 @@ mod tests {
             .expect("chat_stream itself should not fail");
 
         // The spawned task must return an Err (worker dead).
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            handle,
-        )
-        .await
-        .expect("join timeout")
-        .expect("join error");
+        let result = tokio::time::timeout(std::time::Duration::from_millis(200), handle)
+            .await
+            .expect("join timeout")
+            .expect("join error");
         assert!(result.is_err(), "chat against dead worker must fail");
 
         // After the failed request, a subsequent take_chat_sink must not debug_assert.

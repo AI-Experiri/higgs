@@ -46,11 +46,16 @@ impl HiggsEngine for LlamaCppEngine {
         // Drop any resident model first — one loaded model at a time (v1).
         self.loaded = None;
         let model_params = LlamaModelParams::default().with_n_gpu_layers(params.gpu_layers);
-        let model =
-            LlamaModel::load_from_file(backend(), path, &model_params).map_err(|e| {
-                HiggsError::EngineLoadFailed { id: path.to_string(), reason: e.to_string() }
-            })?;
-        self.loaded = Some(LoadedModel { model, params: params.clone() });
+        let model = LlamaModel::load_from_file(backend(), path, &model_params).map_err(|e| {
+            HiggsError::EngineLoadFailed {
+                id: path.to_string(),
+                reason: e.to_string(),
+            }
+        })?;
+        self.loaded = Some(LoadedModel {
+            model,
+            params: params.clone(),
+        });
         Ok(())
     }
 
@@ -70,7 +75,9 @@ impl HiggsEngine for LlamaCppEngine {
     ) -> Result<(String, &'static str), HiggsError> {
         let Some(loaded) = self.loaded.as_ref() else {
             // defensive guard; worker checks first — id unknown at engine level
-            return Err(HiggsError::ModelNotLoaded { id: "unloaded".into() });
+            return Err(HiggsError::ModelNotLoaded {
+                id: "unloaded".into(),
+            });
         };
         let gen_fail = |stage: &'static str, reason: String| HiggsError::GenerationFailed {
             stage: stage.to_string(),
@@ -136,7 +143,8 @@ impl HiggsEngine for LlamaCppEngine {
                 .add(token, pos, &[0], i == last_index)
                 .map_err(|e| gen_fail("batch add", e.to_string()))?;
         }
-        ctx.decode(&mut batch).map_err(|e| gen_fail("prompt decode", e.to_string()))?;
+        ctx.decode(&mut batch)
+            .map_err(|e| gen_fail("prompt decode", e.to_string()))?;
 
         // Greedy when temperature is zero, else temp + seeded dist (example chain).
         let mut sampler = if params.temperature <= 0.0 {
@@ -177,7 +185,8 @@ impl HiggsEngine for LlamaCppEngine {
                 .add(token, n_cur, &[0], true)
                 .map_err(|e| gen_fail("batch add", e.to_string()))?;
             n_cur += 1;
-            ctx.decode(&mut batch).map_err(|e| gen_fail("loop decode", e.to_string()))?;
+            ctx.decode(&mut batch)
+                .map_err(|e| gen_fail("loop decode", e.to_string()))?;
         };
 
         // Flush the UTF-8 decoder: a response ending mid-multi-byte sequence (e.g.
@@ -205,14 +214,27 @@ mod tests {
     fn first_token_from_real_model() {
         let path = std::env::var("HIGGS_TEST_GGUF").expect("set HIGGS_TEST_GGUF");
         let mut e = LlamaCppEngine::default();
-        e.load(&path, &LoadParams { ctx_len: 2048, gpu_layers: u32::MAX, threads: 4 })
-            .unwrap();
+        e.load(
+            &path,
+            &LoadParams {
+                ctx_len: 2048,
+                gpu_layers: u32::MAX,
+                threads: 4,
+            },
+        )
+        .unwrap();
         assert!(e.is_loaded());
         let mut out = String::new();
         let (text, finish_reason) = e
             .chat(
-                &[EngineMessage { role: "user".into(), content: "Say hi in one word.".into() }],
-                &GenParams { max_tokens: 8, temperature: 0.0 },
+                &[EngineMessage {
+                    role: "user".into(),
+                    content: "Say hi in one word.".into(),
+                }],
+                &GenParams {
+                    max_tokens: 8,
+                    temperature: 0.0,
+                },
                 &mut |d| out.push_str(d),
             )
             .unwrap();

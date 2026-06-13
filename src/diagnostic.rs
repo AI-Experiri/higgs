@@ -11,7 +11,10 @@ pub enum HiggsError {
     /// A configured model directory could not be read during scan.
     #[snafu(display("[HG001] model dir unreadable: {path}: {source}"))]
     #[diagnostic(code(HG001))]
-    ModelDirUnreadable { path: String, source: std::io::Error },
+    ModelDirUnreadable {
+        path: String,
+        source: std::io::Error,
+    },
 
     /// Requested model id is not present in any scanned source.
     #[snafu(display("[HG002] model not found on disk: {id}"))]
@@ -29,9 +32,15 @@ pub enum HiggsError {
     EngineLoadFailed { id: String, reason: String },
 
     /// Prompt + max generation tokens exceed the context window.
-    #[snafu(display("[HG005] context overflow: prompt {prompt_tokens} + max_gen {max_gen} > n_ctx {n_ctx}"))]
+    #[snafu(display(
+        "[HG005] context overflow: prompt {prompt_tokens} + max_gen {max_gen} > n_ctx {n_ctx}"
+    ))]
     #[diagnostic(code(HG005))]
-    ContextOverflow { prompt_tokens: usize, max_gen: usize, n_ctx: usize },
+    ContextOverflow {
+        prompt_tokens: usize,
+        max_gen: usize,
+        n_ctx: usize,
+    },
 
     /// The worker process could not be spawned.
     #[snafu(display("[HG006] worker spawn failed: {source}"))]
@@ -70,7 +79,9 @@ mod tests {
 
     #[test]
     fn display_carries_code() {
-        let e = HiggsError::ModelNotFound { id: "google/gemma-4-12b".into() };
+        let e = HiggsError::ModelNotFound {
+            id: "google/gemma-4-12b".into(),
+        };
         assert!(e.to_string().starts_with("[HG002]"));
         assert!(e.to_string().contains("google/gemma-4-12b"));
     }

@@ -43,7 +43,9 @@ pub struct HiggsOk {
 impl HiggsOk {
     /// Build the canonical `{"status":"ok"}` body.
     pub fn new() -> Self {
-        Self { status: "ok".into() }
+        Self {
+            status: "ok".into(),
+        }
     }
 }
 
@@ -142,10 +144,19 @@ pub(crate) fn http_status(err: &HiggsError) -> StatusCode {
 /// `type` is `invalid_request_error` for 4xx and `server_error` otherwise;
 /// `code` is `model_not_found` on 404 (the only coded case on this surface).
 fn v1_envelope(status: StatusCode, message: String) -> WrappedError {
-    let kind = if status.is_client_error() { "invalid_request_error" } else { "server_error" };
+    let kind = if status.is_client_error() {
+        "invalid_request_error"
+    } else {
+        "server_error"
+    };
     let code = (status == StatusCode::NOT_FOUND).then(|| "model_not_found".to_owned());
     WrappedError {
-        error: ApiError { message, r#type: Some(kind.to_owned()), param: None, code },
+        error: ApiError {
+            message,
+            r#type: Some(kind.to_owned()),
+            param: None,
+            code,
+        },
     }
 }
 
@@ -163,7 +174,12 @@ fn v1_error(err: &HiggsError) -> (StatusCode, Json<WrappedError>) {
 
 /// Control-route error response: mapped status + `{"error":"<display>"}` body.
 fn control_error(err: &HiggsError) -> (StatusCode, Json<HiggsErrorResponse>) {
-    (http_status(err), Json(HiggsErrorResponse { error: err.to_string() }))
+    (
+        http_status(err),
+        Json(HiggsErrorResponse {
+            error: err.to_string(),
+        }),
+    )
 }
 
 // ── Router ────────────────────────────────────────────────────────────────────
@@ -217,7 +233,11 @@ async fn v1_models(State(higgs): State<Arc<Higgs>>) -> Response {
                     owned_by: "higgs".to_owned(),
                 })
                 .collect();
-            Json(ListModelResponse { object: "list".to_owned(), data }).into_response()
+            Json(ListModelResponse {
+                object: "list".to_owned(),
+                data,
+            })
+            .into_response()
         }
         Err(err) => {
             tracing::warn!(error = %err, "higgs: /v1/models failed");
@@ -243,7 +263,9 @@ async fn v1_chat_completions(
         }
     };
     if loaded.is_none_or(|l| l.id != req.model) {
-        let err = HiggsError::ModelNotLoaded { id: req.model.clone() };
+        let err = HiggsError::ModelNotLoaded {
+            id: req.model.clone(),
+        };
         tracing::warn!(model = %req.model, "higgs: chat for unloaded model");
         return v1_error(&err).into_response();
     }
@@ -288,7 +310,10 @@ async fn v1_chat_completions(
             Err(join_err) => {
                 tracing::warn!(error = %join_err, "higgs: chat task failed");
                 let status = StatusCode::INTERNAL_SERVER_ERROR;
-                (status, Json(v1_envelope(status, format!("chat task failed: {join_err}"))))
+                (
+                    status,
+                    Json(v1_envelope(status, format!("chat task failed: {join_err}"))),
+                )
                     .into_response()
             }
         }
@@ -474,7 +499,11 @@ async fn control_load(
         })
     };
     match higgs.load(&req.id, params).await {
-        Ok(()) => Json(HiggsLoadResponse { status: HiggsOk::new(), id: req.id }).into_response(),
+        Ok(()) => Json(HiggsLoadResponse {
+            status: HiggsOk::new(),
+            id: req.id,
+        })
+        .into_response(),
         Err(err) => {
             tracing::warn!(id = %req.id, error = %err, "higgs: load failed");
             control_error(&err).into_response()
@@ -512,7 +541,9 @@ async fn control_logs(
     Query(q): Query<LogsQuery>,
 ) -> Json<HiggsLogsResponse> {
     tracing::info!(n = q.n.unwrap_or(200), "higgs: GET /api/higgs/logs");
-    Json(HiggsLogsResponse { lines: higgs.logs(q.n.unwrap_or(200)) })
+    Json(HiggsLogsResponse {
+        lines: higgs.logs(q.n.unwrap_or(200)),
+    })
 }
 
 /// `POST /api/higgs/worker/start` — spawn the worker process.
@@ -574,17 +605,24 @@ mod tests {
 
         let sup = Supervisor::with_factory(Box::new(move |ring| {
             *ring_capture.lock() = Some(ring);
-            let write = sup_write_cell.lock().take().ok_or_else(|| {
-                HiggsError::WorkerSpawnFailed {
-                    source: std::io::Error::other("mock: no more write halves"),
-                }
-            })?;
-            let read = sup_read_cell.lock().take().ok_or_else(|| {
-                HiggsError::WorkerSpawnFailed {
-                    source: std::io::Error::other("mock: no more read halves"),
-                }
-            })?;
-            Ok(WorkerHalves { write: Box::new(write), read: Box::new(read) })
+            let write =
+                sup_write_cell
+                    .lock()
+                    .take()
+                    .ok_or_else(|| HiggsError::WorkerSpawnFailed {
+                        source: std::io::Error::other("mock: no more write halves"),
+                    })?;
+            let read =
+                sup_read_cell
+                    .lock()
+                    .take()
+                    .ok_or_else(|| HiggsError::WorkerSpawnFailed {
+                        source: std::io::Error::other("mock: no more read halves"),
+                    })?;
+            Ok(WorkerHalves {
+                write: Box::new(write),
+                read: Box::new(read),
+            })
         }));
 
         sup.start().expect("mock start");
@@ -603,7 +641,10 @@ mod tests {
             result: Some(result),
             error: None,
         }));
-        stream.write_all(format!("{line}\n").as_bytes()).await.unwrap();
+        stream
+            .write_all(format!("{line}\n").as_bytes())
+            .await
+            .unwrap();
         stream.flush().await.unwrap();
     }
 
@@ -613,13 +654,19 @@ mod tests {
             method: N_CHAT_CHUNK.into(),
             params: json!({ "request_id": null, "delta": delta }),
         }));
-        stream.write_all(format!("{line}\n").as_bytes()).await.unwrap();
+        stream
+            .write_all(format!("{line}\n").as_bytes())
+            .await
+            .unwrap();
         stream.flush().await.unwrap();
     }
 
     /// Wrap a mock supervisor in a `Higgs` facade and build the router.
     fn make_app(sup: Supervisor) -> Router {
-        router(Arc::new(Higgs::with_supervisor(Arc::new(sup), HiggsConfig::default())))
+        router(Arc::new(Higgs::with_supervisor(
+            Arc::new(sup),
+            HiggsConfig::default(),
+        )))
     }
 
     fn get(uri: &str) -> Request<Body> {
@@ -636,7 +683,12 @@ mod tests {
     }
 
     async fn body_bytes(resp: Response) -> Vec<u8> {
-        resp.into_body().collect().await.unwrap().to_bytes().to_vec()
+        resp.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec()
     }
 
     fn loaded_status_json() -> serde_json::Value {
@@ -655,8 +707,12 @@ mod tests {
 
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(30)).await;
-            write_response(&mut test_write, 1, json!({"loaded": null, "models_scanned": 0}))
-                .await;
+            write_response(
+                &mut test_write,
+                1,
+                json!({"loaded": null, "models_scanned": 0}),
+            )
+            .await;
         });
 
         let resp = app.oneshot(get("/v1/models")).await.unwrap();
@@ -696,8 +752,12 @@ mod tests {
 
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(30)).await;
-            write_response(&mut test_write, 1, json!({"loaded": null, "models_scanned": 0}))
-                .await;
+            write_response(
+                &mut test_write,
+                1,
+                json!({"loaded": null, "models_scanned": 0}),
+            )
+            .await;
         });
 
         let req = post_json(
@@ -708,9 +768,18 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
         let body = String::from_utf8(body_bytes(resp).await).unwrap();
-        assert!(body.contains("[HG003]"), "body carries the diagnostic code: {body}");
-        assert!(body.contains("model_not_found"), "envelope code present: {body}");
-        assert!(body.contains("invalid_request_error"), "envelope type present: {body}");
+        assert!(
+            body.contains("[HG003]"),
+            "body carries the diagnostic code: {body}"
+        );
+        assert!(
+            body.contains("model_not_found"),
+            "envelope code present: {body}"
+        );
+        assert!(
+            body.contains("invalid_request_error"),
+            "envelope type present: {body}"
+        );
     }
 
     // ── Test 4: non-streaming chat returns ChatOutcome.content ───────────────
@@ -782,22 +851,37 @@ mod tests {
         );
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let content_type = resp.headers().get("content-type").unwrap().to_str().unwrap();
-        assert!(content_type.starts_with("text/event-stream"), "got: {content_type}");
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            content_type.starts_with("text/event-stream"),
+            "got: {content_type}"
+        );
 
         let body = String::from_utf8(body_bytes(resp).await).unwrap();
-        let datas: Vec<&str> =
-            body.lines().filter_map(|l| l.strip_prefix("data: ")).collect();
+        let datas: Vec<&str> = body
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .collect();
         assert_eq!(datas.len(), 5, "role + 2 deltas + finish + [DONE]: {body}");
 
-        let parse = |s: &str| -> CreateChatCompletionStreamResponse {
-            serde_json::from_str(s).unwrap()
-        };
+        let parse =
+            |s: &str| -> CreateChatCompletionStreamResponse { serde_json::from_str(s).unwrap() };
         let role = parse(datas[0]);
         assert_eq!(role.choices[0].delta.role, Some(Role::Assistant));
         assert_eq!(role.object, "chat.completion.chunk");
-        assert_eq!(parse(datas[1]).choices[0].delta.content.as_deref(), Some("hel"));
-        assert_eq!(parse(datas[2]).choices[0].delta.content.as_deref(), Some("lo"));
+        assert_eq!(
+            parse(datas[1]).choices[0].delta.content.as_deref(),
+            Some("hel")
+        );
+        assert_eq!(
+            parse(datas[2]).choices[0].delta.content.as_deref(),
+            Some("lo")
+        );
         let finish = parse(datas[3]);
         assert_eq!(finish.choices[0].finish_reason, Some(FinishReason::Stop));
         assert_eq!(datas[4], "[DONE]");
@@ -821,7 +905,10 @@ mod tests {
 
         let resp = app
             .clone()
-            .oneshot(post_json("/api/higgs/models/load", &json!({"id": "org/model"})))
+            .oneshot(post_json(
+                "/api/higgs/models/load",
+                &json!({"id": "org/model"}),
+            ))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -854,6 +941,10 @@ mod tests {
         let resp = app.oneshot(get("/api/higgs/logs?n=2")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-        assert_eq!(v["lines"], json!(["line two", "line three"]), "tail of n, oldest first");
+        assert_eq!(
+            v["lines"],
+            json!(["line two", "line three"]),
+            "tail of n, oldest first"
+        );
     }
 }

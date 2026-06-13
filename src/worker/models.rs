@@ -364,7 +364,10 @@ fn scan_ollama(root: &Path, out: &mut Vec<HiggsModel>) -> Result<(), HiggsError>
             Some(n) if !n.is_empty() => n.to_string(),
             _ => continue,
         };
-        let name = match manifest_path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str())
+        let name = match manifest_path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
         {
             Some(n) if !n.is_empty() => n.to_string(),
             _ => continue,
@@ -401,18 +404,21 @@ fn scan_ollama(root: &Path, out: &mut Vec<HiggsModel>) -> Result<(), HiggsError>
         };
 
         let digest =
-            model_layer["digest"].as_str().ok_or_else(|| HiggsError::OllamaManifestInvalid {
-                path: manifest_path.display().to_string(),
-                detail: "model layer missing `digest`".into(),
-            })?;
+            model_layer["digest"]
+                .as_str()
+                .ok_or_else(|| HiggsError::OllamaManifestInvalid {
+                    path: manifest_path.display().to_string(),
+                    detail: "model layer missing `digest`".into(),
+                })?;
 
         // digest is "sha256:<hex>"; blob filename is "sha256-<hex>"
-        let hex = digest.strip_prefix("sha256:").ok_or_else(|| {
-            HiggsError::OllamaManifestInvalid {
-                path: manifest_path.display().to_string(),
-                detail: format!("unexpected digest format: {digest}"),
-            }
-        })?;
+        let hex =
+            digest
+                .strip_prefix("sha256:")
+                .ok_or_else(|| HiggsError::OllamaManifestInvalid {
+                    path: manifest_path.display().to_string(),
+                    detail: format!("unexpected digest format: {digest}"),
+                })?;
         let blob_name = format!("sha256-{hex}");
         let blob_path = blobs_dir.join(&blob_name);
 
@@ -494,7 +500,9 @@ fn collect_manifest_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Higg
 /// checks whether it looks like a quantization tag (`Q…`, `IQ…`, `f16`,
 /// `bf16`, `f32`).
 fn quant_from_filename(name: &str) -> Option<String> {
-    let stem = name.strip_suffix(".gguf").or_else(|| name.strip_suffix(".GGUF"))?;
+    let stem = name
+        .strip_suffix(".gguf")
+        .or_else(|| name.strip_suffix(".GGUF"))?;
     let tail = stem.rsplit(['-', '.']).next()?;
     let looks_quant = tail.starts_with('Q')
         || tail.starts_with("IQ")
@@ -596,7 +604,10 @@ mod tests {
         let root = dir.path();
 
         // Blob exists but has junk bytes — not a valid GGUF file.
-        write_file(&root.join("blobs/sha256-cafebabe"), &[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00]);
+        write_file(
+            &root.join("blobs/sha256-cafebabe"),
+            &[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00],
+        );
 
         let manifest = r#"{"layers":[{"mediaType":"application/vnd.ollama.image.model","digest":"sha256:cafebabe"}]}"#;
         write_file(
@@ -690,9 +701,20 @@ mod tests {
         let models = store.scan(&[dir.path().to_path_buf()], &[], &[]).unwrap();
 
         assert_eq!(models.len(), 1);
-        assert_eq!(models[0].arch.as_deref(), Some("llama"), "arch should be extracted");
-        assert_eq!(models[0].ctx_train, Some(4096), "ctx_train should be extracted");
-        assert!(models[0].has_chat_template, "has_chat_template should be true");
+        assert_eq!(
+            models[0].arch.as_deref(),
+            Some("llama"),
+            "arch should be extracted"
+        );
+        assert_eq!(
+            models[0].ctx_train,
+            Some(4096),
+            "ctx_train should be extracted"
+        );
+        assert!(
+            models[0].has_chat_template,
+            "has_chat_template should be true"
+        );
     }
 
     /// Non-GGUF Ollama manifests (no `layers`, or no model layer) must not abort the
@@ -729,9 +751,15 @@ mod tests {
 
         let mut store = ModelStore::default();
         // Must succeed (not Err) and return exactly the one valid model.
-        let models = store.scan(&[], &[], &[root.to_path_buf()]).expect("scan must not fail on non-GGUF manifests");
+        let models = store
+            .scan(&[], &[], &[root.to_path_buf()])
+            .expect("scan must not fail on non-GGUF manifests");
 
-        assert_eq!(models.len(), 1, "only the GGUF-model manifest should yield a result");
+        assert_eq!(
+            models.len(),
+            1,
+            "only the GGUF-model manifest should yield a result"
+        );
         assert!(
             models[0].path.ends_with("sha256-aabbccdd"),
             "unexpected path: {}",

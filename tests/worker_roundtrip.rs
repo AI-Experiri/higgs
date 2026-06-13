@@ -73,7 +73,8 @@ fn worker_stdio_roundtrip() {
     // Build a minimal LM Studio fixture: root/google/gemma-4-12b/file-Q4_K_M.gguf
     let tmp = tempfile::TempDir::new().expect("tempdir");
     write_file(
-        &tmp.path().join("google/gemma-4-12b/gemma-4-12b-Q4_K_M.gguf"),
+        &tmp.path()
+            .join("google/gemma-4-12b/gemma-4-12b-Q4_K_M.gguf"),
         &[0u8; 16], // 16 dummy bytes — not a valid GGUF; scan tolerates it
     );
     let lmstudio_root = tmp.path().to_str().expect("utf-8 path").to_string();
@@ -126,13 +127,19 @@ fn worker_stdio_roundtrip() {
             "ollama": []
         }),
     );
-    child_stdin.write_all(scan_req.as_bytes()).expect("write scan");
+    child_stdin
+        .write_all(scan_req.as_bytes())
+        .expect("write scan");
     child_stdin.flush().expect("flush scan");
 
     let scan_line = recv_line(&rx, "scan response");
     let scan_resp = parse_response(&scan_line);
     assert_eq!(scan_resp.id, 1, "scan id");
-    assert!(scan_resp.error.is_none(), "scan error: {:?}", scan_resp.error);
+    assert!(
+        scan_resp.error.is_none(),
+        "scan error: {:?}",
+        scan_resp.error
+    );
     let models = scan_resp
         .result
         .as_ref()
@@ -146,13 +153,19 @@ fn worker_stdio_roundtrip() {
 
     // ---- request 2: higgs/status -------------------------------------------
     let status_req = req_line(2, "higgs/status", serde_json::Value::Null);
-    child_stdin.write_all(status_req.as_bytes()).expect("write status");
+    child_stdin
+        .write_all(status_req.as_bytes())
+        .expect("write status");
     child_stdin.flush().expect("flush status");
 
     let status_line = recv_line(&rx, "status response");
     let status_resp = parse_response(&status_line);
     assert_eq!(status_resp.id, 2, "status id");
-    assert!(status_resp.error.is_none(), "status error: {:?}", status_resp.error);
+    assert!(
+        status_resp.error.is_none(),
+        "status error: {:?}",
+        status_resp.error
+    );
     let result = status_resp.result.as_ref().expect("status result");
     assert_eq!(result["models_scanned"], 1, "models_scanned after scan");
     assert!(
@@ -163,7 +176,9 @@ fn worker_stdio_roundtrip() {
 
     // ---- request 3: higgs/shutdown -----------------------------------------
     let shutdown_req = req_line(3, "higgs/shutdown", serde_json::Value::Null);
-    child_stdin.write_all(shutdown_req.as_bytes()).expect("write shutdown");
+    child_stdin
+        .write_all(shutdown_req.as_bytes())
+        .expect("write shutdown");
     child_stdin.flush().expect("flush shutdown");
 
     let shutdown_line = recv_line(&rx, "shutdown response");

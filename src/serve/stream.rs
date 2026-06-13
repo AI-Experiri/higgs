@@ -62,7 +62,14 @@ async fn assemble(
         let _ = tx.send(payload);
     };
 
-    send(chunk_payload(&id, &model, created, Some(Role::Assistant), None, None));
+    send(chunk_payload(
+        &id,
+        &model,
+        created,
+        Some(Role::Assistant),
+        None,
+        None,
+    ));
 
     let joined = loop {
         tokio::select! {
@@ -96,7 +103,10 @@ async fn assemble(
         )),
         Ok(Err(err)) => {
             tracing::warn!(error = %err, "higgs: chat stream failed mid-generation");
-            send(super::v1_envelope_json(super::http_status(&err), err.to_string()));
+            send(super::v1_envelope_json(
+                super::http_status(&err),
+                err.to_string(),
+            ));
         }
         // JoinError: the chat task panicked or was aborted — not a HiggsError.
         Err(join_err) => {
@@ -171,7 +181,15 @@ mod tests {
         outcome: JoinHandle<Result<ChatOutcome, HiggsError>>,
     ) -> Vec<String> {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        assemble("chatcmpl-t".into(), "org/model".into(), 1, deltas, outcome, tx).await;
+        assemble(
+            "chatcmpl-t".into(),
+            "org/model".into(),
+            1,
+            deltas,
+            outcome,
+            tx,
+        )
+        .await;
         let mut out = Vec::new();
         while let Ok(p) = rx.try_recv() {
             out.push(p);
@@ -192,21 +210,29 @@ mod tests {
         dtx.send("hel".to_owned()).unwrap();
         dtx.send("lo".to_owned()).unwrap();
         let outcome = tokio::spawn(async {
-            Ok(ChatOutcome { content: "hello".into(), finish_reason: "stop".into() })
+            Ok(ChatOutcome {
+                content: "hello".into(),
+                finish_reason: "stop".into(),
+            })
         });
 
         let payloads = run_assemble(drx, outcome).await;
         assert_eq!(payloads.len(), 5, "role + 2 deltas + finish + [DONE]");
 
-        let parse = |s: &str| -> CreateChatCompletionStreamResponse {
-            serde_json::from_str(s).unwrap()
-        };
+        let parse =
+            |s: &str| -> CreateChatCompletionStreamResponse { serde_json::from_str(s).unwrap() };
         let role = parse(&payloads[0]);
         assert_eq!(role.choices[0].delta.role, Some(Role::Assistant));
         assert_eq!(role.object, "chat.completion.chunk");
 
-        assert_eq!(parse(&payloads[1]).choices[0].delta.content.as_deref(), Some("hel"));
-        assert_eq!(parse(&payloads[2]).choices[0].delta.content.as_deref(), Some("lo"));
+        assert_eq!(
+            parse(&payloads[1]).choices[0].delta.content.as_deref(),
+            Some("hel")
+        );
+        assert_eq!(
+            parse(&payloads[2]).choices[0].delta.content.as_deref(),
+            Some("lo")
+        );
 
         let finish = parse(&payloads[3]);
         assert_eq!(finish.choices[0].finish_reason, Some(FinishReason::Stop));
@@ -219,12 +245,17 @@ mod tests {
     async fn assemble_error_emits_envelope_then_done() {
         let (_dtx, drx) = mpsc::unbounded_channel::<String>();
         let outcome = tokio::spawn(async {
-            Err(HiggsError::WorkerDead { context: "gone".into() })
+            Err(HiggsError::WorkerDead {
+                context: "gone".into(),
+            })
         });
 
         let payloads = run_assemble(drx, outcome).await;
         assert_eq!(payloads.len(), 3, "role + error envelope + [DONE]");
-        assert!(payloads[1].contains("[HG007]"), "envelope carries the diagnostic code");
+        assert!(
+            payloads[1].contains("[HG007]"),
+            "envelope carries the diagnostic code"
+        );
         assert!(payloads[1].contains("server_error"));
         assert_eq!(payloads[2], "[DONE]");
     }
@@ -241,21 +272,31 @@ mod tests {
         drop(dtx);
 
         let outcome = tokio::spawn(async {
-            Err(HiggsError::WorkerDead { context: "worker panicked mid-generation".into() })
+            Err(HiggsError::WorkerDead {
+                context: "worker panicked mid-generation".into(),
+            })
         });
 
         let payloads = run_assemble(drx, outcome).await;
         // Expected: role chunk + "he" delta + error envelope + [DONE]
         assert_eq!(payloads.len(), 4, "role + delta + error envelope + [DONE]");
 
-        let parse = |s: &str| -> CreateChatCompletionStreamResponse {
-            serde_json::from_str(s).unwrap()
-        };
-        assert_eq!(parse(&payloads[0]).choices[0].delta.role, Some(Role::Assistant));
-        assert_eq!(parse(&payloads[1]).choices[0].delta.content.as_deref(), Some("he"));
+        let parse =
+            |s: &str| -> CreateChatCompletionStreamResponse { serde_json::from_str(s).unwrap() };
+        assert_eq!(
+            parse(&payloads[0]).choices[0].delta.role,
+            Some(Role::Assistant)
+        );
+        assert_eq!(
+            parse(&payloads[1]).choices[0].delta.content.as_deref(),
+            Some("he")
+        );
 
         // Error envelope carries the diagnostic code and error type.
-        assert!(payloads[2].contains("[HG007]"), "envelope carries the diagnostic code");
+        assert!(
+            payloads[2].contains("[HG007]"),
+            "envelope carries the diagnostic code"
+        );
         assert!(payloads[2].contains("server_error"));
 
         assert_eq!(payloads[3], "[DONE]", "[DONE] is always last");

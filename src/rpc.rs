@@ -72,11 +72,19 @@ pub fn decode(line: &str) -> Result<RpcFrame, HiggsError> {
     })?;
     let has_id = v.get("id").is_some();
     let has_method = v.get("method").is_some();
-    let parse = |detail: &str| HiggsError::RpcDecode { detail: detail.to_string() };
+    let parse = |detail: &str| HiggsError::RpcDecode {
+        detail: detail.to_string(),
+    };
     match (has_id, has_method) {
-        (true, true) => serde_json::from_value(v).map(RpcFrame::Request).map_err(|e| parse(&e.to_string())),
-        (true, false) => serde_json::from_value(v).map(RpcFrame::Response).map_err(|e| parse(&e.to_string())),
-        (false, true) => serde_json::from_value(v).map(RpcFrame::Notification).map_err(|e| parse(&e.to_string())),
+        (true, true) => serde_json::from_value(v)
+            .map(RpcFrame::Request)
+            .map_err(|e| parse(&e.to_string())),
+        (true, false) => serde_json::from_value(v)
+            .map(RpcFrame::Response)
+            .map_err(|e| parse(&e.to_string())),
+        (false, true) => serde_json::from_value(v)
+            .map(RpcFrame::Notification)
+            .map_err(|e| parse(&e.to_string())),
         (false, false) => Err(parse("neither id nor method present")),
     }
 }
@@ -123,7 +131,10 @@ mod tests {
             jsonrpc: "2.0".into(),
             id: 10,
             result: None,
-            error: Some(RpcError { code: -32601, message: "unknown method".into() }),
+            error: Some(RpcError {
+                code: -32601,
+                message: "unknown method".into(),
+            }),
         });
         assert_eq!(decode(&encode(&err)).unwrap(), err);
     }
