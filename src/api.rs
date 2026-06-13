@@ -14,6 +14,7 @@ use crate::diagnostic::HiggsError;
 use crate::supervisor::{HiggsEvent, Supervisor};
 use crate::worker::engine::LoadParams;
 use crate::worker::models::HiggsModel;
+use crate::worker::{M_CHAT, M_LOAD, M_SCAN, M_STATUS, M_UNLOAD};
 
 // ── HiggsConfig ───────────────────────────────────────────────────────────────
 
@@ -182,10 +183,10 @@ impl Higgs {
             )
         };
         let params = json!({ "lmstudio": lmstudio, "hf": hf, "ollama": ollama });
-        let result = self.sup.request("higgs/scan", params.clone()).await?;
+        let result = self.sup.request(M_SCAN, params.clone()).await?;
         let models: Vec<HiggsModel> = serde_json::from_value(result).map_err(|e| {
             HiggsError::WorkerRpc {
-                method: "higgs/scan".into(),
+                method: M_SCAN.into(),
                 message: format!("response parse failed: {e}"),
             }
         })?;
@@ -205,7 +206,7 @@ impl Higgs {
             "gpu_layers": p.gpu_layers,
             "threads": p.threads,
         });
-        self.sup.request("higgs/load", req_params.clone()).await?;
+        self.sup.request(M_LOAD, req_params.clone()).await?;
         self.sup.record_last_load(req_params);
         self.sup.emit(HiggsEvent::ModelLoaded { id: id.to_owned() });
         Ok(())
@@ -219,17 +220,19 @@ impl Higgs {
         // TODO(v2): single RPC — status+unload is TOCTOU if worker state changes between calls (v1: worker serializes, benign)
         // Capture id from status before unloading so the event carries it.
         let id = self.loaded_id().await.unwrap_or_default();
-        self.sup.request("higgs/unload", serde_json::Value::Null).await?;
+        self.sup.request(M_UNLOAD, serde_json::Value::Null).await?;
         self.sup.emit(HiggsEvent::ModelUnloaded { id });
         Ok(())
     }
 
     /// Return a live status snapshot.
     ///
-    /// Worker-dead and malformed-status both collapse to `worker_alive: false` by
-    /// design in v1 — callers treat any non-OK state as "no worker available".
+    /// `worker_alive` is `true` iff the RPC round-trip succeeded. `loaded` is
+    /// independently best-effort: an RPC failure yields `worker_alive:false` with
+    /// `loaded:None`; a malformed `loaded` shape in an otherwise-OK response yields
+    /// `worker_alive:true` with `loaded:None`.
     pub async fn status(&self) -> Result<HiggsStatus, HiggsError> {
-        let result = self.sup.request("higgs/status", serde_json::Value::Null).await;
+        let result = self.sup.request(M_STATUS, serde_json::Value::Null).await;
         let worker_alive = result.is_ok();
         let v = result.unwrap_or(serde_json::Value::Null);
 
@@ -289,14 +292,24 @@ impl Higgs {
         let handle = tokio::spawn(async move {
             let result = sup
                 .request(
-                    "higgs/chat",
+                    M_CHAT,
                     json!({
                         "messages": msgs,
                         "max_tokens": max_tokens,
                         "temperature": temperature,
                     }),
                 )
-                .await?;
+                .await;
+
+            // On request failure, clear the stale chat sink so the next
+            // take_chat_sink call does not trip the debug_assert.
+            let result = match result {
+                Ok(v) => v,
+                Err(e) => {
+                    sup.clear_chat_sink();
+                    return Err(e);
+                }
+            };
 
             let content = result
                 .get("content")
@@ -325,11 +338,28 @@ impl Higgs {
         self.sup.logs(n)
     }
 
+    /// Snapshot of the configured default load parameters.
+    ///
+    /// The serve router uses this to fill fields absent from a partial
+    /// load request — config stays the single home for the defaults.
+    pub(crate) fn default_load(&self) -> LoadParams {
+        self.config.lock().default_load.clone()
+    }
+
+    /// Test-only: build a `Higgs` over a pre-built (mock) supervisor.
+    ///
+    /// Lets sibling modules (`serve`) reuse the duplex mock seam without
+    /// access to this module's private fields.
+    #[cfg(test)]
+    pub(crate) fn with_supervisor(sup: Arc<Supervisor>, config: HiggsConfig) -> Self {
+        Self { sup, config: parking_lot::Mutex::new(config) }
+    }
+
     // ── private ───────────────────────────────────────────────────────────────
 
     /// Best-effort: ask the worker for the currently loaded model id.
     async fn loaded_id(&self) -> Option<String> {
-        let v = self.sup.request("higgs/status", serde_json::Value::Null).await.ok()?;
+        let v = self.sup.request(M_STATUS, serde_json::Value::Null).await.ok()?;
         v.get("loaded")?.get("id")?.as_str().map(ToOwned::to_owned)
     }
 }
@@ -340,6 +370,7 @@ impl Higgs {
 mod tests {
     use super::*;
     use crate::supervisor::WorkerHalves;
+    use crate::worker::N_CHAT_CHUNK;
     use parking_lot::Mutex;
     use serde_json::json;
     use tokio::io::AsyncWriteExt;
@@ -534,7 +565,7 @@ mod tests {
         for delta in &["hel", "lo"] {
             let notif = encode(&RpcFrame::Notification(RpcNotification {
                 jsonrpc: "2.0".into(),
-                method: "higgs/chat/chunk".into(),
+                method: N_CHAT_CHUNK.into(),
                 params: json!({ "request_id": null, "delta": delta }),
             }));
             test_write
@@ -571,5 +602,47 @@ mod tests {
         let chunk2 = rx.try_recv().expect("chunk 2");
         assert_eq!(chunk1, "hel");
         assert_eq!(chunk2, "lo");
+    }
+
+    // ── Test 5: chat_stream against dead worker clears sink ───────────────────
+
+    /// When the chat request fails (write_tx is None — worker not running), the
+    /// installed chat sink must be cleared so a subsequent `take_chat_sink` does
+    /// not trip the debug_assert.
+    #[tokio::test]
+    async fn chat_stream_dead_worker_clears_sink() {
+        // Build a Supervisor with no worker halves — factory always fails.
+        let sup = crate::supervisor::Supervisor::with_factory(Box::new(|_ring| {
+            Err(HiggsError::WorkerSpawnFailed {
+                source: std::io::Error::other("mock: no worker"),
+            })
+        }));
+        // Do NOT call start() — write_tx stays None (dead worker).
+
+        let higgs = Higgs {
+            sup: Arc::new(sup),
+            config: parking_lot::Mutex::new(HiggsConfig::default()),
+        };
+
+        // chat_stream installs the sink then the spawned task encounters dead worker.
+        let (_rx, handle) = higgs
+            .chat_stream(vec![("user".into(), "hi".into())], 8, 0.0)
+            .await
+            .expect("chat_stream itself should not fail");
+
+        // The spawned task must return an Err (worker dead).
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            handle,
+        )
+        .await
+        .expect("join timeout")
+        .expect("join error");
+        assert!(result.is_err(), "chat against dead worker must fail");
+
+        // After the failed request, a subsequent take_chat_sink must not debug_assert.
+        // (In release builds the assert is a no-op; in debug builds it would panic if
+        // the sink was not cleared.)
+        let _rx2 = higgs.sup.take_chat_sink();
     }
 }

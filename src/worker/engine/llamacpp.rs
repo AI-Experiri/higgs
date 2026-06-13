@@ -179,6 +179,17 @@ impl HiggsEngine for LlamaCppEngine {
             n_cur += 1;
             ctx.decode(&mut batch).map_err(|e| gen_fail("loop decode", e.to_string()))?;
         };
+
+        // Flush the UTF-8 decoder: a response ending mid-multi-byte sequence (e.g.
+        // CJK) would otherwise silently truncate the final character. The final call
+        // with last=true drains any buffered incomplete bytes.
+        let mut tail = String::new();
+        let _ = decoder.decode_to_string(&[], &mut tail, true);
+        if !tail.is_empty() {
+            sink(&tail);
+            full.push_str(&tail);
+        }
+
         Ok((full, finish_reason))
     }
 }

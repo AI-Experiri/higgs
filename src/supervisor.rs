@@ -42,9 +42,7 @@ use tracing::{info, warn};
 
 use crate::diagnostic::HiggsError;
 use crate::rpc::{self, RpcFrame, RpcNotification, RpcRequest};
-
-/// Method name for chat-chunk notifications sent by the worker.
-const N_CHAT_CHUNK: &str = "higgs/chat/chunk";
+use crate::worker::{M_LOAD, M_SCAN, M_SHUTDOWN, N_CHAT_CHUNK};
 
 /// Events the host application subscribes to.
 #[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
@@ -276,6 +274,14 @@ impl Supervisor {
         rx
     }
 
+    /// Clear the active chat-chunk sink.
+    ///
+    /// Called on the error path of a chat request to prevent a stale sender
+    /// from tripping the `debug_assert!` in the next `take_chat_sink` call.
+    pub(crate) fn clear_chat_sink(&self) {
+        *self.inner.chat_sink.lock() = None;
+    }
+
     /// Gracefully shut down the worker (2s timeout) then drop the write channel.
     ///
     /// Sets the deliberate-stop flag so death does not trigger respawn.
@@ -283,7 +289,7 @@ impl Supervisor {
         self.inner.stopped.store(true, Ordering::Relaxed);
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            self.request("higgs/shutdown", Value::Null),
+            self.request(M_SHUTDOWN, Value::Null),
         )
         .await;
         // Drop the sender — the writer task exits when its channel closes.
@@ -418,6 +424,8 @@ async fn attempt_restart(inner: &Arc<Inner>) -> Option<ReadHalf> {
         }
         Err(e) => {
             warn!(error = %e, "higgs worker respawn failed — giving up");
+            // Doc promise: terminal factory failure → broadcasts WorkerDied before exit.
+            let _ = inner.events_tx.send(HiggsEvent::WorkerDied);
             None
         }
     }
@@ -501,7 +509,7 @@ fn replay_fire_and_forget(inner: &Arc<Inner>, method: &str, params: Value) {
 /// restarted; user re-drives if needed).
 fn replay_scan_then_load(inner: &Arc<Inner>) {
     if let Some(p) = inner.last_scan.lock().clone() {
-        replay_fire_and_forget(inner, "higgs/scan", p);
+        replay_fire_and_forget(inner, M_SCAN, p);
     }
     if let Some(load_params) = inner.last_load.lock().clone() {
         // Extract the model id from recorded params before moving them into the task.
@@ -538,7 +546,7 @@ async fn replay_load_await(inner: &Arc<Inner>, params: Value) -> Result<(), Higg
     let line = rpc::encode(&RpcFrame::Request(RpcRequest {
         jsonrpc: "2.0".into(),
         id,
-        method: "higgs/load".to_string(),
+        method: M_LOAD.to_string(),
         params,
     }));
 
@@ -560,7 +568,7 @@ async fn replay_load_await(inner: &Arc<Inner>, params: Value) -> Result<(), Higg
         Ok(resp) => {
             if let Some(err) = resp.error {
                 Err(HiggsError::WorkerRpc {
-                    method: "higgs/load".into(),
+                    method: M_LOAD.into(),
                     message: err.message,
                 })
             } else {
@@ -815,8 +823,8 @@ mod tests {
             "pending request should fail on EOF"
         );
 
-        // WorkerDied must arrive (respawn fires after 1s sleep; wait 2s total).
-        let died = tokio::time::timeout(std::time::Duration::from_millis(2000), async {
+        // First WorkerDied must arrive (worker EOF).
+        let first_died = tokio::time::timeout(std::time::Duration::from_millis(2000), async {
             loop {
                 match events.recv().await {
                     Ok(HiggsEvent::WorkerDied) => return true,
@@ -826,7 +834,21 @@ mod tests {
             }
         })
         .await;
-        assert!(matches!(died, Ok(true)), "WorkerDied event expected");
+        assert!(matches!(first_died, Ok(true)), "first WorkerDied event expected (EOF)");
+
+        // After the 1s respawn backoff, the factory fails (no more halves) →
+        // a second terminal WorkerDied must be broadcast before the reader task exits.
+        let second_died = tokio::time::timeout(std::time::Duration::from_millis(2000), async {
+            loop {
+                match events.recv().await {
+                    Ok(HiggsEvent::WorkerDied) => return true,
+                    Ok(_) => continue,
+                    Err(_) => return false,
+                }
+            }
+        })
+        .await;
+        assert!(matches!(second_died, Ok(true)), "second WorkerDied event expected (factory failure)");
     }
 
     // ─── Test 4: worker RPC error maps to HG009 ──────────────────────────────
@@ -835,7 +857,7 @@ mod tests {
     async fn worker_error_maps_to_hg009() {
         let (sup, mut test_write, _test_read) = make_supervisor();
 
-        let fut = sup.request("higgs/load", json!({"id": "org/bad"}));
+        let fut = sup.request(M_LOAD, json!({"id": "org/bad"}));
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         write_line(&mut test_write, &err_response(1, -32000, "model file corrupt")).await;
 
@@ -953,8 +975,8 @@ mod tests {
 
         let first: serde_json::Value = serde_json::from_str(&received[0]).expect("valid json");
         let second: serde_json::Value = serde_json::from_str(&received[1]).expect("valid json");
-        assert_eq!(first["method"], "higgs/scan", "first replayed method must be higgs/scan");
-        assert_eq!(second["method"], "higgs/load", "second replayed method must be higgs/load");
+        assert_eq!(first["method"], M_SCAN, "first replayed method must be higgs/scan");
+        assert_eq!(second["method"], M_LOAD, "second replayed method must be higgs/load");
         assert_eq!(first["params"], json!({"dirs": ["/models"]}));
         assert_eq!(second["params"], json!({"id": "org/model"}));
 

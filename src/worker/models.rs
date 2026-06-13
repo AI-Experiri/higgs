@@ -80,7 +80,7 @@ impl ModelStore {
             scan_ollama(root, &mut collected)?;
         }
 
-        collected.sort_by(|a, b| a.id.cmp(&b.id));
+        collected.sort_by(|a, b| a.id.cmp(&b.id).then_with(|| a.path.cmp(&b.path)));
         collected.dedup_by(|a, b| a.id == b.id && a.path == b.path);
 
         self.models = collected;
@@ -93,6 +93,10 @@ impl ModelStore {
     }
 
     /// Look up a model by HuggingFace repo id.
+    ///
+    /// When multiple variants share the same id (e.g. different quantization paths
+    /// for the same repo), returns the lexically-first path variant. Explicit
+    /// variant selection by path is a v2 feature.
     pub fn get(&self, id: &str) -> Option<&HiggsModel> {
         self.models.iter().find(|m| m.id == id)
     }
@@ -348,18 +352,8 @@ fn scan_hf_cache(root: &Path, out: &mut Vec<HiggsModel>) -> Result<(), HiggsErro
 fn scan_ollama(root: &Path, out: &mut Vec<HiggsModel>) -> Result<(), HiggsError> {
     let manifests_dir = root.join("manifests");
 
-    // Probe manifests dir directly — NotFound = silently skip, other errors = HG001.
-    match std::fs::read_dir(root) {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => {
-            return Err(HiggsError::ModelDirUnreadable {
-                path: root.display().to_string(),
-                source: e,
-            })
-        }
-    }
-
+    // collect_manifest_files handles NotFound (silently skips) and HG001 on real errors;
+    // no separate root probe needed.
     let blobs_dir = root.join("blobs");
     let mut manifest_files: Vec<PathBuf> = Vec::new();
     collect_manifest_files(&manifests_dir, &mut manifest_files)?;
@@ -389,21 +383,22 @@ fn scan_ollama(root: &Path, out: &mut Vec<HiggsModel>) -> Result<(), HiggsError>
                 detail: format!("json parse: {e}"),
             })?;
 
-        let layers =
-            manifest["layers"].as_array().ok_or_else(|| HiggsError::OllamaManifestInvalid {
-                path: manifest_path.display().to_string(),
-                detail: "missing or non-array `layers`".into(),
-            })?;
+        // Missing or non-array `layers` means this is not a GGUF-model manifest
+        // (common for embedding and vision pulls). Skip silently — not an error.
+        let Some(layers) = manifest["layers"].as_array() else {
+            tracing::debug!(path = %manifest_path.display(), "ollama manifest has no `layers`; skipping");
+            continue;
+        };
 
         let model_layer = layers
             .iter()
             .find(|l| l["mediaType"].as_str() == Some("application/vnd.ollama.image.model"));
 
-        let model_layer =
-            model_layer.ok_or_else(|| HiggsError::OllamaManifestInvalid {
-                path: manifest_path.display().to_string(),
-                detail: "no layer with mediaType application/vnd.ollama.image.model".into(),
-            })?;
+        // No GGUF model layer — normal for vision/embedding manifests. Skip silently.
+        let Some(model_layer) = model_layer else {
+            tracing::debug!(path = %manifest_path.display(), "ollama manifest has no model layer; skipping");
+            continue;
+        };
 
         let digest =
             model_layer["digest"].as_str().ok_or_else(|| HiggsError::OllamaManifestInvalid {
@@ -698,5 +693,74 @@ mod tests {
         assert_eq!(models[0].arch.as_deref(), Some("llama"), "arch should be extracted");
         assert_eq!(models[0].ctx_train, Some(4096), "ctx_train should be extracted");
         assert!(models[0].has_chat_template, "has_chat_template should be true");
+    }
+
+    /// Non-GGUF Ollama manifests (no `layers`, or no model layer) must not abort the
+    /// scan — they are silently skipped.  A valid GGUF manifest alongside them is
+    /// still returned.
+    #[test]
+    fn ollama_non_gguf_manifest_skipped_valid_returned() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+
+        // A valid GGUF blob.
+        write_file(&root.join("blobs/sha256-aabbccdd"), b"GGUFxxxxxxxxxxxx");
+
+        // Manifest that points to the valid GGUF blob.
+        let good_manifest = r#"{"layers":[{"mediaType":"application/vnd.ollama.image.model","digest":"sha256:aabbccdd"}]}"#;
+        write_file(
+            &root.join("manifests/registry.ollama.ai/library/llama3/latest"),
+            good_manifest.as_bytes(),
+        );
+
+        // Embedding manifest: has `layers` but none with the model mediaType.
+        let embed_manifest = r#"{"layers":[{"mediaType":"application/vnd.ollama.image.params"}]}"#;
+        write_file(
+            &root.join("manifests/registry.ollama.ai/library/nomic-embed-text/latest"),
+            embed_manifest.as_bytes(),
+        );
+
+        // Vision manifest: no `layers` key at all.
+        let vision_manifest = r#"{"config":{"mediaType":"application/vnd.ollama.image"}}"#;
+        write_file(
+            &root.join("manifests/registry.ollama.ai/library/llava/latest"),
+            vision_manifest.as_bytes(),
+        );
+
+        let mut store = ModelStore::default();
+        // Must succeed (not Err) and return exactly the one valid model.
+        let models = store.scan(&[], &[], &[root.to_path_buf()]).expect("scan must not fail on non-GGUF manifests");
+
+        assert_eq!(models.len(), 1, "only the GGUF-model manifest should yield a result");
+        assert!(
+            models[0].path.ends_with("sha256-aabbccdd"),
+            "unexpected path: {}",
+            models[0].path
+        );
+    }
+
+    /// When the same model id is present under two different paths (e.g. two quant
+    /// variants), `get()` must return the lexically-first path consistently.
+    #[test]
+    fn get_returns_lexically_first_path_for_multi_variant_id() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        // Two files with the same org/model id but different quant suffixes.
+        // Lexicographic order: Q4_K_M < Q8_0, so Q4_K_M path comes first.
+        write_file(&root.join("org/model/model-Q4_K_M.gguf"), b"gguf");
+        write_file(&root.join("org/model/model-Q8_0.gguf"), b"gguf");
+
+        let mut store = ModelStore::default();
+        store.scan(&[root.to_path_buf()], &[], &[]).unwrap();
+
+        let found = store.get("org/model").expect("model must be found");
+        assert!(
+            found.path.contains("Q4_K_M"),
+            "expected lexically-first path (Q4_K_M) but got: {}",
+            found.path
+        );
+        // Called twice: must return the same result (deterministic).
+        let found2 = store.get("org/model").expect("model must be found");
+        assert_eq!(found.path, found2.path, "get() must be deterministic");
     }
 }
