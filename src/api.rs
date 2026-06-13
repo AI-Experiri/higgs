@@ -216,6 +216,7 @@ impl Higgs {
     /// Emits [`HiggsEvent::ModelUnloaded`] with an empty id when no model id
     /// is available at the facade layer (v1 limitation; worker tracks it).
     pub async fn unload(&self) -> Result<(), HiggsError> {
+        // TODO(v2): single RPC — status+unload is TOCTOU if worker state changes between calls (v1: worker serializes, benign)
         // Capture id from status before unloading so the event carries it.
         let id = self.loaded_id().await.unwrap_or_default();
         self.sup.request("higgs/unload", serde_json::Value::Null).await?;
@@ -224,6 +225,9 @@ impl Higgs {
     }
 
     /// Return a live status snapshot.
+    ///
+    /// Worker-dead and malformed-status both collapse to `worker_alive: false` by
+    /// design in v1 — callers treat any non-OK state as "no worker available".
     pub async fn status(&self) -> Result<HiggsStatus, HiggsError> {
         let result = self.sup.request("higgs/status", serde_json::Value::Null).await;
         let worker_alive = result.is_ok();
@@ -252,9 +256,13 @@ impl Higgs {
     /// Stream a chat completion.
     ///
     /// Returns `(receiver, join_handle)`:
-    /// - `receiver` yields content deltas as they arrive from the worker.
-    /// - `join_handle` resolves with the [`ChatOutcome`] when generation is
-    ///   complete, or `Err` if the worker fails.
+    /// - `receiver` carries streaming deltas — each item is one content chunk
+    ///   from the worker; this is the canonical output for SSE / streaming consumers.
+    /// - `join_handle` resolves with the final [`ChatOutcome`] when generation is
+    ///   complete (or `Err` if the worker fails); `ChatOutcome::content` is the
+    ///   full concatenated text and is the canonical output for non-streaming
+    ///   consumers (`/v1` with `stream: false`).  Both are retained on purpose —
+    ///   callers choose which representation they need.
     ///
     /// v1 constraint: only one chat may be in flight at a time (the worker
     /// serialises). See [`Supervisor::take_chat_sink`] for the debug assert.

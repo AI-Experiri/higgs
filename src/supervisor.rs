@@ -494,14 +494,82 @@ fn replay_fire_and_forget(inner: &Arc<Inner>, method: &str, params: Value) {
 
 /// Best-effort replay of the last successful scan (if any) then load (if any) after restart.
 ///
-/// Scan is replayed first so the worker's model index is populated before the
-/// load request arrives.
+/// Scan is replayed first (fire-and-forget) so the worker's model index is
+/// populated before the load request arrives.  The load replay awaits its
+/// response so we can emit [`HiggsEvent::ModelLoaded`] only on confirmed
+/// success — replay failures are intentionally logged-and-dropped (worker just
+/// restarted; user re-drives if needed).
 fn replay_scan_then_load(inner: &Arc<Inner>) {
     if let Some(p) = inner.last_scan.lock().clone() {
         replay_fire_and_forget(inner, "higgs/scan", p);
     }
-    if let Some(p) = inner.last_load.lock().clone() {
-        replay_fire_and_forget(inner, "higgs/load", p);
+    if let Some(load_params) = inner.last_load.lock().clone() {
+        // Extract the model id from recorded params before moving them into the task.
+        let id = load_params
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_owned();
+        let inner2 = Arc::clone(inner);
+        tokio::spawn(async move {
+            // Replay failures are intentionally logged-and-dropped (worker just
+            // restarted; user re-drives).
+            match replay_load_await(&inner2, load_params).await {
+                Ok(()) => {
+                    let _ = inner2.events_tx.send(HiggsEvent::ModelLoaded { id });
+                }
+                Err(e) => {
+                    warn!(error = %e, "higgs: replayed load failed after restart");
+                }
+            }
+        });
+    }
+}
+
+/// Send a `higgs/load` RPC and await its response, correlating via the pending map.
+///
+/// Shares the same correlation plumbing as [`Supervisor::request`] but is
+/// called from within the supervisor internals after a worker restart.
+async fn replay_load_await(inner: &Arc<Inner>, params: Value) -> Result<(), HiggsError> {
+    let id = inner.next_id.fetch_add(1, Ordering::Relaxed);
+    let (tx, rx) = oneshot::channel();
+    inner.pending.lock().insert(id, tx);
+
+    let line = rpc::encode(&RpcFrame::Request(RpcRequest {
+        jsonrpc: "2.0".into(),
+        id,
+        method: "higgs/load".to_string(),
+        params,
+    }));
+
+    let send_result = {
+        let guard = inner.write_tx.lock();
+        match guard.as_ref() {
+            Some(tx) => tx.send(line).map_err(|_| ()),
+            None => Err(()),
+        }
+    };
+    if send_result.is_err() {
+        inner.pending.lock().remove(&id);
+        return Err(HiggsError::WorkerDead {
+            context: "replay load: no worker running".into(),
+        });
+    }
+
+    match rx.await {
+        Ok(resp) => {
+            if let Some(err) = resp.error {
+                Err(HiggsError::WorkerRpc {
+                    method: "higgs/load".into(),
+                    message: err.message,
+                })
+            } else {
+                Ok(())
+            }
+        }
+        Err(_) => Err(HiggsError::WorkerDead {
+            context: "replay load: worker died before response".into(),
+        }),
     }
 }
 
@@ -799,23 +867,26 @@ mod tests {
         assert_eq!(r.front().unwrap(), "line-100");
     }
 
-    // ─── Test 6: restart replays scan before load ────────────────────────────
+    // ─── Test 6: restart replays scan before load and emits ModelLoaded ─────────
+    //
+    // The mock factory hands out two transport pairs:
+    //   pair-1: first worker lifetime (killed by dropping test_write_1)
+    //   pair-2: second worker lifetime (receives replayed RPCs; the test drives
+    //           it by reading the replayed higgs/load and writing back an OK)
+    //
+    // Duplex wiring — each pair (A, B) means writing to A comes out of B:
+    //   sup_write_1  ↔ _obs_rx_1  : supervisor writes requests; test ignores them
+    //   test_write_1 ↔ sup_read_1 : drop triggers EOF on supervisor's read half
+    //   sup_write_2  ↔ obs_rx_2   : supervisor writes replayed msgs; test reads here
+    //   test_tx_2    ↔ sup_read_2 : test writes mock OK responses back to supervisor
 
     #[tokio::test]
     async fn restart_replays_scan_then_load() {
-        // First transport: lives until we close test_write_1 (EOF on sup_read_1).
-        // Second transport: receives the replayed messages; we keep it alive.
-        //
-        // Duplex wiring — each pair (A, B) means writing to A comes out of B:
-        //   sup_write_1  ↔ _obs_rx_1 : supervisor writes requests; test ignores them
-        //   test_write_1 ↔ sup_read_1: drop triggers EOF on supervisor's read half
-        //   sup_write_2  ↔ obs_rx_2  : supervisor writes replayed msgs; test reads here
-        //   _test_tx_2   ↔ sup_read_2: kept alive so supervisor read doesn't EOF early
         let (sup_write_1, _obs_rx_1) = tokio::io::duplex(64 * 1024);
         let (test_write_1, sup_read_1) = tokio::io::duplex(64 * 1024);
 
         let (sup_write_2, mut obs_rx_2) = tokio::io::duplex(64 * 1024);
-        let (_test_tx_2, sup_read_2) = tokio::io::duplex(64 * 1024);
+        let (mut test_tx_2, sup_read_2) = tokio::io::duplex(64 * 1024);
 
         let cell_sup_write_1 = Arc::new(Mutex::new(Some(sup_write_1)));
         let cell_sup_read_1 = Arc::new(Mutex::new(Some(sup_read_1)));
@@ -846,6 +917,8 @@ mod tests {
             }
         }));
         sup.start().expect("start");
+
+        let mut events = sup.events();
 
         // Record scan and load so replay has something to send.
         sup.record_last_scan(json!({"dirs": ["/models"]}));
@@ -884,5 +957,30 @@ mod tests {
         assert_eq!(second["method"], "higgs/load", "second replayed method must be higgs/load");
         assert_eq!(first["params"], json!({"dirs": ["/models"]}));
         assert_eq!(second["params"], json!({"id": "org/model"}));
+
+        // Reply to the replayed higgs/load with an OK response so the await
+        // path resolves and ModelLoaded is emitted.
+        let load_id = second["id"].as_u64().expect("load request must carry an id");
+        let ok_line = ok_response(load_id, json!({"id": "org/model"}));
+        write_line(&mut test_tx_2, &ok_line).await;
+
+        // ModelLoaded must arrive on the event channel.
+        let got_loaded = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            loop {
+                match events.recv().await {
+                    Ok(HiggsEvent::ModelLoaded { id }) => return Some(id),
+                    Ok(_) => continue,
+                    Err(_) => return None,
+                }
+            }
+        })
+        .await
+        .expect("timeout waiting for ModelLoaded");
+
+        assert_eq!(
+            got_loaded.as_deref(),
+            Some("org/model"),
+            "ModelLoaded must carry the replayed model id"
+        );
     }
 }
