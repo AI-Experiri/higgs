@@ -30,12 +30,14 @@
 //! rmcp's `TokioChildProcess` / LSP client writers.
 
 use std::collections::{HashMap, VecDeque};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Command;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{info, warn};
 
@@ -617,9 +619,6 @@ async fn replay_load_await(inner: &Arc<Inner>, params: Value) -> Result<(), Higg
 fn production_factory(
     stderr_ring: Arc<Mutex<VecDeque<String>>>,
 ) -> Result<WorkerHalves, HiggsError> {
-    use std::process::Stdio;
-    use tokio::process::Command;
-
     let exe = std::env::current_exe().map_err(|e| HiggsError::WorkerSpawnFailed { source: e })?;
     let mut child = Command::new(exe)
         .arg("--higgs-worker")
@@ -638,7 +637,6 @@ fn production_factory(
     // not std::io::Read, so we read it with a tokio task using AsyncBufReadExt.
     // `child` is moved in so it stays alive until stderr drains.
     tokio::spawn(async move {
-        use tokio::io::AsyncBufReadExt;
         let mut lines = tokio::io::BufReader::new(stderr).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             let mut ring = stderr_ring.lock();

@@ -12,8 +12,18 @@ use std::sync::Arc;
 
 use async_openai::error::{ApiError, WrappedError};
 use async_openai::types::chat::{
-    ChatChoice, ChatCompletionRequestMessage, ChatCompletionResponseMessage, CompletionUsage,
-    CreateChatCompletionRequest, CreateChatCompletionResponse, Role,
+    ChatChoice, ChatCompletionRequestAssistantMessageContent as AssistantContent,
+    ChatCompletionRequestAssistantMessageContentPart as AssistantPart,
+    ChatCompletionRequestDeveloperMessageContent as DeveloperContent,
+    ChatCompletionRequestDeveloperMessageContentPart as DeveloperPart,
+    ChatCompletionRequestMessage, ChatCompletionRequestMessage as Msg,
+    ChatCompletionRequestSystemMessageContent as SystemContent,
+    ChatCompletionRequestSystemMessageContentPart as SystemPart,
+    ChatCompletionRequestToolMessageContent as ToolContent,
+    ChatCompletionRequestToolMessageContentPart as ToolPart,
+    ChatCompletionRequestUserMessageContent as UserContent,
+    ChatCompletionRequestUserMessageContentPart as UserPart, ChatCompletionResponseMessage,
+    CompletionUsage, CreateChatCompletionRequest, CreateChatCompletionResponse, Role,
 };
 use async_openai::types::models::{ListModelResponse, Model};
 use axum::extract::{Query, State};
@@ -364,20 +374,6 @@ fn chat_response(model: String, out: &ChatOutcome) -> CreateChatCompletionRespon
 fn messages_to_pairs(
     messages: &[ChatCompletionRequestMessage],
 ) -> Result<Vec<(String, String)>, String> {
-    use async_openai::types::chat::{
-        ChatCompletionRequestAssistantMessageContent as AssistantContent,
-        ChatCompletionRequestAssistantMessageContentPart as AssistantPart,
-        ChatCompletionRequestDeveloperMessageContent as DeveloperContent,
-        ChatCompletionRequestDeveloperMessageContentPart as DeveloperPart,
-        ChatCompletionRequestMessage as Msg,
-        ChatCompletionRequestSystemMessageContent as SystemContent,
-        ChatCompletionRequestSystemMessageContentPart as SystemPart,
-        ChatCompletionRequestToolMessageContent as ToolContent,
-        ChatCompletionRequestToolMessageContentPart as ToolPart,
-        ChatCompletionRequestUserMessageContent as UserContent,
-        ChatCompletionRequestUserMessageContentPart as UserPart,
-    };
-
     /// Join already-extracted text parts (shimmy convention: `\n`).
     fn join(parts: &[String]) -> String {
         parts.join("\n")

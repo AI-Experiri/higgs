@@ -2,6 +2,7 @@
 //! stores. Model identity is the HuggingFace repo id (`org/model`) everywhere.
 //! Higgs NEVER writes into another app's model storage.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use ggus::{GGuf, GGufMetaMapExt};
@@ -441,10 +442,7 @@ fn scan_ollama(root: &Path, out: &mut Vec<HiggsModel>) -> Result<(), HiggsError>
         // Validate GGUF magic — corrupt/partial blobs are silently skipped,
         // matching shimmy/LM Studio behavior.
         let mut magic = [0u8; 4];
-        match std::fs::File::open(&blob_path).and_then(|mut f| {
-            use std::io::Read;
-            f.read_exact(&mut magic)
-        }) {
+        match std::fs::File::open(&blob_path).and_then(|mut f| f.read_exact(&mut magic)) {
             Ok(()) if &magic == b"GGUF" => {}
             _ => continue,
         }
