@@ -249,21 +249,22 @@ impl Supervisor {
     /// Install a new chat-chunk receiver for the next in-flight chat request.
     ///
     /// Only one chat may be in flight at a time (v1 invariant: the worker
-    /// serialises).  The caller owns the returned receiver and reads deltas
-    /// until the sender is dropped (end of stream).
-    ///
-    /// # Panics (debug only)
-    /// `debug_assert!`s that no existing sink is live when called, catching
-    /// accidental in-flight clobbering during development.
-    pub(crate) fn take_chat_sink(&self) -> mpsc::UnboundedReceiver<String> {
+    /// serialises). Returns `Err(ChatBusy)` [HG012] when a live sink is already
+    /// installed, enforcing the single-in-flight invariant as a real runtime
+    /// guard rather than a debug-only assert. The caller owns the returned
+    /// receiver and reads deltas until the sender is dropped (end of stream).
+    pub(crate) fn take_chat_sink(&self) -> Result<mpsc::UnboundedReceiver<String>, HiggsError> {
         let (tx, rx) = mpsc::unbounded_channel();
         let mut guard = self.inner.chat_sink.lock();
-        debug_assert!(
-            guard.as_ref().is_none_or(mpsc::UnboundedSender::is_closed),
-            "take_chat_sink called while a chat sink is already live (v1 single-in-flight invariant)"
-        );
+        // Reject if a sender is present AND still open (live in-flight chat).
+        if guard
+            .as_ref()
+            .is_some_and(|s| !mpsc::UnboundedSender::is_closed(s))
+        {
+            return Err(HiggsError::ChatBusy);
+        }
         *guard = Some(tx);
-        rx
+        Ok(rx)
     }
 
     /// Clear the active chat-chunk sink.
@@ -316,7 +317,14 @@ impl Supervisor {
 
     /// Build fresh I/O halves, spawn the writer and reader tasks, and install
     /// the mpsc sender in `Inner`.
+    ///
+    /// Resets `stopped` to `false` before launching so a stop→start cycle
+    /// restores normal auto-restart behavior (F2: stop() sets stopped=true but
+    /// start() must allow auto-restart on the new worker lifetime).
     fn do_spawn(&self) -> Result<(), HiggsError> {
+        // Reset the deliberate-stop flag so the new worker's reader_task
+        // will auto-restart on unexpected death (stop→start cycle fix).
+        self.inner.stopped.store(false, Ordering::Relaxed);
         let halves = (self.inner.factory)(self.inner.stderr_ring.clone())?;
         let (write_tx, write_rx) = mpsc::unbounded_channel::<String>();
         *self.inner.write_tx.lock() = Some(write_tx);
@@ -354,9 +362,10 @@ async fn writer_task(mut write: WriteHalf, mut rx: mpsc::UnboundedReceiver<Strin
 ///
 /// Runs as a tokio task.  On EOF or read error:
 /// 1. Fails all pending requests.
-/// 2. Broadcasts `WorkerDied`.
-/// 3. If not stopped: waits 1 s, attempts one respawn; on factory failure →
-///    broadcasts terminal `WorkerDied` and exits.
+/// 2. Broadcasts `WorkerDied` only for genuine unexpected death (not clean stop).
+/// 3. If not stopped: waits 1 s, re-checks `stopped` after the sleep, then
+///    attempts one respawn; on factory failure → broadcasts terminal `WorkerDied`
+///    and exits.
 async fn reader_task(inner: Arc<Inner>, read: ReadHalf) {
     let mut reader = BufReader::new(read).lines();
 
@@ -365,13 +374,18 @@ async fn reader_task(inner: Arc<Inner>, read: ReadHalf) {
         match line_result {
             Ok(Some(line)) => dispatch(&inner, &line),
             Ok(None) => {
-                // EOF — worker exited cleanly.
-                on_worker_death(&inner, None);
+                // EOF — worker exited.
+                let deliberate = inner.stopped.load(Ordering::Relaxed);
+                // Pass `deliberate` so on_worker_death suppresses the event on clean stop.
+                on_worker_death(&inner, None, deliberate);
+                if deliberate {
+                    return;
+                }
+                // 1 s backoff, then re-check stopped before respawning.
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 if inner.stopped.load(Ordering::Relaxed) {
                     return;
                 }
-                // 1 s backoff then one respawn attempt.
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 match attempt_restart(&inner).await {
                     Some(new_read) => {
                         reader = BufReader::new(new_read).lines();
@@ -382,11 +396,16 @@ async fn reader_task(inner: Arc<Inner>, read: ReadHalf) {
             }
             Err(e) => {
                 // I/O error on the read half.
-                on_worker_death(&inner, Some(e.to_string()));
-                if inner.stopped.load(Ordering::Relaxed) {
+                let deliberate = inner.stopped.load(Ordering::Relaxed);
+                on_worker_death(&inner, Some(e.to_string()), deliberate);
+                if deliberate {
                     return;
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                // Re-check stopped after backoff sleep (F1: stop() may have raced).
+                if inner.stopped.load(Ordering::Relaxed) {
+                    return;
+                }
                 match attempt_restart(&inner).await {
                     Some(new_read) => {
                         reader = BufReader::new(new_read).lines();
@@ -452,8 +471,14 @@ fn route_notification(inner: &Arc<Inner>, notif: &RpcNotification) {
     }
 }
 
-/// Handle worker death: fail all pending requests, clear write channel, broadcast event.
-fn on_worker_death(inner: &Arc<Inner>, reason: Option<String>) {
+/// Handle worker death: fail all pending requests, clear write channel, and
+/// (for unexpected deaths only) broadcast `WorkerDied` and log at warn.
+///
+/// `deliberate` is true when `stop()` was called before the EOF was observed —
+/// in that case neither the broadcast event nor the warn log is emitted (clean
+/// shutdown is not a death event). This enforces four-pillar pillar 3: log once
+/// at origin, not at every boundary that observes the same event.
+fn on_worker_death(inner: &Arc<Inner>, reason: Option<String>, deliberate: bool) {
     // Drain and drop all pending senders — the rx.await in `request` sees Err.
     let drained: Vec<_> = inner.pending.lock().drain().collect();
     for (_id, tx) in drained {
@@ -464,54 +489,55 @@ fn on_worker_death(inner: &Arc<Inner>, reason: Option<String>) {
     // Clear chat sink.
     *inner.chat_sink.lock() = None;
 
+    if deliberate {
+        // Clean stop: no event, no warn — the shutdown was requested.
+        info!("higgs worker stopped (deliberate)");
+        return;
+    }
+
+    // Unexpected death: broadcast event (origin log once here).
     let _ = inner.events_tx.send(HiggsEvent::WorkerDied);
     if let Some(r) = reason {
         warn!(detail = %r, "higgs worker died");
     } else {
-        info!("higgs worker exited (EOF)");
-    }
-}
-
-/// Best-effort fire-and-forget replay of one RPC request (no response tracking).
-fn replay_fire_and_forget(inner: &Arc<Inner>, method: &str, params: Value) {
-    let id = inner.next_id.fetch_add(1, Ordering::Relaxed);
-    let line = rpc::encode(&RpcFrame::Request(RpcRequest {
-        jsonrpc: "2.0".into(),
-        id,
-        method: method.to_string(),
-        params,
-    }));
-    let guard = inner.write_tx.lock();
-    if let Some(tx) = guard.as_ref() {
-        if let Err(e) = tx.send(line) {
-            warn!(error = %e, method, "higgs: replay send failed");
-        }
+        warn!("higgs worker exited unexpectedly (EOF)");
     }
 }
 
 /// Best-effort replay of the last successful scan (if any) then load (if any) after restart.
 ///
-/// Scan is replayed first (fire-and-forget) so the worker's model index is
-/// populated before the load request arrives.  The load replay awaits its
-/// response so we can emit [`HiggsEvent::ModelLoaded`] only on confirmed
-/// success — replay failures are intentionally logged-and-dropped (worker just
-/// restarted; user re-drives if needed).
+/// Scan is replayed with awaited response tracking so a scan failure on the
+/// restarted worker is visible in logs (F3: fire-and-forget scan meant the
+/// response was silently dropped, making subsequent load failures misleading).
+/// Load replay awaits its response so we can emit [`HiggsEvent::ModelLoaded`]
+/// only on confirmed success. Both replay failures are intentionally
+/// logged-and-dropped (worker just restarted; user re-drives if needed).
 fn replay_scan_then_load(inner: &Arc<Inner>) {
-    if let Some(p) = inner.last_scan.lock().clone() {
-        replay_fire_and_forget(inner, M_SCAN, p);
+    let scan_params = inner.last_scan.lock().clone();
+    let load_params = inner.last_load.lock().clone();
+
+    if scan_params.is_none() && load_params.is_none() {
+        return;
     }
-    if let Some(load_params) = inner.last_load.lock().clone() {
-        // Extract the model id from recorded params before moving them into the task.
-        let id = load_params
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_owned();
-        let inner2 = Arc::clone(inner);
-        tokio::spawn(async move {
-            // Replay failures are intentionally logged-and-dropped (worker just
-            // restarted; user re-drives).
-            match replay_load_await(&inner2, load_params).await {
+
+    let inner2 = Arc::clone(inner);
+    tokio::spawn(async move {
+        // Scan first (awaited): worker model index must be populated before load.
+        if let Some(p) = scan_params {
+            if let Err(e) = replay_rpc_await(&inner2, M_SCAN, p).await {
+                warn!(error = %e, "higgs: replayed scan failed after restart");
+                // Do not abort: load replay is still worth trying if scan state
+                // was already warm from the previous worker lifetime.
+            }
+        }
+        // Load (awaited): emit ModelLoaded only on confirmed success.
+        if let Some(lp) = load_params {
+            let id = lp
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned();
+            match replay_load_await(&inner2, lp).await {
                 Ok(()) => {
                     let _ = inner2.events_tx.send(HiggsEvent::ModelLoaded { id });
                 }
@@ -519,15 +545,19 @@ fn replay_scan_then_load(inner: &Arc<Inner>) {
                     warn!(error = %e, "higgs: replayed load failed after restart");
                 }
             }
-        });
-    }
+        }
+    });
 }
 
-/// Send a `higgs/load` RPC and await its response, correlating via the pending map.
+/// Send an RPC request and await its response, correlating via the pending map.
 ///
-/// Shares the same correlation plumbing as [`Supervisor::request`] but is
-/// called from within the supervisor internals after a worker restart.
-async fn replay_load_await(inner: &Arc<Inner>, params: Value) -> Result<(), HiggsError> {
+/// Used for replay of scan (and any future awaited replay RPC). Returns the
+/// raw result value on success or a typed error on failure.
+async fn replay_rpc_await(
+    inner: &Arc<Inner>,
+    method: &str,
+    params: Value,
+) -> Result<Value, HiggsError> {
     let id = inner.next_id.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = oneshot::channel();
     inner.pending.lock().insert(id, tx);
@@ -535,7 +565,7 @@ async fn replay_load_await(inner: &Arc<Inner>, params: Value) -> Result<(), Higg
     let line = rpc::encode(&RpcFrame::Request(RpcRequest {
         jsonrpc: "2.0".into(),
         id,
-        method: M_LOAD.to_string(),
+        method: method.to_string(),
         params,
     }));
 
@@ -549,7 +579,7 @@ async fn replay_load_await(inner: &Arc<Inner>, params: Value) -> Result<(), Higg
     if send_result.is_err() {
         inner.pending.lock().remove(&id);
         return Err(HiggsError::WorkerDead {
-            context: "replay load: no worker running".into(),
+            context: format!("replay {method}: no worker running"),
         });
     }
 
@@ -557,17 +587,25 @@ async fn replay_load_await(inner: &Arc<Inner>, params: Value) -> Result<(), Higg
         Ok(resp) => {
             if let Some(err) = resp.error {
                 Err(HiggsError::WorkerRpc {
-                    method: M_LOAD.into(),
+                    method: method.to_string(),
                     message: err.message,
                 })
             } else {
-                Ok(())
+                Ok(resp.result.unwrap_or(Value::Null))
             }
         }
         Err(_) => Err(HiggsError::WorkerDead {
-            context: "replay load: worker died before response".into(),
+            context: format!("replay {method}: worker died before response"),
         }),
     }
+}
+
+/// Send a `higgs/load` RPC and await its response via the shared replay helper.
+///
+/// Delegates to [`replay_rpc_await`] with `M_LOAD`; exists as a named function
+/// to keep `replay_scan_then_load` readable.
+async fn replay_load_await(inner: &Arc<Inner>, params: Value) -> Result<(), HiggsError> {
+    replay_rpc_await(inner, M_LOAD, params).await.map(|_| ())
 }
 
 /// Production factory: re-exec current binary with `--higgs-worker`.
@@ -748,7 +786,7 @@ mod tests {
     async fn chat_chunks_routed() {
         let (sup, mut test_write, _test_read) = make_supervisor();
 
-        let mut rx = sup.take_chat_sink();
+        let mut rx = sup.take_chat_sink().expect("first sink must succeed");
 
         let deltas = ["hello", " world", "!"];
         for d in &deltas {
@@ -893,6 +931,34 @@ mod tests {
         assert_eq!(r.front().unwrap(), "line-100");
     }
 
+    // ─── Test 6-a: concurrent take_chat_sink returns ChatBusy ────────────────
+    //
+    // F8: the second take_chat_sink while one is live must return Err(ChatBusy)
+    // rather than clobbering the first sink.
+
+    #[tokio::test]
+    async fn concurrent_chat_sink_returns_busy() {
+        let (sup, _test_write, _test_read) = make_supervisor();
+
+        // First sink — succeeds.
+        let rx1 = sup.take_chat_sink().expect("first sink must succeed");
+
+        // Second sink while first is still open — must fail with ChatBusy.
+        let result = sup.take_chat_sink();
+        assert!(
+            matches!(result, Err(HiggsError::ChatBusy)),
+            "second take_chat_sink must return ChatBusy, got: {result:?}"
+        );
+
+        // Drop the first receiver — its sender in the lock becomes closed.
+        drop(rx1);
+
+        // Now a third take_chat_sink must succeed (sink was closed).
+        let _rx3 = sup
+            .take_chat_sink()
+            .expect("third sink must succeed after first is dropped");
+    }
+
     // ─── Test 6: restart replays scan before load and emits ModelLoaded ─────────
     //
     // The mock factory hands out two transport pairs:
@@ -966,34 +1032,50 @@ mod tests {
         drop(test_write_1);
 
         // After 1s backoff + restart, the second transport receives
-        // higgs/scan first, then higgs/load.  Read them from obs_rx_2, which
-        // is the duplex peer of sup_write_2 — data written to sup_write_2 by
-        // the supervisor's writer task comes out here.
-        let deadline = std::time::Duration::from_millis(2500);
-        let received = tokio::time::timeout(deadline, async {
-            use tokio::io::AsyncBufReadExt;
+        // higgs/scan first (awaited — F3 fix), then higgs/load (awaited).
+        // obs_rx_2 is the duplex peer of sup_write_2 — data written by the
+        // supervisor's writer task comes out here.
+        //
+        // Because scan is now awaited before load is sent, the test must:
+        //   1. Read the scan line from obs_rx_2.
+        //   2. Write an OK for scan into test_tx_2 so the awaited scan resolves.
+        //   3. Read the load line from obs_rx_2 (sent after scan reply is received).
+        //   4. Write an OK for load so ModelLoaded is emitted.
+        let deadline = std::time::Duration::from_millis(3000);
+
+        use tokio::io::AsyncBufReadExt;
+        let (first_line, second_line) = tokio::time::timeout(deadline, async {
             let mut lines = BufReader::new(&mut obs_rx_2).lines();
-            let mut msgs = Vec::new();
-            // Collect exactly 2 lines.
-            while msgs.len() < 2 {
-                match lines.next_line().await {
-                    Ok(Some(l)) => msgs.push(l),
-                    _ => break,
-                }
-            }
-            msgs
+
+            // Step 1: read the scan RPC.
+            let scan_line = lines
+                .next_line()
+                .await
+                .unwrap()
+                .expect("scan line expected");
+
+            // Step 2: parse its id and reply OK so the awaited scan resolves.
+            let scan_req: serde_json::Value = serde_json::from_str(&scan_line).expect("valid json");
+            let scan_rpc_id = scan_req["id"]
+                .as_u64()
+                .expect("scan request must carry an id");
+            let scan_ok = ok_response(scan_rpc_id, json!([]));
+            write_line(&mut test_tx_2, &scan_ok).await;
+
+            // Step 3: read the load RPC (sent after scan reply).
+            let load_line = lines
+                .next_line()
+                .await
+                .unwrap()
+                .expect("load line expected");
+
+            (scan_line, load_line)
         })
         .await
-        .expect("timeout waiting for replayed messages");
+        .expect("timeout waiting for replayed scan+load messages");
 
-        assert_eq!(
-            received.len(),
-            2,
-            "expected exactly 2 replayed messages, got: {received:?}"
-        );
-
-        let first: serde_json::Value = serde_json::from_str(&received[0]).expect("valid json");
-        let second: serde_json::Value = serde_json::from_str(&received[1]).expect("valid json");
+        let first: serde_json::Value = serde_json::from_str(&first_line).expect("valid json");
+        let second: serde_json::Value = serde_json::from_str(&second_line).expect("valid json");
         assert_eq!(
             first["method"], M_SCAN,
             "first replayed method must be higgs/scan"
@@ -1005,8 +1087,7 @@ mod tests {
         assert_eq!(first["params"], json!({"dirs": ["/models"]}));
         assert_eq!(second["params"], json!({"id": "org/model"}));
 
-        // Reply to the replayed higgs/load with an OK response so the await
-        // path resolves and ModelLoaded is emitted.
+        // Step 4: reply to the replayed higgs/load so ModelLoaded is emitted.
         let load_id = second["id"]
             .as_u64()
             .expect("load request must carry an id");

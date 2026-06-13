@@ -146,13 +146,14 @@ impl HiggsEngine for LlamaCppEngine {
         ctx.decode(&mut batch)
             .map_err(|e| gen_fail("prompt decode", e.to_string()))?;
 
-        // Greedy when temperature is zero, else temp + seeded dist (example chain).
+        // Greedy when temperature is zero, else temp + dist with real per-request
+        // entropy (F5: was hardcoded seed 1234 — fully deterministic across requests).
         let mut sampler = if params.temperature <= 0.0 {
             LlamaSampler::chain_simple([LlamaSampler::greedy()])
         } else {
             LlamaSampler::chain_simple([
                 LlamaSampler::temp(params.temperature),
-                LlamaSampler::dist(1234),
+                LlamaSampler::dist(rand::random::<u32>()),
             ])
         };
 

@@ -92,6 +92,7 @@ pub struct HiggsLoadRequest {
 #[derive(Debug, serde::Serialize, ts_rs::TS)]
 #[ts(export, export_to = "../../../frontend/src/lib/generated/")]
 pub struct HiggsLoadResponse {
+    /// Confirmation status; always `{"status":"ok"}` on success.
     #[serde(flatten)]
     pub status: HiggsOk,
     /// Id of the model that was loaded.
@@ -125,7 +126,8 @@ struct LogsQuery {
 // ── Error mapping ─────────────────────────────────────────────────────────────
 
 /// Map a `HiggsError` to its HTTP status — the single status table for both
-/// surfaces: HG002/HG003 → 404, HG005 → 400, HG006/HG007 → 503, else 500.
+/// surfaces: HG002/HG003 → 404, HG005 → 400, HG006/HG007 → 503,
+/// HG012 → 409 Conflict, else 500.
 pub(crate) fn http_status(err: &HiggsError) -> StatusCode {
     match err {
         HiggsError::ModelNotFound { .. } | HiggsError::ModelNotLoaded { .. } => {
@@ -135,6 +137,7 @@ pub(crate) fn http_status(err: &HiggsError) -> StatusCode {
         HiggsError::WorkerSpawnFailed { .. } | HiggsError::WorkerDead { .. } => {
             StatusCode::SERVICE_UNAVAILABLE
         }
+        HiggsError::ChatBusy => StatusCode::CONFLICT,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }

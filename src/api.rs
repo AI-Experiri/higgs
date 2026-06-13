@@ -274,8 +274,9 @@ impl Higgs {
     ///   consumers (`/v1` with `stream: false`).  Both are retained on purpose —
     ///   callers choose which representation they need.
     ///
-    /// v1 constraint: only one chat may be in flight at a time (the worker
-    /// serialises). See [`Supervisor::take_chat_sink`] for the debug assert.
+    /// v1 constraint: only one chat may be in flight at a time. Returns
+    /// `Err(ChatBusy)` [HG012] when a chat is already in flight; the caller
+    /// must wait for the current request to finish before issuing another.
     pub async fn chat_stream(
         &self,
         messages: Vec<(String, String)>,
@@ -288,7 +289,7 @@ impl Higgs {
         ),
         HiggsError,
     > {
-        let rx = self.sup.take_chat_sink();
+        let rx = self.sup.take_chat_sink()?;
         let sup = Arc::clone(&self.sup);
 
         let msgs: Vec<serde_json::Value> = messages
@@ -628,6 +629,40 @@ mod tests {
         assert_eq!(chunk2, "lo");
     }
 
+    // ── Test 4-a: concurrent chat_stream returns ChatBusy ────────────────────
+    //
+    // F8: a second chat_stream while one is in flight must return Err(ChatBusy)
+    // [HG012]. The first request must not be disturbed.
+
+    #[tokio::test]
+    async fn chat_stream_concurrent_second_returns_busy() {
+        let (sup, _test_write, _test_read) = make_supervisor();
+        let higgs = Higgs {
+            sup: Arc::new(sup),
+            config: parking_lot::Mutex::new(HiggsConfig::default()),
+        };
+
+        // First chat_stream — succeeds (sink installed).
+        let (_rx1, _handle1) = higgs
+            .chat_stream(vec![("user".into(), "first".into())], 16, 0.7)
+            .await
+            .expect("first chat_stream must succeed");
+
+        // Second chat_stream while first is in flight — must fail with ChatBusy.
+        let result = higgs
+            .chat_stream(vec![("user".into(), "second".into())], 16, 0.7)
+            .await;
+        let err = result.expect_err("second concurrent chat_stream must fail");
+        assert!(
+            matches!(err, HiggsError::ChatBusy),
+            "must be ChatBusy [HG012], got: {err}"
+        );
+        assert!(
+            err.to_string().contains("[HG012]"),
+            "display must carry [HG012]: {err}"
+        );
+    }
+
     // ── Test 5: chat_stream against dead worker clears sink ───────────────────
 
     /// When the chat request fails (write_tx is None — worker not running), the
@@ -661,9 +696,11 @@ mod tests {
             .expect("join error");
         assert!(result.is_err(), "chat against dead worker must fail");
 
-        // After the failed request, a subsequent take_chat_sink must not debug_assert.
-        // (In release builds the assert is a no-op; in debug builds it would panic if
-        // the sink was not cleared.)
-        let _rx2 = higgs.sup.take_chat_sink();
+        // After the failed request, a subsequent take_chat_sink must succeed
+        // (sink was cleared on error path, not live → not ChatBusy).
+        let _rx2 = higgs
+            .sup
+            .take_chat_sink()
+            .expect("take_chat_sink must succeed after failed chat");
     }
 }
