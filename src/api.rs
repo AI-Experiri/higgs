@@ -19,7 +19,8 @@ use crate::worker::{M_CHAT, M_LOAD, M_SCAN, M_STATUS, M_UNLOAD};
 // ── HiggsConfig ───────────────────────────────────────────────────────────────
 
 /// Host-supplied configuration (the host maps its own config table onto this).
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[ts(export, export_to = "../../../frontend/src/lib/generated/")]
 pub struct HiggsConfig {
     /// LM Studio model directories to scan.
     pub lmstudio_dirs: Vec<PathBuf>,
