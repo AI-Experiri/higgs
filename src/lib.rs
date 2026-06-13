@@ -9,6 +9,7 @@
 pub mod api;
 pub mod diagnostic;
 pub mod rpc;
+pub mod serve;
 pub mod supervisor;
 pub mod worker;
 

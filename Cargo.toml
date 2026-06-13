@@ -11,6 +11,11 @@ tokio = { version = "1", features = ["full"] }
 # Default OS-specific directories (home, config, cache, data). 246M downloads.
 dirs = "5"
 axum = { version = "0.8" }
+# OpenAI wire types ONLY (no HTTP client): /v1 request/response/chunk shapes
+# come from this crate verbatim — never hand-rolled.
+async-openai = { version = "0.41", default-features = false, features = ["chat-completion-types", "model-types"] }
+# chatcmpl-{uuid} response ids (mirrors shimmy/omlx id construction)
+uuid = { version = "1", features = ["v4"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
