@@ -57,6 +57,11 @@ pub enum HiggsError {
     #[snafu(display("[HG010] ollama manifest invalid: {path}: {detail}"))]
     #[diagnostic(code(HG010))]
     OllamaManifestInvalid { path: String, detail: String },
+
+    /// A generation-time failure: context creation, prompt decode, sampling, detokenize, or loop decode.
+    #[snafu(display("[HG011] generation failed at {stage}: {reason}"))]
+    #[diagnostic(code(HG011))]
+    GenerationFailed { stage: String, reason: String },
 }
 
 #[cfg(test)]

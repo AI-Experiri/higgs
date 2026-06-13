@@ -4,6 +4,8 @@
 
 use std::path::{Path, PathBuf};
 
+use ggus::{GGuf, GGufMetaMapExt};
+use memmap2::MmapOptions;
 use serde::{Deserialize, Serialize};
 
 use crate::diagnostic::HiggsError;
@@ -22,7 +24,8 @@ pub enum HiggsModelSource {
 #[ts(export, export_to = "../../../frontend/src/lib/generated/")]
 pub struct HiggsModel {
     /// HuggingFace repo id, `org/model` — the identity used everywhere.
-    /// Ollama-sourced models currently use `ollama/{name}:{tag}` (PARKED: pending user decision).
+    /// Ollama-sourced models keep their established Ollama name (`ollama/{name}:{tag}`);
+    /// no HuggingFace id is fabricated.
     pub id: String,
     /// Absolute path to the GGUF file.
     pub path: String,
@@ -34,6 +37,18 @@ pub struct HiggsModel {
     pub quant: Option<String>,
     /// Which store the file was found in.
     pub source: HiggsModelSource,
+    /// Model architecture read from GGUF header (e.g. `"llama"`, `"gemma3"`).
+    /// `None` when the header could not be read or the field is absent.
+    #[ts(optional)]
+    pub arch: Option<String>,
+    /// Training context length (`{arch}.context_length`) from the GGUF header.
+    /// `None` when the header could not be read or the field is absent.
+    #[ts(type = "number")]
+    #[ts(optional)]
+    pub ctx_train: Option<u64>,
+    /// Whether `tokenizer.chat_template` is present in the GGUF header.
+    /// `false` when the header could not be read.
+    pub has_chat_template: bool,
 }
 
 /// Scans configured model directories; owns the resulting catalog.
@@ -81,6 +96,32 @@ impl ModelStore {
     pub fn get(&self, id: &str) -> Option<&HiggsModel> {
         self.models.iter().find(|m| m.id == id)
     }
+}
+
+// ---------------------------------------------------------------------------
+// GGUF header enrichment
+// ---------------------------------------------------------------------------
+
+/// Read GGUF header metadata from `path` and fill in the enrichment fields of
+/// `model`. A corrupt or unreadable header leaves the fields at `None`/`false`
+/// — the model stays cataloged. No new error codes are raised here.
+fn enrich_gguf_metadata(model: &mut HiggsModel) {
+    let file = match std::fs::File::open(&model.path) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    // SAFETY: standard read-only mmap; we do not mutate the mapping.
+    let mmap = match unsafe { MmapOptions::new().map(&file) } {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    let gguf = match GGuf::new(&mmap) {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    model.arch = gguf.general_architecture().ok().map(ToString::to_string);
+    model.ctx_train = gguf.llm_context_length().ok().map(|n| n as u64);
+    model.has_chat_template = gguf.tokenizer_chat_template().is_ok();
 }
 
 // ---------------------------------------------------------------------------
@@ -168,13 +209,18 @@ fn scan_lmstudio(root: &Path, out: &mut Vec<HiggsModel>) -> Result<(), HiggsErro
                 }
                 let size_bytes = file_path.metadata().map(|m| m.len()).unwrap_or(0);
                 let quant = quant_from_filename(&fname);
-                out.push(HiggsModel {
+                let mut model = HiggsModel {
                     id: id.clone(),
                     path: file_path.display().to_string(),
                     size_bytes,
                     quant,
                     source: HiggsModelSource::LmStudio,
-                });
+                    arch: None,
+                    ctx_train: None,
+                    has_chat_template: false,
+                };
+                enrich_gguf_metadata(&mut model);
+                out.push(model);
             }
         }
     }
@@ -275,13 +321,18 @@ fn scan_hf_cache(root: &Path, out: &mut Vec<HiggsModel>) -> Result<(), HiggsErro
                 }
                 let size_bytes = file_path.metadata().map(|m| m.len()).unwrap_or(0);
                 let quant = quant_from_filename(&fname);
-                out.push(HiggsModel {
+                let mut model = HiggsModel {
                     id: id.clone(),
                     path: file_path.display().to_string(),
                     size_bytes,
                     quant,
                     source: HiggsModelSource::HfCache,
-                });
+                    arch: None,
+                    ctx_train: None,
+                    has_chat_template: false,
+                };
+                enrich_gguf_metadata(&mut model);
+                out.push(model);
             }
         }
     }
@@ -388,16 +439,21 @@ fn scan_ollama(root: &Path, out: &mut Vec<HiggsModel>) -> Result<(), HiggsError>
 
         let size_bytes = blob_path.metadata().map(|m| m.len()).unwrap_or(0);
 
-        // PARKED: identity form pending user decision (spec: HF repo id everywhere)
+        // Decided: Ollama-sourced models keep their established Ollama name (no HF id fabrication).
         let id = format!("ollama/{name}:{tag}");
 
-        out.push(HiggsModel {
+        let mut model = HiggsModel {
             id,
             path: blob_path.display().to_string(),
             size_bytes,
             quant: None,
             source: HiggsModelSource::Ollama,
-        });
+            arch: None,
+            ctx_train: None,
+            has_chat_template: false,
+        };
+        enrich_gguf_metadata(&mut model);
+        out.push(model);
     }
 
     Ok(())
@@ -489,6 +545,10 @@ mod tests {
         assert_eq!(models[0].id, "google/gemma-4-12b");
         assert_eq!(models[0].quant, Some("Q4_K_M".into()));
         assert_eq!(models[0].source, HiggsModelSource::LmStudio);
+        // Fake GGUF (not a valid header) — enrichment must tolerate and leave None/false.
+        assert_eq!(models[0].arch, None);
+        assert_eq!(models[0].ctx_train, None);
+        assert!(!models[0].has_chat_template);
     }
 
     #[test]
@@ -574,5 +634,69 @@ mod tests {
         assert_eq!(quant_from_filename("m-Q4_K_M.gguf"), Some("Q4_K_M".into()));
         assert_eq!(quant_from_filename("m.f16.gguf"), Some("f16".into()));
         assert_eq!(quant_from_filename("notgguf.bin"), None);
+    }
+
+    /// Build a minimal valid GGUF file in memory using the ggus writer API and
+    /// verify that `enrich_gguf_metadata` extracts architecture and context length.
+    ///
+    /// Wire encoding for a GGUF String metadata value:
+    ///   u64_le(byte_length) ++ utf8_bytes  (no null terminator)
+    /// Wire encoding for a U32 metadata value: 4 bytes little-endian u32.
+    #[test]
+    fn valid_gguf_header_enrichment() {
+        use ggus::{GGufFileHeader, GGufFileWriter, GGufMetaDataValueType};
+        use std::io::Cursor;
+
+        // Encode a GGUF String value: 8-byte LE length prefix + UTF-8 bytes.
+        fn gguf_string(s: &str) -> Vec<u8> {
+            let bytes = s.as_bytes();
+            let mut out = Vec::with_capacity(8 + bytes.len());
+            out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            out.extend_from_slice(bytes);
+            out
+        }
+
+        // 3 metadata keys: general.architecture, llama.context_length, tokenizer.chat_template
+        let header = GGufFileHeader::new(3, 0, 3);
+        let mut buf = Cursor::new(Vec::<u8>::new());
+        let mut writer = GGufFileWriter::new(&mut buf, header).unwrap();
+
+        writer
+            .write_meta_kv(
+                "general.architecture",
+                GGufMetaDataValueType::String,
+                &gguf_string("llama"),
+            )
+            .unwrap();
+        writer
+            .write_meta_kv(
+                "llama.context_length",
+                GGufMetaDataValueType::U32,
+                &4096u32.to_le_bytes(),
+            )
+            .unwrap();
+        writer
+            .write_meta_kv(
+                "tokenizer.chat_template",
+                GGufMetaDataValueType::String,
+                &gguf_string("{% for m in messages %}{{ m.content }}{% endfor %}"),
+            )
+            .unwrap();
+
+        // No tensors — finish with write_data = false.
+        writer.finish::<Vec<u8>>(false).finish().unwrap();
+
+        // Write to a tempfile and scan it via ModelStore.
+        let dir = TempDir::new().unwrap();
+        let gguf_path = dir.path().join("myorg/mymodel/model-Q4_K_M.gguf");
+        write_file(&gguf_path, buf.into_inner().as_slice());
+
+        let mut store = ModelStore::default();
+        let models = store.scan(&[dir.path().to_path_buf()], &[], &[]).unwrap();
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].arch.as_deref(), Some("llama"), "arch should be extracted");
+        assert_eq!(models[0].ctx_train, Some(4096), "ctx_train should be extracted");
+        assert!(models[0].has_chat_template, "has_chat_template should be true");
     }
 }

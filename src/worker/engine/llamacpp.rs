@@ -32,8 +32,6 @@ struct LoadedModel {
     model: LlamaModel,
     /// Load-time knobs; `ctx_len`/`threads` shape the per-request context.
     params: LoadParams,
-    /// GGUF path — the failure identity in [HG004]/[HG003] diagnostics.
-    path: String,
 }
 
 /// llama.cpp-backed [`HiggsEngine`]. Hosts one loaded model at a time (v1);
@@ -52,11 +50,7 @@ impl HiggsEngine for LlamaCppEngine {
             LlamaModel::load_from_file(backend(), path, &model_params).map_err(|e| {
                 HiggsError::EngineLoadFailed { id: path.to_string(), reason: e.to_string() }
             })?;
-        self.loaded = Some(LoadedModel {
-            model,
-            params: params.clone(),
-            path: path.to_string(),
-        });
+        self.loaded = Some(LoadedModel { model, params: params.clone() });
         Ok(())
     }
 
@@ -75,35 +69,38 @@ impl HiggsEngine for LlamaCppEngine {
         sink: &mut dyn FnMut(&str),
     ) -> Result<(String, &'static str), HiggsError> {
         let Some(loaded) = self.loaded.as_ref() else {
-            return Err(HiggsError::ModelNotLoaded { id: "(none)".into() });
+            // defensive guard; worker checks first — id unknown at engine level
+            return Err(HiggsError::ModelNotLoaded { id: "unloaded".into() });
         };
-        let fail = |reason: String| HiggsError::EngineLoadFailed {
-            id: loaded.path.clone(),
+        let gen_fail = |stage: &'static str, reason: String| HiggsError::GenerationFailed {
+            stage: stage.to_string(),
             reason,
         };
 
-        // GGUF-embedded chat template; the crate prescribes the named
-        // "chatml" template as the fallback when the model embeds none.
+        // GGUF-embedded chat template; fall back to "chatml" when the model embeds none.
         let template = match loaded.model.chat_template(None) {
             Ok(t) => t,
-            Err(_) => LlamaChatTemplate::new("chatml")
-                .map_err(|e| fail(format!("chatml fallback template: {e}")))?,
+            Err(e) => {
+                tracing::warn!(error = %e, "GGUF chat template unavailable; falling back to chatml");
+                LlamaChatTemplate::new("chatml")
+                    .map_err(|e| gen_fail("chatml fallback template", e.to_string()))?
+            }
         };
         let chat: Vec<LlamaChatMessage> = messages
             .iter()
             .map(|m| LlamaChatMessage::new(m.role.clone(), m.content.clone()))
             .collect::<Result<_, _>>()
-            .map_err(|e| fail(format!("chat message: {e}")))?;
+            .map_err(|e| gen_fail("chat message build", e.to_string()))?;
         let prompt = loaded
             .model
             .apply_chat_template(&template, &chat, true)
-            .map_err(|e| fail(format!("apply chat template: {e}")))?;
+            .map_err(|e| gen_fail("apply chat template", e.to_string()))?;
 
         // Fit check BEFORE any decode: prompt + full generation budget must fit.
         let tokens = loaded
             .model
             .str_to_token(&prompt, AddBos::Always)
-            .map_err(|e| fail(format!("tokenize prompt: {e}")))?;
+            .map_err(|e| gen_fail("tokenize prompt", e.to_string()))?;
         let n_ctx = loaded.params.ctx_len as usize;
         if tokens.len() + params.max_tokens > n_ctx {
             return Err(HiggsError::ContextOverflow {
@@ -128,18 +125,18 @@ impl HiggsEngine for LlamaCppEngine {
         let mut ctx = loaded
             .model
             .new_context(backend(), ctx_params)
-            .map_err(|e| fail(format!("create context: {e}")))?;
+            .map_err(|e| gen_fail("create context", e.to_string()))?;
 
         // Prompt feed: logits only for the last prompt token (example shape).
         let mut batch = LlamaBatch::new(tokens.len().max(1), 1);
         let last_index = tokens.len().saturating_sub(1);
         for (i, token) in tokens.into_iter().enumerate() {
-            let pos = i32::try_from(i).map_err(|e| fail(format!("prompt position: {e}")))?;
+            let pos = i32::try_from(i).map_err(|e| gen_fail("prompt position", e.to_string()))?;
             batch
                 .add(token, pos, &[0], i == last_index)
-                .map_err(|e| fail(format!("batch add: {e}")))?;
+                .map_err(|e| gen_fail("batch add", e.to_string()))?;
         }
-        ctx.decode(&mut batch).map_err(|e| fail(format!("prompt decode: {e}")))?;
+        ctx.decode(&mut batch).map_err(|e| gen_fail("prompt decode", e.to_string()))?;
 
         // Greedy when temperature is zero, else temp + seeded dist (example chain).
         let mut sampler = if params.temperature <= 0.0 {
@@ -164,7 +161,7 @@ impl HiggsEngine for LlamaCppEngine {
             let piece = loaded
                 .model
                 .token_to_piece(token, &mut decoder, true, None)
-                .map_err(|e| fail(format!("detokenize: {e}")))?;
+                .map_err(|e| gen_fail("detokenize", e.to_string()))?;
             // The UTF-8 decoder buffers partial multi-byte sequences — only
             // forward pieces that decoded to visible text.
             if !piece.is_empty() {
@@ -178,9 +175,9 @@ impl HiggsEngine for LlamaCppEngine {
             batch.clear();
             batch
                 .add(token, n_cur, &[0], true)
-                .map_err(|e| fail(format!("batch add: {e}")))?;
+                .map_err(|e| gen_fail("batch add", e.to_string()))?;
             n_cur += 1;
-            ctx.decode(&mut batch).map_err(|e| fail(format!("decode: {e}")))?;
+            ctx.decode(&mut batch).map_err(|e| gen_fail("loop decode", e.to_string()))?;
         };
         Ok((full, finish_reason))
     }

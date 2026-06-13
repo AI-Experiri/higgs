@@ -153,7 +153,7 @@ impl WorkerState {
             M_CHAT => {
                 if self.loaded.is_none() {
                     return Err(to_rpc_error(&HiggsError::ModelNotLoaded {
-                        id: "(none)".into(),
+                        id: "unloaded".into(),
                     }));
                 }
                 let request_id = req.params.get("request_id").cloned().unwrap_or(Value::Null);
@@ -173,18 +173,24 @@ impl WorkerState {
                         .and_then(Value::as_f64)
                         .map_or(0.7, |v| v as f32),
                 };
+                let mut chunk_write_failed = false;
                 let mut sink = |delta: &str| {
                     let note = RpcNotification {
                         jsonrpc: "2.0".into(),
                         method: N_CHAT_CHUNK.into(),
                         params: json!({"request_id": request_id.clone(), "delta": delta}),
                     };
-                    let _ = writeln!(writer, "{}", encode(&RpcFrame::Notification(note)));
+                    if writeln!(writer, "{}", encode(&RpcFrame::Notification(note))).is_err() {
+                        chunk_write_failed = true;
+                    }
                 };
                 let (content, finish_reason) = self
                     .engine
                     .chat(&messages, &gen, &mut sink)
                     .map_err(|e| to_rpc_error(&e))?;
+                if chunk_write_failed {
+                    tracing::warn!("chat chunk write failed; supervisor pipe broken");
+                }
                 Ok(json!({"content": content, "finish_reason": finish_reason}))
             }
             other => {

@@ -42,7 +42,9 @@ pub trait HiggsEngine: Send {
     /// Render the GGUF-embedded chat template over `messages` and stream
     /// completion deltas into `sink`. Returns (full_text, finish_reason)
     /// where finish_reason is "stop" (EOG) or "length" (max_tokens).
-    /// Fails with [HG005] when the prompt cannot fit, [HG004] on engine failures.
+    /// Fails with [HG005] when the prompt cannot fit, [HG004] on load-state errors,
+    /// [HG011] on generation failures (context create, prompt decode, sampler, detokenize,
+    /// loop decode).
     fn chat(
         &mut self,
         messages: &[EngineMessage],

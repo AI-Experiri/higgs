@@ -20,6 +20,9 @@ ts-rs = { version = "10", features = ["serde-compat", "serde-json-impl"] }
 llama-cpp-2 = "0.1"
 # token_to_piece (the crate's non-deprecated detokenizer) takes &mut encoding_rs::Decoder
 encoding_rs = "0.8"
+# Header-only GGUF metadata reading (memory-maps the file; weights are never loaded)
+ggus = "0.5.1"
+memmap2 = "0.9"
 
 [dev-dependencies]
 tempfile = "3"
