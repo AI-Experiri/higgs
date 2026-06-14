@@ -1,0 +1,68 @@
+//! `higgs-server` — the standalone higgs runtime as its own process.
+//!
+//! higgs is a self-contained local-model server (OpenAI `/v1/*` + its own
+//! `/api/higgs/*` control surface). It owns its whole HTTP surface on its own
+//! port; other apps (jigglebot included) consume it purely as an
+//! OpenAI-compatible endpoint via HTTP — nothing imports higgs's internals.
+//!
+//! Crash isolation: the worker supervisor re-executes THIS binary with
+//! `--higgs-worker` (Chromium model). That flag is detected before anything
+//! touches stdout, because `worker_main()` owns stdin/stdout for NDJSON JSON-RPC.
+//!
+//! Configuration (env):
+//!   HIGGS_BIND   bind address      (default `127.0.0.1` — localhost only)
+//!   HIGGS_PORT   listen port       (default `11434`)
+//!   RUST_LOG     tracing filter    (default `info`)
+//!
+//! ```text
+//! higgs-server                       # 127.0.0.1:11434
+//! HIGGS_BIND=0.0.0.0 HIGGS_PORT=1234 higgs-server   # LAN-reachable on :1234
+//! ```
+
+use std::sync::Arc;
+
+use higgs::{Higgs, HiggsConfig};
+
+fn main() {
+    // Worker role: detect BEFORE tracing/anything writes stdout — the worker
+    // speaks NDJSON JSON-RPC over stdio and must own it exclusively.
+    if std::env::args().skip(1).any(|a| a == "--higgs-worker") {
+        higgs::worker::worker_main();
+        return;
+    }
+
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
+    let bind = std::env::var("HIGGS_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let port: u16 = std::env::var("HIGGS_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(11434);
+    let addr = format!("{bind}:{port}");
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+
+    rt.block_on(async move {
+        let higgs = Arc::new(Higgs::new(HiggsConfig::default()));
+        if let Err(e) = higgs.start().await {
+            tracing::error!(error = %e, "higgs failed to start (worker spawn)");
+            std::process::exit(1);
+        }
+
+        let app = higgs::serve::router(Arc::clone(&higgs));
+        let listener = tokio::net::TcpListener::bind(&addr)
+            .await
+            .unwrap_or_else(|e| panic!("bind {addr}: {e}"));
+
+        tracing::info!(%addr, "higgs-server listening — /v1 (OpenAI) + /api/higgs (control)");
+        axum::serve(listener, app).await.expect("serve");
+    });
+}
