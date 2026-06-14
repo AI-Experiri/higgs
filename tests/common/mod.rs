@@ -16,7 +16,14 @@ pub struct ServerGuard {
 
 impl Drop for ServerGuard {
     fn drop(&mut self) {
-        let _ = self.child.kill();
+        // SIGTERM (not SIGKILL): higgs-server shuts down gracefully — stopping
+        // its worker and running at-exit handlers — then we reap it. Under
+        // coverage instrumentation the graceful exit is what flushes the spawned
+        // process's profile; a hard kill() would discard it.
+        // SAFETY: a plain kill(2) on our own child's pid.
+        unsafe {
+            libc::kill(self.child.id() as libc::pid_t, libc::SIGTERM);
+        }
         let _ = self.child.wait();
     }
 }

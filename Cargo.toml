@@ -47,6 +47,9 @@ http-body-util = "0.1"
 # HTTP client for the black-box integration tests (spawn higgs-server, drive /v1
 # + /api/higgs over real HTTP). rustls to avoid a system OpenSSL dependency.
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+# SIGTERM the spawned server for graceful shutdown (so its coverage profile
+# flushes — a hard SIGKILL would drop it).
+libc = "0.2"
 
 [lints]
 workspace = true

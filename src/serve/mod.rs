@@ -259,6 +259,24 @@ pub fn router(higgs: Arc<Higgs>) -> Router {
         .with_state(higgs)
 }
 
+/// Serve the higgs router on `listener`, shutting down **gracefully** when
+/// `shutdown` resolves: in-flight requests drain, then the worker is stopped
+/// via [`Higgs::stop`]. The single graceful-shutdown entry point for any host —
+/// the `higgs-server` binary wires it to SIGTERM/Ctrl-C; tests pass their own
+/// future. Returns the serve I/O error, if any.
+pub async fn serve_with_shutdown(
+    higgs: Arc<Higgs>,
+    listener: tokio::net::TcpListener,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
+    let app = router(Arc::clone(&higgs));
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await?;
+    higgs.stop().await;
+    Ok(())
+}
+
 /// CORS for higgs's standalone listener: the frontend calls higgs's own port
 /// cross-origin (from the Tauri webview or the dev server), so the local UI
 /// origins must be allowed. Localhost/webview only — not a public surface.

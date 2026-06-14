@@ -22,6 +22,7 @@
 use std::sync::Arc;
 
 use higgs::{Higgs, HiggsConfig};
+use tokio::signal;
 
 fn main() {
     // Worker role: detect BEFORE tracing/anything writes stdout — the worker
@@ -57,12 +58,40 @@ fn main() {
             std::process::exit(1);
         }
 
-        let app = higgs::serve::router(Arc::clone(&higgs));
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
             .unwrap_or_else(|e| panic!("bind {addr}: {e}"));
 
         tracing::info!(%addr, "higgs-server listening — /v1 (OpenAI) + /api/higgs (control)");
-        axum::serve(listener, app).await.expect("serve");
+        // Graceful shutdown on SIGTERM/Ctrl-C: drain requests, then stop the
+        // worker. The crate owns the shutdown semantics (serve_with_shutdown).
+        if let Err(e) = higgs::serve::serve_with_shutdown(higgs, listener, shutdown_signal()).await
+        {
+            tracing::error!(error = %e, "higgs-server serve failed");
+            std::process::exit(1);
+        }
     });
+}
+
+/// Resolve when the process is asked to terminate — SIGTERM (the standard
+/// supervisor/`kill` signal) or Ctrl-C. Graceful shutdown lets in-flight
+/// requests finish and runs normal at-exit handlers (which, under coverage
+/// instrumentation, flush this process's profile).
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
 }
