@@ -5,6 +5,14 @@
 //! for the frontend). `/v1/models` lists LOADED models only (no JIT in v1:
 //! chat against an unloaded model is a 404). Spec:
 //! docs/superpowers/specs/2026-06-12-higgs-runtime-design.md
+//!
+//! ## Adding a control endpoint
+//!
+//! 1. Define a `Higgs*` response struct with `#[derive(serde::Serialize, ts_rs::TS)]`
+//!    and `#[ts(export, export_to = "…/frontend/src/lib/generated/")]`; add its
+//!    re-export line to `frontend/src/lib/types.ts`.
+//! 2. Write an `async fn control_<name>(State(higgs): State<Arc<Higgs>>) -> Response`.
+//! 3. Register it in [`router`] under `/api/higgs/<name>`.
 
 mod stream;
 
@@ -26,7 +34,7 @@ use async_openai::types::chat::{
     CompletionUsage, CreateChatCompletionRequest, CreateChatCompletionResponse, Role,
 };
 use async_openai::types::models::{ListModelResponse, Model};
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -70,10 +78,24 @@ impl Default for HiggsOk {
 #[ts(export, export_to = "../../../frontend/src/lib/generated/")]
 pub struct HiggsModelsResponse {
     /// Models discovered by a live scan of the configured directories.
-    pub models: Vec<HiggsModel>,
+    pub models: Vec<HiggsModelEntry>,
     /// Id of the currently loaded model, if any — matches `HiggsModel::id`.
     #[ts(optional)]
     pub loaded_id: Option<String>,
+}
+
+/// Per-model entry in `GET /api/higgs/models`: enriches [`HiggsModel`] with
+/// request-derived fields computed by the control handler.
+#[derive(Debug, serde::Serialize, ts_rs::TS)]
+#[ts(export, export_to = "../../../frontend/src/lib/generated/")]
+pub struct HiggsModelEntry {
+    /// All canonical model fields (id, path, size_bytes, quant, source, arch, ctx_train, has_chat_template).
+    #[serde(flatten)]
+    pub model: HiggsModel,
+    /// Load state: `"loaded"` if this model is currently resident, `"not-loaded"` otherwise.
+    pub state: String,
+    /// File format — always `"gguf"` for higgs-discovered models.
+    pub format: String,
 }
 
 /// Request body for `POST /api/higgs/models/load`.
@@ -195,6 +217,26 @@ fn control_error(err: &HiggsError) -> (StatusCode, Json<HiggsErrorResponse>) {
 
 // ── Router ────────────────────────────────────────────────────────────────────
 
+/// The llama-cpp-2 crate version bundled with this build.
+///
+/// llama-cpp-2 does not expose a runtime build-time constant, so we
+/// bake the dependency version from the lock file as a compile-time const.
+const LLAMA_CPP_2_VERSION: &str = "0.1.139";
+
+/// Response for `GET /api/higgs/version`.
+#[derive(Debug, serde::Serialize, ts_rs::TS)]
+#[ts(export, export_to = "../../../frontend/src/lib/generated/")]
+pub struct HiggsVersionResponse {
+    /// Higgs crate version from Cargo.toml (`CARGO_PKG_VERSION`).
+    pub higgs: String,
+    /// Human-readable engine name.
+    pub engine: String,
+    /// llama-cpp-2 dependency version.
+    pub engine_version: String,
+    /// File formats this runtime supports.
+    pub supported_formats: Vec<String>,
+}
+
 /// Build the higgs router: OpenAI-compatible `/v1` + `/api/higgs/*` control.
 ///
 /// The host nests or merges this into its own server; all state flows through
@@ -206,10 +248,12 @@ pub fn router(higgs: Arc<Higgs>) -> Router {
         .route("/api/higgs/models", get(control_models))
         .route("/api/higgs/models/load", post(control_load))
         .route("/api/higgs/models/unload", post(control_unload))
+        .route("/api/higgs/models/{id}", get(control_model_by_id))
         .route("/api/higgs/status", get(control_status))
         .route("/api/higgs/logs", get(control_logs))
         .route("/api/higgs/worker/start", post(control_worker_start))
         .route("/api/higgs/worker/stop", post(control_worker_stop))
+        .route("/api/higgs/version", get(control_version))
         .with_state(higgs)
 }
 
@@ -475,7 +519,68 @@ async fn control_models(State(higgs): State<Arc<Higgs>>) -> Response {
             return control_error(&err).into_response();
         }
     };
-    Json(HiggsModelsResponse { models, loaded_id }).into_response()
+    let entries: Vec<HiggsModelEntry> = models
+        .into_iter()
+        .map(|m| {
+            let is_loaded = loaded_id.as_deref() == Some(m.id.as_str());
+            HiggsModelEntry {
+                state: if is_loaded {
+                    "loaded".to_owned()
+                } else {
+                    "not-loaded".to_owned()
+                },
+                format: "gguf".to_owned(),
+                model: m,
+            }
+        })
+        .collect();
+    Json(HiggsModelsResponse {
+        models: entries,
+        loaded_id,
+    })
+    .into_response()
+}
+
+/// `GET /api/higgs/models/:id` — single enriched model by HuggingFace repo id.
+///
+/// Returns [`HiggsModelEntry`] on success, or 404 [`HiggsErrorResponse`] when the
+/// id is absent from the scanned catalog.
+async fn control_model_by_id(State(higgs): State<Arc<Higgs>>, Path(id): Path<String>) -> Response {
+    tracing::info!(id = %id, "higgs: GET /api/higgs/models/:id");
+    let models = match higgs.scan().await {
+        Ok(m) => m,
+        Err(err) => {
+            tracing::warn!(id = %id, error = %err, "higgs: scan failed");
+            return control_error(&err).into_response();
+        }
+    };
+    let loaded_id = match higgs.status().await {
+        Ok(s) => s.loaded.map(|l| l.id),
+        Err(err) => {
+            tracing::warn!(id = %id, error = %err, "higgs: status failed");
+            return control_error(&err).into_response();
+        }
+    };
+    match models.into_iter().find(|m| m.id == id) {
+        Some(model) => {
+            let is_loaded = loaded_id.as_deref() == Some(model.id.as_str());
+            let entry = HiggsModelEntry {
+                state: if is_loaded {
+                    "loaded".to_owned()
+                } else {
+                    "not-loaded".to_owned()
+                },
+                format: "gguf".to_owned(),
+                model,
+            };
+            Json(entry).into_response()
+        }
+        None => {
+            let err = HiggsError::ModelNotFound { id };
+            tracing::warn!(error = %err, "higgs: model not found");
+            control_error(&err).into_response()
+        }
+    }
 }
 
 /// `POST /api/higgs/models/load` — load a model by id; absent parameters
@@ -560,6 +665,17 @@ async fn control_worker_stop(State(higgs): State<Arc<Higgs>>) -> Json<HiggsOk> {
     tracing::warn!("higgs: stopping worker");
     higgs.stop().await;
     Json(HiggsOk::new())
+}
+
+/// `GET /api/higgs/version` — higgs build version and engine info.
+async fn control_version() -> Json<HiggsVersionResponse> {
+    tracing::info!("higgs: GET /api/higgs/version");
+    Json(HiggsVersionResponse {
+        higgs: env!("CARGO_PKG_VERSION").to_owned(),
+        engine: "llama.cpp via llama-cpp-2".to_owned(),
+        engine_version: LLAMA_CPP_2_VERSION.to_owned(),
+        supported_formats: vec!["gguf".to_owned()],
+    })
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -929,7 +1045,99 @@ mod tests {
         assert_eq!(v["status"], "ok");
     }
 
-    // ── Test 7: logs endpoint shape and tail semantics ────────────────────────
+    // ── Test 7: control_model_by_id found ────────────────────────────────────
+
+    #[tokio::test]
+    async fn control_model_by_id_found() {
+        let (sup, mut test_write, _test_read, _ring) = make_supervisor();
+        let app = make_app(sup);
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            // scan response
+            write_response(
+                &mut test_write,
+                1,
+                serde_json::json!([{
+                    "id": "org/model",
+                    "path": "/models/model.gguf",
+                    "size_bytes": 4000000000u64,
+                    "quant": "Q4_K_M",
+                    "source": "LmStudio",
+                    "arch": "llama",
+                    "ctx_train": 8192u64,
+                    "has_chat_template": true,
+                }]),
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            // status response (nothing loaded)
+            write_response(
+                &mut test_write,
+                2,
+                serde_json::json!({"loaded": null, "models_scanned": 1}),
+            )
+            .await;
+        });
+
+        let resp = app
+            .oneshot(get("/api/higgs/models/org%2Fmodel"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(v["id"], "org/model");
+        assert_eq!(v["state"], "not-loaded");
+        assert_eq!(v["format"], "gguf");
+        assert_eq!(v["arch"], "llama");
+    }
+
+    // ── Test 8: control_model_by_id not found ────────────────────────────────
+
+    #[tokio::test]
+    async fn control_model_by_id_not_found() {
+        let (sup, mut test_write, _test_read, _ring) = make_supervisor();
+        let app = make_app(sup);
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            write_response(&mut test_write, 1, serde_json::json!([])).await;
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            write_response(
+                &mut test_write,
+                2,
+                serde_json::json!({"loaded": null, "models_scanned": 0}),
+            )
+            .await;
+        });
+
+        let resp = app
+            .oneshot(get("/api/higgs/models/org%2Fnope"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert!(v["error"].as_str().unwrap().contains("[HG002]"));
+    }
+
+    // ── Test 9: version endpoint ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn version_endpoint() {
+        let (sup, _test_write, _test_read, _ring) = make_supervisor();
+        let app = make_app(sup);
+
+        let resp = app.oneshot(get("/api/higgs/version")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert!(v["higgs"].as_str().is_some(), "higgs version present");
+        assert_eq!(v["engine"], "llama.cpp via llama-cpp-2");
+        assert!(v["engine_version"].as_str().is_some());
+        let fmts = v["supported_formats"].as_array().expect("array");
+        assert!(fmts.contains(&serde_json::Value::String("gguf".to_owned())));
+    }
+
+    // ── (original Test 7, now test 10): logs endpoint shape and tail semantics ─
 
     #[tokio::test]
     async fn logs_endpoint_shapes() {
