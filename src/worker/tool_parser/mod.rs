@@ -15,11 +15,23 @@
 //! mlx-lm / omlx use), so the right parser is known before generation, which the
 //! future streaming path also needs.
 
+mod deepseek3;
+mod function_gemma;
+mod gemma4;
+mod glm_xml;
+mod mistral_bracket;
+mod qwen_json;
 mod stream_filter;
 mod xml_function;
 
 use serde_json::Value;
 
+pub use deepseek3::DeepSeek3Parser;
+pub use function_gemma::FunctionGemmaParser;
+pub use gemma4::Gemma4Parser;
+pub use glm_xml::GlmXmlParser;
+pub use mistral_bracket::MistralBracketParser;
+pub use qwen_json::QwenJsonParser;
 pub use stream_filter::ToolCallStreamFilter;
 pub use xml_function::XmlFunctionParser;
 
@@ -61,9 +73,24 @@ pub struct ToolParserRegistry {
 
 impl ToolParserRegistry {
     /// Registry with every built-in parser. New format families are added here.
+    ///
+    /// Order is most-specific → most-generic: `select` returns the first
+    /// `handles` match, so families that share an opening marker (all the
+    /// `<tool_call>` dialects) must be ordered so the discriminating ones win.
+    /// `QwenJsonParser` is the generic `<tool_call>`-JSON catch-all and stays
+    /// last; its `handles` already excludes the `<function=`/`<arg_key>` markers
+    /// the XML and GLM families use, so the ordering is belt-and-suspenders.
     pub fn with_defaults() -> Self {
         Self {
-            parsers: vec![Box::new(XmlFunctionParser)],
+            parsers: vec![
+                Box::new(XmlFunctionParser), // <function=…><parameter=…> (Nemotron, Qwen3-Coder)
+                Box::new(GlmXmlParser),      // <tool_call> + <arg_key>/<arg_value> (GLM)
+                Box::new(DeepSeek3Parser),   // <｜tool▁calls▁begin｜> unicode tags
+                Box::new(MistralBracketParser), // [TOOL_CALLS] … [ARGS]
+                Box::new(Gemma4Parser),      // <|tool_call> … <tool_call|>
+                Box::new(FunctionGemmaParser), // <start_function_call> … <end_function_call>
+                Box::new(QwenJsonParser),    // <tool_call>{json} — generic, last
+            ],
         }
     }
 
