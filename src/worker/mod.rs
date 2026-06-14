@@ -141,11 +141,17 @@ impl WorkerState {
             }
             M_STATUS => {
                 let loaded = self.loaded.as_ref().map(|(id, p)| {
+                    let meta = self.store.get(id);
                     json!({
                         "id": id,
                         "ctx_len": p.ctx_len,
                         "gpu_layers": p.gpu_layers,
                         "threads": p.threads,
+                        "arch": meta.and_then(|m| m.arch.as_deref()),
+                        "quant": meta.and_then(|m| m.quant.as_deref()),
+                        "max_context_length": meta.and_then(|m| m.ctx_train),
+                        "size_bytes": meta.map(|m| m.size_bytes),
+                        "has_chat_template": meta.map(|m| m.has_chat_template).unwrap_or(false),
                     })
                 });
                 Ok(json!({"loaded": loaded, "models_scanned": self.store.models().len()}))

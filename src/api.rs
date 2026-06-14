@@ -108,6 +108,25 @@ pub struct LoadedInfo {
     /// Worker threads used during generation.
     #[ts(type = "number")]
     pub threads: u32,
+    // Model metadata from the store — present when the worker has scanned the model.
+    /// Model architecture read from GGUF header (e.g. `"llama"`, `"gemma3"`).
+    #[ts(optional)]
+    pub arch: Option<String>,
+    /// Quantization tag (e.g. `Q4_K_M`), if present.
+    #[ts(optional)]
+    pub quant: Option<String>,
+    /// Training context length from GGUF header (model's maximum). Distinct from
+    /// `ctx_len` which is the actually loaded window size.
+    #[ts(type = "number")]
+    #[ts(optional)]
+    pub max_context_length: Option<u64>,
+    /// File size in bytes.
+    #[ts(type = "number")]
+    #[ts(optional)]
+    pub size_bytes: Option<u64>,
+    /// Whether `tokenizer.chat_template` is present in the GGUF header.
+    #[ts(optional)]
+    pub has_chat_template: Option<bool>,
 }
 
 /// Live status snapshot returned by [`Higgs::status`].
@@ -249,6 +268,21 @@ impl Higgs {
                 ctx_len: l.get("ctx_len")?.as_u64()? as u32,
                 gpu_layers: l.get("gpu_layers")?.as_u64()? as u32,
                 threads: l.get("threads")?.as_u64()? as u32,
+                arch: l
+                    .get("arch")
+                    .and_then(|v| v.as_str())
+                    .map(ToOwned::to_owned),
+                quant: l
+                    .get("quant")
+                    .and_then(|v| v.as_str())
+                    .map(ToOwned::to_owned),
+                max_context_length: l
+                    .get("max_context_length")
+                    .and_then(serde_json::Value::as_u64),
+                size_bytes: l.get("size_bytes").and_then(serde_json::Value::as_u64),
+                has_chat_template: l
+                    .get("has_chat_template")
+                    .and_then(serde_json::Value::as_bool),
             })
         });
 
@@ -578,6 +612,48 @@ mod tests {
         assert_eq!(li.id, "org/model");
         assert_eq!(li.ctx_len, 4096);
         assert_eq!(li.gpu_layers, u32::MAX);
+    }
+
+    // ── Test 3b: status loaded info includes model metadata ──────────────────
+
+    #[tokio::test]
+    async fn status_loaded_info_includes_model_metadata() {
+        let (sup, mut test_write, _test_read) = make_supervisor();
+        let higgs = Higgs {
+            sup: Arc::new(sup),
+            config: parking_lot::Mutex::new(HiggsConfig::default()),
+        };
+
+        let status_fut = higgs.status();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        write_response(
+            &mut test_write,
+            1,
+            json!({
+                "loaded": {
+                    "id": "org/model",
+                    "ctx_len": 4096,
+                    "gpu_layers": 99,
+                    "threads": 4,
+                    "arch": "llama",
+                    "quant": "Q4_K_M",
+                    "max_context_length": 8192u64,
+                    "size_bytes": 4000000000u64,
+                    "has_chat_template": true,
+                },
+                "models_scanned": 1,
+            }),
+        )
+        .await;
+
+        let st = status_fut.await.expect("status should succeed");
+        let li = st.loaded.expect("loaded should be Some");
+        assert_eq!(li.id, "org/model");
+        assert_eq!(li.arch.as_deref(), Some("llama"));
+        assert_eq!(li.quant.as_deref(), Some("Q4_K_M"));
+        assert_eq!(li.max_context_length, Some(8192));
+        assert_eq!(li.size_bytes, Some(4000000000));
+        assert_eq!(li.has_chat_template, Some(true));
     }
 
     // ── Test 4: chat_stream delivers chunks and outcome ────────────────────────
