@@ -1,0 +1,152 @@
+//! Streaming content filter — suppresses tool-call markup from the streamed
+//! `content` deltas so a model's `<tool_call>…` envelope never leaks to the
+//! client as assistant text.
+//!
+//! The structured `tool_calls` are emitted separately, parsed from the full
+//! generation at end of stream (see `serve::stream`). This filter only decides,
+//! incrementally, which generated text is safe to stream as content NOW. It is
+//! engine-agnostic — it operates on `&str` and the open markers a
+//! [`ToolCallParser`](super::ToolCallParser) declares.
+
+/// Incrementally filters generated text, emitting only content that is
+/// definitely not part of a tool call.
+///
+/// Holds back a short tail that could still grow into an opening marker (e.g.
+/// a piece ending in `"<tool_"`), so a marker split across pieces is never
+/// streamed. Once a full opening marker is seen, every subsequent piece is
+/// withheld for the rest of the turn.
+pub struct ToolCallStreamFilter {
+    markers: &'static [&'static str],
+    held: String,
+    suppressing: bool,
+}
+
+impl ToolCallStreamFilter {
+    /// Filter for a parser whose tool calls open with any of `markers`.
+    pub fn new(markers: &'static [&'static str]) -> Self {
+        Self {
+            markers,
+            held: String::new(),
+            suppressing: false,
+        }
+    }
+
+    /// Feed one generated piece; `emit` receives the content safe to stream now.
+    pub fn push(&mut self, piece: &str, emit: &mut dyn FnMut(&str)) {
+        if self.suppressing {
+            return;
+        }
+        self.held.push_str(piece);
+
+        // A full opening marker present → emit everything before it, then
+        // suppress the marker and all that follows for the rest of the turn.
+        if let Some(pos) = self.earliest_marker() {
+            if pos > 0 {
+                let safe = self.held[..pos].to_string();
+                emit(&safe);
+            }
+            self.held.clear();
+            self.suppressing = true;
+            return;
+        }
+
+        // No full marker: emit all but a tail that could still become one.
+        let keep = self.partial_tail_len();
+        if self.held.len() > keep {
+            let cut = self.held.len() - keep;
+            let chunk = self.held[..cut].to_string();
+            self.held.drain(..cut);
+            emit(&chunk);
+        }
+    }
+
+    /// End of generation: flush any held text that never became a marker.
+    pub fn finish(&mut self, emit: &mut dyn FnMut(&str)) {
+        if !self.suppressing && !self.held.is_empty() {
+            let rest = std::mem::take(&mut self.held);
+            emit(&rest);
+        }
+    }
+
+    /// Earliest byte index where any marker fully occurs in `held`.
+    fn earliest_marker(&self) -> Option<usize> {
+        self.markers.iter().filter_map(|m| self.held.find(m)).min()
+    }
+
+    /// Longest suffix of `held` that is a proper prefix of some marker — held
+    /// back in case the remainder of the marker arrives in the next piece.
+    fn partial_tail_len(&self) -> usize {
+        let mut best = 0;
+        let len = self.held.len();
+        for m in self.markers {
+            let max = (m.len() - 1).min(len);
+            for k in (1..=max).rev() {
+                if self.held.is_char_boundary(len - k) && m.starts_with(&self.held[len - k..]) {
+                    best = best.max(k);
+                    break;
+                }
+            }
+        }
+        best
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const M: &[&str] = &["<tool_call>"];
+
+    /// Collect everything the filter emits across the given pieces + finish.
+    fn run(pieces: &[&str]) -> String {
+        let mut f = ToolCallStreamFilter::new(M);
+        let mut out = String::new();
+        for p in pieces {
+            f.push(p, &mut |s| out.push_str(s));
+        }
+        f.finish(&mut |s| out.push_str(s));
+        out
+    }
+
+    #[test]
+    fn plain_text_passes_through() {
+        assert_eq!(run(&["Hello", " ", "world"]), "Hello world");
+    }
+
+    #[test]
+    fn suppresses_from_marker_onward() {
+        assert_eq!(
+            run(&[
+                "Sure!",
+                "<tool_call>",
+                "<function=x></function></tool_call>"
+            ]),
+            "Sure!"
+        );
+    }
+
+    #[test]
+    fn marker_split_across_pieces_never_leaks() {
+        // The marker arrives one char at a time; none of it must be emitted.
+        let pieces = ["Hi ", "<tool", "_cal", "l>", "junk"];
+        assert_eq!(run(&pieces), "Hi ");
+    }
+
+    #[test]
+    fn partial_marker_that_is_not_a_marker_is_flushed() {
+        // "<too" looks like it could start the marker but the turn ends; it must
+        // be flushed at finish, not swallowed.
+        assert_eq!(run(&["abc", "<too"]), "abc<too");
+    }
+
+    #[test]
+    fn lone_lt_is_not_held_forever() {
+        assert_eq!(run(&["a < b"]), "a < b");
+    }
+
+    #[test]
+    fn multibyte_content_not_split() {
+        // CJK before a marker; bytes must stay char-aligned.
+        assert_eq!(run(&["天气", "<tool_call>x"]), "天气");
+    }
+}

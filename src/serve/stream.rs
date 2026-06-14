@@ -9,11 +9,12 @@
 use std::convert::Infallible;
 
 use async_openai::types::chat::{
-    ChatChoiceStream, ChatCompletionStreamResponseDelta, CreateChatCompletionStreamResponse,
-    FinishReason, Role,
+    ChatChoiceStream, ChatCompletionMessageToolCallChunk, ChatCompletionStreamResponseDelta,
+    CreateChatCompletionStreamResponse, FinishReason, FunctionCallStream, FunctionType, Role,
 };
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::Stream;
+use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -69,6 +70,7 @@ async fn assemble(
         Some(Role::Assistant),
         None,
         None,
+        None,
     ));
 
     let joined = loop {
@@ -77,7 +79,7 @@ async fn assemble(
             biased;
             maybe = deltas.recv() => match maybe {
                 Some(delta) => {
-                    send(chunk_payload(&id, &model, created, None, Some(delta), None));
+                    send(chunk_payload(&id, &model, created, None, Some(delta), None, None));
                 }
                 // Sink closed early: worker died — the outcome carries the error.
                 None => break outcome.await,
@@ -85,7 +87,7 @@ async fn assemble(
             joined = &mut outcome => {
                 // Generation finished; flush deltas still queued in the channel.
                 while let Ok(delta) = deltas.try_recv() {
-                    send(chunk_payload(&id, &model, created, None, Some(delta), None));
+                    send(chunk_payload(&id, &model, created, None, Some(delta), None, None));
                 }
                 break joined;
             }
@@ -93,14 +95,36 @@ async fn assemble(
     };
 
     match joined {
-        Ok(Ok(out)) => send(chunk_payload(
-            &id,
-            &model,
-            created,
-            None,
-            None,
-            Some(finish_reason_from(&out.finish_reason)),
-        )),
+        Ok(Ok(out)) => {
+            // Any tool calls go out as one delta chunk (full name + arguments),
+            // followed by a finish chunk whose reason is "tool_calls" per spec.
+            let tool_calls = out.tool_calls.as_ref().and_then(stream_tool_calls);
+            let finish = if tool_calls.is_some() {
+                FinishReason::ToolCalls
+            } else {
+                finish_reason_from(&out.finish_reason)
+            };
+            if let Some(tc) = tool_calls {
+                send(chunk_payload(
+                    &id,
+                    &model,
+                    created,
+                    None,
+                    None,
+                    Some(tc),
+                    None,
+                ));
+            }
+            send(chunk_payload(
+                &id,
+                &model,
+                created,
+                None,
+                None,
+                None,
+                Some(finish),
+            ));
+        }
         Ok(Err(err)) => {
             tracing::warn!(error = %err, "higgs: chat stream failed mid-generation");
             send(super::v1_envelope_json(
@@ -120,6 +144,40 @@ async fn assemble(
     send("[DONE]".to_owned());
 }
 
+/// Convert the parsed OpenAI `tool_calls` array (our `ChatOutcome.tool_calls`)
+/// into streaming tool-call chunks. Emits one chunk per call with its full
+/// name + arguments (we buffer the call rather than streaming argument deltas).
+/// Returns `None` when the value is absent or not a non-empty array.
+fn stream_tool_calls(v: &Value) -> Option<Vec<ChatCompletionMessageToolCallChunk>> {
+    let arr = v.as_array()?;
+    let calls: Vec<_> = arr
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let func = c.get("function");
+            let field = |key: &str| {
+                func.and_then(|f| f.get(key))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            };
+            ChatCompletionMessageToolCallChunk {
+                index: i as u32,
+                id: c.get("id").and_then(Value::as_str).map(ToOwned::to_owned),
+                r#type: Some(FunctionType::Function),
+                function: Some(FunctionCallStream {
+                    name: field("name"),
+                    arguments: field("arguments"),
+                }),
+            }
+        })
+        .collect();
+    if calls.is_empty() {
+        None
+    } else {
+        Some(calls)
+    }
+}
+
 /// Serialize one `chat.completion.chunk` into its `data:` payload string.
 fn chunk_payload(
     id: &str,
@@ -127,6 +185,7 @@ fn chunk_payload(
     created: u32,
     role: Option<Role>,
     content: Option<String>,
+    tool_calls: Option<Vec<ChatCompletionMessageToolCallChunk>>,
     finish_reason: Option<FinishReason>,
 ) -> String {
     // function_call / system_fingerprint are deprecated-but-required fields of
@@ -140,7 +199,7 @@ fn chunk_payload(
             delta: ChatCompletionStreamResponseDelta {
                 content,
                 function_call: None,
-                tool_calls: None,
+                tool_calls,
                 role,
                 refusal: None,
             },

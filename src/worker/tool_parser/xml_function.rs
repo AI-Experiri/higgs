@@ -36,6 +36,10 @@ impl ToolCallParser for XmlFunctionParser {
         chat_template.contains("<function=") && chat_template.contains("<parameter=")
     }
 
+    fn open_markers(&self) -> &'static [&'static str] {
+        &["<tool_call>"]
+    }
+
     fn parse(&self, text: &str, id_seed: &str) -> Option<Vec<Value>> {
         let mut calls = Vec::new();
         let mut rest = text;

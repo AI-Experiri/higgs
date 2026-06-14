@@ -16,7 +16,7 @@ use llama_cpp_2::sampling::LlamaSampler;
 
 use super::{EngineMessage, GenParams, HiggsEngine, LoadParams};
 use crate::diagnostic::HiggsError;
-use crate::worker::tool_parser::ToolParserRegistry;
+use crate::worker::tool_parser::{ToolCallStreamFilter, ToolParserRegistry};
 
 /// Process-wide llama.cpp backend handle — the FFI global init must run
 /// exactly once per process.
@@ -185,6 +185,19 @@ impl HiggsEngine for LlamaCppEngine {
             ])
         };
 
+        // Tool-call streaming: when tools were requested and a registry parser
+        // recognizes this model's format, suppress the call envelope from the
+        // streamed content (the structured tool_calls are emitted at end of
+        // stream by `serve::stream`, parsed from `full` below). The same parser
+        // does the final parse in the fallback branch.
+        let tmpl_str = template.to_str().unwrap_or("");
+        let selected_parser = params
+            .tools_json
+            .as_ref()
+            .and_then(|_| self.tool_parsers.select(tmpl_str));
+        let mut stream_filter =
+            selected_parser.map(|p| ToolCallStreamFilter::new(p.open_markers()));
+
         let mut decoder = encoding_rs::UTF_8.new_decoder();
         let mut full = String::new();
         let mut n_generated: usize = 0;
@@ -202,7 +215,10 @@ impl HiggsEngine for LlamaCppEngine {
             // The UTF-8 decoder buffers partial multi-byte sequences — only
             // forward pieces that decoded to visible text.
             if !piece.is_empty() {
-                sink(&piece);
+                match stream_filter.as_mut() {
+                    Some(f) => f.push(&piece, sink),
+                    None => sink(&piece),
+                }
                 full.push_str(&piece);
             }
             n_generated += 1;
@@ -224,8 +240,16 @@ impl HiggsEngine for LlamaCppEngine {
         let mut tail = String::new();
         let _ = decoder.decode_to_string(&[], &mut tail, true);
         if !tail.is_empty() {
-            sink(&tail);
+            match stream_filter.as_mut() {
+                Some(f) => f.push(&tail, sink),
+                None => sink(&tail),
+            }
             full.push_str(&tail);
+        }
+        // Flush any safe content the filter held back (a tail that never became
+        // a marker); suppressed content stays withheld.
+        if let Some(f) = stream_filter.as_mut() {
+            f.finish(sink);
         }
 
         // Parse the full generation into an OpenAI message.
@@ -251,11 +275,9 @@ impl HiggsEngine for LlamaCppEngine {
                 (content, tool_calls)
             }
             Err(e) => {
-                // Crate parser declined. Select an engine-agnostic parser by
-                // sniffing the model's chat template (the mlx-lm/omlx approach),
-                // then parse the generated text with it.
-                let tmpl_str = template.to_str().unwrap_or("");
-                match self.tool_parsers.select(tmpl_str) {
+                // Crate parser declined. Use the registry parser already selected
+                // for this model (by chat-template sniff) to parse the text.
+                match selected_parser {
                     Some(parser) => {
                         let seed = uuid::Uuid::new_v4().simple().to_string();
                         match parser.parse(&full, &seed) {

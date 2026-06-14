@@ -15,10 +15,12 @@
 //! mlx-lm / omlx use), so the right parser is known before generation, which the
 //! future streaming path also needs.
 
+mod stream_filter;
 mod xml_function;
 
 use serde_json::Value;
 
+pub use stream_filter::ToolCallStreamFilter;
 pub use xml_function::XmlFunctionParser;
 
 /// One tool-call output format family (e.g. the XML `<function=…>` family).
@@ -33,6 +35,11 @@ pub trait ToolCallParser: Send + Sync {
     /// Whether this parser handles the model whose GGUF chat template is
     /// `chat_template` — matched on the format markers the template declares.
     fn handles(&self, chat_template: &str) -> bool;
+
+    /// Literal strings that open a tool call in this format (e.g.
+    /// `["<tool_call>"]`). The streaming filter withholds content from the
+    /// first occurrence so the call envelope never leaks as assistant text.
+    fn open_markers(&self) -> &'static [&'static str];
 
     /// Parse complete generated `text` into the OpenAI `tool_calls` array, or
     /// `None` when the turn emitted no tool call. `id_seed` supplies the per-call
