@@ -82,6 +82,10 @@ async fn control_api_lifecycle() {
         .expect("loaded model in list");
     assert_eq!(entry["state"], "loaded", "entry state is loaded");
     assert_eq!(entry["format"], "gguf");
+    // Capabilities are derived from the GGUF template: Nemotron supports tools
+    // and emits a reasoning block.
+    assert_eq!(entry["supports_tools"], true, "Nemotron supports tools");
+    assert_eq!(entry["supports_reasoning"], true, "Nemotron reasons");
 
     // model-by-id (the wildcard route handles the slashed HF repo id).
     let by_id: serde_json::Value = get(format!("/api/higgs/models/{id}"))
@@ -108,6 +112,23 @@ async fn control_api_lifecycle() {
         .await
         .unwrap();
     assert!(logs["lines"].is_array(), "logs has a lines array");
+
+    // system: hardware + runtime panels (the LM-Studio-style info).
+    let system: serde_json::Value = get("/api/higgs/system".into())
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        !system["hardware"]["cpu_name"].as_str().unwrap().is_empty(),
+        "system reports a CPU name"
+    );
+    assert!(
+        system["hardware"]["ram_total_bytes"].as_u64().unwrap() > 0,
+        "system reports total RAM"
+    );
+    assert_eq!(system["runtime"]["engine"], "llama.cpp", "runtime engine");
 
     // unload → status clears.
     let unload: serde_json::Value = c

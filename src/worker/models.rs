@@ -50,6 +50,16 @@ pub struct HiggsModel {
     /// Whether `tokenizer.chat_template` is present in the GGUF header.
     /// `false` when the header could not be read.
     pub has_chat_template: bool,
+    /// Whether the chat template declares tool/function calling. Heuristic: the
+    /// embedded template references tool calls (`tool_call`/`tools`). `false`
+    /// when there is no template or it carries no tool markup. `serde(default)`
+    /// so older scan payloads without the field deserialize as `false`.
+    #[serde(default)]
+    pub supports_tools: bool,
+    /// Whether the model emits a reasoning/thinking block. Heuristic: the
+    /// template references `<think>`/thinking. `false` when unknown.
+    #[serde(default)]
+    pub supports_reasoning: bool,
 }
 
 /// Scans configured model directories; owns the resulting catalog.
@@ -126,7 +136,16 @@ fn enrich_gguf_metadata(model: &mut HiggsModel) {
     };
     model.arch = gguf.general_architecture().ok().map(ToString::to_string);
     model.ctx_train = gguf.llm_context_length().ok().map(|n| n as u64);
-    model.has_chat_template = gguf.tokenizer_chat_template().is_ok();
+    // Read the embedded chat template once and derive capabilities from it
+    // (the template is the GGUF's own declaration of how it talks).
+    let template = gguf.tokenizer_chat_template().ok();
+    model.has_chat_template = template.is_some();
+    if let Some(t) = template {
+        model.supports_tools = t.contains("tool_call") || t.contains("tools");
+        model.supports_reasoning = t.contains("</think>")
+            || t.contains("<think>")
+            || t.to_lowercase().contains("thinking");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -223,6 +242,8 @@ fn scan_lmstudio(root: &Path, out: &mut Vec<HiggsModel>) -> Result<(), HiggsErro
                     arch: None,
                     ctx_train: None,
                     has_chat_template: false,
+                    supports_tools: false,
+                    supports_reasoning: false,
                 };
                 enrich_gguf_metadata(&mut model);
                 out.push(model);
@@ -340,6 +361,8 @@ fn scan_hf_cache(root: &Path, out: &mut Vec<HiggsModel>) -> Result<(), HiggsErro
                     arch: None,
                     ctx_train: None,
                     has_chat_template: false,
+                    supports_tools: false,
+                    supports_reasoning: false,
                 };
                 enrich_gguf_metadata(&mut model);
                 out.push(model);
@@ -461,6 +484,8 @@ fn scan_ollama(root: &Path, out: &mut Vec<HiggsModel>) -> Result<(), HiggsError>
             arch: None,
             ctx_train: None,
             has_chat_template: false,
+            supports_tools: false,
+            supports_reasoning: false,
         };
         enrich_gguf_metadata(&mut model);
         out.push(model);

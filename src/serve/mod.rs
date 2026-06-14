@@ -36,13 +36,16 @@ use async_openai::types::chat::{
 };
 use async_openai::types::models::{ListModelResponse, Model};
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 
+use tower_http::cors::{AllowOrigin, CorsLayer};
+
 use crate::api::{ChatOutcome, Higgs};
 use crate::diagnostic::HiggsError;
+use crate::system::SystemInfo;
 use crate::worker::engine::LoadParams;
 use crate::worker::models::HiggsModel;
 
@@ -218,11 +221,7 @@ fn control_error(err: &HiggsError) -> (StatusCode, Json<HiggsErrorResponse>) {
 
 // ── Router ────────────────────────────────────────────────────────────────────
 
-/// The llama-cpp-2 crate version bundled with this build.
-///
-/// llama-cpp-2 does not expose a runtime build-time constant, so we
-/// bake the dependency version from the lock file as a compile-time const.
-const LLAMA_CPP_2_VERSION: &str = "0.1.139";
+use crate::LLAMA_CPP_2_VERSION;
 
 /// Response for `GET /api/higgs/version`.
 #[derive(Debug, serde::Serialize, ts_rs::TS)]
@@ -251,11 +250,32 @@ pub fn router(higgs: Arc<Higgs>) -> Router {
         .route("/api/higgs/models/unload", post(control_unload))
         .route("/api/higgs/models/{*id}", get(control_model_by_id))
         .route("/api/higgs/status", get(control_status))
+        .route("/api/higgs/system", get(control_system))
         .route("/api/higgs/logs", get(control_logs))
         .route("/api/higgs/worker/start", post(control_worker_start))
         .route("/api/higgs/worker/stop", post(control_worker_stop))
         .route("/api/higgs/version", get(control_version))
+        .layer(local_cors())
         .with_state(higgs)
+}
+
+/// CORS for higgs's standalone listener: the frontend calls higgs's own port
+/// cross-origin (from the Tauri webview or the dev server), so the local UI
+/// origins must be allowed. Localhost/webview only — not a public surface.
+fn local_cors() -> CorsLayer {
+    let origins: Vec<HeaderValue> = [
+        "tauri://localhost",
+        "http://tauri.localhost",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ]
+    .iter()
+    .filter_map(|o| o.parse().ok())
+    .collect();
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::list(origins))
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers(tower_http::cors::Any)
 }
 
 // ── /v1 handlers ──────────────────────────────────────────────────────────────
@@ -722,6 +742,18 @@ async fn control_version() -> Json<HiggsVersionResponse> {
         engine_version: LLAMA_CPP_2_VERSION.to_owned(),
         supported_formats: vec!["gguf".to_owned()],
     })
+}
+
+/// `GET /api/higgs/system` — host hardware (CPU/RAM/load) + inference runtime.
+///
+/// Gathering samples CPU load over a short interval, so it runs on a blocking
+/// thread to avoid stalling the async executor.
+async fn control_system() -> Json<SystemInfo> {
+    tracing::info!("higgs: GET /api/higgs/system");
+    let info = tokio::task::spawn_blocking(SystemInfo::gather)
+        .await
+        .expect("system info gather task");
+    Json(info)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

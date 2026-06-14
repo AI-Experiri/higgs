@@ -31,6 +31,12 @@ encoding_rs = "0.8"
 # Header-only GGUF metadata reading (memory-maps the file; weights are never loaded)
 ggus = "0.5.1"
 memmap2 = "0.9"
+# Host hardware + resource info (CPU name/arch, RAM total/used, CPU load) for
+# the /api/higgs/system endpoint. Cross-platform, ~200M downloads.
+sysinfo = "0.32"
+# CORS for higgs's standalone listener (the frontend calls it cross-origin from
+# the webview / dev server once higgs is its own process).
+tower-http = { version = "0.6", features = ["cors"] }
 # Structured logs for the `higgs-server` binary.
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
