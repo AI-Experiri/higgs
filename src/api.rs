@@ -146,10 +146,13 @@ pub struct HiggsStatus {
 /// Final outcome of a completed chat request.
 #[derive(Debug, Clone)]
 pub struct ChatOutcome {
-    /// Concatenated full text from all chunks.
+    /// Assistant text after tool-call parsing (the OpenAI message `content`).
     pub content: String,
-    /// OpenAI finish_reason ("stop" or "length").
+    /// OpenAI finish_reason ("stop" or "length"); the boundary upgrades this to
+    /// "tool_calls" when [`tool_calls`](Self::tool_calls) is present.
     pub finish_reason: String,
+    /// Parsed OpenAI `tool_calls` array, or `None` when the turn emitted none.
+    pub tool_calls: Option<serde_json::Value>,
     /// Prompt token count from the engine (for OpenAI `usage.prompt_tokens`).
     pub prompt_tokens: u32,
     /// Completion token count from the engine (for OpenAI `usage.completion_tokens`).
@@ -322,6 +325,7 @@ impl Higgs {
         messages: Vec<(String, String)>,
         max_tokens: usize,
         temperature: f32,
+        tools_json: Option<String>,
     ) -> Result<
         (
             mpsc::UnboundedReceiver<String>,
@@ -354,6 +358,7 @@ impl Higgs {
                         "messages": msgs,
                         "max_tokens": max_tokens,
                         "temperature": temperature,
+                        "tools": tools_json,
                     }),
                 )
                 .await;
@@ -382,10 +387,12 @@ impl Higgs {
                 .get("completion_tokens")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0) as u32;
+            let tool_calls = result.get("tool_calls").filter(|v| !v.is_null()).cloned();
 
             Ok(ChatOutcome {
                 content,
                 finish_reason,
+                tool_calls,
                 prompt_tokens,
                 completion_tokens,
             })
@@ -686,7 +693,7 @@ mod tests {
         };
 
         let (mut rx, handle) = higgs
-            .chat_stream(vec![("user".into(), "hi".into())], 256, 0.7)
+            .chat_stream(vec![("user".into(), "hi".into())], 256, 0.7, None)
             .await
             .expect("chat_stream should succeed");
 
@@ -754,7 +761,7 @@ mod tests {
 
         // chat_stream registers the sink then the spawned task encounters dead worker.
         let (_rx, handle) = higgs
-            .chat_stream(vec![("user".into(), "hi".into())], 8, 0.0)
+            .chat_stream(vec![("user".into(), "hi".into())], 8, 0.0, None)
             .await
             .expect("chat_stream itself should not fail");
 

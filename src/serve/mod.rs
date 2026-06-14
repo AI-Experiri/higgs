@@ -20,7 +20,8 @@ use std::sync::Arc;
 
 use async_openai::error::{ApiError, WrappedError};
 use async_openai::types::chat::{
-    ChatChoice, ChatCompletionRequestAssistantMessageContent as AssistantContent,
+    ChatChoice, ChatCompletionMessageToolCalls,
+    ChatCompletionRequestAssistantMessageContent as AssistantContent,
     ChatCompletionRequestAssistantMessageContentPart as AssistantPart,
     ChatCompletionRequestDeveloperMessageContent as DeveloperContent,
     ChatCompletionRequestDeveloperMessageContentPart as DeveloperPart,
@@ -31,7 +32,7 @@ use async_openai::types::chat::{
     ChatCompletionRequestToolMessageContentPart as ToolPart,
     ChatCompletionRequestUserMessageContent as UserContent,
     ChatCompletionRequestUserMessageContentPart as UserPart, ChatCompletionResponseMessage,
-    CompletionUsage, CreateChatCompletionRequest, CreateChatCompletionResponse, Role,
+    CompletionUsage, CreateChatCompletionRequest, CreateChatCompletionResponse, FinishReason, Role,
 };
 use async_openai::types::models::{ListModelResponse, Model};
 use axum::extract::{Path, Query, State};
@@ -341,7 +342,25 @@ async fn v1_chat_completions(
     let max_tokens = req.max_completion_tokens.or(req.max_tokens).unwrap_or(1024) as usize;
     let temperature = req.temperature.unwrap_or(0.7);
 
-    let (deltas, outcome) = match higgs.chat_stream(pairs, max_tokens, temperature).await {
+    // Serialize the OpenAI `tools` array to a JSON string for the chat template.
+    // A serialization failure is a malformed request body → 400.
+    let tools_json = match req.tools.as_ref().map(serde_json::to_string).transpose() {
+        Ok(t) => t,
+        Err(err) => {
+            tracing::warn!(error = %err, "higgs: chat tools serialization failed");
+            let status = StatusCode::BAD_REQUEST;
+            return (
+                status,
+                Json(v1_envelope(status, format!("invalid tools: {err}"))),
+            )
+                .into_response();
+        }
+    };
+
+    let (deltas, outcome) = match higgs
+        .chat_stream(pairs, max_tokens, temperature, tools_json)
+        .await
+    {
         Ok(pair) => pair,
         Err(err) => {
             tracing::warn!(error = %err, "higgs: chat_stream failed to start");
@@ -377,6 +396,26 @@ async fn v1_chat_completions(
 
 /// Build the non-streaming chat completion response from a final outcome.
 fn chat_response(model: String, out: &ChatOutcome) -> CreateChatCompletionResponse {
+    // Deserialize the parser-produced `tool_calls` array into the async-openai
+    // wire type. This data was produced by the crate's OAI-compat parser, so it
+    // is already OpenAI-shaped; a deserialize failure is an internal bug — log
+    // the actual serde error and degrade to no tool calls rather than panic.
+    let tool_calls: Option<Vec<ChatCompletionMessageToolCalls>> =
+        out.tool_calls.as_ref().and_then(|v| {
+            serde_json::from_value(v.clone())
+                .map_err(|err| {
+                    tracing::error!(error = %err, "higgs: tool_calls deserialize failed");
+                    err
+                })
+                .ok()
+        });
+    // Per the OpenAI spec, a turn that emits tool calls reports finish_reason
+    // "tool_calls" regardless of the engine's stop/length signal.
+    let finish_reason = if tool_calls.is_some() {
+        FinishReason::ToolCalls
+    } else {
+        stream::finish_reason_from(&out.finish_reason)
+    };
     // function_call / system_fingerprint are deprecated-but-required fields of
     // the async-openai wire structs; populating them with None is the only way
     // to construct the type.
@@ -388,13 +427,13 @@ fn chat_response(model: String, out: &ChatOutcome) -> CreateChatCompletionRespon
             message: ChatCompletionResponseMessage {
                 content: Some(out.content.clone()),
                 refusal: None,
-                tool_calls: None,
+                tool_calls,
                 annotations: None,
                 role: Role::Assistant,
                 function_call: None,
                 audio: None,
             },
-            finish_reason: Some(stream::finish_reason_from(&out.finish_reason)),
+            finish_reason: Some(finish_reason),
             logprobs: None,
         }],
         created: now_secs(),

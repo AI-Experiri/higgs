@@ -16,6 +16,7 @@ use llama_cpp_2::sampling::LlamaSampler;
 
 use super::{EngineMessage, GenParams, HiggsEngine, LoadParams};
 use crate::diagnostic::HiggsError;
+use crate::worker::tool_parser::ToolParserRegistry;
 
 /// Process-wide llama.cpp backend handle — the FFI global init must run
 /// exactly once per process.
@@ -39,6 +40,10 @@ struct LoadedModel {
 #[derive(Default)]
 pub struct LlamaCppEngine {
     loaded: Option<LoadedModel>,
+    /// Engine-agnostic fallback parsers, consulted when the crate's own
+    /// template parser rejects the output (e.g. nemotron XML). Shared shape:
+    /// a future MLX/CUDA engine constructs the same registry.
+    tool_parsers: ToolParserRegistry,
 }
 
 impl HiggsEngine for LlamaCppEngine {
@@ -98,15 +103,29 @@ impl HiggsEngine for LlamaCppEngine {
             .map(|m| LlamaChatMessage::new(m.role.clone(), m.content.clone()))
             .collect::<Result<_, _>>()
             .map_err(|e| gen_fail("chat message build", e.to_string()))?;
-        let prompt = loaded
+        // Single path for tools and no-tools alike: the OAI-compat apply renders
+        // the GGUF template (with the tools array when present) AND returns the
+        // serialized PEG parser + chat_format the crate's vendored `common_chat`
+        // selected for this model. We keep `tmpl_result` alive across the decode
+        // so `parse_response_oaicompat` can turn the raw output back into an
+        // OpenAI message (content + tool_calls) — no parser invented here.
+        // (Grammar-constrained sampling via tmpl_result.grammar is deferred.)
+        let tmpl_result = loaded
             .model
-            .apply_chat_template(&template, &chat, true)
+            .apply_chat_template_with_tools_oaicompat(
+                &template,
+                &chat,
+                params.tools_json.as_deref(),
+                None,
+                true,
+            )
             .map_err(|e| gen_fail("apply chat template", e.to_string()))?;
+        let prompt = tmpl_result.prompt.as_str();
 
         // Fit check BEFORE any decode: prompt + full generation budget must fit.
         let tokens = loaded
             .model
-            .str_to_token(&prompt, AddBos::Always)
+            .str_to_token(prompt, AddBos::Always)
             .map_err(|e| gen_fail("tokenize prompt", e.to_string()))?;
         let n_ctx = loaded.params.ctx_len as usize;
         if tokens.len() + params.max_tokens > n_ctx {
@@ -123,6 +142,7 @@ impl HiggsEngine for LlamaCppEngine {
             return Ok(super::ChatResult {
                 content: String::new(),
                 finish_reason: "length",
+                tool_calls: None,
                 prompt_tokens,
                 completion_tokens: 0,
             });
@@ -208,9 +228,58 @@ impl HiggsEngine for LlamaCppEngine {
             full.push_str(&tail);
         }
 
+        // Parse the full generation into an OpenAI message.
+        //   Primary: the parser the template apply selected — covers the
+        //     families llama.cpp's vendored common_chat handles (Qwen, Mistral,
+        //     Llama-3, Hermes, …), all derived from the GGUF template.
+        //   Fallback: when that parser rejects the output — which it does for
+        //     formats it cannot auto-derive, e.g. nemotron_h's
+        //     `<function=…><parameter=…>` XML — parse the format the GGUF
+        //     template itself declares, via `tool_parse`. Both paths read the
+        //     GGUF; neither curates per-model.
+        let (content, tool_calls) = match tmpl_result.parse_response_oaicompat(&full, false) {
+            Ok(msg_json) => {
+                let parsed: serde_json::Value = serde_json::from_str(&msg_json)
+                    .map_err(|e| gen_fail("parse response json", e.to_string()))?;
+                // content may be null when the turn is purely tool calls; fall
+                // back to the raw text so nothing is silently dropped.
+                let content = parsed
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .map_or_else(|| full.clone(), ToOwned::to_owned);
+                let tool_calls = parsed.get("tool_calls").filter(|v| !v.is_null()).cloned();
+                (content, tool_calls)
+            }
+            Err(e) => {
+                // Crate parser declined. Select an engine-agnostic parser by
+                // sniffing the model's chat template (the mlx-lm/omlx approach),
+                // then parse the generated text with it.
+                let tmpl_str = template.to_str().unwrap_or("");
+                match self.tool_parsers.select(tmpl_str) {
+                    Some(parser) => {
+                        let seed = uuid::Uuid::new_v4().simple().to_string();
+                        match parser.parse(&full, &seed) {
+                            Some(calls) => {
+                                tracing::debug!(error = %e, parser = parser.id(), "crate parse rejected output; registry parser recovered tool calls");
+                                (parser.content(&full), Some(serde_json::Value::Array(calls)))
+                            }
+                            // Parser matched the format but the turn had no call.
+                            None => (full.clone(), None),
+                        }
+                    }
+                    // No registered parser for this model's format: preserve text.
+                    None => {
+                        tracing::warn!(error = %e, "crate parse rejected output and no registry parser matched; returning raw text");
+                        (full.clone(), None)
+                    }
+                }
+            }
+        };
+
         Ok(super::ChatResult {
-            content: full,
+            content,
             finish_reason,
+            tool_calls,
             prompt_tokens,
             // n_generated counts tokens emitted in the decode loop (one per iteration).
             completion_tokens: n_generated as u32,
@@ -249,6 +318,7 @@ mod tests {
                 &GenParams {
                     max_tokens: 8,
                     temperature: 0.0,
+                    tools_json: None,
                 },
                 &mut |d| out.push_str(d),
             )

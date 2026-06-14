@@ -16,6 +16,12 @@ pub struct EngineMessage {
 pub struct GenParams {
     pub max_tokens: usize,
     pub temperature: f32,
+    /// OpenAI-compatible `tools` array serialized to a JSON string, or `None`
+    /// when the request carries no tools. Fed verbatim to the GGUF chat
+    /// template via `apply_chat_template_with_tools_oaicompat`; the crate's
+    /// vendored `common_chat` renders the tool grammar and selects the
+    /// matching tool-call parser. We invent no parser of our own.
+    pub tools_json: Option<String>,
 }
 
 /// Parameters fixed at load time.
@@ -34,10 +40,19 @@ pub struct LoadParams {
 /// Result returned by [`HiggsEngine::chat`], carrying the generated text,
 /// finish reason, and token counts for OpenAI-standard `usage` reporting.
 pub struct ChatResult {
-    /// Concatenated full text of the generation.
+    /// Assistant text after tool-call parsing — the `content` field of the
+    /// OpenAI message produced by `parse_response_oaicompat`. When the model
+    /// emitted tool calls, the call markup is stripped out and lives in
+    /// [`tool_calls`](Self::tool_calls) instead; otherwise this is the full
+    /// generation verbatim.
     pub content: String,
     /// OpenAI finish_reason: `"stop"` (EOG) or `"length"` (max_tokens hit).
+    /// Note: when [`tool_calls`](Self::tool_calls) is present the boundary
+    /// (`serve`) reports `"tool_calls"` per the OpenAI spec.
     pub finish_reason: &'static str,
+    /// Parsed OpenAI `tool_calls` array (verbatim from `parse_response_oaicompat`),
+    /// or `None` when the model emitted no tool calls.
+    pub tool_calls: Option<serde_json::Value>,
     /// Number of tokens in the rendered prompt (after chat-template application).
     pub prompt_tokens: u32,
     /// Number of tokens emitted during the decode loop.

@@ -4,6 +4,7 @@
 
 pub mod engine;
 pub mod models;
+pub mod tool_parser;
 
 use std::io::{BufRead, Write};
 
@@ -208,6 +209,13 @@ impl WorkerState {
                         .get("temperature")
                         .and_then(Value::as_f64)
                         .map_or(0.7, |v| v as f32),
+                    // OpenAI `tools` array, already serialized to a JSON string by
+                    // the serve layer; passed verbatim to the chat template.
+                    tools_json: req
+                        .params
+                        .get("tools")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
                 };
                 let mut chunk_write_failed = false;
                 let mut sink = |delta: &str| {
@@ -230,6 +238,7 @@ impl WorkerState {
                 Ok(json!({
                     "content": result.content,
                     "finish_reason": result.finish_reason,
+                    "tool_calls": result.tool_calls,
                     "prompt_tokens": result.prompt_tokens,
                     "completion_tokens": result.completion_tokens,
                 }))
@@ -322,6 +331,7 @@ mod tests {
             Ok(engine::ChatResult {
                 content: "hello".into(),
                 finish_reason: "stop",
+                tool_calls: None,
                 // Scripted counts: 5 prompt tokens, 2 completion tokens.
                 prompt_tokens: 5,
                 completion_tokens: 2,
