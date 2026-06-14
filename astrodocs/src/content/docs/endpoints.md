@@ -90,6 +90,11 @@ Chat with the loaded model. Requires a model to be loaded first (`POST /api/higg
 v1 is **text-only** — image, audio, and file content parts are rejected with 400.
 Both `max_tokens` (deprecated) and `max_completion_tokens` are accepted; the newer field wins.
 
+**Tools.** The OpenAI `tools` array is accepted and passed verbatim to the
+model's GGUF chat template. When the model emits a tool call it is returned as
+spec-shaped `tool_calls` with `finish_reason: "tool_calls"` — in both the
+non-streaming and streaming responses. A malformed `tools` body is a 400.
+
 **Request body (OpenAI wire):**
 
 ```json
@@ -97,11 +102,25 @@ Both `max_tokens` (deprecated) and `max_completion_tokens` are accepted; the new
   "model": "org/model-name",
   "messages": [
     { "role": "system", "content": "You are a helpful assistant." },
-    { "role": "user", "content": "What is 2 + 2?" }
+    { "role": "user", "content": "What is the weather in Paris?" }
   ],
   "stream": false,
   "max_completion_tokens": 256,
-  "temperature": 0.7
+  "temperature": 0.7,
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city",
+        "parameters": {
+          "type": "object",
+          "properties": { "city": { "type": "string" } },
+          "required": ["city"]
+        }
+      }
+    }
+  ]
 }
 ```
 
@@ -124,7 +143,37 @@ Both `max_tokens` (deprecated) and `max_completion_tokens` are accepted; the new
 }
 ```
 
-Note: token counts are zeros in v1; the worker protocol does not yet carry usage stats.
+**Non-streaming response with a tool call (200):**
+
+```json
+{
+  "id": "chatcmpl-abc123",
+  "object": "chat.completion",
+  "created": 1718000001,
+  "model": "org/model-name",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "id": "call_abc123",
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "arguments": "{\"city\":\"Paris\"}"
+            }
+          }
+        ]
+      },
+      "finish_reason": "tool_calls"
+    }
+  ],
+  "usage": { "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0 }
+}
+```
 
 **Streaming response (200, `stream: true`):**
 
@@ -139,6 +188,21 @@ data: [DONE]
 ```
 
 The stream always ends with `data: [DONE]`. On mid-stream errors the OpenAI error envelope is emitted as a `data:` event before `[DONE]`.
+
+**Streaming with a tool call.** The tool-call envelope is suppressed from the
+content deltas; the structured call is sent as a single delta (full name +
+arguments, not argument-by-argument) just before a finish chunk whose reason is
+`tool_calls`:
+
+```
+data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk",...,"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk",...,"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_abc123","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk",...,"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+```
 
 **curl (streaming):**
 

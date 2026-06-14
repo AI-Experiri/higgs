@@ -88,6 +88,58 @@ curl -X POST http://localhost:8081/api/higgs/models/unload
 
 ---
 
+## Tool calling
+
+Send an OpenAI `tools` array; when the model decides to call a tool, the
+response carries spec-shaped `tool_calls` with `finish_reason: "tool_calls"`.
+Works the same against any loaded model — the tool-call format is read from the
+model's own GGUF chat template, not configured per request.
+
+```sh
+curl -H "Content-Type: application/json" \
+  -d '{
+    "model": "org/model-name",
+    "messages": [{"role":"user","content":"What is the weather in Paris?"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city",
+        "parameters": {
+          "type": "object",
+          "properties": {"city": {"type": "string"}},
+          "required": ["city"]
+        }
+      }
+    }]
+  }' \
+  http://localhost:8081/v1/chat/completions | jq '.choices[0]'
+```
+
+```json
+{
+  "index": 0,
+  "message": {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+      {
+        "id": "call_abc123",
+        "type": "function",
+        "function": { "name": "get_weather", "arguments": "{\"city\":\"Paris\"}" }
+      }
+    ]
+  },
+  "finish_reason": "tool_calls"
+}
+```
+
+Add `"stream": true` to receive the call as a single SSE delta followed by a
+finish chunk with `finish_reason: "tool_calls"` (see the Endpoints reference for
+the exact framing). The tool-call envelope never leaks into the content deltas.
+
+---
+
 ## HIGGS_TEST_GGUF Smoke Test
 
 The worker and engine have integration tests that run against a real GGUF file

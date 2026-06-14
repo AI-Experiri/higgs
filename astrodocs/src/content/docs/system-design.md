@@ -130,6 +130,85 @@ ModelStore::scan(lmstudio_roots, hf_roots, ollama_roots)
 
 ---
 
+## Tool calling
+
+`/v1/chat/completions` accepts an OpenAI `tools` array and returns OpenAI
+`tool_calls` (streaming and non-streaming). Both `/v1` surfaces stay strict
+OpenAI — `tool_calls` are spec-shaped. higgs invents no tool-call format of its
+own: the model side is the GGUF-embedded chat template, applied with tools via
+`apply_chat_template_with_tools_oaicompat`.
+
+### Tools flow (request → prompt)
+
+```
+POST /v1/chat/completions  { tools: [...] }   (async-openai wire)
+        │  serve: serde_json::to_string(tools)  → JSON string (400 on bad body)
+        ▼
+chat_stream(..., tools_json)  →  M_CHAT RPC params
+        │
+        ▼
+GenParams.tools_json: Option<String>          (worker boundary)
+        │
+        ▼
+engine: apply_chat_template_with_tools_oaicompat(messages, tools_json)
+        │  the GGUF template renders the tool grammar; the vendored
+        ▼  common_chat selects its matching tool-call parser
+   rendered prompt → decode loop
+```
+
+### Parse pipeline (generation → tool_calls)
+
+```
+full generated text
+        │
+        ▼
+┌─────────────────────────────────────────────────────────────┐
+│ PRIMARY   crate parse_response_oaicompat                     │
+│           covers the families llama.cpp's common_chat        │
+│           handles (Qwen, Mistral, Llama-3, Hermes, …)        │
+└─────────────────────────────────────────────────────────────┘
+      │ Ok → content + tool_calls          │ Err (crate declined)
+      ▼                                     ▼
+  done                          ┌───────────────────────────────────┐
+                                │ FALLBACK  our ToolParserRegistry  │
+                                │   parser selected by chat-template│
+                                │   sniff — handles formats the     │
+                                │   crate rejects (e.g. nemotron_h  │
+                                │   <function=…><parameter=…> XML)  │
+                                └───────────────────────────────────┘
+                                   │ Some calls        │ no parser / no call
+                                   ▼                   ▼
+                              content + calls       RAW: return text verbatim,
+                                                    no tool_calls (warn logged)
+```
+
+The registry is **engine-agnostic** — pure `&str → tool_calls`, no llama
+dependencies — so a future MLX/CUDA engine reuses it unchanged. It ships 7
+parsers, each owning one format family declared by the model's own GGUF chat
+template: `xml-function` (Nemotron/Qwen3-Coder), `qwen-json`, `deepseek3`,
+`glm-xml`, `mistral-bracket`, `gemma4`, `function-gemma`. Adding a format is one
+`ToolCallParser` impl plus one line in `with_defaults()`. (Implementation:
+`worker/tool_parser/` — see its README/DESIGN.)
+
+### Streaming suppression
+
+```
+decode loop piece ──▶ ToolCallStreamFilter ──▶ content delta (SSE)
+                         │  marker-aware:
+                         │  • holds back a tail that could still grow into an
+                         │    open marker (marker never split across pieces)
+                         │  • once a full open marker is seen, suppresses the
+                         │    envelope and the rest of the turn
+                         ▼
+                   tool-call envelope never leaks as assistant text
+
+end of stream:  tool_calls parsed from the FULL generation (pipeline above)
+                → emitted as a final SSE delta
+                → finish chunk with finish_reason "tool_calls"
+```
+
+---
+
 ## How higgs works with jigglebot
 
 The integration is live. jigglebot holds `Arc<Higgs>` in `AppState` and wires it
