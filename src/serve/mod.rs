@@ -402,8 +402,13 @@ fn chat_response(model: String, out: &ChatOutcome) -> CreateChatCompletionRespon
         service_tier: None,
         system_fingerprint: None,
         object: "chat.completion".to_owned(),
-        // v1: the worker protocol carries no token counts yet — usage is zeros.
-        usage: Some(CompletionUsage::default()),
+        // Real token counts from the engine, wired through ChatOutcome.
+        usage: Some(CompletionUsage {
+            prompt_tokens: out.prompt_tokens,
+            completion_tokens: out.completion_tokens,
+            total_tokens: out.prompt_tokens + out.completion_tokens,
+            ..Default::default()
+        }),
     }
 }
 
@@ -917,7 +922,7 @@ mod tests {
             write_response(
                 &mut test_write,
                 2,
-                json!({"content": "hello", "finish_reason": "stop"}), // higgs/chat
+                json!({"content": "hello", "finish_reason": "stop", "prompt_tokens": 12, "completion_tokens": 5}), // higgs/chat
             )
             .await;
         });
@@ -936,8 +941,10 @@ mod tests {
         assert!(chat.id.starts_with("chatcmpl-"));
         assert_eq!(chat.choices[0].message.content.as_deref(), Some("hello"));
         assert_eq!(chat.choices[0].finish_reason, Some(FinishReason::Stop));
-        let usage = chat.usage.expect("usage present (zeros in v1)");
-        assert_eq!(usage.total_tokens, 0);
+        let usage = chat.usage.expect("usage must be present");
+        assert_eq!(usage.prompt_tokens, 12);
+        assert_eq!(usage.completion_tokens, 5);
+        assert_eq!(usage.total_tokens, 17);
     }
 
     // ── Test 5: streaming chat SSE framing ───────────────────────────────────

@@ -150,6 +150,10 @@ pub struct ChatOutcome {
     pub content: String,
     /// OpenAI finish_reason ("stop" or "length").
     pub finish_reason: String,
+    /// Prompt token count from the engine (for OpenAI `usage.prompt_tokens`).
+    pub prompt_tokens: u32,
+    /// Completion token count from the engine (for OpenAI `usage.completion_tokens`).
+    pub completion_tokens: u32,
 }
 
 // ── Higgs ─────────────────────────────────────────────────────────────────────
@@ -370,10 +374,20 @@ impl Higgs {
                 .and_then(|v| v.as_str())
                 .unwrap_or("stop")
                 .to_owned();
+            let prompt_tokens = result
+                .get("prompt_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as u32;
+            let completion_tokens = result
+                .get("completion_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as u32;
 
             Ok(ChatOutcome {
                 content,
                 finish_reason,
+                prompt_tokens,
+                completion_tokens,
             })
         });
 
@@ -693,11 +707,11 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
 
-        // Final response for M_CHAT (RPC id=1).
+        // Final response for M_CHAT (RPC id=1) — includes token counts.
         write_response(
             &mut test_write,
             1,
-            json!({"content": "hello", "finish_reason": "stop"}),
+            json!({"content": "hello", "finish_reason": "stop", "prompt_tokens": 10, "completion_tokens": 3}),
         )
         .await;
 
@@ -709,6 +723,8 @@ mod tests {
 
         assert_eq!(outcome.content, "hello");
         assert_eq!(outcome.finish_reason, "stop");
+        assert_eq!(outcome.prompt_tokens, 10);
+        assert_eq!(outcome.completion_tokens, 3);
 
         // Chunks must have arrived.
         let chunk1 = rx.try_recv().expect("chunk 1");

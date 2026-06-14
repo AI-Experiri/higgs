@@ -213,6 +213,8 @@ mod tests {
             Ok(ChatOutcome {
                 content: "hello".into(),
                 finish_reason: "stop".into(),
+                prompt_tokens: 0,
+                completion_tokens: 0,
             })
         });
 

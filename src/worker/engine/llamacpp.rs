@@ -72,7 +72,7 @@ impl HiggsEngine for LlamaCppEngine {
         messages: &[EngineMessage],
         params: &GenParams,
         sink: &mut dyn FnMut(&str),
-    ) -> Result<(String, &'static str), HiggsError> {
+    ) -> Result<super::ChatResult, HiggsError> {
         let Some(loaded) = self.loaded.as_ref() else {
             // defensive guard; worker checks first — id unknown at engine level
             return Err(HiggsError::ModelNotLoaded {
@@ -116,8 +116,16 @@ impl HiggsEngine for LlamaCppEngine {
                 n_ctx,
             });
         }
+        // prompt_tokens is the length of the tokenized, template-applied prompt.
+        let prompt_tokens = tokens.len() as u32;
+
         if params.max_tokens == 0 {
-            return Ok((String::new(), "length"));
+            return Ok(super::ChatResult {
+                content: String::new(),
+                finish_reason: "length",
+                prompt_tokens,
+                completion_tokens: 0,
+            });
         }
 
         // Fresh context per request (v1 simplicity: naive full re-prefill).
@@ -200,7 +208,13 @@ impl HiggsEngine for LlamaCppEngine {
             full.push_str(&tail);
         }
 
-        Ok((full, finish_reason))
+        Ok(super::ChatResult {
+            content: full,
+            finish_reason,
+            prompt_tokens,
+            // n_generated counts tokens emitted in the decode loop (one per iteration).
+            completion_tokens: n_generated as u32,
+        })
     }
 }
 
@@ -226,7 +240,7 @@ mod tests {
         .unwrap();
         assert!(e.is_loaded());
         let mut out = String::new();
-        let (text, finish_reason) = e
+        let result = e
             .chat(
                 &[EngineMessage {
                     role: "user".into(),
@@ -239,10 +253,18 @@ mod tests {
                 &mut |d| out.push_str(d),
             )
             .unwrap();
-        println!("model said: {text:?} (finish_reason={finish_reason})");
-        assert!(!text.is_empty());
-        assert_eq!(text, out);
-        assert!(finish_reason == "stop" || finish_reason == "length");
+        println!(
+            "model said: {:?} (finish_reason={}, prompt_tokens={}, completion_tokens={})",
+            result.content, result.finish_reason, result.prompt_tokens, result.completion_tokens
+        );
+        assert!(!result.content.is_empty());
+        assert_eq!(result.content, out);
+        assert!(result.finish_reason == "stop" || result.finish_reason == "length");
+        assert!(result.prompt_tokens > 0, "prompt_tokens must be non-zero");
+        assert!(
+            result.completion_tokens > 0,
+            "completion_tokens must be non-zero"
+        );
         e.unload();
         assert!(!e.is_loaded());
     }

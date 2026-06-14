@@ -220,14 +220,19 @@ impl WorkerState {
                         chunk_write_failed = true;
                     }
                 };
-                let (content, finish_reason) = self
+                let result = self
                     .engine
                     .chat(&messages, &gen, &mut sink)
                     .map_err(|e| to_rpc_error(&e))?;
                 if chunk_write_failed {
                     tracing::warn!("chat chunk write failed; supervisor pipe broken");
                 }
-                Ok(json!({"content": content, "finish_reason": finish_reason}))
+                Ok(json!({
+                    "content": result.content,
+                    "finish_reason": result.finish_reason,
+                    "prompt_tokens": result.prompt_tokens,
+                    "completion_tokens": result.completion_tokens,
+                }))
             }
             other => Err(RpcError {
                 code: -32601,
@@ -310,11 +315,17 @@ mod tests {
             _messages: &[engine::EngineMessage],
             _params: &engine::GenParams,
             sink: &mut dyn FnMut(&str),
-        ) -> Result<(String, &'static str), HiggsError> {
+        ) -> Result<engine::ChatResult, HiggsError> {
             self.calls.lock().push("chat".into());
             sink("he");
             sink("llo");
-            Ok(("hello".into(), "stop"))
+            Ok(engine::ChatResult {
+                content: "hello".into(),
+                finish_reason: "stop",
+                // Scripted counts: 5 prompt tokens, 2 completion tokens.
+                prompt_tokens: 5,
+                completion_tokens: 2,
+            })
         }
     }
 
