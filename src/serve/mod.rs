@@ -248,7 +248,7 @@ pub fn router(higgs: Arc<Higgs>) -> Router {
         .route("/api/higgs/models", get(control_models))
         .route("/api/higgs/models/load", post(control_load))
         .route("/api/higgs/models/unload", post(control_unload))
-        .route("/api/higgs/models/{id}", get(control_model_by_id))
+        .route("/api/higgs/models/{*id}", get(control_model_by_id))
         .route("/api/higgs/status", get(control_status))
         .route("/api/higgs/logs", get(control_logs))
         .route("/api/higgs/worker/start", post(control_worker_start))
@@ -541,12 +541,14 @@ async fn control_models(State(higgs): State<Arc<Higgs>>) -> Response {
     .into_response()
 }
 
-/// `GET /api/higgs/models/:id` — single enriched model by HuggingFace repo id.
+/// `GET /api/higgs/models/{*id}` — single enriched model by HuggingFace repo id.
 ///
+/// The wildcard captures the full remaining path so slashed HF repo ids
+/// (`org/model`, `lmstudio-community/Foo-GGUF`) round-trip correctly.
 /// Returns [`HiggsModelEntry`] on success, or 404 [`HiggsErrorResponse`] when the
 /// id is absent from the scanned catalog.
 async fn control_model_by_id(State(higgs): State<Arc<Higgs>>, Path(id): Path<String>) -> Response {
-    tracing::info!(id = %id, "higgs: GET /api/higgs/models/:id");
+    tracing::info!(id = %id, "higgs: GET /api/higgs/models/{{*id}}");
     let models = match higgs.scan().await {
         Ok(m) => m,
         Err(err) => {
@@ -1045,21 +1047,29 @@ mod tests {
         assert_eq!(v["status"], "ok");
     }
 
-    // ── Test 7: control_model_by_id found ────────────────────────────────────
+    // ── Test 7: control_model_by_id with a slashed HF repo id ───────────────
+    //
+    // This is the regression test for the wildcard-route bug: with the old
+    // single-segment `{id}` route, a request to `/api/higgs/models/org/model`
+    // (literal slash in the path, as real curl sends) never matched — axum
+    // treated `org` and `model` as separate segments. The test previously used
+    // `org%2Fmodel` (percent-encoded) which happened to work against the broken
+    // route because `%2F` is a single segment. Using a literal slash here
+    // ensures the wildcard `{*id}` route is exercised as real callers do.
 
     #[tokio::test]
-    async fn control_model_by_id_found() {
+    async fn control_model_by_id_found_slashed() {
         let (sup, mut test_write, _test_read, _ring) = make_supervisor();
         let app = make_app(sup);
 
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(30)).await;
-            // scan response
+            // scan response — realistic HF repo id with slash
             write_response(
                 &mut test_write,
                 1,
                 serde_json::json!([{
-                    "id": "org/model",
+                    "id": "lmstudio-community/NVIDIA-Nemotron-3-Nano-4B-GGUF",
                     "path": "/models/model.gguf",
                     "size_bytes": 4000000000u64,
                     "quant": "Q4_K_M",
@@ -1080,19 +1090,23 @@ mod tests {
             .await;
         });
 
+        // Literal slash in the URL — this is what real curl sends and what
+        // the old `{id}` route could never match.
         let resp = app
-            .oneshot(get("/api/higgs/models/org%2Fmodel"))
+            .oneshot(get(
+                "/api/higgs/models/lmstudio-community/NVIDIA-Nemotron-3-Nano-4B-GGUF",
+            ))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-        assert_eq!(v["id"], "org/model");
+        assert_eq!(v["id"], "lmstudio-community/NVIDIA-Nemotron-3-Nano-4B-GGUF");
         assert_eq!(v["state"], "not-loaded");
         assert_eq!(v["format"], "gguf");
         assert_eq!(v["arch"], "llama");
     }
 
-    // ── Test 8: control_model_by_id not found ────────────────────────────────
+    // ── Test 8: control_model_by_id not found (slashed id) ───────────────────
 
     #[tokio::test]
     async fn control_model_by_id_not_found() {
@@ -1111,8 +1125,9 @@ mod tests {
             .await;
         });
 
+        // Slashed id that does not exist in the catalog → 404 HG002.
         let resp = app
-            .oneshot(get("/api/higgs/models/org%2Fnope"))
+            .oneshot(get("/api/higgs/models/org/nope"))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
