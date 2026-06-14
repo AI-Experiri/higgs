@@ -23,6 +23,9 @@ impl Drop for ServerGuard {
 
 /// Spawn `higgs-server` on `127.0.0.1:{port}` and wait until `/api/higgs/status`
 /// answers (worker spawned + listener bound). Panics if it never comes up.
+// The spawned child is reaped by `ServerGuard::drop` (kill + wait), so the
+// zombie-process lint is a false positive — clippy can't see the Drop impl.
+#[allow(clippy::zombie_processes)]
 pub async fn spawn(port: u16) -> ServerGuard {
     let child = Command::new(env!("CARGO_BIN_EXE_higgs-server"))
         .env("HIGGS_BIND", "127.0.0.1")

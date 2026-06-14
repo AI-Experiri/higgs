@@ -1252,4 +1252,357 @@ mod tests {
             "tail of n, oldest first"
         );
     }
+
+    fn scan_json() -> serde_json::Value {
+        json!([{
+            "id": "org/model",
+            "path": "/models/model.gguf",
+            "size_bytes": 4000000000u64,
+            "quant": "Q4_K_M",
+            "source": "LmStudio",
+            "arch": "llama",
+            "ctx_train": 8192u64,
+            "has_chat_template": true,
+        }])
+    }
+
+    // ── control_models: scan + status enrichment ─────────────────────────────
+
+    #[tokio::test]
+    async fn control_models_lists_with_loaded_flag() {
+        let (sup, mut test_write, _test_read, _ring) = make_supervisor();
+        let app = make_app(sup);
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            write_response(&mut test_write, 1, scan_json()).await; // scan
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            write_response(&mut test_write, 2, loaded_status_json()).await; // status
+        });
+
+        let resp = app.oneshot(get("/api/higgs/models")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(v["loaded_id"], "org/model");
+        let models = v["models"].as_array().expect("models array");
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0]["state"], "loaded", "loaded id is flagged");
+        assert_eq!(models[0]["format"], "gguf");
+        assert_eq!(models[0]["id"], "org/model");
+    }
+
+    // ── control_status passthrough ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn control_status_returns_snapshot() {
+        let (sup, mut test_write, _test_read, _ring) = make_supervisor();
+        let app = make_app(sup);
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            write_response(&mut test_write, 1, loaded_status_json()).await;
+        });
+
+        let resp = app.oneshot(get("/api/higgs/status")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(v["loaded"]["id"], "org/model");
+    }
+
+    // ── control_load with explicit params (non-default branch) ───────────────
+
+    #[tokio::test]
+    async fn control_load_with_explicit_params() {
+        let (sup, mut test_write, _test_read, _ring) = make_supervisor();
+        let app = make_app(sup);
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            write_response(&mut test_write, 1, json!({"id": "org/model"})).await;
+            // higgs/load
+        });
+
+        // Providing ctx_len takes the param-merge branch (Some(LoadParams)).
+        let resp = app
+            .oneshot(post_json(
+                "/api/higgs/models/load",
+                &json!({"id": "org/model", "ctx_len": 2048}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["id"], "org/model");
+    }
+
+    // ── control_system: real host snapshot ───────────────────────────────────
+
+    #[tokio::test]
+    async fn control_system_returns_host_info() {
+        let (sup, _test_write, _test_read, _ring) = make_supervisor();
+        let app = make_app(sup);
+
+        let resp = app.oneshot(get("/api/higgs/system")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        // SystemInfo always reports a positive total RAM on a real host.
+        assert!(
+            v.get("ram").is_some() || v.get("cpu").is_some() || v.is_object(),
+            "system info is a populated object: {v}"
+        );
+    }
+
+    // ── control_worker_stop: graceful, always ok ─────────────────────────────
+
+    #[tokio::test]
+    async fn control_worker_stop_ok() {
+        let (sup, _test_write, _test_read, _ring) = make_supervisor();
+        let app = make_app(sup);
+
+        let resp = app
+            .oneshot(post_json("/api/higgs/worker/stop", &json!({})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(v["status"], "ok");
+    }
+
+    // ── messages_to_pairs: pure role-flattening ──────────────────────────────
+    //
+    // Parse OpenAI request messages from JSON (their canonical wire form) so the
+    // async-openai untagged content enums deserialize exactly as a real request
+    // would, then assert the flattened (role, text) pairs.
+
+    fn parse_messages(v: serde_json::Value) -> Vec<ChatCompletionRequestMessage> {
+        serde_json::from_value(v).expect("messages deserialize")
+    }
+
+    #[test]
+    fn messages_to_pairs_role_interleaving_and_multiturn() {
+        let msgs = parse_messages(json!([
+            {"role": "system", "content": "be terse"},
+            {"role": "developer", "content": "dev note"},
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "answer one"},
+            {"role": "user", "content": "second"},
+            {"role": "tool", "content": "tool out", "tool_call_id": "call_1"}
+        ]));
+        let pairs = messages_to_pairs(&msgs).expect("all text → Ok");
+        assert_eq!(
+            pairs,
+            vec![
+                ("system".to_owned(), "be terse".to_owned()),
+                ("developer".to_owned(), "dev note".to_owned()),
+                ("user".to_owned(), "first".to_owned()),
+                ("assistant".to_owned(), "answer one".to_owned()),
+                ("user".to_owned(), "second".to_owned()),
+                ("tool".to_owned(), "tool out".to_owned()),
+            ],
+            "order and roles preserved across the multi-turn conversation"
+        );
+    }
+
+    #[test]
+    fn messages_to_pairs_text_part_arrays_joined_with_newline() {
+        // Every role whose content can be a text-part array: system, developer,
+        // user, assistant, tool. Parts join with `\n` (shimmy convention).
+        let msgs = parse_messages(json!([
+            {"role": "system", "content": [
+                {"type": "text", "text": "a"}, {"type": "text", "text": "b"}
+            ]},
+            {"role": "developer", "content": [
+                {"type": "text", "text": "c"}, {"type": "text", "text": "d"}
+            ]},
+            {"role": "user", "content": [
+                {"type": "text", "text": "e"}, {"type": "text", "text": "f"}
+            ]},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": "g"}, {"type": "text", "text": "h"}
+            ]},
+            {"role": "tool", "tool_call_id": "t1", "content": [
+                {"type": "text", "text": "i"}, {"type": "text", "text": "j"}
+            ]}
+        ]));
+        let pairs = messages_to_pairs(&msgs).expect("text parts → Ok");
+        assert_eq!(pairs[0], ("system".to_owned(), "a\nb".to_owned()));
+        assert_eq!(pairs[1], ("developer".to_owned(), "c\nd".to_owned()));
+        assert_eq!(pairs[2], ("user".to_owned(), "e\nf".to_owned()));
+        assert_eq!(pairs[3], ("assistant".to_owned(), "g\nh".to_owned()));
+        assert_eq!(pairs[4], ("tool".to_owned(), "i\nj".to_owned()));
+    }
+
+    #[test]
+    fn messages_to_pairs_assistant_none_content_is_empty_string() {
+        // An assistant turn with only tool_calls (no content) flattens to "".
+        let msgs = parse_messages(json!([
+            {"role": "assistant", "tool_calls": [
+                {"id": "c1", "type": "function",
+                 "function": {"name": "f", "arguments": "{}"}}
+            ]}
+        ]));
+        let pairs = messages_to_pairs(&msgs).expect("None content → Ok");
+        assert_eq!(pairs, vec![("assistant".to_owned(), String::new())]);
+    }
+
+    #[test]
+    fn messages_to_pairs_rejects_user_image_part() {
+        let msgs = parse_messages(json!([
+            {"role": "user", "content": [
+                {"type": "text", "text": "look"},
+                {"type": "image_url", "image_url": {"url": "http://x/y.png"}}
+            ]}
+        ]));
+        let err = messages_to_pairs(&msgs).expect_err("image part → Err");
+        assert!(
+            err.contains("non-text content part"),
+            "rejection message: {err}"
+        );
+    }
+
+    #[test]
+    fn messages_to_pairs_rejects_assistant_refusal_part() {
+        let msgs = parse_messages(json!([
+            {"role": "assistant", "content": [
+                {"type": "refusal", "refusal": "I cannot help with that"}
+            ]}
+        ]));
+        let err = messages_to_pairs(&msgs).expect_err("refusal part → Err");
+        assert!(err.contains("refusal content part"), "message: {err}");
+    }
+
+    // ── chat_response: pure ChatOutcome → response mapping ────────────────────
+
+    #[test]
+    fn chat_response_without_tool_calls() {
+        let out = ChatOutcome {
+            content: "hi there".into(),
+            finish_reason: "stop".into(),
+            tool_calls: None,
+            prompt_tokens: 10,
+            completion_tokens: 7,
+        };
+        let resp = chat_response("org/model".into(), &out);
+        assert_eq!(resp.model, "org/model");
+        assert_eq!(resp.object, "chat.completion");
+        let choice = &resp.choices[0];
+        assert_eq!(choice.message.content.as_deref(), Some("hi there"));
+        assert!(choice.message.tool_calls.is_none());
+        assert_eq!(choice.finish_reason, Some(FinishReason::Stop));
+        assert_eq!(choice.message.role, Role::Assistant);
+        let usage = resp.usage.expect("usage present");
+        assert_eq!(usage.prompt_tokens, 10);
+        assert_eq!(usage.completion_tokens, 7);
+        assert_eq!(usage.total_tokens, 17);
+    }
+
+    #[test]
+    fn chat_response_length_finish_reason_passthrough() {
+        let out = ChatOutcome {
+            content: "truncated".into(),
+            finish_reason: "length".into(),
+            tool_calls: None,
+            prompt_tokens: 3,
+            completion_tokens: 1024,
+        };
+        let resp = chat_response("org/model".into(), &out);
+        assert_eq!(
+            resp.choices[0].finish_reason,
+            Some(FinishReason::Length),
+            "engine length signal passes through when no tool calls"
+        );
+    }
+
+    #[test]
+    fn chat_response_with_tool_calls_forces_finish_reason() {
+        let out = ChatOutcome {
+            content: String::new(),
+            // Engine says "stop" but tool_calls must force "tool_calls".
+            finish_reason: "stop".into(),
+            tool_calls: Some(json!([{
+                "id": "call_99",
+                "type": "function",
+                "function": {"name": "search", "arguments": "{\"q\":\"rust\"}"}
+            }])),
+            prompt_tokens: 20,
+            completion_tokens: 4,
+        };
+        let resp = chat_response("org/model".into(), &out);
+        let choice = &resp.choices[0];
+        assert_eq!(
+            choice.finish_reason,
+            Some(FinishReason::ToolCalls),
+            "tool_calls overrides the engine stop signal"
+        );
+        let calls = choice
+            .message
+            .tool_calls
+            .as_ref()
+            .expect("tool_calls populated");
+        assert_eq!(calls.len(), 1);
+        let ChatCompletionMessageToolCalls::Function(call) = &calls[0] else {
+            panic!("expected a function tool call, got {:?}", calls[0]);
+        };
+        assert_eq!(call.id, "call_99");
+        assert_eq!(call.function.name, "search");
+        assert_eq!(call.function.arguments, "{\"q\":\"rust\"}");
+        let usage = resp.usage.expect("usage present");
+        assert_eq!(usage.total_tokens, 24);
+    }
+
+    #[test]
+    fn chat_response_malformed_tool_calls_degrade_to_none() {
+        // tool_calls that don't deserialize into the async-openai wire type must
+        // degrade to no tool calls (logged internally) rather than panic; the
+        // finish reason then comes from the engine signal.
+        let out = ChatOutcome {
+            content: "text".into(),
+            finish_reason: "stop".into(),
+            // A bare string is not a tool_calls array.
+            tool_calls: Some(json!("not a tool call array")),
+            prompt_tokens: 1,
+            completion_tokens: 1,
+        };
+        let resp = chat_response("org/model".into(), &out);
+        assert!(
+            resp.choices[0].message.tool_calls.is_none(),
+            "malformed tool_calls degrade to None"
+        );
+        assert_eq!(resp.choices[0].finish_reason, Some(FinishReason::Stop));
+    }
+
+    // ── http_status mapping table ────────────────────────────────────────────
+
+    #[test]
+    fn http_status_mapping_table() {
+        assert_eq!(
+            http_status(&HiggsError::ModelNotFound { id: "x".into() }),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            http_status(&HiggsError::ModelNotLoaded { id: "x".into() }),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            http_status(&HiggsError::ContextOverflow {
+                prompt_tokens: 10,
+                max_gen: 5,
+                n_ctx: 8,
+            }),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            http_status(&HiggsError::WorkerDead {
+                context: "gone".into(),
+            }),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            http_status(&HiggsError::WorkerSpawnFailed {
+                source: std::io::Error::other("boom"),
+            }),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
 }

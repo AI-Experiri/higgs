@@ -1174,4 +1174,111 @@ mod tests {
             "ModelLoaded must carry the replayed model id"
         );
     }
+
+    /// `logs(n)` returns the tail of the stderr ring, oldest first, and clamps
+    /// to the ring length when fewer than `n` lines are present.
+    #[tokio::test]
+    async fn logs_tail_and_clamp() {
+        let (sup, _tw, _tr) = make_supervisor();
+        {
+            let mut ring = sup.inner.stderr_ring.lock();
+            ring.push_back("a".to_owned());
+            ring.push_back("b".to_owned());
+            ring.push_back("c".to_owned());
+        }
+        // Tail of 2 → last two, oldest first.
+        assert_eq!(sup.logs(2), vec!["b".to_owned(), "c".to_owned()]);
+        // n larger than the ring → all lines, no panic.
+        assert_eq!(
+            sup.logs(100),
+            vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]
+        );
+        // n == 0 → empty.
+        assert!(sup.logs(0).is_empty());
+    }
+
+    /// `record_last_scan` / `record_last_load` persist replay params, and
+    /// `alloc_request_id` hands out strictly increasing ids.
+    #[tokio::test]
+    async fn record_params_and_alloc_ids() {
+        let (sup, _tw, _tr) = make_supervisor();
+        assert!(sup.last_scan_params().is_none(), "no scan recorded yet");
+
+        sup.record_last_scan(json!({"roots": ["/x"]}));
+        sup.record_last_load(json!({"id": "org/model"}));
+        assert_eq!(sup.last_scan_params(), Some(json!({"roots": ["/x"]})));
+
+        let a = sup.alloc_request_id();
+        let b = sup.alloc_request_id();
+        assert!(b > a, "ids strictly increase: {a} then {b}");
+    }
+
+    /// `register_chat_sink` then `remove_chat_sink` adds and releases the keyed
+    /// map entry; the dropped sender closes the receiver (end-of-stream).
+    #[tokio::test]
+    async fn chat_sink_register_and_remove() {
+        let (sup, _tw, _tr) = make_supervisor();
+        assert_eq!(sup.chat_sinks_count(), 0);
+
+        let mut rx = sup.register_chat_sink(42);
+        assert_eq!(sup.chat_sinks_count(), 1);
+
+        sup.remove_chat_sink(42);
+        assert_eq!(sup.chat_sinks_count(), 0);
+        // The dropped sender closes the receiver → recv yields None.
+        assert!(rx.recv().await.is_none(), "removed sink closes the stream");
+    }
+
+    /// A `route_notification` with an unrelated method, a missing `request_id`,
+    /// or a missing `delta` is a silent no-op (no sink delivery, no panic).
+    #[tokio::test]
+    async fn route_notification_ignores_malformed() {
+        let (sup, _tw, _tr) = make_supervisor();
+        let mut rx = sup.register_chat_sink(7);
+
+        // Wrong method.
+        route_notification(
+            &sup.inner,
+            &rpc::RpcNotification {
+                jsonrpc: "2.0".into(),
+                method: "higgs/other".into(),
+                params: json!({"request_id": 7, "delta": "x"}),
+            },
+        );
+        // Right method but no request_id.
+        route_notification(
+            &sup.inner,
+            &rpc::RpcNotification {
+                jsonrpc: "2.0".into(),
+                method: N_CHAT_CHUNK.into(),
+                params: json!({"delta": "x"}),
+            },
+        );
+        // Right method, request_id present, but no delta.
+        route_notification(
+            &sup.inner,
+            &rpc::RpcNotification {
+                jsonrpc: "2.0".into(),
+                method: N_CHAT_CHUNK.into(),
+                params: json!({"request_id": 7}),
+            },
+        );
+
+        // None of the above delivered anything to the sink.
+        assert!(
+            rx.try_recv().is_err(),
+            "malformed notifications deliver nothing"
+        );
+
+        // A well-formed one delivers.
+        route_notification(
+            &sup.inner,
+            &rpc::RpcNotification {
+                jsonrpc: "2.0".into(),
+                method: N_CHAT_CHUNK.into(),
+                params: json!({"request_id": 7, "delta": "hi"}),
+            },
+        );
+        assert_eq!(rx.try_recv().unwrap(), "hi");
+    }
 }

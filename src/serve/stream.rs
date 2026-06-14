@@ -363,4 +363,140 @@ mod tests {
 
         assert_eq!(payloads[3], "[DONE]", "[DONE] is always last");
     }
+
+    #[test]
+    fn stream_tool_calls_maps_fields() {
+        let v = serde_json::json!([
+            {
+                "id": "call_abc",
+                "type": "function",
+                "function": { "name": "get_weather", "arguments": "{\"city\":\"SF\"}" }
+            },
+            {
+                "id": "call_def",
+                "function": { "name": "lookup", "arguments": "{}" }
+            }
+        ]);
+        let chunks = stream_tool_calls(&v).expect("non-empty array maps to Some");
+        assert_eq!(chunks.len(), 2);
+
+        assert_eq!(chunks[0].index, 0);
+        assert_eq!(chunks[0].id.as_deref(), Some("call_abc"));
+        assert_eq!(chunks[0].r#type, Some(FunctionType::Function));
+        let f0 = chunks[0].function.as_ref().expect("function present");
+        assert_eq!(f0.name.as_deref(), Some("get_weather"));
+        assert_eq!(f0.arguments.as_deref(), Some("{\"city\":\"SF\"}"));
+
+        assert_eq!(chunks[1].index, 1);
+        assert_eq!(chunks[1].id.as_deref(), Some("call_def"));
+        let f1 = chunks[1].function.as_ref().expect("function present");
+        assert_eq!(f1.name.as_deref(), Some("lookup"));
+        assert_eq!(f1.arguments.as_deref(), Some("{}"));
+    }
+
+    #[test]
+    fn stream_tool_calls_none_for_empty_or_non_array() {
+        // Empty array → None (no calls to emit).
+        assert!(stream_tool_calls(&serde_json::json!([])).is_none());
+        // Non-array values → None.
+        assert!(stream_tool_calls(&serde_json::json!({"function": {"name": "x"}})).is_none());
+        assert!(stream_tool_calls(&serde_json::json!("not an array")).is_none());
+        assert!(stream_tool_calls(&serde_json::Value::Null).is_none());
+    }
+
+    #[test]
+    fn stream_tool_calls_missing_function_fields_are_none() {
+        // An array element with no `function`/`id` keys still yields a chunk,
+        // but its name/arguments/id collapse to None.
+        let v = serde_json::json!([{}]);
+        let chunks = stream_tool_calls(&v).expect("one element → Some");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].id, None);
+        let f = chunks[0]
+            .function
+            .as_ref()
+            .expect("function wrapper present");
+        assert_eq!(f.name, None);
+        assert_eq!(f.arguments, None);
+    }
+
+    /// An outcome carrying tool_calls must emit a tool-call delta chunk plus a
+    /// finish chunk whose reason is `tool_calls` (overriding the engine's
+    /// stop/length signal), before `[DONE]`.
+    #[tokio::test]
+    async fn assemble_tool_calls_path() {
+        let (_dtx, drx) = mpsc::unbounded_channel::<String>();
+        let outcome = tokio::spawn(async {
+            Ok(ChatOutcome {
+                content: String::new(),
+                // Engine said "stop" but tool_calls must force "tool_calls".
+                finish_reason: "stop".into(),
+                tool_calls: Some(serde_json::json!([{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": { "name": "search", "arguments": "{\"q\":\"x\"}" }
+                }])),
+                prompt_tokens: 0,
+                completion_tokens: 0,
+            })
+        });
+
+        let payloads = run_assemble(drx, outcome).await;
+        // role chunk + tool_calls delta + finish chunk + [DONE]
+        assert_eq!(payloads.len(), 4, "role + tool_calls + finish + [DONE]");
+
+        let parse =
+            |s: &str| -> CreateChatCompletionStreamResponse { serde_json::from_str(s).unwrap() };
+
+        // payloads[1] carries the tool-call delta.
+        let tc = parse(&payloads[1]);
+        let calls = tc.choices[0]
+            .delta
+            .tool_calls
+            .as_ref()
+            .expect("tool_calls delta present");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id.as_deref(), Some("call_1"));
+        assert_eq!(
+            calls[0].function.as_ref().unwrap().name.as_deref(),
+            Some("search")
+        );
+        // No finish_reason on the tool-call delta chunk itself.
+        assert_eq!(tc.choices[0].finish_reason, None);
+
+        // payloads[2] is the finish chunk: reason forced to tool_calls.
+        let finish = parse(&payloads[2]);
+        assert_eq!(
+            finish.choices[0].finish_reason,
+            Some(FinishReason::ToolCalls)
+        );
+
+        assert_eq!(payloads[3], "[DONE]");
+    }
+
+    /// Outcome with an empty tool_calls array behaves like a normal completion:
+    /// `stream_tool_calls` returns None, so the finish reason comes from the
+    /// engine signal and no tool-call delta chunk is emitted.
+    #[tokio::test]
+    async fn assemble_empty_tool_calls_falls_back_to_finish_reason() {
+        let (_dtx, drx) = mpsc::unbounded_channel::<String>();
+        let outcome = tokio::spawn(async {
+            Ok(ChatOutcome {
+                content: "done".into(),
+                finish_reason: "length".into(),
+                tool_calls: Some(serde_json::json!([])),
+                prompt_tokens: 0,
+                completion_tokens: 0,
+            })
+        });
+
+        let payloads = run_assemble(drx, outcome).await;
+        // role + finish + [DONE] — no tool-call delta for an empty array.
+        assert_eq!(payloads.len(), 3, "role + finish + [DONE]");
+        let parse =
+            |s: &str| -> CreateChatCompletionStreamResponse { serde_json::from_str(s).unwrap() };
+        let finish = parse(&payloads[1]);
+        assert_eq!(finish.choices[0].finish_reason, Some(FinishReason::Length));
+        assert_eq!(payloads[2], "[DONE]");
+    }
 }

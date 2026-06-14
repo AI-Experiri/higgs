@@ -912,4 +912,258 @@ mod tests {
         let found2 = store.get("org/model").expect("model must be found");
         assert_eq!(found.path, found2.path, "get() must be deterministic");
     }
+
+    /// Build a GGUF in `dir/{org}/{model}/file.gguf` with the given metadata,
+    /// then scan it. Returns the single discovered model. Encodes GGUF String
+    /// values as an 8-byte LE length prefix + UTF-8 bytes.
+    fn scan_single_gguf(
+        kvs: &[(&str, ggus::GGufMetaDataValueType, Vec<u8>)],
+        rel: &str,
+    ) -> HiggsModel {
+        use ggus::{GGufFileHeader, GGufFileWriter};
+        use std::io::Cursor;
+
+        let header = GGufFileHeader::new(3, 0, kvs.len() as u64);
+        let mut buf = Cursor::new(Vec::<u8>::new());
+        let mut writer = GGufFileWriter::new(&mut buf, header).unwrap();
+        for (key, ty, bytes) in kvs {
+            writer.write_meta_kv(key, *ty, bytes).unwrap();
+        }
+        writer.finish::<Vec<u8>>(false).finish().unwrap();
+
+        let dir = TempDir::new().unwrap();
+        let gguf_path = dir.path().join(rel);
+        write_file(&gguf_path, buf.into_inner().as_slice());
+
+        let mut store = ModelStore::default();
+        let models = store.scan(&[dir.path().to_path_buf()], &[], &[]).unwrap();
+        assert_eq!(models.len(), 1);
+        models[0].clone()
+    }
+
+    fn gguf_str(s: &str) -> Vec<u8> {
+        let b = s.as_bytes();
+        let mut out = Vec::with_capacity(8 + b.len());
+        out.extend_from_slice(&(b.len() as u64).to_le_bytes());
+        out.extend_from_slice(b);
+        out
+    }
+
+    /// A chat template referencing `tool_call`/`tools` and `<think>` must set
+    /// both capability flags during enrichment.
+    #[test]
+    fn enrich_detects_tool_and_reasoning_capabilities() {
+        use ggus::GGufMetaDataValueType::{String as GS, U32};
+        let model = scan_single_gguf(
+            &[
+                ("general.architecture", GS, gguf_str("qwen3")),
+                ("qwen3.context_length", U32, 32768u32.to_le_bytes().to_vec()),
+                (
+                    "tokenizer.chat_template",
+                    GS,
+                    gguf_str("{% if tools %}{{ tool_call }}{% endif %}<think></think>"),
+                ),
+            ],
+            "qwen/q3/model-Q4_K_M.gguf",
+        );
+        assert_eq!(model.arch.as_deref(), Some("qwen3"));
+        assert_eq!(model.ctx_train, Some(32768));
+        assert!(model.has_chat_template);
+        assert!(model.supports_tools, "template references tools/tool_call");
+        assert!(model.supports_reasoning, "template references <think>");
+    }
+
+    /// A plain chat template with no tool/think markup leaves both capability
+    /// flags false even though has_chat_template is true.
+    #[test]
+    fn enrich_plain_template_no_capabilities() {
+        use ggus::GGufMetaDataValueType::{String as GS, U32};
+        let model = scan_single_gguf(
+            &[
+                ("general.architecture", GS, gguf_str("gemma3")),
+                ("gemma3.context_length", U32, 8192u32.to_le_bytes().to_vec()),
+                (
+                    "tokenizer.chat_template",
+                    GS,
+                    gguf_str("{% for m in messages %}{{ m.content }}{% endfor %}"),
+                ),
+            ],
+            "google/gemma/model-Q8_0.gguf",
+        );
+        assert!(model.has_chat_template);
+        assert!(!model.supports_tools);
+        assert!(!model.supports_reasoning);
+    }
+
+    /// The lowercase "thinking" heuristic path: a template that says "thinking"
+    /// (no `<think>` tags) still flags reasoning support.
+    #[test]
+    fn enrich_thinking_word_flags_reasoning() {
+        use ggus::GGufMetaDataValueType::{String as GS, U32};
+        let model = scan_single_gguf(
+            &[
+                ("general.architecture", GS, gguf_str("llama")),
+                ("llama.context_length", U32, 4096u32.to_le_bytes().to_vec()),
+                (
+                    "tokenizer.chat_template",
+                    GS,
+                    gguf_str("You may show your Thinking before answering."),
+                ),
+            ],
+            "org/m/model-Q4_K_M.gguf",
+        );
+        assert!(model.has_chat_template);
+        assert!(model.supports_reasoning, "the word 'thinking' flags it");
+        assert!(!model.supports_tools);
+    }
+
+    /// Ollama manifest whose model layer digest lacks the `sha256:` prefix is an
+    /// invalid manifest → HG009 error aborting the scan.
+    #[test]
+    fn ollama_bad_digest_format_errors() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let manifest =
+            r#"{"layers":[{"mediaType":"application/vnd.ollama.image.model","digest":"md5:zzz"}]}"#;
+        write_file(
+            &root.join("manifests/registry.ollama.ai/library/bad/latest"),
+            manifest.as_bytes(),
+        );
+        let mut store = ModelStore::default();
+        let err = store
+            .scan(&[], &[], &[root.to_path_buf()])
+            .expect_err("non-sha256 digest must error");
+        assert!(
+            matches!(err, HiggsError::OllamaManifestInvalid { .. }),
+            "got: {err:?}"
+        );
+    }
+
+    /// Ollama model layer missing the `digest` field entirely → HG009 error.
+    #[test]
+    fn ollama_missing_digest_errors() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let manifest = r#"{"layers":[{"mediaType":"application/vnd.ollama.image.model"}]}"#;
+        write_file(
+            &root.join("manifests/registry.ollama.ai/library/nodigest/latest"),
+            manifest.as_bytes(),
+        );
+        let mut store = ModelStore::default();
+        let err = store
+            .scan(&[], &[], &[root.to_path_buf()])
+            .expect_err("missing digest must error");
+        assert!(matches!(err, HiggsError::OllamaManifestInvalid { .. }));
+    }
+
+    /// A manifest whose blob is absent from `blobs/` is skipped silently (normal
+    /// for partial pulls) — scan succeeds with no model.
+    #[test]
+    fn ollama_missing_blob_skipped() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        // Manifest references a blob that was never written.
+        let manifest = r#"{"layers":[{"mediaType":"application/vnd.ollama.image.model","digest":"sha256:absent"}]}"#;
+        write_file(
+            &root.join("manifests/registry.ollama.ai/library/gone/latest"),
+            manifest.as_bytes(),
+        );
+        let mut store = ModelStore::default();
+        let models = store.scan(&[], &[], &[root.to_path_buf()]).unwrap();
+        assert!(models.is_empty(), "missing blob → skipped, no error");
+    }
+
+    /// Non-`.gguf` files in an LM Studio model dir are ignored; only GGUF files
+    /// become catalog entries.
+    #[test]
+    fn lmstudio_non_gguf_files_ignored() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        write_file(&root.join("org/m/README.md"), b"docs");
+        write_file(&root.join("org/m/config.json"), b"{}");
+        write_file(&root.join("org/m/model-Q4_K_M.gguf"), b"gguf");
+        let mut store = ModelStore::default();
+        let models = store.scan(&[root.to_path_buf()], &[], &[]).unwrap();
+        assert_eq!(models.len(), 1, "only the .gguf file is cataloged");
+        assert!(models[0].path.ends_with("model-Q4_K_M.gguf"));
+    }
+
+    /// HF cache directories that don't follow the `models--org--name` prefix
+    /// convention are skipped.
+    #[test]
+    fn hf_cache_non_model_dirs_skipped() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        // A stray dir without the models-- prefix, plus a valid repo.
+        write_file(&root.join(".locks/whatever"), b"x");
+        write_file(
+            &root.join("models--org--good/snapshots/rev/model-Q4_K_M.gguf"),
+            b"gguf",
+        );
+        let mut store = ModelStore::default();
+        let models = store.scan(&[], &[root.to_path_buf()], &[]).unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "org/good");
+    }
+
+    /// A plain file (not a directory) at the LM Studio org level is skipped —
+    /// the org-entry `is_dir` guard. No model results, no error.
+    #[test]
+    fn lmstudio_file_at_org_level_skipped() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        // A stray file directly under the root (not an org dir).
+        write_file(&root.join("stray.txt"), b"x");
+        // A valid org/model/gguf alongside it.
+        write_file(&root.join("org/m/model-Q4_K_M.gguf"), b"gguf");
+        let mut store = ModelStore::default();
+        let models = store.scan(&[root.to_path_buf()], &[], &[]).unwrap();
+        assert_eq!(models.len(), 1, "stray file ignored, valid model kept");
+        assert_eq!(models[0].id, "org/m");
+    }
+
+    /// An HF repo dir without a `snapshots/` subdir is skipped (the
+    /// `snapshots_path.is_dir()` guard) without error.
+    #[test]
+    fn hf_cache_repo_without_snapshots_skipped() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        // Repo dir with the right prefix but no snapshots subtree.
+        fs::create_dir_all(root.join("models--org--bare")).unwrap();
+        // A complete repo alongside it.
+        write_file(
+            &root.join("models--org--full/snapshots/rev/model-Q8_0.gguf"),
+            b"gguf",
+        );
+        let mut store = ModelStore::default();
+        let models = store.scan(&[], &[root.to_path_buf()], &[]).unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "org/full");
+    }
+
+    /// An unreadable root directory (permissions stripped) maps to
+    /// `HG001 ModelDirUnreadable` rather than being silently skipped.
+    /// Unix-only: relies on chmod semantics not present on Windows.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_root_errors_hg001() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("locked");
+        fs::create_dir(&root).unwrap();
+        // Strip all permissions so read_dir fails with PermissionDenied.
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let mut store = ModelStore::default();
+        let result = store.scan(std::slice::from_ref(&root), &[], &[]);
+
+        // Restore permissions so TempDir cleanup succeeds regardless of outcome.
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = result.expect_err("unreadable dir must error");
+        assert!(
+            matches!(err, HiggsError::ModelDirUnreadable { .. }),
+            "got: {err:?}"
+        );
+    }
 }
