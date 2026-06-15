@@ -18,9 +18,13 @@ pub use api::{Higgs, HiggsConfig};
 pub use diagnostic::HiggsError;
 pub use supervisor::HiggsEvent;
 
-/// The `llama-cpp-2` crate version bundled with this build.
+/// The `llama-cpp-2` Rust binding crate version bundled with this build.
 ///
-/// llama-cpp-2 exposes no runtime build constant, so the dependency version is
-/// baked from the lock file as a compile-time const. Single home — both the
-/// `/api/higgs/version` and `/api/higgs/system` responses read it from here.
+/// This is the BINDING version, not the engine version — the underlying engine
+/// version is reported at runtime by
+/// [`engine_version`](crate::worker::engine::llamacpp::engine_version)
+/// (`ggml_version()`). The binding crate exposes no runtime version constant of
+/// its own, so it is baked from the lock file as a compile-time const. Single
+/// home — both the `/api/higgs/version` and `/api/higgs/system` responses read
+/// the `binding` field from here.
 pub(crate) const LLAMA_CPP_2_VERSION: &str = "0.1.139";

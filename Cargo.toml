@@ -26,6 +26,10 @@ tracing = "0.1"
 parking_lot = "0.12"
 ts-rs = { version = "10", features = ["serde-compat", "serde-json-impl"] }
 llama-cpp-2 = "0.1"
+# Raw FFI for the engine version string — the safe `llama-cpp-2` crate wraps
+# neither `ggml_version()` nor `llama_print_system_info()`. Pinned to match the
+# `llama-cpp-2` resolution so both link the same vendored llama.cpp.
+llama-cpp-sys-2 = "0.1"
 # token_to_piece (the crate's non-deprecated detokenizer) takes &mut encoding_rs::Decoder
 encoding_rs = "0.8"
 # Header-only GGUF metadata reading (memory-maps the file; weights are never loaded)

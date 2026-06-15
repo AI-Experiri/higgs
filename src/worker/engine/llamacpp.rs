@@ -29,6 +29,24 @@ fn backend() -> &'static LlamaBackend {
     BACKEND.get_or_init(|| LlamaBackend::init().expect("sole llama backend init"))
 }
 
+/// The vendored engine's version string — `ggml_version()` (e.g. `"0.9.7"`).
+///
+/// This is the real, runtime-reported version of the ggml/llama.cpp engine
+/// linked into this build, distinct from the `llama-cpp-2` Rust binding version.
+/// The upstream llama.cpp `bNNNN` build number is not obtainable from the crate
+/// (the vendored tree ships without git, so its build-info constants are unset
+/// and unbound). `ggml_version()` returns a static C string and needs no model
+/// or context, so it is safe to call at any time.
+pub fn engine_version() -> String {
+    // SAFETY: `ggml_version()` returns a pointer to a static, NUL-terminated C
+    // string baked into the engine; it takes no arguments and never fails.
+    unsafe {
+        std::ffi::CStr::from_ptr(llama_cpp_sys_2::ggml_version())
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
 /// A resident model plus the load-time state `chat()` needs to serve it.
 struct LoadedModel {
     model: LlamaModel,

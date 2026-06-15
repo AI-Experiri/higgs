@@ -215,8 +215,9 @@ pub(super) async fn control_version() -> Json<HiggsVersionResponse> {
     tracing::info!("higgs: GET /api/higgs/version");
     Json(HiggsVersionResponse {
         higgs: env!("CARGO_PKG_VERSION").to_owned(),
-        engine: "llama.cpp via llama-cpp-2".to_owned(),
-        engine_version: LLAMA_CPP_2_VERSION.to_owned(),
+        engine: "llama.cpp".to_owned(),
+        engine_version: crate::worker::engine::llamacpp::engine_version(),
+        binding: LLAMA_CPP_2_VERSION.to_owned(),
         supported_formats: vec!["gguf".to_owned()],
     })
 }
@@ -378,8 +379,11 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
         assert!(v["higgs"].as_str().is_some(), "higgs version present");
-        assert_eq!(v["engine"], "llama.cpp via llama-cpp-2");
-        assert!(v["engine_version"].as_str().is_some());
+        assert_eq!(v["engine"], "llama.cpp");
+        // engine_version is the real engine (ggml) version from ggml_version();
+        // binding is the llama-cpp-2 wrapper version — distinct fields.
+        assert!(v["engine_version"].as_str().is_some_and(|s| !s.is_empty()));
+        assert!(v["binding"].as_str().is_some_and(|s| !s.is_empty()));
         let fmts = v["supported_formats"].as_array().expect("array");
         assert!(fmts.contains(&serde_json::Value::String("gguf".to_owned())));
     }

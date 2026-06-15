@@ -115,8 +115,11 @@ pub struct HiggsVersionResponse {
     pub higgs: String,
     /// Human-readable engine name.
     pub engine: String,
-    /// llama-cpp-2 dependency version.
+    /// Engine version reported at runtime by `ggml_version()` (e.g. `"0.9.7"`) —
+    /// the actual vendored ggml/llama.cpp engine version.
     pub engine_version: String,
+    /// `llama-cpp-2` Rust binding crate version (e.g. `"0.1.139"`).
+    pub binding: String,
     /// File formats this runtime supports.
     pub supported_formats: Vec<String>,
 }

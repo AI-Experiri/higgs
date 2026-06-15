@@ -39,8 +39,12 @@ pub struct RuntimeInfo {
     pub engine: String,
     /// Compute backend: `"Metal"` on macOS, else `"CPU"`.
     pub backend: String,
-    /// Binding crate version.
+    /// Engine version reported at runtime by `ggml_version()` (e.g. `"0.9.7"`) —
+    /// the actual vendored ggml/llama.cpp engine version.
     pub version: String,
+    /// `llama-cpp-2` Rust binding crate version (e.g. `"0.1.139"`) — the wrapper
+    /// the engine is driven through, distinct from the engine version above.
+    pub binding: String,
 }
 
 /// Response for `GET /api/higgs/system`: hardware + runtime panels.
@@ -86,7 +90,8 @@ impl SystemInfo {
                 } else {
                     "CPU".to_string()
                 },
-                version: LLAMA_CPP_2_VERSION.to_string(),
+                version: crate::worker::engine::llamacpp::engine_version(),
+                binding: LLAMA_CPP_2_VERSION.to_string(),
             },
         }
     }
