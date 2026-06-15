@@ -173,6 +173,13 @@ impl WorkerState {
                     .get(id)
                     .ok_or_else(|| to_rpc_error(&HiggsError::ModelNotFound { id: id.into() }))?;
                 let path = model.path.clone();
+                // The engine drops any resident model before loading the new one,
+                // so the previous model is already gone the moment we attempt this
+                // load. Clear our tracked id up front: if the load then fails, the
+                // `?` returns before the `Some(...)` below runs, leaving `loaded`
+                // as `None` — so status reports nothing loaded, matching the empty
+                // engine, instead of lying about the old id.
+                self.loaded = None;
                 self.engine
                     .load(&path, &params)
                     .map_err(|e| to_rpc_error(&e))?;

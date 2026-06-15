@@ -265,13 +265,23 @@ impl HiggsEngine for LlamaCppEngine {
             Ok(msg_json) => {
                 let parsed: serde_json::Value = serde_json::from_str(&msg_json)
                     .map_err(|e| gen_fail("parse response json", e.to_string()))?;
-                // content may be null when the turn is purely tool calls; fall
-                // back to the raw text so nothing is silently dropped.
+                let tool_calls = parsed.get("tool_calls").filter(|v| !v.is_null()).cloned();
+                // `content` is null when the turn is purely tool calls. Only fall
+                // back to the raw generated text when there are NO tool calls —
+                // otherwise the tool-call markup would be returned as assistant
+                // content *alongside* the structured tool_calls (OpenAI requires
+                // content to be empty/null on a tool-call turn).
                 let content = parsed
                     .get("content")
                     .and_then(|v| v.as_str())
-                    .map_or_else(|| full.clone(), ToOwned::to_owned);
-                let tool_calls = parsed.get("tool_calls").filter(|v| !v.is_null()).cloned();
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| {
+                        if tool_calls.is_some() {
+                            String::new()
+                        } else {
+                            full.clone()
+                        }
+                    });
                 (content, tool_calls)
             }
             Err(e) => {

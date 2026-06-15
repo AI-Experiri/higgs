@@ -131,6 +131,15 @@ struct Inner {
     last_load: Mutex<Option<Value>>,
     /// Set on `stop()` — suppresses respawn after death.
     stopped: AtomicBool,
+    /// True for the entire lifetime of a live worker — from the spawn that
+    /// started it through any in-loop restart, until the reader gives up or
+    /// `stop()` reaps it. `do_spawn` refuses to start a second worker while
+    /// this is set, which guarantees a single reader task: without it, a
+    /// `start()` (e.g. `POST /api/higgs/worker/start`) on a running worker
+    /// would spawn a second reader whose later EOF clears the live worker's
+    /// `write_tx`. Set across restart so the death→respawn window is also
+    /// covered.
+    running: AtomicBool,
     /// mpsc sender into the writer task for the active worker lifetime.
     /// `None` when no worker is live.  Replacing this drops the previous
     /// sender, which signals the old writer task to exit.
@@ -177,6 +186,7 @@ impl Supervisor {
             last_scan: Mutex::new(None),
             last_load: Mutex::new(None),
             stopped: AtomicBool::new(false),
+            running: AtomicBool::new(false),
             write_tx: Mutex::new(None),
             proc: tokio::sync::Mutex::new(None),
             factory: Box::new(production_factory),
@@ -200,6 +210,7 @@ impl Supervisor {
             last_scan: Mutex::new(None),
             last_load: Mutex::new(None),
             stopped: AtomicBool::new(false),
+            running: AtomicBool::new(false),
             write_tx: Mutex::new(None),
             proc: tokio::sync::Mutex::new(None),
             factory,
@@ -311,6 +322,9 @@ impl Supervisor {
                 }
             }
         }
+        // Release the lifetime flag synchronously so a subsequent start() can
+        // spawn without racing the reader task's own clear on EOF.
+        self.inner.running.store(false, Ordering::Release);
     }
 
     /// Record the params of a successful `higgs/scan` for post-restart replay.
@@ -405,10 +419,24 @@ impl Supervisor {
     /// restores normal auto-restart behavior (F2: stop() sets stopped=true but
     /// start() must allow auto-restart on the new worker lifetime).
     fn do_spawn(&self) -> Result<(), HiggsError> {
+        // Refuse to spawn a second worker while one is already live (single-reader
+        // invariant — see `Inner::running`). Idempotent: a redundant start() on a
+        // running worker is a no-op, not an error or a leaked second process.
+        if self.inner.running.swap(true, Ordering::AcqRel) {
+            warn!("higgs: start() called while worker already running — ignoring");
+            return Ok(());
+        }
         // Reset the deliberate-stop flag so the new worker's reader_task
         // will auto-restart on unexpected death (stop→start cycle fix).
         self.inner.stopped.store(false, Ordering::Relaxed);
-        let halves = (self.inner.factory)(self.inner.stderr_ring.clone())?;
+        let halves = match (self.inner.factory)(self.inner.stderr_ring.clone()) {
+            Ok(h) => h,
+            Err(e) => {
+                // Spawn failed: release the running flag so a later retry can spawn.
+                self.inner.running.store(false, Ordering::Release);
+                return Err(e);
+            }
+        };
         // Stash the child handle so stop() can wait on / kill it. No concurrent
         // holder exists at (re)spawn time — stop() is terminal and never races a
         // spawn — so a non-blocking lock is sufficient and avoids blocking_lock
@@ -459,6 +487,9 @@ async fn writer_task(mut write: WriteHalf, mut rx: mpsc::UnboundedReceiver<Strin
 async fn reader_task(inner: Arc<Inner>, read: ReadHalf) {
     let mut reader = BufReader::new(read).lines();
 
+    // Every terminal exit `break`s so the single post-loop clear releases the
+    // `running` lifetime flag exactly once. A successful restart `continue`s the
+    // loop on the new transport without clearing it (the lifetime persists).
     loop {
         let line_result = reader.next_line().await;
         match line_result {
@@ -469,19 +500,19 @@ async fn reader_task(inner: Arc<Inner>, read: ReadHalf) {
                 // Pass `deliberate` so on_worker_death suppresses the event on clean stop.
                 on_worker_death(&inner, None, deliberate);
                 if deliberate {
-                    return;
+                    break;
                 }
                 // 1 s backoff, then re-check stopped before respawning.
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 if inner.stopped.load(Ordering::Relaxed) {
-                    return;
+                    break;
                 }
                 match attempt_restart(&inner).await {
                     Some(new_read) => {
                         reader = BufReader::new(new_read).lines();
                         // Continue outer loop on the new transport.
                     }
-                    None => return,
+                    None => break,
                 }
             }
             Err(e) => {
@@ -489,22 +520,25 @@ async fn reader_task(inner: Arc<Inner>, read: ReadHalf) {
                 let deliberate = inner.stopped.load(Ordering::Relaxed);
                 on_worker_death(&inner, Some(e.to_string()), deliberate);
                 if deliberate {
-                    return;
+                    break;
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 // Re-check stopped after backoff sleep (F1: stop() may have raced).
                 if inner.stopped.load(Ordering::Relaxed) {
-                    return;
+                    break;
                 }
                 match attempt_restart(&inner).await {
                     Some(new_read) => {
                         reader = BufReader::new(new_read).lines();
                     }
-                    None => return,
+                    None => break,
                 }
             }
         }
     }
+    // Lifetime over (clean stop or respawn give-up): release the flag so a
+    // future start() can spawn a fresh worker. Idempotent with stop()'s clear.
+    inner.running.store(false, Ordering::Release);
 }
 
 /// Attempt a single respawn: call factory, install new write channel, return
@@ -512,6 +546,10 @@ async fn reader_task(inner: Arc<Inner>, read: ReadHalf) {
 async fn attempt_restart(inner: &Arc<Inner>) -> Option<ReadHalf> {
     match (inner.factory)(inner.stderr_ring.clone()) {
         Ok(halves) => {
+            // Stash the restarted child so stop() can later wait on / SIGKILL it.
+            // do_spawn does this for the initial spawn; the respawn path must too,
+            // or a worker restarted after a death would be unreapable by stop().
+            *inner.proc.lock().await = halves.proc;
             let (write_tx, write_rx) = mpsc::unbounded_channel::<String>();
             *inner.write_tx.lock() = Some(write_tx);
             tokio::spawn(writer_task(halves.write, write_rx));
@@ -878,6 +916,30 @@ mod tests {
         let (r1, r2) = tokio::join!(fut1, fut2);
         assert_eq!(r1.unwrap(), json!({"n": 1}));
         assert_eq!(r2.unwrap(), json!({"n": 2}));
+    }
+
+    // ─── Test 1-b: redundant start() is an idempotent no-op ──────────────────
+    //
+    // The mock factory hands out exactly one set of duplex halves, so a second
+    // real spawn would fail (`mock: no more write halves`). The `running` guard
+    // means a `start()` on a live worker is never a second spawn — it returns
+    // Ok without touching the factory, preserving the single reader and the
+    // original transport. Guards the supervisor.rs:225 "start while running"
+    // race that would otherwise let an old reader clear the new write_tx.
+
+    #[tokio::test]
+    async fn redundant_start_is_noop() {
+        let (sup, mut test_write, _test_read) = make_supervisor();
+
+        // Already started by make_supervisor; a second start must not spawn.
+        sup.start()
+            .expect("redundant start is a no-op, not a second spawn");
+
+        // The original worker transport is intact: a request still correlates.
+        let fut = sup.request("higgs/ping", json!({}));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        write_line(&mut test_write, &ok_response(1, json!({"ok": true}))).await;
+        assert_eq!(fut.await.unwrap(), json!({"ok": true}));
     }
 
     // ─── Test 2: chat-chunk routing (keyed) ──────────────────────────────────

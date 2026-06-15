@@ -234,7 +234,13 @@ fn chat_response(model: String, out: &ChatOutcome) -> CreateChatCompletionRespon
         choices: vec![ChatChoice {
             index: 0,
             message: ChatCompletionResponseMessage {
-                content: Some(out.content.clone()),
+                // OpenAI: a tool-call turn carries content: null. Emit None when
+                // there are tool calls and no surviving text content.
+                content: if tool_calls.is_some() && out.content.is_empty() {
+                    None
+                } else {
+                    Some(out.content.clone())
+                },
                 refusal: None,
                 tool_calls,
                 annotations: None,
@@ -754,6 +760,11 @@ mod tests {
         assert_eq!(call.id, "call_99");
         assert_eq!(call.function.name, "search");
         assert_eq!(call.function.arguments, "{\"q\":\"rust\"}");
+        // OpenAI: a pure tool-call turn (empty content) carries content: null.
+        assert!(
+            choice.message.content.is_none(),
+            "tool-call turn with empty content must emit null content, not empty string"
+        );
         let usage = resp.usage.expect("usage present");
         assert_eq!(usage.total_tokens, 24);
     }
