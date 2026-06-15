@@ -487,6 +487,7 @@ mod tests {
             Ok(WorkerHalves {
                 write: Box::new(write),
                 read: Box::new(read),
+                proc: None,
             })
         }));
 

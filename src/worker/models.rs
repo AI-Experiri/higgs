@@ -62,6 +62,34 @@ pub struct HiggsModel {
     pub supports_reasoning: bool,
 }
 
+impl HiggsModel {
+    /// A scanned model with only its on-disk facts known: identity, path, size,
+    /// quant tag, and source store. All GGUF-header-derived fields (`arch`,
+    /// `ctx_train`, `has_chat_template`, `supports_tools`, `supports_reasoning`)
+    /// start empty and are filled by [`enrich_gguf_metadata`]. The single
+    /// construction point shared by every scanner.
+    fn base(
+        id: impl Into<String>,
+        path: impl Into<String>,
+        size_bytes: u64,
+        quant: Option<String>,
+        source: HiggsModelSource,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            path: path.into(),
+            size_bytes,
+            quant,
+            source,
+            arch: None,
+            ctx_train: None,
+            has_chat_template: false,
+            supports_tools: false,
+            supports_reasoning: false,
+        }
+    }
+}
+
 /// Scans configured model directories; owns the resulting catalog.
 #[derive(Debug, Default)]
 pub struct ModelStore {
@@ -233,18 +261,13 @@ fn scan_lmstudio(root: &Path, out: &mut Vec<HiggsModel>) -> Result<(), HiggsErro
                 }
                 let size_bytes = file_path.metadata().map(|m| m.len()).unwrap_or(0);
                 let quant = quant_from_filename(&fname);
-                let mut model = HiggsModel {
-                    id: id.clone(),
-                    path: file_path.display().to_string(),
+                let mut model = HiggsModel::base(
+                    id.clone(),
+                    file_path.display().to_string(),
                     size_bytes,
                     quant,
-                    source: HiggsModelSource::LmStudio,
-                    arch: None,
-                    ctx_train: None,
-                    has_chat_template: false,
-                    supports_tools: false,
-                    supports_reasoning: false,
-                };
+                    HiggsModelSource::LmStudio,
+                );
                 enrich_gguf_metadata(&mut model);
                 out.push(model);
             }
@@ -352,18 +375,13 @@ fn scan_hf_cache(root: &Path, out: &mut Vec<HiggsModel>) -> Result<(), HiggsErro
                     std::fs::canonicalize(&file_path).unwrap_or_else(|_| file_path.clone());
                 let size_bytes = canonical_path.metadata().map(|m| m.len()).unwrap_or(0);
                 let quant = quant_from_filename(&fname);
-                let mut model = HiggsModel {
-                    id: id.clone(),
-                    path: canonical_path.display().to_string(),
+                let mut model = HiggsModel::base(
+                    id.clone(),
+                    canonical_path.display().to_string(),
                     size_bytes,
                     quant,
-                    source: HiggsModelSource::HfCache,
-                    arch: None,
-                    ctx_train: None,
-                    has_chat_template: false,
-                    supports_tools: false,
-                    supports_reasoning: false,
-                };
+                    HiggsModelSource::HfCache,
+                );
                 enrich_gguf_metadata(&mut model);
                 out.push(model);
             }
@@ -475,18 +493,13 @@ fn scan_ollama(root: &Path, out: &mut Vec<HiggsModel>) -> Result<(), HiggsError>
         // Decided: Ollama-sourced models keep their established Ollama name (no HF id fabrication).
         let id = format!("ollama/{name}:{tag}");
 
-        let mut model = HiggsModel {
+        let mut model = HiggsModel::base(
             id,
-            path: blob_path.display().to_string(),
+            blob_path.display().to_string(),
             size_bytes,
-            quant: None,
-            source: HiggsModelSource::Ollama,
-            arch: None,
-            ctx_train: None,
-            has_chat_template: false,
-            supports_tools: false,
-            supports_reasoning: false,
-        };
+            None,
+            HiggsModelSource::Ollama,
+        );
         enrich_gguf_metadata(&mut model);
         out.push(model);
     }
