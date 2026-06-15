@@ -46,6 +46,15 @@ pub(crate) fn http_status(err: &HiggsError) -> StatusCode {
         HiggsError::WorkerSpawnFailed { .. } | HiggsError::WorkerDead { .. } => {
             StatusCode::SERVICE_UNAVAILABLE
         }
+        // A worker-reported error carries the worker's origin diagnostic code;
+        // map by it so a worker-side HG002/HG003/HG005/HG006/HG007 reaches the
+        // client as its true status instead of a generic 500.
+        HiggsError::WorkerRpc { worker_code, .. } => match worker_code.as_deref() {
+            Some("HG002") | Some("HG003") => StatusCode::NOT_FOUND,
+            Some("HG005") => StatusCode::BAD_REQUEST,
+            Some("HG006") | Some("HG007") => StatusCode::SERVICE_UNAVAILABLE,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        },
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -327,5 +336,28 @@ mod tests {
             }),
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    #[test]
+    fn worker_rpc_maps_by_worker_code() {
+        // A worker-reported error maps to its origin code's status, not 500.
+        let rpc = |code: Option<&str>| HiggsError::WorkerRpc {
+            method: "higgs/chat".into(),
+            message: "x".into(),
+            worker_code: code.map(ToOwned::to_owned),
+        };
+        assert_eq!(http_status(&rpc(Some("HG002"))), StatusCode::NOT_FOUND);
+        assert_eq!(http_status(&rpc(Some("HG003"))), StatusCode::NOT_FOUND);
+        assert_eq!(http_status(&rpc(Some("HG005"))), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            http_status(&rpc(Some("HG007"))),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        // Unknown / absent code falls back to 500.
+        assert_eq!(
+            http_status(&rpc(Some("HG011"))),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(http_status(&rpc(None)), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

@@ -219,6 +219,7 @@ impl Higgs {
             serde_json::from_value(result).map_err(|e| HiggsError::WorkerRpc {
                 method: M_SCAN.into(),
                 message: format!("response parse failed: {e}"),
+                worker_code: None,
             })?;
         self.sup.record_last_scan(params);
         Ok(models)

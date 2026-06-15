@@ -34,6 +34,12 @@ pub struct RpcResponse {
 pub struct RpcError {
     pub code: i64,
     pub message: String,
+    /// Structured error payload (JSON-RPC `data`). The worker carries the
+    /// origin diagnostic code here (`{"code":"HG005"}`) so the supervisor can
+    /// map a worker error to the right HTTP status instead of collapsing every
+    /// worker failure to a generic 500. `None` when no structured data applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
 }
 
 /// A JSON-RPC notification (no id; fire-and-forget — used for chat chunks).
@@ -134,6 +140,7 @@ mod tests {
             error: Some(RpcError {
                 code: -32601,
                 message: "unknown method".into(),
+                data: None,
             }),
         });
         assert_eq!(decode(&encode(&err)).unwrap(), err);

@@ -8,6 +8,7 @@ pub mod tool_parser;
 
 use std::io::{BufRead, Write};
 
+use miette::Diagnostic;
 use serde_json::{json, Value};
 
 use crate::diagnostic::HiggsError;
@@ -62,6 +63,7 @@ fn serve_state(mut state: WorkerState, reader: impl BufRead, mut writer: impl Wr
                     Err(RpcError {
                         code: -32700,
                         message: e.to_string(),
+                        data: None,
                     }),
                 );
             }
@@ -163,8 +165,18 @@ impl WorkerState {
                     .get("id")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
+                // ctx_len 0 would load (NonZeroU32::new(0)=None → llama uses the
+                // model default) but the stored 0 makes the chat fit-check
+                // (tokens + max_tokens > n_ctx) fail for every request, so the
+                // model loads yet is unusable. Coerce 0 → default so the stored
+                // window matches the real one.
+                let mut ctx_len = u32_param(&req.params, "ctx_len", 4096);
+                if ctx_len == 0 {
+                    tracing::warn!("higgs: ctx_len=0 requested; using default 4096");
+                    ctx_len = 4096;
+                }
                 let params = engine::LoadParams {
-                    ctx_len: u32_param(&req.params, "ctx_len", 4096),
+                    ctx_len,
                     gpu_layers: u32_param(&req.params, "gpu_layers", u32::MAX),
                     threads: u32_param(&req.params, "threads", 4),
                 };
@@ -208,6 +220,7 @@ impl WorkerState {
                     .and_then(Value::as_str)
                     .ok_or_else(|| RpcError {
                         code: -32602,
+                        data: None,
                         message: "missing messages_json".to_string(),
                     })?;
                 let gen = engine::GenParams {
@@ -258,6 +271,7 @@ impl WorkerState {
             other => Err(RpcError {
                 code: -32601,
                 message: format!("unknown method {other}"),
+                data: None,
             }),
         }
     }
@@ -272,10 +286,19 @@ fn u32_param(params: &Value, key: &str, default: u32) -> u32 {
         .unwrap_or(default)
 }
 
+/// Serialize a `HiggsError` into a JSON-RPC error, carrying its origin
+/// diagnostic code (HG002/HG005/…) in `data.code`. The supervisor reconstructs
+/// the code so the HTTP boundary maps the worker error to its true status (404
+/// for not-found/not-loaded, 400 for context overflow, 503 for worker-down)
+/// instead of collapsing every worker failure to a 500.
 fn to_rpc_error(e: &crate::diagnostic::HiggsError) -> RpcError {
+    let data = e
+        .code()
+        .map(|c| serde_json::json!({ "code": c.to_string() }));
     RpcError {
         code: -32000,
         message: e.to_string(),
+        data,
     }
 }
 

@@ -133,6 +133,14 @@ impl HiggsEngine for LlamaCppEngine {
             .map_err(|e| gen_fail("apply chat template", e.to_string()))?;
         let prompt = tmpl_result.prompt.as_str();
 
+        // KNOWN LIMITATION: `tmpl_result.additional_stops` (stop STRINGS the
+        // template declares) is not yet honored — the decode loop below stops
+        // only on EOG tokens / max_tokens. The supported families (Qwen,
+        // Llama-3, Gemma, Nemotron) terminate on EOG tokens and declare no
+        // stop strings, so this is latent; a model relying on a literal stop
+        // string would leak it and run to max_tokens. Honoring additional_stops
+        // (and grammar, below) is deferred.
+
         // Fit check BEFORE any decode: prompt + full generation budget must fit.
         let tokens = loaded
             .model

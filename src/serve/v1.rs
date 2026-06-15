@@ -88,6 +88,15 @@ pub(super) async fn v1_models(State(higgs): State<Arc<Higgs>>) -> Response {
     tracing::info!("higgs: GET /v1/models");
     match higgs.status().await {
         Ok(status) => {
+            // A dead worker can serve nothing — report 503, not a misleading
+            // 200 with an empty list (which reads as "no models loaded").
+            if !status.worker_alive {
+                let err = HiggsError::WorkerDead {
+                    context: "worker not running".into(),
+                };
+                tracing::warn!("higgs: /v1/models while worker is down");
+                return v1_error(&err).into_response();
+            }
             let data = status
                 .loaded
                 .into_iter()
@@ -119,14 +128,24 @@ pub(super) async fn v1_chat_completions(
 ) -> Response {
     tracing::info!(model = %req.model, stream = req.stream.unwrap_or(false), "higgs: POST /v1/chat/completions");
 
-    // Loaded-model gate (a dead worker also reports nothing loaded).
-    let loaded = match higgs.status().await {
-        Ok(s) => s.loaded,
+    let status = match higgs.status().await {
+        Ok(s) => s,
         Err(err) => {
             tracing::warn!(error = %err, "higgs: chat status check failed");
             return v1_error(&err).into_response();
         }
     };
+    // A dead worker is infrastructure-down (503), NOT a client "model not
+    // loaded" (404). Distinguish it before the loaded-model gate — `status()`
+    // reports `worker_alive:false` rather than erroring when the worker is gone.
+    if !status.worker_alive {
+        let err = HiggsError::WorkerDead {
+            context: "worker not running".into(),
+        };
+        tracing::warn!("higgs: chat while worker is down");
+        return v1_error(&err).into_response();
+    }
+    let loaded = status.loaded;
     if loaded.is_none_or(|l| l.id != req.model) {
         let err = HiggsError::ModelNotLoaded {
             id: req.model.clone(),

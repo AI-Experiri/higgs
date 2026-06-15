@@ -398,9 +398,19 @@ impl Supervisor {
         match rx.await {
             Ok(resp) => {
                 if let Some(err) = resp.error {
+                    // Recover the worker's origin diagnostic code (HG002/HG005/…)
+                    // from the JSON-RPC `data` so the boundary maps the true
+                    // status rather than collapsing to 500.
+                    let worker_code = err
+                        .data
+                        .as_ref()
+                        .and_then(|d| d.get("code"))
+                        .and_then(|c| c.as_str())
+                        .map(ToOwned::to_owned);
                     Err(HiggsError::WorkerRpc {
                         method: method.to_string(),
                         message: err.message,
+                        worker_code,
                     })
                 } else {
                     Ok(resp.result.unwrap_or(Value::Null))
@@ -725,9 +735,16 @@ async fn replay_rpc_await(
     match rx.await {
         Ok(resp) => {
             if let Some(err) = resp.error {
+                let worker_code = err
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.get("code"))
+                    .and_then(|c| c.as_str())
+                    .map(ToOwned::to_owned);
                 Err(HiggsError::WorkerRpc {
                     method: method.to_string(),
                     message: err.message,
+                    worker_code,
                 })
             } else {
                 Ok(resp.result.unwrap_or(Value::Null))
@@ -874,6 +891,7 @@ mod tests {
             error: Some(rpc::RpcError {
                 code,
                 message: message.into(),
+                data: None,
             }),
         }))
     }

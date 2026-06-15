@@ -15,6 +15,14 @@
 /// a piece ending in `"<tool_"`), so a marker split across pieces is never
 /// streamed. Once a full opening marker is seen, every subsequent piece is
 /// withheld for the rest of the turn.
+///
+/// KNOWN LIMITATION: this latches `suppressing` permanently at the first open
+/// marker — it does not track OPEN..CLOSE spans. So text emitted AFTER or
+/// BETWEEN tool calls is dropped from the stream, whereas the non-streaming
+/// parser's `content()` preserves it. Streaming and non-streaming `content`
+/// therefore diverge for that (uncommon) case; the structured `tool_calls`
+/// themselves are identical in both modes (both parsed from the full text).
+/// Fixing this requires resuming emission after each close marker.
 pub struct ToolCallStreamFilter {
     markers: &'static [&'static str],
     held: String,

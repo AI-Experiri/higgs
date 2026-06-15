@@ -57,10 +57,16 @@ pub enum HiggsError {
     #[diagnostic(code(HG008))]
     RpcDecode { detail: String },
 
-    /// The worker returned a JSON-RPC error for a request.
+    /// The worker returned a JSON-RPC error for a request. `worker_code` carries
+    /// the worker's own origin diagnostic code (e.g. `"HG005"`) when present, so
+    /// the HTTP boundary can map to the true status; `None` falls back to 500.
     #[snafu(display("[HG009] worker error on {method}: {message}"))]
     #[diagnostic(code(HG009))]
-    WorkerRpc { method: String, message: String },
+    WorkerRpc {
+        method: String,
+        message: String,
+        worker_code: Option<String>,
+    },
 
     /// An Ollama manifest existed but could not be resolved to a GGUF blob.
     #[snafu(display("[HG010] ollama manifest invalid: {path}: {detail}"))]
