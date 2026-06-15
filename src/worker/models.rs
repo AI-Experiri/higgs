@@ -34,16 +34,19 @@ pub struct HiggsModel {
     #[ts(type = "number")]
     pub size_bytes: u64,
     /// Quantization tag parsed from the filename (e.g. `Q4_K_M`), if present.
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub quant: Option<String>,
     /// Which store the file was found in.
     pub source: HiggsModelSource,
     /// Model architecture read from GGUF header (e.g. `"llama"`, `"gemma3"`).
     /// `None` when the header could not be read or the field is absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub arch: Option<String>,
     /// Training context length (`{arch}.context_length`) from the GGUF header.
     /// `None` when the header could not be read or the field is absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(type = "number")]
     #[ts(optional)]
     pub ctx_train: Option<u64>,

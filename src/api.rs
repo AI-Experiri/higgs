@@ -110,21 +110,26 @@ pub struct LoadedInfo {
     pub threads: u32,
     // Model metadata from the store — present when the worker has scanned the model.
     /// Model architecture read from GGUF header (e.g. `"llama"`, `"gemma3"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub arch: Option<String>,
     /// Quantization tag (e.g. `Q4_K_M`), if present.
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub quant: Option<String>,
     /// Training context length from GGUF header (model's maximum). Distinct from
     /// `ctx_len` which is the actually loaded window size.
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(type = "number")]
     #[ts(optional)]
     pub max_context_length: Option<u64>,
     /// File size in bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(type = "number")]
     #[ts(optional)]
     pub size_bytes: Option<u64>,
     /// Whether `tokenizer.chat_template` is present in the GGUF header.
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub has_chat_template: Option<bool>,
 }
@@ -136,6 +141,7 @@ pub struct HiggsStatus {
     /// Whether the worker process is currently alive.
     pub worker_alive: bool,
     /// Info about the loaded model, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub loaded: Option<LoadedInfo>,
     /// Number of models discovered in the last scan.

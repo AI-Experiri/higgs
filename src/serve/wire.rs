@@ -39,6 +39,7 @@ pub struct HiggsModelsResponse {
     /// Models discovered by a live scan of the configured directories.
     pub models: Vec<HiggsModelEntry>,
     /// Id of the currently loaded model, if any — matches `HiggsModel::id`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub loaded_id: Option<String>,
 }
