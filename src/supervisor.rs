@@ -360,6 +360,13 @@ impl Supervisor {
         *self.inner.last_load.lock() = Some(params);
     }
 
+    /// Forget the recorded `higgs/load` replay params — called after an explicit
+    /// unload so a later unexpected worker restart does NOT reload the model the
+    /// user just unloaded.
+    pub(crate) fn clear_last_load(&self) {
+        *self.inner.last_load.lock() = None;
+    }
+
     /// Emit a lifecycle event on the broadcast channel.
     ///
     /// Used by the [`Higgs`](crate::api::Higgs) facade to publish

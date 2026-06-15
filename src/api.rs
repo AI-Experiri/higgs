@@ -261,6 +261,9 @@ impl Higgs {
         // Capture id from status before unloading so the event carries it.
         let id = self.loaded_id().await.unwrap_or_default();
         self.sup.request(M_UNLOAD, serde_json::Value::Null).await?;
+        // Drop the load-replay state: a post-unload worker restart must NOT
+        // reload the model the user explicitly unloaded.
+        self.sup.clear_last_load();
         self.sup.emit(HiggsEvent::ModelUnloaded { id });
         Ok(())
     }
