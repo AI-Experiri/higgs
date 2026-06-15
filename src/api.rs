@@ -18,22 +18,23 @@ use crate::worker::{M_CHAT, M_LOAD, M_SCAN, M_STATUS, M_UNLOAD};
 
 // ── HiggsConfig ───────────────────────────────────────────────────────────────
 
-/// Host-supplied configuration (the host maps its own config table onto this).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, ts_rs::TS)]
-#[ts(export, export_to = "../../../frontend/src/lib/generated/")]
-pub struct HiggsConfig {
-    /// LM Studio model directories to scan.
-    pub lmstudio_dirs: Vec<PathBuf>,
-    /// HuggingFace Hub cache directories to scan.
-    ///
-    /// Note: HuggingFace hardcodes `~/.cache/huggingface/hub` on ALL platforms —
-    /// it does not follow XDG or macOS conventions. We use
-    /// `dirs::home_dir().join(".cache/huggingface/hub")`, NOT `dirs::cache_dir()`.
-    pub hf_dirs: Vec<PathBuf>,
-    /// Ollama model store directories to scan.
-    pub ollama_dirs: Vec<PathBuf>,
-    /// Load parameters used when none are supplied by the caller.
-    pub default_load: LoadParams,
+higgs_ts! {
+    /// Host-supplied configuration (the host maps its own config table onto this).
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    pub struct HiggsConfig {
+        /// LM Studio model directories to scan.
+        pub lmstudio_dirs: Vec<PathBuf>,
+        /// HuggingFace Hub cache directories to scan.
+        ///
+        /// Note: HuggingFace hardcodes `~/.cache/huggingface/hub` on ALL platforms —
+        /// it does not follow XDG or macOS conventions. We use
+        /// `dirs::home_dir().join(".cache/huggingface/hub")`, NOT `dirs::cache_dir()`.
+        pub hf_dirs: Vec<PathBuf>,
+        /// Ollama model store directories to scan.
+        pub ollama_dirs: Vec<PathBuf>,
+        /// Load parameters used when none are supplied by the caller.
+        pub default_load: LoadParams,
+    }
 }
 
 impl Default for HiggsConfig {
@@ -93,60 +94,62 @@ impl Default for HiggsConfig {
 
 // ── Output types ──────────────────────────────────────────────────────────────
 
-/// Info about the currently loaded model.
-#[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
-#[ts(export, export_to = "../../../frontend/src/lib/generated/")]
-pub struct LoadedInfo {
-    /// HuggingFace repo id of the resident model.
-    pub id: String,
-    /// Context window size in tokens.
-    #[ts(type = "number")]
-    pub ctx_len: u32,
-    /// GPU layers offloaded; u32::MAX means all.
-    #[ts(type = "number")]
-    pub gpu_layers: u32,
-    /// Worker threads used during generation.
-    #[ts(type = "number")]
-    pub threads: u32,
-    // Model metadata from the store — present when the worker has scanned the model.
-    /// Model architecture read from GGUF header (e.g. `"llama"`, `"gemma3"`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub arch: Option<String>,
-    /// Quantization tag (e.g. `Q4_K_M`), if present.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub quant: Option<String>,
-    /// Training context length from GGUF header (model's maximum). Distinct from
-    /// `ctx_len` which is the actually loaded window size.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[ts(type = "number")]
-    #[ts(optional)]
-    pub max_context_length: Option<u64>,
-    /// File size in bytes.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[ts(type = "number")]
-    #[ts(optional)]
-    pub size_bytes: Option<u64>,
-    /// Whether `tokenizer.chat_template` is present in the GGUF header.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub has_chat_template: Option<bool>,
+higgs_ts! {
+    /// Info about the currently loaded model.
+    #[derive(Debug, Clone, serde::Serialize)]
+    pub struct LoadedInfo {
+        /// HuggingFace repo id of the resident model.
+        pub id: String,
+        /// Context window size in tokens.
+        #[ts(type = "number")]
+        pub ctx_len: u32,
+        /// GPU layers offloaded; u32::MAX means all.
+        #[ts(type = "number")]
+        pub gpu_layers: u32,
+        /// Worker threads used during generation.
+        #[ts(type = "number")]
+        pub threads: u32,
+        // Model metadata from the store — present when the worker has scanned the model.
+        /// Model architecture read from GGUF header (e.g. `"llama"`, `"gemma3"`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub arch: Option<String>,
+        /// Quantization tag (e.g. `Q4_K_M`), if present.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub quant: Option<String>,
+        /// Training context length from GGUF header (model's maximum). Distinct from
+        /// `ctx_len` which is the actually loaded window size.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(type = "number")]
+        #[ts(optional)]
+        pub max_context_length: Option<u64>,
+        /// File size in bytes.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(type = "number")]
+        #[ts(optional)]
+        pub size_bytes: Option<u64>,
+        /// Whether `tokenizer.chat_template` is present in the GGUF header.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub has_chat_template: Option<bool>,
+    }
 }
 
-/// Live status snapshot returned by [`Higgs::status`].
-#[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
-#[ts(export, export_to = "../../../frontend/src/lib/generated/")]
-pub struct HiggsStatus {
-    /// Whether the worker process is currently alive.
-    pub worker_alive: bool,
-    /// Info about the loaded model, if any.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub loaded: Option<LoadedInfo>,
-    /// Number of models discovered in the last scan.
-    #[ts(type = "number")]
-    pub models_on_disk: u32,
+higgs_ts! {
+    /// Live status snapshot returned by [`Higgs::status`].
+    #[derive(Debug, Clone, serde::Serialize)]
+    pub struct HiggsStatus {
+        /// Whether the worker process is currently alive.
+        pub worker_alive: bool,
+        /// Info about the loaded model, if any.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub loaded: Option<LoadedInfo>,
+        /// Number of models discovered in the last scan.
+        #[ts(type = "number")]
+        pub models_on_disk: u32,
+    }
 }
 
 /// Final outcome of a completed chat request.

@@ -17,17 +17,18 @@ pub struct GenParams {
     pub tools_json: Option<String>,
 }
 
-/// Parameters fixed at load time.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, ts_rs::TS)]
-#[ts(export, export_to = "../../../frontend/src/lib/generated/")]
-pub struct LoadParams {
-    #[ts(type = "number")]
-    pub ctx_len: u32,
-    /// Layers offloaded to GPU; u32::MAX = all (LM Studio "max" semantics).
-    #[ts(type = "number")]
-    pub gpu_layers: u32,
-    #[ts(type = "number")]
-    pub threads: u32,
+higgs_ts! {
+    /// Parameters fixed at load time.
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    pub struct LoadParams {
+        #[ts(type = "number")]
+        pub ctx_len: u32,
+        /// Layers offloaded to GPU; u32::MAX = all (LM Studio "max" semantics).
+        #[ts(type = "number")]
+        pub gpu_layers: u32,
+        #[ts(type = "number")]
+        pub threads: u32,
+    }
 }
 
 /// Result returned by [`HiggsEngine::chat`], carrying the generated text,

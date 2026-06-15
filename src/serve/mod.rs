@@ -10,8 +10,10 @@
 //!
 //! ## Adding a control endpoint
 //!
-//! 1. Add the response struct to `wire.rs` (`#[derive(serde::Serialize, ts_rs::TS)]`
-//!    + `#[ts(export, …)]`) and re-export it from `frontend/src/lib/types.ts`.
+//! 1. Add the response struct to `wire.rs` wrapped in `higgs_ts! { … }` (the
+//!    macro injects the `ts_rs::TS` derive + export into
+//!    `frontend/src/lib/generated/higgs/`) and re-export it from
+//!    `frontend/src/lib/types.ts` via `./generated/higgs/<Name>`.
 //! 2. Add `async fn control_<name>` to `control.rs`.
 //! 3. Register it in [`router`] under `/api/higgs/<name>`.
 

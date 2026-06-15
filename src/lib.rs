@@ -6,6 +6,11 @@
 //! `--higgs-worker` (Chromium model), speaking newline-delimited JSON-RPC 2.0
 //! over stdio (MCP wire). Spec: docs/superpowers/specs/2026-06-12-higgs-runtime-design.md
 
+// Declared first with `#[macro_use]` so `higgs_ts!` is in scope for every
+// module below — it owns the single ts-rs export path for all higgs types.
+#[macro_use]
+mod ts_export;
+
 pub mod api;
 pub mod diagnostic;
 pub mod rpc;

@@ -11,19 +11,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::diagnostic::HiggsError;
 
-/// Where a scanned model file came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
-#[ts(export, export_to = "../../../frontend/src/lib/generated/")]
-pub enum HiggsModelSource {
-    LmStudio,
-    HfCache,
-    Ollama,
+higgs_ts! {
+    /// Where a scanned model file came from.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum HiggsModelSource {
+        LmStudio,
+        HfCache,
+        Ollama,
+    }
 }
 
-/// One discoverable model file on disk.
-#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
-#[ts(export, export_to = "../../../frontend/src/lib/generated/")]
-pub struct HiggsModel {
+higgs_ts! {
+    /// One discoverable model file on disk.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct HiggsModel {
     /// HuggingFace repo id, `org/model` — the identity used everywhere.
     /// Ollama-sourced models keep their established Ollama name (`ollama/{name}:{tag}`);
     /// no HuggingFace id is fabricated.
@@ -63,6 +64,7 @@ pub struct HiggsModel {
     /// template references `<think>`/thinking. `false` when unknown.
     #[serde(default)]
     pub supports_reasoning: bool,
+    }
 }
 
 impl HiggsModel {

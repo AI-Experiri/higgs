@@ -61,18 +61,19 @@ const WORKER_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// already capped by `max_tokens` and streams progress chunks.
 const CONTROL_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// Events the host application subscribes to.
-#[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
-#[ts(export, export_to = "../../../frontend/src/lib/generated/")]
-pub enum HiggsEvent {
-    /// A model finished loading and is ready to serve requests.
-    ModelLoaded { id: String },
-    /// A model was unloaded and is no longer available.
-    ModelUnloaded { id: String },
-    /// The worker process exited unexpectedly.
-    WorkerDied,
-    /// The worker process was restarted after a death.
-    WorkerRestarted,
+higgs_ts! {
+    /// Events the host application subscribes to.
+    #[derive(Debug, Clone, serde::Serialize)]
+    pub enum HiggsEvent {
+        /// A model finished loading and is ready to serve requests.
+        ModelLoaded { id: String },
+        /// A model was unloaded and is no longer available.
+        ModelUnloaded { id: String },
+        /// The worker process exited unexpectedly.
+        WorkerDied,
+        /// The worker process was restarted after a death.
+        WorkerRestarted,
+    }
 }
 
 // ── Worker halves ─────────────────────────────────────────────────────────────

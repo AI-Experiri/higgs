@@ -10,51 +10,54 @@ use sysinfo::System;
 
 use crate::LLAMA_CPP_2_VERSION;
 
-/// Host hardware snapshot.
-#[derive(Debug, Clone, Serialize, ts_rs::TS)]
-#[ts(export, export_to = "../../../frontend/src/lib/generated/")]
-pub struct HardwareInfo {
-    /// CPU brand string (e.g. `"Apple M3 Max"`).
-    pub cpu_name: String,
-    /// Process architecture (e.g. `"aarch64"`).
-    pub arch: String,
-    /// Logical CPU count.
-    #[ts(type = "number")]
-    pub cpu_cores: u32,
-    /// Total physical RAM in bytes.
-    #[ts(type = "number")]
-    pub ram_total_bytes: u64,
-    /// RAM currently in use, in bytes.
-    #[ts(type = "number")]
-    pub ram_used_bytes: u64,
-    /// Global CPU load at request time, 0–100.
-    pub cpu_usage_percent: f32,
+higgs_ts! {
+    /// Host hardware snapshot.
+    #[derive(Debug, Clone, Serialize)]
+    pub struct HardwareInfo {
+        /// CPU brand string (e.g. `"Apple M3 Max"`).
+        pub cpu_name: String,
+        /// Process architecture (e.g. `"aarch64"`).
+        pub arch: String,
+        /// Logical CPU count.
+        #[ts(type = "number")]
+        pub cpu_cores: u32,
+        /// Total physical RAM in bytes.
+        #[ts(type = "number")]
+        pub ram_total_bytes: u64,
+        /// RAM currently in use, in bytes.
+        #[ts(type = "number")]
+        pub ram_used_bytes: u64,
+        /// Global CPU load at request time, 0–100.
+        pub cpu_usage_percent: f32,
+    }
 }
 
-/// Inference engine/runtime identity.
-#[derive(Debug, Clone, Serialize, ts_rs::TS)]
-#[ts(export, export_to = "../../../frontend/src/lib/generated/")]
-pub struct RuntimeInfo {
-    /// Engine name — always `"llama.cpp"` in v1.
-    pub engine: String,
-    /// Compute backend: `"Metal"` on macOS, else `"CPU"`.
-    pub backend: String,
-    /// Engine version reported at runtime by `ggml_version()` (e.g. `"0.9.7"`) —
-    /// the actual vendored ggml/llama.cpp engine version.
-    pub version: String,
-    /// `llama-cpp-2` Rust binding crate version (e.g. `"0.1.139"`) — the wrapper
-    /// the engine is driven through, distinct from the engine version above.
-    pub binding: String,
+higgs_ts! {
+    /// Inference engine/runtime identity.
+    #[derive(Debug, Clone, Serialize)]
+    pub struct RuntimeInfo {
+        /// Engine name — always `"llama.cpp"` in v1.
+        pub engine: String,
+        /// Compute backend: `"Metal"` on macOS, else `"CPU"`.
+        pub backend: String,
+        /// Engine version reported at runtime by `ggml_version()` (e.g. `"0.9.7"`) —
+        /// the actual vendored ggml/llama.cpp engine version.
+        pub version: String,
+        /// `llama-cpp-2` Rust binding crate version (e.g. `"0.1.139"`) — the wrapper
+        /// the engine is driven through, distinct from the engine version above.
+        pub binding: String,
+    }
 }
 
-/// Response for `GET /api/higgs/system`: hardware + runtime panels.
-#[derive(Debug, Clone, Serialize, ts_rs::TS)]
-#[ts(export, export_to = "../../../frontend/src/lib/generated/")]
-pub struct SystemInfo {
-    /// Host hardware (CPU, RAM, live load).
-    pub hardware: HardwareInfo,
-    /// Inference engine + backend.
-    pub runtime: RuntimeInfo,
+higgs_ts! {
+    /// Response for `GET /api/higgs/system`: hardware + runtime panels.
+    #[derive(Debug, Clone, Serialize)]
+    pub struct SystemInfo {
+        /// Host hardware (CPU, RAM, live load).
+        pub hardware: HardwareInfo,
+        /// Inference engine + backend.
+        pub runtime: RuntimeInfo,
+    }
 }
 
 impl SystemInfo {
