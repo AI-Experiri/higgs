@@ -94,22 +94,39 @@ pub async fn serve_with_shutdown(
 }
 
 /// CORS for higgs's standalone listener: the frontend calls higgs's own port
-/// cross-origin (from the Tauri webview or the dev server), so the local UI
-/// origins must be allowed. Localhost/webview only — not a public surface.
+/// cross-origin, so its serving origin must be allowed. The frontend is served
+/// from three different origins depending on mode — the Tauri webview
+/// (`tauri://localhost`), the Vite dev server (`http://localhost:5173`), and
+/// the gateway-embedded SPA (`http://{host}:{port}`, a dynamic port not known
+/// here). Rather than enumerate ports, allow any localhost/127.0.0.1 origin
+/// plus the tauri webview origins. higgs is localhost/webview only — not a
+/// public surface — so trusting any loopback origin matches its threat model.
 fn local_cors() -> CorsLayer {
-    let origins: Vec<HeaderValue> = [
-        "tauri://localhost",
-        "http://tauri.localhost",
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ]
-    .iter()
-    .filter_map(|o| o.parse().ok())
-    .collect();
     CorsLayer::new()
-        .allow_origin(AllowOrigin::list(origins))
+        .allow_origin(AllowOrigin::predicate(|origin: &HeaderValue, _req| {
+            is_local_origin(origin)
+        }))
         .allow_methods([Method::GET, Method::POST])
         .allow_headers(tower_http::cors::Any)
+}
+
+/// Whether `origin` is a trusted local origin: the Tauri webview
+/// (`tauri://localhost`, `http://tauri.localhost`) or any loopback HTTP origin
+/// (`http://localhost[:port]`, `http://127.0.0.1[:port]`). Non-UTF-8 or
+/// non-loopback origins are rejected.
+fn is_local_origin(origin: &HeaderValue) -> bool {
+    let Ok(s) = origin.to_str() else {
+        return false;
+    };
+    if s == "tauri://localhost" || s == "http://tauri.localhost" {
+        return true;
+    }
+    // Strip the scheme, then match the host with an optional `:port` suffix.
+    let Some(host_port) = s.strip_prefix("http://") else {
+        return false;
+    };
+    let host = host_port.split(':').next().unwrap_or(host_port);
+    host == "localhost" || host == "127.0.0.1"
 }
 
 // ── Shared test harness ─────────────────────────────────────────────────────
@@ -245,10 +262,40 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::http_status;
-    use axum::http::StatusCode;
+    use super::{http_status, is_local_origin};
+    use axum::http::{HeaderValue, StatusCode};
 
     use crate::diagnostic::HiggsError;
+
+    #[test]
+    fn local_origin_matcher() {
+        let yes = [
+            "tauri://localhost",
+            "http://tauri.localhost",
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+            "http://localhost:8081", // gateway-embedded SPA on an arbitrary port
+            "http://127.0.0.1",      // no port
+        ];
+        let no = [
+            "https://localhost:5173", // non-loopback scheme (TLS not served locally)
+            "http://example.com",
+            "http://evil.localhost.attacker.com",
+            "http://10.0.0.5:5173",
+        ];
+        for o in yes {
+            assert!(
+                is_local_origin(&HeaderValue::from_static(o)),
+                "should allow {o}"
+            );
+        }
+        for o in no {
+            assert!(
+                !is_local_origin(&HeaderValue::from_static(o)),
+                "should reject {o}"
+            );
+        }
+    }
 
     #[test]
     fn http_status_mapping_table() {

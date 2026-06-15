@@ -1,7 +1,7 @@
 # higgs Configuration
 
 ## Table of Contents
-- [config.toml — \[higgs\] Section](#configtoml--higgs-section)
+- [Process & Environment](#process--environment)
 - [HiggsConfig Fields](#higgsconfig-fields)
 - [Model Directory Layouts](#model-directory-layouts)
 - [Build Note: LIBCLANG_PATH](#build-note-libclang_path)
@@ -10,42 +10,39 @@
 
 ---
 
-## config.toml — [higgs] Section
+## Process & Environment
 
-higgs is configured through the `[higgs]` table in `~/.jigglebot/config.toml`.
-The server reads it at boot and maps it onto `HiggsConfig` before passing `Arc<Higgs>`
-into `AppState`. All fields have serde defaults via `HiggsConfig::default()` so the
-table may be omitted entirely.
+higgs runs as its own process — the `higgs-server` binary
+(`src/bin/higgs-server.rs`), a separate listener from the jigglebot gateway.
+jigglebot does not embed higgs; it reaches it over HTTP at `higgs_base_url`
+(seeded as a runtime-only provider — see
+[server config](../server/src/config/CONFIG.md)).
 
-```toml
-[higgs]
-# Each field below is optional — the Default impl fills in the right value
-# when the key is absent.
+The binary reads three environment variables; everything else comes from
+`HiggsConfig::default()` (the standalone binary constructs
+`Higgs::new(HiggsConfig::default())` — there is no config file at this layer).
 
-# LM Studio model directories (both pre-0.3 and post-0.3 paths by default)
-lmstudio_dirs = [
-  "~/.lmstudio/models",
-  "~/.cache/lm-studio/models",
-]
+| Env var | Default | Effect |
+|---------|---------|--------|
+| `HIGGS_BIND` | `127.0.0.1` | Bind address. `0.0.0.0` exposes it LAN-wide. |
+| `HIGGS_PORT` | `11434` | Listen port. |
+| `RUST_LOG` | `info` | tracing filter. |
 
-# HuggingFace Hub cache (always ~/.cache/huggingface/hub — NOT dirs::cache_dir())
-hf_dirs = ["~/.cache/huggingface/hub"]
-
-# Ollama model store
-ollama_dirs = ["~/.ollama/models"]
-
-# Default load parameters (used when no params are supplied to /api/higgs/load)
-[higgs.default_load]
-ctx_len    = 4096     # context window tokens
-gpu_layers = 4294967295  # u32::MAX → all layers on GPU
-threads    = 0        # 0 = auto (available_cpus - 2, min 1)
+```sh
+higgs-server                                      # 127.0.0.1:11434
+HIGGS_BIND=0.0.0.0 HIGGS_PORT=1234 higgs-server   # LAN-reachable on :1234
 ```
+
+A host that embeds the crate directly (instead of spawning `higgs-server`)
+constructs its own `HiggsConfig` and passes it to `Higgs::new`; the fields
+below are that struct's defaults.
 
 ---
 
 ## HiggsConfig Fields
 
-The host maps its own config table onto `HiggsConfig`. There is no standalone config file — higgs receives its configuration through the Rust API.
+Defaults from `HiggsConfig::default()` — what the `higgs-server` binary uses.
+An embedding host may override any field when it constructs `HiggsConfig`.
 
 | Field | Type | Default | Notes |
 |-------|------|---------|-------|
