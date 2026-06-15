@@ -45,6 +45,43 @@ async fn inference_and_tools() {
         eprintln!("SKIP inference_and_tools: no Nemotron model on disk");
         return;
     };
+
+    // ── /v1/models is EMPTY before any model is loaded ────────────────────────
+    let empty: Value = c
+        .get(format!("{}/v1/models", srv.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(empty["object"], "list", "/v1/models is a list");
+    assert!(
+        empty["data"].as_array().unwrap().is_empty(),
+        "/v1/models is empty with nothing loaded"
+    );
+
+    // ── Chat for an unloaded model → 404 OpenAI error envelope ────────────────
+    let unloaded = c
+        .post(format!("{}/v1/chat/completions", srv.base))
+        .json(&json!({
+            "model": id, "stream": false,
+            "messages": [{ "role": "user", "content": "hi" }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unloaded.status(), 404, "chat for unloaded model is 404");
+    let env: Value = unloaded.json().await.unwrap();
+    assert_eq!(
+        env["error"]["code"], "model_not_found",
+        "404 envelope codes model_not_found: {env:?}"
+    );
+    assert_eq!(
+        env["error"]["type"], "invalid_request_error",
+        "404 is an invalid_request_error"
+    );
+
     let load = c
         .post(format!("{}/api/higgs/models/load", srv.base))
         .json(&json!({ "id": id }))
@@ -105,6 +142,126 @@ async fn inference_and_tools() {
         resp["usage"]["prompt_tokens"].as_u64().unwrap() > 0
             && resp["usage"]["completion_tokens"].as_u64().unwrap() > 0,
         "usage token counts are non-zero"
+    );
+
+    // ── Multi-turn messages + BOTH max_tokens and max_completion_tokens ───────
+    // max_completion_tokens wins when both are set; a small cap → finish "length".
+    let resp: Value = chat(json!({
+        "model": id, "stream": false,
+        "max_tokens": 200, "max_completion_tokens": 8,
+        "messages": [
+            { "role": "system", "content": "You are terse." },
+            { "role": "user", "content": "Name a color." },
+            { "role": "assistant", "content": "Blue." },
+            { "role": "user", "content": "Name another one." }
+        ]
+    }))
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let choice = &resp["choices"][0];
+    assert!(
+        matches!(
+            choice["finish_reason"].as_str(),
+            Some("stop") | Some("length")
+        ),
+        "multi-turn finish_reason is stop|length"
+    );
+    assert!(
+        resp["usage"]["completion_tokens"].as_u64().unwrap() <= 8,
+        "max_completion_tokens (8) caps the completion"
+    );
+
+    // ── Diverse message roles + array content parts (messages_to_pairs) ───────
+    // developer + system + array-of-text user + assistant + tool roles all map
+    // to (role, text) pairs without rejection.
+    let resp: Value = chat(json!({
+        "model": id, "stream": false,
+        "max_completion_tokens": 8,
+        "messages": [
+            { "role": "developer", "content": "Be brief." },
+            { "role": "system", "content": [{ "type": "text", "text": "One word answers." }] },
+            { "role": "user", "content": [{ "type": "text", "text": "Pick a fruit." }] },
+            { "role": "assistant", "content": "Apple." },
+            { "role": "tool", "tool_call_id": "call_x", "content": "ignored" },
+            { "role": "user", "content": "Now pick a vegetable." }
+        ]
+    }))
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert!(
+        resp["choices"][0]["message"]["content"].is_string(),
+        "diverse-role chat returns content: {resp:?}"
+    );
+
+    // ── A non-text content part (image_url) → 400 invalid_request_error ───────
+    let img = c
+        .post(format!("{}/v1/chat/completions", srv.base))
+        .json(&json!({
+            "model": id, "stream": false,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "describe" },
+                    { "type": "image_url", "image_url": { "url": "https://example.com/x.png" } }
+                ]
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(img.status(), 400, "image content part is rejected 400");
+    let img_env: Value = img.json().await.unwrap();
+    assert_eq!(
+        img_env["error"]["type"], "invalid_request_error",
+        "non-text part is an invalid_request_error: {img_env:?}"
+    );
+
+    // ── A tool is offered but the prompt should NOT trigger one ───────────────
+    let resp: Value = chat(json!({
+        "model": id, "stream": false,
+        "messages": [{ "role": "user", "content": "Just say hi back, one word." }],
+        "tools": [weather_tool()]
+    }))
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let choice = &resp["choices"][0];
+    assert!(
+        choice["message"]["tool_calls"].is_null(),
+        "plain greeting does not call a tool: {choice:?}"
+    );
+    assert!(
+        choice["message"]["content"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()),
+        "no-tool turn still returns content"
+    );
+    assert_ne!(
+        choice["finish_reason"], "tool_calls",
+        "no-tool turn does not finish with tool_calls"
+    );
+
+    // ── Malformed request: missing `model` field → 4xx (no 5xx, no panic) ─────
+    let bad = c
+        .post(format!("{}/v1/chat/completions", srv.base))
+        .json(&json!({
+            "messages": [{ "role": "user", "content": "hi" }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        bad.status().is_client_error(),
+        "missing model is a 4xx, got {}",
+        bad.status()
     );
 
     // ── Non-streaming tool call ───────────────────────────────────────────

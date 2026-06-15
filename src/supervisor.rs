@@ -45,6 +45,12 @@ use crate::diagnostic::HiggsError;
 use crate::rpc::{self, RpcFrame, RpcNotification, RpcRequest};
 use crate::worker::{M_LOAD, M_SCAN, M_SHUTDOWN, N_CHAT_CHUNK};
 
+/// How long `stop()` waits for the worker to exit on its own (after stdin
+/// closes) before SIGKILL-ing it. Generous enough for the child to free a
+/// loaded model and run its at-exit handlers; bounded so a wedged worker can
+/// never outlive its supervisor.
+const WORKER_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Events the host application subscribes to.
 #[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
 #[ts(export, export_to = "../../../frontend/src/lib/generated/")]
@@ -80,6 +86,12 @@ pub(crate) struct WorkerHalves {
     pub(crate) write: WriteHalf,
     /// Read half (supervisor reads responses/notifications here).
     pub(crate) read: ReadHalf,
+    /// Live child process handle, for the production factory only.
+    ///
+    /// `stop()` uses it to wait for the worker to exit on its own (after stdin
+    /// closes) and to SIGKILL it as a last resort. `None` for the in-memory
+    /// test factory, which has no OS process to reap.
+    pub(crate) proc: Option<tokio::process::Child>,
 }
 
 /// Factory: produces fresh I/O halves on each (re)spawn.
@@ -123,6 +135,13 @@ struct Inner {
     /// `None` when no worker is live.  Replacing this drops the previous
     /// sender, which signals the old writer task to exit.
     write_tx: Mutex<Option<mpsc::UnboundedSender<String>>>,
+    /// Live worker child process for the current lifetime (production only).
+    ///
+    /// Held so `stop()` can wait for the worker to exit cleanly after stdin
+    /// closes — which lets the child run its at-exit handlers (under coverage
+    /// instrumentation, this is what flushes the worker's profile) — and
+    /// SIGKILL it only as a timeout fallback. `None` under the test factory.
+    proc: tokio::sync::Mutex<Option<tokio::process::Child>>,
     /// Factory that builds fresh I/O halves on each (re)spawn.
     factory: HalvesFactory,
 }
@@ -159,6 +178,7 @@ impl Supervisor {
             last_load: Mutex::new(None),
             stopped: AtomicBool::new(false),
             write_tx: Mutex::new(None),
+            proc: tokio::sync::Mutex::new(None),
             factory: Box::new(production_factory),
         });
         Self { inner }
@@ -181,6 +201,7 @@ impl Supervisor {
             last_load: Mutex::new(None),
             stopped: AtomicBool::new(false),
             write_tx: Mutex::new(None),
+            proc: tokio::sync::Mutex::new(None),
             factory,
         });
         Self { inner }
@@ -257,9 +278,16 @@ impl Supervisor {
         self.inner.chat_sinks.lock().remove(&request_id);
     }
 
-    /// Gracefully shut down the worker (2s timeout) then drop the write channel.
+    /// Gracefully shut down the worker, then wait for the process to exit.
     ///
-    /// Sets the deliberate-stop flag so death does not trigger respawn.
+    /// Sets the deliberate-stop flag so death does not trigger respawn, sends a
+    /// best-effort `higgs/shutdown` (2s timeout), then drops the write channel —
+    /// closing the worker's stdin so its read loop hits EOF and `worker_main()`
+    /// returns normally. A clean exit lets the child run its at-exit handlers
+    /// (under coverage instrumentation, that is what flushes the worker's
+    /// profile). It is then reaped, waiting up to `WORKER_EXIT_TIMEOUT` for a
+    /// self-exit and SIGKILL-ing as a last resort so a wedged worker can never
+    /// outlive its supervisor.
     pub(crate) async fn stop(&self) {
         self.inner.stopped.store(true, Ordering::Relaxed);
         let _ = tokio::time::timeout(
@@ -267,8 +295,22 @@ impl Supervisor {
             self.request(M_SHUTDOWN, Value::Null),
         )
         .await;
-        // Drop the sender — the writer task exits when its channel closes.
+        // Drop the sender — the writer task exits when its channel closes, which
+        // drops the worker's stdin and signals EOF to its read loop.
         *self.inner.write_tx.lock() = None;
+        // Reap the process: prefer a clean self-exit (flushes coverage),
+        // fall back to SIGKILL on timeout.
+        let mut guard = self.inner.proc.lock().await;
+        if let Some(mut child) = guard.take() {
+            match tokio::time::timeout(WORKER_EXIT_TIMEOUT, child.wait()).await {
+                Ok(_) => {} // worker exited on its own — at-exit handlers ran.
+                Err(_) => {
+                    // Wedged: force-kill and reap so we never leak the process.
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                }
+            }
+        }
     }
 
     /// Record the params of a successful `higgs/scan` for post-restart replay.
@@ -367,6 +409,13 @@ impl Supervisor {
         // will auto-restart on unexpected death (stop→start cycle fix).
         self.inner.stopped.store(false, Ordering::Relaxed);
         let halves = (self.inner.factory)(self.inner.stderr_ring.clone())?;
+        // Stash the child handle so stop() can wait on / kill it. No concurrent
+        // holder exists at (re)spawn time — stop() is terminal and never races a
+        // spawn — so a non-blocking lock is sufficient and avoids blocking_lock
+        // inside the async runtime.
+        if let Ok(mut guard) = self.inner.proc.try_lock() {
+            *guard = halves.proc;
+        }
         let (write_tx, write_rx) = mpsc::unbounded_channel::<String>();
         *self.inner.write_tx.lock() = Some(write_tx);
         // Writer task: owns the write half, drains the mpsc channel.
@@ -685,7 +734,9 @@ fn production_factory(
 
     // Drain stderr asynchronously: tokio::process::ChildStderr is AsyncRead,
     // not std::io::Read, so we read it with a tokio task using AsyncBufReadExt.
-    // `child` is moved in so it stays alive until stderr drains.
+    // The drain owns only the stderr half; the `child` handle now lives in
+    // `Inner.proc` so `stop()` can wait on / kill the process. When the worker
+    // exits, the stderr pipe closes and this task ends.
     tokio::spawn(async move {
         let mut lines = tokio::io::BufReader::new(stderr).lines();
         while let Ok(Some(line)) = lines.next_line().await {
@@ -695,12 +746,12 @@ fn production_factory(
             }
             ring.push_back(line);
         }
-        drop(child);
     });
 
     Ok(WorkerHalves {
         write: Box::new(stdin),
         read: Box::new(stdout),
+        proc: Some(child),
     })
 }
 
@@ -759,6 +810,7 @@ mod tests {
             Ok(WorkerHalves {
                 write: Box::new(write),
                 read: Box::new(read),
+                proc: None,
             })
         }));
 
@@ -918,6 +970,7 @@ mod tests {
             Ok(WorkerHalves {
                 write: Box::new(write),
                 read: Box::new(read),
+                proc: None,
             })
         }));
         sup.start().expect("start");
@@ -1058,6 +1111,7 @@ mod tests {
                     Ok(WorkerHalves {
                         write: Box::new(write),
                         read: Box::new(read),
+                        proc: None,
                     })
                 } else {
                     let write = cell_sup_write_2.lock().take().ok_or_else(|| {
@@ -1077,6 +1131,7 @@ mod tests {
                     Ok(WorkerHalves {
                         write: Box::new(write),
                         read: Box::new(read),
+                        proc: None,
                     })
                 }
             }));
