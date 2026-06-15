@@ -51,6 +51,16 @@ use crate::worker::{M_LOAD, M_SCAN, M_SHUTDOWN, N_CHAT_CHUNK};
 /// never outlive its supervisor.
 const WORKER_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Bound on a single control RPC (scan/load/status/unload) round-trip. These
+/// are not streaming and complete quickly — even loading a large GGUF is well
+/// under this. The bound exists so a worker that is ALIVE but wedged (e.g. an
+/// FFI call hung inside llama.cpp, or stdout polluted so its real response is
+/// dropped on decode) can never hang the caller forever — without it,
+/// `rx.await` blocks indefinitely since no EOF arrives to drain `pending`.
+/// Chat (M_CHAT via `request_with_id`) is intentionally NOT bounded here: it is
+/// already capped by `max_tokens` and streams progress chunks.
+const CONTROL_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Events the host application subscribes to.
 #[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
 #[ts(export, export_to = "../../../frontend/src/lib/generated/")]
@@ -253,7 +263,19 @@ impl Supervisor {
     /// Returns `Err(WorkerRpc)` [HG009] if the worker replies with a JSON-RPC error.
     pub(crate) async fn request(&self, method: &str, params: Value) -> Result<Value, HiggsError> {
         let id = self.alloc_request_id();
-        self.send_request(id, method, params).await
+        match tokio::time::timeout(CONTROL_RPC_TIMEOUT, self.send_request(id, method, params)).await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                // Timed out: drop the orphaned pending entry so it doesn't leak,
+                // and surface a worker-unavailable error rather than hanging.
+                self.inner.pending.lock().remove(&id);
+                warn!(method, "higgs: control RPC timed out");
+                Err(HiggsError::WorkerDead {
+                    context: format!("{method} timed out after {CONTROL_RPC_TIMEOUT:?}"),
+                })
+            }
+        }
     }
 
     /// Send a request using a pre-allocated id.

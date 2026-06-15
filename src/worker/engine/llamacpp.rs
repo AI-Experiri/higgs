@@ -209,6 +209,17 @@ impl HiggsEngine for LlamaCppEngine {
         // streamed content (the structured tool_calls are emitted at end of
         // stream by `serve::stream`, parsed from `full` below). The same parser
         // does the final parse in the fallback branch.
+        //
+        // KNOWN LIMITATION: the filter is installed ONLY when a registry parser
+        // matches. The registry covers higgs's target families (Gemma, Qwen,
+        // DeepSeek, Nemotron). A model whose tool format the crate's primary
+        // `parse_response_oaicompat` handles but the registry does NOT match
+        // (e.g. Llama-3's `<|python_tag|>` — outside higgs's target set) gets
+        // `stream_filter = None`, so its tool-call markup streams raw as content
+        // deltas while the final structured tool_calls are still returned. The
+        // non-streaming `content` is unaffected (set empty when tool_calls
+        // present). A general fix would suppress on the union of all known open
+        // markers; deferred since target models are covered.
         let tmpl_str = template.to_str().unwrap_or("");
         let selected_parser = params
             .tools_json
