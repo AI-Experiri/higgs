@@ -11,10 +11,11 @@ use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaChatTemplate, LlamaModel};
+use llama_cpp_2::model::{AddBos, LlamaChatTemplate, LlamaModel};
+use llama_cpp_2::openai::OpenAIChatTemplateParams;
 use llama_cpp_2::sampling::LlamaSampler;
 
-use super::{EngineMessage, GenParams, HiggsEngine, LoadParams};
+use super::{GenParams, HiggsEngine, LoadParams};
 use crate::diagnostic::HiggsError;
 use crate::worker::tool_parser::{ToolCallStreamFilter, ToolParserRegistry};
 
@@ -74,7 +75,7 @@ impl HiggsEngine for LlamaCppEngine {
 
     fn chat(
         &mut self,
-        messages: &[EngineMessage],
+        messages_json: &str,
         params: &GenParams,
         sink: &mut dyn FnMut(&str),
     ) -> Result<super::ChatResult, HiggsError> {
@@ -98,27 +99,37 @@ impl HiggsEngine for LlamaCppEngine {
                     .map_err(|e| gen_fail("chatml fallback template", e.to_string()))?
             }
         };
-        let chat: Vec<LlamaChatMessage> = messages
-            .iter()
-            .map(|m| LlamaChatMessage::new(m.role.clone(), m.content.clone()))
-            .collect::<Result<_, _>>()
-            .map_err(|e| gen_fail("chat message build", e.to_string()))?;
-        // Single path for tools and no-tools alike: the OAI-compat apply renders
-        // the GGUF template (with the tools array when present) AND returns the
+        // Single path for tools and no-tools alike: the OAI-compat apply parses
+        // the verbatim OpenAI `messages` JSON (preserving assistant `tool_calls`
+        // and tool `tool_call_id` for multi-turn tool loops), renders the GGUF
+        // template (with the tools array when present), AND returns the
         // serialized PEG parser + chat_format the crate's vendored `common_chat`
         // selected for this model. We keep `tmpl_result` alive across the decode
         // so `parse_response_oaicompat` can turn the raw output back into an
         // OpenAI message (content + tool_calls) — no parser invented here.
+        //
+        // `add_bos: false` — the prompt is tokenized below with `AddBos::Always`,
+        // so the template must not also prepend BOS (would double it).
         // (Grammar-constrained sampling via tmpl_result.grammar is deferred.)
+        let oai_params = OpenAIChatTemplateParams {
+            messages_json,
+            tools_json: params.tools_json.as_deref(),
+            tool_choice: None,
+            json_schema: None,
+            grammar: None,
+            reasoning_format: None,
+            chat_template_kwargs: None,
+            add_generation_prompt: true,
+            use_jinja: true,
+            parallel_tool_calls: false,
+            enable_thinking: false,
+            add_bos: false,
+            add_eos: false,
+            parse_tool_calls: params.tools_json.is_some(),
+        };
         let tmpl_result = loaded
             .model
-            .apply_chat_template_with_tools_oaicompat(
-                &template,
-                &chat,
-                params.tools_json.as_deref(),
-                None,
-                true,
-            )
+            .apply_chat_template_oaicompat(&template, &oai_params)
             .map_err(|e| gen_fail("apply chat template", e.to_string()))?;
         let prompt = tmpl_result.prompt.as_str();
 
@@ -343,10 +354,7 @@ mod tests {
         let mut out = String::new();
         let result = e
             .chat(
-                &[EngineMessage {
-                    role: "user".into(),
-                    content: "Say hi in one word.".into(),
-                }],
+                r#"[{"role":"user","content":"Say hi in one word."}]"#,
                 &GenParams {
                     max_tokens: 8,
                     temperature: 0.0,

@@ -4,13 +4,6 @@ pub mod llamacpp;
 
 use crate::diagnostic::HiggsError;
 
-/// One chat message on the engine boundary (OpenAI role vocabulary).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct EngineMessage {
-    pub role: String,
-    pub content: String,
-}
-
 /// Generation parameters for one request.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GenParams {
@@ -18,9 +11,9 @@ pub struct GenParams {
     pub temperature: f32,
     /// OpenAI-compatible `tools` array serialized to a JSON string, or `None`
     /// when the request carries no tools. Fed verbatim to the GGUF chat
-    /// template via `apply_chat_template_with_tools_oaicompat`; the crate's
-    /// vendored `common_chat` renders the tool grammar and selects the
-    /// matching tool-call parser. We invent no parser of our own.
+    /// template alongside the messages; the crate's vendored `common_chat`
+    /// renders the tool grammar and selects the matching tool-call parser. We
+    /// invent no parser of our own.
     pub tools_json: Option<String>,
 }
 
@@ -67,15 +60,23 @@ pub trait HiggsEngine: Send {
     fn unload(&mut self);
     /// True when a model is resident.
     fn is_loaded(&self) -> bool;
-    /// Render the GGUF-embedded chat template over `messages` and stream
+    /// Render the GGUF-embedded chat template over `messages_json` and stream
     /// completion deltas into `sink`. Returns a [`ChatResult`] with the full
     /// text, finish reason, and prompt/completion token counts.
+    ///
+    /// `messages_json` is the request's OpenAI `messages` array serialized
+    /// verbatim — including assistant `tool_calls` and tool `tool_call_id`, so
+    /// multi-turn tool loops round-trip. This is the engine-neutral boundary:
+    /// each engine renders this same OpenAI JSON by its own means (llama.cpp via
+    /// `common_chat`; a future MLX engine via its own jinja renderer). The
+    /// template-apply mechanism never crosses above this trait.
+    ///
     /// Fails with [HG005] when the prompt cannot fit, [HG004] on load-state errors,
     /// [HG011] on generation failures (context create, prompt decode, sampler, detokenize,
     /// loop decode).
     fn chat(
         &mut self,
-        messages: &[EngineMessage],
+        messages_json: &str,
         params: &GenParams,
         sink: &mut dyn FnMut(&str),
     ) -> Result<ChatResult, HiggsError>;

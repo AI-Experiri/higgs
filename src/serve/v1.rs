@@ -135,13 +135,29 @@ pub(super) async fn v1_chat_completions(
         return v1_error(&err).into_response();
     }
 
-    let pairs = match messages_to_pairs(&req.messages) {
-        Ok(p) => p,
-        // v1 is text-only: image/audio/file/refusal content parts → 400.
-        Err(reject) => {
-            tracing::warn!(detail = %reject, "higgs: chat request rejected");
+    // v1 is text-only: reject image/audio/file/refusal content parts → 400.
+    // (Validation only — the flattened pairs are discarded; the engine receives
+    // the verbatim OpenAI messages JSON below so tool_calls / tool_call_id are
+    // preserved for multi-turn tool loops.)
+    if let Err(reject) = messages_to_pairs(&req.messages) {
+        tracing::warn!(detail = %reject, "higgs: chat request rejected");
+        let status = StatusCode::BAD_REQUEST;
+        return (status, Json(v1_envelope(status, reject))).into_response();
+    }
+
+    // Serialize the OpenAI `messages` array verbatim — the engine feeds it to
+    // the GGUF chat template via the crate's OAI-compat apply, which parses
+    // assistant tool_calls and tool tool_call_id natively.
+    let messages_json = match serde_json::to_string(&req.messages) {
+        Ok(s) => s,
+        Err(err) => {
+            tracing::warn!(error = %err, "higgs: messages serialization failed");
             let status = StatusCode::BAD_REQUEST;
-            return (status, Json(v1_envelope(status, reject))).into_response();
+            return (
+                status,
+                Json(v1_envelope(status, format!("invalid messages: {err}"))),
+            )
+                .into_response();
         }
     };
 
@@ -167,7 +183,7 @@ pub(super) async fn v1_chat_completions(
     };
 
     let (deltas, outcome) = match higgs
-        .chat_stream(pairs, max_tokens, temperature, tools_json)
+        .chat_stream(messages_json, max_tokens, temperature, tools_json)
         .await
     {
         Ok(pair) => pair,

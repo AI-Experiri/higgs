@@ -322,7 +322,7 @@ impl Higgs {
     /// each other's streams.
     pub async fn chat_stream(
         &self,
-        messages: Vec<(String, String)>,
+        messages_json: String,
         max_tokens: usize,
         temperature: f32,
         tools_json: Option<String>,
@@ -343,11 +343,6 @@ impl Higgs {
         let rx = self.sup.register_chat_sink(request_id);
         let sup = Arc::clone(&self.sup);
 
-        let msgs: Vec<serde_json::Value> = messages
-            .into_iter()
-            .map(|(role, content)| json!({ "role": role, "content": content }))
-            .collect();
-
         let handle = tokio::spawn(async move {
             let result = sup
                 .request_with_id(
@@ -355,7 +350,10 @@ impl Higgs {
                     M_CHAT,
                     json!({
                         "request_id": request_id,
-                        "messages": msgs,
+                        // Raw OpenAI messages array (serialized verbatim by the
+                        // serve layer) carried as a JSON string so tool_calls /
+                        // tool_call_id survive to the engine's chat template.
+                        "messages_json": messages_json,
                         "max_tokens": max_tokens,
                         "temperature": temperature,
                         "tools": tools_json,
@@ -694,7 +692,12 @@ mod tests {
         };
 
         let (mut rx, handle) = higgs
-            .chat_stream(vec![("user".into(), "hi".into())], 256, 0.7, None)
+            .chat_stream(
+                r#"[{"role":"user","content":"hi"}]"#.to_owned(),
+                256,
+                0.7,
+                None,
+            )
             .await
             .expect("chat_stream should succeed");
 
@@ -762,7 +765,12 @@ mod tests {
 
         // chat_stream registers the sink then the spawned task encounters dead worker.
         let (_rx, handle) = higgs
-            .chat_stream(vec![("user".into(), "hi".into())], 8, 0.0, None)
+            .chat_stream(
+                r#"[{"role":"user","content":"hi"}]"#.to_owned(),
+                8,
+                0.0,
+                None,
+            )
             .await
             .expect("chat_stream itself should not fail");
 

@@ -198,13 +198,18 @@ impl WorkerState {
                     }));
                 }
                 let request_id = req.params.get("request_id").cloned().unwrap_or(Value::Null);
-                let messages: Vec<engine::EngineMessage> = serde_json::from_value(
-                    req.params.get("messages").cloned().unwrap_or(Value::Null),
-                )
-                .map_err(|e| RpcError {
-                    code: -32602,
-                    message: format!("invalid messages: {e}"),
-                })?;
+                // The serve layer serialized the request's OpenAI `messages`
+                // array verbatim (preserving tool_calls / tool_call_id); the
+                // engine feeds it straight to the chat template. Carried as a
+                // JSON string so it round-trips unparsed.
+                let messages_json = req
+                    .params
+                    .get("messages_json")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| RpcError {
+                        code: -32602,
+                        message: "missing messages_json".to_string(),
+                    })?;
                 let gen = engine::GenParams {
                     max_tokens: req
                         .params
@@ -237,7 +242,7 @@ impl WorkerState {
                 };
                 let result = self
                     .engine
-                    .chat(&messages, &gen, &mut sink)
+                    .chat(messages_json, &gen, &mut sink)
                     .map_err(|e| to_rpc_error(&e))?;
                 if chunk_write_failed {
                     tracing::warn!("chat chunk write failed; supervisor pipe broken");
@@ -328,7 +333,7 @@ mod tests {
 
         fn chat(
             &mut self,
-            _messages: &[engine::EngineMessage],
+            _messages_json: &str,
             _params: &engine::GenParams,
             sink: &mut dyn FnMut(&str),
         ) -> Result<engine::ChatResult, HiggsError> {
@@ -468,7 +473,7 @@ mod tests {
         input.push_str(&req_line(
             3,
             M_CHAT,
-            json!({"request_id": 7, "messages": [{"role": "user", "content": "hi"}]}),
+            json!({"request_id": 7, "messages_json": "[{\"role\":\"user\",\"content\":\"hi\"}]"}),
         ));
 
         let (frames, calls) = serve_with_fake(&input);
@@ -513,7 +518,7 @@ mod tests {
 
     #[test]
     fn chat_before_load_is_hg003() {
-        let input = req_line(2, M_CHAT, json!({"request_id": 1, "messages": []}));
+        let input = req_line(2, M_CHAT, json!({"request_id": 1, "messages_json": "[]"}));
         let (frames, calls) = serve_with_fake(&input);
 
         assert_eq!(frames.len(), 1);
