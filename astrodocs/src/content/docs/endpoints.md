@@ -10,7 +10,7 @@ higgs exposes two route groups:
 | Group | Purpose |
 |-------|---------|
 | `/v1/*` | OpenAI-compatible inference — chat clients, OpenAI SDK drop-ins |
-| `/api/higgs/*` | Control plane — scan, load, unload, status, logs, worker lifecycle |
+| `/api/higgs/*` | Control plane — scan, load, unload, status, system, logs, worker stop, version |
 
 All routes are mounted by `higgs::serve::router(Arc<Higgs>)`.
 
@@ -253,7 +253,10 @@ curl http://localhost:8081/api/higgs/models
 
 ### POST /api/higgs/models/load
 
-Load a model by HuggingFace repo id. Load parameters fall back to `HiggsConfig.default_load` when absent.
+Load a model by HuggingFace repo id. This **spawns the worker process** (named
+`higgs(<id>)`) — with nothing loaded there is no worker. The GGUF path is
+resolved host-side and carried into the worker. Load parameters fall back to
+`HiggsConfig.default_load` when absent.
 
 **Request body:**
 
@@ -287,7 +290,8 @@ curl -X POST -H "Content-Type: application/json" \
 
 ### POST /api/higgs/models/unload
 
-Unload the current model.
+Unload the current model. This **kills the worker process** (kill-on-unload), so
+after this there is no higgs worker until the next load.
 
 **Response (200):**
 
@@ -316,13 +320,21 @@ Live status snapshot. `worker_alive` is true iff an RPC round-trip to the worker
     "id": "org/model-name",
     "ctx_len": 4096,
     "gpu_layers": 4294967295,
-    "threads": 4
+    "threads": 4,
+    "arch": "llama",
+    "quant": "Q4_K_M",
+    "max_context_length": 131072,
+    "size_bytes": 4200000000,
+    "has_chat_template": true
   },
   "models_on_disk": 3
 }
 ```
 
-`loaded` is absent when no model is loaded. `models_on_disk` is the count from the last scan.
+`loaded` is absent when no model is loaded (then `worker_alive` is also false —
+no worker exists). `models_on_disk` and the `arch`/`quant`/`max_context_length`/
+`size_bytes`/`has_chat_template` fields are computed **host-side** (the worker's
+store is empty); the worker reports only `id`/`ctx_len`/`gpu_layers`/`threads`.
 
 **curl:**
 
@@ -357,27 +369,11 @@ curl "http://localhost:8081/api/higgs/logs?n=50"
 
 ---
 
-### POST /api/higgs/worker/start
-
-Spawn the worker process if it is not already running.
-
-**Response (200):**
-
-```json
-{ "status": "ok" }
-```
-
-**curl:**
-
-```sh
-curl -X POST http://localhost:8081/api/higgs/worker/start
-```
-
----
-
 ### POST /api/higgs/worker/stop
 
-Gracefully shut down the worker (2 second timeout).
+Gracefully shut down the worker (2 second timeout). There is no `/worker/start`
+counterpart — loading a model **is** the start (it spawns the worker), and
+unloading **is** the stop. Use `POST /api/higgs/models/load` to bring a worker up.
 
 **Response (200):**
 

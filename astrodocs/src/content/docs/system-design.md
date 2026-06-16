@@ -8,30 +8,38 @@ description: higgs architecture — crate API, worker model, engine trait, model
 higgs is a **standalone Rust crate** with zero dependency edges to any other jigglebot crate.
 A host application constructs a `Higgs` facade, mounts the router, and talks to it through the Rust API or over HTTP.
 
+In production the host is the jigglebot server itself (`backend/server/src/higgs/`
+launcher), which constructs `Higgs`, serves the router on an ephemeral
+`127.0.0.1` port, and stores that origin in `config.higgs_base_url`.
+
 ```
 ┌──────────────────────────────────────────────┐
 │                  host app                    │
-│  Higgs::new(HiggsConfig)  →  h.start()       │
-│  Router::new().merge(serve::router(h))        │
+│  Arc::new(Higgs::new(HiggsConfig))            │
+│  serve(serve::router(h), 127.0.0.1:0)         │
+│  h.start()  ← near-no-op: NO worker yet       │
 └───────────────────┬──────────────────────────┘
-                    │ Rust API (zero-copy)
+                    │ Rust API (launcher only)
+                    │ HTTP /api/higgs/* (pane), /v1 (agents)
                     ▼
 ┌──────────────────────────────────────────────┐
 │              higgs crate                     │
-│  api.rs      Higgs facade                    │
+│  api.rs      Higgs facade (scan = host-side) │
 │  supervisor  Worker manager + RPC correlator │
-│  serve/      Axum router (/v1 + /api/higgs/) │
-│  rpc.rs      NDJSON JSON-RPC 2.0 codec       │
-│  worker/     Re-exec'd subprocess            │
+│  serve/      Axum router (/v1 + /api/higgs/) │  PURE RUST
+│  rpc.rs      NDJSON JSON-RPC 2.0 codec       │  (cannot crash
+│  worker/     Re-exec'd subprocess            │   the host)
 │  diagnostic  HiggsError HG001–HG011          │
 └───────────────────┬──────────────────────────┘
                     │ stdio (NDJSON JSON-RPC 2.0)
+                    │ ONLY while a model is loaded
                     ▼
          ┌─────────────────────┐
-         │   worker process    │
-         │ <binary> --higgs-   │
-         │         worker      │
-         │  llama.cpp engine   │
+         │   worker process    │  spawn-on-load /
+         │   higgs(<model>)    │  kill-on-unload
+         │ <binary> --higgs-   │  (zero process when
+         │         worker      │   nothing loaded —
+         │  llama.cpp engine   │   ISOLATED crash domain)
          └─────────────────────┘
 ```
 
@@ -44,11 +52,11 @@ A host application constructs a `Higgs` facade, mounts the router, and talks to 
 | Method | What it does |
 |--------|-------------|
 | `Higgs::new(config)` | Construct without spawning the worker |
-| `start()` | Spawn worker + run initial scan |
-| `stop()` | Graceful shutdown (2 s timeout) |
-| `scan()` | Scan model dirs, return `Vec<HiggsModel>` |
-| `load(id, params?)` | Load a model by HuggingFace repo id |
-| `unload()` | Unload the current model |
+| `start()` | Near-no-op — control surface only; spawns **no** worker |
+| `stop()` | Kill the worker (2 s graceful timeout) + clear load-replay state |
+| `scan()` | Host-side scan of model dirs (no worker), return `Vec<HiggsModel>` |
+| `load(id, params?)` | Resolve GGUF path host-side, **spawn** the worker, send M_LOAD |
+| `unload()` | M_UNLOAD then **kill** the worker |
 | `status()` | `HiggsStatus { worker_alive, loaded, models_on_disk }` |
 | `chat_stream(messages, max_tokens, temp)` | Returns `(delta_rx, outcome_handle)` |
 | `events()` | Subscribe to `HiggsEvent` broadcast |
@@ -61,13 +69,21 @@ A host application constructs a `Higgs` facade, mounts the router, and talks to 
 The llama.cpp FFI runs inside a **re-exec'd copy of the host binary** launched with `--higgs-worker`.
 The supervisor communicates with it over stdio using NDJSON JSON-RPC 2.0.
 
+The worker is **spawned on load and killed on unload** — there is no idle worker.
+`start()` spawns nothing. `load(M)` spawns a worker (argv0 `higgs(<M>)`, ≤64
+chars) then sends M_LOAD; `unload()` sends M_UNLOAD then kills it. With nothing
+loaded, zero higgs worker processes exist. A failed load tears the worker back
+down. A `tokio` lifecycle mutex serialises load/unload/stop so spawn-on-load and
+kill-on-unload never interleave.
+
 ```
-NORMAL DEATH (stdout EOF):
-  stopped flag set?  → do nothing (intentional stop)
-  not stopped        → single respawn (1 s backoff)
-                           replay higgs/scan params
-                           replay higgs/load params   → emit ModelLoaded
-                           emit WorkerRestarted
+UNEXPECTED DEATH (stdout EOF / read error, NOT a deliberate stop):
+  deliberate stop?  → do nothing, no event
+  unexpected        → single respawn (1 s backoff)
+                          argv0 re-stamped higgs(<loaded id>); old child reaped
+                          replay higgs/load (bounded RPC timeout) → emit ModelLoaded
+                          emit WorkerRestarted
+                          (scan is host-side — NO scan replay)
 
 FACTORY FAILURE on respawn → emit WorkerDied, no further retry
 ```
@@ -108,8 +124,14 @@ returns `HG005 ContextOverflow` instead of silently truncating or hanging.
 
 ## Model Scan Flow
 
+Scan runs **host-side** (pure Rust: `ggus` + `memmap2` + `std::fs`, no llama.cpp
+FFI, no worker RPC), wrapped in `spawn_blocking`. The model list is therefore
+available with no worker live. `load()` resolves the chosen model's GGUF path
+from this same scan and carries it in the M_LOAD params; the worker's own store
+stays empty.
+
 ```
-ModelStore::scan(lmstudio_roots, hf_roots, ollama_roots)
+ModelStore::scan(lmstudio_roots, hf_roots, ollama_roots)   (host process)
   │
   ├── LM Studio (< 0.3)  ~/.lmstudio/models/org/model/*.gguf
   ├── LM Studio (>= 0.3) ~/.cache/lm-studio/models/org/model/*.gguf
@@ -211,76 +233,82 @@ end of stream:  tool_calls parsed from the FULL generation (pipeline above)
 
 ## How higgs works with jigglebot
 
-The integration is live. jigglebot holds `Arc<Higgs>` in `AppState` and wires it
-at three points in the server startup sequence.
+higgs runs **embedded in-process** inside the jigglebot server. The only module
+that imports the higgs crate is the launcher (`backend/server/src/higgs/`); it
+owns the `Arc<Higgs>` and serves higgs's self-contained router on its own
+localhost listener. jigglebot's gateway and event bus are never in higgs's path.
+
+jigglebot reaches higgs by exactly three routes:
+
+- the **library** (the launcher holds the `Arc<Higgs>`),
+- the **frontend control surface** — the higgs pane hits `/api/higgs/*` directly,
+- **agents** — through genai `AdapterKind::Higgs` over `/v1`.
+
+The only jigglebot-side knowledge of the address is `config.higgs_base_url`.
 
 ### Boot sequence
 
 ```
-lib.rs  init_app()
+init_app() (lib.rs)
   │
-  ├─ Higgs::new(config.higgs)     ← constructs facade, no worker yet
+  config.higgs_base_url = higgs::launch().await   ← BEFORE provider load
+  │    │
+  │    ├─ Arc::new(Higgs::new(HiggsConfig::default()))   ← facade, no worker
+  │    ├─ bind 127.0.0.1:0  → readback ephemeral addr
+  │    ├─ spawn serve_with_shutdown(router)  (detached, owns Arc for the
+  │    │     process lifetime — control surface up FIRST, survives a dead worker)
+  │    ├─ higgs.start().await   ← near-no-op (best-effort; no worker spawned)
+  │    └─ return "http://127.0.0.1:<port>"   (None on failure → jigglebot
+  │         runs without embedded local models; non-fatal)
   │
-  ├─ higgs.start().await          ← spawns worker subprocess + initial scan
-  │    non-fatal: if worker can't start (llama.cpp missing)
-  │    jigglebot continues without local model support
-  │
-  └─ AppState { …, higgs }        ← Arc<Higgs> stored in shared state
+  ProviderRegistry::load(config)  → seeds runtime-only higgs provider at base_url
+  /api/meta                       → returns config.higgs_base_url = resolved addr
 
-server.rs  run()  (after TCP bind — actual port now known)
+main.rs / tauri-app main()
   │
-  ├─ spawn_higgs_provider_sync(&higgs, provider_registry, base_url)
-  │    base_url = "http://127.0.0.1:{actual_port}"
-  │    higgs_sync appends /v1 before storing as provider's base_url
-  │
-  └─ app.merge(higgs::serve::router(Arc<Higgs>))
-       mounts /v1/*         (OpenAI-compatible chat completions, models list)
-       mounts /api/higgs/*  (scan, load, unload, status, logs control routes)
-
-main.rs
-  │
-  └─ Commands::HiggsWorker → higgs::worker::worker_main()
-       dispatched BEFORE building the tokio runtime (worker_main is sync)
-       this is the re-exec target: supervisor spawns the same binary with
-       --higgs-worker and communicates via stdio NDJSON JSON-RPC 2.0
+  └─ maybe_run_worker()   ← MUST be first, before tracing init
+       if argv has --higgs-worker → higgs::worker::worker_main(); exit(0)
+       (the re-exec target: load() spawns current_exe() with --higgs-worker;
+        the worker owns stdin/stdout for NDJSON JSON-RPC — anything that writes
+        stdout first corrupts the wire)
 ```
 
-### Provider sync — HiggsEvent → ProviderRegistry
+### Crash isolation
 
-`spawn_higgs_provider_sync` subscribes to `higgs.events()` (a `broadcast::Receiver`)
-and translates worker lifecycle events into `ProviderRegistry` mutations:
+The serve + control layers are **pure Rust** and cannot crash jigglebot. Only the
+worker (llama.cpp FFI) is a separate process, so a segfault there can never reach
+jigglebot — the supervisor respawns it once, and the provider lifecycle reconciles
+on the next switch/attach.
+
+### Provider model sync — lazy, on switch/attach
+
+There is **no event→registry sync task**. A single runtime-only `higgs` provider
+(`ProviderBackend::Higgs`, fixed-UUID, never persisted) is seeded once at startup
+pointing at `higgs_base_url`. Its `model` field starts empty; higgs's chat gate
+rejects a request whose model isn't the loaded one. The gateway closes the gap by
+**lazily syncing** that field from higgs's `GET /v1/models` (loaded-only) at the
+points where a pool is (re)built:
 
 ```
-HiggsEvent::ModelLoaded { id }
-  → ProviderConfig {
-        backend:  ProviderBackend::Higgs,
-        api_key:  "" (empty — no key for local inference),
-        model:    id  (HuggingFace repo id verbatim),
-        base_url: Some("http://127.0.0.1:{port}/v1"),
-        max_concurrent: DEFAULT_MAX_CONCURRENT_LOCAL,
-        …
-    }
-  → registry.add(config)      — runtime-only, NEVER persisted to disk
-  → slug_map.insert(id, slug) — track for later removal
+provider switch / attach targeting higgs (WS ProviderSwitch, attach_provider,
+  set_providers, handlers_agents) → sync_higgs_model_if_targeted(slugs)
+boot restore of a saved higgs attachment → attach_provider_pool
 
-HiggsEvent::ModelUnloaded { id }
-  → slug_map.remove(id) → registry.remove_provider(slug)
-  (LM Studio eject semantics — provider disappears from the list entirely)
-
-HiggsEvent::WorkerDied
-  → for each tracked slug: registry.remove_provider(slug)
-  → slug_map.drain()
-
-HiggsEvent::WorkerRestarted
-  → no-op (ModelLoaded events follow for each re-loaded model)
+  sync_higgs_model():  GET {higgs_base_url}/v1/models
+                       → if loaded model changed, update()+rebuild the provider
 ```
+
+Deliberately **NOT** on `GET /api/providers`: a read must not mutate runtime
+state (`sync_higgs_model` can retire the entry, breaking an attached pool).
+Source: `ProviderRegistry::sync_higgs_model` / `sync_higgs_model_if_targeted`
+(`backend/server/src/provider/higgs.rs`).
 
 ### Local = just a provider URL
 
 Because higgs serves OpenAI wire at `/v1`, agents consume loaded models through the
 standard `GenaiProvider` path — the same code path used for any OpenAI-compatible
 cloud provider. The only difference is `ProviderBackend::Higgs`, which signals
-`adapter_kind = OpenAI`, `no api_key`, and `base_url = gateway /v1`.
+`adapter_kind = Higgs`, no api_key, and `base_url = {higgs_base_url}/v1`.
 
 ```
 Agent actor (provider phase)
@@ -292,60 +320,29 @@ ProviderPool → GenaiProvider { backend: Higgs, base_url: "http://127.0.0.1:{po
 POST /v1/chat/completions          ← higgs::serve handles this
   │
   ▼
-llama.cpp worker (via stdio RPC)
+llama.cpp worker (via stdio RPC; spawned on load)
 ```
 
----
+### Mid-session swap limitation
 
-### Design decisions
-
-Two deliberate choices that could have gone differently:
-
-**1. ModelUnloaded = remove_provider, not retire**
-
-When a model is unloaded (or the worker dies), `remove_provider` is called — the
-provider entry disappears from the registry entirely. An alternative was `retire`,
-which marks the provider stale but leaves a ghost entry. `retire` was rejected
-because repeated load/unload cycles accumulate ghost entries: the provider list
-grows unboundedly and stale-provider cleanup machinery (`check_all`, health polling)
-runs on entries that can never recover until restart. `remove_provider` matches
-LM Studio's eject semantics (the model is gone — its provider should be too) and
-keeps the registry clean across arbitrary load/unload cycles.
-
-**2. Higgs providers excluded from check_all() health polling**
-
-`ProviderRegistry::check_all()` (the periodic health-check loop) does not poll
-higgs-backed providers. Liveness is event-driven via `higgs_sync`: the supervisor
-emits `WorkerDied` / `ModelUnloaded` when the model stops being available, and
-`higgs_sync` removes the provider at that point. If `check_all` were to poll higgs
-providers, genai's `all_model_names` call would hit `api.openai.com` instead of
-the local endpoint (genai resolves OpenAI model names from a static list for the
-`OpenAI` adapter kind). The higgs provider would be marked stale spuriously.
-Event-driven removal is both correct and cheaper.
-
----
-
-### Known limitation
-
-`broadcast::Receiver` has a finite channel capacity (64). Under sustained rapid
-model churn, a `RecvError::Lagged` could cause `higgs_sync` to miss a
-`ModelUnloaded` event. If that happens, the provider lingers in the registry until
-the next `WorkerDied` event clears the entire map. This is logged at `warn` level
-(`higgs_sync lagged — some model events were missed`) but not yet reconciled: there
-is no periodic re-sync between registry state and actual worker state.
-Normal usage (one model loaded at a time, infrequent swaps) cannot trigger the lag.
+If higgs is already attached to an agent and the user loads a *different* model
+from the Higgs pane (which only POSTs to `/api/higgs/models/load`), that agent's
+pre-built pool keeps the old model id and chat fails (`[HG003]`) until the
+provider is re-selected (which re-syncs + rebuilds). Auto-rebuilding attached
+pools on a pane-driven load is a future enhancement.
 
 ---
 
 ## Embedding higgs in any host app
 
-The same three integration points work for any Axum host:
+The same integration points work for any Axum host:
 
-1. **Construct and start** — `Higgs::new(config).start().await`
-2. **Mount the router** — `Router::new().merge(higgs::serve::router(Arc::clone(&h)))`
-3. **Subscribe to events** — `h.events()` returns a broadcast receiver; map
-   `HiggsEvent::ModelLoaded` / `ModelUnloaded` to whatever your host's provider
-   lifecycle expects
+1. **Construct** — `let h = Arc::new(Higgs::new(config));`
+2. **Serve the router** — `serve(higgs::serve::router(Arc::clone(&h)), listener)`
+3. **Start** — `h.start().await` (control only; the worker spawns on first load)
+4. **Drive the lifecycle** — call `h.load(id, …)` / `h.unload()`; optionally
+   subscribe to `h.events()` for `ModelLoaded` / `ModelUnloaded` / `WorkerDied` /
+   `WorkerRestarted`
 
 The host binary must also dispatch `--higgs-worker` to `higgs::worker::worker_main()`
 so the re-exec pattern works:

@@ -14,41 +14,44 @@
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                         host app                            │
-│  (jigglebot server — in phase 2; any Axum host in general)  │
+│  production: jigglebot server (backend/server/src/higgs/    │
+│  launcher); also any Axum host in general                   │
 │                                                             │
 │  HiggsConfig { lmstudio_dirs, hf_dirs, ollama_dirs,        │
 │                default_load }                               │
 │                                                             │
-│  let h = Higgs::new(config);    // facade construction      │
-│  h.start().await;               // spawns worker + scan     │
-│  Router::new().merge(higgs::serve::router(Arc::clone(&h)))  │
+│  let h = Arc::new(Higgs::new(config)); // construct, no worker│
+│  serve(higgs::serve::router(h), 127.0.0.1:0) // ephemeral   │
+│  h.start().await;               // near-no-op (no worker yet)│
 └──────────────────────────┬──────────────────────────────────┘
-                           │ Rust API only
+                           │ Rust API only (launcher)
+                           │ HTTP /api/higgs/* (frontend pane)
+                           │ HTTP /v1 (agents, genai Higgs adapter)
                            ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                         higgs crate                         │
 │  (standalone — zero dep edges to engine / common / server)  │
+│  serve + control = PURE RUST (cannot crash the host)        │
 │                                                             │
-│  api.rs        Higgs facade: scan / load / unload /         │
-│                chat_stream / status / events / logs         │
+│  api.rs        Higgs facade: scan(host-side) / load /       │
+│                unload / chat_stream / status / events / logs │
 │  supervisor.rs Worker process manager + RPC correlator      │
 │  serve/        Axum router (/v1 + /api/higgs/*)             │
 │  rpc.rs        NDJSON JSON-RPC 2.0 codec                    │
-│  worker/       Re-exec'd subprocess: engine + model store   │
+│  worker/       Re-exec'd subprocess: engine (model store    │
+│                empty — scan is host-side; path comes in M_LOAD)│
 │  diagnostic.rs HiggsError HG001–HG011                      │
 └──────────────────────────┬──────────────────────────────────┘
                            │ stdio (NDJSON JSON-RPC 2.0)
+                           │ ONLY while a model is loaded
                            ▼
                ┌───────────────────────┐
-               │   worker process      │
-               │   (re-exec'd binary   │
-               │    --higgs-worker)    │
-               │   llama.cpp engine    │
+               │   worker process      │  spawn-on-load /
+               │   higgs(<model>)      │  kill-on-unload
+               │   (re-exec'd binary   │  (zero process when
+               │    --higgs-worker)    │   nothing loaded —
+               │   llama.cpp engine    │   ISOLATED crash domain)│
                └───────────────────────┘
-
-  Note: phase 2 integration (jigglebot provider upsert,
-  WS events, config merge) is not yet wired — see astrodocs
-  system-design page for the planned integration layer.
 ```
 
 ---
@@ -56,47 +59,46 @@
 ## Worker Lifecycle
 
 ```
-  host calls Higgs::start()
-        │
-        ▼
-  Supervisor::start()
-        │
-        ├─── spawn child process:  <binary> --higgs-worker
-        │    (stdin piped ← supervisor writes requests)
-        │    (stdout piped → supervisor reads responses/notifs)
-        │    (stderr → ring buffer, cap 2000 lines)
-        │
-        ├─── writer task   owns stdin half
-        │    drains mpsc channel → write_all + flush
-        │
-        └─── reader task   owns stdout half
-             BufReader::lines() loop
-                  │
-                  ├─ Response (has id, no method)
-                  │      → correlate by id → oneshot reply
-                  │
-                  └─ Notification (no id)  N_CHAT_CHUNK
-                         → active chat sink (mpsc)
+  Higgs::start()  →  near-no-op: NO worker spawned (control surface only).
+                     scan() runs host-side and needs no worker.
 
-  NORMAL DEATH (stdout EOF):
-        │
-        ├─── stopped flag set? → do nothing (intentional stop)
-        │
-        └─── not stopped → single respawn attempt (1 s backoff)
-                  │
-                  ├─── replay last scan params  (higgs/scan)
-                  ├─── replay last load params  (higgs/load)
-                  │    → emit HiggsEvent::ModelLoaded on success
-                  │
-                  └─── emit HiggsEvent::WorkerRestarted
-                           │
-                           ├── factory fails → emit WorkerDied
-                           │                    no further retry
-                           └── replay fails  → HG009 logged;
-                                               worker stays up
-                                               (scan/load may fail)
+  ┌──────────────┬──────────────────────────────────────────────┐
+  │ nothing      │  ZERO higgs worker processes (zero idle RAM). │
+  │ loaded       │  chat for an unloaded model → 404 (no worker).│
+  └──────────────┴──────────────────────────────────────────────┘
 
-  TERMINAL: factory failure on respawn → WorkerDied, no loop
+  load(M)   (lifecycle mutex held for the whole body)
+        │
+        ├─ scan() host-side → resolve M's GGUF path
+        ├─ Supervisor::start_for(M)  → SPAWN worker process
+        │     <binary> --higgs-worker, argv0 = higgs(<M>) (≤64 chars)
+        │     (stdin/stdout piped; stderr → ring buffer, cap 2000)
+        │     writer task owns stdin; reader task owns stdout
+        ├─ send M_LOAD { id, path, ctx_len, gpu_layers, threads }
+        │     fail → clear_last_load + stop() (tear worker back down)
+        └─ ok   → record_last_load(params) + emit ModelLoaded
+
+  unload()  (lifecycle mutex held for the whole body)
+        │
+        ├─ clear_last_load()  (so a racing respawn cannot replay it)
+        ├─ send M_UNLOAD (best-effort graceful)
+        ├─ Supervisor::stop()  → KILL worker process
+        └─ emit ModelUnloaded
+
+  reader loop dispatch (while a worker is live):
+        ├─ Response  (has id) → correlate by id → oneshot reply
+        └─ Notification N_CHAT_CHUNK → keyed chat sink (by request_id)
+
+  UNEXPECTED DEATH (stdout EOF / read error, NOT a deliberate stop):
+        └─ single respawn attempt (1 s backoff)
+                  ├─ argv0 re-stamped higgs(<loaded id>); old child reaped
+                  ├─ replay last load (M_LOAD, bounded RPC timeout)
+                  │    → emit ModelLoaded on confirmed success
+                  └─ emit WorkerRestarted
+                       (scan is host-side — NO scan replay)
+
+  TERMINAL: deliberate stop → no respawn, no event.
+            factory failure on respawn → WorkerDied, no loop.
 ```
 
 ---
@@ -115,10 +117,10 @@
        │
        ├─── messages_to_pairs()   (v1 text-only; rejects image/audio → 400)
        │
-       └─── Higgs::chat_stream(pairs, max_tokens, temperature)
+       └─── Higgs::chat_stream(messages_json, max_tokens, temperature, tools_json)
                   │
-                  └─── Supervisor::take_chat_sink()  (installs mpsc sink)
-                       Supervisor::request(M_CHAT, params)
+                  └─── Supervisor::register_chat_sink(request_id)  (installs mpsc sink)
+                       Supervisor::request_with_id(request_id, M_CHAT, params)
                             │ NDJSON line  →  worker stdin
                             │
                             ▼
@@ -152,12 +154,12 @@
 ## Model Scan Flow
 
 ```
-  Higgs::scan(lmstudio_dirs, hf_dirs, ollama_dirs)
-        │
-        └─── Supervisor::request(M_SCAN, {lmstudio:[…], hf:[…], ollama:[…]})
-                  │ NDJSON  →  worker stdin
-                  ▼
-             WorkerState: ModelStore::scan(lmstudio, hf, ollama)
+  Higgs::scan()   — HOST-SIDE (pure Rust: ggus + memmap2 + std::fs,
+        │            NO llama.cpp FFI, NO worker RPC). Wrapped in
+        │            spawn_blocking. Available with no worker live.
+        └─── ModelStore::scan(lmstudio_dirs, hf_dirs, ollama_dirs)
+                  (the worker no longer scans; load() resolves the
+                   GGUF path here and carries it in M_LOAD params)
 
   Three store layouts (read-only — higgs NEVER writes):
 
@@ -206,15 +208,18 @@
   ┌─────────────────────────────────────────────────────────────────┐
   │  /api/higgs/*  (control)                                        │
   ├──────────────────────────┬──────────────────────────────────────┤
-  │  GET  /api/higgs/models  │  Live scan + loaded_id              │
-  │  POST /api/higgs/models/load   │  Load by id; body: HiggsLoadRequest│
-  │  POST /api/higgs/models/unload │  Unload current model         │
+  │  GET  /api/higgs/models  │  Host-side scan + loaded_id         │
+  │  GET  /api/higgs/models/{*id}  │  Single enriched model by id  │
+  │  POST /api/higgs/models/load   │  Load by id (spawns worker)   │
+  │  POST /api/higgs/models/unload │  Unload current (kills worker)│
   │  GET  /api/higgs/status  │  HiggsStatus {worker_alive, loaded, │
   │                          │              models_on_disk}         │
+  │  GET  /api/higgs/system  │  Host CPU/RAM + inference runtime   │
   │  GET  /api/higgs/logs    │  Worker stderr tail (?n=200)        │
-  │  POST /api/higgs/worker/start │  Spawn worker                  │
   │  POST /api/higgs/worker/stop  │  Graceful shutdown (2 s)       │
+  │  GET  /api/higgs/version │  Build version + engine info        │
   └──────────────────────────┴──────────────────────────────────────┘
+  (no /worker/start — load IS the start, unload IS the stop)
 
   Error mapping (same table for both surfaces):
   ┌────────────────────────────┬──────────┐

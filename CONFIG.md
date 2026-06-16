@@ -12,30 +12,36 @@
 
 ## Process & Environment
 
-higgs runs as its own process — the `higgs-server` binary
-(`src/bin/higgs-server.rs`), a separate listener from the jigglebot gateway.
-jigglebot does not embed higgs; it reaches it over HTTP at `higgs_base_url`
-(seeded as a runtime-only provider — see
-[server config](../server/src/config/CONFIG.md)).
+**Production: higgs runs embedded in-process inside the jigglebot server.**
+The `backend/server/src/higgs/` launcher constructs `Higgs::new(HiggsConfig::
+default())`, binds an **ephemeral** `127.0.0.1:0` listener (the OS picks the
+port), and serves `higgs::serve::router` on it. The resolved origin is stored
+in `config.higgs_base_url` BEFORE the provider registry / `/api/meta` read it,
+and seeded as a runtime-only provider — see
+[server config](../server/src/config/CONFIG.md) and
+[`backend/server/src/higgs/CONFIG.md`](../server/src/higgs/CONFIG.md). The
+embedded path reads no `HIGGS_*` env vars and binds no fixed port (so it never
+collides with a separately-running higgs/Ollama on 11434).
 
-The binary reads three environment variables; everything else comes from
-`HiggsConfig::default()` (the standalone binary constructs
-`Higgs::new(HiggsConfig::default())` — there is no config file at this layer).
+**Standalone / dev: the `higgs-server` binary** (`src/bin/higgs-server.rs`) runs
+higgs as its own process with a fixed bind/port. It is NOT the production path.
+It reads three environment variables; everything else comes from
+`HiggsConfig::default()` (there is no config file at this layer).
 
-| Env var | Default | Effect |
-|---------|---------|--------|
-| `HIGGS_BIND` | `127.0.0.1` | Bind address. `0.0.0.0` exposes it LAN-wide. |
-| `HIGGS_PORT` | `11434` | Listen port. |
-| `RUST_LOG` | `info` | tracing filter. |
+| Env var | Default | Effect | Where |
+|---------|---------|--------|-------|
+| `HIGGS_BIND` | `127.0.0.1` | Bind address. `0.0.0.0` exposes it LAN-wide. | `higgs-server` only |
+| `HIGGS_PORT` | `11434` | Listen port. | `higgs-server` only |
+| `RUST_LOG` | `info` | tracing filter. | both |
 
 ```sh
-higgs-server                                      # 127.0.0.1:11434
+higgs-server                                      # 127.0.0.1:11434 (standalone)
 HIGGS_BIND=0.0.0.0 HIGGS_PORT=1234 higgs-server   # LAN-reachable on :1234
 ```
 
-A host that embeds the crate directly (instead of spawning `higgs-server`)
-constructs its own `HiggsConfig` and passes it to `Higgs::new`; the fields
-below are that struct's defaults.
+A host that embeds the crate directly (as jigglebot does) constructs its own
+`HiggsConfig` and passes it to `Higgs::new`; the fields below are that struct's
+defaults.
 
 ---
 

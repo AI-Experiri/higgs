@@ -174,6 +174,12 @@ pub struct ChatOutcome {
 ///
 /// Constructing `Higgs` does not start the worker; call [`start`](Self::start)
 /// when the host is ready to serve requests.
+/// Default context-window cap used when a load does not pin `ctx_len`: the
+/// model's trained context is used but never exceeds this, so a huge-context
+/// model doesn't allocate an enormous KV cache by default. A caller (the UI)
+/// can still request the full trained window explicitly.
+const DEFAULT_CTX_CAP: u32 = 32_768;
+
 pub struct Higgs {
     sup: Arc<Supervisor>,
     config: parking_lot::Mutex<HiggsConfig>,
@@ -252,21 +258,30 @@ impl Higgs {
         // kill-on-unload must never interleave (protects last_load and the
         // supervisor proc handle). Held for the entire method body.
         let _lifecycle = self.lifecycle.lock().await;
-        let p = params.unwrap_or_else(|| self.config.lock().default_load.clone());
+        let explicit_params = params.is_some();
+        let mut p = params.unwrap_or_else(|| self.config.lock().default_load.clone());
         // Scan moved host-side, so the worker's ModelStore is empty on a fresh
-        // spawn-on-load worker: resolve the GGUF path HERE and carry it in the
-        // M_LOAD params. Without this the worker's `store.get(id)` returns HG002
-        // for every normal load. Take the first matching model's path.
-        let path = self
+        // spawn-on-load worker: resolve the model HERE and carry the GGUF path in
+        // the M_LOAD params. Without this the worker's `store.get(id)` returns
+        // HG002 for every normal load. Take the first matching model.
+        let model = self
             .scan()
             .await?
             .into_iter()
             .find(|m| m.id == id)
-            .map(|m| m.path)
             .ok_or_else(|| HiggsError::ModelNotFound { id: id.to_owned() })?;
+        // When the caller didn't pin ctx_len, default it to the model's trained
+        // context (capped at DEFAULT_CTX_CAP) rather than the hardcoded 4096 —
+        // otherwise an agent asking for a large max_tokens overflows n_ctx
+        // ([HG005]). The UI can still request the full trained window explicitly.
+        if !explicit_params {
+            if let Some(train) = model.ctx_train {
+                p.ctx_len = (train as u32).min(DEFAULT_CTX_CAP);
+            }
+        }
         let req_params = json!({
             "id": id,
-            "path": path,
+            "path": model.path,
             "ctx_len": p.ctx_len,
             "gpu_layers": p.gpu_layers,
             "threads": p.threads,

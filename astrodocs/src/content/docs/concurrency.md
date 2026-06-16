@@ -16,10 +16,13 @@ description: Current request-keyed routing design and deferred parallel-executio
 
 | Layer | Behaviour |
 |---|---|
+| Worker process | Spawn-on-load / kill-on-unload — at most one worker, named `higgs(<model>)`; zero process when nothing loaded |
+| Lifecycle serialisation | A `tokio::sync::Mutex` serialises `load` / `unload` / `stop` so spawn-on-load and kill-on-unload never interleave |
 | Worker execution | Single-threaded stdin loop — one `higgs/chat` at a time |
 | Supervisor routing | Per-request `mpsc::unbounded_channel` keyed by `request_id` |
 | Concurrent callers | Accepted; serialised at the worker; each caller's deltas are isolated |
-| Rejection policy | None — no 409, no busy signal |
+| Control RPC bound | `scan`/`load`/`status`/`unload` capped at 120 s; chat is unbounded (capped by `max_tokens`) |
+| Rejection policy | None — no 409, no busy signal. Chat for an unloaded model → 404 (no worker) |
 
 ### Request-keyed routing flow
 

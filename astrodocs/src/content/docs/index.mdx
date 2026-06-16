@@ -21,11 +21,11 @@ hero:
 import { Card, CardGrid } from '@astrojs/starlight/components';
 
 <CardGrid stagger>
-  <Card title="Standalone crate" icon="puzzle">
-    higgs imports nothing from any jigglebot crate. Mount it in any Axum app with one call.
+  <Card title="Embedded, standalone crate" icon="puzzle">
+    higgs imports nothing from any jigglebot crate. In production it runs in-process inside jigglebot; mount it in any Axum app with one call.
   </Card>
-  <Card title="Crash-isolated worker" icon="warning">
-    The llama.cpp engine runs in a re-exec'd subprocess. A crash restarts automatically, replaying the last scan and load.
+  <Card title="Spawn-on-load worker" icon="warning">
+    The llama.cpp engine runs in a re-exec'd subprocess spawned on load and killed on unload — zero idle process. A crash mid-use restarts automatically, replaying the last load.
   </Card>
   <Card title="OpenAI-compatible" icon="approve-check">
     `/v1/chat/completions` speaks the OpenAI wire protocol verbatim — stream or non-stream.

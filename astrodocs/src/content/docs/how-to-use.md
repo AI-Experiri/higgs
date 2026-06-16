@@ -14,27 +14,29 @@ use std::sync::Arc;
 // 1. Configure
 let config = HiggsConfig::default(); // uses ~/.lmstudio, ~/.cache/huggingface/hub, ~/.ollama
 
-// 2. Construct + start (spawns worker, runs initial scan)
+// 2. Construct + start (control surface only — NO worker spawned yet)
 let h = Arc::new(Higgs::new(config));
 h.start().await?;
 
-// 3. Scan to see what's available
+// 3. Scan to see what's available (host-side — needs no worker)
 let models = h.scan().await?;
 for m in &models {
-    println!("{} ({}) — {} bytes", m.id, m.source, m.size_bytes);
+    println!("{} ({:?}) — {} bytes", m.id, m.source, m.size_bytes);
 }
 
-// 4. Load a model
+// 4. Load a model — THIS spawns the worker process (higgs(<id>))
 h.load("org/model-name", None).await?;
 
-// 5. Chat — streaming
+// 5. Chat — streaming. messages is a JSON string of the OpenAI
+//    messages array; tools is an optional JSON string (None here).
 let (mut rx, outcome) = h.chat_stream(
-    vec![
-        ("system".into(), "You are a helpful assistant.".into()),
-        ("user".into(), "What is 2 + 2?".into()),
-    ],
-    256,   // max_tokens
-    0.7,   // temperature
+    r#"[
+        {"role":"system","content":"You are a helpful assistant."},
+        {"role":"user","content":"What is 2 + 2?"}
+    ]"#.to_owned(),
+    256,    // max_tokens
+    0.7,    // temperature
+    None,   // tools_json
 ).await?;
 
 while let Some(delta) = rx.recv().await {
@@ -43,14 +45,15 @@ while let Some(delta) = rx.recv().await {
 let result = outcome.await??;
 println!("\n[{}]", result.finish_reason);
 
-// 6. Unload when done
+// 6. Unload when done — THIS kills the worker process
 h.unload().await?;
-h.stop().await;
+h.stop().await;   // idempotent: also kills the worker if one is still up
 ```
 
 ### Via HTTP
 
 The HTTP surface is the OpenAI wire protocol — any OpenAI-compatible client works.
+Scan needs no worker (host-side); **load spawns the worker, unload kills it**.
 
 **Step 1: scan**
 
@@ -149,13 +152,14 @@ when the environment variable `HIGGS_TEST_GGUF` is set:
 HIGGS_TEST_GGUF=/path/to/model.gguf cargo test -p higgs -- --nocapture
 ```
 
-Without `HIGGS_TEST_GGUF` set, the llama.cpp tests are skipped automatically.
-The supervisor round-trip tests run with in-memory duplex streams and do not need a real model.
+Without `HIGGS_TEST_GGUF` set, the llama.cpp tests are skipped automatically
+(`#[ignore]`). The supervisor RPC tests run with in-memory duplex streams and do
+not need a real model or a spawned worker.
 
-To run only the worker stdio round-trip test (no GGUF needed):
+To run only the supervisor stdio round-trip test (no GGUF, no worker process):
 
 ```sh
-cargo test -p higgs worker_roundtrip -- --nocapture
+cargo test -p higgs request_response_correlation -- --nocapture
 ```
 
 ---
