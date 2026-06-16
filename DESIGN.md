@@ -120,10 +120,11 @@
        ▼
   serve::mod  v1_chat_completions()
        │
-       ├─── status check: is model loaded?
-       │         HG003 → 404 if not
+       ├─── status check: is model loaded?  (gate_and_validate)
+       │         HG003 → 404 if not — covers unloaded, idle (no worker),
+       │         AND crashed-worker; /v1 never emits a worker-down 503
        │
-       ├─── validate_sampling()   (temp/top_p/n/penalties/max_tokens; vllm ranges)
+       ├─── validate_sampling()   (temp/top_p/n=1/penalties/max_tokens; vllm ranges)
        │         HG013 → 400 if out of range
        │
        ├─── check_prompt_fits()   (prompt_bytes/4 + max_tokens vs loaded ctx_len)
@@ -228,9 +229,14 @@
   │  /v1  (OpenAI-compatible)                                       │
   ├──────────────────────────┬──────────────────────────────────────┤
   │  GET  /v1/models         │  Loaded models only (ListModelResponse)│
+  │                          │  idle (no worker) → 200 {"data":[]}  │
   │  POST /v1/chat/completions│  stream or non-stream               │
+  │                          │  unloaded/idle/crashed → 404 HG003   │
   │                          │  OpenAI error envelope on failure    │
   └──────────────────────────┴──────────────────────────────────────┘
+  /v1 NEVER returns 503 worker-down: spawn-on-load means "no worker" ==
+  "nothing loaded", so a crashed worker presents as empty /v1/models +
+  404 chat. GET /api/higgs/status still exposes worker_alive for diagnostics.
 
   ┌─────────────────────────────────────────────────────────────────┐
   │  /api/higgs/*  (control)                                        │

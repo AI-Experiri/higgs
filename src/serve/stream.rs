@@ -9,12 +9,12 @@
 use std::convert::Infallible;
 
 use async_openai::types::chat::{
-    ChatChoiceStream, ChatCompletionMessageToolCallChunk, ChatCompletionStreamResponseDelta,
-    CreateChatCompletionStreamResponse, FinishReason, FunctionCallStream, FunctionType, Role,
+    ChatChoiceStream, ChatCompletionMessageToolCallChunk, ChatCompletionMessageToolCalls,
+    ChatCompletionStreamResponseDelta, CreateChatCompletionStreamResponse, FinishReason,
+    FunctionCallStream, FunctionType, Role,
 };
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::Stream;
-use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -54,8 +54,8 @@ async fn assemble(
     id: String,
     model: String,
     created: u32,
-    mut deltas: mpsc::UnboundedReceiver<String>,
-    mut outcome: JoinHandle<Result<ChatOutcome, HiggsError>>,
+    deltas: mpsc::UnboundedReceiver<String>,
+    outcome: JoinHandle<Result<ChatOutcome, HiggsError>>,
     tx: mpsc::UnboundedSender<String>,
 ) {
     let send = |payload: String| {
@@ -73,58 +73,10 @@ async fn assemble(
         None,
     ));
 
-    let joined = loop {
-        tokio::select! {
-            // Drain deltas first so all content precedes the finish chunk.
-            biased;
-            maybe = deltas.recv() => match maybe {
-                Some(delta) => {
-                    send(chunk_payload(&id, &model, created, None, Some(delta), None, None));
-                }
-                // Sink closed early: worker died — the outcome carries the error.
-                None => break outcome.await,
-            },
-            joined = &mut outcome => {
-                // Generation finished; flush deltas still queued in the channel.
-                while let Ok(delta) = deltas.try_recv() {
-                    send(chunk_payload(&id, &model, created, None, Some(delta), None, None));
-                }
-                break joined;
-            }
-        }
-    };
+    let joined = drain_deltas(&id, &model, created, deltas, outcome, &send).await;
 
     match joined {
-        Ok(Ok(out)) => {
-            // Any tool calls go out as one delta chunk (full name + arguments),
-            // followed by a finish chunk whose reason is "tool_calls" per spec.
-            let tool_calls = out.tool_calls.as_ref().and_then(stream_tool_calls);
-            let finish = if tool_calls.is_some() {
-                FinishReason::ToolCalls
-            } else {
-                finish_reason_from(&out.finish_reason)
-            };
-            if let Some(tc) = tool_calls {
-                send(chunk_payload(
-                    &id,
-                    &model,
-                    created,
-                    None,
-                    None,
-                    Some(tc),
-                    None,
-                ));
-            }
-            send(chunk_payload(
-                &id,
-                &model,
-                created,
-                None,
-                None,
-                None,
-                Some(finish),
-            ));
-        }
+        Ok(Ok(out)) => emit_outcome(&id, &model, created, &out, &send),
         Ok(Err(err)) => {
             tracing::warn!(error = %err, "higgs: chat stream failed mid-generation");
             send(super::v1::v1_envelope_json(
@@ -144,38 +96,110 @@ async fn assemble(
     send("[DONE]".to_owned());
 }
 
-/// Convert the parsed OpenAI `tool_calls` array (our `ChatOutcome.tool_calls`)
-/// into streaming tool-call chunks. Emits one chunk per call with its full
-/// name + arguments (we buffer the call rather than streaming argument deltas).
-/// Returns `None` when the value is absent or not a non-empty array.
-fn stream_tool_calls(v: &Value) -> Option<Vec<ChatCompletionMessageToolCallChunk>> {
-    let arr = v.as_array()?;
-    let calls: Vec<_> = arr
-        .iter()
+/// Stream content delta chunks until generation completes, returning the joined
+/// outcome. Deltas are drained ahead of the finish (biased select) so all
+/// content precedes it; on early sink close (worker death) the outcome carries
+/// the error.
+async fn drain_deltas(
+    id: &str,
+    model: &str,
+    created: u32,
+    mut deltas: mpsc::UnboundedReceiver<String>,
+    mut outcome: JoinHandle<Result<ChatOutcome, HiggsError>>,
+    send: &impl Fn(String),
+) -> Result<Result<ChatOutcome, HiggsError>, tokio::task::JoinError> {
+    loop {
+        tokio::select! {
+            // Drain deltas first so all content precedes the finish chunk.
+            biased;
+            maybe = deltas.recv() => match maybe {
+                Some(delta) => {
+                    send(chunk_payload(id, model, created, None, Some(delta), None, None));
+                }
+                // Sink closed early: worker died — the outcome carries the error.
+                None => break outcome.await,
+            },
+            joined = &mut outcome => {
+                // Generation finished; flush deltas still queued in the channel.
+                while let Ok(delta) = deltas.try_recv() {
+                    send(chunk_payload(id, model, created, None, Some(delta), None, None));
+                }
+                break joined;
+            }
+        }
+    }
+}
+
+/// Map a completed outcome onto its terminal chunks: an optional tool-call delta
+/// chunk (full name + arguments) followed by the finish chunk. The tool-call
+/// interpretation is shared with the non-streaming path ([`interpret_tool_calls`]
+/// in `v1`), so identical worker output yields the same `finish_reason` on both:
+/// a value that fails to deserialize (e.g. `[{}]`) degrades to no tool calls and
+/// the engine's stop/length signal drives the finish reason.
+///
+/// [`interpret_tool_calls`]: super::v1::interpret_tool_calls
+fn emit_outcome(id: &str, model: &str, created: u32, out: &ChatOutcome, send: &impl Fn(String)) {
+    let tool_calls = super::v1::interpret_tool_calls(&out.tool_calls).map(stream_tool_calls);
+    let finish = if tool_calls.is_some() {
+        FinishReason::ToolCalls
+    } else {
+        finish_reason_from(&out.finish_reason)
+    };
+    if let Some(tc) = tool_calls {
+        send(chunk_payload(
+            id,
+            model,
+            created,
+            None,
+            None,
+            Some(tc),
+            None,
+        ));
+    }
+    send(chunk_payload(
+        id,
+        model,
+        created,
+        None,
+        None,
+        None,
+        Some(finish),
+    ));
+}
+
+/// Convert validated OpenAI tool calls (from the shared
+/// [`interpret_tool_calls`](super::v1::interpret_tool_calls)) into streaming
+/// tool-call chunks — one chunk per call with its full name + arguments (we
+/// buffer the call rather than streaming argument deltas). The input is already
+/// non-empty and well-formed (degradation happened in `interpret_tool_calls`),
+/// so this is a pure shape map.
+fn stream_tool_calls(
+    calls: Vec<ChatCompletionMessageToolCalls>,
+) -> Vec<ChatCompletionMessageToolCallChunk> {
+    calls
+        .into_iter()
         .enumerate()
-        .map(|(i, c)| {
-            let func = c.get("function");
-            let field = |key: &str| {
-                func.and_then(|f| f.get(key))
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned)
-            };
-            ChatCompletionMessageToolCallChunk {
+        .map(|(i, call)| match call {
+            ChatCompletionMessageToolCalls::Function(c) => ChatCompletionMessageToolCallChunk {
                 index: i as u32,
-                id: c.get("id").and_then(Value::as_str).map(ToOwned::to_owned),
+                id: Some(c.id),
                 r#type: Some(FunctionType::Function),
                 function: Some(FunctionCallStream {
-                    name: field("name"),
-                    arguments: field("arguments"),
+                    name: Some(c.function.name),
+                    arguments: Some(c.function.arguments),
                 }),
-            }
+            },
+            // higgs's OAI-compat parser only ever emits function calls, so a
+            // Custom call is not produced in practice; surface its id so the
+            // chunk is still well-formed (no streaming-function shape exists).
+            ChatCompletionMessageToolCalls::Custom(c) => ChatCompletionMessageToolCallChunk {
+                index: i as u32,
+                id: Some(c.id),
+                r#type: Some(FunctionType::Function),
+                function: None,
+            },
         })
-        .collect();
-    if calls.is_empty() {
-        None
-    } else {
-        Some(calls)
-    }
+        .collect()
 }
 
 /// Serialize one `chat.completion.chunk` into its `data:` payload string.
@@ -364,9 +388,15 @@ mod tests {
         assert_eq!(payloads[3], "[DONE]", "[DONE] is always last");
     }
 
+    /// Parse a worker `tool_calls` value through the shared interpreter (as the
+    /// assemble path does), then map to streaming chunks. Mirrors the real flow.
+    fn stream_from_value(v: serde_json::Value) -> Option<Vec<ChatCompletionMessageToolCallChunk>> {
+        super::super::v1::interpret_tool_calls(&Some(v)).map(stream_tool_calls)
+    }
+
     #[test]
     fn stream_tool_calls_maps_fields() {
-        let v = serde_json::json!([
+        let chunks = stream_from_value(serde_json::json!([
             {
                 "id": "call_abc",
                 "type": "function",
@@ -374,10 +404,11 @@ mod tests {
             },
             {
                 "id": "call_def",
+                "type": "function",
                 "function": { "name": "lookup", "arguments": "{}" }
             }
-        ]);
-        let chunks = stream_tool_calls(&v).expect("non-empty array maps to Some");
+        ]))
+        .expect("non-empty well-formed array maps to Some");
         assert_eq!(chunks.len(), 2);
 
         assert_eq!(chunks[0].index, 0);
@@ -395,29 +426,18 @@ mod tests {
     }
 
     #[test]
-    fn stream_tool_calls_none_for_empty_or_non_array() {
+    fn stream_tool_calls_none_for_empty_or_malformed() {
         // Empty array → None (no calls to emit).
-        assert!(stream_tool_calls(&serde_json::json!([])).is_none());
-        // Non-array values → None.
-        assert!(stream_tool_calls(&serde_json::json!({"function": {"name": "x"}})).is_none());
-        assert!(stream_tool_calls(&serde_json::json!("not an array")).is_none());
-        assert!(stream_tool_calls(&serde_json::Value::Null).is_none());
-    }
-
-    #[test]
-    fn stream_tool_calls_missing_function_fields_are_none() {
-        // An array element with no `function`/`id` keys still yields a chunk,
-        // but its name/arguments/id collapse to None.
-        let v = serde_json::json!([{}]);
-        let chunks = stream_tool_calls(&v).expect("one element → Some");
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].id, None);
-        let f = chunks[0]
-            .function
-            .as_ref()
-            .expect("function wrapper present");
-        assert_eq!(f.name, None);
-        assert_eq!(f.arguments, None);
+        assert!(stream_from_value(serde_json::json!([])).is_none());
+        // Non-array / wrong-shaped values fail to deserialize → None (same
+        // degradation as the non-streaming path).
+        assert!(stream_from_value(serde_json::json!({"function": {"name": "x"}})).is_none());
+        assert!(stream_from_value(serde_json::json!("not an array")).is_none());
+        assert!(stream_from_value(serde_json::Value::Null).is_none());
+        // A malformed element `[{}]` — no id/type/function — does NOT deserialize
+        // into the wire type, so the whole value degrades to None (matching the
+        // non-streaming path: identical worker output → same finish_reason).
+        assert!(stream_from_value(serde_json::json!([{}])).is_none());
     }
 
     /// An outcome carrying tool_calls must emit a tool-call delta chunk plus a
@@ -497,6 +517,40 @@ mod tests {
             |s: &str| -> CreateChatCompletionStreamResponse { serde_json::from_str(s).unwrap() };
         let finish = parse(&payloads[1]);
         assert_eq!(finish.choices[0].finish_reason, Some(FinishReason::Length));
+        assert_eq!(payloads[2], "[DONE]");
+    }
+
+    /// C3 parity: a malformed `tool_calls` (`[{}]`, which does NOT deserialize
+    /// into the async-openai wire type) must degrade to no tool calls on the
+    /// streaming path just as it does on the non-streaming path — no tool-call
+    /// delta, and finish_reason comes from the engine signal (NOT forced to
+    /// `tool_calls`). The matching non-stream assertion lives in `v1`'s
+    /// `chat_response_malformed_tool_calls_degrade_to_none`.
+    #[tokio::test]
+    async fn assemble_malformed_tool_calls_degrade_to_finish_reason() {
+        let (_dtx, drx) = mpsc::unbounded_channel::<String>();
+        let outcome = tokio::spawn(async {
+            Ok(ChatOutcome {
+                content: "text".into(),
+                finish_reason: "stop".into(),
+                // `[{}]` — a non-empty array whose element lacks id/type/function.
+                tool_calls: Some(serde_json::json!([{}])),
+                prompt_tokens: 1,
+                completion_tokens: 1,
+            })
+        });
+
+        let payloads = run_assemble(drx, outcome).await;
+        // role + finish + [DONE] — no tool-call delta for the degraded value.
+        assert_eq!(payloads.len(), 3, "role + finish + [DONE]: {payloads:?}");
+        let parse =
+            |s: &str| -> CreateChatCompletionStreamResponse { serde_json::from_str(s).unwrap() };
+        let finish = parse(&payloads[1]);
+        assert_eq!(
+            finish.choices[0].finish_reason,
+            Some(FinishReason::Stop),
+            "malformed tool_calls must not force a tool_calls finish reason"
+        );
         assert_eq!(payloads[2], "[DONE]");
     }
 }

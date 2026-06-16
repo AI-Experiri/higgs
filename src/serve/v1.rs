@@ -123,6 +123,23 @@ fn v1_error(err: &HiggsError) -> (StatusCode, Json<WrappedError>) {
     (status, Json(v1_envelope(status, &err.to_string())))
 }
 
+/// `/v1` error response for a non-[`HiggsError`] failure (a malformed body, a
+/// panicked chat task) — `status` + OpenAI error envelope body. Sibling of
+/// [`v1_error`] so the envelope shape lives in exactly one place.
+fn v1_envelope_response(status: StatusCode, message: &str) -> (StatusCode, Json<WrappedError>) {
+    (status, Json(v1_envelope(status, message)))
+}
+
+/// `/v1` 400 response with a custom message (malformed request body).
+fn v1_bad_request(message: &str) -> (StatusCode, Json<WrappedError>) {
+    v1_envelope_response(StatusCode::BAD_REQUEST, message)
+}
+
+/// `/v1` 500 response with a custom message (an internal, non-`HiggsError` failure).
+fn v1_internal(message: &str) -> (StatusCode, Json<WrappedError>) {
+    v1_envelope_response(StatusCode::INTERNAL_SERVER_ERROR, message)
+}
+
 /// Current Unix time in whole seconds (OpenAI `created` field).
 fn now_secs() -> u32 {
     std::time::SystemTime::now()
@@ -138,19 +155,17 @@ fn chatcmpl_id() -> String {
 
 /// `GET /v1/models` — LOADED models only: answers "what can serve chat right
 /// now", never the on-disk catalog (that is the control `models` route).
+///
+/// higgs is spawn-on-load, so the normal idle state has NO worker: nothing
+/// loaded means there is no worker process. An empty list is the correct OpenAI
+/// answer in that case — "no models can serve chat right now" — so this never
+/// gates on `worker_alive`. A crashed worker mid-serve likewise presents here as
+/// an empty list (it can serve nothing); `GET /api/higgs/status` still exposes
+/// `worker_alive` truthfully for diagnostics.
 pub(super) async fn v1_models(State(higgs): State<Arc<Higgs>>) -> Response {
     tracing::info!("higgs: GET /v1/models");
     match higgs.status().await {
         Ok(status) => {
-            // A dead worker can serve nothing — report 503, not a misleading
-            // 200 with an empty list (which reads as "no models loaded").
-            if !status.worker_alive {
-                let err = HiggsError::WorkerDead {
-                    context: "worker not running".into(),
-                };
-                tracing::warn!("higgs: /v1/models while worker is down");
-                return v1_error(&err).into_response();
-            }
             let data = status
                 .loaded
                 .into_iter()
@@ -182,91 +197,26 @@ pub(super) async fn v1_chat_completions(
 ) -> Response {
     tracing::info!(model = %req.model, stream = req.stream.unwrap_or(false), "higgs: POST /v1/chat/completions");
 
-    let status = match higgs.status().await {
+    // Gate + validation: the named model must be loaded, and sampling / prompt /
+    // content checks pass — each maps to its own status. Any failure short-circuits.
+    if let Err(resp) = gate_and_validate(&higgs, &req).await {
+        return resp;
+    }
+
+    // Serialize the OpenAI `messages` and `tools` arrays for the chat template,
+    // or 400 on a malformed body.
+    let messages_json = match serialize_messages(&req) {
         Ok(s) => s,
-        Err(err) => {
-            tracing::warn!(error = %err, "higgs: chat status check failed");
-            return v1_error(&err).into_response();
-        }
+        Err(resp) => return *resp,
     };
-    // A dead worker is infrastructure-down (503), NOT a client "model not
-    // loaded" (404). Distinguish it before the loaded-model gate — `status()`
-    // reports `worker_alive:false` rather than erroring when the worker is gone.
-    if !status.worker_alive {
-        let err = HiggsError::WorkerDead {
-            context: "worker not running".into(),
-        };
-        tracing::warn!("higgs: chat while worker is down");
-        return v1_error(&err).into_response();
-    }
-    let Some(loaded) = status.loaded.filter(|l| l.id == req.model) else {
-        let err = HiggsError::ModelNotLoaded {
-            id: req.model.clone(),
-        };
-        tracing::warn!(model = %req.model, "higgs: chat for unloaded model");
-        return v1_error(&err).into_response();
-    };
-
-    // Validate sampling params (temperature/top_p/n/penalties/max_tokens) BEFORE
-    // dispatching to the worker — out-of-range → 400 [HG013]. Ranges mirror vllm.
-    if let Err(err) = validate_sampling(&req) {
-        tracing::warn!(error = %err, "higgs: chat sampling param rejected");
-        return v1_error(&err).into_response();
-    }
-
-    // Early prompt-vs-context reject: a prompt whose conservative token estimate
-    // plus the generation budget cannot fit the loaded window is a client error
-    // (400 [HG005]) — reject here instead of shipping it to the worker. The
-    // worker's tokenizer-exact [HG005] check remains the authoritative backstop.
-    if let Err(err) = check_prompt_fits(&req, loaded.ctx_len) {
-        tracing::warn!(error = %err, "higgs: chat prompt exceeds context window");
-        return v1_error(&err).into_response();
-    }
-
-    // v1 is text-only: reject image/audio/file/refusal content parts → 400.
-    // (Validation only — the flattened pairs are discarded; the engine receives
-    // the verbatim OpenAI messages JSON below so tool_calls / tool_call_id are
-    // preserved for multi-turn tool loops.)
-    if let Err(reject) = messages_to_pairs(&req.messages) {
-        tracing::warn!(detail = %reject, "higgs: chat request rejected");
-        let status = StatusCode::BAD_REQUEST;
-        return (status, Json(v1_envelope(status, &reject))).into_response();
-    }
-
-    // Serialize the OpenAI `messages` array verbatim — the engine feeds it to
-    // the GGUF chat template via the crate's OAI-compat apply, which parses
-    // assistant tool_calls and tool tool_call_id natively.
-    let messages_json = match serde_json::to_string(&req.messages) {
-        Ok(s) => s,
-        Err(err) => {
-            tracing::warn!(error = %err, "higgs: messages serialization failed");
-            let status = StatusCode::BAD_REQUEST;
-            return (
-                status,
-                Json(v1_envelope(status, &format!("invalid messages: {err}"))),
-            )
-                .into_response();
-        }
+    let tools_json = match serialize_tools(&req) {
+        Ok(t) => t,
+        Err(resp) => return *resp,
     };
 
     // Effective generation budget (validated above to be in [1, MAX_OUTPUT_TOKENS]).
     let max_tokens = effective_max_tokens(&req) as usize;
     let temperature = req.temperature.unwrap_or(0.7);
-
-    // Serialize the OpenAI `tools` array to a JSON string for the chat template.
-    // A serialization failure is a malformed request body → 400.
-    let tools_json = match req.tools.as_ref().map(serde_json::to_string).transpose() {
-        Ok(t) => t,
-        Err(err) => {
-            tracing::warn!(error = %err, "higgs: chat tools serialization failed");
-            let status = StatusCode::BAD_REQUEST;
-            return (
-                status,
-                Json(v1_envelope(status, &format!("invalid tools: {err}"))),
-            )
-                .into_response();
-        }
-    };
 
     let (deltas, outcome) = match higgs
         .chat_stream(messages_json, max_tokens, temperature, tools_json)
@@ -294,35 +244,128 @@ pub(super) async fn v1_chat_completions(
             // JoinError: the chat task panicked or was aborted — not a HiggsError.
             Err(join_err) => {
                 tracing::warn!(error = %join_err, "higgs: chat task failed");
-                let status = StatusCode::INTERNAL_SERVER_ERROR;
-                (
-                    status,
-                    Json(v1_envelope(
-                        status,
-                        &format!("chat task failed: {join_err}"),
-                    )),
-                )
-                    .into_response()
+                v1_internal(&format!("chat task failed: {join_err}")).into_response()
             }
         }
     }
 }
 
+/// Run the pre-dispatch gate and request validation for a chat request:
+/// loaded-model check, sampling-param ranges, prompt-vs-context fit, and the
+/// v1 text-only content check. Returns `Err(response)` with the first failing
+/// gate's mapped response; `Ok(())` when the request may be dispatched.
+///
+/// higgs is spawn-on-load, so an unloaded or unknown model — including the idle
+/// no-worker state and a crashed-worker state — falls through to the HG003 404
+/// `ModelNotLoaded` gate. There is no separate worker-down 503 on this surface;
+/// `GET /api/higgs/status` exposes `worker_alive` for diagnostics instead.
+async fn gate_and_validate(
+    higgs: &Arc<Higgs>,
+    req: &CreateChatCompletionRequest,
+) -> Result<(), Response> {
+    let status = match higgs.status().await {
+        Ok(s) => s,
+        Err(err) => {
+            tracing::warn!(error = %err, "higgs: chat status check failed");
+            return Err(v1_error(&err).into_response());
+        }
+    };
+    // Loaded-model gate: an unloaded/unknown model — and, since spawn-on-load
+    // means "no worker" == "nothing loaded", the idle and crashed-worker states
+    // too — is a client "model not loaded" 404 [HG003].
+    let Some(loaded) = status.loaded.filter(|l| l.id == req.model) else {
+        let err = HiggsError::ModelNotLoaded {
+            id: req.model.clone(),
+        };
+        tracing::warn!(model = %req.model, "higgs: chat for unloaded model");
+        return Err(v1_error(&err).into_response());
+    };
+
+    // Validate sampling params (temperature/top_p/n/penalties/max_tokens) BEFORE
+    // dispatching to the worker — out-of-range → 400 [HG013]. Ranges mirror vllm.
+    if let Err(err) = validate_sampling(req) {
+        tracing::warn!(error = %err, "higgs: chat sampling param rejected");
+        return Err(v1_error(&err).into_response());
+    }
+
+    // Early prompt-vs-context reject: a prompt whose conservative token estimate
+    // plus the generation budget cannot fit the loaded window is a client error
+    // (400 [HG005]) — reject here instead of shipping it to the worker. The
+    // worker's tokenizer-exact [HG005] check remains the authoritative backstop.
+    if let Err(err) = check_prompt_fits(req, loaded.ctx_len) {
+        tracing::warn!(error = %err, "higgs: chat prompt exceeds context window");
+        return Err(v1_error(&err).into_response());
+    }
+
+    // v1 is text-only: reject image/audio/file/refusal content parts → 400.
+    // (Validation only — the flattened pairs are discarded; the engine receives
+    // the verbatim OpenAI messages JSON below so tool_calls / tool_call_id are
+    // preserved for multi-turn tool loops.)
+    if let Err(reject) = messages_to_pairs(&req.messages) {
+        tracing::warn!(detail = %reject, "higgs: chat request rejected");
+        return Err(v1_bad_request(&reject).into_response());
+    }
+    Ok(())
+}
+
+/// Serialize the OpenAI `messages` array verbatim for the chat template — the
+/// engine feeds it to the GGUF template via the crate's OAI-compat apply, which
+/// parses assistant tool_calls and tool tool_call_id natively. `Err(400)` on a
+/// malformed body.
+fn serialize_messages(req: &CreateChatCompletionRequest) -> Result<String, Box<Response>> {
+    serde_json::to_string(&req.messages).map_err(|err| {
+        tracing::warn!(error = %err, "higgs: messages serialization failed");
+        Box::new(v1_bad_request(&format!("invalid messages: {err}")).into_response())
+    })
+}
+
+/// Serialize the OpenAI `tools` array (if present) to a JSON string for the chat
+/// template. `Err(400)` on a malformed body.
+fn serialize_tools(req: &CreateChatCompletionRequest) -> Result<Option<String>, Box<Response>> {
+    req.tools
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|err| {
+            tracing::warn!(error = %err, "higgs: chat tools serialization failed");
+            Box::new(v1_bad_request(&format!("invalid tools: {err}")).into_response())
+        })
+}
+
+/// Interpret a worker-produced `tool_calls` value into the async-openai wire
+/// type, the SINGLE canonical interpretation shared by the non-streaming and
+/// streaming paths so identical worker output yields the same `finish_reason` on
+/// both. This data was produced by the crate's OAI-compat parser, so it is
+/// already OpenAI-shaped; a value that does not deserialize into the wire type
+/// (e.g. a bare string or a malformed `[{}]` element) is an internal bug — the
+/// actual serde error is logged and the call degrades to `None` rather than
+/// panicking or forcing a spurious `tool_calls` finish reason.
+///
+/// `None` (no calls) when the value is absent, deserializes to an empty array,
+/// or fails to deserialize.
+pub(super) fn interpret_tool_calls(
+    tool_calls: &Option<serde_json::Value>,
+) -> Option<Vec<ChatCompletionMessageToolCalls>> {
+    let calls: Vec<ChatCompletionMessageToolCalls> = tool_calls.as_ref().and_then(|v| {
+        serde_json::from_value(v.clone())
+            .map_err(|err| {
+                tracing::error!(error = %err, "higgs: tool_calls deserialize failed");
+                err
+            })
+            .ok()
+    })?;
+    // An empty array carries no calls — treat it as "no tool calls" so the
+    // engine's stop/length signal drives finish_reason.
+    if calls.is_empty() {
+        None
+    } else {
+        Some(calls)
+    }
+}
+
 /// Build the non-streaming chat completion response from a final outcome.
 fn chat_response(model: String, out: &ChatOutcome) -> CreateChatCompletionResponse {
-    // Deserialize the parser-produced `tool_calls` array into the async-openai
-    // wire type. This data was produced by the crate's OAI-compat parser, so it
-    // is already OpenAI-shaped; a deserialize failure is an internal bug — log
-    // the actual serde error and degrade to no tool calls rather than panic.
-    let tool_calls: Option<Vec<ChatCompletionMessageToolCalls>> =
-        out.tool_calls.as_ref().and_then(|v| {
-            serde_json::from_value(v.clone())
-                .map_err(|err| {
-                    tracing::error!(error = %err, "higgs: tool_calls deserialize failed");
-                    err
-                })
-                .ok()
-        });
+    let tool_calls = interpret_tool_calls(&out.tool_calls);
     // Per the OpenAI spec, a turn that emits tool calls reports finish_reason
     // "tool_calls" regardless of the engine's stop/length signal.
     let finish_reason = if tool_calls.is_some() {
@@ -381,9 +424,11 @@ fn effective_max_tokens(req: &CreateChatCompletionRequest) -> u32 {
 
 /// Validate the chat request's sampling parameters against their accepted
 /// ranges; `Err(HiggsError::InvalidSamplingParam)` (→ 400) on the first
-/// violation. Ranges mirror vllm `SamplingParams._verify_args`:
-/// `temperature >= 0`, `top_p` in `(0, 1]`, `n >= 1`, `presence_penalty` and
+/// violation. Ranges mirror vllm `SamplingParams._verify_args`, except `n`:
+/// `temperature >= 0`, `top_p` in `(0, 1]`, `presence_penalty` and
 /// `frequency_penalty` in `[-2, 2]`, `max_tokens >= 1` and `<= MAX_OUTPUT_TOKENS`.
+/// `n` must be exactly `1` — higgs serves a single choice, so n>1 is rejected
+/// rather than silently honored as one choice.
 fn validate_sampling(req: &CreateChatCompletionRequest) -> Result<(), HiggsError> {
     let invalid = |param: &str, detail: String| HiggsError::InvalidSamplingParam {
         param: param.to_owned(),
@@ -401,8 +446,13 @@ fn validate_sampling(req: &CreateChatCompletionRequest) -> Result<(), HiggsError
         }
     }
     if let Some(n) = req.n {
-        if n == 0 {
-            return Err(invalid("n", "must be at least 1".into()));
+        // higgs serves exactly one choice per request — n>1 (multiple choices)
+        // is unsupported, and n==0 is out of range. Only n==1 is accepted.
+        if n != 1 {
+            return Err(invalid(
+                "n",
+                format!("must be 1 (higgs serves a single choice; n={n} is unsupported)"),
+            ));
         }
     }
     if let Some(pp) = req.presence_penalty {
@@ -718,6 +768,47 @@ mod tests {
         );
     }
 
+    // ── C1: idle (no worker) — /v1/models 200 empty, /v1/chat 404 ────────────
+    //
+    // higgs is spawn-on-load: the normal idle state has NO worker, so
+    // status().worker_alive is false. /v1/models must still answer 200 with an
+    // empty list (the correct OpenAI answer for "nothing loaded"), and chat for
+    // any model must be a 404 HG003 — NOT a 503. The idle supervisor never
+    // spawns, so its M_STATUS RPC fails and status() reports worker_alive:false
+    // with loaded:None, no worker I/O involved.
+
+    #[tokio::test]
+    async fn v1_models_idle_no_worker_200_empty() {
+        let app = make_app(make_idle_supervisor());
+        let resp = app.oneshot(get("/v1/models")).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "idle /v1/models is 200, not 503"
+        );
+        let list: ListModelResponse = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(list.object, "list");
+        assert!(list.data.is_empty(), "idle list is empty");
+    }
+
+    #[tokio::test]
+    async fn v1_chat_idle_no_worker_404_hg003() {
+        let app = make_app(make_idle_supervisor());
+        let req = post_json(
+            "/v1/chat/completions",
+            &json!({"model": "org/model", "messages": [{"role": "user", "content": "hi"}]}),
+        );
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "idle chat is 404 model-not-loaded, not 503"
+        );
+        let body = String::from_utf8(body_bytes(resp).await).unwrap();
+        assert!(body.contains("[HG003]"), "carries HG003: {body}");
+        assert!(body.contains("model_not_found"), "envelope code: {body}");
+    }
+
     // ── Test 4: non-streaming chat returns ChatOutcome.content ───────────────
 
     #[tokio::test]
@@ -968,6 +1059,9 @@ mod tests {
             (json!({"top_p": 0.0}), "top_p"),
             (json!({"top_p": 1.5}), "top_p"),
             (json!({"n": 0}), "n"),
+            // C2: higgs serves a single choice, so n>1 is rejected (not honored
+            // as one choice). Both n==0 and n==2 flag the `n` param.
+            (json!({"n": 2}), "n"),
             (json!({"presence_penalty": 2.1}), "presence_penalty"),
             (json!({"frequency_penalty": -2.1}), "frequency_penalty"),
             (json!({"max_tokens": 0}), "max_tokens"),

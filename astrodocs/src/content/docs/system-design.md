@@ -483,9 +483,10 @@ per-handler guards (the worker FFI loader is never reached on a rejection):
 
 - **Sampling validation** — vllm `SamplingParams` ranges, checked at
   `/v1/chat/completions` **before** dispatch: `temperature >= 0` (finite),
-  `top_p` in `(0, 1]`, `n >= 1`, `presence_penalty` & `frequency_penalty` in
-  `[-2, 2]`, `max_tokens` in `[1, 32768]`. Out of range → `HG013
-  InvalidSamplingParam` → `400`.
+  `top_p` in `(0, 1]`, `presence_penalty` & `frequency_penalty` in
+  `[-2, 2]`, `max_tokens` in `[1, 32768]`. `n` must be exactly `1` — higgs
+  serves a single choice, so `n>1` is **rejected** (not silently honored as one
+  choice). Out of range → `HG013 InvalidSamplingParam` → `400`.
 - **max_tokens cap** — `MAX_OUTPUT_TOKENS` = 32768. A request with `max_tokens`
   / `max_completion_tokens` above this → `HG013` → `400`.
 - **Prompt-vs-context early reject** — a conservative estimate
@@ -494,6 +495,28 @@ per-handler guards (the worker FFI loader is never reached on a rejection):
   ContextOverflow` → `400`, rejected early at the serve layer. The serve layer
   has **no tokenizer**; the worker's exact tokenizer check remains the
   authoritative `HG005` backstop.
+
+### /v1 idle & crashed-worker behavior (deliberate decision)
+
+higgs is **spawn-on-load**, so the normal idle state has **no worker process**
+(`status().worker_alive == false`). On the `/v1` (OpenAI-interop) surface this is
+not an error condition:
+
+- **`GET /v1/models`** always returns `200` with the loaded models as the list —
+  an empty `{"data":[]}` when nothing is loaded. An empty list is the correct
+  OpenAI answer for "nothing can serve chat right now"; `/v1/models` never gates
+  on `worker_alive`.
+- **`POST /v1/chat/completions`** for an unloaded or unknown model is `404
+  [HG003] ModelNotLoaded`. Because "no worker" == "nothing loaded", the idle
+  state and a crashed-worker state both fall through this same `404` gate — the
+  `/v1` surface **never** emits a worker-down `503`.
+
+This is a deliberate decision: the `/v1` surface answers strictly in OpenAI
+terms (a model is loaded or it is not). The control surface still tells the truth
+about the worker — `GET /api/higgs/status` exposes `worker_alive` for
+diagnostics. A crashed worker therefore presents on `/v1` as an empty
+`/v1/models` and a `404` chat, while `/api/higgs/status` shows
+`worker_alive:false`.
 
 ### Inference admission gate
 

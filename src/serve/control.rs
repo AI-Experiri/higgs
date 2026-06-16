@@ -19,6 +19,7 @@ use crate::api::Higgs;
 use crate::diagnostic::HiggsError;
 use crate::system::SystemInfo;
 use crate::worker::engine::LoadParams;
+use crate::worker::models::HiggsModel;
 use crate::LLAMA_CPP_2_VERSION;
 
 /// Query parameters for `GET /api/higgs/logs` (`?n=200`).
@@ -38,39 +39,53 @@ fn control_error(err: &HiggsError) -> (StatusCode, Json<HiggsErrorResponse>) {
     )
 }
 
+/// Host-side scan of all configured directories plus the currently loaded model
+/// id. The scan is pure Rust (no worker); only the `status()` call is a worker
+/// RPC. `Err(response)` carries the mapped control error on either failure.
+async fn scan_with_loaded(
+    higgs: &Arc<Higgs>,
+) -> Result<(Vec<HiggsModel>, Option<String>), Response> {
+    let models = higgs.scan().await.map_err(|err| {
+        tracing::warn!(error = %err, "higgs: scan failed");
+        control_error(&err).into_response()
+    })?;
+    let loaded_id = higgs
+        .status()
+        .await
+        .map(|s| s.loaded.map(|l| l.id))
+        .map_err(|err| {
+            tracing::warn!(error = %err, "higgs: status failed");
+            control_error(&err).into_response()
+        })?;
+    Ok((models, loaded_id))
+}
+
+/// Build the per-model control entry: the canonical [`HiggsModel`] enriched with
+/// its load `state` (flagged against `loaded_id`) and `format`.
+fn model_entry(model: HiggsModel, loaded_id: Option<&str>) -> HiggsModelEntry {
+    let is_loaded = loaded_id == Some(model.id.as_str());
+    HiggsModelEntry {
+        state: if is_loaded {
+            "loaded".to_owned()
+        } else {
+            "not-loaded".to_owned()
+        },
+        format: "gguf".to_owned(),
+        model,
+    }
+}
+
 /// `GET /api/higgs/models` — live scan of all configured directories, plus
 /// the currently loaded model id.
-// v1: two RPC round-trips (scan + status) — catalog reads are UI-paced, latency acceptable; single-RPC catalog is a v2 item
 pub(super) async fn control_models(State(higgs): State<Arc<Higgs>>) -> Response {
     tracing::info!("higgs: GET /api/higgs/models");
-    let models = match higgs.scan().await {
-        Ok(m) => m,
-        Err(err) => {
-            tracing::warn!(error = %err, "higgs: scan failed");
-            return control_error(&err).into_response();
-        }
-    };
-    let loaded_id = match higgs.status().await {
-        Ok(s) => s.loaded.map(|l| l.id),
-        Err(err) => {
-            tracing::warn!(error = %err, "higgs: status failed");
-            return control_error(&err).into_response();
-        }
+    let (models, loaded_id) = match scan_with_loaded(&higgs).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
     };
     let entries: Vec<HiggsModelEntry> = models
         .into_iter()
-        .map(|m| {
-            let is_loaded = loaded_id.as_deref() == Some(m.id.as_str());
-            HiggsModelEntry {
-                state: if is_loaded {
-                    "loaded".to_owned()
-                } else {
-                    "not-loaded".to_owned()
-                },
-                format: "gguf".to_owned(),
-                model: m,
-            }
-        })
+        .map(|m| model_entry(m, loaded_id.as_deref()))
         .collect();
     Json(HiggsModelsResponse {
         models: entries,
@@ -90,34 +105,12 @@ pub(super) async fn control_model_by_id(
     Path(id): Path<String>,
 ) -> Response {
     tracing::info!(id = %id, "higgs: GET /api/higgs/models/{{*id}}");
-    let models = match higgs.scan().await {
-        Ok(m) => m,
-        Err(err) => {
-            tracing::warn!(id = %id, error = %err, "higgs: scan failed");
-            return control_error(&err).into_response();
-        }
-    };
-    let loaded_id = match higgs.status().await {
-        Ok(s) => s.loaded.map(|l| l.id),
-        Err(err) => {
-            tracing::warn!(id = %id, error = %err, "higgs: status failed");
-            return control_error(&err).into_response();
-        }
+    let (models, loaded_id) = match scan_with_loaded(&higgs).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
     };
     match models.into_iter().find(|m| m.id == id) {
-        Some(model) => {
-            let is_loaded = loaded_id.as_deref() == Some(model.id.as_str());
-            let entry = HiggsModelEntry {
-                state: if is_loaded {
-                    "loaded".to_owned()
-                } else {
-                    "not-loaded".to_owned()
-                },
-                format: "gguf".to_owned(),
-                model,
-            };
-            Json(entry).into_response()
-        }
+        Some(model) => Json(model_entry(model, loaded_id.as_deref())).into_response(),
         None => {
             let err = HiggsError::ModelNotFound { id };
             tracing::warn!(error = %err, "higgs: model not found");

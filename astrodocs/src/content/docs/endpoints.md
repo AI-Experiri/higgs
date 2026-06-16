@@ -100,8 +100,14 @@ curl http://localhost:8081/api/higgs/health
 
 ### GET /v1/models
 
-Returns the **loaded** model only. An empty list means no model is currently loaded.
-Use `GET /api/higgs/models` for the full on-disk catalog.
+Returns the **loaded** model only. An empty list means no model is currently
+loaded. Use `GET /api/higgs/models` for the full on-disk catalog.
+
+higgs is **spawn-on-load**, so the idle state has no worker; this endpoint still
+returns `200` with `{"data":[]}` then (it never gates on `worker_alive`). A
+crashed worker likewise presents here as an empty list — `GET /api/higgs/status`
+exposes `worker_alive` for diagnostics. This surface never returns a worker-down
+`503`.
 
 **Response (200):**
 
@@ -129,7 +135,11 @@ curl http://localhost:8081/v1/models
 
 ### POST /v1/chat/completions
 
-Chat with the loaded model. Requires a model to be loaded first (`POST /api/higgs/models/load`).
+Chat with the loaded model. Requires a model to be loaded first (`POST
+/api/higgs/models/load`). An unloaded or unknown model is a `404 [HG003]
+ModelNotLoaded`. Because higgs is spawn-on-load ("no worker" == "nothing
+loaded"), the idle state and a crashed-worker state both surface as this same
+`404` — the `/v1` surface never returns a worker-down `503`.
 
 v1 is **text-only** — image, audio, and file content parts are rejected with 400.
 Both `max_tokens` (deprecated) and `max_completion_tokens` are accepted; the newer field wins.
@@ -142,9 +152,10 @@ non-streaming and streaming responses. A malformed `tools` body is a 400.
 **Validation & limits.** The request is checked before dispatch:
 
 - **400** `[HG013]` — invalid sampling param (vllm `SamplingParams` ranges:
-  `temperature >= 0`, `top_p` in `(0, 1]`, `n >= 1`, `presence_penalty` &
-  `frequency_penalty` in `[-2, 2]`), or `max_tokens` / `max_completion_tokens`
-  above the cap of `32768`.
+  `temperature >= 0`, `top_p` in `(0, 1]`, `presence_penalty` &
+  `frequency_penalty` in `[-2, 2]`; `n` must be exactly `1` — higgs serves a
+  single choice, so `n>1` is rejected), or `max_tokens` /
+  `max_completion_tokens` above the cap of `32768`.
 - **400** `[HG005]` — prompt exceeds the loaded model's context window. The
   serve layer early-rejects on a conservative estimate (`prompt_bytes / 4` +
   `max_tokens` vs `ctx_len`); the worker's exact tokenizer check is the
