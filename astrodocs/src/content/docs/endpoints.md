@@ -37,6 +37,7 @@ The same status table applies to both surfaces:
 | HG014 ServerBusy | 503 |
 | HG015 InvalidModelId | 400 |
 | HG016 ChatTimeout | 504 |
+| HG017 InsufficientMemory | 503 |
 | anything else | 500 |
 
 **`/v1` error envelope:**
@@ -54,7 +55,14 @@ The same status table applies to both surfaces:
 `type` is `invalid_request_error` for 4xx, `server_error` otherwise.
 `code` is `model_not_found` on 404; absent on other statuses.
 
-**Control error envelope:**
+The `/v1` envelope `message` is **path-redacted**: absolute filesystem paths and
+`host:port` bind addresses are replaced with `<redacted>` before crossing the
+client boundary (diagnostic code, model id, and prose are preserved). No prompt
+CONTENT is logged at `info` on the `/v1` path. The full unredacted message (with
+paths) is still logged server-side at the origin and returned on the control
+surface below — which is ours, not an interop boundary.
+
+**Control error envelope** (NOT redacted — full Display, paths included):
 
 ```json
 { "error": "[HG003] model not loaded: org/model — load it explicitly first" }
@@ -332,6 +340,10 @@ The `id` is validated before anything is resolved or spawned:
   `..` path component. The resolved GGUF path must also canonicalize **inside**
   a configured scan dir (`path_within_roots`) — a symlink or `..` escape never
   reaches the worker FFI loader.
+- **503** `[HG017]` — insufficient memory. Before spawning a worker, the load is
+  refused if the model's GGUF file size exceeds `available_ram * 0.8`
+  (`MEMORY_HEADROOM_FRACTION`, ollama's placement rule). Retryable: free memory
+  or unload another model and try again.
 
 **Response (200):**
 
@@ -353,6 +365,11 @@ curl -X POST -H "Content-Type: application/json" \
 
 Unload the current model. This **kills the worker process** (kill-on-unload), so
 after this there is no higgs worker until the next load.
+
+The model is **also** auto-unloaded after 5 minutes (`IDLE_UNLOAD_TTL`, ollama's
+`keep_alive` default) with no chat request — a background idle reaper frees
+memory on an idle host through this same path. The reaper never unloads while a
+request is in flight, and any chat resets the idle timer.
 
 **Response (200):**
 

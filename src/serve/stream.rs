@@ -129,7 +129,7 @@ async fn assemble(
             tracing::warn!(error = %err, "higgs: chat stream failed mid-generation");
             send(super::v1::v1_envelope_json(
                 super::http_status(&err),
-                err.to_string(),
+                &err.to_string(),
             ));
         }
         // JoinError: the chat task panicked or was aborted — not a HiggsError.
@@ -137,7 +137,7 @@ async fn assemble(
             tracing::warn!(error = %join_err, "higgs: chat task failed");
             send(super::v1::v1_envelope_json(
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("chat task failed: {join_err}"),
+                &format!("chat task failed: {join_err}"),
             ));
         }
     }

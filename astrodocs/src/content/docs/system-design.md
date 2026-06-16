@@ -29,7 +29,7 @@ launcher), which constructs `Higgs`, serves the router on an ephemeral
 │  serve/      Axum router (/v1 + /api/higgs/) │  PURE RUST
 │  rpc.rs      NDJSON JSON-RPC 2.0 codec       │  (cannot crash
 │  worker/     Re-exec'd subprocess            │   the host)
-│  diagnostic  HiggsError HG001–HG016          │
+│  diagnostic  HiggsError HG001–HG017       │
 └───────────────────┬──────────────────────────┘
                     │ stdio (NDJSON JSON-RPC 2.0)
                     │ ONLY while a model is loaded
@@ -384,8 +384,50 @@ PER-HANDLER GUARDS (beyond the shared stack above):
 
   POST /api/higgs/models/load
     │  validate_repo_id + path_within_roots → 400 [HG015]
+    │  RAM headroom guard: file_size > avail_ram*0.8 → 503 [HG017]
     ▼  spawn worker → M_LOAD
 ```
+
+### Pre-load RAM headroom guard
+
+Before spawning a worker, `load()` reads available system RAM (the same
+`sysinfo` path that backs `GET /api/higgs/system`) and refuses any model whose
+GGUF file size exceeds `available_ram * MEMORY_HEADROOM_FRACTION` (0.8). The
+GGUF file size is a lower-bound proxy for resident weights; the remaining 20% is
+headroom for the KV cache, compute buffers, and the rest of the system. A
+refusal is `503 [HG017] InsufficientMemory` — a **retryable capacity** signal:
+the user can unload another model or free memory and retry. Failing here (rather
+than letting the worker OOM mid-load) turns an opaque `[HG004]`/`[HG006]` crash
+into a clean, actionable error. The 0.8 fraction is ollama's placement rule
+verbatim (`server/sched.go`: "Use 80% of free memory as threshold to leave
+headroom").
+
+### Idle auto-unload (keep_alive TTL)
+
+`Higgs::start()` spawns an **idle reaper** background task that auto-unloads the
+loaded model after `IDLE_UNLOAD_TTL` (5 minutes — ollama's `keep_alive` default)
+with no inference, freeing memory on an idle host. Every `IDLE_REAP_INTERVAL`
+(30 s) it compares `now − last_activity` against the TTL. `last_activity` is
+stamped at the top of every `chat_stream`. The reaper never unloads
+mid-generation: it unloads only when the inference admission semaphore is fully
+open (zero in-flight requests) and a model is actually loaded, and it reuses the
+ordinary `unload()` path (which takes the lifecycle mutex, so it serializes
+against a concurrent load). It holds a `Weak<Higgs>`, so it self-terminates when
+the host drops its `Arc<Higgs>`. The `Instant` is copied out from under the
+`parking_lot` guard before any `.await`, honoring the never-hold-a-lock-across-
+await rule.
+
+### Log redaction on the /v1 boundary
+
+The `/v1` surface is the untrusted OpenAI-interop boundary. No prompt CONTENT is
+logged at `info` on that path — only the model id, the stream flag, and
+lengths/ids. Every client-facing `/v1` error message is `redact_paths`-sanitized:
+absolute filesystem paths and `host:port` bind addresses are replaced with
+`<redacted>`, so the host's directory layout and listen address never leak in
+error text. Diagnostic codes (`[HG004]`), model ids (`org/model`), and human
+prose are preserved. The full unredacted `Display` (with paths) is still logged
+**server-side at the origin** (four-pillar pillar 1) and returned verbatim on the
+`/api/higgs/*` control surface — which is ours, not an interop boundary.
 
 ### DNS-rebinding Host guard — the #1 defense
 

@@ -41,7 +41,13 @@ use super::{MAX_OUTPUT_TOKENS, PROMPT_BYTES_PER_TOKEN};
 ///
 /// `type` is `invalid_request_error` for 4xx and `server_error` otherwise;
 /// `code` is `model_not_found` on 404 (the only coded case on this surface).
-fn v1_envelope(status: StatusCode, message: String) -> WrappedError {
+///
+/// The message is [`redact_paths`]-sanitized: the `/v1` surface is the untrusted
+/// OpenAI-interop boundary, so host filesystem paths and bind addresses are
+/// stripped from the client-facing string. The full unredacted Display (with
+/// paths) is still logged server-side at the origin (four-pillar pillar 1) and
+/// returned verbatim on the `/api/higgs/*` control surface, which is ours.
+fn v1_envelope(status: StatusCode, message: &str) -> WrappedError {
     let kind = if status.is_client_error() {
         "invalid_request_error"
     } else {
@@ -50,7 +56,7 @@ fn v1_envelope(status: StatusCode, message: String) -> WrappedError {
     let code = (status == StatusCode::NOT_FOUND).then(|| "model_not_found".to_owned());
     WrappedError {
         error: ApiError {
-            message,
+            message: redact_paths(message),
             r#type: Some(kind.to_owned()),
             param: None,
             code,
@@ -58,8 +64,55 @@ fn v1_envelope(status: StatusCode, message: String) -> WrappedError {
     }
 }
 
+/// Strip host filesystem paths and `host:port` bind addresses from a string
+/// before it crosses the `/v1` client boundary. A no-auth interop surface must
+/// not leak the host's directory layout or listen address in error text.
+///
+/// Replaces each whitespace-delimited token that looks like an absolute path
+/// (starts with `/`, or a Windows drive like `C:\`) or a `host:port` literal
+/// with `<redacted>`. Diagnostic codes (`[HG004]`), ids (`org/model` — no
+/// leading slash), and human prose are preserved. Conservative by design: it
+/// only redacts tokens that are unambiguously a path or address, so a normal
+/// error message reads unchanged.
+fn redact_paths(message: &str) -> String {
+    /// Whether `tok` looks like an absolute host path or a `host:port` address.
+    fn is_sensitive(tok: &str) -> bool {
+        // Trim surrounding punctuation a path/address may be wrapped in.
+        let t = tok.trim_matches(|c: char| matches!(c, '(' | ')' | '\'' | '"' | ',' | '.'));
+        if t.is_empty() {
+            return false;
+        }
+        // Unix absolute path: leading `/` (an `org/model` id has no leading slash).
+        if t.starts_with('/') {
+            return true;
+        }
+        // Windows drive path: `C:\…` or `C:/…`.
+        let bytes = t.as_bytes();
+        if bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && (bytes[2] == b'\\' || bytes[2] == b'/')
+        {
+            return true;
+        }
+        // `host:port` bind address: `127.0.0.1:8081`, `localhost:11434`.
+        if let Some((host, port)) = t.rsplit_once(':') {
+            if !host.is_empty() && !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) {
+                return true;
+            }
+        }
+        false
+    }
+
+    message
+        .split(' ')
+        .map(|tok| if is_sensitive(tok) { "<redacted>" } else { tok })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Serialize the `/v1` error envelope to a JSON string (SSE `data:` payloads).
-pub(super) fn v1_envelope_json(status: StatusCode, message: String) -> String {
+pub(super) fn v1_envelope_json(status: StatusCode, message: &str) -> String {
     serde_json::to_string(&v1_envelope(status, message))
         .expect("error envelope serialization cannot fail")
 }
@@ -67,7 +120,7 @@ pub(super) fn v1_envelope_json(status: StatusCode, message: String) -> String {
 /// `/v1` error response: mapped status + OpenAI error envelope body.
 fn v1_error(err: &HiggsError) -> (StatusCode, Json<WrappedError>) {
     let status = http_status(err);
-    (status, Json(v1_envelope(status, err.to_string())))
+    (status, Json(v1_envelope(status, &err.to_string())))
 }
 
 /// Current Unix time in whole seconds (OpenAI `created` field).
@@ -177,7 +230,7 @@ pub(super) async fn v1_chat_completions(
     if let Err(reject) = messages_to_pairs(&req.messages) {
         tracing::warn!(detail = %reject, "higgs: chat request rejected");
         let status = StatusCode::BAD_REQUEST;
-        return (status, Json(v1_envelope(status, reject))).into_response();
+        return (status, Json(v1_envelope(status, &reject))).into_response();
     }
 
     // Serialize the OpenAI `messages` array verbatim — the engine feeds it to
@@ -190,7 +243,7 @@ pub(super) async fn v1_chat_completions(
             let status = StatusCode::BAD_REQUEST;
             return (
                 status,
-                Json(v1_envelope(status, format!("invalid messages: {err}"))),
+                Json(v1_envelope(status, &format!("invalid messages: {err}"))),
             )
                 .into_response();
         }
@@ -209,7 +262,7 @@ pub(super) async fn v1_chat_completions(
             let status = StatusCode::BAD_REQUEST;
             return (
                 status,
-                Json(v1_envelope(status, format!("invalid tools: {err}"))),
+                Json(v1_envelope(status, &format!("invalid tools: {err}"))),
             )
                 .into_response();
         }
@@ -244,7 +297,10 @@ pub(super) async fn v1_chat_completions(
                 let status = StatusCode::INTERNAL_SERVER_ERROR;
                 (
                     status,
-                    Json(v1_envelope(status, format!("chat task failed: {join_err}"))),
+                    Json(v1_envelope(
+                        status,
+                        &format!("chat task failed: {join_err}"),
+                    )),
                 )
                     .into_response()
             }
@@ -529,6 +585,50 @@ mod tests {
 
     fn parse_messages(v: serde_json::Value) -> Vec<ChatCompletionRequestMessage> {
         serde_json::from_value(v).expect("messages deserialize")
+    }
+
+    // ── redact_paths: client-facing /v1 error sanitization ───────────────────
+
+    #[test]
+    fn redact_paths_strips_paths_and_addresses() {
+        // Unix absolute path is redacted; the diagnostic code and prose survive.
+        let r = redact_paths("[HG001] model dir unreadable: /Users/me/.lmstudio/models: oops");
+        assert!(!r.contains("/Users/me"), "host path leaked: {r}");
+        assert!(r.contains("[HG001]"), "code preserved: {r}");
+        assert!(r.contains("<redacted>"), "redaction marker present: {r}");
+
+        // host:port bind address is redacted.
+        let r = redact_paths("bind failed on 127.0.0.1:8081");
+        assert!(!r.contains("127.0.0.1:8081"), "bind address leaked: {r}");
+
+        // Windows drive path is redacted.
+        let r = redact_paths(r"engine load failed C:\Users\m\model.gguf bad");
+        assert!(!r.contains(r"C:\Users"), "windows path leaked: {r}");
+    }
+
+    #[test]
+    fn redact_paths_preserves_ids_and_prose() {
+        // A model id (no leading slash) and ordinary words are NOT redacted.
+        let r = redact_paths("[HG003] model not loaded: org/model — load it first");
+        assert_eq!(
+            r, "[HG003] model not loaded: org/model — load it first",
+            "ids and prose must pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn v1_envelope_redacts_message() {
+        // End-to-end: a path-carrying message is sanitized in the built envelope.
+        let env = v1_envelope(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "[HG004] engine failed to load org/model: /opt/models/x.gguf mmap error",
+        );
+        assert!(
+            !env.error.message.contains("/opt/models"),
+            "envelope leaked host path: {}",
+            env.error.message
+        );
+        assert!(env.error.message.contains("[HG004]"));
     }
 
     // ── Test 1: /v1/models empty when nothing is loaded ──────────────────────

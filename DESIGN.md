@@ -67,9 +67,17 @@
   │ loaded       │  chat for an unloaded model → 404 (no worker).│
   └──────────────┴──────────────────────────────────────────────┘
 
+  Higgs::start() also SPAWNS the idle reaper task (holds Weak<Higgs>):
+        every IDLE_REAP_INTERVAL (30 s), if now − last_activity > IDLE_UNLOAD_TTL
+        (5 min, ollama keep_alive) AND inference gate fully open (no in-flight)
+        AND a model is loaded → unload() (reuses the unload path below).
+        Self-terminates when the host drops its Arc<Higgs>.
+
   load(M)   (lifecycle mutex held for the whole body)
         │
         ├─ scan() host-side → resolve M's GGUF path
+        ├─ RAM headroom guard: refuse if M's file size > available_ram * 0.8
+        │     → InsufficientMemory [HG017] → 503 (BEFORE spawning a worker)
         ├─ Supervisor::start_for(M)  → SPAWN worker process
         │     <binary> --higgs-worker, argv0 = higgs(<M>) (≤64 chars)
         │     (stdin/stdout piped; stderr → ring buffer, cap 2000)
@@ -125,6 +133,8 @@
        │
        └─── Higgs::chat_stream(messages_json, max_tokens, temperature, tools_json)
                   │
+                  ├─── stamp last_activity = Instant::now()  (keeps idle reaper at bay)
+                  │
                   ├─── inference_gate.try_acquire_owned()  (admission, max 8)
                   │         HG014 → 503 if full (permit rides the gen task)
                   │
@@ -158,6 +168,12 @@
                                  → "data: [DONE]"
 
   Non-streaming: drop(deltas), await outcome → single JSON body
+
+  /v1 error envelope: every client-facing message is redact_paths()-sanitized —
+  absolute filesystem paths + host:port bind addresses → "<redacted>". No prompt
+  CONTENT is logged at info (only model id, stream flag, lengths/ids). The full
+  Display (with paths) still logs server-side at the origin and returns verbatim
+  on /api/higgs/* (the control surface is ours).
 ```
 
 ---

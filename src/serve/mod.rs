@@ -91,7 +91,7 @@ pub use wire::*;
 
 /// Map a `HiggsError` to its HTTP status — the single status table shared by
 /// both surfaces and the SSE path: HG002/HG003 → 404, HG005/HG013/HG015 → 400,
-/// HG006/HG007/HG014 → 503, HG016 → 504, else 500.
+/// HG006/HG007/HG014/HG017 → 503, HG016 → 504, else 500.
 pub(crate) fn http_status(err: &HiggsError) -> StatusCode {
     match err {
         HiggsError::ModelNotFound { .. } | HiggsError::ModelNotLoaded { .. } => {
@@ -104,7 +104,8 @@ pub(crate) fn http_status(err: &HiggsError) -> StatusCode {
         // Capacity / infrastructure-down — retryable.
         HiggsError::WorkerSpawnFailed { .. }
         | HiggsError::WorkerDead { .. }
-        | HiggsError::ServerBusy { .. } => StatusCode::SERVICE_UNAVAILABLE,
+        | HiggsError::ServerBusy { .. }
+        | HiggsError::InsufficientMemory { .. } => StatusCode::SERVICE_UNAVAILABLE,
         // A wedged-but-alive worker that didn't finish generation in time.
         HiggsError::ChatTimeout { .. } => StatusCode::GATEWAY_TIMEOUT,
         // A worker-reported error carries the worker's origin diagnostic code;
@@ -699,6 +700,16 @@ mod tests {
                 elapsed: std::time::Duration::from_secs(600),
             }),
             StatusCode::GATEWAY_TIMEOUT
+        );
+        // Phase B: insufficient-memory load refusal is a retryable capacity 503.
+        assert_eq!(
+            http_status(&HiggsError::InsufficientMemory {
+                id: "org/model".into(),
+                needed_bytes: 8_000_000_000,
+                available_bytes: 4_000_000_000,
+                headroom_fraction: 0.8,
+            }),
+            StatusCode::SERVICE_UNAVAILABLE
         );
     }
 

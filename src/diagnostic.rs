@@ -122,6 +122,27 @@ pub enum HiggsError {
     #[snafu(display("[HG016] chat RPC timed out after {elapsed:?}"))]
     #[diagnostic(code(HG016))]
     ChatTimeout { elapsed: std::time::Duration },
+
+    /// A load was refused because the model's estimated memory need exceeds the
+    /// safe headroom over currently-available system RAM. Rejected on the load
+    /// path BEFORE spawning a worker (HTTP 503 — capacity, retryable: the user
+    /// may free memory or unload another model and retry). The estimate uses the
+    /// GGUF file size on disk as a lower-bound proxy for resident weights; the
+    /// safe threshold is [`MEMORY_HEADROOM_FRACTION`] of available RAM (ollama's
+    /// `freeMemory*80/100` placement rule). `needed_bytes` is the model file
+    /// size; `available_bytes` is the system's available RAM at request time.
+    ///
+    /// [`MEMORY_HEADROOM_FRACTION`]: crate::api::MEMORY_HEADROOM_FRACTION
+    #[snafu(display(
+        "[HG017] insufficient memory to load {id}: need ~{needed_bytes} bytes, only {available_bytes} available (headroom {headroom_fraction})"
+    ))]
+    #[diagnostic(code(HG017))]
+    InsufficientMemory {
+        id: String,
+        needed_bytes: u64,
+        available_bytes: u64,
+        headroom_fraction: f64,
+    },
 }
 
 #[cfg(test)]
@@ -162,6 +183,14 @@ mod tests {
         }
         .to_string()
         .starts_with("[HG016]"));
+        assert!(HiggsError::InsufficientMemory {
+            id: "org/model".into(),
+            needed_bytes: 8_000_000_000,
+            available_bytes: 4_000_000_000,
+            headroom_fraction: 0.8,
+        }
+        .to_string()
+        .starts_with("[HG017]"));
     }
 
     #[test]
