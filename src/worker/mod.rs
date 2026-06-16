@@ -1,6 +1,7 @@
-//! Worker role: runs inside the re-exec'd process. Owns the ModelStore and
-//! the engine. Speaks NDJSON JSON-RPC on stdin/stdout; logs to stderr. The
-//! supervisor is the ONLY client.
+//! Worker role: runs inside the re-exec'd process. Owns the engine. Speaks
+//! NDJSON JSON-RPC on stdin/stdout; logs to stderr. The supervisor is the ONLY
+//! client. Model scanning is host-side — the worker holds no catalog; the host
+//! resolves the GGUF path and passes it in the M_LOAD params.
 
 pub mod engine;
 pub mod models;
@@ -13,10 +14,8 @@ use serde_json::{json, Value};
 
 use crate::diagnostic::HiggsError;
 use crate::rpc::{decode, encode, RpcError, RpcFrame, RpcNotification, RpcRequest, RpcResponse};
-use models::ModelStore;
 
 /// Method names — the only vocabulary on the supervisor↔worker wire.
-pub const M_SCAN: &str = "higgs/scan";
 pub const M_LOAD: &str = "higgs/load";
 pub const M_UNLOAD: &str = "higgs/unload";
 pub const M_STATUS: &str = "higgs/status";
@@ -86,22 +85,25 @@ fn respond(writer: &mut impl Write, id: u64, out: Result<Value, RpcError>) {
             error: Some(error),
         },
     };
-    let _ = writeln!(writer, "{}", encode(&RpcFrame::Response(resp)));
+    // The supervisor is the sole reader; a broken response pipe means it is
+    // gone. Warn rather than crash the loop — stdin EOF will end it shortly.
+    if writeln!(writer, "{}", encode(&RpcFrame::Response(resp))).is_err() {
+        tracing::warn!("response write failed; supervisor pipe broken");
+    }
 }
 
-/// Worker-held state: catalog, engine, and load bookkeeping.
+/// Worker-held state: engine and load bookkeeping. No model catalog — scanning
+/// is host-side and the GGUF path arrives in the M_LOAD params.
 struct WorkerState {
-    store: ModelStore,
     engine: Box<dyn engine::HiggsEngine>,
     /// (model id, load params) of the resident model — reported by M_STATUS.
     loaded: Option<(String, engine::LoadParams)>,
 }
 
 impl WorkerState {
-    /// Production state: llama.cpp engine, empty catalog.
+    /// Production state: llama.cpp engine, nothing loaded.
     fn new() -> Self {
         Self {
-            store: ModelStore::default(),
             engine: Box::new(engine::llamacpp::LlamaCppEngine::default()),
             loaded: None,
         }
@@ -111,7 +113,6 @@ impl WorkerState {
     #[cfg(test)]
     fn with_engine(engine: Box<dyn engine::HiggsEngine>) -> Self {
         Self {
-            store: ModelStore::default(),
             engine,
             loaded: None,
         }
@@ -124,165 +125,156 @@ impl WorkerState {
         writer: &mut impl Write,
     ) -> Result<Value, RpcError> {
         match req.method.as_str() {
-            M_SCAN => {
-                let dirs = |k: &str| {
-                    req.params
-                        .get(k)
-                        .and_then(Value::as_array)
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(Value::as_str)
-                                .map(Into::into)
-                                .collect::<Vec<std::path::PathBuf>>()
-                        })
-                        .unwrap_or_default()
-                };
-                self.store
-                    .scan(&dirs("lmstudio"), &dirs("hf"), &dirs("ollama"))
-                    .map(|models| serde_json::to_value(models).expect("serializable"))
-                    .map_err(|e| to_rpc_error(&e))
-            }
-            M_STATUS => {
-                let loaded = self.loaded.as_ref().map(|(id, p)| {
-                    let meta = self.store.get(id);
-                    json!({
-                        "id": id,
-                        "ctx_len": p.ctx_len,
-                        "gpu_layers": p.gpu_layers,
-                        "threads": p.threads,
-                        "arch": meta.and_then(|m| m.arch.as_deref()),
-                        "quant": meta.and_then(|m| m.quant.as_deref()),
-                        "max_context_length": meta.and_then(|m| m.ctx_train),
-                        "size_bytes": meta.map(|m| m.size_bytes),
-                        "has_chat_template": meta.map(|m| m.has_chat_template).unwrap_or(false),
-                    })
-                });
-                Ok(json!({"loaded": loaded, "models_scanned": self.store.models().len()}))
-            }
-            M_LOAD => {
-                let id = req
-                    .params
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                // ctx_len 0 would load (NonZeroU32::new(0)=None → llama uses the
-                // model default) but the stored 0 makes the chat fit-check
-                // (tokens + max_tokens > n_ctx) fail for every request, so the
-                // model loads yet is unusable. Coerce 0 → default so the stored
-                // window matches the real one.
-                let mut ctx_len = u32_param(&req.params, "ctx_len", 4096);
-                if ctx_len == 0 {
-                    tracing::warn!("higgs: ctx_len=0 requested; using default 4096");
-                    ctx_len = 4096;
-                }
-                let params = engine::LoadParams {
-                    ctx_len,
-                    gpu_layers: u32_param(&req.params, "gpu_layers", u32::MAX),
-                    threads: u32_param(&req.params, "threads", 4),
-                };
-                // Path resolution moved host-side (scan no longer runs in the
-                // worker): the host resolves the GGUF path and passes it in
-                // `params.path`. Use it directly when present; fall back to the
-                // worker's own ModelStore only when absent (any caller that still
-                // scans worker-side).
-                let path = match req.params.get("path").and_then(Value::as_str) {
-                    Some(p) => p.to_string(),
-                    None => {
-                        let model = self.store.get(id).ok_or_else(|| {
-                            to_rpc_error(&HiggsError::ModelNotFound { id: id.into() })
-                        })?;
-                        model.path.clone()
-                    }
-                };
-                // The engine drops any resident model before loading the new one,
-                // so the previous model is already gone the moment we attempt this
-                // load. Clear our tracked id up front: if the load then fails, the
-                // `?` returns before the `Some(...)` below runs, leaving `loaded`
-                // as `None` — so status reports nothing loaded, matching the empty
-                // engine, instead of lying about the old id.
-                self.loaded = None;
-                self.engine
-                    .load(&path, &params)
-                    .map_err(|e| to_rpc_error(&e))?;
-                self.loaded = Some((id.to_string(), params));
-                Ok(json!({"id": id}))
-            }
+            M_STATUS => Ok(self.handle_status()),
+            M_LOAD => self.handle_load(req),
             M_UNLOAD => {
                 self.engine.unload();
                 self.loaded = None;
                 Ok(json!({}))
             }
-            M_CHAT => {
-                if self.loaded.is_none() {
-                    return Err(to_rpc_error(&HiggsError::ModelNotLoaded {
-                        id: "unloaded".into(),
-                    }));
-                }
-                let request_id = req.params.get("request_id").cloned().unwrap_or(Value::Null);
-                // The serve layer serialized the request's OpenAI `messages`
-                // array verbatim (preserving tool_calls / tool_call_id); the
-                // engine feeds it straight to the chat template. Carried as a
-                // JSON string so it round-trips unparsed.
-                let messages_json = req
-                    .params
-                    .get("messages_json")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| RpcError {
-                        code: -32602,
-                        data: None,
-                        message: "missing messages_json".to_string(),
-                    })?;
-                let gen = engine::GenParams {
-                    max_tokens: req
-                        .params
-                        .get("max_tokens")
-                        .and_then(Value::as_u64)
-                        .map_or(1024, |v| usize::try_from(v).unwrap_or(usize::MAX)),
-                    temperature: req
-                        .params
-                        .get("temperature")
-                        .and_then(Value::as_f64)
-                        .map_or(0.7, |v| v as f32),
-                    // OpenAI `tools` array, already serialized to a JSON string by
-                    // the serve layer; passed verbatim to the chat template.
-                    tools_json: req
-                        .params
-                        .get("tools")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned),
-                };
-                let mut chunk_write_failed = false;
-                let mut sink = |delta: &str| {
-                    let note = RpcNotification {
-                        jsonrpc: "2.0".into(),
-                        method: N_CHAT_CHUNK.into(),
-                        params: json!({"request_id": request_id.clone(), "delta": delta}),
-                    };
-                    if writeln!(writer, "{}", encode(&RpcFrame::Notification(note))).is_err() {
-                        chunk_write_failed = true;
-                    }
-                };
-                let result = self
-                    .engine
-                    .chat(messages_json, &gen, &mut sink)
-                    .map_err(|e| to_rpc_error(&e))?;
-                if chunk_write_failed {
-                    tracing::warn!("chat chunk write failed; supervisor pipe broken");
-                }
-                Ok(json!({
-                    "content": result.content,
-                    "finish_reason": result.finish_reason,
-                    "tool_calls": result.tool_calls,
-                    "prompt_tokens": result.prompt_tokens,
-                    "completion_tokens": result.completion_tokens,
-                }))
-            }
+            M_CHAT => self.handle_chat(req, writer),
             other => Err(RpcError {
                 code: -32601,
                 message: format!("unknown method {other}"),
                 data: None,
             }),
         }
+    }
+
+    /// Report the resident model's id and load params (or `null` when nothing is
+    /// loaded). Model metadata (arch/quant/size/ctx) is enriched host-side from
+    /// the scan; the worker holds no catalog, so it reports only what it knows.
+    fn handle_status(&self) -> Value {
+        let loaded = self.loaded.as_ref().map(|(id, p)| {
+            json!({
+                "id": id,
+                "ctx_len": p.ctx_len,
+                "gpu_layers": p.gpu_layers,
+                "threads": p.threads,
+            })
+        });
+        json!({ "loaded": loaded })
+    }
+
+    /// Load the GGUF at the host-resolved `path` (the host scans and carries the
+    /// path in M_LOAD params). Coerces `ctx_len == 0` to a usable default.
+    fn handle_load(&mut self, req: &RpcRequest) -> Result<Value, RpcError> {
+        let id = req
+            .params
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        // ctx_len 0 would load (NonZeroU32::new(0)=None → llama uses the
+        // model default) but the stored 0 makes the chat fit-check
+        // (tokens + max_tokens > n_ctx) fail for every request, so the
+        // model loads yet is unusable. Coerce 0 → default so the stored
+        // window matches the real one.
+        let mut ctx_len = u32_param(&req.params, "ctx_len", 4096);
+        if ctx_len == 0 {
+            tracing::warn!("higgs: ctx_len=0 requested; using default 4096");
+            ctx_len = 4096;
+        }
+        let params = engine::LoadParams {
+            ctx_len,
+            gpu_layers: u32_param(&req.params, "gpu_layers", u32::MAX),
+            threads: u32_param(&req.params, "threads", 4),
+        };
+        // Scan moved host-side: the host resolves the GGUF path and passes it in
+        // `params.path`. The worker holds no catalog of its own.
+        let path = req
+            .params
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcError {
+                code: -32602,
+                data: None,
+                message: "missing path".to_string(),
+            })?
+            .to_string();
+        // The engine drops any resident model before loading the new one,
+        // so the previous model is already gone the moment we attempt this
+        // load. Clear our tracked id up front: if the load then fails, the
+        // `?` returns before the `Some(...)` below runs, leaving `loaded`
+        // as `None` — so status reports nothing loaded, matching the empty
+        // engine, instead of lying about the old id.
+        self.loaded = None;
+        self.engine
+            .load(&path, &params)
+            .map_err(|e| to_rpc_error(&e))?;
+        self.loaded = Some((id.to_string(), params));
+        Ok(json!({ "id": id }))
+    }
+
+    /// Run one chat completion, streaming each content delta as an
+    /// N_CHAT_CHUNK notification through `writer`, then return the final result.
+    fn handle_chat(
+        &mut self,
+        req: &RpcRequest,
+        writer: &mut impl Write,
+    ) -> Result<Value, RpcError> {
+        if self.loaded.is_none() {
+            return Err(to_rpc_error(&HiggsError::ModelNotLoaded {
+                id: "unloaded".into(),
+            }));
+        }
+        let request_id = req.params.get("request_id").cloned().unwrap_or(Value::Null);
+        // The serve layer serialized the request's OpenAI `messages`
+        // array verbatim (preserving tool_calls / tool_call_id); the
+        // engine feeds it straight to the chat template. Carried as a
+        // JSON string so it round-trips unparsed.
+        let messages_json = req
+            .params
+            .get("messages_json")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcError {
+                code: -32602,
+                data: None,
+                message: "missing messages_json".to_string(),
+            })?;
+        let gen = engine::GenParams {
+            max_tokens: req
+                .params
+                .get("max_tokens")
+                .and_then(Value::as_u64)
+                .map_or(1024, |v| usize::try_from(v).unwrap_or(usize::MAX)),
+            temperature: req
+                .params
+                .get("temperature")
+                .and_then(Value::as_f64)
+                .map_or(0.7, |v| v as f32),
+            // OpenAI `tools` array, already serialized to a JSON string by
+            // the serve layer; passed verbatim to the chat template.
+            tools_json: req
+                .params
+                .get("tools")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+        };
+        let mut chunk_write_failed = false;
+        let mut sink = |delta: &str| {
+            let note = RpcNotification {
+                jsonrpc: "2.0".into(),
+                method: N_CHAT_CHUNK.into(),
+                params: json!({"request_id": request_id.clone(), "delta": delta}),
+            };
+            if writeln!(writer, "{}", encode(&RpcFrame::Notification(note))).is_err() {
+                chunk_write_failed = true;
+            }
+        };
+        let result = self
+            .engine
+            .chat(messages_json, &gen, &mut sink)
+            .map_err(|e| to_rpc_error(&e))?;
+        if chunk_write_failed {
+            tracing::warn!("chat chunk write failed; supervisor pipe broken");
+        }
+        Ok(json!({
+            "content": result.content,
+            "finish_reason": result.finish_reason,
+            "tool_calls": result.tool_calls,
+            "prompt_tokens": result.prompt_tokens,
+            "completion_tokens": result.completion_tokens,
+        }))
     }
 }
 
@@ -313,12 +305,9 @@ fn to_rpc_error(e: &crate::diagnostic::HiggsError) -> RpcError {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
     use std::io::Cursor;
-    use std::path::Path;
 
     use serde_json::json;
-    use tempfile::TempDir;
 
     use super::*;
     use crate::rpc::{decode, RpcFrame};
@@ -393,21 +382,16 @@ mod tests {
         (parse_responses(&out), calls)
     }
 
-    /// Write an LM Studio-layout fixture and return (tempdir, scan request line).
-    fn scan_fixture() -> (TempDir, String) {
-        let dir = TempDir::new().unwrap();
-        write_file(
-            &dir.path()
-                .join("google/gemma-4-12b/gemma-4-12b-Q4_K_M.gguf"),
-            b"dummy",
-        );
-        let root = dir.path().to_str().unwrap().to_string();
-        let line = req_line(
-            1,
-            M_SCAN,
-            json!({"lmstudio": [root], "hf": [], "ollama": []}),
-        );
-        (dir, line)
+    /// An M_LOAD request line for `id` carrying the host-resolved GGUF `path`,
+    /// plus any extra params merged in.
+    fn load_line(req_id: u64, id: &str, path: &str, extra: serde_json::Value) -> String {
+        let mut params = json!({ "id": id, "path": path });
+        if let Value::Object(map) = extra {
+            for (k, v) in map {
+                params[k] = v;
+            }
+        }
+        req_line(req_id, M_LOAD, params)
     }
 
     /// Build a single NDJSON line from a request value.
@@ -431,50 +415,9 @@ mod tests {
             .collect()
     }
 
-    fn write_file(path: &Path, content: &[u8]) {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).unwrap();
-        }
-        fs::write(path, content).unwrap();
-    }
-
     // ---------------------------------------------------------------------------
     // Tests
     // ---------------------------------------------------------------------------
-
-    #[test]
-    fn scan_over_fixture() {
-        let dir = TempDir::new().unwrap();
-        let root = dir.path();
-        // LM Studio layout: root/google/gemma-4-12b/gemma-4-12b-Q4_K_M.gguf
-        write_file(
-            &root.join("google/gemma-4-12b/gemma-4-12b-Q4_K_M.gguf"),
-            b"dummy",
-        );
-
-        let root_str = root.to_str().unwrap();
-        let input = req_line(
-            1,
-            M_SCAN,
-            json!({"lmstudio": [root_str], "hf": [], "ollama": []}),
-        );
-
-        let mut out: Vec<u8> = Vec::new();
-        serve(Cursor::new(input.as_bytes()), &mut out);
-
-        let frames = parse_responses(&out);
-        assert_eq!(frames.len(), 1);
-        let RpcFrame::Response(resp) = &frames[0] else {
-            panic!("expected response")
-        };
-        assert_eq!(resp.id, 1);
-        assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
-
-        let result = resp.result.as_ref().unwrap();
-        let arr = result.as_array().expect("result should be array");
-        assert_eq!(arr.len(), 1, "expected exactly one model");
-        assert_eq!(arr[0]["id"], "google/gemma-4-12b");
-    }
 
     #[test]
     fn unknown_method_is_32601() {
@@ -499,9 +442,8 @@ mod tests {
 
     #[test]
     fn load_then_chat_streams() {
-        let (_dir, scan) = scan_fixture();
-        let mut input = scan;
-        input.push_str(&req_line(2, M_LOAD, json!({"id": "google/gemma-4-12b"})));
+        let path = "/models/google/gemma-4-12b/gemma-4-12b-Q4_K_M.gguf";
+        let mut input = load_line(2, "google/gemma-4-12b", path, json!({}));
         input.push_str(&req_line(
             3,
             M_CHAT,
@@ -511,18 +453,18 @@ mod tests {
         let (frames, calls) = serve_with_fake(&input);
         assert_eq!(
             frames.len(),
-            5,
-            "scan + load responses, 2 chunks, chat response: {frames:?}"
+            4,
+            "load response, 2 chunks, chat response: {frames:?}"
         );
 
-        let RpcFrame::Response(load) = &frames[1] else {
+        let RpcFrame::Response(load) = &frames[0] else {
             panic!("expected load response")
         };
         assert_eq!(load.id, 2);
         assert_eq!(load.result.as_ref().unwrap()["id"], "google/gemma-4-12b");
 
         // The two chunk notifications arrive in order, BEFORE the final response.
-        for (idx, delta) in [(2, "he"), (3, "llo")] {
+        for (idx, delta) in [(1, "he"), (2, "llo")] {
             let RpcFrame::Notification(note) = &frames[idx] else {
                 panic!("frame {idx} should be a notification: {:?}", frames[idx])
             };
@@ -531,7 +473,7 @@ mod tests {
             assert_eq!(note.params["delta"], delta);
         }
 
-        let RpcFrame::Response(chat) = &frames[4] else {
+        let RpcFrame::Response(chat) = &frames[3] else {
             panic!("expected chat response")
         };
         assert_eq!(chat.id, 3);
@@ -541,10 +483,7 @@ mod tests {
 
         let calls = calls.lock();
         assert_eq!(calls.len(), 2, "calls: {calls:?}");
-        assert!(
-            calls[0].starts_with("load ") && calls[0].ends_with(".gguf"),
-            "calls: {calls:?}"
-        );
+        assert_eq!(calls[0], format!("load {path}"), "calls: {calls:?}");
         assert_eq!(calls[1], "chat");
     }
 
@@ -569,21 +508,16 @@ mod tests {
 
     #[test]
     fn unload_then_status() {
-        let (_dir, scan) = scan_fixture();
-        let mut input = scan;
-        input.push_str(&req_line(
-            2,
-            M_LOAD,
-            json!({"id": "google/gemma-4-12b", "ctx_len": 2048}),
-        ));
+        let path = "/models/google/gemma-4-12b/gemma-4-12b-Q4_K_M.gguf";
+        let mut input = load_line(2, "google/gemma-4-12b", path, json!({"ctx_len": 2048}));
         input.push_str(&req_line(3, M_STATUS, json!(null)));
         input.push_str(&req_line(4, M_UNLOAD, json!(null)));
         input.push_str(&req_line(5, M_STATUS, json!(null)));
 
         let (frames, calls) = serve_with_fake(&input);
-        assert_eq!(frames.len(), 5);
+        assert_eq!(frames.len(), 4);
 
-        let RpcFrame::Response(loaded_status) = &frames[2] else {
+        let RpcFrame::Response(loaded_status) = &frames[1] else {
             panic!("expected response")
         };
         let loaded = &loaded_status.result.as_ref().unwrap()["loaded"];
@@ -591,7 +525,7 @@ mod tests {
         assert_eq!(loaded["ctx_len"], 2048);
         assert_eq!(loaded["threads"], 4, "default threads");
 
-        let RpcFrame::Response(final_status) = &frames[4] else {
+        let RpcFrame::Response(final_status) = &frames[3] else {
             panic!("expected response")
         };
         assert_eq!(final_status.result.as_ref().unwrap()["loaded"], Value::Null);
@@ -599,19 +533,21 @@ mod tests {
     }
 
     #[test]
-    fn load_unknown_id_is_hg002() {
-        let (_dir, scan) = scan_fixture();
-        let mut input = scan;
-        input.push_str(&req_line(2, M_LOAD, json!({"id": "nope/nope"})));
+    fn load_without_path_is_invalid_params() {
+        // Scan is host-side: M_LOAD must carry the resolved GGUF path. A request
+        // missing `path` is a malformed call (-32602), and the engine is never
+        // touched.
+        let input = req_line(2, M_LOAD, json!({"id": "nope/nope"}));
 
         let (frames, calls) = serve_with_fake(&input);
-        assert_eq!(frames.len(), 2);
-        let RpcFrame::Response(resp) = &frames[1] else {
+        assert_eq!(frames.len(), 1);
+        let RpcFrame::Response(resp) = &frames[0] else {
             panic!("expected response")
         };
         let err = resp.error.as_ref().expect("expected error");
+        assert_eq!(err.code, -32602);
         assert!(
-            err.message.contains("[HG002]"),
+            err.message.contains("missing path"),
             "message was: {}",
             err.message
         );

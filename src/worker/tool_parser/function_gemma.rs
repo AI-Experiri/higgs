@@ -29,9 +29,9 @@
 //! We parse it because llama.cpp's vendored `common_chat` has no parser for this
 //! family — the markers are Gemma-specific and unique to this template.
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value};
 
-use super::ToolCallParser;
+use super::{build_tool_call, strip_leading_reasoning, ToolCallParser};
 
 const OPEN: &str = "<start_function_call>";
 const CLOSE: &str = "<end_function_call>";
@@ -103,17 +103,7 @@ impl ToolCallParser for FunctionGemmaParser {
                 }
             }
         }
-        strip_think(&out).trim().to_string()
-    }
-}
-
-/// Remove a leading reasoning block. Handles both an explicit `<think>…</think>`
-/// and the template-forced-open case (no opening tag, just a trailing
-/// `</think>`): everything up to and including the first `</think>` is dropped.
-fn strip_think(s: &str) -> &str {
-    match s.find("</think>") {
-        Some(end) => &s[end + "</think>".len()..],
-        None => s,
+        strip_leading_reasoning(&out, "</think>").trim().to_string()
     }
 }
 
@@ -143,15 +133,12 @@ fn parse_one(block: &str, id_seed: &str, index: usize) -> Option<Value> {
 
     let args = parse_object(args_body);
 
-    Some(json!({
-        "id": format!("call_{id_seed}_{index}"),
-        "type": "function",
-        "function": {
-            "name": name,
-            // OpenAI `arguments` is a JSON STRING, not an object.
-            "arguments": Value::Object(args).to_string(),
-        }
-    }))
+    Some(build_tool_call(
+        name,
+        &Value::Object(args).to_string(),
+        id_seed,
+        index,
+    ))
 }
 
 /// Parse a `key:value,key:value` body into a JSON object.
@@ -265,6 +252,8 @@ fn split_top_level(body: &str) -> Vec<&str> {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     /// Byte layout matching Ollama's `functiongemma_test.go` ground truth.

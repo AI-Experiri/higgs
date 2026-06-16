@@ -38,8 +38,8 @@
 │  supervisor.rs Worker process manager + RPC correlator      │
 │  serve/        Axum router (/v1 + /api/higgs/*)             │
 │  rpc.rs        NDJSON JSON-RPC 2.0 codec                    │
-│  worker/       Re-exec'd subprocess: engine (model store    │
-│                empty — scan is host-side; path comes in M_LOAD)│
+│  worker/       Re-exec'd subprocess: engine only (no model   │
+│                catalog — scan is host-side; path comes in M_LOAD)│
 │  diagnostic.rs HiggsError HG001–HG016                      │
 └──────────────────────────┬──────────────────────────────────┘
                            │ stdio (NDJSON JSON-RPC 2.0)

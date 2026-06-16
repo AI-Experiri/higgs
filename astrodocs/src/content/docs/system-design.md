@@ -127,8 +127,8 @@ returns `HG005 ContextOverflow` instead of silently truncating or hanging.
 Scan runs **host-side** (pure Rust: `ggus` + `memmap2` + `std::fs`, no llama.cpp
 FFI, no worker RPC), wrapped in `spawn_blocking`. The model list is therefore
 available with no worker live. `load()` resolves the chosen model's GGUF path
-from this same scan and carries it in the M_LOAD params; the worker's own store
-stays empty.
+from this same scan and carries it in the M_LOAD params; the worker holds no
+model catalog of its own.
 
 ```
 ModelStore::scan(lmstudio_roots, hf_roots, ollama_roots)   (host process)

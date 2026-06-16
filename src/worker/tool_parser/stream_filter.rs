@@ -31,7 +31,17 @@ pub struct ToolCallStreamFilter {
 
 impl ToolCallStreamFilter {
     /// Filter for a parser whose tool calls open with any of `markers`.
+    ///
+    /// INVARIANT: every marker is non-empty. `partial_tail_len` computes
+    /// `m.len() - 1`, which underflows on an empty marker. All built-in
+    /// [`ToolCallParser::open_markers`](super::ToolCallParser::open_markers) are
+    /// non-empty literals, so this holds; the `debug_assert` catches a future
+    /// empty marker in tests.
     pub fn new(markers: &'static [&'static str]) -> Self {
+        debug_assert!(
+            markers.iter().all(|m| !m.is_empty()),
+            "tool-call open markers must be non-empty"
+        );
         Self {
             markers,
             held: String::new(),

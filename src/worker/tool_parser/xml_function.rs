@@ -1,7 +1,7 @@
 //! XML `<function=…>` tool-call family.
 //!
 //! Handles the format several GGUF chat templates declare verbatim — Nemotron
-//! (`nemotron_h`), Qwen3-Coder, GLM-style XML:
+//! (`nemotron_h`), Qwen3-Coder:
 //!
 //! ```text
 //! <tool_call>
@@ -18,9 +18,9 @@
 //! this family at completion (a non-null derived PEG that still throws FFI -3 on
 //! `nemotron_h`).
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value};
 
-use super::ToolCallParser;
+use super::{build_tool_call, strip_leading_reasoning, ToolCallParser};
 
 /// Parser for the XML `<function=…><parameter=…>` tool-call family.
 pub struct XmlFunctionParser;
@@ -62,17 +62,7 @@ impl ToolCallParser for XmlFunctionParser {
 
     fn content(&self, text: &str) -> String {
         let head = text.find("<tool_call>").map_or(text, |i| &text[..i]);
-        strip_think(head).trim().to_string()
-    }
-}
-
-/// Remove a leading reasoning block. Handles both an explicit `<think>…</think>`
-/// and the template-forced-open case (no opening tag, just a trailing
-/// `</think>`): everything up to and including the first `</think>` is dropped.
-fn strip_think(s: &str) -> &str {
-    match s.find("</think>") {
-        Some(end) => &s[end + "</think>".len()..],
-        None => s,
+        strip_leading_reasoning(head, "</think>").trim().to_string()
     }
 }
 
@@ -110,15 +100,12 @@ fn parse_one(block: &str, id_seed: &str, index: usize) -> Option<Value> {
         rest = &vbody[vend + "</parameter>".len()..];
     }
 
-    Some(json!({
-        "id": format!("call_{id_seed}_{index}"),
-        "type": "function",
-        "function": {
-            "name": name,
-            // OpenAI `arguments` is a JSON STRING, not an object.
-            "arguments": Value::Object(args).to_string(),
-        }
-    }))
+    Some(build_tool_call(
+        name,
+        &Value::Object(args).to_string(),
+        id_seed,
+        index,
+    ))
 }
 
 #[cfg(test)]

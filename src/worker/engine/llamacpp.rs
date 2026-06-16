@@ -11,13 +11,14 @@ use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{AddBos, LlamaChatTemplate, LlamaModel};
+use llama_cpp_2::model::{AddBos, ChatTemplateResult, LlamaChatTemplate, LlamaModel};
 use llama_cpp_2::openai::OpenAIChatTemplateParams;
 use llama_cpp_2::sampling::LlamaSampler;
+use llama_cpp_2::token::LlamaToken;
 
 use super::{GenParams, HiggsEngine, LoadParams};
 use crate::diagnostic::HiggsError;
-use crate::worker::tool_parser::{ToolCallStreamFilter, ToolParserRegistry};
+use crate::worker::tool_parser::{ToolCallParser, ToolCallStreamFilter, ToolParserRegistry};
 
 /// Process-wide llama.cpp backend handle — the FFI global init must run
 /// exactly once per process.
@@ -103,78 +104,23 @@ impl HiggsEngine for LlamaCppEngine {
                 id: "unloaded".into(),
             });
         };
-        let gen_fail = |stage: &'static str, reason: String| HiggsError::GenerationFailed {
-            stage: stage.to_string(),
-            reason,
-        };
 
-        // GGUF-embedded chat template; fall back to "chatml" when the model embeds none.
-        let template = match loaded.model.chat_template(None) {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!(error = %e, "GGUF chat template unavailable; falling back to chatml");
-                LlamaChatTemplate::new("chatml")
-                    .map_err(|e| gen_fail("chatml fallback template", e.to_string()))?
-            }
-        };
-        // Single path for tools and no-tools alike: the OAI-compat apply parses
-        // the verbatim OpenAI `messages` JSON (preserving assistant `tool_calls`
-        // and tool `tool_call_id` for multi-turn tool loops), renders the GGUF
-        // template (with the tools array when present), AND returns the
-        // serialized PEG parser + chat_format the crate's vendored `common_chat`
-        // selected for this model. We keep `tmpl_result` alive across the decode
-        // so `parse_response_oaicompat` can turn the raw output back into an
-        // OpenAI message (content + tool_calls) — no parser invented here.
-        //
-        // `add_bos: false` — the prompt is tokenized below with `AddBos::Always`,
-        // so the template must not also prepend BOS (would double it).
-        // (Grammar-constrained sampling via tmpl_result.grammar is deferred.)
-        let oai_params = OpenAIChatTemplateParams {
-            messages_json,
-            tools_json: params.tools_json.as_deref(),
-            tool_choice: None,
-            json_schema: None,
-            grammar: None,
-            reasoning_format: None,
-            chat_template_kwargs: None,
-            add_generation_prompt: true,
-            use_jinja: true,
-            parallel_tool_calls: false,
-            enable_thinking: false,
-            add_bos: false,
-            add_eos: false,
-            parse_tool_calls: params.tools_json.is_some(),
-        };
-        let tmpl_result = loaded
-            .model
-            .apply_chat_template_oaicompat(&template, &oai_params)
-            .map_err(|e| gen_fail("apply chat template", e.to_string()))?;
-        let prompt = tmpl_result.prompt.as_str();
+        // 1. Render the GGUF chat template over the OpenAI messages + tools.
+        let template = load_template(&loaded.model);
+        let tmpl_result = apply_template(&loaded.model, &template, messages_json, params)?;
 
-        // KNOWN LIMITATION: `tmpl_result.additional_stops` (stop STRINGS the
-        // template declares) is not yet honored — the decode loop below stops
-        // only on EOG tokens / max_tokens. The supported families (Qwen,
-        // Llama-3, Gemma, Nemotron) terminate on EOG tokens and declare no
-        // stop strings, so this is latent; a model relying on a literal stop
-        // string would leak it and run to max_tokens. Honoring additional_stops
-        // (and grammar, below) is deferred.
-
-        // Fit check BEFORE any decode: prompt + full generation budget must fit.
-        let tokens = loaded
-            .model
-            .str_to_token(prompt, AddBos::Always)
-            .map_err(|e| gen_fail("tokenize prompt", e.to_string()))?;
-        let n_ctx = loaded.params.ctx_len as usize;
-        if tokens.len() + params.max_tokens > n_ctx {
-            return Err(HiggsError::ContextOverflow {
-                prompt_tokens: tokens.len(),
-                max_gen: params.max_tokens,
-                n_ctx,
-            });
-        }
-        // prompt_tokens is the length of the tokenized, template-applied prompt.
+        // 2. Tokenize and fit-check before any decode.
+        let tokens = fit_check(
+            &loaded.model,
+            tmpl_result.prompt.as_str(),
+            &loaded.params,
+            params,
+        )?;
         let prompt_tokens = tokens.len() as u32;
 
+        // Defensive: the serve layer (serve/v1.rs) already rejects max_tokens==0
+        // with HG013 before the request reaches the worker, so this never fires
+        // in production. Kept so the engine is correct in isolation.
         if params.max_tokens == 0 {
             return Ok(super::ChatResult {
                 content: String::new(),
@@ -185,185 +131,319 @@ impl HiggsEngine for LlamaCppEngine {
             });
         }
 
-        // Fresh context per request (v1 simplicity: naive full re-prefill).
-        // n_batch sized to the context so any fit-checked prompt decodes in
-        // one llama_decode call (llama.cpp's simple.cpp sizes it the same way).
-        let threads = i32::try_from(loaded.params.threads).unwrap_or(i32::MAX);
-        let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(NonZeroU32::new(loaded.params.ctx_len))
-            .with_n_batch(loaded.params.ctx_len.max(1))
-            .with_n_threads(threads)
-            .with_n_threads_batch(threads);
-        let mut ctx = loaded
-            .model
-            .new_context(backend(), ctx_params)
-            .map_err(|e| gen_fail("create context", e.to_string()))?;
+        // The registry parser (if any) selected by chat-template sniff: used both
+        // to suppress the call envelope from the stream and as the final-parse
+        // fallback. KNOWN LIMITATION: the filter is installed ONLY when a registry
+        // parser matches. The registry covers higgs's target families (Gemma,
+        // Qwen, DeepSeek, Nemotron). A model whose tool format the crate's primary
+        // `parse_response_oaicompat` handles but the registry does NOT match (e.g.
+        // Llama-3's `<|python_tag|>`) gets no filter, so its tool-call markup
+        // streams raw as content deltas while the final structured tool_calls are
+        // still returned. The non-streaming `content` is unaffected (set empty
+        // when tool_calls present). A general fix would suppress on the union of
+        // all known open markers; deferred since target models are covered.
+        let selected_parser = self.select_parser(&template, params);
 
-        // Prompt feed: logits only for the last prompt token (example shape).
-        let mut batch = LlamaBatch::new(tokens.len().max(1), 1);
-        let last_index = tokens.len().saturating_sub(1);
-        for (i, token) in tokens.into_iter().enumerate() {
-            let pos = i32::try_from(i).map_err(|e| gen_fail("prompt position", e.to_string()))?;
-            batch
-                .add(token, pos, &[0], i == last_index)
-                .map_err(|e| gen_fail("batch add", e.to_string()))?;
-        }
-        ctx.decode(&mut batch)
-            .map_err(|e| gen_fail("prompt decode", e.to_string()))?;
+        // 3. Decode loop — streams content deltas (filtered) into `sink`.
+        let decoded = run_decode(loaded, tokens, params, selected_parser, sink)?;
 
-        // Greedy when temperature is zero, else temp + dist with real per-request
-        // entropy (F5: was hardcoded seed 1234 — fully deterministic across requests).
-        let mut sampler = if params.temperature <= 0.0 {
-            LlamaSampler::chain_simple([LlamaSampler::greedy()])
-        } else {
-            LlamaSampler::chain_simple([
-                LlamaSampler::temp(params.temperature),
-                LlamaSampler::dist(rand::random::<u32>()),
-            ])
-        };
-
-        // Tool-call streaming: when tools were requested and a registry parser
-        // recognizes this model's format, suppress the call envelope from the
-        // streamed content (the structured tool_calls are emitted at end of
-        // stream by `serve::stream`, parsed from `full` below). The same parser
-        // does the final parse in the fallback branch.
-        //
-        // KNOWN LIMITATION: the filter is installed ONLY when a registry parser
-        // matches. The registry covers higgs's target families (Gemma, Qwen,
-        // DeepSeek, Nemotron). A model whose tool format the crate's primary
-        // `parse_response_oaicompat` handles but the registry does NOT match
-        // (e.g. Llama-3's `<|python_tag|>` — outside higgs's target set) gets
-        // `stream_filter = None`, so its tool-call markup streams raw as content
-        // deltas while the final structured tool_calls are still returned. The
-        // non-streaming `content` is unaffected (set empty when tool_calls
-        // present). A general fix would suppress on the union of all known open
-        // markers; deferred since target models are covered.
-        let tmpl_str = template.to_str().unwrap_or("");
-        let selected_parser = params
-            .tools_json
-            .as_ref()
-            .and_then(|_| self.tool_parsers.select(tmpl_str));
-        let mut stream_filter =
-            selected_parser.map(|p| ToolCallStreamFilter::new(p.open_markers()));
-
-        let mut decoder = encoding_rs::UTF_8.new_decoder();
-        let mut full = String::new();
-        let mut n_generated: usize = 0;
-        let mut n_cur = batch.n_tokens();
-        let finish_reason = loop {
-            let token = sampler.sample(&ctx, batch.n_tokens() - 1);
-            sampler.accept(token);
-            if loaded.model.is_eog_token(token) {
-                break "stop";
-            }
-            let piece = loaded
-                .model
-                .token_to_piece(token, &mut decoder, true, None)
-                .map_err(|e| gen_fail("detokenize", e.to_string()))?;
-            // The UTF-8 decoder buffers partial multi-byte sequences — only
-            // forward pieces that decoded to visible text.
-            if !piece.is_empty() {
-                match stream_filter.as_mut() {
-                    Some(f) => f.push(&piece, sink),
-                    None => sink(&piece),
-                }
-                full.push_str(&piece);
-            }
-            n_generated += 1;
-            if n_generated >= params.max_tokens {
-                break "length";
-            }
-            batch.clear();
-            batch
-                .add(token, n_cur, &[0], true)
-                .map_err(|e| gen_fail("batch add", e.to_string()))?;
-            n_cur += 1;
-            ctx.decode(&mut batch)
-                .map_err(|e| gen_fail("loop decode", e.to_string()))?;
-        };
-
-        // Flush the UTF-8 decoder: a response ending mid-multi-byte sequence (e.g.
-        // CJK) would otherwise silently truncate the final character. The final call
-        // with last=true drains any buffered incomplete bytes.
-        let mut tail = String::new();
-        let _ = decoder.decode_to_string(&[], &mut tail, true);
-        if !tail.is_empty() {
-            match stream_filter.as_mut() {
-                Some(f) => f.push(&tail, sink),
-                None => sink(&tail),
-            }
-            full.push_str(&tail);
-        }
-        // Flush any safe content the filter held back (a tail that never became
-        // a marker); suppressed content stays withheld.
-        if let Some(f) = stream_filter.as_mut() {
-            f.finish(sink);
-        }
-
-        // Parse the full generation into an OpenAI message.
-        //   Primary: the parser the template apply selected — covers the
-        //     families llama.cpp's vendored common_chat handles (Qwen, Mistral,
-        //     Llama-3, Hermes, …), all derived from the GGUF template.
-        //   Fallback: when that parser rejects the output — which it does for
-        //     formats it cannot auto-derive, e.g. nemotron_h's
-        //     `<function=…><parameter=…>` XML — parse the format the GGUF
-        //     template itself declares, via `tool_parse`. Both paths read the
-        //     GGUF; neither curates per-model.
-        let (content, tool_calls) = match tmpl_result.parse_response_oaicompat(&full, false) {
-            Ok(msg_json) => {
-                let parsed: serde_json::Value = serde_json::from_str(&msg_json)
-                    .map_err(|e| gen_fail("parse response json", e.to_string()))?;
-                let tool_calls = parsed.get("tool_calls").filter(|v| !v.is_null()).cloned();
-                // `content` is null when the turn is purely tool calls. Only fall
-                // back to the raw generated text when there are NO tool calls —
-                // otherwise the tool-call markup would be returned as assistant
-                // content *alongside* the structured tool_calls (OpenAI requires
-                // content to be empty/null on a tool-call turn).
-                let content = parsed
-                    .get("content")
-                    .and_then(|v| v.as_str())
-                    .map(ToOwned::to_owned)
-                    .unwrap_or_else(|| {
-                        if tool_calls.is_some() {
-                            String::new()
-                        } else {
-                            full.clone()
-                        }
-                    });
-                (content, tool_calls)
-            }
-            Err(e) => {
-                // Crate parser declined. Use the registry parser already selected
-                // for this model (by chat-template sniff) to parse the text.
-                match selected_parser {
-                    Some(parser) => {
-                        let seed = uuid::Uuid::new_v4().simple().to_string();
-                        match parser.parse(&full, &seed) {
-                            Some(calls) => {
-                                tracing::debug!(error = %e, parser = parser.id(), "crate parse rejected output; registry parser recovered tool calls");
-                                (parser.content(&full), Some(serde_json::Value::Array(calls)))
-                            }
-                            // Parser matched the format but the turn had no call.
-                            None => (full.clone(), None),
-                        }
-                    }
-                    // No registered parser for this model's format: preserve text.
-                    None => {
-                        tracing::warn!(error = %e, "crate parse rejected output and no registry parser matched; returning raw text");
-                        (full.clone(), None)
-                    }
-                }
-            }
-        };
+        // 4. Parse the full generation into an OpenAI message (content + tool_calls).
+        let (content, tool_calls) = parse_output(&tmpl_result, &decoded.full, selected_parser)?;
 
         Ok(super::ChatResult {
             content,
-            finish_reason,
+            finish_reason: decoded.finish_reason,
             tool_calls,
             prompt_tokens,
             // n_generated counts tokens emitted in the decode loop (one per iteration).
-            completion_tokens: n_generated as u32,
+            completion_tokens: decoded.n_generated as u32,
         })
+    }
+}
+
+impl LlamaCppEngine {
+    /// The registry parser this model's chat template selects, or `None` when no
+    /// tools were requested or no parser recognizes the template. Warns when the
+    /// template is not valid UTF-8 (silently disables tool-call filtering).
+    fn select_parser(
+        &self,
+        template: &LlamaChatTemplate,
+        params: &GenParams,
+    ) -> Option<&dyn ToolCallParser> {
+        let tmpl_str = template.to_str().unwrap_or_else(|e| {
+            // GGUF chat templates are UTF-8; a non-UTF-8 template means no parser
+            // can be selected by template sniff, silently disabling tool-call
+            // suppression. Warn so the degradation is visible rather than hidden.
+            tracing::warn!(error = %e, "chat template is not valid UTF-8; tool-call filtering disabled for this model");
+            ""
+        });
+        params
+            .tools_json
+            .as_ref()
+            .and_then(|_| self.tool_parsers.select(tmpl_str))
+    }
+}
+
+/// Construct a `GenerationFailed` diagnostic for a named decode stage.
+fn gen_fail(stage: &'static str, reason: &impl ToString) -> HiggsError {
+    HiggsError::GenerationFailed {
+        stage: stage.to_string(),
+        reason: reason.to_string(),
+    }
+}
+
+/// The model's GGUF-embedded chat template, falling back to `"chatml"` when the
+/// model embeds none. The fallback constructor cannot fail for the literal
+/// `"chatml"`, so its error path is unreachable in practice.
+fn load_template(model: &LlamaModel) -> LlamaChatTemplate {
+    match model.chat_template(None) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(error = %e, "GGUF chat template unavailable; falling back to chatml");
+            LlamaChatTemplate::new("chatml").expect("chatml is a valid built-in template name")
+        }
+    }
+}
+
+/// Apply the OAI-compat chat template over the verbatim OpenAI `messages` JSON
+/// (and `tools`, when present), returning the crate's template result.
+///
+/// The result carries the rendered prompt AND the serialized PEG parser +
+/// chat_format the crate's vendored `common_chat` selected for this model; the
+/// caller keeps it alive across the decode so `parse_response_oaicompat` can turn
+/// the raw output back into an OpenAI message — no parser invented here.
+///
+/// `add_bos: false` — the prompt is tokenized with `AddBos::Always`, so the
+/// template must not also prepend BOS (would double it). Grammar-constrained
+/// sampling via `tmpl_result.grammar` is deferred.
+fn apply_template(
+    model: &LlamaModel,
+    template: &LlamaChatTemplate,
+    messages_json: &str,
+    params: &GenParams,
+) -> Result<ChatTemplateResult, HiggsError> {
+    let oai_params = OpenAIChatTemplateParams {
+        messages_json,
+        tools_json: params.tools_json.as_deref(),
+        tool_choice: None,
+        json_schema: None,
+        grammar: None,
+        reasoning_format: None,
+        chat_template_kwargs: None,
+        add_generation_prompt: true,
+        use_jinja: true,
+        parallel_tool_calls: false,
+        enable_thinking: false,
+        add_bos: false,
+        add_eos: false,
+        parse_tool_calls: params.tools_json.is_some(),
+    };
+    model
+        .apply_chat_template_oaicompat(template, &oai_params)
+        .map_err(|e| gen_fail("apply chat template", &e))
+    // KNOWN LIMITATION: `tmpl_result.additional_stops` (stop STRINGS the template
+    // declares) is not honored — the decode loop stops only on EOG tokens /
+    // max_tokens. The supported families (Qwen, Llama-3, Gemma, Nemotron)
+    // terminate on EOG tokens and declare no stop strings, so this is latent.
+}
+
+/// Tokenize `prompt` and verify prompt + full generation budget fits `n_ctx`.
+/// Returns the prompt tokens on success, [HG005] `ContextOverflow` otherwise.
+fn fit_check(
+    model: &LlamaModel,
+    prompt: &str,
+    load: &LoadParams,
+    gen: &GenParams,
+) -> Result<Vec<LlamaToken>, HiggsError> {
+    let tokens = model
+        .str_to_token(prompt, AddBos::Always)
+        .map_err(|e| gen_fail("tokenize prompt", &e))?;
+    let n_ctx = load.ctx_len as usize;
+    if tokens.len() + gen.max_tokens > n_ctx {
+        return Err(HiggsError::ContextOverflow {
+            prompt_tokens: tokens.len(),
+            max_gen: gen.max_tokens,
+            n_ctx,
+        });
+    }
+    Ok(tokens)
+}
+
+/// The result of [`run_decode`]: the full generated text, the OpenAI finish
+/// reason, and the number of tokens emitted in the loop.
+struct DecodeOutput {
+    full: String,
+    finish_reason: &'static str,
+    n_generated: usize,
+}
+
+/// Feed the prompt `tokens`, then sample → detokenize → stream → re-batch →
+/// decode until an EOG token or `max_tokens`. Content deltas are streamed into
+/// `sink`, with the call envelope suppressed when `parser` is present.
+///
+/// A fresh context is built per request (v1 simplicity: naive full re-prefill);
+/// `n_batch` is sized to the context so any fit-checked prompt decodes in one
+/// `llama_decode` call (matching llama.cpp's `simple.cpp`).
+fn run_decode(
+    loaded: &LoadedModel,
+    tokens: Vec<LlamaToken>,
+    params: &GenParams,
+    parser: Option<&dyn ToolCallParser>,
+    sink: &mut dyn FnMut(&str),
+) -> Result<DecodeOutput, HiggsError> {
+    let model = &loaded.model;
+    let threads = i32::try_from(loaded.params.threads).unwrap_or(i32::MAX);
+    let ctx_params = LlamaContextParams::default()
+        .with_n_ctx(NonZeroU32::new(loaded.params.ctx_len))
+        .with_n_batch(loaded.params.ctx_len.max(1))
+        .with_n_threads(threads)
+        .with_n_threads_batch(threads);
+    let mut ctx = model
+        .new_context(backend(), ctx_params)
+        .map_err(|e| gen_fail("create context", &e))?;
+
+    // Prompt feed: logits only for the last prompt token (example shape).
+    let mut batch = LlamaBatch::new(tokens.len().max(1), 1);
+    let last_index = tokens.len().saturating_sub(1);
+    for (i, token) in tokens.into_iter().enumerate() {
+        let pos = i32::try_from(i).map_err(|e| gen_fail("prompt position", &e))?;
+        batch
+            .add(token, pos, &[0], i == last_index)
+            .map_err(|e| gen_fail("batch add", &e))?;
+    }
+    ctx.decode(&mut batch)
+        .map_err(|e| gen_fail("prompt decode", &e))?;
+
+    // Greedy when temperature is zero, else temp + dist with real per-request
+    // entropy (F5: was hardcoded seed 1234 — fully deterministic across requests).
+    let mut sampler = if params.temperature <= 0.0 {
+        LlamaSampler::chain_simple([LlamaSampler::greedy()])
+    } else {
+        LlamaSampler::chain_simple([
+            LlamaSampler::temp(params.temperature),
+            LlamaSampler::dist(rand::random::<u32>()),
+        ])
+    };
+
+    let mut stream_filter = parser.map(|p| ToolCallStreamFilter::new(p.open_markers()));
+    let mut decoder = encoding_rs::UTF_8.new_decoder();
+    let mut full = String::new();
+    let mut n_generated: usize = 0;
+    let mut n_cur = batch.n_tokens();
+    let finish_reason = loop {
+        let token = sampler.sample(&ctx, batch.n_tokens() - 1);
+        sampler.accept(token);
+        if model.is_eog_token(token) {
+            break "stop";
+        }
+        let piece = model
+            .token_to_piece(token, &mut decoder, true, None)
+            .map_err(|e| gen_fail("detokenize", &e))?;
+        // The UTF-8 decoder buffers partial multi-byte sequences — only
+        // forward pieces that decoded to visible text.
+        if !piece.is_empty() {
+            match stream_filter.as_mut() {
+                Some(f) => f.push(&piece, sink),
+                None => sink(&piece),
+            }
+            full.push_str(&piece);
+        }
+        n_generated += 1;
+        if n_generated >= params.max_tokens {
+            break "length";
+        }
+        batch.clear();
+        batch
+            .add(token, n_cur, &[0], true)
+            .map_err(|e| gen_fail("batch add", &e))?;
+        n_cur += 1;
+        ctx.decode(&mut batch)
+            .map_err(|e| gen_fail("loop decode", &e))?;
+    };
+
+    // Flush the UTF-8 decoder: a response ending mid-multi-byte sequence (e.g.
+    // CJK) would otherwise silently truncate the final character. The final call
+    // with last=true drains any buffered incomplete bytes.
+    let mut tail = String::new();
+    let _ = decoder.decode_to_string(&[], &mut tail, true);
+    if !tail.is_empty() {
+        match stream_filter.as_mut() {
+            Some(f) => f.push(&tail, sink),
+            None => sink(&tail),
+        }
+        full.push_str(&tail);
+    }
+    // Flush any safe content the filter held back (a tail that never became a
+    // marker); suppressed content stays withheld.
+    if let Some(f) = stream_filter.as_mut() {
+        f.finish(sink);
+    }
+
+    Ok(DecodeOutput {
+        full,
+        finish_reason,
+        n_generated,
+    })
+}
+
+/// Parse the full generation into an OpenAI message `(content, tool_calls)`.
+///
+/// Primary: the parser the template apply selected — covers the families
+/// llama.cpp's vendored common_chat handles (Qwen, Mistral, Llama-3, Hermes, …),
+/// all derived from the GGUF template. Fallback: when that parser rejects the
+/// output (e.g. nemotron_h's `<function=…><parameter=…>` XML), the registry
+/// `parser` selected by chat-template sniff parses the text. Both paths read the
+/// GGUF; neither curates per-model.
+fn parse_output(
+    tmpl_result: &ChatTemplateResult,
+    full: &str,
+    parser: Option<&dyn ToolCallParser>,
+) -> Result<(String, Option<serde_json::Value>), HiggsError> {
+    match tmpl_result.parse_response_oaicompat(full, false) {
+        Ok(msg_json) => {
+            let parsed: serde_json::Value =
+                serde_json::from_str(&msg_json).map_err(|e| gen_fail("parse response json", &e))?;
+            let tool_calls = parsed.get("tool_calls").filter(|v| !v.is_null()).cloned();
+            // `content` is null when the turn is purely tool calls. Only fall back
+            // to the raw generated text when there are NO tool calls — otherwise
+            // the tool-call markup would be returned as assistant content
+            // *alongside* the structured tool_calls (OpenAI requires content to be
+            // empty/null on a tool-call turn).
+            let content = parsed
+                .get("content")
+                .and_then(|v| v.as_str())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| {
+                    if tool_calls.is_some() {
+                        String::new()
+                    } else {
+                        full.to_string()
+                    }
+                });
+            Ok((content, tool_calls))
+        }
+        Err(e) => {
+            // Crate parser declined. Use the registry parser already selected for
+            // this model (by chat-template sniff) to parse the text.
+            match parser {
+                Some(parser) => {
+                    let seed = uuid::Uuid::new_v4().simple().to_string();
+                    match parser.parse(full, &seed) {
+                        Some(calls) => {
+                            tracing::debug!(error = %e, parser = parser.id(), "crate parse rejected output; registry parser recovered tool calls");
+                            Ok((parser.content(full), Some(serde_json::Value::Array(calls))))
+                        }
+                        // Parser matched the format but the turn had no call.
+                        None => Ok((full.to_string(), None)),
+                    }
+                }
+                // No registered parser for this model's format: preserve text.
+                None => {
+                    tracing::warn!(error = %e, "crate parse rejected output and no registry parser matched; returning raw text");
+                    Ok((full.to_string(), None))
+                }
+            }
+        }
     }
 }
 

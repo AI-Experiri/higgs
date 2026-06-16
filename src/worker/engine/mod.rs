@@ -72,9 +72,9 @@ pub trait HiggsEngine: Send {
     /// `common_chat`; a future MLX engine via its own jinja renderer). The
     /// template-apply mechanism never crosses above this trait.
     ///
-    /// Fails with [HG005] when the prompt cannot fit, [HG004] on load-state errors,
-    /// [HG011] on generation failures (context create, prompt decode, sampler, detokenize,
-    /// loop decode).
+    /// Fails with [HG005] when the prompt cannot fit, [HG003] when no model is
+    /// loaded, [HG011] on generation failures (context create, prompt decode,
+    /// sampler, detokenize, loop decode).
     fn chat(
         &mut self,
         messages_json: &str,

@@ -2,15 +2,14 @@
 //!
 //! Re-executes this test binary under `HIGGS_WORKER_TEST=1` so the child runs
 //! `worker_main()` directly on its stdio — the same Chromium-style re-exec used
-//! by the real supervisor.  The parent drives real pipes: scan → status →
-//! shutdown, asserts each response, and waits for a clean exit.
+//! by the real supervisor.  The parent drives real pipes: status → shutdown,
+//! asserts each response, and waits for a clean exit.
 //!
 //! Engine methods (load/chat) are intentionally NOT exercised here; those paths
-//! are covered by unit tests in `worker/mod.rs`.
+//! are covered by unit tests in `worker/mod.rs`. Scanning is host-side, so the
+//! worker has no scan method to exercise.
 
-use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -29,14 +28,6 @@ fn req_line(id: u64, method: &str, params: serde_json::Value) -> String {
         params,
     };
     format!("{}\n", encode(&RpcFrame::Request(r)))
-}
-
-/// Write `content` at `path`, creating parent directories as needed.
-fn write_file(path: &Path, content: &[u8]) {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).unwrap();
-    }
-    fs::write(path, content).unwrap();
 }
 
 /// Parse one NDJSON line into an `RpcResponse`, panicking on anything else.
@@ -69,15 +60,6 @@ fn worker_stdio_roundtrip() {
     }
 
     // ---- parent role --------------------------------------------------------
-
-    // Build a minimal LM Studio fixture: root/google/gemma-4-12b/file-Q4_K_M.gguf
-    let tmp = tempfile::TempDir::new().expect("tempdir");
-    write_file(
-        &tmp.path()
-            .join("google/gemma-4-12b/gemma-4-12b-Q4_K_M.gguf"),
-        &[0u8; 16], // 16 dummy bytes — not a valid GGUF; scan tolerates it
-    );
-    let lmstudio_root = tmp.path().to_str().expect("utf-8 path").to_string();
 
     // Re-exec this test binary as the child worker.
     // `--exact worker_stdio_roundtrip --nocapture` makes the child jump straight
@@ -117,42 +99,10 @@ fn worker_stdio_roundtrip() {
         }
     });
 
-    // ---- request 1: higgs/scan ---------------------------------------------
-    let scan_req = req_line(
-        1,
-        "higgs/scan",
-        serde_json::json!({
-            "lmstudio": [lmstudio_root],
-            "hf": [],
-            "ollama": []
-        }),
-    );
-    child_stdin
-        .write_all(scan_req.as_bytes())
-        .expect("write scan");
-    child_stdin.flush().expect("flush scan");
-
-    let scan_line = recv_line(&rx, "scan response");
-    let scan_resp = parse_response(&scan_line);
-    assert_eq!(scan_resp.id, 1, "scan id");
-    assert!(
-        scan_resp.error.is_none(),
-        "scan error: {:?}",
-        scan_resp.error
-    );
-    let models = scan_resp
-        .result
-        .as_ref()
-        .and_then(|v| v.as_array())
-        .expect("scan result is array");
-    assert_eq!(models.len(), 1, "expected exactly one model: {models:?}");
-    assert_eq!(
-        models[0]["id"], "google/gemma-4-12b",
-        "model id mismatch: {models:?}"
-    );
-
-    // ---- request 2: higgs/status -------------------------------------------
-    let status_req = req_line(2, "higgs/status", serde_json::Value::Null);
+    // ---- request 1: higgs/status -------------------------------------------
+    // Scan is host-side; the worker serves status (and reports nothing loaded)
+    // over real stdio. This is what the re-exec round-trip verifies.
+    let status_req = req_line(1, "higgs/status", serde_json::Value::Null);
     child_stdin
         .write_all(status_req.as_bytes())
         .expect("write status");
@@ -160,22 +110,21 @@ fn worker_stdio_roundtrip() {
 
     let status_line = recv_line(&rx, "status response");
     let status_resp = parse_response(&status_line);
-    assert_eq!(status_resp.id, 2, "status id");
+    assert_eq!(status_resp.id, 1, "status id");
     assert!(
         status_resp.error.is_none(),
         "status error: {:?}",
         status_resp.error
     );
     let result = status_resp.result.as_ref().expect("status result");
-    assert_eq!(result["models_scanned"], 1, "models_scanned after scan");
     assert!(
         result["loaded"].is_null(),
         "nothing should be loaded yet: {}",
         result["loaded"]
     );
 
-    // ---- request 3: higgs/shutdown -----------------------------------------
-    let shutdown_req = req_line(3, "higgs/shutdown", serde_json::Value::Null);
+    // ---- request 2: higgs/shutdown -----------------------------------------
+    let shutdown_req = req_line(2, "higgs/shutdown", serde_json::Value::Null);
     child_stdin
         .write_all(shutdown_req.as_bytes())
         .expect("write shutdown");
@@ -183,7 +132,7 @@ fn worker_stdio_roundtrip() {
 
     let shutdown_line = recv_line(&rx, "shutdown response");
     let shutdown_resp = parse_response(&shutdown_line);
-    assert_eq!(shutdown_resp.id, 3, "shutdown id");
+    assert_eq!(shutdown_resp.id, 2, "shutdown id");
     assert!(
         shutdown_resp.error.is_none(),
         "shutdown error: {:?}",

@@ -1036,7 +1036,7 @@ mod tests {
     }
 
     /// Ollama manifest whose model layer digest lacks the `sha256:` prefix is an
-    /// invalid manifest → HG009 error aborting the scan.
+    /// invalid manifest → HG010 error aborting the scan.
     #[test]
     fn ollama_bad_digest_format_errors() {
         let dir = TempDir::new().unwrap();
@@ -1057,7 +1057,7 @@ mod tests {
         );
     }
 
-    /// Ollama model layer missing the `digest` field entirely → HG009 error.
+    /// Ollama model layer missing the `digest` field entirely → HG010 error.
     #[test]
     fn ollama_missing_digest_errors() {
         let dir = TempDir::new().unwrap();

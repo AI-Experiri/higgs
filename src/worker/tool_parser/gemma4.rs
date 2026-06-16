@@ -31,9 +31,9 @@
 //! schema-gated, best-effort recovery for malformed model output and are not
 //! needed for the common, well-formed path. We parse the common path only.
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value};
 
-use super::ToolCallParser;
+use super::{build_tool_call, strip_leading_reasoning, ToolCallParser};
 
 /// Opening envelope marker for a Gemma-4 tool call.
 const OPEN_TAG: &str = "<|tool_call>";
@@ -88,7 +88,9 @@ impl ToolCallParser for Gemma4Parser {
 
     fn content(&self, text: &str) -> String {
         let head = text.find(OPEN_TAG).map_or(text, |i| &text[..i]);
-        strip_think(strip_channel(head)).trim().to_string()
+        strip_leading_reasoning(strip_channel(head), "</think>")
+            .trim()
+            .to_string()
     }
 }
 
@@ -101,16 +103,6 @@ impl ToolCallParser for Gemma4Parser {
 fn strip_channel(s: &str) -> &str {
     match s.find(CHANNEL_CLOSE_TAG) {
         Some(end) => &s[end + CHANNEL_CLOSE_TAG.len()..],
-        None => s,
-    }
-}
-
-/// Remove a leading reasoning block. Handles both an explicit `<think>…</think>`
-/// and the template-forced-open case (no opening tag, just a trailing
-/// `</think>`): everything up to and including the first `</think>` is dropped.
-fn strip_think(s: &str) -> &str {
-    match s.find("</think>") {
-        Some(end) => &s[end + "</think>".len()..],
         None => s,
     }
 }
@@ -136,15 +128,12 @@ fn parse_one(block: &str, id_seed: &str, index: usize) -> Option<Value> {
         _ => Map::new(),
     };
 
-    Some(json!({
-        "id": format!("call_{id_seed}_{index}"),
-        "type": "function",
-        "function": {
-            "name": name,
-            // OpenAI `arguments` is a JSON STRING, not an object.
-            "arguments": Value::Object(args).to_string(),
-        }
-    }))
+    Some(build_tool_call(
+        name,
+        &Value::Object(args).to_string(),
+        id_seed,
+        index,
+    ))
 }
 
 /// Translate Gemma-4's argument syntax into JSON text.

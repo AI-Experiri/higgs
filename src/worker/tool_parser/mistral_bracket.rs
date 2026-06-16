@@ -27,9 +27,9 @@
 //! JSON-end finder) but drop its incremental state machine and partial-tag
 //! overlap heuristics, which only matter for token-by-token streaming.
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value};
 
-use super::ToolCallParser;
+use super::{build_tool_call, strip_leading_reasoning, ToolCallParser};
 
 const TOOL_CALLS_TAG: &str = "[TOOL_CALLS]";
 const ARGS_TAG: &str = "[ARGS]";
@@ -87,19 +87,9 @@ impl ToolCallParser for MistralBracketParser {
 
     fn content(&self, text: &str) -> String {
         let head = text.find(TOOL_CALLS_TAG).map_or(text, |i| &text[..i]);
-        strip_think(head).trim().to_string()
-    }
-}
-
-/// Remove a leading reasoning block. Handles both an explicit
-/// `[THINK]…[/THINK]` and the template-forced-open case (no opening tag, just a
-/// trailing `[/THINK]`): everything up to and including the first `[/THINK]` is
-/// dropped. Mirrors the `strip_think` logic of the XML family (which uses
-/// `</think>`); here the close tag is `[/THINK]`.
-fn strip_think(s: &str) -> &str {
-    match s.find(THINK_END_TAG) {
-        Some(end) => &s[end + THINK_END_TAG.len()..],
-        None => s,
+        strip_leading_reasoning(head, THINK_END_TAG)
+            .trim()
+            .to_string()
     }
 }
 
@@ -113,15 +103,12 @@ fn build_call(name: &str, json_str: &str, id_seed: &str, index: usize) -> Option
         // the call. (Ollama errors here; we degrade instead.)
         _ => Map::new(),
     };
-    Some(json!({
-        "id": format!("call_{id_seed}_{index}"),
-        "type": "function",
-        "function": {
-            "name": name,
-            // OpenAI `arguments` is a JSON STRING, not an object.
-            "arguments": Value::Object(args).to_string(),
-        }
-    }))
+    Some(build_tool_call(
+        name,
+        &Value::Object(args).to_string(),
+        id_seed,
+        index,
+    ))
 }
 
 /// Index of the closing brace that completes the root JSON value at the start

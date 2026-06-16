@@ -422,8 +422,9 @@ Live status snapshot. `worker_alive` is true iff an RPC round-trip to the worker
 
 `loaded` is absent when no model is loaded (then `worker_alive` is also false —
 no worker exists). `models_on_disk` and the `arch`/`quant`/`max_context_length`/
-`size_bytes`/`has_chat_template` fields are computed **host-side** (the worker's
-store is empty); the worker reports only `id`/`ctx_len`/`gpu_layers`/`threads`.
+`size_bytes`/`has_chat_template` fields are computed **host-side** (the worker
+holds no model catalog); the worker reports only
+`id`/`ctx_len`/`gpu_layers`/`threads`.
 
 **curl:**
 

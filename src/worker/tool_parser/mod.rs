@@ -12,8 +12,9 @@
 //! `<function=…><parameter=…>` XML). Each registered [`ToolCallParser`] owns one
 //! format family, declared by the model's own GGUF chat template — not a
 //! per-model catalog. Selection sniffs the chat template (the approach
-//! mlx-lm / omlx use), so the right parser is known before generation, which the
-//! future streaming path also needs.
+//! mlx-lm / omlx use), so the right parser is known before generation — the
+//! [`ToolCallStreamFilter`] reuses that selection to suppress the call envelope
+//! from streamed content.
 
 mod deepseek3;
 mod function_gemma;
@@ -24,7 +25,7 @@ mod qwen_json;
 mod stream_filter;
 mod xml_function;
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 pub use deepseek3::DeepSeek3Parser;
 pub use function_gemma::FunctionGemmaParser;
@@ -34,6 +35,39 @@ pub use mistral_bracket::MistralBracketParser;
 pub use qwen_json::QwenJsonParser;
 pub use stream_filter::ToolCallStreamFilter;
 pub use xml_function::XmlFunctionParser;
+
+/// Remove a leading reasoning block from `s`, given the family's reasoning
+/// close tag (`</think>`, `[/THINK]`, …).
+///
+/// Handles both an explicit `<open>…<close_tag>` block and the
+/// template-forced-open case (no opening tag, just a trailing `close_tag`):
+/// everything up to and including the first `close_tag` is dropped. When no
+/// close tag is present the input is returned unchanged. `close_tag` must be
+/// non-empty.
+pub(crate) fn strip_leading_reasoning<'a>(s: &'a str, close_tag: &str) -> &'a str {
+    match s.find(close_tag) {
+        Some(end) => &s[end + close_tag.len()..],
+        None => s,
+    }
+}
+
+/// Build one OpenAI tool-call object from a function name and its already-
+/// serialized `arguments` JSON string.
+///
+/// `arguments` is emitted verbatim as the OpenAI `arguments` field (which is a
+/// JSON STRING, not an object). The call `id` follows the shared
+/// `call_{id_seed}_{index}` format so ids are stable across the families.
+pub(crate) fn build_tool_call(name: &str, arguments: &str, id_seed: &str, index: usize) -> Value {
+    json!({
+        "id": format!("call_{id_seed}_{index}"),
+        "type": "function",
+        "function": {
+            "name": name,
+            // OpenAI `arguments` is a JSON STRING, not an object.
+            "arguments": arguments,
+        }
+    })
+}
 
 /// One tool-call output format family (e.g. the XML `<function=…>` family).
 ///
@@ -132,5 +166,56 @@ mod tests {
         assert!(reg
             .select("{% for m in messages %}<|im_start|>{{ m.role }}")
             .is_none());
+    }
+
+    #[test]
+    fn strip_leading_reasoning_explicit_block() {
+        // Explicit <think>…</think> — everything up to and including the close.
+        assert_eq!(
+            strip_leading_reasoning("<think>reasoning</think>answer", "</think>"),
+            "answer"
+        );
+    }
+
+    #[test]
+    fn strip_leading_reasoning_forced_open() {
+        // Template forced the block open → only a trailing close tag.
+        assert_eq!(
+            strip_leading_reasoning("reasoning</think>answer", "</think>"),
+            "answer"
+        );
+    }
+
+    #[test]
+    fn strip_leading_reasoning_no_close_tag_unchanged() {
+        assert_eq!(
+            strip_leading_reasoning("plain answer", "</think>"),
+            "plain answer"
+        );
+    }
+
+    #[test]
+    fn strip_leading_reasoning_alternate_close_tag() {
+        // Mistral's [/THINK] close tag.
+        assert_eq!(
+            strip_leading_reasoning("reasoning[/THINK]done", "[/THINK]"),
+            "done"
+        );
+    }
+
+    #[test]
+    fn build_tool_call_shape() {
+        let call = build_tool_call("get_weather", r#"{"location":"Paris"}"#, "abc", 0);
+        assert_eq!(call["id"], "call_abc_0");
+        assert_eq!(call["type"], "function");
+        assert_eq!(call["function"]["name"], "get_weather");
+        // arguments is a JSON STRING verbatim, not an object.
+        assert_eq!(call["function"]["arguments"], r#"{"location":"Paris"}"#);
+    }
+
+    #[test]
+    fn build_tool_call_index_in_id() {
+        let call = build_tool_call("f", "{}", "s", 2);
+        assert_eq!(call["id"], "call_s_2");
     }
 }

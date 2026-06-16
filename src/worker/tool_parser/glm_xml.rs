@@ -18,9 +18,9 @@
 //! ourselves because llama.cpp's vendored `common_chat` does not cover the GLM
 //! key/value dialect.
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value};
 
-use super::ToolCallParser;
+use super::{build_tool_call, strip_leading_reasoning, ToolCallParser};
 
 const TOOL_OPEN: &str = "<tool_call>";
 const TOOL_CLOSE: &str = "</tool_call>";
@@ -70,17 +70,7 @@ impl ToolCallParser for GlmXmlParser {
 
     fn content(&self, text: &str) -> String {
         let head = text.find(TOOL_OPEN).map_or(text, |i| &text[..i]);
-        strip_think(head).trim().to_string()
-    }
-}
-
-/// Remove a leading reasoning block. Handles both an explicit `<think>…</think>`
-/// and the template-forced-open case (no opening tag, just a trailing
-/// `</think>`): everything up to and including the first `</think>` is dropped.
-fn strip_think(s: &str) -> &str {
-    match s.find("</think>") {
-        Some(end) => &s[end + "</think>".len()..],
-        None => s,
+        strip_leading_reasoning(head, "</think>").trim().to_string()
     }
 }
 
@@ -130,15 +120,12 @@ fn parse_one(block: &str, id_seed: &str, index: usize) -> Option<Value> {
         rest = &after_v[ve + VAL_CLOSE.len()..];
     }
 
-    Some(json!({
-        "id": format!("call_{id_seed}_{index}"),
-        "type": "function",
-        "function": {
-            "name": name,
-            // OpenAI `arguments` is a JSON STRING, not an object.
-            "arguments": Value::Object(args).to_string(),
-        }
-    }))
+    Some(build_tool_call(
+        name,
+        &Value::Object(args).to_string(),
+        id_seed,
+        index,
+    ))
 }
 
 #[cfg(test)]
