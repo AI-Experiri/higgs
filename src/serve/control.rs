@@ -214,9 +214,12 @@ pub(super) async fn control_version() -> Json<HiggsVersionResponse> {
 ///
 /// Gathering samples CPU load over a short interval, so it runs on a blocking
 /// thread to avoid stalling the async executor.
-pub(super) async fn control_system() -> Json<SystemInfo> {
+pub(super) async fn control_system(State(higgs): State<Arc<Higgs>>) -> Json<SystemInfo> {
     tracing::info!("higgs: GET /api/higgs/system");
-    let info = tokio::task::spawn_blocking(SystemInfo::gather)
+    // Snapshot the read-only server config (cheap lock, no I/O) on the async
+    // thread, then move it into the blocking gather (which samples CPU load).
+    let config = higgs.server_config();
+    let info = tokio::task::spawn_blocking(move || SystemInfo::gather(config))
         .await
         .expect("system info gather task");
     Json(info)

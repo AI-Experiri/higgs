@@ -19,7 +19,7 @@ Because higgs carries its own HTTP router, any Axum host can mount it with one c
 | Path | What it does |
 |------|-------------|
 | `src/lib.rs` | Crate root — re-exports `Higgs`, `HiggsConfig`, `HiggsError`, `HiggsEvent` |
-| `src/api.rs` | `Higgs` facade and `HiggsConfig` — the host-facing API; `HiggsStatus`, `LoadedInfo`, `ChatOutcome` |
+| `src/api.rs` | `Higgs` facade and `HiggsConfig` — the host-facing API; `HiggsStatus`, `LoadedInfo`, `ChatOutcome`, `HiggsServerConfig` (read-only effective config surfaced by `Higgs::server_config()`) |
 | `src/diagnostic.rs` | `HiggsError` enum with diagnostic codes HG001–HG011 |
 | `src/rpc.rs` | NDJSON JSON-RPC 2.0 encode/decode — the supervisor↔worker wire protocol |
 | `src/supervisor.rs` | Worker process supervisor: spawn, restart, request correlation, chat-chunk routing |

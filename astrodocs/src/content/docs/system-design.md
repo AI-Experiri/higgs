@@ -246,6 +246,15 @@ jigglebot reaches higgs by exactly three routes:
 
 The only jigglebot-side knowledge of the address is `config.higgs_base_url`.
 
+### Read-only config surfacing
+
+`GET /api/higgs/system` returns `SystemInfo { hardware, runtime, config }`, where
+`config` is a `HiggsServerConfig` derived **read-only** from `HiggsConfig` plus the
+`BIND_HOST` (`"127.0.0.1"`) and `DEFAULT_CTX_CAP` (`32768`) consts in `api.rs`. It
+is produced by `Higgs::server_config()` — a pure read, no worker RPC, no mutation.
+higgs exposes **no endpoint to change config**; the frontend higgs pane reads this
+to display effective scan dirs, load defaults, and bind host, never to edit them.
+
 ### Boot sequence
 
 ```

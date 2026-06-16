@@ -92,6 +92,31 @@ impl Default for HiggsConfig {
     }
 }
 
+higgs_ts! {
+    /// Read-only snapshot of the server's effective configuration, surfaced at
+    /// `GET /api/higgs/system` so the UI can show the real scan dirs, load
+    /// defaults, and bind host without inventing anything. Derived entirely from
+    /// [`HiggsConfig`] plus the two fixed invariants ([`BIND_HOST`],
+    /// [`DEFAULT_CTX_CAP`]); carries no mutable state and no mutating endpoint.
+    #[derive(Debug, Clone, serde::Serialize)]
+    pub struct HiggsServerConfig {
+        /// Loopback host the listener binds to — always [`BIND_HOST`] (localhost).
+        pub bind_host: String,
+        /// Configured LM Studio scan directories, as absolute path strings.
+        pub lmstudio_dirs: Vec<String>,
+        /// Configured HuggingFace Hub cache scan directories, as path strings.
+        pub hf_dirs: Vec<String>,
+        /// Configured Ollama store scan directories, as path strings.
+        pub ollama_dirs: Vec<String>,
+        /// Load parameters applied when a load request omits them.
+        pub default_load: LoadParams,
+        /// Context-window cap applied to an auto (unpinned) load — a huge-context
+        /// model's window is the trained length but never exceeds this.
+        #[ts(type = "number")]
+        pub default_ctx_cap: u32,
+    }
+}
+
 // ── Output types ──────────────────────────────────────────────────────────────
 
 higgs_ts! {
@@ -178,7 +203,16 @@ pub struct ChatOutcome {
 /// model's trained context is used but never exceeds this, so a huge-context
 /// model doesn't allocate an enormous KV cache by default. A caller (the UI)
 /// can still request the full trained window explicitly.
-const DEFAULT_CTX_CAP: u32 = 32_768;
+pub const DEFAULT_CTX_CAP: u32 = 32_768;
+
+/// Loopback address the embedded higgs listener binds to.
+///
+/// higgs is localhost-only by contract: the launcher binds `127.0.0.1:0`
+/// (ephemeral port) and never exposes the server on a routable interface. The
+/// port varies per boot, but the host is this fixed invariant — surfaced in the
+/// read-only [`HiggsServerConfig`] so the UI can state "Network: localhost only"
+/// honestly. Single home for the bind host.
+pub const BIND_HOST: &str = "127.0.0.1";
 
 pub struct Higgs {
     sup: Arc<Supervisor>,
@@ -489,6 +523,23 @@ impl Higgs {
     /// load request — config stays the single home for the defaults.
     pub(crate) fn default_load(&self) -> LoadParams {
         self.config.lock().default_load.clone()
+    }
+
+    /// Read-only snapshot of the effective server config for `GET
+    /// /api/higgs/system`. Clones the scan dirs and load defaults from the live
+    /// [`HiggsConfig`] and pairs them with the two fixed invariants ([`BIND_HOST`],
+    /// [`DEFAULT_CTX_CAP`]). Pure read — no worker RPC, no mutation.
+    pub fn server_config(&self) -> HiggsServerConfig {
+        let cfg = self.config.lock();
+        let to_strings = |dirs: &[PathBuf]| dirs.iter().map(|p| p.display().to_string()).collect();
+        HiggsServerConfig {
+            bind_host: BIND_HOST.to_owned(),
+            lmstudio_dirs: to_strings(&cfg.lmstudio_dirs),
+            hf_dirs: to_strings(&cfg.hf_dirs),
+            ollama_dirs: to_strings(&cfg.ollama_dirs),
+            default_load: cfg.default_load.clone(),
+            default_ctx_cap: DEFAULT_CTX_CAP,
+        }
     }
 
     /// Test-only: build a `Higgs` over a pre-built (mock) supervisor.

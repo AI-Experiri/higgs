@@ -214,7 +214,8 @@
   │  POST /api/higgs/models/unload │  Unload current (kills worker)│
   │  GET  /api/higgs/status  │  HiggsStatus {worker_alive, loaded, │
   │                          │              models_on_disk}         │
-  │  GET  /api/higgs/system  │  Host CPU/RAM + inference runtime   │
+  │  GET  /api/higgs/system  │  SystemInfo {hardware, runtime,     │
+  │                          │  config: HiggsServerConfig}(read-only)│
   │  GET  /api/higgs/logs    │  Worker stderr tail (?n=200)        │
   │  POST /api/higgs/worker/stop  │  Graceful shutdown (2 s)       │
   │  GET  /api/higgs/version │  Build version + engine info        │

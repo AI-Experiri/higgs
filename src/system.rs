@@ -8,6 +8,7 @@
 use serde::Serialize;
 use sysinfo::System;
 
+use crate::api::HiggsServerConfig;
 use crate::LLAMA_CPP_2_VERSION;
 
 higgs_ts! {
@@ -50,20 +51,27 @@ higgs_ts! {
 }
 
 higgs_ts! {
-    /// Response for `GET /api/higgs/system`: hardware + runtime panels.
+    /// Response for `GET /api/higgs/system`: hardware + runtime + server config.
     #[derive(Debug, Clone, Serialize)]
     pub struct SystemInfo {
         /// Host hardware (CPU, RAM, live load).
         pub hardware: HardwareInfo,
         /// Inference engine + backend.
         pub runtime: RuntimeInfo,
+        /// Read-only effective server config (scan dirs, load defaults, bind host).
+        pub config: HiggsServerConfig,
     }
 }
 
 impl SystemInfo {
     /// Gather a fresh snapshot. Blocking (samples CPU usage over a short
     /// interval) — call from a blocking context, not directly in an async task.
-    pub fn gather() -> Self {
+    ///
+    /// `config` is the read-only server-config snapshot from
+    /// [`Higgs::server_config`](crate::api::Higgs::server_config); it is folded
+    /// in verbatim (no I/O) so the response carries the live scan dirs and load
+    /// defaults alongside the sampled hardware/runtime.
+    pub fn gather(config: HiggsServerConfig) -> Self {
         let mut sys = System::new();
         sys.refresh_memory();
         // CPU usage needs two samples spaced by the platform minimum interval.
@@ -96,6 +104,7 @@ impl SystemInfo {
                 version: crate::worker::engine::llamacpp::engine_version(),
                 binding: LLAMA_CPP_2_VERSION.to_string(),
             },
+            config,
         }
     }
 }
@@ -106,7 +115,8 @@ mod tests {
 
     #[test]
     fn gather_reports_plausible_hardware() {
-        let info = SystemInfo::gather();
+        let cfg = crate::api::Higgs::new(crate::HiggsConfig::default()).server_config();
+        let info = SystemInfo::gather(cfg);
         assert!(!info.hardware.cpu_name.is_empty(), "cpu name present");
         assert!(info.hardware.cpu_cores >= 1, "at least one core");
         assert!(info.hardware.ram_total_bytes > 0, "ram total > 0");
@@ -121,5 +131,9 @@ mod tests {
         );
         assert_eq!(info.runtime.engine, "llama.cpp");
         assert!(!info.runtime.backend.is_empty());
+        // Read-only server config is folded in: bind host is the fixed loopback
+        // invariant and the auto ctx cap is the DEFAULT_CTX_CAP const.
+        assert_eq!(info.config.bind_host, crate::api::BIND_HOST);
+        assert_eq!(info.config.default_ctx_cap, crate::api::DEFAULT_CTX_CAP);
     }
 }

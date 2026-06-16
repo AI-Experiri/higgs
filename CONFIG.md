@@ -3,6 +3,7 @@
 ## Table of Contents
 - [Process & Environment](#process--environment)
 - [HiggsConfig Fields](#higgsconfig-fields)
+- [Effective Config (read-only surface)](#effective-config-read-only-surface)
 - [Model Directory Layouts](#model-directory-layouts)
 - [Build Note: LIBCLANG_PATH](#build-note-libclang_path)
 - [Non-Configurable Defaults](#non-configurable-defaults)
@@ -58,6 +59,22 @@ An embedding host may override any field when it constructs `HiggsConfig`.
 | `default_load.ctx_len` | `u32` | `4096` | Context window tokens for new loads when the caller does not supply params |
 | `default_load.gpu_layers` | `u32` | `u32::MAX` | `u32::MAX` means all layers offloaded (LM Studio "max" semantics) |
 | `default_load.threads` | `u32` | `available_cpus - 2` (min 1) | Worker threads during generation; computed from `std::thread::available_parallelism()` |
+
+---
+
+## Effective Config (read-only surface)
+
+The resolved config is surfaced **read-only** at `GET /api/higgs/system` as the
+`config: HiggsServerConfig` field (alongside `hardware` and `runtime`). It is
+built by `Higgs::server_config()` — a pure read, no worker RPC, no mutation;
+there is **no endpoint to change config**.
+
+| `HiggsServerConfig` field | Source |
+|---------------------------|--------|
+| `bind_host` | `BIND_HOST` const (`api.rs`) — always `"127.0.0.1"` |
+| `lmstudio_dirs` / `hf_dirs` / `ollama_dirs` | the configured scan dirs as path strings |
+| `default_load` | `HiggsConfig.default_load` (`ctx_len`, `gpu_layers`, `threads`) |
+| `default_ctx_cap` | `DEFAULT_CTX_CAP` const (`api.rs`) = `32768` |
 
 ---
 

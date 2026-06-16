@@ -344,6 +344,40 @@ curl http://localhost:8081/api/higgs/status
 
 ---
 
+### GET /api/higgs/system
+
+Host hardware, inference runtime, and the **read-only effective config**. This is
+purely informational — there is **no mutating counterpart**.
+
+**Response (200):**
+
+```json
+{
+  "hardware": { "...": "host CPU / RAM / GPU" },
+  "runtime": { "backend": "llama.cpp", "engine": "...", "version": "...", "binding": "..." },
+  "config": {
+    "bind_host": "127.0.0.1",
+    "lmstudio_dirs": ["/home/user/.cache/lm-studio/models"],
+    "hf_dirs": ["/home/user/.cache/huggingface/hub"],
+    "ollama_dirs": ["/home/user/.ollama/models"],
+    "default_load": { "ctx_len": 4096, "gpu_layers": 4294967295, "threads": 4 },
+    "default_ctx_cap": 32768
+  }
+}
+```
+
+`config` (`HiggsServerConfig`) is built by `Higgs::server_config()` — a pure read,
+no worker RPC. `bind_host` is always `"127.0.0.1"`; `default_ctx_cap` is `32768`
+(the auto-context cap); `gpu_layers: 4294967295` (`u32::MAX`) means "offload all".
+
+**curl:**
+
+```sh
+curl http://localhost:8081/api/higgs/system
+```
+
+---
+
 ### GET /api/higgs/logs
 
 Worker stderr tail. Useful for diagnosing load failures and llama.cpp output.
