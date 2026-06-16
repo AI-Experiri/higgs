@@ -94,11 +94,49 @@ impl Default for HiggsConfig {
 }
 
 higgs_ts! {
+    /// Read-only snapshot of the serve-layer safety limits, surfaced inside
+    /// [`HiggsServerConfig`] so the Server Settings UI can show the actual
+    /// hardening posture of the no-auth loopback server. Every field mirrors a
+    /// documented `const` in this module (or `serve::mod`); none is yet mutable
+    /// at runtime — this is honest disclosure, not a control surface.
+    #[derive(Debug, Clone, serde::Serialize)]
+    pub struct HiggsLimits {
+        /// Max request-body bytes before a `413` (`serve::MAX_BODY_BYTES`).
+        #[ts(type = "number")]
+        pub max_body_bytes: u64,
+        /// Whole-request timeout for the `/api/higgs/*` control surface, in
+        /// seconds (`serve::CONTROL_TIMEOUT`). The streaming `/v1` chat path is
+        /// deliberately un-timed at the HTTP layer.
+        #[ts(type = "number")]
+        pub control_timeout_secs: u64,
+        /// Worker chat-RPC timeout in seconds — the bound on a single generation
+        /// (`supervisor::CHAT_RPC_TIMEOUT`); a timeout is `[HG016]` → 504.
+        #[ts(type = "number")]
+        pub chat_timeout_secs: u64,
+        /// Absolute upper cap on a request's `max_tokens` ([`MAX_OUTPUT_TOKENS`]).
+        #[ts(type = "number")]
+        pub max_output_tokens: u32,
+        /// Max concurrent in-flight chat requests before a `503` busy
+        /// ([`MAX_CONCURRENT_INFERENCE`]).
+        #[ts(type = "number")]
+        pub max_concurrent_inference: u32,
+        /// Fraction of available RAM a load may claim before `[HG017]` → 503
+        /// ([`MEMORY_HEADROOM_FRACTION`]).
+        pub memory_headroom_fraction: f64,
+        /// Idle minutes after which the loaded model is auto-unloaded
+        /// ([`IDLE_UNLOAD_TTL`]).
+        #[ts(type = "number")]
+        pub idle_unload_ttl_secs: u64,
+    }
+}
+
+higgs_ts! {
     /// Read-only snapshot of the server's effective configuration, surfaced at
     /// `GET /api/higgs/system` so the UI can show the real scan dirs, load
-    /// defaults, and bind host without inventing anything. Derived entirely from
-    /// [`HiggsConfig`] plus the two fixed invariants ([`BIND_HOST`],
-    /// [`DEFAULT_CTX_CAP`]); carries no mutable state and no mutating endpoint.
+    /// defaults, bind host, and safety limits without inventing anything. Derived
+    /// entirely from [`HiggsConfig`] plus the fixed invariants ([`BIND_HOST`],
+    /// [`DEFAULT_CTX_CAP`]) and the documented serve-layer limit consts; carries
+    /// no mutable state and no mutating endpoint.
     #[derive(Debug, Clone, serde::Serialize)]
     pub struct HiggsServerConfig {
         /// Loopback host the listener binds to — always [`BIND_HOST`] (localhost).
@@ -115,6 +153,8 @@ higgs_ts! {
         /// model's window is the trained length but never exceeds this.
         #[ts(type = "number")]
         pub default_ctx_cap: u32,
+        /// Serve-layer safety limits (read-only disclosure of the hardening).
+        pub limits: HiggsLimits,
     }
 }
 
@@ -680,6 +720,15 @@ impl Higgs {
             ollama_dirs: to_strings(&cfg.ollama_dirs),
             default_load: cfg.default_load.clone(),
             default_ctx_cap: DEFAULT_CTX_CAP,
+            limits: HiggsLimits {
+                max_body_bytes: crate::serve::MAX_BODY_BYTES as u64,
+                control_timeout_secs: crate::serve::CONTROL_TIMEOUT.as_secs(),
+                chat_timeout_secs: crate::supervisor::CHAT_RPC_TIMEOUT.as_secs(),
+                max_output_tokens: crate::serve::MAX_OUTPUT_TOKENS,
+                max_concurrent_inference: MAX_CONCURRENT_INFERENCE as u32,
+                memory_headroom_fraction: MEMORY_HEADROOM_FRACTION,
+                idle_unload_ttl_secs: IDLE_UNLOAD_TTL.as_secs(),
+            },
         }
     }
 
