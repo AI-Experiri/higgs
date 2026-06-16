@@ -40,10 +40,21 @@ fn main() {
         .init();
 
     let bind = std::env::var("HIGGS_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
-    let port: u16 = std::env::var("HIGGS_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(11434);
+    // Parse HIGGS_PORT; an unset var is silently the default, but a SET-but-bad
+    // value (non-numeric, out of u16 range) is a misconfiguration the operator
+    // must see — warn naming the bad value and the fallback before using 11434.
+    let port: u16 = match std::env::var("HIGGS_PORT") {
+        Ok(raw) => raw.parse().unwrap_or_else(|e| {
+            tracing::warn!(
+                value = %raw,
+                error = %e,
+                fallback = 11434,
+                "HIGGS_PORT is not a valid port — falling back to 11434"
+            );
+            11434
+        }),
+        Err(_) => 11434,
+    };
     let addr = format!("{bind}:{port}");
 
     // SECURITY WARNING on a non-loopback bind (vllm's startup warning). higgs

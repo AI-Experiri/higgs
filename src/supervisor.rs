@@ -166,10 +166,10 @@ struct Inner {
     /// started it through any in-loop restart, until the reader gives up or
     /// `stop()` reaps it. `do_spawn` refuses to start a second worker while
     /// this is set, which guarantees a single reader task: without it, a
-    /// `start()` (e.g. `POST /api/higgs/worker/start`) on a running worker
-    /// would spawn a second reader whose later EOF clears the live worker's
-    /// `write_tx`. Set across restart so the death→respawn window is also
-    /// covered.
+    /// redundant `start_for()` (a `load()` while a worker is already live) on a
+    /// running worker would spawn a second reader whose later EOF clears the live
+    /// worker's `write_tx`. Set across restart so the death→respawn window is
+    /// also covered.
     running: AtomicBool,
     /// mpsc sender into the writer task for the active worker lifetime.
     /// `None` when no worker is live.  Replacing this drops the previous
@@ -205,7 +205,7 @@ pub(crate) struct Supervisor {
 impl Supervisor {
     /// Create a supervisor using the production child-process factory.
     ///
-    /// Does not spawn the worker yet; call `start()`.
+    /// Does not spawn the worker yet; the first `load()` calls `start_for()`.
     pub(crate) fn spawn() -> Self {
         let (events_tx, _) = broadcast::channel(64);
         let inner = Arc::new(Inner {
@@ -343,6 +343,67 @@ impl Supervisor {
     /// sender closes the receiver, signalling end-of-stream to the consumer.
     pub(crate) fn remove_chat_sink(&self, request_id: u64) {
         self.inner.chat_sinks.lock().remove(&request_id);
+    }
+
+    /// Drive one chat (M_CHAT) request end to end, owning the full RPC plumbing.
+    ///
+    /// Returns `(rx, fut)`:
+    /// - `rx` is the per-request delta receiver — its keyed chat sink is
+    ///   registered SYNCHRONOUSLY here (before the request is sent), so a chunk
+    ///   that arrives the instant the worker starts is never dropped. The caller
+    ///   takes `rx` immediately for SSE / streaming.
+    /// - `fut` resolves with the worker's raw final response `Value` (or a typed
+    ///   error). The caller awaits it inside its own spawned task so its
+    ///   admission permit rides the whole generation. The sink is removed on ANY
+    ///   outcome (success, error, or timeout), keeping register→send→cleanup
+    ///   atomic in one place — the facade never touches the sink map, the request
+    ///   id, or `request_with_id`.
+    ///
+    /// `messages_json` is the verbatim OpenAI messages array (carried as a JSON
+    /// string so `tool_calls` / `tool_call_id` survive to the engine's chat
+    /// template); `tools_json` is the optional serialized `tools` array.
+    pub(crate) fn chat(
+        &self,
+        messages_json: String,
+        max_tokens: usize,
+        temperature: f32,
+        tools_json: Option<String>,
+    ) -> (
+        mpsc::UnboundedReceiver<String>,
+        impl std::future::Future<Output = Result<Value, HiggsError>>,
+    ) {
+        // One id for both the RPC frame `id` (response correlation) and the
+        // `request_id` in the params (N_CHAT_CHUNK routing): the worker echoes
+        // params.request_id in every chunk, and `route_notification` looks it up
+        // in `chat_sinks`. Register the sink under that id BEFORE the request is
+        // sent so no early chunk is lost.
+        let request_id = self.alloc_request_id();
+        let rx = self.register_chat_sink(request_id);
+        // The future owns its own `Arc<Inner>` clone so it is `'static` for the
+        // caller's `tokio::spawn`, independent of the `&self` borrow above.
+        let inner = Arc::clone(&self.inner);
+        let fut = async move {
+            let sup = Supervisor { inner };
+            let result = sup
+                .request_with_id(
+                    request_id,
+                    crate::worker::M_CHAT,
+                    serde_json::json!({
+                        "request_id": request_id,
+                        "messages_json": messages_json,
+                        "max_tokens": max_tokens,
+                        "temperature": temperature,
+                        "tools": tools_json,
+                    }),
+                )
+                .await;
+            // Remove the sink on any outcome: success drops the sender (closing
+            // the receiver); failure/timeout closes it too. Atomic with the
+            // register above — both live in this one method.
+            sup.remove_chat_sink(request_id);
+            result
+        };
+        (rx, fut)
     }
 
     /// Gracefully shut down the worker, then wait for the process to exit.
@@ -614,68 +675,96 @@ async fn reader_task(inner: Arc<Inner>, read: ReadHalf) {
 /// Attempt a single respawn: call factory, install new write channel, return
 /// new read half on success.  Returns `None` and exits if factory fails.
 async fn attempt_restart(inner: &Arc<Inner>) -> Option<ReadHalf> {
-    // Stamp the respawned worker's argv0 with the loaded model id (if any) so it
-    // is identifiable in `ps`; the model is still re-loaded via the M_LOAD replay.
+    // Step 1 — build the replacement worker (argv0 stamped with the loaded id).
+    let halves = match spawn_replacement(inner) {
+        Ok(h) => h,
+        Err(e) => {
+            // Terminal factory failure: reap the dead old child and emit the
+            // documented terminal WorkerDied before the reader gives up.
+            warn!(error = %e, "higgs worker respawn failed — giving up");
+            reap_old_child(inner).await;
+            let _ = inner.events_tx.send(HiggsEvent::WorkerDied);
+            return None;
+        }
+    };
+    // Step 2 — stopped-race guard. stop()/unload() may have flipped `stopped`
+    // after the reader's pre-call check but while factory() was spawning. If so,
+    // reap the just-spawned child and abandon the restart WITHOUT installing it
+    // or replaying — never resurrect a worker the user explicitly unloaded.
+    if inner.stopped.load(Ordering::Acquire) {
+        reap_child(halves.proc).await;
+        return None;
+    }
+    // Step 3 — reap the OLD (dead) child and stash the new one so stop() can
+    // later wait on / SIGKILL it.
+    install_child(inner, halves.proc).await;
+    // Step 4 — install the new write channel + writer task (drops the old sender).
+    install_writer(inner, halves.write);
+    // Step 5 — announce the restart, then replay the last load (async, bounded).
+    let _ = inner.events_tx.send(HiggsEvent::WorkerRestarted);
+    info!("higgs worker restarted");
+    replay_load(inner);
+    Some(halves.read)
+}
+
+/// Call the factory for a respawn, stamping the loaded model id into argv0 so
+/// the new worker is identifiable in `ps` (cosmetic — the model still reloads
+/// via the M_LOAD replay). Returns the fresh I/O halves or the spawn error.
+fn spawn_replacement(inner: &Arc<Inner>) -> Result<WorkerHalves, HiggsError> {
     let model = inner
         .last_load
         .lock()
         .as_ref()
         .and_then(|p| p.get("id").and_then(|v| v.as_str()).map(ToOwned::to_owned))
         .unwrap_or_default();
-    match (inner.factory)(inner.stderr_ring.clone(), &model) {
-        Ok(halves) => {
-            // Race guard: stop()/unload() may have set `stopped` after the
-            // reader's pre-call check but while factory() was spawning. If so,
-            // reap the just-spawned child and abandon the restart WITHOUT
-            // installing it or replaying the load — never resurrect a worker the
-            // user explicitly unloaded.
-            if inner.stopped.load(Ordering::Acquire) {
-                if let Some(mut child) = halves.proc {
-                    // start_kill() only sends the signal; wait() reaps so the
-                    // abandoned child never lingers as a zombie (mirrors stop()).
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
-                }
-                return None;
-            }
-            // Stash the restarted child so stop() can later wait on / SIGKILL it.
-            // do_spawn does this for the initial spawn; the respawn path must too,
-            // or a worker restarted after a death would be unreapable by stop().
-            //
-            // First reap the OLD child being overwritten: it already exited (its
-            // EOF is what triggered this restart), but `tokio::process::Child`
-            // does NOT reap on drop, so dropping it without `wait()` leaves a
-            // zombie. Take it out and wait — it returns immediately since the
-            // process is already gone.
-            let mut proc_guard = inner.proc.lock().await;
-            if let Some(mut old) = proc_guard.take() {
-                let _ = old.wait().await;
-            }
-            *proc_guard = halves.proc;
-            drop(proc_guard);
-            let (write_tx, write_rx) = mpsc::unbounded_channel::<String>();
-            *inner.write_tx.lock() = Some(write_tx);
-            tokio::spawn(writer_task(halves.write, write_rx));
-            let _ = inner.events_tx.send(HiggsEvent::WorkerRestarted);
-            info!("higgs worker restarted");
-            replay_load(inner);
-            Some(halves.read)
-        }
-        Err(e) => {
-            warn!(error = %e, "higgs worker respawn failed — giving up");
-            // Reap the OLD child too: its EOF triggered this restart so it has
-            // already exited, but `tokio::process::Child` does not reap on drop —
-            // without `wait()` it lingers as a zombie. (Symmetric to the Ok branch.)
-            let mut proc_guard = inner.proc.lock().await;
-            if let Some(mut old) = proc_guard.take() {
-                let _ = old.wait().await;
-            }
-            drop(proc_guard);
-            // Doc promise: terminal factory failure → broadcasts WorkerDied before exit.
-            let _ = inner.events_tx.send(HiggsEvent::WorkerDied);
-            None
-        }
+    (inner.factory)(inner.stderr_ring.clone(), &model)
+}
+
+/// Reap the OLD child currently stored in `inner.proc` (if any).
+///
+/// Its EOF is what triggered this restart, so it has already exited — but
+/// `tokio::process::Child` does NOT reap on drop, so dropping it without
+/// `wait()` leaves a zombie. `wait()` returns immediately since the process is
+/// already gone.
+async fn reap_old_child(inner: &Arc<Inner>) {
+    let mut proc_guard = inner.proc.lock().await;
+    if let Some(mut old) = proc_guard.take() {
+        let _ = old.wait().await;
     }
+}
+
+/// Force-kill and reap a just-spawned `child` that is being abandoned.
+///
+/// `start_kill()` only sends the signal; `wait()` reaps so the abandoned child
+/// never lingers as a zombie (mirrors `stop()`). `None` (test factory) is a
+/// no-op.
+async fn reap_child(proc: Option<tokio::process::Child>) {
+    if let Some(mut child) = proc {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+    }
+}
+
+/// Reap the OLD child, then stash the NEW one in `inner.proc`.
+///
+/// `do_spawn` does this for the initial spawn; the respawn path must too, or a
+/// worker restarted after a death would be unreapable by `stop()`.
+async fn install_child(inner: &Arc<Inner>, new_proc: Option<tokio::process::Child>) {
+    let mut proc_guard = inner.proc.lock().await;
+    if let Some(mut old) = proc_guard.take() {
+        let _ = old.wait().await;
+    }
+    *proc_guard = new_proc;
+}
+
+/// Install a fresh write channel + writer task for the respawned worker.
+///
+/// Replacing `write_tx` drops the previous sender, signalling the old writer
+/// task to exit; the new writer task owns `write`.
+fn install_writer(inner: &Arc<Inner>, write: WriteHalf) {
+    let (write_tx, write_rx) = mpsc::unbounded_channel::<String>();
+    *inner.write_tx.lock() = Some(write_tx);
+    tokio::spawn(writer_task(write, write_rx));
 }
 
 /// Decode one line and dispatch to the appropriate handler.
@@ -768,6 +857,17 @@ fn replay_load(inner: &Arc<Inner>) {
 
     let inner2 = Arc::clone(inner);
     tokio::spawn(async move {
+        // Residual-TOCTOU close: the reader re-checks `stopped` before installing
+        // the respawned worker, but that check fires before this async replay is
+        // even spawned. A deliberate stop/unload that flips `stopped` in the
+        // narrow window between the install guard and this M_LOAD must NOT
+        // resurrect the model. Re-check here, immediately before the load fires;
+        // an Acquire load pairs with the Release store in `stop()`. (When unload
+        // also cleared `last_load` first, the `let Some` above already returned —
+        // this covers the path where `stopped` flips without that clear.)
+        if inner2.stopped.load(Ordering::Acquire) {
+            return;
+        }
         let id = load_params
             .get("id")
             .and_then(|v| v.as_str())
@@ -786,8 +886,9 @@ fn replay_load(inner: &Arc<Inner>) {
 
 /// Send an RPC request and await its response, correlating via the pending map.
 ///
-/// Used for replay of scan (and any future awaited replay RPC). Returns the
-/// raw result value on success or a typed error on failure.
+/// Used for the post-restart load replay (and any future awaited replay RPC).
+/// Scan is host-side, so restart replays only the load — never a scan. Returns
+/// the raw result value on success or a typed error on failure.
 async fn replay_rpc_await(
     inner: &Arc<Inner>,
     method: &str,
@@ -857,7 +958,7 @@ async fn replay_rpc_await(
 /// Send a `higgs/load` RPC and await its response via the shared replay helper.
 ///
 /// Delegates to [`replay_rpc_await`] with `M_LOAD`; exists as a named function
-/// to keep `replay_scan_then_load` readable.
+/// to keep [`replay_load`] readable.
 async fn replay_load_await(inner: &Arc<Inner>, params: Value) -> Result<(), HiggsError> {
     replay_rpc_await(inner, M_LOAD, params).await.map(|_| ())
 }
@@ -1324,7 +1425,7 @@ mod tests {
         assert_eq!(r.front().unwrap(), "line-100");
     }
 
-    // ─── Test 6: restart replays scan before load and emits ModelLoaded ─────────
+    // ─── Test 6: restart replays the load (scan is host-side) + emits ModelLoaded ─
     //
     // The mock factory hands out two transport pairs:
     //   pair-1: first worker lifetime (killed by dropping test_write_1)
@@ -1442,6 +1543,39 @@ mod tests {
             got_loaded.as_deref(),
             Some("org/model"),
             "ModelLoaded must carry the replayed model id"
+        );
+    }
+
+    /// Residual-TOCTOU close (#1): when `stopped` flips between the restart's
+    /// install guard and the async replay, `replay_load` must abort — no M_LOAD
+    /// frame may reach the (respawned) worker, since the user deliberately
+    /// stopped/unloaded. Drives `replay_load` directly with `stopped` already
+    /// set and asserts nothing is written to the worker transport.
+    #[tokio::test]
+    async fn replay_aborts_when_stopped_flips() {
+        let (sup, _test_write, test_read) = make_supervisor();
+
+        // A load is recorded (as after a normal load) so replay HAS something to
+        // send — proving the abort is driven by `stopped`, not an empty replay.
+        sup.record_last_load(json!({"id": "org/model"}));
+        // Deliberate stop/unload flipped the flag in the TOCTOU window.
+        sup.inner.stopped.store(true, Ordering::Release);
+
+        // Fire the replay: the spawned task re-checks `stopped` before the M_LOAD.
+        replay_load(&sup.inner);
+
+        // Give the spawned task time to run (and to NOT send anything).
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // No frame must have been written to the worker. Read with a short
+        // timeout: a clean abort means the read times out (nothing arrived).
+        use tokio::io::AsyncBufReadExt;
+        let mut lines = BufReader::new(test_read).lines();
+        let got =
+            tokio::time::timeout(std::time::Duration::from_millis(100), lines.next_line()).await;
+        assert!(
+            got.is_err(),
+            "replay must send NO M_LOAD when stopped flipped, but a frame arrived"
         );
     }
 

@@ -47,7 +47,22 @@ launcher), which constructs `Higgs`, serves the router on an ephemeral
 
 ## Higgs Facade API
 
-`Higgs` is the host-facing handle. All state lives in the `Supervisor` behind it.
+`Higgs` is the host-facing handle. State is **split** between the facade and the
+`Supervisor` it wraps — neither owns all of it:
+
+| Owner | State |
+|-------|-------|
+| `Higgs` (facade, `api.rs`) | the live `HiggsConfig`, the load/unload/stop **lifecycle mutex**, the **inference admission gate** (semaphore), the **`last_activity`** idle stamp |
+| `Supervisor` (`supervisor.rs`) | the worker **process** handle, **RPC correlation** (`pending`), per-request **chat sinks**, the stderr **ring**, the **`last_load`** replay params, the `stopped`/`running` lifetime flags |
+
+**Event ownership is split too** (deliberate, so each event is emitted exactly
+once at its true origin):
+
+- the **facade** emits `ModelLoaded` / `ModelUnloaded` after `load()` / `unload()`
+  succeed (it drives those transitions),
+- the **supervisor** emits `WorkerDied` / `WorkerRestarted` from its reader/restart
+  path, and the post-restart `ModelLoaded` from the load **replay** (it owns the
+  death→respawn lifecycle the facade never sees).
 
 | Method | What it does |
 |--------|-------------|

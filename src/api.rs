@@ -1,8 +1,11 @@
 //! `Higgs` public facade and `HiggsConfig` — the host-facing API.
 //!
-//! One `Higgs` instance per host app. Thin typed delegation over
-//! [`Supervisor`](crate::supervisor::Supervisor); all state lives in the
-//! supervisor. The host maps its own config table onto [`HiggsConfig`].
+//! One `Higgs` instance per host app. Typed facade over
+//! [`Supervisor`](crate::supervisor::Supervisor): `Higgs` owns the facade-level
+//! state (config, the load/unload lifecycle mutex, the inference admission gate,
+//! the idle `last_activity` stamp) and delegates worker process management, RPC
+//! correlation, and load-replay state to the supervisor. The host maps its own
+//! config table onto [`HiggsConfig`].
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,7 +18,7 @@ use crate::diagnostic::HiggsError;
 use crate::supervisor::{HiggsEvent, Supervisor};
 use crate::worker::engine::LoadParams;
 use crate::worker::models::HiggsModel;
-use crate::worker::{M_CHAT, M_LOAD, M_STATUS, M_UNLOAD};
+use crate::worker::{M_LOAD, M_STATUS, M_UNLOAD};
 
 // ── HiggsConfig ───────────────────────────────────────────────────────────────
 
@@ -236,10 +239,6 @@ pub struct ChatOutcome {
 
 // ── Higgs ─────────────────────────────────────────────────────────────────────
 
-/// The in-process handle to the higgs runtime. One instance per host app.
-///
-/// Constructing `Higgs` does not start the worker; call [`start`](Self::start)
-/// when the host is ready to serve requests.
 /// Default context-window cap used when a load does not pin `ctx_len`: the
 /// model's trained context is used but never exceeds this, so a huge-context
 /// model doesn't allocate an enormous KV cache by default. A caller (the UI)
@@ -301,6 +300,16 @@ pub const IDLE_UNLOAD_TTL: std::time::Duration = std::time::Duration::from_secs(
 /// interval. Grouped with the other Phase B knobs for a later config lift.
 pub const IDLE_REAP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// The in-process handle to the higgs runtime. One instance per host app.
+///
+/// The host-facing facade over the [`Supervisor`]. `Higgs` owns the facade-level
+/// state — the live [`HiggsConfig`], the `lifecycle` mutex that serializes
+/// load/unload/stop, the `inference_gate` admission semaphore, and the
+/// `last_activity` stamp the idle reaper reads — while the [`Supervisor`] owns
+/// the worker process, RPC correlation, and the load-replay state. Constructing
+/// `Higgs` does not start the worker; call [`start`](Self::start) when the host
+/// is ready to serve requests (a worker is spawned lazily on the first
+/// [`load`](Self::load)).
 pub struct Higgs {
     sup: Arc<Supervisor>,
     config: parking_lot::Mutex<HiggsConfig>,
@@ -398,72 +407,18 @@ impl Higgs {
         // kill-on-unload must never interleave (protects last_load and the
         // supervisor proc handle). Held for the entire method body.
         let _lifecycle = self.lifecycle.lock().await;
-        // Charset guard: reject a repo id with traversal/escape characters before
-        // it is ever used to resolve a path. A `..`/absolute/NUL id must never
-        // reach the filesystem. [HG015] → 400.
-        validate_repo_id(id)?;
+        // load() reads as a sequence of named guard/resolve steps; each helper
+        // keeps the exact same order and diagnostic codes as before.
         let explicit_params = params.is_some();
         let mut p = params.unwrap_or_else(|| self.config.lock().default_load.clone());
-        // Scan moved host-side, so the worker's ModelStore is empty on a fresh
-        // spawn-on-load worker: resolve the model HERE and carry the GGUF path in
-        // the M_LOAD params. Without this the worker's `store.get(id)` returns
-        // HG002 for every normal load. Take the first matching model.
-        let model = self
-            .scan()
-            .await?
-            .into_iter()
-            .find(|m| m.id == id)
-            .ok_or_else(|| HiggsError::ModelNotFound { id: id.to_owned() })?;
-        // Path-traversal guard: the resolved GGUF path MUST canonicalize to a
-        // location inside one of the configured scan roots. The path comes from a
-        // host-side scan of those roots, so this holds for every legitimate load;
-        // the check rejects any path that escapes the roots (symlink/`..` escape)
-        // before it is sent to the worker for FFI loading. [HG015] → 400.
-        {
-            let scan_roots: Vec<PathBuf> = {
-                let cfg = self.config.lock();
-                cfg.lmstudio_dirs
-                    .iter()
-                    .chain(cfg.hf_dirs.iter())
-                    .chain(cfg.ollama_dirs.iter())
-                    .cloned()
-                    .collect()
-            };
-            if !path_within_roots(&model.path, &scan_roots) {
-                return Err(HiggsError::InvalidModelId {
-                    id: id.to_owned(),
-                    reason: format!(
-                        "resolved path {} is outside every configured scan directory",
-                        model.path
-                    ),
-                });
-            }
-        }
-        // Pre-load RAM headroom guard: refuse a load whose estimated memory need
-        // (the GGUF file size on disk, a lower-bound proxy for resident weights)
-        // exceeds MEMORY_HEADROOM_FRACTION of currently-available system RAM.
-        // Checked here — before spawning a worker — so an oversized load fails
-        // fast with [HG017] → 503 (retryable) instead of OOM-killing the worker
-        // (which would surface as an opaque [HG004]/[HG006]). The same `sysinfo`
-        // path that backs `GET /api/higgs/system` reads available memory.
-        {
-            let needed = model.size_bytes;
-            let available = available_system_memory();
-            if !fits_in_memory(needed, available) {
-                warn!(
-                    id,
-                    needed_bytes = needed,
-                    available_bytes = available,
-                    "higgs: refusing load — insufficient memory headroom"
-                );
-                return Err(HiggsError::InsufficientMemory {
-                    id: id.to_owned(),
-                    needed_bytes: needed,
-                    available_bytes: available,
-                    headroom_fraction: MEMORY_HEADROOM_FRACTION,
-                });
-            }
-        }
+        // 1. Charset guard ([HG015]) — reject traversal/escape ids before any FS use.
+        validate_repo_id(id)?;
+        // 2. Scan host-side and resolve the GGUF path ([HG002] if not found).
+        let model = self.resolve_model(id).await?;
+        // 3. Path-traversal guard ([HG015]) — resolved path must stay inside the roots.
+        self.guard_path_within_roots(id, &model.path)?;
+        // 4. Pre-load RAM headroom guard ([HG017]) — refuse before spawning a worker.
+        guard_memory_headroom(id, model.size_bytes)?;
         // When the caller didn't pin ctx_len, default it to the model's trained
         // context (capped at DEFAULT_CTX_CAP) rather than the hardcoded 4096 —
         // otherwise an agent asking for a large max_tokens overflows n_ctx
@@ -624,41 +579,21 @@ impl Higgs {
                 in_flight: MAX_CONCURRENT_INFERENCE,
                 max: MAX_CONCURRENT_INFERENCE,
             })?;
-        // Allocate the request id first so the same id is used for both:
-        //   (a) the M_CHAT RPC frame's `id` field (for response correlation), and
-        //   (b) the `request_id` in the M_CHAT params (for N_CHAT_CHUNK routing).
-        // The worker echoes params.request_id in every N_CHAT_CHUNK notification;
-        // `route_notification` looks up this id in `chat_sinks` to deliver each
-        // delta to the correct caller's receiver.
-        let request_id = self.sup.alloc_request_id();
-        let rx = self.sup.register_chat_sink(request_id);
-        let sup = Arc::clone(&self.sup);
-
+        // Mint the request, register its keyed sink, and obtain a future that
+        // drives the M_CHAT RPC to completion and removes the sink on any
+        // outcome — all of it lives in `Supervisor::chat` so this facade does not
+        // touch request-id minting, the sink map, or `request_with_id` directly.
+        // `rx` is returned to the caller now; `call` is awaited inside the spawned
+        // generation task (so the admission permit, kept here, rides it).
+        let (rx, call) = self
+            .sup
+            .chat(messages_json, max_tokens, temperature, tools_json);
         let handle = tokio::spawn(async move {
             // Hold the admission permit for the whole generation; dropping it
             // here (on any return path) releases the gate slot. Bound to a name
             // so it is not dropped early.
             let _permit = permit;
-            let result = sup
-                .request_with_id(
-                    request_id,
-                    M_CHAT,
-                    json!({
-                        "request_id": request_id,
-                        // Raw OpenAI messages array (serialized verbatim by the
-                        // serve layer) carried as a JSON string so tool_calls /
-                        // tool_call_id survive to the engine's chat template.
-                        "messages_json": messages_json,
-                        "max_tokens": max_tokens,
-                        "temperature": temperature,
-                        "tools": tools_json,
-                    }),
-                )
-                .await;
-
-            // Remove the sink on any outcome: on success the sender is dropped
-            // (closing the receiver); on failure the receiver is also closed.
-            sup.remove_chat_sink(request_id);
+            let result = call.await;
 
             let result = result?;
 
@@ -755,6 +690,47 @@ impl Higgs {
 
     // ── private ───────────────────────────────────────────────────────────────
 
+    /// Resolve a model id to its scanned [`HiggsModel`] (with the GGUF path).
+    ///
+    /// Scan moved host-side, so the worker's `ModelStore` is empty on a fresh
+    /// spawn-on-load worker: the model is resolved HERE and its GGUF path carried
+    /// in the M_LOAD params. Without this the worker's `store.get(id)` returns
+    /// HG002 for every normal load. Takes the first matching model; returns
+    /// `Err` [HG002] `ModelNotFound` when no scanned model has this id.
+    async fn resolve_model(&self, id: &str) -> Result<HiggsModel, HiggsError> {
+        self.scan()
+            .await?
+            .into_iter()
+            .find(|m| m.id == id)
+            .ok_or_else(|| HiggsError::ModelNotFound { id: id.to_owned() })
+    }
+
+    /// Reject a resolved GGUF `path` that escapes every configured scan root.
+    ///
+    /// The path comes from a host-side scan of those roots, so this holds for
+    /// every legitimate load; the check rejects any path that escapes the roots
+    /// (symlink/`..` escape) before it is sent to the worker for FFI loading.
+    /// `Err` [HG015] `InvalidModelId` on an escape.
+    fn guard_path_within_roots(&self, id: &str, path: &str) -> Result<(), HiggsError> {
+        let scan_roots: Vec<PathBuf> = {
+            let cfg = self.config.lock();
+            cfg.lmstudio_dirs
+                .iter()
+                .chain(cfg.hf_dirs.iter())
+                .chain(cfg.ollama_dirs.iter())
+                .cloned()
+                .collect()
+        };
+        if path_within_roots(path, &scan_roots) {
+            Ok(())
+        } else {
+            Err(HiggsError::InvalidModelId {
+                id: id.to_owned(),
+                reason: format!("resolved path {path} is outside every configured scan directory"),
+            })
+        }
+    }
+
     /// Best-effort: ask the worker for the currently loaded model id.
     async fn loaded_id(&self) -> Option<String> {
         let v = self
@@ -845,6 +821,32 @@ fn fits_in_memory(needed_bytes: u64, available_bytes: u64) -> bool {
     #[allow(clippy::cast_precision_loss)]
     let safe = (available_bytes as f64) * MEMORY_HEADROOM_FRACTION;
     (needed_bytes as f64) <= safe
+}
+
+/// Pre-load RAM headroom guard: refuse a load whose estimated memory need
+/// (`needed_bytes`, the GGUF file size on disk — a lower-bound proxy for
+/// resident weights) exceeds [`MEMORY_HEADROOM_FRACTION`] of currently-available
+/// system RAM. Checked before spawning a worker so an oversized load fails fast
+/// with `Err` [HG017] `InsufficientMemory` → 503 (retryable) instead of
+/// OOM-killing the worker (an opaque [HG004]/[HG006]). The same `sysinfo` path
+/// that backs `GET /api/higgs/system` reads available memory.
+fn guard_memory_headroom(id: &str, needed_bytes: u64) -> Result<(), HiggsError> {
+    let available = available_system_memory();
+    if fits_in_memory(needed_bytes, available) {
+        return Ok(());
+    }
+    warn!(
+        id,
+        needed_bytes,
+        available_bytes = available,
+        "higgs: refusing load — insufficient memory headroom"
+    );
+    Err(HiggsError::InsufficientMemory {
+        id: id.to_owned(),
+        needed_bytes,
+        available_bytes: available,
+        headroom_fraction: MEMORY_HEADROOM_FRACTION,
+    })
 }
 
 /// Idle reaper: every [`IDLE_REAP_INTERVAL`], unload the loaded model once the

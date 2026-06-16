@@ -11,7 +11,13 @@ use crate::diagnostic::HiggsError;
 /// A JSON-RPC request (has an id; expects a response).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RpcRequest {
+    /// JSON-RPC protocol version — always `"2.0"`. Validated softly on decode
+    /// (see [`decode`]): a mismatch is logged, not rejected, because both peers
+    /// are the same binary and dropping the frame would wedge the RPC loop.
     pub jsonrpc: String,
+    /// Request correlation id. The supervisor's reader matches a response's
+    /// `id` back to the waiting caller (`pending[id]`); for M_CHAT the same id
+    /// also flows in `params.request_id` so chat chunks route to the right sink.
     pub id: u64,
     pub method: String,
     #[serde(default, skip_serializing_if = "Value::is_null")]
@@ -21,7 +27,10 @@ pub struct RpcRequest {
 /// A JSON-RPC response carrying either `result` or `error`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RpcResponse {
+    /// JSON-RPC protocol version — always `"2.0"` (softly validated; see
+    /// [`RpcRequest::jsonrpc`]).
     pub jsonrpc: String,
+    /// Correlation id echoed from the originating [`RpcRequest::id`].
     pub id: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
@@ -45,6 +54,8 @@ pub struct RpcError {
 /// A JSON-RPC notification (no id; fire-and-forget — used for chat chunks).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RpcNotification {
+    /// JSON-RPC protocol version — always `"2.0"` (softly validated; see
+    /// [`RpcRequest::jsonrpc`]).
     pub jsonrpc: String,
     pub method: String,
     #[serde(default, skip_serializing_if = "Value::is_null")]
@@ -72,10 +83,24 @@ pub fn encode(frame: &RpcFrame) -> String {
 /// Decode one NDJSON line into a frame.
 ///
 /// Fails with [HG008] when the line is not valid JSON-RPC 2.0.
+///
+/// The `jsonrpc` version is validated **softly**: a value other than `"2.0"`
+/// is logged at `warn` but the frame is still decoded. Both peers are the same
+/// binary, so a version mismatch is a bug to surface, not a wire condition to
+/// hard-reject — dropping the frame would wedge the RPC loop (no response ever
+/// drains the caller's `pending` entry).
 pub fn decode(line: &str) -> Result<RpcFrame, HiggsError> {
     let v: Value = serde_json::from_str(line).map_err(|e| HiggsError::RpcDecode {
         detail: format!("not json: {e}"),
     })?;
+    if let Some(ver) = v.get("jsonrpc").and_then(Value::as_str) {
+        if ver != "2.0" {
+            tracing::warn!(
+                jsonrpc = ver,
+                "higgs: unexpected JSON-RPC version (expected 2.0)"
+            );
+        }
+    }
     let has_id = v.get("id").is_some();
     let has_method = v.get("method").is_some();
     let parse = |detail: &str| HiggsError::RpcDecode {
@@ -150,5 +175,14 @@ mod tests {
     fn garbage_is_hg008() {
         let err = decode("{not json").unwrap_err();
         assert!(err.to_string().starts_with("[HG008]"));
+    }
+
+    #[test]
+    fn wrong_jsonrpc_version_decodes_softly() {
+        // A mismatched version is logged (soft check) but still decodes — a hard
+        // reject would wedge the RPC loop since both peers are the same binary.
+        let line = r#"{"jsonrpc":"1.0","id":1,"method":"higgs/ping","params":null}"#;
+        let frame = decode(line).expect("soft version check must not reject the frame");
+        assert!(matches!(frame, RpcFrame::Request(_)));
     }
 }
