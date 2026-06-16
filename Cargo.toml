@@ -49,6 +49,9 @@ tower-http = { version = "0.6", features = ["cors", "catch-panic", "limit", "tim
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
+# test-util: paused-clock control (tokio::time::advance) so the 600 s chat-RPC
+# timeout test elapses instantly instead of waiting in real time.
+tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

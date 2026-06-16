@@ -59,22 +59,54 @@ pub const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 /// chat-RPC timeout, a different layer).
 pub const CONTROL_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Upper cap on a chat request's generation budget (`max_tokens` /
+/// `max_completion_tokens`). A request asking for more is rejected with
+/// `400 [HG013]` BEFORE dispatch. Bounds per-request work on the no-auth server
+/// (a single request can't pin the worker generating millions of tokens) and
+/// keeps the prompt+budget fit-check meaningful. vllm/ollama bound output via
+/// `max_tokens` against the model context window rather than a fixed ceiling;
+/// higgs additionally enforces this absolute cap so the bound holds regardless
+/// of the loaded model. 32768 matches [`DEFAULT_CTX_CAP`] — no single response
+/// should exceed the default context window. Documented `const`, grouped for a
+/// later config lift.
+///
+/// [`DEFAULT_CTX_CAP`]: crate::api::DEFAULT_CTX_CAP
+pub const MAX_OUTPUT_TOKENS: u32 = 32_768;
+
+/// Conservative bytes-per-token ratio for the serve-layer prompt-length
+/// pre-check. The serve layer has no tokenizer (real tokenization needs the
+/// loaded model and happens worker-side, where the authoritative `[HG005]`
+/// context-overflow check runs — see `worker/engine/llamacpp.rs`). This ratio
+/// gives a cheap LOWER bound on token count from the prompt byte length so an
+/// obviously-too-large prompt is rejected early with `400 [HG005]` instead of
+/// being shipped to the worker. 4 bytes/token is the standard conservative
+/// English-text estimate (OpenAI's published rule of thumb); using it as a
+/// divisor under-counts tokens, so the early reject only fires when the prompt
+/// is unambiguously over the window — the worker remains the precise backstop.
+pub const PROMPT_BYTES_PER_TOKEN: usize = 4;
+
 // The control wire structs are part of this module's public surface (and the
 // ts-rs export path), so re-export them at `crate::serve::*`.
 pub use wire::*;
 
 /// Map a `HiggsError` to its HTTP status — the single status table shared by
-/// both surfaces and the SSE path: HG002/HG003 → 404, HG005 → 400,
-/// HG006/HG007 → 503, else 500.
+/// both surfaces and the SSE path: HG002/HG003 → 404, HG005/HG013/HG015 → 400,
+/// HG006/HG007/HG014 → 503, HG016 → 504, else 500.
 pub(crate) fn http_status(err: &HiggsError) -> StatusCode {
     match err {
         HiggsError::ModelNotFound { .. } | HiggsError::ModelNotLoaded { .. } => {
             StatusCode::NOT_FOUND
         }
-        HiggsError::ContextOverflow { .. } => StatusCode::BAD_REQUEST,
-        HiggsError::WorkerSpawnFailed { .. } | HiggsError::WorkerDead { .. } => {
-            StatusCode::SERVICE_UNAVAILABLE
-        }
+        // Client-side request errors caught at the boundary before dispatch.
+        HiggsError::ContextOverflow { .. }
+        | HiggsError::InvalidSamplingParam { .. }
+        | HiggsError::InvalidModelId { .. } => StatusCode::BAD_REQUEST,
+        // Capacity / infrastructure-down — retryable.
+        HiggsError::WorkerSpawnFailed { .. }
+        | HiggsError::WorkerDead { .. }
+        | HiggsError::ServerBusy { .. } => StatusCode::SERVICE_UNAVAILABLE,
+        // A wedged-but-alive worker that didn't finish generation in time.
+        HiggsError::ChatTimeout { .. } => StatusCode::GATEWAY_TIMEOUT,
         // A worker-reported error carries the worker's origin diagnostic code;
         // map by it so a worker-side HG002/HG003/HG005/HG006/HG007 reaches the
         // client as its true status instead of a generic 500.
@@ -639,6 +671,34 @@ mod tests {
                 source: std::io::Error::other("boom"),
             }),
             StatusCode::SERVICE_UNAVAILABLE
+        );
+        // Phase A2 hardening codes.
+        assert_eq!(
+            http_status(&HiggsError::InvalidSamplingParam {
+                param: "top_p".into(),
+                detail: "must be in (0, 1]".into(),
+            }),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            http_status(&HiggsError::InvalidModelId {
+                id: "../x".into(),
+                reason: "traversal".into(),
+            }),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            http_status(&HiggsError::ServerBusy {
+                in_flight: 8,
+                max: 8,
+            }),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            http_status(&HiggsError::ChatTimeout {
+                elapsed: std::time::Duration::from_secs(600),
+            }),
+            StatusCode::GATEWAY_TIMEOUT
         );
     }
 

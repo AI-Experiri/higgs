@@ -61,6 +61,24 @@ const WORKER_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// already capped by `max_tokens` and streams progress chunks.
 const CONTROL_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// Bound on a single chat/inference RPC (M_CHAT) round-trip. Distinct from
+/// [`CONTROL_RPC_TIMEOUT`] and far more generous: generation is long-running and
+/// streams progress chunks, so a wedged chat must be tolerated far longer than a
+/// scan/load/status control round-trip. The bound still exists so a worker that
+/// is ALIVE but wedged mid-generation (an FFI call hung inside llama.cpp, no
+/// further chunks, no final response) can never hang the caller — and thus the
+/// HTTP connection — forever: without it, `rx.await` blocks indefinitely since
+/// no EOF arrives to drain `pending`. This is the layer that bounds streaming
+/// chat duration; the HTTP layer deliberately does NOT time
+/// `/v1/chat/completions` (a long SSE stream must outlive any per-request HTTP
+/// timeout). On expiry the caller gets [`HiggsError::ChatTimeout`] → HTTP 504.
+/// 10 minutes covers a very long large-model generation while still bounding a
+/// hang; no reference fixes a chat-RPC ceiling (vllm/ollama bound per-request
+/// output via `max_tokens`, which higgs also caps), so this is the documented
+/// higgs value, grouped with the other serve-layer limits for a later config
+/// lift.
+pub(crate) const CHAT_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
 higgs_ts! {
     /// Events the host application subscribes to.
     #[derive(Debug, Clone, serde::Serialize)]
@@ -282,17 +300,29 @@ impl Supervisor {
         }
     }
 
-    /// Send a request using a pre-allocated id.
+    /// Send a request using a pre-allocated id, bounded by [`CHAT_RPC_TIMEOUT`].
     ///
     /// Used for M_CHAT so the caller can register the chat sink under the
     /// SAME id before sending the request — ensuring chunk routing matches.
+    /// On timeout the orphaned `pending[id]` entry is removed (so it doesn't
+    /// leak — no EOF arrives to drain it for an alive-but-wedged worker) and
+    /// [`HiggsError::ChatTimeout`] is returned, mapping to HTTP 504.
     pub(crate) async fn request_with_id(
         &self,
         id: u64,
         method: &str,
         params: Value,
     ) -> Result<Value, HiggsError> {
-        self.send_request(id, method, params).await
+        match tokio::time::timeout(CHAT_RPC_TIMEOUT, self.send_request(id, method, params)).await {
+            Ok(result) => result,
+            Err(_) => {
+                self.inner.pending.lock().remove(&id);
+                warn!(method, "higgs: chat RPC timed out");
+                Err(HiggsError::ChatTimeout {
+                    elapsed: CHAT_RPC_TIMEOUT,
+                })
+            }
+        }
     }
 
     /// Register a per-request chat-chunk receiver keyed by `request_id`.
@@ -893,6 +923,7 @@ fn production_factory(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worker::M_CHAT;
     use serde_json::json;
 
     // ── Test seam ─────────────────────────────────────────────────────────────
@@ -1228,6 +1259,27 @@ mod tests {
             matches!(second_died, Ok(true)),
             "second WorkerDied event expected (factory failure)"
         );
+    }
+
+    // ─── Test 3-b: chat RPC times out → HG016 ChatTimeout ────────────────────
+    //
+    // Uses a paused clock so the 600 s CHAT_RPC_TIMEOUT elapses instantly. The
+    // worker never responds; request_with_id must remove its pending entry and
+    // return ChatTimeout (→ 504), not hang.
+
+    #[tokio::test(start_paused = true)]
+    async fn chat_rpc_times_out() {
+        let (sup, _test_write, _test_read) = make_supervisor();
+        // Pre-allocate the id the way the chat path does.
+        let id = sup.alloc_request_id();
+        let fut = sup.request_with_id(id, M_CHAT, json!({"request_id": id}));
+        // Advance past the chat-RPC timeout with no response written.
+        tokio::time::advance(CHAT_RPC_TIMEOUT + std::time::Duration::from_secs(1)).await;
+        let err = fut.await.expect_err("must time out");
+        assert!(matches!(err, HiggsError::ChatTimeout { .. }), "got {err}");
+        assert!(err.to_string().starts_with("[HG016]"));
+        // The orphaned pending entry was removed (no leak).
+        assert!(sup.inner.pending.lock().is_empty());
     }
 
     // ─── Test 4: worker RPC error maps to HG009 ──────────────────────────────

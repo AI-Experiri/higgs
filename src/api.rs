@@ -214,12 +214,33 @@ pub const DEFAULT_CTX_CAP: u32 = 32_768;
 /// honestly. Single home for the bind host.
 pub const BIND_HOST: &str = "127.0.0.1";
 
+/// Maximum number of chat/inference requests admitted concurrently. The worker
+/// executes generations serially (single-threaded stdin loop — see
+/// `concurrency.md`), so additional admitted requests queue at the worker; this
+/// gate caps how many may queue at once so the no-auth loopback server can't be
+/// flooded into unbounded memory/queue growth. A full gate returns
+/// [`HiggsError::ServerBusy`] → HTTP 503 (vllm/ollama "all slots busy" capacity
+/// signal). Scoped to the inference path only (control RPCs are unaffected).
+///
+/// 8 is the documented higgs value: generous headroom above the single-sequence
+/// worker (ollama's `OLLAMA_NUM_PARALLEL` default is 1, `OLLAMA_MAX_QUEUE` 512)
+/// while still bounding a flood. Grouped here with the other serve-layer limits
+/// for a later lift into `HiggsConfig` + the Server Settings UI; the true
+/// parallel-execution work (`max_concurrent_requests` in `concurrency.md`) is a
+/// separate, deferred effort and does not change this admission ceiling.
+pub const MAX_CONCURRENT_INFERENCE: usize = 8;
+
 pub struct Higgs {
     sup: Arc<Supervisor>,
     config: parking_lot::Mutex<HiggsConfig>,
     /// Serializes load/unload so spawn-on-load and kill-on-unload never
     /// interleave (protects last_load and the supervisor proc handle).
     lifecycle: tokio::sync::Mutex<()>,
+    /// Inference admission gate — at most [`MAX_CONCURRENT_INFERENCE`] chat
+    /// requests in flight. A `try_acquire_owned` failure on the chat path is a
+    /// [`HiggsError::ServerBusy`] (HTTP 503); the owned permit rides the spawned
+    /// generation task and releases on its completion (success/error/timeout).
+    inference_gate: Arc<tokio::sync::Semaphore>,
 }
 
 impl Higgs {
@@ -231,6 +252,7 @@ impl Higgs {
             sup: Arc::new(Supervisor::spawn()),
             config: parking_lot::Mutex::new(config),
             lifecycle: tokio::sync::Mutex::new(()),
+            inference_gate: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_INFERENCE)),
         }
     }
 
@@ -292,6 +314,10 @@ impl Higgs {
         // kill-on-unload must never interleave (protects last_load and the
         // supervisor proc handle). Held for the entire method body.
         let _lifecycle = self.lifecycle.lock().await;
+        // Charset guard: reject a repo id with traversal/escape characters before
+        // it is ever used to resolve a path. A `..`/absolute/NUL id must never
+        // reach the filesystem. [HG015] → 400.
+        validate_repo_id(id)?;
         let explicit_params = params.is_some();
         let mut p = params.unwrap_or_else(|| self.config.lock().default_load.clone());
         // Scan moved host-side, so the worker's ModelStore is empty on a fresh
@@ -304,6 +330,31 @@ impl Higgs {
             .into_iter()
             .find(|m| m.id == id)
             .ok_or_else(|| HiggsError::ModelNotFound { id: id.to_owned() })?;
+        // Path-traversal guard: the resolved GGUF path MUST canonicalize to a
+        // location inside one of the configured scan roots. The path comes from a
+        // host-side scan of those roots, so this holds for every legitimate load;
+        // the check rejects any path that escapes the roots (symlink/`..` escape)
+        // before it is sent to the worker for FFI loading. [HG015] → 400.
+        {
+            let scan_roots: Vec<PathBuf> = {
+                let cfg = self.config.lock();
+                cfg.lmstudio_dirs
+                    .iter()
+                    .chain(cfg.hf_dirs.iter())
+                    .chain(cfg.ollama_dirs.iter())
+                    .cloned()
+                    .collect()
+            };
+            if !path_within_roots(&model.path, &scan_roots) {
+                return Err(HiggsError::InvalidModelId {
+                    id: id.to_owned(),
+                    reason: format!(
+                        "resolved path {} is outside every configured scan directory",
+                        model.path
+                    ),
+                });
+            }
+        }
         // When the caller didn't pin ctx_len, default it to the model's trained
         // context (capped at DEFAULT_CTX_CAP) rather than the hardcoded 4096 —
         // otherwise an agent asking for a large max_tokens overflows n_ctx
@@ -441,6 +492,17 @@ impl Higgs {
         ),
         HiggsError,
     > {
+        // Admission gate: bound concurrent in-flight inference so the no-auth
+        // server can't be flooded. A full gate is a capacity signal (HTTP 503),
+        // not a failure — the client may retry. The owned permit is moved into
+        // the spawned generation task below so it is held for the WHOLE request
+        // (queue wait + generation) and released on any outcome.
+        let permit = Arc::clone(&self.inference_gate)
+            .try_acquire_owned()
+            .map_err(|_| HiggsError::ServerBusy {
+                in_flight: MAX_CONCURRENT_INFERENCE,
+                max: MAX_CONCURRENT_INFERENCE,
+            })?;
         // Allocate the request id first so the same id is used for both:
         //   (a) the M_CHAT RPC frame's `id` field (for response correlation), and
         //   (b) the `request_id` in the M_CHAT params (for N_CHAT_CHUNK routing).
@@ -452,6 +514,10 @@ impl Higgs {
         let sup = Arc::clone(&self.sup);
 
         let handle = tokio::spawn(async move {
+            // Hold the admission permit for the whole generation; dropping it
+            // here (on any return path) releases the gate slot. Bound to a name
+            // so it is not dropped early.
+            let _permit = permit;
             let result = sup
                 .request_with_id(
                     request_id,
@@ -552,6 +618,7 @@ impl Higgs {
             sup,
             config: parking_lot::Mutex::new(config),
             lifecycle: tokio::sync::Mutex::new(()),
+            inference_gate: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_INFERENCE)),
         }
     }
 
@@ -566,6 +633,65 @@ impl Higgs {
             .ok()?;
         v.get("loaded")?.get("id")?.as_str().map(ToOwned::to_owned)
     }
+}
+
+/// Validate a model id's charset before it is used to resolve a filesystem path.
+///
+/// Identity is the HuggingFace repo id (`org/model`); Ollama-sourced ids keep
+/// their `ollama/{name}:{tag}` form (see [`HiggsModel::id`]). The accepted
+/// charset mirrors ollama's byte-level name validation
+/// (`types/model/name.go`): ASCII alphanumerics plus `_ - . / :`. The structural
+/// separators `/` (org/model) and `:` (ollama tag) are permitted, but a path
+/// component of exactly `..` is rejected outright — that is the traversal vector
+/// — as are empty ids and absolute paths. `Err(HiggsError::InvalidModelId)` (→
+/// 400) on any violation.
+fn validate_repo_id(id: &str) -> Result<(), HiggsError> {
+    let reject = |reason: &str| {
+        Err(HiggsError::InvalidModelId {
+            id: id.to_owned(),
+            reason: reason.to_owned(),
+        })
+    };
+    if id.is_empty() {
+        return reject("id is empty");
+    }
+    if id.starts_with('/') || id.starts_with('\\') {
+        return reject("id must not be an absolute path");
+    }
+    if id.contains('\0') {
+        return reject("id contains a NUL byte");
+    }
+    for ch in id.chars() {
+        let ok = ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | ':');
+        if !ok {
+            return reject(&format!("id contains an illegal character {ch:?}"));
+        }
+    }
+    // A `..` path component is the traversal vector — reject it even though its
+    // bytes are individually legal. Split on both separators a path may use.
+    if id.split(['/', '\\']).any(|seg| seg == "..") {
+        return reject("id contains a `..` path component");
+    }
+    Ok(())
+}
+
+/// Whether `path` canonicalizes to a location inside one of `roots`.
+///
+/// Both sides are canonicalized (resolving symlinks and `..`) before the prefix
+/// comparison, so a symlink or `..` that escapes a root is caught. A root that
+/// does not exist on disk is skipped (a missing scan dir is legitimate — see
+/// `HiggsConfig`). Returns `false` when `path` itself cannot be canonicalized
+/// (e.g. it does not exist) — a non-existent resolved model path is not a valid
+/// load target.
+fn path_within_roots(path: &str, roots: &[PathBuf]) -> bool {
+    let Ok(canon_path) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    roots.iter().any(|root| {
+        std::fs::canonicalize(root)
+            .map(|canon_root| canon_path.starts_with(&canon_root))
+            .unwrap_or(false)
+    })
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -636,6 +762,113 @@ mod tests {
             .await
             .unwrap();
         stream.flush().await.unwrap();
+    }
+
+    // ── Phase A2: repo-id charset + path-traversal guards ────────────────────
+
+    #[test]
+    fn validate_repo_id_accepts_legitimate_ids() {
+        for id in [
+            "org/model",
+            "lmstudio-community/NVIDIA-Nemotron-3-Nano-4B-GGUF",
+            "ollama/llama3:8b",
+            "google/gemma-3.1-12b",
+        ] {
+            validate_repo_id(id).unwrap_or_else(|e| panic!("{id} should be valid: {e}"));
+        }
+    }
+
+    #[test]
+    fn validate_repo_id_rejects_traversal_and_illegal() {
+        for (id, why) in [
+            ("", "empty"),
+            ("/etc/passwd", "absolute"),
+            ("..", "dotdot"),
+            ("org/../../etc/passwd", "embedded dotdot"),
+            ("org/model;rm -rf", "illegal char"),
+            ("org/model\0", "nul"),
+        ] {
+            let err = validate_repo_id(id).expect_err(why);
+            assert!(
+                matches!(err, HiggsError::InvalidModelId { .. }),
+                "{why}: {err}"
+            );
+            assert!(err.to_string().starts_with("[HG015]"), "{why}: {err}");
+        }
+    }
+
+    #[test]
+    fn path_within_roots_contains_and_escapes() {
+        let root = tempfile::TempDir::new().unwrap();
+        let inside = root.path().join("org").join("m.gguf");
+        std::fs::create_dir_all(inside.parent().unwrap()).unwrap();
+        std::fs::write(&inside, b"x").unwrap();
+        let roots = vec![root.path().to_path_buf()];
+        assert!(path_within_roots(inside.to_str().unwrap(), &roots));
+
+        // A path outside every root (a different temp dir) is rejected.
+        let other = tempfile::TempDir::new().unwrap();
+        let outside = other.path().join("escape.gguf");
+        std::fs::write(&outside, b"x").unwrap();
+        assert!(!path_within_roots(outside.to_str().unwrap(), &roots));
+
+        // A non-existent path can't canonicalize → rejected.
+        assert!(!path_within_roots("/nope/does/not/exist.gguf", &roots));
+    }
+
+    /// `load` rejects an id that fails charset validation with [HG015], before
+    /// any scan or worker RPC.
+    #[tokio::test]
+    async fn load_rejects_traversal_id() {
+        let higgs = Higgs::new(HiggsConfig {
+            lmstudio_dirs: vec![],
+            hf_dirs: vec![],
+            ollama_dirs: vec![],
+            default_load: HiggsConfig::default().default_load,
+        });
+        let err = higgs
+            .load("org/../../etc/passwd", None)
+            .await
+            .expect_err("traversal id must be rejected");
+        assert!(matches!(err, HiggsError::InvalidModelId { .. }));
+    }
+
+    /// The inference admission gate returns `ServerBusy` once all permits are
+    /// taken; releasing a permit re-opens a slot.
+    #[tokio::test]
+    async fn inference_gate_rejects_when_full() {
+        let (sup, _tw, _tr) = make_supervisor();
+        let higgs = Higgs {
+            sup: Arc::new(sup),
+            config: parking_lot::Mutex::new(HiggsConfig::default()),
+            lifecycle: tokio::sync::Mutex::new(()),
+            // One-slot gate so the test deterministically fills it.
+            inference_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        };
+        // Take the only permit and hold it.
+        let held = Arc::clone(&higgs.inference_gate)
+            .try_acquire_owned()
+            .expect("first permit");
+        // chat_stream must now fail fast with ServerBusy (no worker RPC).
+        let err = higgs
+            .chat_stream(
+                r#"[{"role":"user","content":"hi"}]"#.to_owned(),
+                8,
+                0.0,
+                None,
+            )
+            .await
+            .expect_err("gate full → ServerBusy");
+        assert!(matches!(err, HiggsError::ServerBusy { .. }), "got {err}");
+        drop(held);
+        // With the permit released, a request is admitted again (it then fails
+        // later for lack of a real worker response, but admission succeeds).
+        assert!(
+            Arc::clone(&higgs.inference_gate)
+                .try_acquire_owned()
+                .is_ok(),
+            "slot re-opens after release"
+        );
     }
 
     // ── Test 1: default config paths ─────────────────────────────────────────
@@ -716,6 +949,9 @@ mod tests {
             sup: Arc::new(sup),
             config: parking_lot::Mutex::new(cfg),
             lifecycle: tokio::sync::Mutex::new(()),
+            inference_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                crate::api::MAX_CONCURRENT_INFERENCE,
+            )),
         };
         let mut events_rx = higgs.events();
         // `load`/`status` run a host-side scan (on a blocking thread) before each
@@ -787,6 +1023,9 @@ mod tests {
             sup: Arc::new(sup),
             config: parking_lot::Mutex::new(cfg),
             lifecycle: tokio::sync::Mutex::new(()),
+            inference_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                crate::api::MAX_CONCURRENT_INFERENCE,
+            )),
         };
 
         // `status` runs a host-side scan (on a blocking thread) before M_STATUS,
@@ -850,6 +1089,9 @@ mod tests {
             sup: Arc::new(sup),
             config: parking_lot::Mutex::new(cfg),
             lifecycle: tokio::sync::Mutex::new(()),
+            inference_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                crate::api::MAX_CONCURRENT_INFERENCE,
+            )),
         };
 
         // Drive the load. `load` first runs a host-side scan (on a blocking
@@ -888,6 +1130,9 @@ mod tests {
             sup: Arc::new(sup),
             config: parking_lot::Mutex::new(HiggsConfig::default()),
             lifecycle: tokio::sync::Mutex::new(()),
+            inference_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                crate::api::MAX_CONCURRENT_INFERENCE,
+            )),
         };
 
         let (mut rx, handle) = higgs
@@ -961,6 +1206,9 @@ mod tests {
             sup: Arc::new(sup),
             config: parking_lot::Mutex::new(HiggsConfig::default()),
             lifecycle: tokio::sync::Mutex::new(()),
+            inference_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                crate::api::MAX_CONCURRENT_INFERENCE,
+            )),
         };
 
         // chat_stream registers the sink then the spawned task encounters dead worker.

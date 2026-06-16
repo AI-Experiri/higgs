@@ -29,7 +29,7 @@ launcher), which constructs `Higgs`, serves the router on an ephemeral
 │  serve/      Axum router (/v1 + /api/higgs/) │  PURE RUST
 │  rpc.rs      NDJSON JSON-RPC 2.0 codec       │  (cannot crash
 │  worker/     Re-exec'd subprocess            │   the host)
-│  diagnostic  HiggsError HG001–HG011          │
+│  diagnostic  HiggsError HG001–HG016          │
 └───────────────────┬──────────────────────────┘
                     │ stdio (NDJSON JSON-RPC 2.0)
                     │ ONLY while a model is loaded
@@ -371,6 +371,20 @@ request
   │
   ▼
 router (/v1, /api/higgs/*, /health, /api/higgs/health)
+
+PER-HANDLER GUARDS (beyond the shared stack above):
+
+  POST /v1/chat/completions
+    │  sampling validation (vllm ranges)  → 400 [HG013]
+    │  max_tokens > 32768                 → 400 [HG013]
+    │  prompt_bytes/4 + max_tokens > ctx  → 400 [HG005] (early)
+    │  admission gate (Semaphore, ≤ 8)    → 503 [HG014] when full
+    ▼  dispatch → M_CHAT (bounded by CHAT_RPC_TIMEOUT 600 s)
+                                          → 504 [HG016] on timeout
+
+  POST /api/higgs/models/load
+    │  validate_repo_id + path_within_roots → 400 [HG015]
+    ▼  spawn worker → M_LOAD
 ```
 
 ### DNS-rebinding Host guard — the #1 defense
@@ -406,12 +420,62 @@ jigglebot path) is unreachable off-box.
 /api/higgs/* , /v1/models  ──▶ TimeoutLayer(120s)  ──▶ 408 if exceeded
 /v1/chat/completions        ──▶ (no HTTP timeout)  ──▶ bounded by the
                                                         worker chat-RPC timeout
+                                                        CHAT_RPC_TIMEOUT = 600 s
 ```
 
 Control endpoints are bounded request/response, so a 120 s cap is safe. A chat
 **completion is an SSE stream** — aborting it at the HTTP layer would truncate a
 legitimate long generation mid-token. Its duration is bounded one layer down by
 the worker chat-RPC timeout instead, so the HTTP layer never cuts the stream.
+
+`CHAT_RPC_TIMEOUT` = 600 s (in `supervisor.rs`) bounds a single M_CHAT
+(chat/inference) RPC round-trip — it is **the** layer that bounds streaming chat
+duration, since the HTTP layer deliberately does not time `/v1/chat/completions`.
+A wedged-but-alive worker that never replies trips this timeout, surfacing as
+`HG016 ChatTimeout` → HTTP `504`.
+
+### Chat request validation & limits
+
+Before a chat request is dispatched, the serve layer applies a chain of
+per-handler guards (the worker FFI loader is never reached on a rejection):
+
+- **Sampling validation** — vllm `SamplingParams` ranges, checked at
+  `/v1/chat/completions` **before** dispatch: `temperature >= 0` (finite),
+  `top_p` in `(0, 1]`, `n >= 1`, `presence_penalty` & `frequency_penalty` in
+  `[-2, 2]`, `max_tokens` in `[1, 32768]`. Out of range → `HG013
+  InvalidSamplingParam` → `400`.
+- **max_tokens cap** — `MAX_OUTPUT_TOKENS` = 32768. A request with `max_tokens`
+  / `max_completion_tokens` above this → `HG013` → `400`.
+- **Prompt-vs-context early reject** — a conservative estimate
+  `prompt_bytes / 4` (const `PROMPT_BYTES_PER_TOKEN` = 4) plus `max_tokens` is
+  compared to the loaded model's `ctx_len`. If it cannot fit → `HG005
+  ContextOverflow` → `400`, rejected early at the serve layer. The serve layer
+  has **no tokenizer**; the worker's exact tokenizer check remains the
+  authoritative `HG005` backstop.
+
+### Inference admission gate
+
+`MAX_CONCURRENT_INFERENCE` = 8 — a `tokio` Semaphore in the `Higgs` facade —
+caps in-flight chat requests at 8. A full gate → `HG014 ServerBusy` → `503`
+(a retryable capacity signal). It is scoped to the chat path only.
+
+This is **distinct** from the deferred worker-slot `max_concurrent_requests`
+design in `concurrency.md`: that is about true parallel execution *inside* the
+worker; this is an HTTP-layer flood gate sitting *over* the still-single-sequence
+worker. The two must not be conflated.
+
+### Model-id validation on load
+
+`POST /api/higgs/models/load` validates the repo id before anything else:
+
+- **`validate_repo_id`** allows ASCII alphanumerics plus `_ - . / :` (mirrors
+  ollama `types/model/name.go` byte-level validation). It rejects empty,
+  absolute paths, NUL, illegal chars, and any `..` path component → `HG015
+  InvalidModelId` → `400`.
+- **`path_within_roots`** additionally requires the resolved GGUF path to
+  canonicalize **inside** a configured scan directory (lmstudio / hf / ollama
+  dirs), else `HG015` → `400`. A symlink or `..` escape therefore never reaches
+  the worker FFI loader.
 
 ### /health readiness
 

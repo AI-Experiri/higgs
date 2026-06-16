@@ -40,7 +40,7 @@
 │  rpc.rs        NDJSON JSON-RPC 2.0 codec                    │
 │  worker/       Re-exec'd subprocess: engine (model store    │
 │                empty — scan is host-side; path comes in M_LOAD)│
-│  diagnostic.rs HiggsError HG001–HG011                      │
+│  diagnostic.rs HiggsError HG001–HG016                      │
 └──────────────────────────┬──────────────────────────────────┘
                            │ stdio (NDJSON JSON-RPC 2.0)
                            │ ONLY while a model is loaded
@@ -115,12 +115,23 @@
        ├─── status check: is model loaded?
        │         HG003 → 404 if not
        │
+       ├─── validate_sampling()   (temp/top_p/n/penalties/max_tokens; vllm ranges)
+       │         HG013 → 400 if out of range
+       │
+       ├─── check_prompt_fits()   (prompt_bytes/4 + max_tokens vs loaded ctx_len)
+       │         HG005 → 400 early reject (worker tokenizer is the exact backstop)
+       │
        ├─── messages_to_pairs()   (v1 text-only; rejects image/audio → 400)
        │
        └─── Higgs::chat_stream(messages_json, max_tokens, temperature, tools_json)
                   │
+                  ├─── inference_gate.try_acquire_owned()  (admission, max 8)
+                  │         HG014 → 503 if full (permit rides the gen task)
+                  │
                   └─── Supervisor::register_chat_sink(request_id)  (installs mpsc sink)
                        Supervisor::request_with_id(request_id, M_CHAT, params)
+                            │ bounded by CHAT_RPC_TIMEOUT (600 s)
+                            │   HG016 → 504 if a wedged worker never replies
                             │ NDJSON line  →  worker stdin
                             │
                             ▼
@@ -239,6 +250,16 @@
   └──────────────────────────────────────────────────────────────────┘
   Non-loopback HIGGS_BIND (standalone bin) → startup SECURITY WARNING.
 
+  Inference-path guards (in handler/facade, not tower layers):
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  validate_sampling   temp/top_p/n/penalties/max_tokens → 400 HG013│
+  │  check_prompt_fits   prompt est + max_tokens > ctx_len → 400 HG005│
+  │  inference_gate      > MAX_CONCURRENT_INFERENCE (8)   → 503 HG014│
+  │  CHAT_RPC_TIMEOUT    wedged worker, no reply in 600 s → 504 HG016│
+  │  validate_repo_id    charset / `..` traversal on load → 400 HG015│
+  │  path_within_roots   resolved path escapes scan dirs  → 400 HG015│
+  └──────────────────────────────────────────────────────────────────┘
+
   Error mapping (same table for both surfaces):
   ┌────────────────────────────┬──────────┐
   │  HiggsError variant        │  HTTP    │
@@ -248,6 +269,10 @@
   │  HG005 ContextOverflow     │  400     │
   │  HG006 WorkerSpawnFailed   │  503     │
   │  HG007 WorkerDead          │  503     │
+  │  HG013 InvalidSamplingParam│  400     │
+  │  HG014 ServerBusy          │  503     │
+  │  HG015 InvalidModelId      │  400     │
+  │  HG016 ChatTimeout         │  504     │
   │  anything else             │  500     │
   └────────────────────────────┴──────────┘
 

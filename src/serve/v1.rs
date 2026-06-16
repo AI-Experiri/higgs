@@ -35,6 +35,7 @@ use crate::diagnostic::HiggsError;
 
 use super::http_status;
 use super::stream;
+use super::{MAX_OUTPUT_TOKENS, PROMPT_BYTES_PER_TOKEN};
 
 /// Build the OpenAI error envelope `{"error":{message,type,code}}` for `/v1`.
 ///
@@ -145,12 +146,27 @@ pub(super) async fn v1_chat_completions(
         tracing::warn!("higgs: chat while worker is down");
         return v1_error(&err).into_response();
     }
-    let loaded = status.loaded;
-    if loaded.is_none_or(|l| l.id != req.model) {
+    let Some(loaded) = status.loaded.filter(|l| l.id == req.model) else {
         let err = HiggsError::ModelNotLoaded {
             id: req.model.clone(),
         };
         tracing::warn!(model = %req.model, "higgs: chat for unloaded model");
+        return v1_error(&err).into_response();
+    };
+
+    // Validate sampling params (temperature/top_p/n/penalties/max_tokens) BEFORE
+    // dispatching to the worker — out-of-range → 400 [HG013]. Ranges mirror vllm.
+    if let Err(err) = validate_sampling(&req) {
+        tracing::warn!(error = %err, "higgs: chat sampling param rejected");
+        return v1_error(&err).into_response();
+    }
+
+    // Early prompt-vs-context reject: a prompt whose conservative token estimate
+    // plus the generation budget cannot fit the loaded window is a client error
+    // (400 [HG005]) — reject here instead of shipping it to the worker. The
+    // worker's tokenizer-exact [HG005] check remains the authoritative backstop.
+    if let Err(err) = check_prompt_fits(&req, loaded.ctx_len) {
+        tracing::warn!(error = %err, "higgs: chat prompt exceeds context window");
         return v1_error(&err).into_response();
     }
 
@@ -180,10 +196,8 @@ pub(super) async fn v1_chat_completions(
         }
     };
 
-    // Both the deprecated `max_tokens` and `max_completion_tokens` are
-    // honored; the newer field wins when both are present. Default 1024.
-    #[allow(deprecated)]
-    let max_tokens = req.max_completion_tokens.or(req.max_tokens).unwrap_or(1024) as usize;
+    // Effective generation budget (validated above to be in [1, MAX_OUTPUT_TOKENS]).
+    let max_tokens = effective_max_tokens(&req) as usize;
     let temperature = req.temperature.unwrap_or(0.7);
 
     // Serialize the OpenAI `tools` array to a JSON string for the chat template.
@@ -299,6 +313,95 @@ fn chat_response(model: String, out: &ChatOutcome) -> CreateChatCompletionRespon
             ..Default::default()
         }),
     }
+}
+
+/// Effective generation budget for a request: `max_completion_tokens` wins over
+/// the deprecated `max_tokens`; default 1024 when neither is set. Shared by
+/// validation, the prompt fit-check, and the dispatch call so all three agree.
+#[allow(deprecated)]
+fn effective_max_tokens(req: &CreateChatCompletionRequest) -> u32 {
+    req.max_completion_tokens.or(req.max_tokens).unwrap_or(1024)
+}
+
+/// Validate the chat request's sampling parameters against their accepted
+/// ranges; `Err(HiggsError::InvalidSamplingParam)` (→ 400) on the first
+/// violation. Ranges mirror vllm `SamplingParams._verify_args`:
+/// `temperature >= 0`, `top_p` in `(0, 1]`, `n >= 1`, `presence_penalty` and
+/// `frequency_penalty` in `[-2, 2]`, `max_tokens >= 1` and `<= MAX_OUTPUT_TOKENS`.
+fn validate_sampling(req: &CreateChatCompletionRequest) -> Result<(), HiggsError> {
+    let invalid = |param: &str, detail: String| HiggsError::InvalidSamplingParam {
+        param: param.to_owned(),
+        detail,
+    };
+
+    if let Some(t) = req.temperature {
+        if !t.is_finite() || t < 0.0 {
+            return Err(invalid("temperature", "must be a finite value >= 0".into()));
+        }
+    }
+    if let Some(p) = req.top_p {
+        if !(p > 0.0 && p <= 1.0) {
+            return Err(invalid("top_p", "must be in (0, 1]".into()));
+        }
+    }
+    if let Some(n) = req.n {
+        if n == 0 {
+            return Err(invalid("n", "must be at least 1".into()));
+        }
+    }
+    if let Some(pp) = req.presence_penalty {
+        if !(-2.0..=2.0).contains(&pp) {
+            return Err(invalid("presence_penalty", "must be in [-2, 2]".into()));
+        }
+    }
+    if let Some(fp) = req.frequency_penalty {
+        if !(-2.0..=2.0).contains(&fp) {
+            return Err(invalid("frequency_penalty", "must be in [-2, 2]".into()));
+        }
+    }
+    // max_tokens: vllm requires >= 1; higgs additionally caps the upper bound so
+    // a single request can't pin the worker generating an unbounded stream.
+    let max_tokens = effective_max_tokens(req);
+    if max_tokens == 0 {
+        return Err(invalid("max_tokens", "must be at least 1".into()));
+    }
+    if max_tokens > MAX_OUTPUT_TOKENS {
+        return Err(invalid(
+            "max_tokens",
+            format!("must not exceed {MAX_OUTPUT_TOKENS}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Cheap early reject when the prompt's conservative token estimate plus the
+/// generation budget cannot fit the loaded context window — `Err(ContextOverflow)`
+/// (→ 400). The serve layer has no tokenizer, so the estimate is a LOWER bound
+/// (`prompt_bytes / PROMPT_BYTES_PER_TOKEN`); the worker runs the exact
+/// tokenizer check (the authoritative `[HG005]`). This only fires when the
+/// prompt is unambiguously over the window.
+fn check_prompt_fits(req: &CreateChatCompletionRequest, ctx_len: u32) -> Result<(), HiggsError> {
+    // Sum the byte length of every message's textual content. Serializing the
+    // messages would add role/JSON-structure/escape bytes and push the estimate
+    // ABOVE the true token count — turning this lower-bound precheck into a
+    // false-reject. Counting only the extracted content text (the same pairs the
+    // worker sees) keeps `bytes / PROMPT_BYTES_PER_TOKEN` a conservative lower
+    // bound. A non-text part here just means 0 bytes; the worker still runs the
+    // authoritative tokenizer check.
+    let prompt_bytes: usize = messages_to_pairs(&req.messages)
+        .map(|pairs| pairs.iter().map(|(_, content)| content.len()).sum())
+        .unwrap_or(0);
+    let prompt_tokens_est = prompt_bytes / PROMPT_BYTES_PER_TOKEN;
+    let max_gen = effective_max_tokens(req) as usize;
+    let n_ctx = ctx_len as usize;
+    if prompt_tokens_est + max_gen > n_ctx {
+        return Err(HiggsError::ContextOverflow {
+            prompt_tokens: prompt_tokens_est,
+            max_gen,
+            n_ctx,
+        });
+    }
+    Ok(())
 }
 
 /// Flatten OpenAI request messages into the worker's `(role, content)` pairs.
@@ -725,6 +828,109 @@ mod tests {
         ]));
         let err = messages_to_pairs(&msgs).expect_err("refusal part → Err");
         assert!(err.contains("refusal content part"), "message: {err}");
+    }
+
+    // ── validate_sampling / check_prompt_fits: pure request validation ────────
+
+    fn req(v: serde_json::Value) -> CreateChatCompletionRequest {
+        serde_json::from_value(v).expect("request deserialize")
+    }
+
+    #[test]
+    fn validate_sampling_accepts_in_range_and_absent() {
+        // All absent → defaults are valid.
+        validate_sampling(&req(json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}]
+        })))
+        .expect("absent params valid");
+        // In-range values valid (temperature 0 and 2, top_p 1, penalties at bounds).
+        validate_sampling(&req(json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "temperature": 2.0, "top_p": 1.0, "n": 1,
+            "presence_penalty": -2.0, "frequency_penalty": 2.0,
+            "max_tokens": 256
+        })))
+        .expect("in-range params valid");
+    }
+
+    #[test]
+    fn validate_sampling_rejects_each_out_of_range() {
+        let base = |extra: serde_json::Value| {
+            let mut m = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+            let obj = m.as_object_mut().unwrap();
+            for (k, v) in extra.as_object().unwrap() {
+                obj.insert(k.clone(), v.clone());
+            }
+            m
+        };
+        for (extra, who) in [
+            (json!({"temperature": -0.1}), "temperature"),
+            (json!({"top_p": 0.0}), "top_p"),
+            (json!({"top_p": 1.5}), "top_p"),
+            (json!({"n": 0}), "n"),
+            (json!({"presence_penalty": 2.1}), "presence_penalty"),
+            (json!({"frequency_penalty": -2.1}), "frequency_penalty"),
+            (json!({"max_tokens": 0}), "max_tokens"),
+            (json!({"max_tokens": MAX_OUTPUT_TOKENS + 1}), "max_tokens"),
+        ] {
+            let err = validate_sampling(&req(base(extra))).expect_err("must reject");
+            let HiggsError::InvalidSamplingParam { param, .. } = &err else {
+                panic!("expected InvalidSamplingParam, got {err}");
+            };
+            assert_eq!(param, who, "wrong param flagged for {who}");
+            assert!(err.to_string().starts_with("[HG013]"));
+        }
+    }
+
+    #[test]
+    fn effective_max_tokens_precedence() {
+        // max_completion_tokens wins over max_tokens; default 1024 when absent.
+        assert_eq!(
+            effective_max_tokens(&req(json!({
+                "model": "m", "messages": [], "max_tokens": 10, "max_completion_tokens": 20
+            }))),
+            20
+        );
+        assert_eq!(
+            effective_max_tokens(&req(json!({
+                "model": "m", "messages": [], "max_tokens": 10
+            }))),
+            10
+        );
+        assert_eq!(
+            effective_max_tokens(&req(json!({"model": "m", "messages": []}))),
+            1024
+        );
+    }
+
+    #[test]
+    fn check_prompt_fits_rejects_oversized_prompt() {
+        // A tiny window with a long prompt overflows the conservative estimate.
+        let long = "x".repeat(8000); // ~2000 estimated tokens at 4 bytes/token.
+        let err = check_prompt_fits(
+            &req(json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": long}],
+                "max_tokens": 16
+            })),
+            128,
+        )
+        .expect_err("oversized prompt must overflow");
+        assert!(matches!(err, HiggsError::ContextOverflow { .. }));
+        assert!(err.to_string().starts_with("[HG005]"));
+    }
+
+    #[test]
+    fn check_prompt_fits_accepts_small_prompt() {
+        check_prompt_fits(
+            &req(json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 16
+            })),
+            4096,
+        )
+        .expect("small prompt fits a large window");
     }
 
     // ── chat_response: pure ChatOutcome → response mapping ────────────────────

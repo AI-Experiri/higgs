@@ -33,6 +33,10 @@ The same status table applies to both surfaces:
 | HG006 WorkerSpawnFailed | 503 |
 | HG007 WorkerDead | 503 |
 | HG012 ForbiddenHost | 403 |
+| HG013 InvalidSamplingParam | 400 |
+| HG014 ServerBusy | 503 |
+| HG015 InvalidModelId | 400 |
+| HG016 ChatTimeout | 504 |
 | anything else | 500 |
 
 **`/v1` error envelope:**
@@ -126,6 +130,22 @@ Both `max_tokens` (deprecated) and `max_completion_tokens` are accepted; the new
 model's GGUF chat template. When the model emits a tool call it is returned as
 spec-shaped `tool_calls` with `finish_reason: "tool_calls"` — in both the
 non-streaming and streaming responses. A malformed `tools` body is a 400.
+
+**Validation & limits.** The request is checked before dispatch:
+
+- **400** `[HG013]` — invalid sampling param (vllm `SamplingParams` ranges:
+  `temperature >= 0`, `top_p` in `(0, 1]`, `n >= 1`, `presence_penalty` &
+  `frequency_penalty` in `[-2, 2]`), or `max_tokens` / `max_completion_tokens`
+  above the cap of `32768`.
+- **400** `[HG005]` — prompt exceeds the loaded model's context window. The
+  serve layer early-rejects on a conservative estimate (`prompt_bytes / 4` +
+  `max_tokens` vs `ctx_len`); the worker's exact tokenizer check is the
+  authoritative backstop.
+- **503** `[HG014]` — server busy: the inference admission gate (at most 8
+  concurrent in-flight chat requests) is full. Retryable.
+- **504** `[HG016]` — chat RPC timeout: a wedged-but-alive worker did not reply
+  within the worker chat-RPC timeout (600 s). The HTTP layer never times the SSE
+  stream itself; this bound lives one layer down in the supervisor.
 
 **Request body (OpenAI wire):**
 
@@ -303,6 +323,15 @@ resolved host-side and carried into the worker. Load parameters fall back to
 
 All fields except `id` are optional.
 `gpu_layers: 4294967295` (`u32::MAX`) means "offload all layers" (LM Studio "max" semantics).
+
+The `id` is validated before anything is resolved or spawned:
+
+- **400** `[HG015]` — invalid model id. `validate_repo_id` allows ASCII
+  alphanumerics plus `_ - . / :` (mirroring ollama's byte-level name
+  validation) and rejects empty, absolute paths, NUL, illegal chars, and any
+  `..` path component. The resolved GGUF path must also canonicalize **inside**
+  a configured scan dir (`path_within_roots`) — a symlink or `..` escape never
+  reaches the worker FFI loader.
 
 **Response (200):**
 
