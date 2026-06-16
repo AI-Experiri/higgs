@@ -179,8 +179,11 @@ fn host_allowed(headers: &HeaderMap) -> Result<(), String> {
 }
 
 /// Whether a `Host`-header value (`host` or `host:port`) names a loopback host:
-/// `127.0.0.1`, `localhost`, or IPv6 `::1` / `[::1]`. The host portion is the
-/// part before the final `:port`, with IPv6 brackets handled (`[::1]:11434`).
+/// `localhost`, any IPv4 in `127.0.0.0/8`, or IPv6 `::1` / `[::1]`. The host
+/// portion is the part before the final `:port`, with IPv6 brackets handled
+/// (`[::1]:11434`). The `127.0.0.0/8` acceptance matches `is_loopback_bind` in
+/// the `higgs-server` binary, so any loopback bind the binary permits without a
+/// warning is also reachable through the Host guard.
 fn is_loopback_host(host_port: &str) -> bool {
     // Bracketed IPv6: `[::1]` or `[::1]:port`.
     let host = if let Some(rest) = host_port.strip_prefix('[') {
@@ -196,7 +199,14 @@ fn is_loopback_host(host_port: &str) -> bool {
         // host or host:port (IPv4 / DNS name).
         host_port.split(':').next().unwrap_or(host_port)
     };
-    host == "127.0.0.1" || host == "localhost" || host == "::1"
+    if host == "localhost" {
+        return true;
+    }
+    // Any loopback IP literal: 127.0.0.0/8 (IPv4) or ::1 (IPv6).
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return ip.is_loopback();
+    }
+    false
 }
 
 /// Serve the higgs router on `listener`, shutting down **gracefully** when
@@ -464,6 +474,8 @@ mod tests {
         for h in [
             "127.0.0.1",
             "127.0.0.1:11434",
+            "127.0.0.5", // 127.0.0.0/8 — matches is_loopback_bind acceptance
+            "127.0.0.5:11434",
             "localhost",
             "localhost:5173",
             "::1",
