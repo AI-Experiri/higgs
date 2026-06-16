@@ -399,8 +399,7 @@ mod tests {
     use crate::worker::N_CHAT_CHUNK;
     use async_openai::types::chat::CreateChatCompletionStreamResponse;
     use serde_json::json;
-    use std::time::Duration;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tower::ServiceExt;
 
     use super::super::test_support::*;
@@ -433,11 +432,15 @@ mod tests {
 
     #[tokio::test]
     async fn v1_models_empty_when_unloaded() {
-        let (sup, mut test_write, _test_read, _ring) = make_supervisor();
+        let (sup, mut test_write, test_read, _ring) = make_supervisor();
         let app = make_app(sup);
 
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(30)).await;
+        // Read-driven mock: the handler runs a host-side scan (blocking thread)
+        // before its M_STATUS RPC, so respond only AFTER reading the request line
+        // (proving the id is pending). A fixed pre-sleep races the scan under load.
+        let mut lines = BufReader::new(test_read).lines();
+        let (resp, _) = tokio::join!(app.oneshot(get("/v1/models")), async {
+            lines.next_line().await.unwrap().expect("M_STATUS request");
             write_response(
                 &mut test_write,
                 1,
@@ -445,8 +448,7 @@ mod tests {
             )
             .await;
         });
-
-        let resp = app.oneshot(get("/v1/models")).await.unwrap();
+        let resp = resp.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let list: ListModelResponse = serde_json::from_slice(&body_bytes(resp).await).unwrap();
         assert_eq!(list.object, "list");
@@ -457,15 +459,15 @@ mod tests {
 
     #[tokio::test]
     async fn v1_models_lists_loaded() {
-        let (sup, mut test_write, _test_read, _ring) = make_supervisor();
+        let (sup, mut test_write, test_read, _ring) = make_supervisor();
         let app = make_app(sup);
 
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(30)).await;
+        let mut lines = BufReader::new(test_read).lines();
+        let (resp, _) = tokio::join!(app.oneshot(get("/v1/models")), async {
+            lines.next_line().await.unwrap().expect("M_STATUS request");
             write_response(&mut test_write, 1, loaded_status_json()).await;
         });
-
-        let resp = app.oneshot(get("/v1/models")).await.unwrap();
+        let resp = resp.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let list: ListModelResponse = serde_json::from_slice(&body_bytes(resp).await).unwrap();
         assert_eq!(list.data.len(), 1);
@@ -478,11 +480,16 @@ mod tests {
 
     #[tokio::test]
     async fn chat_unloaded_404_hg003() {
-        let (sup, mut test_write, _test_read, _ring) = make_supervisor();
+        let (sup, mut test_write, test_read, _ring) = make_supervisor();
         let app = make_app(sup);
 
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(30)).await;
+        let req = post_json(
+            "/v1/chat/completions",
+            &json!({"model": "org/missing", "messages": [{"role": "user", "content": "hi"}]}),
+        );
+        let mut lines = BufReader::new(test_read).lines();
+        let (resp, _) = tokio::join!(app.oneshot(req), async {
+            lines.next_line().await.unwrap().expect("M_STATUS request");
             write_response(
                 &mut test_write,
                 1,
@@ -490,12 +497,7 @@ mod tests {
             )
             .await;
         });
-
-        let req = post_json(
-            "/v1/chat/completions",
-            &json!({"model": "org/missing", "messages": [{"role": "user", "content": "hi"}]}),
-        );
-        let resp = app.oneshot(req).await.unwrap();
+        let resp = resp.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
         let body = String::from_utf8(body_bytes(resp).await).unwrap();
@@ -517,13 +519,21 @@ mod tests {
 
     #[tokio::test]
     async fn chat_nonstream_returns_content() {
-        let (sup, mut test_write, _test_read, _ring) = make_supervisor();
+        let (sup, mut test_write, test_read, _ring) = make_supervisor();
         let app = make_app(sup);
 
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(30)).await;
+        let req = post_json(
+            "/v1/chat/completions",
+            &json!({"model": "org/model", "messages": [{"role": "user", "content": "hi"}]}),
+        );
+        // Respond to each RPC only after reading its request line: M_STATUS gate
+        // (id 1) then M_CHAT (id 2). Read-driven so the host-side scan timing
+        // can't drop a response.
+        let mut lines = BufReader::new(test_read).lines();
+        let (resp, _) = tokio::join!(app.oneshot(req), async {
+            lines.next_line().await.unwrap().expect("M_STATUS request");
             write_response(&mut test_write, 1, loaded_status_json()).await; // status gate
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            lines.next_line().await.unwrap().expect("M_CHAT request");
             write_response(
                 &mut test_write,
                 2,
@@ -531,12 +541,7 @@ mod tests {
             )
             .await;
         });
-
-        let req = post_json(
-            "/v1/chat/completions",
-            &json!({"model": "org/model", "messages": [{"role": "user", "content": "hi"}]}),
-        );
-        let resp = app.oneshot(req).await.unwrap();
+        let resp = resp.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
         let chat: CreateChatCompletionResponse =
@@ -556,24 +561,8 @@ mod tests {
 
     #[tokio::test]
     async fn chat_stream_sse_framing() {
-        let (sup, mut test_write, _test_read, _ring) = make_supervisor();
+        let (sup, mut test_write, test_read, _ring) = make_supervisor();
         let app = make_app(sup);
-
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            write_response(&mut test_write, 1, loaded_status_json()).await; // status gate
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            // Chunks tagged with request_id=2 (the M_CHAT RPC id, allocated after status id=1).
-            write_chunk_notification(&mut test_write, 2, "hel").await;
-            write_chunk_notification(&mut test_write, 2, "lo").await;
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            write_response(
-                &mut test_write,
-                2,
-                json!({"content": "hello", "finish_reason": "stop"}), // higgs/chat
-            )
-            .await;
-        });
 
         let req = post_json(
             "/v1/chat/completions",
@@ -583,7 +572,25 @@ mod tests {
                 "stream": true,
             }),
         );
-        let resp = app.oneshot(req).await.unwrap();
+        // Read-driven: respond to M_STATUS (id 1), then — only after the M_CHAT
+        // request line is read (its sink for request_id=2 is already registered) —
+        // emit the chunk notifications and the final chat response.
+        let mut lines = BufReader::new(test_read).lines();
+        let (resp, _) = tokio::join!(app.oneshot(req), async {
+            lines.next_line().await.unwrap().expect("M_STATUS request");
+            write_response(&mut test_write, 1, loaded_status_json()).await; // status gate
+            lines.next_line().await.unwrap().expect("M_CHAT request");
+            // Chunks tagged with request_id=2 (the M_CHAT RPC id, allocated after status id=1).
+            write_chunk_notification(&mut test_write, 2, "hel").await;
+            write_chunk_notification(&mut test_write, 2, "lo").await;
+            write_response(
+                &mut test_write,
+                2,
+                json!({"content": "hello", "finish_reason": "stop"}), // higgs/chat
+            )
+            .await;
+        });
+        let resp = resp.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let content_type = resp
             .headers()
