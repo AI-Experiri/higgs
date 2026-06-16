@@ -180,11 +180,20 @@ impl WorkerState {
                     gpu_layers: u32_param(&req.params, "gpu_layers", u32::MAX),
                     threads: u32_param(&req.params, "threads", 4),
                 };
-                let model = self
-                    .store
-                    .get(id)
-                    .ok_or_else(|| to_rpc_error(&HiggsError::ModelNotFound { id: id.into() }))?;
-                let path = model.path.clone();
+                // Path resolution moved host-side (scan no longer runs in the
+                // worker): the host resolves the GGUF path and passes it in
+                // `params.path`. Use it directly when present; fall back to the
+                // worker's own ModelStore only when absent (any caller that still
+                // scans worker-side).
+                let path = match req.params.get("path").and_then(Value::as_str) {
+                    Some(p) => p.to_string(),
+                    None => {
+                        let model = self.store.get(id).ok_or_else(|| {
+                            to_rpc_error(&HiggsError::ModelNotFound { id: id.into() })
+                        })?;
+                        model.path.clone()
+                    }
+                };
                 // The engine drops any resident model before loading the new one,
                 // so the previous model is already gone the moment we attempt this
                 // load. Clear our tracked id up front: if the load then fails, the

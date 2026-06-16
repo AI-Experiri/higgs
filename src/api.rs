@@ -14,7 +14,7 @@ use crate::diagnostic::HiggsError;
 use crate::supervisor::{HiggsEvent, Supervisor};
 use crate::worker::engine::LoadParams;
 use crate::worker::models::HiggsModel;
-use crate::worker::{M_CHAT, M_LOAD, M_SCAN, M_STATUS, M_UNLOAD};
+use crate::worker::{M_CHAT, M_LOAD, M_STATUS, M_UNLOAD};
 
 // ── HiggsConfig ───────────────────────────────────────────────────────────────
 
@@ -177,6 +177,9 @@ pub struct ChatOutcome {
 pub struct Higgs {
     sup: Arc<Supervisor>,
     config: parking_lot::Mutex<HiggsConfig>,
+    /// Serializes load/unload so spawn-on-load and kill-on-unload never
+    /// interleave (protects last_load and the supervisor proc handle).
+    lifecycle: tokio::sync::Mutex<()>,
 }
 
 impl Higgs {
@@ -187,51 +190,57 @@ impl Higgs {
         Self {
             sup: Arc::new(Supervisor::spawn()),
             config: parking_lot::Mutex::new(config),
+            lifecycle: tokio::sync::Mutex::new(()),
         }
     }
 
-    /// Spawn the worker and issue an initial scan.
+    /// Bring up control only — does NOT spawn a worker.
     ///
-    /// Returns `Err` [HG006] if the worker process cannot be started.
+    /// A worker is spawned lazily by [`load`](Self::load) (spawn-on-load,
+    /// LM-Studio model). `scan` runs host-side and needs no worker. The serve
+    /// layer holds `Arc<Higgs>` for control regardless of worker liveness.
     pub async fn start(&self) -> Result<(), HiggsError> {
-        self.sup.start()?;
-        // Best-effort initial scan; failures are non-fatal at startup.
-        let _ = self.scan().await;
         Ok(())
     }
 
     /// Gracefully shut down the worker (2 s timeout).
+    ///
+    /// Holds the `lifecycle` mutex for the whole body so a deliberate stop never
+    /// interleaves with a concurrent `load`/`unload` (which would let a load
+    /// spawn + M_LOAD + emit `ModelLoaded` race this kill). Also clears the
+    /// load-replay state: a deliberate worker stop must not leave `last_load`
+    /// behind for `attempt_restart` to resurrect the model.
     pub async fn stop(&self) {
+        let _lifecycle = self.lifecycle.lock().await;
+        self.sup.clear_last_load();
         self.sup.stop().await;
     }
 
     /// Scan all configured model directories and return the discovered models.
     ///
-    /// Records the scan params for post-restart replay.
+    /// Runs host-side: model scanning is pure Rust (`ggus` + `memmap2` + `std::fs`,
+    /// no llama.cpp FFI) so it needs no worker. Returns `Err` [HG001] if a
+    /// configured root exists but cannot be read.
     pub async fn scan(&self) -> Result<Vec<HiggsModel>, HiggsError> {
         let (lmstudio, hf, ollama) = {
             let cfg = self.config.lock();
-            let to_str_array = |dirs: &[PathBuf]| {
-                dirs.iter()
-                    .filter_map(|p| p.to_str().map(|s| serde_json::Value::String(s.to_owned())))
-                    .collect::<Vec<_>>()
-            };
             (
-                to_str_array(&cfg.lmstudio_dirs),
-                to_str_array(&cfg.hf_dirs),
-                to_str_array(&cfg.ollama_dirs),
+                cfg.lmstudio_dirs.clone(),
+                cfg.hf_dirs.clone(),
+                cfg.ollama_dirs.clone(),
             )
         };
-        let params = json!({ "lmstudio": lmstudio, "hf": hf, "ollama": ollama });
-        let result = self.sup.request(M_SCAN, params.clone()).await?;
-        let models: Vec<HiggsModel> =
-            serde_json::from_value(result).map_err(|e| HiggsError::WorkerRpc {
-                method: M_SCAN.into(),
-                message: format!("response parse failed: {e}"),
-                worker_code: None,
-            })?;
-        self.sup.record_last_scan(params);
-        Ok(models)
+        // Scanning does blocking I/O (`std::fs::read_dir`, file open, `memmap2`
+        // mmap). `status` polls `scan` and `load` calls it, so running inline
+        // would block a tokio runtime thread — offload to a blocking thread.
+        // A `JoinError` here means the scan task itself panicked, which is an
+        // unrecoverable bug rather than a host-facing condition.
+        tokio::task::spawn_blocking(move || {
+            let mut store = crate::worker::models::ModelStore::default();
+            store.scan(&lmstudio, &hf, &ollama).map(<[_]>::to_vec)
+        })
+        .await
+        .expect("higgs model scan task panicked")
     }
 
     /// Load a model by HuggingFace repo id.
@@ -239,14 +248,43 @@ impl Higgs {
     /// `params` overrides `default_load` when supplied. On success, records the
     /// load params for post-restart replay and emits [`HiggsEvent::ModelLoaded`].
     pub async fn load(&self, id: &str, params: Option<LoadParams>) -> Result<(), HiggsError> {
+        // Serialize the whole load/unload lifecycle: spawn-on-load and
+        // kill-on-unload must never interleave (protects last_load and the
+        // supervisor proc handle). Held for the entire method body.
+        let _lifecycle = self.lifecycle.lock().await;
         let p = params.unwrap_or_else(|| self.config.lock().default_load.clone());
+        // Scan moved host-side, so the worker's ModelStore is empty on a fresh
+        // spawn-on-load worker: resolve the GGUF path HERE and carry it in the
+        // M_LOAD params. Without this the worker's `store.get(id)` returns HG002
+        // for every normal load. Take the first matching model's path.
+        let path = self
+            .scan()
+            .await?
+            .into_iter()
+            .find(|m| m.id == id)
+            .map(|m| m.path)
+            .ok_or_else(|| HiggsError::ModelNotFound { id: id.to_owned() })?;
         let req_params = json!({
             "id": id,
+            "path": path,
             "ctx_len": p.ctx_len,
             "gpu_layers": p.gpu_layers,
             "threads": p.threads,
         });
-        self.sup.request(M_LOAD, req_params.clone()).await?;
+        // Spawn-on-load: if no worker is live, bring one up named `higgs(<id>)`
+        // before sending M_LOAD. A redundant call while a worker is running is a
+        // no-op (single-reader invariant in the supervisor).
+        self.sup.start_for(id)?;
+        // If M_LOAD fails (bad GGUF, OOM, …) the worker is alive but holds no
+        // model — that contradicts kill-on-unload. Tear it down before
+        // returning. Call `self.sup.stop()` DIRECTLY (not `self.stop()`): we
+        // already hold the `lifecycle` mutex, and `Higgs::stop()` would re-take
+        // it → deadlock. `record_last_load`/`ModelLoaded` stay on success only.
+        if let Err(e) = self.sup.request(M_LOAD, req_params.clone()).await {
+            self.sup.clear_last_load();
+            self.sup.stop().await;
+            return Err(e);
+        }
         self.sup.record_last_load(req_params);
         self.sup.emit(HiggsEvent::ModelLoaded { id: id.to_owned() });
         Ok(())
@@ -257,13 +295,23 @@ impl Higgs {
     /// Emits [`HiggsEvent::ModelUnloaded`] with an empty id when no model id
     /// is available at the facade layer (v1 limitation; worker tracks it).
     pub async fn unload(&self) -> Result<(), HiggsError> {
+        // Serialize the whole load/unload lifecycle (see `load`): held for the
+        // entire method body so a concurrent load cannot re-set last_load after
+        // the clear or race start_for against this stop.
+        let _lifecycle = self.lifecycle.lock().await;
         // TODO(v2): single RPC — status+unload is TOCTOU if worker state changes between calls (v1: worker serializes, benign)
         // Capture id from status before unloading so the event carries it.
         let id = self.loaded_id().await.unwrap_or_default();
-        self.sup.request(M_UNLOAD, serde_json::Value::Null).await?;
-        // Drop the load-replay state: a post-unload worker restart must NOT
-        // reload the model the user explicitly unloaded.
+        // Drop the load-replay state BEFORE the unload/stop awaits: if a respawn
+        // races the stop, there must be nothing left for it to replay. Clearing
+        // after the awaits leaves a window where attempt_restart could reload the
+        // model the user just unloaded.
         self.sup.clear_last_load();
+        // Best-effort graceful in-worker unload, then KILL the worker process
+        // (spawn-on-load / kill-on-unload). `stop()` sets the deliberate-stop flag
+        // so the death triggers no respawn, drains stdin, and reaps the process.
+        let _ = self.sup.request(M_UNLOAD, serde_json::Value::Null).await;
+        self.sup.stop().await;
         self.sup.emit(HiggsEvent::ModelUnloaded { id });
         Ok(())
     }
@@ -279,37 +327,35 @@ impl Higgs {
         let worker_alive = result.is_ok();
         let v = result.unwrap_or(serde_json::Value::Null);
 
+        // Scan moved host-side: the worker no longer scans (its `ModelStore` is
+        // empty), so model metadata and the on-disk count both come from ONE
+        // host-side FS walk (pure Rust, no worker RPC), reused below.
+        let scan = self.scan().await.unwrap_or_default();
+        let models_on_disk = scan.len() as u32;
+
+        // The worker's M_STATUS reports `id`/`ctx_len`/`gpu_layers`/`threads`
+        // from the live model, but `arch`/`quant`/`size_bytes`/
+        // `max_context_length`/`has_chat_template` come back null (its store is
+        // empty). Enrich those from the matching host-scanned `HiggsModel` while
+        // keeping the worker-reported id/ctx_len verbatim.
         let loaded = v.get("loaded").and_then(|l| {
             if l.is_null() {
                 return None;
             }
+            let id = l.get("id")?.as_str()?.to_owned();
+            let scanned = scan.iter().find(|m| m.id == id);
             Some(LoadedInfo {
-                id: l.get("id")?.as_str()?.to_owned(),
                 ctx_len: l.get("ctx_len")?.as_u64()? as u32,
                 gpu_layers: l.get("gpu_layers")?.as_u64()? as u32,
                 threads: l.get("threads")?.as_u64()? as u32,
-                arch: l
-                    .get("arch")
-                    .and_then(|v| v.as_str())
-                    .map(ToOwned::to_owned),
-                quant: l
-                    .get("quant")
-                    .and_then(|v| v.as_str())
-                    .map(ToOwned::to_owned),
-                max_context_length: l
-                    .get("max_context_length")
-                    .and_then(serde_json::Value::as_u64),
-                size_bytes: l.get("size_bytes").and_then(serde_json::Value::as_u64),
-                has_chat_template: l
-                    .get("has_chat_template")
-                    .and_then(serde_json::Value::as_bool),
+                arch: scanned.and_then(|m| m.arch.clone()),
+                quant: scanned.and_then(|m| m.quant.clone()),
+                max_context_length: scanned.and_then(|m| m.ctx_train),
+                size_bytes: scanned.map(|m| m.size_bytes),
+                has_chat_template: scanned.map(|m| m.has_chat_template),
+                id,
             })
         });
-
-        let models_on_disk = v
-            .get("models_scanned")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0) as u32;
 
         Ok(HiggsStatus {
             worker_alive,
@@ -439,6 +485,7 @@ impl Higgs {
         Self {
             sup,
             config: parking_lot::Mutex::new(config),
+            lifecycle: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -480,7 +527,7 @@ mod tests {
         let sup_write_cell = Arc::new(Mutex::new(Some(sup_write)));
         let sup_read_cell = Arc::new(Mutex::new(Some(sup_read)));
 
-        let sup = Supervisor::with_factory(Box::new(move |_ring| {
+        let sup = Supervisor::with_factory(Box::new(move |_ring, _model| {
             let write =
                 sup_write_cell
                     .lock()
@@ -502,7 +549,7 @@ mod tests {
             })
         }));
 
-        sup.start().expect("mock start");
+        sup.start_for("test-model").expect("mock start");
         (sup, test_write, test_read)
     }
 
@@ -560,63 +607,65 @@ mod tests {
         );
     }
 
-    // ── Test 2: scan records and returns ─────────────────────────────────────
+    // ── Test 2: scan runs host-side with no worker ───────────────────────────
 
+    /// `scan()` runs host-side (pure Rust, no worker RPC): with a fresh facade
+    /// that never spawned a worker and empty config dirs, it returns `Ok(empty)`.
     #[tokio::test]
-    async fn scan_records_and_returns() {
-        let (sup, mut test_write, _test_read) = make_supervisor();
+    async fn scan_runs_host_side_without_worker() {
+        // Empty config dirs → nothing to scan → Ok(empty). The point is that no
+        // worker is live (start() never called) yet scan succeeds.
+        let higgs = Higgs::new(HiggsConfig {
+            lmstudio_dirs: vec![],
+            hf_dirs: vec![],
+            ollama_dirs: vec![],
+            default_load: HiggsConfig::default().default_load,
+        });
 
-        // Build Higgs wrapping this test supervisor.
-        let higgs = Higgs {
-            sup: Arc::new(sup),
-            config: parking_lot::Mutex::new(HiggsConfig::default()),
-        };
+        let models = higgs.scan().await.expect("host-side scan should succeed");
+        assert!(models.is_empty(), "empty dirs yield no models");
 
-        // Mock worker responds to higgs/scan with one model.
-        let model_json = json!([{
-            "id": "org/model",
-            "path": "/models/model.gguf",
-            "size_bytes": 4000000000u64,
-            "quant": "Q4_K_M",
-            "source": "LmStudio",
-            "arch": "llama",
-            "ctx_train": 4096u64,
-            "has_chat_template": true,
-        }]);
-
-        let scan_fut = higgs.scan();
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        write_response(&mut test_write, 1, model_json.clone()).await;
-
-        let models = scan_fut.await.expect("scan should succeed");
-        assert_eq!(models.len(), 1);
-        assert_eq!(models[0].id, "org/model");
-
-        // Verify supervisor recorded the params for replay.
-        let recorded = higgs.sup.last_scan_params();
-        assert!(recorded.is_some(), "last_scan should be recorded");
-        let recorded = recorded.unwrap();
-        assert!(recorded.get("lmstudio").is_some());
-        assert!(recorded.get("hf").is_some());
-        assert!(recorded.get("ollama").is_some());
+        // No worker was ever spawned: status reports worker_alive=false.
+        let st = higgs.status().await.expect("status");
+        assert!(!st.worker_alive, "scan must not spawn a worker");
     }
 
     // ── Test 3: load then status maps ─────────────────────────────────────────
 
     #[tokio::test]
     async fn load_then_status_maps() {
-        let (sup, mut test_write, _test_read) = make_supervisor();
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let (sup, mut test_write, test_read) = make_supervisor();
+        // `load` resolves the GGUF path host-side, so point config at a fixture.
+        let dir = tempfile::TempDir::new().unwrap();
+        crate::serve::test_support::write_gguf_fixture(dir.path(), "org/model");
+        let cfg = HiggsConfig {
+            lmstudio_dirs: vec![dir.path().to_path_buf()],
+            hf_dirs: vec![],
+            ollama_dirs: vec![],
+            default_load: HiggsConfig::default().default_load,
+        };
         let higgs = Higgs {
             sup: Arc::new(sup),
-            config: parking_lot::Mutex::new(HiggsConfig::default()),
+            config: parking_lot::Mutex::new(cfg),
+            lifecycle: tokio::sync::Mutex::new(()),
         };
         let mut events_rx = higgs.events();
+        // `load`/`status` run a host-side scan (on a blocking thread) before each
+        // RPC, so drive the operation future concurrently with the responder: the
+        // responder reads the request line (proving the id is pending) and only
+        // then writes the reply. A fixed pre-sleep + sequential write would race
+        // the scan and drop the response.
+        let mut lines = BufReader::new(test_read).lines();
 
         // Issue load — mock responds with ok.
         let load_fut = higgs.load("org/model", None);
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        write_response(&mut test_write, 1, json!({"id": "org/model"})).await;
-        load_fut.await.expect("load should succeed");
+        let (load_res, _) = tokio::join!(load_fut, async {
+            lines.next_line().await.unwrap().expect("M_LOAD request");
+            write_response(&mut test_write, 1, json!({"id": "org/model"})).await;
+        });
+        load_res.expect("load should succeed");
 
         // ModelLoaded event must arrive.
         let ev = tokio::time::timeout(std::time::Duration::from_millis(100), events_rx.recv())
@@ -627,20 +676,23 @@ mod tests {
 
         // Issue status — mock responds with loaded info.
         let status_fut = higgs.status();
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        write_response(
-            &mut test_write,
-            2,
-            json!({
-                "loaded": { "id": "org/model", "ctx_len": 4096, "gpu_layers": 4294967295u64, "threads": 4 },
-                "models_scanned": 3,
-            }),
-        )
-        .await;
-
-        let st = status_fut.await.expect("status should succeed");
+        let (st, _) = tokio::join!(status_fut, async {
+            lines.next_line().await.unwrap().expect("M_STATUS request");
+            write_response(
+                &mut test_write,
+                2,
+                json!({
+                    "loaded": { "id": "org/model", "ctx_len": 4096, "gpu_layers": 4294967295u64, "threads": 4 },
+                    "models_scanned": 3,
+                }),
+            )
+            .await;
+        });
+        let st = st.expect("status should succeed");
         assert!(st.worker_alive);
-        assert_eq!(st.models_on_disk, 3);
+        // models_on_disk now comes from a host-side scan of the config dirs
+        // (one GGUF fixture), not the worker's `models_scanned`.
+        assert_eq!(st.models_on_disk, 1);
         let li = st.loaded.expect("loaded should be Some");
         assert_eq!(li.id, "org/model");
         assert_eq!(li.ctx_len, 4096);
@@ -651,42 +703,109 @@ mod tests {
 
     #[tokio::test]
     async fn status_loaded_info_includes_model_metadata() {
-        let (sup, mut test_write, _test_read) = make_supervisor();
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let (sup, mut test_write, test_read) = make_supervisor();
+        // Metadata now comes from the HOST scan, not the worker response: point
+        // config at a GGUF fixture (arch=llama, ctx_train=4096, chat template)
+        // so the host-scanned `HiggsModel` enriches the worker-reported `loaded`.
+        let dir = tempfile::TempDir::new().unwrap();
+        crate::serve::test_support::write_gguf_fixture(dir.path(), "org/model");
+        let cfg = HiggsConfig {
+            lmstudio_dirs: vec![dir.path().to_path_buf()],
+            hf_dirs: vec![],
+            ollama_dirs: vec![],
+            default_load: HiggsConfig::default().default_load,
+        };
         let higgs = Higgs {
             sup: Arc::new(sup),
-            config: parking_lot::Mutex::new(HiggsConfig::default()),
+            config: parking_lot::Mutex::new(cfg),
+            lifecycle: tokio::sync::Mutex::new(()),
         };
 
+        // `status` runs a host-side scan (on a blocking thread) before M_STATUS,
+        // so drive the future concurrently with a responder that reads the
+        // request line before replying — a fixed sleep would race the scan. The
+        // worker reports only id/ctx_len/gpu_layers/threads; the metadata fields
+        // are filled host-side from the fixture.
+        let mut lines = BufReader::new(test_read).lines();
         let status_fut = higgs.status();
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        write_response(
-            &mut test_write,
-            1,
-            json!({
-                "loaded": {
-                    "id": "org/model",
-                    "ctx_len": 4096,
-                    "gpu_layers": 99,
-                    "threads": 4,
-                    "arch": "llama",
-                    "quant": "Q4_K_M",
-                    "max_context_length": 8192u64,
-                    "size_bytes": 4000000000u64,
-                    "has_chat_template": true,
-                },
-                "models_scanned": 1,
-            }),
-        )
-        .await;
-
-        let st = status_fut.await.expect("status should succeed");
+        let (st, _) = tokio::join!(status_fut, async {
+            lines.next_line().await.unwrap().expect("M_STATUS request");
+            write_response(
+                &mut test_write,
+                1,
+                json!({
+                    "loaded": {
+                        "id": "org/model",
+                        "ctx_len": 4096,
+                        "gpu_layers": 99,
+                        "threads": 4,
+                    },
+                    "models_scanned": 1,
+                }),
+            )
+            .await;
+        });
+        let st = st.expect("status should succeed");
         let li = st.loaded.expect("loaded should be Some");
         assert_eq!(li.id, "org/model");
         assert_eq!(li.arch.as_deref(), Some("llama"));
         assert_eq!(li.quant.as_deref(), Some("Q4_K_M"));
-        assert_eq!(li.max_context_length, Some(8192));
-        assert_eq!(li.size_bytes, Some(4000000000));
+        assert_eq!(li.max_context_length, Some(4096));
+        assert!(li.size_bytes.is_some(), "size_bytes from fixture file");
         assert_eq!(li.has_chat_template, Some(true));
+    }
+
+    // ── Test 3c: host-resolved load carries the GGUF path (no worker scan) ────
+    //
+    // Regression: after scan moved host-side, the worker's ModelStore is empty,
+    // so the worker can only resolve a path if the host puts it in M_LOAD params.
+    // This asserts `load(id)` resolves the path host-side and includes it in the
+    // M_LOAD request — proving the load works WITHOUT a prior worker scan. If the
+    // path-passing were removed (worker fell back to its empty `store.get(id)`),
+    // the params would carry no `path` and this test would fail.
+    #[tokio::test]
+    async fn load_carries_host_resolved_path() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let (sup, mut test_write, test_read) = make_supervisor();
+
+        // Real GGUF fixture so the host-side scan discovers the id with a path.
+        let dir = tempfile::TempDir::new().unwrap();
+        crate::serve::test_support::write_gguf_fixture(dir.path(), "org/model");
+        let cfg = HiggsConfig {
+            lmstudio_dirs: vec![dir.path().to_path_buf()],
+            hf_dirs: vec![],
+            ollama_dirs: vec![],
+            default_load: HiggsConfig::default().default_load,
+        };
+        let higgs = Higgs {
+            sup: Arc::new(sup),
+            config: parking_lot::Mutex::new(cfg),
+            lifecycle: tokio::sync::Mutex::new(()),
+        };
+
+        // Drive the load. `load` first runs a host-side scan (on a blocking
+        // thread) before sending M_LOAD, so drive the load future concurrently
+        // with a responder that reads the request line (proving id=1 is pending)
+        // before replying. A fixed pre-sleep would race the scan and drop the
+        // response.
+        let mut lines = BufReader::new(test_read).lines();
+        let load_fut = higgs.load("org/model", None);
+        let (load_res, line) = tokio::join!(load_fut, async {
+            let line = lines.next_line().await.unwrap().expect("M_LOAD request");
+            write_response(&mut test_write, 1, json!({"id": "org/model"})).await;
+            line
+        });
+        load_res.expect("host-resolved load should succeed");
+
+        // The M_LOAD request carries the fixture path resolved host-side.
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["method"], M_LOAD);
+        let path = v["params"]["path"].as_str().expect("path in M_LOAD params");
+        assert!(path.ends_with(".gguf"), "path was: {path}");
+        assert!(path.contains("org/model"), "path was: {path}");
     }
 
     // ── Test 4: chat_stream delivers chunks and outcome ────────────────────────
@@ -702,6 +821,7 @@ mod tests {
         let higgs = Higgs {
             sup: Arc::new(sup),
             config: parking_lot::Mutex::new(HiggsConfig::default()),
+            lifecycle: tokio::sync::Mutex::new(()),
         };
 
         let (mut rx, handle) = higgs
@@ -764,7 +884,7 @@ mod tests {
     #[tokio::test]
     async fn chat_stream_dead_worker_removes_sink() {
         // Build a Supervisor with no worker halves — factory always fails.
-        let sup = crate::supervisor::Supervisor::with_factory(Box::new(|_ring| {
+        let sup = crate::supervisor::Supervisor::with_factory(Box::new(|_ring, _model| {
             Err(HiggsError::WorkerSpawnFailed {
                 source: std::io::Error::other("mock: no worker"),
             })
@@ -774,6 +894,7 @@ mod tests {
         let higgs = Higgs {
             sup: Arc::new(sup),
             config: parking_lot::Mutex::new(HiggsConfig::default()),
+            lifecycle: tokio::sync::Mutex::new(()),
         };
 
         // chat_stream registers the sink then the spawned task encounters dead worker.

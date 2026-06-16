@@ -191,18 +191,6 @@ pub(super) async fn control_logs(
     })
 }
 
-/// `POST /api/higgs/worker/start` — spawn the worker process.
-pub(super) async fn control_worker_start(State(higgs): State<Arc<Higgs>>) -> Response {
-    tracing::warn!("higgs: starting worker");
-    match higgs.start().await {
-        Ok(()) => Json(HiggsOk::new()).into_response(),
-        Err(err) => {
-            tracing::warn!(error = %err, "higgs: worker start failed");
-            control_error(&err).into_response()
-        }
-    }
-}
-
 /// `POST /api/higgs/worker/stop` — gracefully shut down the worker.
 pub(super) async fn control_worker_stop(State(higgs): State<Arc<Higgs>>) -> Json<HiggsOk> {
     tracing::warn!("higgs: stopping worker");
@@ -247,7 +235,10 @@ mod tests {
     #[tokio::test]
     async fn control_load_unload_roundtrip() {
         let (sup, mut test_write, _test_read, _ring) = make_supervisor();
-        let app = make_app(sup);
+        // `load` resolves the GGUF path host-side, so the id must be discoverable.
+        let dir = tempfile::TempDir::new().unwrap();
+        write_gguf_fixture(dir.path(), "org/model");
+        let app = make_app_with_lmstudio(sup, dir.path().to_path_buf());
 
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(30)).await;
@@ -293,31 +284,20 @@ mod tests {
     #[tokio::test]
     async fn control_model_by_id_found_slashed() {
         let (sup, mut test_write, _test_read, _ring) = make_supervisor();
-        let app = make_app(sup);
+        // Scan runs host-side: discover the slashed id from a real GGUF fixture.
+        let dir = tempfile::TempDir::new().unwrap();
+        write_gguf_fixture(
+            dir.path(),
+            "lmstudio-community/NVIDIA-Nemotron-3-Nano-4B-GGUF",
+        );
+        let app = make_app_with_lmstudio(sup, dir.path().to_path_buf());
 
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(30)).await;
-            // scan response — realistic HF repo id with slash
+            // Only the worker RPC remains: status (nothing loaded).
             write_response(
                 &mut test_write,
                 1,
-                serde_json::json!([{
-                    "id": "lmstudio-community/NVIDIA-Nemotron-3-Nano-4B-GGUF",
-                    "path": "/models/model.gguf",
-                    "size_bytes": 4000000000u64,
-                    "quant": "Q4_K_M",
-                    "source": "LmStudio",
-                    "arch": "llama",
-                    "ctx_train": 8192u64,
-                    "has_chat_template": true,
-                }]),
-            )
-            .await;
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            // status response (nothing loaded)
-            write_response(
-                &mut test_write,
-                2,
                 serde_json::json!({"loaded": null, "models_scanned": 1}),
             )
             .await;
@@ -344,15 +324,16 @@ mod tests {
     #[tokio::test]
     async fn control_model_by_id_not_found() {
         let (sup, mut test_write, _test_read, _ring) = make_supervisor();
-        let app = make_app(sup);
+        // Empty temp dir → host-side scan finds nothing → the id is absent.
+        let dir = tempfile::TempDir::new().unwrap();
+        let app = make_app_with_lmstudio(sup, dir.path().to_path_buf());
 
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(30)).await;
-            write_response(&mut test_write, 1, serde_json::json!([])).await;
-            tokio::time::sleep(Duration::from_millis(30)).await;
+            // Only the worker RPC remains: status (nothing loaded).
             write_response(
                 &mut test_write,
-                2,
+                1,
                 serde_json::json!({"loaded": null, "models_scanned": 0}),
             )
             .await;
@@ -411,31 +392,19 @@ mod tests {
         );
     }
 
-    fn scan_json() -> serde_json::Value {
-        json!([{
-            "id": "org/model",
-            "path": "/models/model.gguf",
-            "size_bytes": 4000000000u64,
-            "quant": "Q4_K_M",
-            "source": "LmStudio",
-            "arch": "llama",
-            "ctx_train": 8192u64,
-            "has_chat_template": true,
-        }])
-    }
-
     // ── control_models: scan + status enrichment ─────────────────────────────
 
     #[tokio::test]
     async fn control_models_lists_with_loaded_flag() {
         let (sup, mut test_write, _test_read, _ring) = make_supervisor();
-        let app = make_app(sup);
+        // Host-side scan discovers `org/model`; the worker reports it loaded.
+        let dir = tempfile::TempDir::new().unwrap();
+        write_gguf_fixture(dir.path(), "org/model");
+        let app = make_app_with_lmstudio(sup, dir.path().to_path_buf());
 
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(30)).await;
-            write_response(&mut test_write, 1, scan_json()).await; // scan
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            write_response(&mut test_write, 2, loaded_status_json()).await; // status
+            write_response(&mut test_write, 1, loaded_status_json()).await; // status
         });
 
         let resp = app.oneshot(get("/api/higgs/models")).await.unwrap();
@@ -472,7 +441,10 @@ mod tests {
     #[tokio::test]
     async fn control_load_with_explicit_params() {
         let (sup, mut test_write, _test_read, _ring) = make_supervisor();
-        let app = make_app(sup);
+        // `load` resolves the GGUF path host-side, so the id must be discoverable.
+        let dir = tempfile::TempDir::new().unwrap();
+        write_gguf_fixture(dir.path(), "org/model");
+        let app = make_app_with_lmstudio(sup, dir.path().to_path_buf());
 
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(30)).await;

@@ -43,7 +43,7 @@ use tracing::{info, warn};
 
 use crate::diagnostic::HiggsError;
 use crate::rpc::{self, RpcFrame, RpcNotification, RpcRequest};
-use crate::worker::{M_LOAD, M_SCAN, M_SHUTDOWN, N_CHAT_CHUNK};
+use crate::worker::{M_LOAD, M_SHUTDOWN, N_CHAT_CHUNK};
 
 /// How long `stop()` waits for the worker to exit on its own (after stdin
 /// closes) before SIGKILL-ing it. Generous enough for the child to free a
@@ -109,8 +109,12 @@ pub(crate) struct WorkerHalves {
 ///
 /// Receives the stderr ring so the production impl can wire its drain task.
 /// Test factories receive the ring too but may ignore it.
-type HalvesFactory =
-    Box<dyn Fn(Arc<Mutex<VecDeque<String>>>) -> Result<WorkerHalves, HiggsError> + Send + Sync>;
+/// The `&str` model argument is the model id to be loaded; the production impl
+/// stamps it into the worker's argv0 (`higgs(<model>)`) so the process is
+/// identifiable in `ps`. It is cosmetic only — the model still loads via M_LOAD.
+type HalvesFactory = Box<
+    dyn Fn(Arc<Mutex<VecDeque<String>>>, &str) -> Result<WorkerHalves, HiggsError> + Send + Sync,
+>;
 
 /// Shared supervisor state.
 struct Inner {
@@ -136,8 +140,6 @@ struct Inner {
     /// Ring buffer of recent stderr lines (cap 2000).
     /// `Arc`-wrapped so the factory closure can clone the handle.
     stderr_ring: Arc<Mutex<VecDeque<String>>>,
-    /// Params of the last successful `higgs/scan`; replayed before load after restart.
-    last_scan: Mutex<Option<Value>>,
     /// Params of the last successful `higgs/load`; replayed after restart.
     last_load: Mutex<Option<Value>>,
     /// Set on `stop()` — suppresses respawn after death.
@@ -194,7 +196,6 @@ impl Supervisor {
             next_id: AtomicU64::new(1),
             events_tx,
             stderr_ring: Arc::new(Mutex::new(VecDeque::with_capacity(2000))),
-            last_scan: Mutex::new(None),
             last_load: Mutex::new(None),
             stopped: AtomicBool::new(false),
             running: AtomicBool::new(false),
@@ -218,7 +219,6 @@ impl Supervisor {
             next_id: AtomicU64::new(1),
             events_tx,
             stderr_ring: Arc::new(Mutex::new(VecDeque::with_capacity(2000))),
-            last_scan: Mutex::new(None),
             last_load: Mutex::new(None),
             stopped: AtomicBool::new(false),
             running: AtomicBool::new(false),
@@ -241,11 +241,14 @@ impl Supervisor {
         ring.iter().skip(skip).cloned().collect()
     }
 
-    /// Spawn the worker and start the reader task.
+    /// Spawn a worker (named `higgs(<model>)` in `ps`) and start the reader task.
     ///
-    /// Returns `Err` only if the initial spawn fails.
-    pub(crate) fn start(&self) -> Result<(), HiggsError> {
-        self.do_spawn()?;
+    /// Called by `load()` when no worker is live. `model` is stamped into the
+    /// worker's argv0 only — the model still loads via the M_LOAD RPC. Idempotent:
+    /// a call while a worker is already running is a no-op (single-reader invariant).
+    /// Returns `Err` only if the spawn fails.
+    pub(crate) fn start_for(&self, model: &str) -> Result<(), HiggsError> {
+        self.do_spawn(model)?;
         Ok(())
     }
 
@@ -323,7 +326,9 @@ impl Supervisor {
     /// self-exit and SIGKILL-ing as a last resort so a wedged worker can never
     /// outlive its supervisor.
     pub(crate) async fn stop(&self) {
-        self.inner.stopped.store(true, Ordering::Relaxed);
+        // Release so a racing attempt_restart's Acquire load observes the stop
+        // before it installs a respawned worker (F1 deliberate-unload race).
+        self.inner.stopped.store(true, Ordering::Release);
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             self.request(M_SHUTDOWN, Value::Null),
@@ -350,11 +355,6 @@ impl Supervisor {
         self.inner.running.store(false, Ordering::Release);
     }
 
-    /// Record the params of a successful `higgs/scan` for post-restart replay.
-    pub(crate) fn record_last_scan(&self, params: Value) {
-        *self.inner.last_scan.lock() = Some(params);
-    }
-
     /// Record the params of a successful `higgs/load` for post-restart replay.
     pub(crate) fn record_last_load(&self, params: Value) {
         *self.inner.last_load.lock() = Some(params);
@@ -375,10 +375,10 @@ impl Supervisor {
         let _ = self.inner.events_tx.send(event);
     }
 
-    /// Return a clone of the last-recorded scan params (for test introspection).
+    /// Return a clone of the last-recorded load params (for test introspection).
     #[cfg(test)]
-    pub(crate) fn last_scan_params(&self) -> Option<Value> {
-        self.inner.last_scan.lock().clone()
+    pub(crate) fn last_load_params(&self) -> Option<Value> {
+        self.inner.last_load.lock().clone()
     }
 
     /// Return the number of active chat sinks (for test introspection).
@@ -458,7 +458,7 @@ impl Supervisor {
     /// Resets `stopped` to `false` before launching so a stop→start cycle
     /// restores normal auto-restart behavior (F2: stop() sets stopped=true but
     /// start() must allow auto-restart on the new worker lifetime).
-    fn do_spawn(&self) -> Result<(), HiggsError> {
+    fn do_spawn(&self, model: &str) -> Result<(), HiggsError> {
         // Refuse to spawn a second worker while one is already live (single-reader
         // invariant — see `Inner::running`). Idempotent: a redundant start() on a
         // running worker is a no-op, not an error or a leaked second process.
@@ -469,7 +469,7 @@ impl Supervisor {
         // Reset the deliberate-stop flag so the new worker's reader_task
         // will auto-restart on unexpected death (stop→start cycle fix).
         self.inner.stopped.store(false, Ordering::Relaxed);
-        let halves = match (self.inner.factory)(self.inner.stderr_ring.clone()) {
+        let halves = match (self.inner.factory)(self.inner.stderr_ring.clone(), model) {
             Ok(h) => h,
             Err(e) => {
                 // Spawn failed: release the running flag so a later retry can spawn.
@@ -584,22 +584,63 @@ async fn reader_task(inner: Arc<Inner>, read: ReadHalf) {
 /// Attempt a single respawn: call factory, install new write channel, return
 /// new read half on success.  Returns `None` and exits if factory fails.
 async fn attempt_restart(inner: &Arc<Inner>) -> Option<ReadHalf> {
-    match (inner.factory)(inner.stderr_ring.clone()) {
+    // Stamp the respawned worker's argv0 with the loaded model id (if any) so it
+    // is identifiable in `ps`; the model is still re-loaded via the M_LOAD replay.
+    let model = inner
+        .last_load
+        .lock()
+        .as_ref()
+        .and_then(|p| p.get("id").and_then(|v| v.as_str()).map(ToOwned::to_owned))
+        .unwrap_or_default();
+    match (inner.factory)(inner.stderr_ring.clone(), &model) {
         Ok(halves) => {
+            // Race guard: stop()/unload() may have set `stopped` after the
+            // reader's pre-call check but while factory() was spawning. If so,
+            // reap the just-spawned child and abandon the restart WITHOUT
+            // installing it or replaying the load — never resurrect a worker the
+            // user explicitly unloaded.
+            if inner.stopped.load(Ordering::Acquire) {
+                if let Some(mut child) = halves.proc {
+                    // start_kill() only sends the signal; wait() reaps so the
+                    // abandoned child never lingers as a zombie (mirrors stop()).
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                }
+                return None;
+            }
             // Stash the restarted child so stop() can later wait on / SIGKILL it.
             // do_spawn does this for the initial spawn; the respawn path must too,
             // or a worker restarted after a death would be unreapable by stop().
-            *inner.proc.lock().await = halves.proc;
+            //
+            // First reap the OLD child being overwritten: it already exited (its
+            // EOF is what triggered this restart), but `tokio::process::Child`
+            // does NOT reap on drop, so dropping it without `wait()` leaves a
+            // zombie. Take it out and wait — it returns immediately since the
+            // process is already gone.
+            let mut proc_guard = inner.proc.lock().await;
+            if let Some(mut old) = proc_guard.take() {
+                let _ = old.wait().await;
+            }
+            *proc_guard = halves.proc;
+            drop(proc_guard);
             let (write_tx, write_rx) = mpsc::unbounded_channel::<String>();
             *inner.write_tx.lock() = Some(write_tx);
             tokio::spawn(writer_task(halves.write, write_rx));
             let _ = inner.events_tx.send(HiggsEvent::WorkerRestarted);
             info!("higgs worker restarted");
-            replay_scan_then_load(inner);
+            replay_load(inner);
             Some(halves.read)
         }
         Err(e) => {
             warn!(error = %e, "higgs worker respawn failed — giving up");
+            // Reap the OLD child too: its EOF triggered this restart so it has
+            // already exited, but `tokio::process::Child` does not reap on drop —
+            // without `wait()` it lingers as a zombie. (Symmetric to the Ok branch.)
+            let mut proc_guard = inner.proc.lock().await;
+            if let Some(mut old) = proc_guard.take() {
+                let _ = old.wait().await;
+            }
+            drop(proc_guard);
             // Doc promise: terminal factory failure → broadcasts WorkerDied before exit.
             let _ = inner.events_tx.send(HiggsEvent::WorkerDied);
             None
@@ -683,46 +724,31 @@ fn on_worker_death(inner: &Arc<Inner>, reason: Option<String>, deliberate: bool)
     }
 }
 
-/// Best-effort replay of the last successful scan (if any) then load (if any) after restart.
+/// Best-effort replay of the last successful load (if any) after restart.
 ///
-/// Scan is replayed with awaited response tracking so a scan failure on the
-/// restarted worker is visible in logs (F3: fire-and-forget scan meant the
-/// response was silently dropped, making subsequent load failures misleading).
-/// Load replay awaits its response so we can emit [`HiggsEvent::ModelLoaded`]
-/// only on confirmed success. Both replay failures are intentionally
-/// logged-and-dropped (worker just restarted; user re-drives if needed).
-fn replay_scan_then_load(inner: &Arc<Inner>) {
-    let scan_params = inner.last_scan.lock().clone();
-    let load_params = inner.last_load.lock().clone();
-
-    if scan_params.is_none() && load_params.is_none() {
+/// Scan is host-side now and needs no replay; only the load is re-driven so a
+/// model resident before the death is reloaded into the respawned worker. The
+/// load replay awaits its response so we emit [`HiggsEvent::ModelLoaded`] only on
+/// confirmed success. Replay failure is intentionally logged-and-dropped (worker
+/// just restarted; the user re-drives if needed).
+fn replay_load(inner: &Arc<Inner>) {
+    let Some(load_params) = inner.last_load.lock().clone() else {
         return;
-    }
+    };
 
     let inner2 = Arc::clone(inner);
     tokio::spawn(async move {
-        // Scan first (awaited): worker model index must be populated before load.
-        if let Some(p) = scan_params {
-            if let Err(e) = replay_rpc_await(&inner2, M_SCAN, p).await {
-                warn!(error = %e, "higgs: replayed scan failed after restart");
-                // Do not abort: load replay is still worth trying if scan state
-                // was already warm from the previous worker lifetime.
+        let id = load_params
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_owned();
+        match replay_load_await(&inner2, load_params).await {
+            Ok(()) => {
+                let _ = inner2.events_tx.send(HiggsEvent::ModelLoaded { id });
             }
-        }
-        // Load (awaited): emit ModelLoaded only on confirmed success.
-        if let Some(lp) = load_params {
-            let id = lp
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_owned();
-            match replay_load_await(&inner2, lp).await {
-                Ok(()) => {
-                    let _ = inner2.events_tx.send(HiggsEvent::ModelLoaded { id });
-                }
-                Err(e) => {
-                    warn!(error = %e, "higgs: replayed load failed after restart");
-                }
+            Err(e) => {
+                warn!(error = %e, "higgs: replayed load failed after restart");
             }
         }
     });
@@ -762,8 +788,13 @@ async fn replay_rpc_await(
         });
     }
 
-    match rx.await {
-        Ok(resp) => {
+    // Bound the await like `request()` does: a respawned worker that accepts
+    // stdin but wedges would otherwise leak this task and the `pending[id]`
+    // entry forever (no EOF arrives to drain it). On timeout, remove the
+    // orphaned pending entry (same cleanup `request()` does) and give up — no
+    // retry loop.
+    match tokio::time::timeout(CONTROL_RPC_TIMEOUT, rx).await {
+        Ok(Ok(resp)) => {
             if let Some(err) = resp.error {
                 let worker_code = err
                     .data
@@ -780,9 +811,16 @@ async fn replay_rpc_await(
                 Ok(resp.result.unwrap_or(Value::Null))
             }
         }
-        Err(_) => Err(HiggsError::WorkerDead {
+        Ok(Err(_)) => Err(HiggsError::WorkerDead {
             context: format!("replay {method}: worker died before response"),
         }),
+        Err(_) => {
+            inner.pending.lock().remove(&id);
+            warn!(method, "higgs: replay RPC timed out");
+            Err(HiggsError::WorkerDead {
+                context: format!("replay {method} timed out after {CONTROL_RPC_TIMEOUT:?}"),
+            })
+        }
     }
 }
 
@@ -802,9 +840,19 @@ async fn replay_load_await(inner: &Arc<Inner>, params: Value) -> Result<(), Higg
 /// Wires a blocking stderr drain task to fill the ring.
 fn production_factory(
     stderr_ring: Arc<Mutex<VecDeque<String>>>,
+    model: &str,
 ) -> Result<WorkerHalves, HiggsError> {
     let exe = std::env::current_exe().map_err(|e| HiggsError::WorkerSpawnFailed { source: e })?;
-    let mut child = Command::new(exe)
+    let mut cmd = Command::new(exe);
+    // Stamp argv0 as `higgs(<model>)` so the worker is identifiable in `ps`.
+    // Cosmetic only — the model still loads via the M_LOAD RPC. `tokio::process::
+    // Command::arg0` is cross-platform (no-op effect on platforms without argv0).
+    // Truncate the label to a char-boundary-safe 64 chars: a pathological model
+    // id would otherwise grow argv unbounded and risk E2BIG at spawn (HG006),
+    // turning a normal not-found into a spawn failure. RPC `id` is unaffected.
+    let label: String = model.chars().take(64).collect();
+    cmd.arg0(format!("higgs({label})"));
+    let mut child = cmd
         .arg("--higgs-worker")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -877,7 +925,7 @@ mod tests {
         let sup_write_cell = Arc::new(Mutex::new(Some(sup_write)));
         let sup_read_cell = Arc::new(Mutex::new(Some(sup_read)));
 
-        let sup = Supervisor::with_factory(Box::new(move |_ring| {
+        let sup = Supervisor::with_factory(Box::new(move |_ring, _model| {
             let write =
                 sup_write_cell
                     .lock()
@@ -899,7 +947,7 @@ mod tests {
             })
         }));
 
-        sup.start().expect("mock start failed");
+        sup.start_for("test-model").expect("mock start failed");
 
         (sup, test_write, test_read)
     }
@@ -966,6 +1014,47 @@ mod tests {
         assert_eq!(r2.unwrap(), json!({"n": 2}));
     }
 
+    // ─── Test 1-a: spawn-on-start_for then kill-on-stop lifecycle ────────────
+    //
+    // No worker is live until start_for; a request then correlates. After stop()
+    // the write_tx is cleared so a subsequent request fails WorkerDead — proving
+    // stop() tears the worker down (kill-on-unload at the supervisor layer).
+
+    #[tokio::test]
+    async fn start_for_then_stop_lifecycle() {
+        let (sup_write, _test_read) = tokio::io::duplex(64 * 1024);
+        let (mut test_write, sup_read) = tokio::io::duplex(64 * 1024);
+        let sup_write_cell = Arc::new(Mutex::new(Some(sup_write)));
+        let sup_read_cell = Arc::new(Mutex::new(Some(sup_read)));
+
+        let sup = Supervisor::with_factory(Box::new(move |_ring, _model| {
+            Ok(WorkerHalves {
+                write: Box::new(sup_write_cell.lock().take().expect("one spawn")),
+                read: Box::new(sup_read_cell.lock().take().expect("one spawn")),
+                proc: None,
+            })
+        }));
+
+        // Before start_for: no write_tx → request fails immediately.
+        assert!(
+            sup.request("higgs/ping", json!({})).await.is_err(),
+            "no worker before start_for"
+        );
+
+        // start_for spawns a worker; a request now correlates. The pre-spawn
+        // request already consumed id 1, so this one is id 2.
+        sup.start_for("org/model").expect("spawn");
+        let fut = sup.request("higgs/ping", json!({}));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        write_line(&mut test_write, &ok_response(2, json!({"ok": true}))).await;
+        assert_eq!(fut.await.unwrap(), json!({"ok": true}));
+
+        // stop() kills the worker; a later request fails WorkerDead.
+        sup.stop().await;
+        let err = sup.request("higgs/ping", json!({})).await.unwrap_err();
+        assert!(err.to_string().contains("[HG007]"), "display: {err}");
+    }
+
     // ─── Test 1-b: redundant start() is an idempotent no-op ──────────────────
     //
     // The mock factory hands out exactly one set of duplex halves, so a second
@@ -980,7 +1069,7 @@ mod tests {
         let (sup, mut test_write, _test_read) = make_supervisor();
 
         // Already started by make_supervisor; a second start must not spawn.
-        sup.start()
+        sup.start_for("test-model")
             .expect("redundant start is a no-op, not a second spawn");
 
         // The original worker transport is intact: a request still correlates.
@@ -1062,7 +1151,7 @@ mod tests {
         let sup_write_cell = Arc::new(Mutex::new(Some(sup_write_1)));
         let sup_read_cell = Arc::new(Mutex::new(Some(sup_read_1)));
 
-        let sup = Supervisor::with_factory(Box::new(move |_ring| {
+        let sup = Supervisor::with_factory(Box::new(move |_ring, _model| {
             let write =
                 sup_write_cell
                     .lock()
@@ -1083,7 +1172,7 @@ mod tests {
                 proc: None,
             })
         }));
-        sup.start().expect("start");
+        sup.start_for("test-model").expect("start");
 
         let mut events = sup.events();
 
@@ -1197,7 +1286,7 @@ mod tests {
     //   test_tx_2    ↔ sup_read_2 : test writes mock OK responses back to supervisor
 
     #[tokio::test]
-    async fn restart_replays_scan_then_load() {
+    async fn restart_replays_load() {
         let (sup_write_1, _obs_rx_1) = tokio::io::duplex(64 * 1024);
         let (test_write_1, sup_read_1) = tokio::io::duplex(64 * 1024);
 
@@ -1213,7 +1302,7 @@ mod tests {
         let call_count2 = Arc::clone(&call_count);
 
         let sup =
-            Supervisor::with_factory(Box::new(move |_ring| {
+            Supervisor::with_factory(Box::new(move |_ring, _model| {
                 let n = call_count2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 if n == 0 {
                     let write = cell_sup_write_1.lock().take().unwrap();
@@ -1245,78 +1334,42 @@ mod tests {
                     })
                 }
             }));
-        sup.start().expect("start");
+        sup.start_for("test-model").expect("start");
 
         let mut events = sup.events();
 
-        // Record scan and load so replay has something to send.
-        sup.record_last_scan(json!({"dirs": ["/models"]}));
+        // Record load so replay has something to send. Scan is host-side now —
+        // no scan replay; only the load is re-driven after restart.
         sup.record_last_load(json!({"id": "org/model"}));
 
         // Wait for the reader task to settle, then trigger EOF on first transport.
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         drop(test_write_1);
 
-        // After 1s backoff + restart, the second transport receives
-        // higgs/scan first (awaited — F3 fix), then higgs/load (awaited).
-        // obs_rx_2 is the duplex peer of sup_write_2 — data written by the
-        // supervisor's writer task comes out here.
-        //
-        // Because scan is now awaited before load is sent, the test must:
-        //   1. Read the scan line from obs_rx_2.
-        //   2. Write an OK for scan into test_tx_2 so the awaited scan resolves.
-        //   3. Read the load line from obs_rx_2 (sent after scan reply is received).
-        //   4. Write an OK for load so ModelLoaded is emitted.
+        // After 1s backoff + restart, the second transport receives the replayed
+        // higgs/load (awaited). obs_rx_2 is the duplex peer of sup_write_2 — data
+        // written by the supervisor's writer task comes out here. The test reads
+        // the load RPC then replies OK so ModelLoaded is emitted.
         let deadline = std::time::Duration::from_millis(3000);
 
         use tokio::io::AsyncBufReadExt;
-        let (first_line, second_line) = tokio::time::timeout(deadline, async {
+        let load_line = tokio::time::timeout(deadline, async {
             let mut lines = BufReader::new(&mut obs_rx_2).lines();
-
-            // Step 1: read the scan RPC.
-            let scan_line = lines
+            lines
                 .next_line()
                 .await
                 .unwrap()
-                .expect("scan line expected");
-
-            // Step 2: parse its id and reply OK so the awaited scan resolves.
-            let scan_req: serde_json::Value = serde_json::from_str(&scan_line).expect("valid json");
-            let scan_rpc_id = scan_req["id"]
-                .as_u64()
-                .expect("scan request must carry an id");
-            let scan_ok = ok_response(scan_rpc_id, json!([]));
-            write_line(&mut test_tx_2, &scan_ok).await;
-
-            // Step 3: read the load RPC (sent after scan reply).
-            let load_line = lines
-                .next_line()
-                .await
-                .unwrap()
-                .expect("load line expected");
-
-            (scan_line, load_line)
+                .expect("load line expected")
         })
         .await
-        .expect("timeout waiting for replayed scan+load messages");
+        .expect("timeout waiting for replayed load message");
 
-        let first: serde_json::Value = serde_json::from_str(&first_line).expect("valid json");
-        let second: serde_json::Value = serde_json::from_str(&second_line).expect("valid json");
-        assert_eq!(
-            first["method"], M_SCAN,
-            "first replayed method must be higgs/scan"
-        );
-        assert_eq!(
-            second["method"], M_LOAD,
-            "second replayed method must be higgs/load"
-        );
-        assert_eq!(first["params"], json!({"dirs": ["/models"]}));
-        assert_eq!(second["params"], json!({"id": "org/model"}));
+        let load: serde_json::Value = serde_json::from_str(&load_line).expect("valid json");
+        assert_eq!(load["method"], M_LOAD, "replayed method must be higgs/load");
+        assert_eq!(load["params"], json!({"id": "org/model"}));
 
-        // Step 4: reply to the replayed higgs/load so ModelLoaded is emitted.
-        let load_id = second["id"]
-            .as_u64()
-            .expect("load request must carry an id");
+        // Reply to the replayed higgs/load so ModelLoaded is emitted.
+        let load_id = load["id"].as_u64().expect("load request must carry an id");
         let ok_line = ok_response(load_id, json!({"id": "org/model"}));
         write_line(&mut test_tx_2, &ok_line).await;
 
@@ -1362,16 +1415,15 @@ mod tests {
         assert!(sup.logs(0).is_empty());
     }
 
-    /// `record_last_scan` / `record_last_load` persist replay params, and
-    /// `alloc_request_id` hands out strictly increasing ids.
+    /// `record_last_load` persists replay params, and `alloc_request_id` hands
+    /// out strictly increasing ids.
     #[tokio::test]
     async fn record_params_and_alloc_ids() {
         let (sup, _tw, _tr) = make_supervisor();
-        assert!(sup.last_scan_params().is_none(), "no scan recorded yet");
+        assert!(sup.last_load_params().is_none(), "no load recorded yet");
 
-        sup.record_last_scan(json!({"roots": ["/x"]}));
         sup.record_last_load(json!({"id": "org/model"}));
-        assert_eq!(sup.last_scan_params(), Some(json!({"roots": ["/x"]})));
+        assert_eq!(sup.last_load_params(), Some(json!({"id": "org/model"})));
 
         let a = sup.alloc_request_id();
         let b = sup.alloc_request_id();

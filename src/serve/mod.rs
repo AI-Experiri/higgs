@@ -76,10 +76,6 @@ pub fn router(higgs: Arc<Higgs>) -> Router {
         .route("/api/higgs/status", get(control::control_status))
         .route("/api/higgs/system", get(control::control_system))
         .route("/api/higgs/logs", get(control::control_logs))
-        .route(
-            "/api/higgs/worker/start",
-            post(control::control_worker_start),
-        )
         .route("/api/higgs/worker/stop", post(control::control_worker_stop))
         .route("/api/higgs/version", get(control::control_version))
         .layer(local_cors())
@@ -181,7 +177,7 @@ pub(crate) mod test_support {
             Arc::new(Mutex::new(None));
         let ring_capture = Arc::clone(&ring_cell);
 
-        let sup = Supervisor::with_factory(Box::new(move |ring| {
+        let sup = Supervisor::with_factory(Box::new(move |ring, _model| {
             *ring_capture.lock() = Some(ring);
             let write =
                 sup_write_cell
@@ -204,7 +200,7 @@ pub(crate) mod test_support {
             })
         }));
 
-        sup.start().expect("mock start");
+        sup.start_for("test-model").expect("mock start");
         let ring = ring_cell.lock().take().expect("factory ran on start");
         (sup, test_write, test_read, ring)
     }
@@ -234,6 +230,67 @@ pub(crate) mod test_support {
             Arc::new(sup),
             HiggsConfig::default(),
         )))
+    }
+
+    /// Build an app whose host-side `scan()` reads `lmstudio_dirs`.
+    ///
+    /// Scan runs host-side now, so control tests that need a discoverable model
+    /// point the config at a temp LM Studio fixture dir (see [`write_gguf_fixture`])
+    /// instead of injecting models through the worker.
+    pub(crate) fn make_app_with_lmstudio(sup: Supervisor, dir: std::path::PathBuf) -> Router {
+        let cfg = HiggsConfig {
+            lmstudio_dirs: vec![dir],
+            hf_dirs: vec![],
+            ollama_dirs: vec![],
+            default_load: HiggsConfig::default().default_load,
+        };
+        router(Arc::new(Higgs::with_supervisor(Arc::new(sup), cfg)))
+    }
+
+    /// Write a minimal valid GGUF file (arch=llama, ctx=4096, chat template) at
+    /// `<root>/<id>/model-Q4_K_M.gguf` so a host-side scan discovers `id` with
+    /// enriched metadata. Returns nothing; the caller owns the temp dir.
+    pub(crate) fn write_gguf_fixture(root: &std::path::Path, id: &str) {
+        use ggus::{GGufFileHeader, GGufFileWriter, GGufMetaDataValueType};
+        use std::io::Cursor;
+
+        fn gguf_string(s: &str) -> Vec<u8> {
+            let bytes = s.as_bytes();
+            let mut out = Vec::with_capacity(8 + bytes.len());
+            out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            out.extend_from_slice(bytes);
+            out
+        }
+
+        let header = GGufFileHeader::new(3, 0, 3);
+        let mut buf = Cursor::new(Vec::<u8>::new());
+        let mut writer = GGufFileWriter::new(&mut buf, header).unwrap();
+        writer
+            .write_meta_kv(
+                "general.architecture",
+                GGufMetaDataValueType::String,
+                &gguf_string("llama"),
+            )
+            .unwrap();
+        writer
+            .write_meta_kv(
+                "llama.context_length",
+                GGufMetaDataValueType::U32,
+                &4096u32.to_le_bytes(),
+            )
+            .unwrap();
+        writer
+            .write_meta_kv(
+                "tokenizer.chat_template",
+                GGufMetaDataValueType::String,
+                &gguf_string("{% for m in messages %}{{ m.content }}{% endfor %}"),
+            )
+            .unwrap();
+        writer.finish::<Vec<u8>>(false).finish().unwrap();
+
+        let path = root.join(id).join("model-Q4_K_M.gguf");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, buf.into_inner()).unwrap();
     }
 
     /// A `GET` request to `uri`.
