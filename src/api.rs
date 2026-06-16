@@ -495,6 +495,12 @@ impl Higgs {
             return Err(e);
         }
         self.sup.record_last_load(req_params);
+        // Stamp activity on a successful load: the idle reaper measures the TTL
+        // from the last chat OR load. Without this, a model loaded while the
+        // process has been idle past IDLE_UNLOAD_TTL would be eligible for
+        // auto-unload on the reaper's very next tick — before the user gets to
+        // send a single chat. A fresh load IS recent activity.
+        *self.last_activity.lock() = std::time::Instant::now();
         self.sup.emit(HiggsEvent::ModelLoaded { id: id.to_owned() });
         Ok(())
     }
