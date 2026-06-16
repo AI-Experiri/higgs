@@ -40,7 +40,11 @@ memmap2 = "0.9"
 sysinfo = "0.32"
 # CORS for higgs's standalone listener (the frontend calls it cross-origin from
 # the webview / dev server once higgs is its own process).
-tower-http = { version = "0.6", features = ["cors"] }
+# cors: cross-origin from the webview/dev server. catch-panic: a handler panic
+# returns a structured 500 instead of dropping the connection (ollama gin
+# Recovery). limit: caps request-body size (MAX_BODY_BYTES). timeout: bounds
+# non-streaming control routes only — never the SSE chat stream.
+tower-http = { version = "0.6", features = ["cors", "catch-panic", "limit", "timeout"] }
 # Structured logs for the `higgs-server` binary.
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

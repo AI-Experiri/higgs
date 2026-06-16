@@ -23,14 +23,41 @@ mod v1;
 mod wire;
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use axum::http::{HeaderValue, Method, StatusCode};
+use axum::extract::{DefaultBodyLimit, Request};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::cors::{AllowOrigin, CorsLayer};
+use tower_http::timeout::TimeoutLayer;
 
 use crate::api::Higgs;
 use crate::diagnostic::HiggsError;
+
+// ── Serve-layer limits ──────────────────────────────────────────────────────
+//
+// Documented `const`s (not config yet). A later phase lifts the user-facing
+// ones (body limit, timeouts, bind) into `HiggsConfig` + the Server Settings UI;
+// they are grouped here so that lift is a mechanical move.
+
+/// Maximum accepted request-body size, in bytes. Caps `/v1/chat/completions`
+/// (large `messages` arrays) and every control body. 32 MB is generous for
+/// image-less chat while bounding memory per request — oversized bodies get a
+/// `413 Payload Too Large` from [`DefaultBodyLimit`]. (vllm's default is ~4 MB;
+/// ours is larger because a long conversation transcript is legitimately big.)
+pub const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+/// Whole-request timeout for the **non-streaming control surface**
+/// (`/api/higgs/*`). Generous (a cold model load can take seconds), but bounded
+/// so a wedged control request can't pin a connection forever. Deliberately
+/// **not** applied to `/v1/chat/completions`: a long SSE stream must outlive any
+/// per-request timeout (its duration is bounded separately by the worker
+/// chat-RPC timeout, a different layer).
+pub const CONTROL_TIMEOUT: Duration = Duration::from_secs(120);
 
 // The control wire structs are part of this module's public surface (and the
 // ts-rs export path), so re-export them at `crate::serve::*`.
@@ -61,14 +88,37 @@ pub(crate) fn http_status(err: &HiggsError) -> StatusCode {
     }
 }
 
+/// Cheap readiness probe: returns `200 OK` as soon as the HTTP server is up,
+/// without any worker RPC. "Server is reachable" — not "a model is loaded".
+/// Mirrors vllm's `/health`. Served at both `/health` and `/api/higgs/health`.
+async fn health() -> StatusCode {
+    StatusCode::OK
+}
+
 /// Build the higgs router: OpenAI-compatible `/v1` + `/api/higgs/*` control.
 ///
 /// The host serves this on its own listener; all state flows through the shared
-/// [`Higgs`] facade.
+/// [`Higgs`] facade. Hardening (established ollama/vllm practice) layered here:
+///
+/// - **DNS-rebinding host guard** ([`host_guard`]) on every request — rejects a
+///   `Host` header that isn't loopback, so a malicious page can't rebind a
+///   hostname to `127.0.0.1` and reach this no-auth server.
+/// - **Body-size limit** ([`MAX_BODY_BYTES`]) → `413` on oversized bodies.
+/// - **Panic recovery** ([`CatchPanicLayer`]) → a handler panic becomes a `500`
+///   instead of dropping the connection.
+/// - **Control timeout** ([`CONTROL_TIMEOUT`]) on `/api/higgs/*` only — the
+///   streaming `/v1/chat/completions` is left un-timed at the HTTP layer so a
+///   long SSE stream is never aborted mid-flight.
 pub fn router(higgs: Arc<Higgs>) -> Router {
-    Router::new()
+    // Streaming surface: NO whole-request timeout (an SSE chat stream must
+    // outlive any per-request bound). The chat duration is bounded separately
+    // by the worker chat-RPC timeout.
+    let streaming = Router::new().route("/v1/chat/completions", post(v1::v1_chat_completions));
+
+    // Control + non-streaming surface: a generous whole-request timeout is safe
+    // and prevents a wedged request pinning a connection.
+    let control = Router::new()
         .route("/v1/models", get(v1::v1_models))
-        .route("/v1/chat/completions", post(v1::v1_chat_completions))
         .route("/api/higgs/models", get(control::control_models))
         .route("/api/higgs/models/load", post(control::control_load))
         .route("/api/higgs/models/unload", post(control::control_unload))
@@ -78,8 +128,75 @@ pub fn router(higgs: Arc<Higgs>) -> Router {
         .route("/api/higgs/logs", get(control::control_logs))
         .route("/api/higgs/worker/stop", post(control::control_worker_stop))
         .route("/api/higgs/version", get(control::control_version))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            CONTROL_TIMEOUT,
+        ));
+
+    streaming
+        .merge(control)
+        .route("/health", get(health))
+        .route("/api/higgs/health", get(health))
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .layer(CatchPanicLayer::new())
+        .layer(middleware::from_fn(host_guard))
         .layer(local_cors())
         .with_state(higgs)
+}
+
+/// DNS-rebinding defense: reject any request whose `Host` header is not a
+/// trusted loopback host. The #1 protection for a no-auth loopback server
+/// (ollama's `allowedHostsMiddleware`) — without it, a malicious web page can
+/// DNS-rebind its own hostname to `127.0.0.1` and reach this server from the
+/// victim's browser. A missing `Host` header is rejected (ollama behavior). On
+/// rejection: `403` carrying the `[HG012]` diagnostic.
+async fn host_guard(req: Request, next: Next) -> Response {
+    match host_allowed(req.headers()) {
+        Ok(()) => next.run(req).await,
+        Err(host) => {
+            let err = HiggsError::ForbiddenHost { host };
+            tracing::warn!(%err, "rejected request with non-loopback Host header");
+            (StatusCode::FORBIDDEN, err.to_string()).into_response()
+        }
+    }
+}
+
+/// Validate the `Host` header: the host portion (sans `:port`) must be a
+/// loopback host. Returns `Err(host_string)` with the offending value (or
+/// `"<missing>"` when absent) on rejection.
+fn host_allowed(headers: &HeaderMap) -> Result<(), String> {
+    let Some(value) = headers.get(axum::http::header::HOST) else {
+        return Err("<missing>".to_string());
+    };
+    let Ok(s) = value.to_str() else {
+        return Err("<non-utf8>".to_string());
+    };
+    if is_loopback_host(s) {
+        Ok(())
+    } else {
+        Err(s.to_string())
+    }
+}
+
+/// Whether a `Host`-header value (`host` or `host:port`) names a loopback host:
+/// `127.0.0.1`, `localhost`, or IPv6 `::1` / `[::1]`. The host portion is the
+/// part before the final `:port`, with IPv6 brackets handled (`[::1]:11434`).
+fn is_loopback_host(host_port: &str) -> bool {
+    // Bracketed IPv6: `[::1]` or `[::1]:port`.
+    let host = if let Some(rest) = host_port.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((inner, _)) => inner,
+            None => return false,
+        }
+    } else if host_port.matches(':').count() >= 2 {
+        // Bare (unbracketed) IPv6 literal like `::1` — no port can be appended
+        // without brackets, so take the whole thing.
+        host_port
+    } else {
+        // host or host:port (IPv4 / DNS name).
+        host_port.split(':').next().unwrap_or(host_port)
+    };
+    host == "127.0.0.1" || host == "localhost" || host == "::1"
 }
 
 /// Serve the higgs router on `listener`, shutting down **gracefully** when
@@ -141,7 +258,7 @@ fn is_local_origin(origin: &HeaderValue) -> bool {
 // Spins up a `Supervisor` over duplex pipes with a mock worker, wraps it in a
 // `Higgs` facade, and builds the router — so the `v1` and `control` handler
 // tests drive the real router without a real worker process. Shared by both
-// surfaces' test modules via `super::super::test_support::*`.
+// surfaces' test modules via `super::test_support::*`.
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::collections::VecDeque;
@@ -293,16 +410,23 @@ pub(crate) mod test_support {
         std::fs::write(&path, buf.into_inner()).unwrap();
     }
 
-    /// A `GET` request to `uri`.
+    /// A `GET` request to `uri`. Carries a loopback `Host` so it passes the
+    /// serve-layer DNS-rebinding guard (`host_guard`).
     pub(crate) fn get(uri: &str) -> Request<Body> {
-        Request::builder().uri(uri).body(Body::empty()).unwrap()
+        Request::builder()
+            .uri(uri)
+            .header("host", "127.0.0.1")
+            .body(Body::empty())
+            .unwrap()
     }
 
-    /// A `POST` request to `uri` with a JSON body.
+    /// A `POST` request to `uri` with a JSON body. Carries a loopback `Host` so
+    /// it passes the serve-layer DNS-rebinding guard (`host_guard`).
     pub(crate) fn post_json(uri: &str, body: &serde_json::Value) -> Request<Body> {
         Request::builder()
             .method("POST")
             .uri(uri)
+            .header("host", "127.0.0.1")
             .header("content-type", "application/json")
             .body(Body::from(body.to_string()))
             .unwrap()
@@ -330,10 +454,119 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::{http_status, is_local_origin};
-    use axum::http::{HeaderValue, StatusCode};
+    use super::{host_allowed, http_status, is_local_origin, is_loopback_host};
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
 
     use crate::diagnostic::HiggsError;
+
+    #[test]
+    fn loopback_host_matcher() {
+        for h in [
+            "127.0.0.1",
+            "127.0.0.1:11434",
+            "localhost",
+            "localhost:5173",
+            "::1",
+            "[::1]",
+            "[::1]:11434",
+        ] {
+            assert!(is_loopback_host(h), "should allow Host {h}");
+        }
+        for h in [
+            "evil.example.com",
+            "evil.example.com:11434",
+            "10.0.0.5:11434",
+            "0.0.0.0",
+            "169.254.169.254",
+            "[2001:db8::1]",
+        ] {
+            assert!(!is_loopback_host(h), "should reject Host {h}");
+        }
+    }
+
+    #[test]
+    fn host_guard_allows_loopback_and_rejects_others() {
+        let mut ok = HeaderMap::new();
+        ok.insert("host", HeaderValue::from_static("127.0.0.1:11434"));
+        assert!(host_allowed(&ok).is_ok());
+
+        let mut bad = HeaderMap::new();
+        bad.insert("host", HeaderValue::from_static("evil.example.com"));
+        assert_eq!(host_allowed(&bad), Err("evil.example.com".to_string()));
+
+        // Missing Host is rejected (ollama behavior).
+        let missing = HeaderMap::new();
+        assert_eq!(host_allowed(&missing), Err("<missing>".to_string()));
+    }
+
+    /// End-to-end through the real router: a foreign `Host` → 403, an oversized
+    /// body → 413, and a loopback `Host` with a small body passes the guard.
+    #[tokio::test]
+    async fn router_host_guard_and_body_limit() {
+        use super::test_support::{make_app, make_supervisor};
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let (sup, _w, _r, _ring) = make_supervisor();
+        let app = make_app(sup);
+
+        // Foreign Host → 403 (HG012), before any handler runs.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/higgs/status")
+                    .header("host", "evil.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // Oversized body (loopback Host) → 413.
+        let big = vec![b'x'; super::MAX_BODY_BYTES + 1];
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/higgs/models/load")
+                    .header("host", "127.0.0.1:11434")
+                    .header("content-type", "application/json")
+                    .body(Body::from(big))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// `/health` returns 200 without a worker RPC.
+    #[tokio::test]
+    async fn health_is_cheap_200() {
+        use super::test_support::{make_app, make_supervisor};
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let (sup, _w, _r, _ring) = make_supervisor();
+        let app = make_app(sup);
+        for uri in ["/health", "/api/higgs/health"] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header("host", "127.0.0.1")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        }
+    }
 
     #[test]
     fn local_origin_matcher() {

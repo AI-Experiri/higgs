@@ -6,6 +6,7 @@
 - [Effective Config (read-only surface)](#effective-config-read-only-surface)
 - [Model Directory Layouts](#model-directory-layouts)
 - [Build Note: LIBCLANG_PATH](#build-note-libclang_path)
+- [Serve-Layer Limits & Hardening](#serve-layer-limits--hardening)
 - [Non-Configurable Defaults](#non-configurable-defaults)
 - [Links](#links)
 
@@ -31,7 +32,7 @@ It reads three environment variables; everything else comes from
 
 | Env var | Default | Effect | Where |
 |---------|---------|--------|-------|
-| `HIGGS_BIND` | `127.0.0.1` | Bind address. `0.0.0.0` exposes it LAN-wide. | `higgs-server` only |
+| `HIGGS_BIND` | `127.0.0.1` | Bind address. A non-loopback value (`0.0.0.0`, a LAN IP) exposes the **no-auth** surface LAN-wide and logs a prominent `tracing::warn!` SECURITY WARNING at startup. | `higgs-server` only |
 | `HIGGS_PORT` | `11434` | Listen port. | `higgs-server` only |
 | `RUST_LOG` | `info` | tracing filter. | both |
 
@@ -117,6 +118,31 @@ export LIBCLANG_PATH=/path/to/libclang/lib
 ```
 
 The project prefix `env -u LIBCLANG_PATH cargo …` unsets any stale value when the correct path is already on `PATH`. When building for the first time on a new machine, set `LIBCLANG_PATH` explicitly before running `cargo build`.
+
+---
+
+## Serve-Layer Limits & Hardening
+
+The serve layer (`src/serve/mod.rs`) applies established ollama/vllm HTTP
+hardening. These are documented `const`s today (not yet config); a later phase
+lifts the user-facing ones into `HiggsConfig` + the Server Settings UI.
+
+| Item | Value | Source const | Effect |
+|------|-------|--------------|--------|
+| Max request body | 32 MB | `serve::MAX_BODY_BYTES` | Oversized body ⇒ `413`. Caps `/v1/chat/completions` + control bodies (vllm uses ~4 MB; ours is larger for long transcripts). |
+| Control timeout | 120 s | `serve::CONTROL_TIMEOUT` | Whole-request timeout on `/api/higgs/*` + `/v1/models` only. **Not** applied to `/v1/chat/completions` — a long SSE stream must never be aborted at the HTTP layer (its duration is bounded by the worker chat-RPC timeout). |
+| Host guard | loopback only | `serve::is_loopback_host` | DNS-rebinding defense. `Host` header (sans `:port`) must be `127.0.0.1` / `localhost` / `::1`, else `403 [HG012]`. Missing `Host` ⇒ `403` (ollama behavior). |
+| Panic recovery | — | `CatchPanicLayer` | A handler panic returns a structured `500` instead of dropping the connection (ollama gin Recovery). |
+| CORS | loopback + tauri origins | `serve::local_cors` | Cross-origin only from loopback / Tauri webview origins. |
+
+`GET /health` (and `/api/higgs/health`) is a cheap readiness probe: `200` as
+soon as the server is up, with **no** worker RPC ("server reachable", not "model
+loaded").
+
+**No-auth threat model:** higgs has no authentication. The Host guard + CORS
+protect *browser* clients from DNS rebinding / cross-origin reads. They do **not**
+protect non-browser clients — which is why a non-loopback `HIGGS_BIND` logs a
+SECURITY WARNING. The embedded (jigglebot) path always binds ephemeral loopback.
 
 ---
 

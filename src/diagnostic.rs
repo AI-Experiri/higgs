@@ -77,6 +77,14 @@ pub enum HiggsError {
     #[snafu(display("[HG011] generation failed at {stage}: {reason}"))]
     #[diagnostic(code(HG011))]
     GenerationFailed { stage: String, reason: String },
+
+    /// The request's `Host` header is not a trusted loopback host. Rejected at
+    /// the serve layer (HTTP 403) as a DNS-rebinding defense — a no-auth
+    /// loopback server must not honor requests addressed to an arbitrary
+    /// hostname a malicious page may have rebound to `127.0.0.1`.
+    #[snafu(display("[HG012] forbidden host: {host}"))]
+    #[diagnostic(code(HG012))]
+    ForbiddenHost { host: String },
 }
 
 #[cfg(test)]

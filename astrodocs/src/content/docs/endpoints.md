@@ -14,6 +14,11 @@ higgs exposes two route groups:
 
 All routes are mounted by `higgs::serve::router(Arc<Higgs>)`.
 
+Both surfaces also expose a cheap readiness probe (`GET /health`,
+`GET /api/higgs/health`) and sit behind a shared **serve-layer hardening** stack
+(Host guard, body limit, control timeout, panic recovery) — see the sections
+below.
+
 ---
 
 ## Error Mapping
@@ -27,6 +32,7 @@ The same status table applies to both surfaces:
 | HG005 ContextOverflow | 400 |
 | HG006 WorkerSpawnFailed | 503 |
 | HG007 WorkerDead | 503 |
+| HG012 ForbiddenHost | 403 |
 | anything else | 500 |
 
 **`/v1` error envelope:**
@@ -48,6 +54,32 @@ The same status table applies to both surfaces:
 
 ```json
 { "error": "[HG003] model not loaded: org/model — load it explicitly first" }
+```
+
+---
+
+## Health Routes
+
+### GET /health  ·  GET /api/higgs/health
+
+Cheap readiness probe. Returns 200 as soon as the server is up — **no worker
+RPC**. This answers "is the higgs server reachable?", not "is a model loaded?".
+Use `GET /api/higgs/status` for load state.
+
+Both paths are identical; `/health` is the conventional top-level probe and
+`/api/higgs/health` keeps the control plane self-contained.
+
+**Response (200):**
+
+```json
+{ "status": "ok" }
+```
+
+**curl:**
+
+```sh
+curl http://localhost:8081/health
+curl http://localhost:8081/api/higgs/health
 ```
 
 ---
@@ -420,3 +452,37 @@ unloading **is** the stop. Use `POST /api/higgs/models/load` to bring a worker u
 ```sh
 curl -X POST http://localhost:8081/api/higgs/worker/stop
 ```
+
+---
+
+## Serve-layer hardening
+
+Every request — both surfaces — passes through a shared middleware stack
+(`higgs::serve::router`) following established ollama/vllm practice. higgs has
+**no auth**; these layers are the defense for a loopback no-auth server.
+
+| Guard | Mechanism | On violation |
+|-------|-----------|--------------|
+| **Host header** | DNS-rebinding guard: the `Host` header's host portion (sans `:port`) must be loopback (`127.0.0.1` / `localhost` / `::1` / `[::1]`). A missing Host is also rejected (ollama behavior). | **403** `[HG012] forbidden host: <host>` |
+| **Body size** | `MAX_BODY_BYTES` = 32 MB via axum `DefaultBodyLimit`. | **413** |
+| **Control timeout** | `CONTROL_TIMEOUT` = 120 s `tower_http::timeout::TimeoutLayer`, applied **only** to `/api/higgs/*` and `/v1/models`. | **408** |
+| **Panic recovery** | `tower_http::catch_panic::CatchPanicLayer` — a handler panic is caught and rendered. | **500** (connection survives) |
+
+**Why the timeout skips chat streaming.** `POST /v1/chat/completions` is **not**
+under `TimeoutLayer` — an SSE generation must never be aborted at the HTTP layer.
+Its duration is bounded separately by the worker chat-RPC timeout.
+
+**`/v1` 403 envelope (Host guard):**
+
+```json
+{
+  "error": {
+    "message": "[HG012] forbidden host: evil.example.com",
+    "type": "invalid_request_error",
+    "code": null
+  }
+}
+```
+
+The control surface returns the plain `{ "error": "[HG012] forbidden host: …" }`
+envelope.

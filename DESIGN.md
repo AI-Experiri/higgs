@@ -222,6 +222,23 @@
   └──────────────────────────┴──────────────────────────────────────┘
   (no /worker/start — load IS the start, unload IS the stop)
 
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  /health, /api/higgs/health  │ 200 immediately, NO worker RPC    │
+  │                              │ ("server up", not "model loaded") │
+  └─────────────────────────────────────────────────────────────────┘
+
+  Serve-layer hardening (request flows top→bottom; first reject wins):
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  local_cors           browser cross-origin: loopback/tauri only   │
+  │  host_guard           DNS-rebind: Host must be loopback → 403 HG012│
+  │  CatchPanicLayer      handler panic → structured 500              │
+  │  DefaultBodyLimit     body > MAX_BODY_BYTES (32 MB) → 413          │
+  │  ── split by route ──                                             │
+  │  /api/higgs/* + /v1/models : TimeoutLayer(CONTROL_TIMEOUT 120 s)  │
+  │  /v1/chat/completions      : NO http timeout — SSE must not abort │
+  └──────────────────────────────────────────────────────────────────┘
+  Non-loopback HIGGS_BIND (standalone bin) → startup SECURITY WARNING.
+
   Error mapping (same table for both surfaces):
   ┌────────────────────────────┬──────────┐
   │  HiggsError variant        │  HTTP    │

@@ -342,6 +342,95 @@ pools on a pane-driven load is a future enhancement.
 
 ---
 
+## Security / HTTP hardening
+
+higgs has **no auth** — there are no API keys, no tokens, no sessions. The threat
+model is therefore "a no-auth HTTP server on a shared host," and the entire serve
+layer is built to keep that surface loopback-only. The hardening follows
+established ollama/vllm practice; the layers wrap **every** request on both
+surfaces.
+
+```
+request
+  │
+  ▼
+┌─────────────────────────────────────────────────────────────┐
+│ CatchPanicLayer        handler panic → structured 500        │
+│                        (connection survives, never dropped)  │
+├─────────────────────────────────────────────────────────────┤
+│ Host guard (#1 defense) Host header host-part must be        │
+│                        loopback (127.0.0.1/localhost/::1/    │
+│                        [::1]); missing Host → reject too     │
+│                        violation → 403 [HG012] ForbiddenHost │
+├─────────────────────────────────────────────────────────────┤
+│ DefaultBodyLimit       MAX_BODY_BYTES = 32 MB → 413          │
+├─────────────────────────────────────────────────────────────┤
+│ TimeoutLayer 120 s     ONLY /api/higgs/* + /v1/models        │
+│                        NOT /v1/chat/completions (SSE)        │
+└─────────────────────────────────────────────────────────────┘
+  │
+  ▼
+router (/v1, /api/higgs/*, /health, /api/higgs/health)
+```
+
+### DNS-rebinding Host guard — the #1 defense
+
+For a loopback no-auth server the dominant attack is **DNS rebinding**: a page in
+the user's browser resolves an attacker-controlled hostname to `127.0.0.1` and
+fires requests at higgs with the browser's implicit trust. The guard defeats this
+by requiring the request's `Host` header host portion (sans `:port`) to be a
+loopback name — `127.0.0.1`, `localhost`, `::1`, or `[::1]`. A non-loopback or
+**missing** Host is a `403 [HG012] ForbiddenHost` (matching ollama). The browser
+cannot forge the `Host` header, so a rebound origin is blocked before it reaches
+any handler.
+
+### CORS is browser-only
+
+CORS, like the Host guard, only constrains **browser** clients — the browser
+enforces it. Neither protects a non-browser client (curl, a script, a process on
+the network) that simply sets its own headers. The only real boundary for those
+clients is the bind address: an ephemeral loopback listener (the embedded
+jigglebot path) is unreachable off-box.
+
+### Body limit & panic recovery
+
+- **Body limit** — `MAX_BODY_BYTES` = 32 MB caps request bodies so a malformed
+  or hostile client can't exhaust memory; oversized bodies are `413`.
+- **Panic recovery** — `CatchPanicLayer` converts a handler panic into a
+  structured `500` rather than a dropped connection, so one bad request can't
+  take down the listener.
+
+### Control timeout, but never the SSE stream
+
+```
+/api/higgs/* , /v1/models  ──▶ TimeoutLayer(120s)  ──▶ 408 if exceeded
+/v1/chat/completions        ──▶ (no HTTP timeout)  ──▶ bounded by the
+                                                        worker chat-RPC timeout
+```
+
+Control endpoints are bounded request/response, so a 120 s cap is safe. A chat
+**completion is an SSE stream** — aborting it at the HTTP layer would truncate a
+legitimate long generation mid-token. Its duration is bounded one layer down by
+the worker chat-RPC timeout instead, so the HTTP layer never cuts the stream.
+
+### /health readiness
+
+`GET /health` and `GET /api/higgs/health` answer "is the server reachable?" with a
+cheap `200` and **no worker RPC** — they report liveness of the control surface,
+not whether a model is loaded (`/api/higgs/status` covers load state). They sit
+behind the same hardening stack.
+
+### Non-loopback bind: SECURITY WARNING
+
+The standalone `higgs-server` binary honors `HIGGS_BIND`. A **non-loopback**
+value (e.g. `0.0.0.0`) is allowed but logs a prominent startup **SECURITY
+WARNING**: higgs has no auth, and the Host guard + CORS only protect *browser*
+clients — any non-browser client on the network can reach the API directly. The
+**embedded jigglebot path always binds an ephemeral `127.0.0.1` port** and never
+takes this risk.
+
+---
+
 ## Embedding higgs in any host app
 
 The same integration points work for any Axum host:

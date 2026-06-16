@@ -46,6 +46,22 @@ fn main() {
         .unwrap_or(11434);
     let addr = format!("{bind}:{port}");
 
+    // SECURITY WARNING on a non-loopback bind (vllm's startup warning). higgs
+    // has NO auth — its control surface (`/api/higgs/*`) and OpenAI `/v1` are
+    // open to anyone who can reach the port. The DNS-rebinding Host guard + CORS
+    // only protect *browser* clients; a non-loopback bind exposes the surface to
+    // any non-browser client on the network. The embedded path always binds
+    // loopback — this only fires for the standalone bin.
+    if !is_loopback_bind(&bind) {
+        tracing::warn!(
+            %bind,
+            "SECURITY WARNING: higgs is binding to a NON-LOOPBACK address. The \
+             no-auth control + /v1 surface is exposed beyond localhost; CORS and \
+             the Host guard do not protect non-browser clients. Bind 127.0.0.1 \
+             unless you intend a LAN-reachable server."
+        );
+    }
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -73,6 +89,16 @@ fn main() {
     });
 }
 
+/// Whether `bind` names a loopback address (no security warning needed).
+/// Anything else (`0.0.0.0`, a LAN IP, a public IP, `::`) is non-loopback.
+fn is_loopback_bind(bind: &str) -> bool {
+    bind == "127.0.0.1"
+        || bind == "localhost"
+        || bind == "::1"
+        || bind == "[::1]"
+        || bind.starts_with("127.")
+}
+
 /// Resolve when the process is asked to terminate — SIGTERM (the standard
 /// supervisor/`kill` signal) or Ctrl-C. Graceful shutdown lets in-flight
 /// requests finish and runs normal at-exit handlers (which, under coverage
@@ -93,5 +119,20 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_loopback_bind;
+
+    #[test]
+    fn loopback_bind_detection() {
+        for b in ["127.0.0.1", "localhost", "::1", "[::1]", "127.0.0.5"] {
+            assert!(is_loopback_bind(b), "{b} is loopback");
+        }
+        for b in ["0.0.0.0", "10.0.0.5", "192.168.1.10", "::", "203.0.113.1"] {
+            assert!(!is_loopback_bind(b), "{b} is non-loopback");
+        }
     }
 }
