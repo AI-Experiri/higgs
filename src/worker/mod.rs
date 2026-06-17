@@ -21,6 +21,9 @@ pub const M_UNLOAD: &str = "higgs/unload";
 pub const M_STATUS: &str = "higgs/status";
 pub const M_CHAT: &str = "higgs/chat";
 pub const M_SHUTDOWN: &str = "higgs/shutdown";
+/// Probe a GGUF for engine loadability (Gate 1) without disturbing the resident
+/// model. Reply carries `{loadable, reason, engine_version}`.
+pub const M_PROBE: &str = "higgs/probe";
 /// Streaming notification carrying one content delta for an in-flight chat.
 pub const N_CHAT_CHUNK: &str = "higgs/chat/chunk";
 
@@ -133,6 +136,7 @@ impl WorkerState {
                 Ok(json!({}))
             }
             M_CHAT => self.handle_chat(req, writer),
+            M_PROBE => Ok(self.handle_probe(req)),
             other => Err(RpcError {
                 code: -32601,
                 message: format!("unknown method {other}"),
@@ -220,6 +224,29 @@ impl WorkerState {
             .map_err(|e| to_rpc_error(&e))?;
         self.loaded = Some((id.to_string(), params));
         Ok(json!({ "id": id }))
+    }
+
+    /// Probe a GGUF for engine loadability (Gate 1) and report this worker's own
+    /// engine version. The probe loads into a throwaway handle (dropped at once,
+    /// never resident) so it never disturbs a model being served. The reply
+    /// carries `{loadable, reason, engine_version}`: `reason` is the engine's
+    /// VERBATIM error string when `loadable` is false, else `null`.
+    ///
+    /// `engine_version` is sourced from THIS probing binary's engine — the host
+    /// can't call the FFI version fn without pulling FFI in, so the worker that
+    /// actually runs the load is the correct source for the cache key.
+    fn handle_probe(&self, req: &RpcRequest) -> Value {
+        let path = req
+            .params
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let (loadable, reason) = self.engine.probe(path);
+        json!({
+            "loadable": loadable,
+            "reason": reason,
+            "engine_version": engine::llamacpp::engine_version(),
+        })
     }
 
     /// Run one chat completion, streaming each content delta as an
@@ -391,6 +418,17 @@ mod tests {
 
         fn is_loaded(&self) -> bool {
             self.loaded
+        }
+
+        fn probe(&self, path: &str) -> (bool, Option<String>) {
+            self.calls.lock().push(format!("probe {path}"));
+            // Scripted verdict: a path containing "gemma4" is unsupported with a
+            // verbatim engine-style reason; everything else loads.
+            if path.contains("gemma4") {
+                (false, Some("unknown model architecture: 'gemma4'".into()))
+            } else {
+                (true, None)
+            }
         }
 
         fn chat(
@@ -639,6 +677,45 @@ mod tests {
             err.message
         );
         assert!(calls.lock().is_empty(), "engine must not load anything");
+    }
+
+    #[test]
+    fn probe_reports_loadable_and_engine_version() {
+        // Supported path: FakeEngine returns (true, None); the reply carries
+        // loadable=true, reason=null, and a non-empty engine_version string.
+        let ok = req_line(
+            2,
+            M_PROBE,
+            json!({"path": "/models/llama/llama-Q4_K_M.gguf"}),
+        );
+        // Unsupported path: FakeEngine returns the verbatim gemma4 reason.
+        let bad = req_line(3, M_PROBE, json!({"path": "/models/gemma4/x.gguf"}));
+        let (frames, calls) = serve_with_fake(&format!("{ok}{bad}"));
+        assert_eq!(frames.len(), 2);
+
+        let RpcFrame::Response(r_ok) = &frames[0] else {
+            panic!("expected response")
+        };
+        let res = r_ok.result.as_ref().unwrap();
+        assert_eq!(res["loadable"], true);
+        assert_eq!(res["reason"], Value::Null);
+        assert!(
+            res["engine_version"]
+                .as_str()
+                .is_some_and(|v| !v.is_empty()),
+            "engine_version present: {res:?}"
+        );
+
+        let RpcFrame::Response(r_bad) = &frames[1] else {
+            panic!("expected response")
+        };
+        let res = r_bad.result.as_ref().unwrap();
+        assert_eq!(res["loadable"], false);
+        assert_eq!(res["reason"], "unknown model architecture: 'gemma4'");
+
+        let calls = calls.lock();
+        assert_eq!(calls.len(), 2);
+        assert!(calls[0].starts_with("probe "));
     }
 
     #[test]

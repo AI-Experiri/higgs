@@ -35,6 +35,21 @@ impl Default for HiggsOk {
 }
 
 higgs_ts! {
+    /// One load-relevant GGUF header key/value, curated for the UI so a support
+    /// mismatch can be pinned to a specific field (e.g. `general.architecture =
+    /// gemma4`). Only keys that bear on loadability are surfaced — giant arrays
+    /// (token lists, merges) are deliberately skipped. `value` is the
+    /// human-readable rendering of the header value.
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    pub struct GgufComponent {
+        /// GGUF metadata key, e.g. `general.architecture` or `llama.block_count`.
+        pub key: String,
+        /// The value as a display string.
+        pub value: String,
+    }
+}
+
+higgs_ts! {
     /// Response for `GET /api/higgs/models`: live scan results plus the loaded id.
     #[derive(Debug, serde::Serialize)]
     pub struct HiggsModelsResponse {
@@ -59,6 +74,26 @@ higgs_ts! {
         pub state: String,
         /// File format — always `"gguf"` for higgs-discovered models.
         pub format: String,
+        /// Gate 1: whether our llama.cpp engine can LOAD this model, as proved by
+        /// a real probe of a representative GGUF for this `(arch, quant)`. `false`
+        /// means a load attempt failed; `support_reason` carries the verbatim
+        /// engine reason.
+        pub loadable: bool,
+        /// Gate 2: whether higgs has a tool-call parser that matches this model's
+        /// chat template. `false` means the model loads but tool calls can't be
+        /// parsed; `support_reason` explains.
+        pub tool_calls: bool,
+        /// The exact reason this model isn't fully supported, or `None` when it is.
+        /// When `!loadable`, this is the engine's VERBATIM load error (e.g.
+        /// `"unknown model architecture: 'gemma4'"`). When `loadable && !tool_calls`,
+        /// it is `"no tool-call parser matches this model's template"`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        ///
+        /// The curated `gguf_components` list — used by the UI to pin a support
+        /// mismatch to a specific header field — rides the flattened
+        /// [`HiggsModel`] (its single home); it is not re-declared here.
+        pub support_reason: Option<String>,
     }
 }
 

@@ -68,10 +68,56 @@ async fn scan_with_loaded(
     Ok((models, loaded_id))
 }
 
+/// The `(arch, quant)` support-cache key for a model. A missing arch/quant is
+/// keyed as the empty string, so all "unknown arch/quant" files share one verdict
+/// (and one probe) rather than each probing redundantly.
+fn support_key(model: &HiggsModel) -> (String, String) {
+    (
+        model.arch.clone().unwrap_or_default(),
+        model.quant.clone().unwrap_or_default(),
+    )
+}
+
+/// Gate 2 (host-side, zero FFI): does any registered tool-call parser recognize
+/// this model's chat template? `false` when there is no template or none matches.
+/// The `tool_parser` registry is pure Rust, so this runs in-process — no worker.
+fn tool_calls_supported(model: &HiggsModel) -> bool {
+    match model.chat_template.as_deref() {
+        Some(tmpl) => crate::worker::tool_parser::ToolParserRegistry::with_defaults()
+            .select(tmpl)
+            .is_some(),
+        None => false,
+    }
+}
+
 /// Build the per-model control entry: the canonical [`HiggsModel`] enriched with
-/// its load `state` (flagged against `loaded_id`) and `format`.
-fn model_entry(model: HiggsModel, loaded_id: Option<&str>) -> HiggsModelEntry {
+/// its load `state`, `format`, and the two support gates.
+///
+/// `loadable`/`load_reason` are the Gate-1 verdict for this model's
+/// `(arch, quant)` (from the probe sweep). `support_reason` is the verbatim
+/// engine reason when `!loadable`, the fixed Gate-2 message when the model loads
+/// but no parser matches its template, else `None`.
+fn model_entry(
+    mut model: HiggsModel,
+    loaded_id: Option<&str>,
+    loadable: bool,
+    load_reason: Option<String>,
+) -> HiggsModelEntry {
     let is_loaded = loaded_id == Some(model.id.as_str());
+    let tool_calls = tool_calls_supported(&model);
+    let support_reason = if !loadable {
+        // Gate 1 failed: surface the engine's verbatim load error.
+        load_reason
+    } else if !tool_calls {
+        // Gate 1 passed, Gate 2 failed: no parser matches the template.
+        Some("no tool-call parser matches this model's template".to_owned())
+    } else {
+        None
+    };
+    // The transient chat_template never leaves the host; drop it explicitly
+    // (it is `serde(skip)` anyway). `gguf_components` stays on the model — its
+    // single home — and rides the flattened payload.
+    model.chat_template = None;
     HiggsModelEntry {
         state: if is_loaded {
             "loaded".to_owned()
@@ -79,21 +125,47 @@ fn model_entry(model: HiggsModel, loaded_id: Option<&str>) -> HiggsModelEntry {
             "not-loaded".to_owned()
         },
         format: "gguf".to_owned(),
+        loadable,
+        tool_calls,
+        support_reason,
         model,
     }
 }
 
 /// `GET /api/higgs/models` — live scan of all configured directories, plus
-/// the currently loaded model id.
+/// the currently loaded model id and the Gate-1/Gate-2 support verdict per model.
 pub(super) async fn control_models(State(higgs): State<Arc<Higgs>>) -> Response {
     tracing::info!("higgs: GET /api/higgs/models");
     let (models, loaded_id) = match scan_with_loaded(&higgs).await {
         Ok(pair) => pair,
         Err(resp) => return resp,
     };
+    // Gate 1 sweep: one representative path per distinct (arch, quant), probed
+    // once (cached thereafter). Every model sharing the combo inherits the verdict.
+    let mut reps: std::collections::HashMap<(String, String), String> =
+        std::collections::HashMap::new();
+    for m in &models {
+        reps.entry(support_key(m)).or_insert_with(|| m.path.clone());
+    }
+    let combos = reps.len();
+    let support = higgs
+        .probe_support(
+            reps.into_iter()
+                .map(|((arch, quant), path)| (arch, quant, path))
+                .collect(),
+        )
+        .await;
+    let unsupported = support.values().filter(|(loadable, _)| !*loadable).count();
+    tracing::info!("higgs: support sweep — probed {combos} combos, {unsupported} unsupported");
     let entries: Vec<HiggsModelEntry> = models
         .into_iter()
-        .map(|m| model_entry(m, loaded_id.as_deref()))
+        .map(|m| {
+            let (loadable, reason) = support
+                .get(&support_key(&m))
+                .cloned()
+                .unwrap_or((false, Some("probe verdict missing".to_owned())));
+            model_entry(m, loaded_id.as_deref(), loadable, reason)
+        })
         .collect();
     Json(HiggsModelsResponse {
         models: entries,
@@ -118,7 +190,18 @@ pub(super) async fn control_model_by_id(
         Err(resp) => return resp,
     };
     match models.into_iter().find(|m| m.id == id) {
-        Some(model) => Json(model_entry(model, loaded_id.as_deref())).into_response(),
+        Some(model) => {
+            // Gate 1 for this one model's (arch, quant) — cached after the first probe.
+            let (arch, quant) = support_key(&model);
+            let support = higgs
+                .probe_support(vec![(arch.clone(), quant.clone(), model.path.clone())])
+                .await;
+            let (loadable, reason) = support
+                .get(&(arch, quant))
+                .cloned()
+                .unwrap_or((false, Some("probe verdict missing".to_owned())));
+            Json(model_entry(model, loaded_id.as_deref(), loadable, reason)).into_response()
+        }
         None => {
             let err = HiggsError::ModelNotFound { id };
             tracing::warn!(error = %err, "higgs: model not found");
@@ -409,6 +492,51 @@ mod tests {
     use serde_json::json;
     use std::time::Duration;
     use tower::ServiceExt;
+
+    // ── Gate 2: host-side tool-call-parser sniff ─────────────────────────────
+
+    /// Build a minimal scanned model carrying only the chat template that the
+    /// Gate-2 sniff inspects; all other fields are placeholder.
+    fn model_with_template(template: Option<&str>) -> crate::worker::models::HiggsModel {
+        crate::worker::models::HiggsModel {
+            id: "org/model".into(),
+            path: "/x.gguf".into(),
+            size_bytes: 0,
+            quant: None,
+            source: crate::worker::models::HiggsModelSource::LmStudio,
+            arch: None,
+            ctx_train: None,
+            has_chat_template: template.is_some(),
+            supports_tools: false,
+            supports_reasoning: false,
+            gguf_components: Vec::new(),
+            chat_template: template.map(ToOwned::to_owned),
+        }
+    }
+
+    #[test]
+    fn gate2_sniffs_tool_call_template() {
+        // A template with the generic `<tool_call>` marker → a parser matches.
+        let with_calls = model_with_template(Some(
+            "{% for m in messages %}<|im_start|>{{ m.role }}<tool_call>{{ tool }}</tool_call>",
+        ));
+        assert!(
+            super::tool_calls_supported(&with_calls),
+            "<tool_call> matches"
+        );
+
+        // A plain chatml template with no tool markup → no parser matches.
+        let plain = model_with_template(Some(
+            "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>",
+        ));
+        assert!(
+            !super::tool_calls_supported(&plain),
+            "plain chatml: no match"
+        );
+
+        // No template at all → false.
+        assert!(!super::tool_calls_supported(&model_with_template(None)));
+    }
 
     // ── Test 6: control load + unload roundtrip ──────────────────────────────
 

@@ -99,6 +99,29 @@ impl HiggsEngine for LlamaCppEngine {
         self.loaded.is_some()
     }
 
+    fn probe(&self, path: &str) -> (bool, Option<String>) {
+        // Load into a LOCAL handle dropped at end of scope — never stored in
+        // `self.loaded`, so a probe never evicts or swaps the resident model.
+        //
+        // `with_vocab_only(true)` validates the GGUF header and architecture
+        // (Gate 1's primary signal — an unknown arch like `gemma4` fails here
+        // with the engine's verbatim reason) without allocating the weight
+        // tensors, keeping the probe cheap. NOTE: the pinned `llama-cpp-2`
+        // 0.1.139 exposes no `with_no_alloc`, so a vocab-only probe cannot catch
+        // a quant/tensor mismatch on an otherwise-known architecture; that
+        // stronger check needs a `no_alloc` load (available from a later
+        // `llama-cpp-2`). Arch loadability — the dominant real-world failure — is
+        // covered.
+        let params = LlamaModelParams::default().with_vocab_only(true);
+        match LlamaModel::load_from_file(backend(), path, &params) {
+            // Drop the handle immediately; we only needed to know it loads.
+            Ok(_model) => (true, None),
+            // Surface the engine's reason VERBATIM — this exact string is the
+            // mismatch the UI shows (e.g. "unknown model architecture: 'gemma4'").
+            Err(e) => (false, Some(e.to_string())),
+        }
+    }
+
     fn chat(
         &mut self,
         messages_json: &str,

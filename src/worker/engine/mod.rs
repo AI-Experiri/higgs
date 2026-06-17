@@ -190,4 +190,15 @@ pub trait HiggsEngine: Send {
         params: &GenParams,
         sink: &mut dyn FnMut(&str),
     ) -> Result<ChatResult, HiggsError>;
+
+    /// Attempt to load the GGUF at `path` into a throwaway model handle to learn
+    /// whether THIS engine can load it (Gate 1 — "can our llama.cpp load it").
+    ///
+    /// Probe-only: the loaded handle is dropped immediately and never stored as
+    /// the resident model, so a probe never disturbs a model already being
+    /// served (`&self`, no resident-slot mutation). Returns `(true, None)` when
+    /// the load succeeds, or `(false, Some(reason))` carrying the engine's
+    /// verbatim error string (e.g. `"unknown model architecture: 'gemma4'"`)
+    /// when it fails — that exact reason is what the UI shows as the mismatch.
+    fn probe(&self, path: &str) -> (bool, Option<String>);
 }

@@ -315,6 +315,14 @@ pub const IDLE_UNLOAD_TTL_MINUTES: u64 = 5;
 /// interval. Grouped with the other Phase B knobs for a later config lift.
 pub const IDLE_REAP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// A Gate-1 support verdict: `(loadable, reason)` where `reason` is the engine's
+/// verbatim load error when `!loadable`, else `None`.
+pub(crate) type SupportVerdict = (bool, Option<String>);
+
+/// Support-cache key: `(architecture, quant, engine_version)`. One verdict per
+/// distinct `(arch, quant)` for a given engine version (NOT per file).
+pub(crate) type SupportKey = (String, String, String);
+
 /// The in-process handle to the higgs runtime. One instance per host app.
 ///
 /// The host-facing facade over the [`Supervisor`]. `Higgs` owns the facade-level
@@ -390,6 +398,13 @@ pub struct Higgs {
     /// Defaults to `true` (serving on). A plain atomic — set/read in isolation,
     /// never across `.await`.
     serving_enabled: std::sync::atomic::AtomicBool,
+    /// Model-support verdict cache, keyed by `(architecture, quant, engine_version)`
+    /// — NOT per file. A probe runs once per distinct `(arch, quant)` for a given
+    /// engine version; every model sharing that key inherits the cached verdict
+    /// `(loadable, reason)`. In-memory only (higgs writes no files; persistence is
+    /// deferred). A plain `parking_lot::Mutex` over a `HashMap` — held only for the
+    /// map read/insert, never across `.await`.
+    probe_cache: parking_lot::Mutex<std::collections::HashMap<SupportKey, SupportVerdict>>,
 }
 
 impl Higgs {
@@ -424,6 +439,7 @@ impl Higgs {
             idle_ttl_minutes: std::sync::atomic::AtomicU64::new(IDLE_UNLOAD_TTL_MINUTES),
             loaded_idle_ttl_override: std::sync::atomic::AtomicU64::new(0),
             serving_enabled: std::sync::atomic::AtomicBool::new(true),
+            probe_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -599,6 +615,69 @@ impl Higgs {
         })
         .await
         .expect("higgs model scan task panicked")
+    }
+
+    /// Resolve the Gate-1 (engine-loadability) verdict for each distinct model
+    /// `(architecture, quant)` combination, probing only the ones not already
+    /// cached for the current engine version.
+    ///
+    /// `reps` is one representative `(arch, quant, path)` per distinct
+    /// `(arch, quant)` — the caller (control layer) dedups by `(arch, quant)` and
+    /// picks any one file's path. Probing ONE file per combo and caching the
+    /// verdict means every model sharing that `(arch, quant)` inherits it, so a
+    /// directory of N quants of the same repo costs at most one probe per quant.
+    ///
+    /// The cache key is `(arch, quant, engine_version)`: the lookup uses this
+    /// binary's engine version, and a stored verdict carries the version the probe
+    /// worker reported — the same binary, so the strings match and a re-probe
+    /// after an engine upgrade is forced (the key changes). Returns a map
+    /// `(arch, quant) -> (loadable, reason)`. A probe-infrastructure failure for a
+    /// path yields `(false, Some("<context>"))` for that combo (never a panic).
+    pub async fn probe_support(
+        &self,
+        reps: Vec<(String, String, String)>,
+    ) -> std::collections::HashMap<(String, String), (bool, Option<String>)> {
+        // This binary's engine version — used to form lookup keys. A stored
+        // verdict carries the probe worker's reported version, which is the same
+        // value (same binary), so hits match and an engine upgrade invalidates.
+        let engine_version = crate::worker::engine::llamacpp::engine_version();
+        let mut result: std::collections::HashMap<(String, String), (bool, Option<String>)> =
+            std::collections::HashMap::new();
+        // Partition into cache hits and the paths that still need a probe.
+        let mut to_probe: Vec<String> = Vec::new();
+        // Map a probe path back to its (arch, quant) so we can key the verdict.
+        let mut path_combo: std::collections::HashMap<String, (String, String)> =
+            std::collections::HashMap::new();
+        {
+            let cache = self.probe_cache.lock();
+            for (arch, quant, path) in reps {
+                let key = (arch.clone(), quant.clone(), engine_version.clone());
+                if let Some(verdict) = cache.get(&key) {
+                    result.insert((arch, quant), verdict.clone());
+                } else {
+                    path_combo.insert(path.clone(), (arch, quant));
+                    to_probe.push(path);
+                }
+            }
+        }
+        if to_probe.is_empty() {
+            return result;
+        }
+        // Probe the misses in a transient, crash-isolated worker.
+        let verdicts = self.sup.probe_paths(to_probe).await;
+        let mut cache = self.probe_cache.lock();
+        for (path, (loadable, reason, probe_version)) in verdicts {
+            let Some((arch, quant)) = path_combo.remove(&path) else {
+                continue;
+            };
+            // Key the stored verdict on the version the worker reported.
+            cache.insert(
+                (arch.clone(), quant.clone(), probe_version),
+                (loadable, reason.clone()),
+            );
+            result.insert((arch, quant), (loadable, reason));
+        }
+        result
     }
 
     /// Load a model by HuggingFace repo id.
@@ -917,6 +996,7 @@ impl Higgs {
             idle_ttl_minutes: std::sync::atomic::AtomicU64::new(IDLE_UNLOAD_TTL_MINUTES),
             loaded_idle_ttl_override: std::sync::atomic::AtomicU64::new(0),
             serving_enabled: std::sync::atomic::AtomicBool::new(true),
+            probe_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -1307,6 +1387,68 @@ mod tests {
         assert!(matches!(err, HiggsError::InvalidModelId { .. }));
     }
 
+    /// `probe_support` returns a cached `(arch, quant)` verdict WITHOUT probing.
+    ///
+    /// The cache is pre-seeded for the current engine version; the rep's combo is
+    /// a hit, so `probe_paths` (which would spawn-fail under the mock factory and
+    /// yield a `false` verdict) is never consulted — the returned verdict is the
+    /// seeded `(true, None)`. A second combo is a miss and goes to the probe path,
+    /// proving the partition.
+    #[tokio::test]
+    async fn probe_support_cache_hit_skips_probe() {
+        let (sup, _tw, _tr) = make_supervisor();
+        let higgs = Higgs {
+            sup: Arc::new(sup),
+            config: parking_lot::Mutex::new(HiggsConfig::default()),
+            lifecycle: tokio::sync::Mutex::new(()),
+            inference_gate: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_INFERENCE)),
+            last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
+            verbose: std::sync::atomic::AtomicBool::new(false),
+            log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
+            jit_enabled: std::sync::atomic::AtomicBool::new(true),
+            auto_unload_idle: std::sync::atomic::AtomicBool::new(true),
+            idle_ttl_minutes: std::sync::atomic::AtomicU64::new(IDLE_UNLOAD_TTL_MINUTES),
+            loaded_idle_ttl_override: std::sync::atomic::AtomicU64::new(0),
+            serving_enabled: std::sync::atomic::AtomicBool::new(true),
+            probe_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        };
+        let ev = crate::worker::engine::llamacpp::engine_version();
+        // Seed a HIT for (llama, Q4_K_M, <this engine version>).
+        higgs
+            .probe_cache
+            .lock()
+            .insert(("llama".into(), "Q4_K_M".into(), ev.clone()), (true, None));
+        let out = higgs
+            .probe_support(vec![
+                // Hit: returns the seeded verdict, no probe.
+                ("llama".into(), "Q4_K_M".into(), "/seeded/path.gguf".into()),
+                // Miss: probe path (mock factory spawn-fails) → false verdict.
+                ("gemma4".into(), "Q8_0".into(), "/miss/path.gguf".into()),
+            ])
+            .await;
+        assert_eq!(
+            out.get(&("llama".into(), "Q4_K_M".into())),
+            Some(&(true, None))
+        );
+        let (miss_loadable, miss_reason) = out
+            .get(&("gemma4".into(), "Q8_0".into()))
+            .cloned()
+            .expect("miss combo present");
+        assert!(
+            !miss_loadable,
+            "miss combo is not loadable under spawn-fail"
+        );
+        assert!(miss_reason.is_some(), "miss carries a reason");
+        // The miss verdict was stored (the probe path inserts under the version
+        // the worker reported — empty here because spawn failed before any reply).
+        let _ = ev;
+        assert!(higgs
+            .probe_cache
+            .lock()
+            .keys()
+            .any(|(a, q, _)| a == "gemma4" && q == "Q8_0"));
+    }
+
     /// The inference admission gate returns `ServerBusy` once all permits are
     /// taken; releasing a permit re-opens a slot.
     #[tokio::test]
@@ -1326,6 +1468,7 @@ mod tests {
             idle_ttl_minutes: std::sync::atomic::AtomicU64::new(IDLE_UNLOAD_TTL_MINUTES),
             loaded_idle_ttl_override: std::sync::atomic::AtomicU64::new(0),
             serving_enabled: std::sync::atomic::AtomicBool::new(true),
+            probe_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         };
         // Take the only permit and hold it.
         let held = Arc::clone(&higgs.inference_gate)
@@ -1647,6 +1790,7 @@ mod tests {
             idle_ttl_minutes: std::sync::atomic::AtomicU64::new(IDLE_UNLOAD_TTL_MINUTES),
             loaded_idle_ttl_override: std::sync::atomic::AtomicU64::new(0),
             serving_enabled: std::sync::atomic::AtomicBool::new(true),
+            probe_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         };
         let mut events_rx = higgs.events();
         // `load`/`status` run a host-side scan (on a blocking thread) before each
@@ -1729,6 +1873,7 @@ mod tests {
             idle_ttl_minutes: std::sync::atomic::AtomicU64::new(IDLE_UNLOAD_TTL_MINUTES),
             loaded_idle_ttl_override: std::sync::atomic::AtomicU64::new(0),
             serving_enabled: std::sync::atomic::AtomicBool::new(true),
+            probe_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         };
 
         // `status` runs a host-side scan (on a blocking thread) before M_STATUS,
@@ -1803,6 +1948,7 @@ mod tests {
             idle_ttl_minutes: std::sync::atomic::AtomicU64::new(IDLE_UNLOAD_TTL_MINUTES),
             loaded_idle_ttl_override: std::sync::atomic::AtomicU64::new(0),
             serving_enabled: std::sync::atomic::AtomicBool::new(true),
+            probe_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         };
 
         // Drive the load. `load` first runs a host-side scan (on a blocking
@@ -1852,6 +1998,7 @@ mod tests {
             idle_ttl_minutes: std::sync::atomic::AtomicU64::new(IDLE_UNLOAD_TTL_MINUTES),
             loaded_idle_ttl_override: std::sync::atomic::AtomicU64::new(0),
             serving_enabled: std::sync::atomic::AtomicBool::new(true),
+            probe_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         };
 
         let (mut rx, handle) = higgs
@@ -1937,6 +2084,7 @@ mod tests {
             idle_ttl_minutes: std::sync::atomic::AtomicU64::new(IDLE_UNLOAD_TTL_MINUTES),
             loaded_idle_ttl_override: std::sync::atomic::AtomicU64::new(0),
             serving_enabled: std::sync::atomic::AtomicBool::new(true),
+            probe_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         };
 
         // chat_stream registers the sink then the spawned task encounters dead worker.

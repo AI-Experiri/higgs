@@ -44,7 +44,7 @@ use tracing::{info, warn};
 use crate::diagnostic::HiggsError;
 use crate::log_bus::LogBus;
 use crate::rpc::{self, RpcFrame, RpcNotification, RpcRequest};
-use crate::worker::{M_LOAD, M_SHUTDOWN, N_CHAT_CHUNK};
+use crate::worker::{M_LOAD, M_PROBE, M_SHUTDOWN, N_CHAT_CHUNK};
 
 /// How long `stop()` waits for the worker to exit on its own (after stdin
 /// closes) before SIGKILL-ing it. Generous enough for the child to free a
@@ -79,6 +79,13 @@ const CONTROL_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// higgs value, grouped with the other serve-layer limits for a later config
 /// lift.
 pub(crate) const CHAT_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Per-path bound on a single M_PROBE round-trip in [`Supervisor::probe_paths`].
+/// A probe is a header-only `with_no_alloc` load — fast — but it runs FFI inside
+/// the transient worker, so a pathological/corrupt GGUF that wedges the loader
+/// must not hang the support sweep. On expiry the path's verdict is
+/// `(false, Some("probe timed out loading <path>"))` and the sweep moves on.
+const PROBE_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 higgs_ts! {
     /// Events the host application subscribes to.
@@ -437,6 +444,88 @@ impl Supervisor {
         (rx, fut)
     }
 
+    /// Probe each GGUF path for engine loadability (Gate 1) in a SEPARATE,
+    /// transient worker — fully isolated from the serving worker (`self.inner`).
+    ///
+    /// Spawns one fresh worker via the same factory (`production_factory(bus,
+    /// "probe")`), runs an M_PROBE round-trip per path on its raw stdio (no
+    /// persistent reader/writer tasks, no `pending`/`chat_sinks` involvement),
+    /// then reaps the child. The serving worker is never touched, so a probe can
+    /// never evict a resident model or interfere with in-flight generation; and a
+    /// probe-worker crash is contained here.
+    ///
+    /// Returns, per input path, `(path, (loadable, reason, engine_version))`:
+    /// - On success the worker's reply supplies all three; `engine_version` keys
+    ///   the support cache (the probing binary is the correct version source).
+    /// - On spawn failure / EOF / per-path timeout the verdict is
+    ///   `(false, Some("<context>"), "")` — never a panic or hang ([HG020]).
+    pub(crate) async fn probe_paths(
+        &self,
+        paths: Vec<String>,
+    ) -> Vec<(String, (bool, Option<String>, String))> {
+        // Fresh worker, independent of the serving lifetime. Stamp argv0 "probe".
+        let halves = match (self.inner.factory)(self.inner.bus.clone(), "probe") {
+            Ok(h) => h,
+            Err(e) => {
+                warn!(error = %e, "higgs: probe worker spawn failed");
+                // Every path inherits the spawn failure as a non-fatal verdict.
+                return paths
+                    .into_iter()
+                    .map(|p| {
+                        (
+                            p,
+                            (
+                                false,
+                                Some(format!("probe worker spawn failed: {e}")),
+                                String::new(),
+                            ),
+                        )
+                    })
+                    .collect();
+            }
+        };
+        let mut write = halves.write;
+        let mut lines = BufReader::new(halves.read).lines();
+        let mut id: u64 = 0;
+
+        let mut out = Vec::with_capacity(paths.len());
+        for path in paths {
+            id += 1;
+            let verdict = match tokio::time::timeout(
+                PROBE_RPC_TIMEOUT,
+                probe_one(&mut write, &mut lines, id, &path),
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(_) => {
+                    warn!(path = %path, "higgs: probe timed out");
+                    (
+                        false,
+                        Some(format!("probe timed out loading {path}")),
+                        String::new(),
+                    )
+                }
+            };
+            out.push((path, verdict));
+        }
+
+        // Reap the transient worker: close stdin (EOF → worker exits its loop),
+        // then wait/kill so it never lingers as a zombie. `drop(write)` closes
+        // the child's stdin; `proc` is the OS handle (None under the test factory).
+        drop(write);
+        if let Some(mut child) = halves.proc {
+            match tokio::time::timeout(WORKER_EXIT_TIMEOUT, child.wait()).await {
+                Ok(_) => {}
+                Err(_) => {
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                }
+            }
+        }
+        out
+    }
+
     /// Gracefully shut down the worker, then wait for the process to exit.
     ///
     /// Sets the deliberate-stop flag so death does not trigger respawn, sends a
@@ -615,6 +704,83 @@ impl Supervisor {
         let inner = Arc::clone(&self.inner);
         tokio::spawn(reader_task(inner, halves.read));
         Ok(())
+    }
+}
+
+/// One synchronous M_PROBE round-trip on the transient probe worker's raw stdio.
+///
+/// Encodes the request with the SAME `rpc` codec the persistent path uses,
+/// writes it to the worker's stdin, then reads lines until the matching response
+/// (by `id`) arrives — skipping any stray notifications the worker might emit.
+/// Returns `(loadable, reason, engine_version)`; a write/EOF/decode failure
+/// yields a non-fatal `(false, Some("<context>"), "")` verdict so the sweep
+/// continues rather than hanging ([HG020] semantics).
+async fn probe_one(
+    write: &mut WriteHalf,
+    lines: &mut tokio::io::Lines<BufReader<ReadHalf>>,
+    id: u64,
+    path: &str,
+) -> (bool, Option<String>, String) {
+    let line = rpc::encode(&RpcFrame::Request(RpcRequest {
+        jsonrpc: "2.0".into(),
+        id,
+        method: M_PROBE.to_string(),
+        params: serde_json::json!({ "path": path }),
+    }));
+    if write.write_all(line.as_bytes()).await.is_err()
+        || write.write_all(b"\n").await.is_err()
+        || write.flush().await.is_err()
+    {
+        return (
+            false,
+            Some(format!("probe worker pipe broken loading {path}")),
+            String::new(),
+        );
+    }
+    loop {
+        match lines.next_line().await {
+            Ok(Some(l)) if l.trim().is_empty() => continue,
+            Ok(Some(l)) => match rpc::decode(&l) {
+                // The probe worker only ever replies with a Response to M_PROBE.
+                Ok(RpcFrame::Response(resp)) if resp.id == id => {
+                    if let Some(err) = resp.error {
+                        return (false, Some(err.message), String::new());
+                    }
+                    let result = resp.result.unwrap_or(Value::Null);
+                    let loadable = result
+                        .get("loadable")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let reason = result
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned);
+                    let engine_version = result
+                        .get("engine_version")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    return (loadable, reason, engine_version);
+                }
+                // Stray frame (notification or other id) — keep reading.
+                Ok(_) => continue,
+                Err(_) => continue,
+            },
+            Ok(None) => {
+                return (
+                    false,
+                    Some(format!("probe worker exited before replying for {path}")),
+                    String::new(),
+                );
+            }
+            Err(e) => {
+                return (
+                    false,
+                    Some(format!("probe worker read error loading {path}: {e}")),
+                    String::new(),
+                );
+            }
+        }
     }
 }
 

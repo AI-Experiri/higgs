@@ -29,7 +29,7 @@ launcher), which constructs `Higgs`, serves the router on an ephemeral
 │  serve/      Axum router (/v1 + /api/higgs/) │  PURE RUST
 │  rpc.rs      NDJSON JSON-RPC 2.0 codec       │  (cannot crash
 │  worker/     Re-exec'd subprocess            │   the host)
-│  diagnostic  HiggsError HG001–HG019       │
+│  diagnostic  HiggsError HG001–HG020       │
 └───────────────────┬──────────────────────────┘
                     │ stdio (NDJSON JSON-RPC 2.0)
                     │ ONLY while a model is loaded
@@ -197,6 +197,103 @@ ModelStore::scan(lmstudio_roots, hf_roots, ollama_roots)   (host process)
   Missing root: silently skipped
   Unreadable root: HG001 ModelDirUnreadable
 ```
+
+---
+
+## Model Support Detection
+
+Each scanned model carries a **two-gate support verdict** so the UI can show
+exactly whether higgs can serve it — and, if not, the precise reason. The two
+gates are independent: Gate 1 proves the engine can LOAD the model, Gate 2 proves
+higgs can PARSE its tool calls.
+
+```
+HiggsModelEntry
+  │
+  ├─ loadable  ── Gate 1 ── engine CAN load (probe of (arch,quant))
+  ├─ tool_calls ─ Gate 2 ── a tool-call parser matches the template
+  └─ support_reason (optional)
+        │  !loadable            → engine's VERBATIM load error
+        │  loadable && !tool_calls → "no tool-call parser matches this model's template"
+        └─ fully supported      → omitted
+```
+
+### Gate 1 — engine loadability (transient probe worker)
+
+Loadability is proved by actually asking the engine to load the GGUF — but never
+in the serving worker. A **separate transient probe worker** is spawned (re-exec
+of the same binary, `production_factory(bus, "probe")`), crash-isolated exactly
+like the serving worker. The probe loads the GGUF into a throwaway handle and
+drops it immediately.
+
+```
+Higgs                              probe worker (re-exec, "probe")
+  │  M_PROBE { path }                       │
+  ├────────────────────────────────────────▶ LlamaModel::load_from_file(
+  │                                          │     path, with_vocab_only(true))
+  │                                          │  handle DROPPED immediately —
+  │                                          │  NEVER stored as resident
+  │  { loadable, reason, engine_version }    │
+  ◀────────────────────────────────────────┤
+  │
+  └─ crash / timeout / spawn-fail ⇒ (false, Some("<context>"))   [HG020]
+```
+
+- The handle is **dropped immediately** and **never stored as resident**, so a
+  probe never disturbs a model being served.
+- The verbatim engine error string becomes `support_reason` when `loadable` is
+  false.
+- **Vocab-only caveat:** the pinned llama-cpp-2 0.1.139 lacks `no_alloc`. A
+  `with_vocab_only(true)` probe validates the architecture/header but **cannot**
+  catch a quant/tensor mismatch — that needs a later llama-cpp-2. So Gate 1 today
+  proves "the engine recognizes this arch and header," not "every tensor loads."
+
+### Verdict caching — per `(arch, quant, engine_version)`, not per file
+
+A probe is expensive (a process spawn + a model load), so verdicts are cached by
+the **combo**, not the file. One probe per distinct `(architecture, quant)`; every
+model sharing that combo inherits the verdict.
+
+```
+key = (architecture, quant, engine_version)
+        │
+        ├─ hit  → reuse verdict, no probe
+        └─ miss → spawn probe worker → cache (loadable, reason)
+
+store: Mutex<HashMap<key, verdict>> on Higgs   (in-memory; no persistence yet)
+engine_version: comes from the probe worker's OWN M_PROBE reply
+                (the probing binary is the version source)
+```
+
+The `engine_version` component of the key is supplied by the probe worker itself
+(its M_PROBE reply), so the key tracks the binary that actually performed the
+probe.
+
+### The M_PROBE RPC
+
+```
+request:  { path }
+reply:    { loadable, reason, engine_version }
+
+per-path timeout
+crash / timeout / spawn-fail  ⇒  (false, Some("<context>"))
+                                  never a panic, never a hang
+                                  diagnostic HG020 ProbeWorkerFailed
+```
+
+### Gate 2 — tool-call parsing (host-side, zero FFI)
+
+Gate 2 is pure Rust on the host — no worker, no FFI:
+
+```
+ToolParserRegistry::with_defaults()
+     .select(chat_template)
+     .is_some()          → tool_calls = true / false
+```
+
+It selects a parser from the model's chat template against the same
+`ToolParserRegistry` the worker's fallback path uses (see **Tool calling**). A
+match means higgs can turn that model's emitted calls into OpenAI `tool_calls`.
 
 ---
 

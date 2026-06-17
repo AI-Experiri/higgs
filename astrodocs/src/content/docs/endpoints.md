@@ -331,7 +331,14 @@ Live scan of all configured model directories plus the currently loaded model id
       "source": "LmStudio",
       "arch": "llama",
       "ctx_train": 131072,
-      "has_chat_template": true
+      "has_chat_template": true,
+      "loadable": true,
+      "tool_calls": true,
+      "gguf_components": [
+        { "key": "general.architecture", "value": "llama" },
+        { "key": "general.file_type", "value": "Q4_K_M" },
+        { "key": "llama.context_length", "value": "131072" }
+      ]
     }
   ],
   "loaded_id": "org/model-name"
@@ -340,6 +347,46 @@ Live scan of all configured model directories plus the currently loaded model id
 
 `source` is one of `"LmStudio"`, `"HfCache"`, `"Ollama"`.
 `quant`, `arch`, `ctx_train` are omitted when unreadable from the GGUF header.
+
+#### Model support detection fields
+
+Each `HiggsModelEntry` carries a two-gate support verdict plus the curated GGUF
+header fields the verdict is computed from:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `loadable` | boolean | **Gate 1** — whether higgs's llama.cpp engine can LOAD this model, proved by a real probe of a representative GGUF for the model's `(architecture, quant)` combo. |
+| `tool_calls` | boolean | **Gate 2** — whether higgs has a tool-call parser matching the model's chat template (host-side, zero FFI). |
+| `support_reason` | string (optional) | The EXACT reason a model isn't fully supported. When `!loadable`: the engine's **verbatim** load error (e.g. `"unknown model architecture: 'gemma4'"`). When `loadable && !tool_calls`: the fixed string `"no tool-call parser matches this model's template"`. **Omitted** when the model is fully supported. |
+| `gguf_components` | `GgufComponent[]` | Curated load-relevant GGUF header fields (this field lives on the flattened `HiggsModel` — its single home). Each `GgufComponent = { key: string, value: string }`. |
+
+The curated `gguf_components` keys are: `gguf.version`, `general.architecture`,
+`general.file_type` (quant), `general.quantization_version`,
+`tokenizer.ggml.model`, `tokenizer.ggml.pre`, `{arch}.context_length`,
+`{arch}.block_count`, `{arch}.attention.head_count`. Giant arrays (token
+lists/merges) are deliberately skipped so the UI can pin a support mismatch to a
+specific component.
+
+**Example — an UNSUPPORTED model** (`gemma4` architecture the engine can't load):
+
+```json
+{
+  "id": "org/gemma4-experimental",
+  "path": "/home/user/.cache/lm-studio/models/org/gemma4-experimental/model-Q4_K_M.gguf",
+  "size_bytes": 4200000000,
+  "quant": "Q4_K_M",
+  "source": "LmStudio",
+  "arch": "gemma4",
+  "has_chat_template": true,
+  "loadable": false,
+  "tool_calls": false,
+  "support_reason": "unknown model architecture: 'gemma4'",
+  "gguf_components": [
+    { "key": "general.architecture", "value": "gemma4" },
+    { "key": "general.file_type", "value": "Q4_K_M" }
+  ]
+}
+```
 
 **curl:**
 

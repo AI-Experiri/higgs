@@ -165,6 +165,17 @@ pub enum HiggsError {
     #[snafu(display("[HG019] serving is disabled — enable the server to accept requests"))]
     #[diagnostic(code(HG019))]
     ServingDisabled,
+
+    /// A model-support probe could not run: the transient probe worker failed to
+    /// spawn, its stdio closed before replying, or the probe RPC timed out. This
+    /// is a probe-infrastructure failure, distinct from a model that loaded and
+    /// returned a verbatim engine reason — those are reported as a verdict, not
+    /// an error. Surfaced as the probe verdict `(false, Some("<context>"))` so a
+    /// failed probe never hangs or panics the support sweep; `context` names the
+    /// path or stage that failed.
+    #[snafu(display("[HG020] probe worker failed: {context}"))]
+    #[diagnostic(code(HG020))]
+    ProbeWorkerFailed { context: String },
 }
 
 #[cfg(test)]
@@ -216,6 +227,11 @@ mod tests {
         assert!(HiggsError::ServingDisabled
             .to_string()
             .starts_with("[HG019]"));
+        assert!(HiggsError::ProbeWorkerFailed {
+            context: "/models/x.gguf".into(),
+        }
+        .to_string()
+        .starts_with("[HG020]"));
     }
 
     #[test]

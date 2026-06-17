@@ -10,6 +10,7 @@ use memmap2::MmapOptions;
 use serde::{Deserialize, Serialize};
 
 use crate::diagnostic::HiggsError;
+use crate::serve::wire::GgufComponent;
 
 higgs_ts! {
     /// Where a scanned model file came from.
@@ -64,6 +65,18 @@ higgs_ts! {
     /// template references `<think>`/thinking. `false` when unknown.
     #[serde(default)]
     pub supports_reasoning: bool,
+    /// Curated load-relevant GGUF header fields (architecture, quant, tokenizer,
+    /// block/head counts, gguf version) for the UI to pin a support mismatch to a
+    /// specific component. Empty when the header could not be read. `serde(default)`
+    /// so older scan payloads without the field deserialize as empty.
+    #[serde(default)]
+    pub gguf_components: Vec<GgufComponent>,
+    /// The embedded chat-template string, captured transiently for the host-side
+    /// Gate-2 tool-call-parser sniff. NOT on the wire (`serde(skip)`): it never
+    /// leaves the host, and stamping it into every model payload would bloat the
+    /// scan response with multi-KB templates the frontend never reads.
+    #[serde(skip)]
+    pub chat_template: Option<String>,
     }
 }
 
@@ -91,6 +104,8 @@ impl HiggsModel {
             has_chat_template: false,
             supports_tools: false,
             supports_reasoning: false,
+            gguf_components: Vec::new(),
+            chat_template: None,
         }
     }
 }
@@ -167,7 +182,8 @@ fn enrich_gguf_metadata(model: &mut HiggsModel) {
         Ok(g) => g,
         Err(_) => return,
     };
-    model.arch = gguf.general_architecture().ok().map(ToString::to_string);
+    let arch = gguf.general_architecture().ok().map(ToString::to_string);
+    model.arch = arch.clone();
     model.ctx_train = gguf.llm_context_length().ok().map(|n| n as u64);
     // Read the embedded chat template once and derive capabilities from it
     // (the template is the GGUF's own declaration of how it talks).
@@ -178,7 +194,66 @@ fn enrich_gguf_metadata(model: &mut HiggsModel) {
         model.supports_reasoning = t.contains("</think>")
             || t.contains("<think>")
             || t.to_lowercase().contains("thinking");
+        // Capture the template for the host-side Gate-2 parser sniff (not on the wire).
+        model.chat_template = Some(t.to_string());
     }
+    model.gguf_components = curated_components(&gguf, arch.as_deref());
+}
+
+/// Build the curated list of LOAD-RELEVANT GGUF header fields for the UI.
+///
+/// Only keys that bear on whether the engine can load and serve the model are
+/// surfaced — giant arrays (token lists, merges) are deliberately skipped so the
+/// scan payload stays small. Missing keys are simply omitted. `arch` (when known)
+/// prefixes the architecture-scoped keys (`{arch}.context_length`, etc.).
+fn curated_components(gguf: &GGuf, arch: Option<&str>) -> Vec<GgufComponent> {
+    let mut out: Vec<GgufComponent> = Vec::new();
+    let mut push = |key: &str, value: String| {
+        out.push(GgufComponent {
+            key: key.into(),
+            value,
+        })
+    };
+
+    // gguf container version (from the file header — not a metadata KV).
+    push("gguf.version", gguf.header.version.to_string());
+
+    // general.* — architecture and quantization shape.
+    if let Ok(v) = gguf.general_architecture() {
+        push("general.architecture", v.to_string());
+    }
+    // general.file_type / general.filetype is the quant enum; render its name.
+    if let Ok(ft) = gguf.general_filetype() {
+        // GGufFileType has no name(); its Debug form is the canonical quant label
+        // (e.g. `MostlyQ4_K_M`).
+        push("general.file_type", format!("{ft:?}"));
+    }
+    if let Ok(v) = gguf.general_quantization_version() {
+        push("general.quantization_version", v.to_string());
+    }
+
+    // tokenizer.* — load-relevant tokenizer identity (scalars only).
+    if let Ok(v) = gguf.get_str("tokenizer.ggml.model") {
+        push("tokenizer.ggml.model", v.to_string());
+    }
+    if let Ok(v) = gguf.get_str("tokenizer.ggml.pre") {
+        push("tokenizer.ggml.pre", v.to_string());
+    }
+
+    // {arch}.* — architecture-scoped scalars that shape the load.
+    if let Some(a) = arch {
+        if let Ok(v) = gguf.get_usize(&format!("{a}.context_length")) {
+            push(&format!("{a}.context_length"), v.to_string());
+        }
+        if let Ok(v) = gguf.get_usize(&format!("{a}.block_count")) {
+            push(&format!("{a}.block_count"), v.to_string());
+        }
+        if let Ok(v) = gguf.get_usize(&format!("{a}.attention.head_count")) {
+            push(&format!("{a}.attention.head_count"), v.to_string());
+        }
+    }
+
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1023,6 +1098,69 @@ mod tests {
         assert!(model.has_chat_template);
         assert!(model.supports_tools, "template references tools/tool_call");
         assert!(model.supports_reasoning, "template references <think>");
+    }
+
+    /// Enrichment captures the curated load-relevant GGUF components (arch,
+    /// quant, tokenizer, arch-scoped scalars, gguf version) and the transient
+    /// chat template, skipping non-curated keys.
+    #[test]
+    fn enrich_collects_curated_gguf_components() {
+        use ggus::GGufMetaDataValueType::{String as GS, U32};
+        let model = scan_single_gguf(
+            &[
+                ("general.architecture", GS, gguf_str("llama")),
+                // general.filetype 15 = MostlyQ4_K_M.
+                ("general.filetype", U32, 15u32.to_le_bytes().to_vec()),
+                (
+                    "general.quantization_version",
+                    U32,
+                    2u32.to_le_bytes().to_vec(),
+                ),
+                ("tokenizer.ggml.model", GS, gguf_str("gpt2")),
+                ("tokenizer.ggml.pre", GS, gguf_str("llama-bpe")),
+                ("llama.context_length", U32, 4096u32.to_le_bytes().to_vec()),
+                ("llama.block_count", U32, 32u32.to_le_bytes().to_vec()),
+                (
+                    "llama.attention.head_count",
+                    U32,
+                    32u32.to_le_bytes().to_vec(),
+                ),
+                // A non-curated key — must NOT appear in the components list.
+                ("general.name", GS, gguf_str("Some Model")),
+                (
+                    "tokenizer.chat_template",
+                    GS,
+                    gguf_str("{{ tools }}<tool_call>"),
+                ),
+            ],
+            "org/m/model-Q4_K_M.gguf",
+        );
+        let comp = |k: &str| {
+            model
+                .gguf_components
+                .iter()
+                .find(|c| c.key == k)
+                .map(|c| c.value.clone())
+        };
+        assert_eq!(comp("general.architecture").as_deref(), Some("llama"));
+        assert_eq!(comp("general.quantization_version").as_deref(), Some("2"));
+        assert_eq!(comp("tokenizer.ggml.model").as_deref(), Some("gpt2"));
+        assert_eq!(comp("tokenizer.ggml.pre").as_deref(), Some("llama-bpe"));
+        assert_eq!(comp("llama.context_length").as_deref(), Some("4096"));
+        assert_eq!(comp("llama.block_count").as_deref(), Some("32"));
+        assert_eq!(comp("llama.attention.head_count").as_deref(), Some("32"));
+        assert!(
+            comp("general.file_type").is_some(),
+            "quant filetype captured"
+        );
+        assert!(comp("gguf.version").is_some(), "container version captured");
+        // Non-curated key is skipped.
+        assert!(comp("general.name").is_none(), "general.name not curated");
+        // Transient chat template captured for the Gate-2 sniff.
+        assert_eq!(
+            model.chat_template.as_deref(),
+            Some("{{ tools }}<tool_call>")
+        );
     }
 
     /// A plain chat template with no tool/think markup leaves both capability
