@@ -38,6 +38,7 @@ The same status table applies to both surfaces:
 | HG015 InvalidModelId | 400 |
 | HG016 ChatTimeout | 504 |
 | HG017 InsufficientMemory | 503 |
+| HG018 ResidentModelMismatch | 503 |
 | anything else | 500 |
 
 **`/v1` error envelope:**
@@ -148,6 +149,16 @@ runtime-toggleable flag — see `GET`/`PUT /api/higgs/settings`):
   failure, etc.), **not** a silent `404`. A single INFO line is emitted per JIT
   load: `higgs: JIT loading {model} (was {prev})` (`prev` is `none` if nothing
   was loaded).
+- **Concurrent JIT swap (resident-model binding)** — each chat is **bound to the
+  model it resolved against**. The serve layer proves the model resident, then
+  releases the lifecycle lock before dispatch; under concurrent load another
+  request's JIT load can swap the resident model in that window (only-keep-last).
+  The worker — the only place that knows the truly-resident id at generation
+  time — compares the requested model to its loaded one and **refuses rather than
+  serve the wrong model**: `503 [HG018] ResidentModelMismatch`, a **retryable**
+  signal (the client's retry re-JITs the requested model). higgs never serves a
+  chat with a model other than the one the request resolved to, and never
+  silently 404s the swap.
 - **JIT on, unknown model id** (not in the on-disk catalog) — `404 [HG002]
   ModelNotFound`. higgs never tries to load an id it hasn't scanned.
 - **JIT off** — an unloaded model is `404 [HG003] ModelNotLoaded` (the explicit

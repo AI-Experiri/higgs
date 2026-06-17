@@ -143,6 +143,19 @@ pub enum HiggsError {
         available_bytes: u64,
         headroom_fraction: f64,
     },
+
+    /// The chat's resolved model is no longer the worker's resident model — a
+    /// concurrent JIT load swapped it out between resolution and dispatch (higgs
+    /// serves one model at a time, only-keep-last). Detected worker-side, where
+    /// the resident id is known: the worker refuses to generate rather than serve
+    /// the WRONG model. Surfaced at the chat boundary as HTTP 503 — transient and
+    /// retryable (the client's retry re-JITs the requested model). `requested` is
+    /// the model the chat resolved against; `resident` is what is loaded now.
+    #[snafu(display(
+        "[HG018] requested model '{requested}' is no longer resident (now '{resident}') — retry"
+    ))]
+    #[diagnostic(code(HG018))]
+    ResidentModelMismatch { requested: String, resident: String },
 }
 
 #[cfg(test)]

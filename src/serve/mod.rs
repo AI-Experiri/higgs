@@ -93,7 +93,7 @@ pub use wire::*;
 
 /// Map a `HiggsError` to its HTTP status — the single status table shared by
 /// both surfaces and the SSE path: HG002/HG003 → 404, HG005/HG013/HG015 → 400,
-/// HG006/HG007/HG014/HG017 → 503, HG016 → 504, else 500.
+/// HG006/HG007/HG014/HG017/HG018 → 503, HG016 → 504, else 500.
 pub(crate) fn http_status(err: &HiggsError) -> StatusCode {
     match err {
         HiggsError::ModelNotFound { .. } | HiggsError::ModelNotLoaded { .. } => {
@@ -116,7 +116,10 @@ pub(crate) fn http_status(err: &HiggsError) -> StatusCode {
         HiggsError::WorkerRpc { worker_code, .. } => match worker_code.as_deref() {
             Some("HG002") | Some("HG003") => StatusCode::NOT_FOUND,
             Some("HG005") => StatusCode::BAD_REQUEST,
-            Some("HG006") | Some("HG007") => StatusCode::SERVICE_UNAVAILABLE,
+            // HG006/HG007: worker down. HG018: the resolved model was swapped
+            // out by a concurrent JIT load before generation (transient) — the
+            // client should retry, which re-JITs the requested model.
+            Some("HG006") | Some("HG007") | Some("HG018") => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         },
         _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -539,6 +542,11 @@ mod tests {
         assert_eq!(http_status(&rpc(Some("HG005"))), StatusCode::BAD_REQUEST);
         assert_eq!(
             http_status(&rpc(Some("HG007"))),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        // HG018: resident-model swap (worker refused) → retryable 503.
+        assert_eq!(
+            http_status(&rpc(Some("HG018"))),
             StatusCode::SERVICE_UNAVAILABLE
         );
         // Unknown / absent code falls back to 500.

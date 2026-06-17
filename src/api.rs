@@ -667,6 +667,12 @@ impl Higgs {
 
     /// Stream a chat completion.
     ///
+    /// `model` is the id the serve layer resolved this chat against (via
+    /// [`ensure_loaded`](crate::serve)). It is carried to the worker, which
+    /// refuses to generate (`[HG018]` → 503) if a concurrent JIT load swapped the
+    /// resident model out between resolution and dispatch — binding each chat to
+    /// its resolved model so a swap errors instead of serving the wrong model.
+    ///
     /// Returns `(receiver, join_handle)`:
     /// - `receiver` carries streaming deltas — each item is one content chunk
     ///   from the worker; this is the canonical output for SSE / streaming consumers.
@@ -682,6 +688,7 @@ impl Higgs {
     /// each other's streams.
     pub async fn chat_stream(
         &self,
+        model: String,
         messages_json: String,
         max_tokens: usize,
         temperature: f32,
@@ -718,7 +725,7 @@ impl Higgs {
         // generation task (so the admission permit, kept here, rides it).
         let (rx, call) = self
             .sup
-            .chat(messages_json, max_tokens, temperature, tools_json);
+            .chat(model, messages_json, max_tokens, temperature, tools_json);
         let handle = tokio::spawn(async move {
             // Hold the admission permit for the whole generation; dropping it
             // here (on any return path) releases the gate slot. Bound to a name
@@ -1236,6 +1243,7 @@ mod tests {
         // chat_stream must now fail fast with ServerBusy (no worker RPC).
         let err = higgs
             .chat_stream(
+                "org/model".to_owned(),
                 r#"[{"role":"user","content":"hi"}]"#.to_owned(),
                 8,
                 0.0,
@@ -1690,6 +1698,7 @@ mod tests {
 
         let (mut rx, handle) = higgs
             .chat_stream(
+                "org/model".to_owned(),
                 r#"[{"role":"user","content":"hi"}]"#.to_owned(),
                 256,
                 0.7,
@@ -1773,6 +1782,7 @@ mod tests {
         // chat_stream registers the sink then the spawned task encounters dead worker.
         let (_rx, handle) = higgs
             .chat_stream(
+                "org/model".to_owned(),
                 r#"[{"role":"user","content":"hi"}]"#.to_owned(),
                 8,
                 0.0,

@@ -371,11 +371,15 @@ impl Supervisor {
     ///   atomic in one place — the facade never touches the sink map, the request
     ///   id, or `request_with_id`.
     ///
-    /// `messages_json` is the verbatim OpenAI messages array (carried as a JSON
-    /// string so `tool_calls` / `tool_call_id` survive to the engine's chat
-    /// template); `tools_json` is the optional serialized `tools` array.
+    /// `model` is the id the serve layer resolved this chat against — carried in
+    /// the M_CHAT params so the worker can refuse (`[HG018]`) if a concurrent JIT
+    /// load swapped the resident model out before generation. `messages_json` is
+    /// the verbatim OpenAI messages array (carried as a JSON string so
+    /// `tool_calls` / `tool_call_id` survive to the engine's chat template);
+    /// `tools_json` is the optional serialized `tools` array.
     pub(crate) fn chat(
         &self,
+        model: String,
         messages_json: String,
         max_tokens: usize,
         temperature: f32,
@@ -402,6 +406,10 @@ impl Supervisor {
                     crate::worker::M_CHAT,
                     serde_json::json!({
                         "request_id": request_id,
+                        // Bind the chat to the model the serve layer resolved
+                        // against so the worker rejects (HG018) rather than serve
+                        // the wrong model after a concurrent JIT swap.
+                        "model": model,
                         "messages_json": messages_json,
                         "max_tokens": max_tokens,
                         "temperature": temperature,

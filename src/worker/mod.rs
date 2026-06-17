@@ -229,10 +229,34 @@ impl WorkerState {
         req: &RpcRequest,
         writer: &mut impl Write,
     ) -> Result<Value, RpcError> {
-        if self.loaded.is_none() {
-            return Err(to_rpc_error(&HiggsError::ModelNotLoaded {
-                id: "unloaded".into(),
-            }));
+        let resident = match self.loaded.as_ref() {
+            Some((id, _)) => id.as_str(),
+            None => {
+                return Err(to_rpc_error(&HiggsError::ModelNotLoaded {
+                    id: "unloaded".into(),
+                }));
+            }
+        };
+        // Bind the chat to the model the serve layer resolved against. The serve
+        // layer proved `requested` was resident, then released the lifecycle
+        // lock; a concurrent JIT load (only-keep-last) can swap the resident model
+        // between resolution and this dispatch. The worker is the only place that
+        // knows the truly-resident id at generation time, so it refuses here
+        // rather than serve the WRONG model — `[HG018]` → 503, retryable. An
+        // absent/empty `model` param means "no check" (backward-compat); the serve
+        // layer always sends it now.
+        if let Some(requested) = req
+            .params
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|m| !m.is_empty())
+        {
+            if requested != resident {
+                return Err(to_rpc_error(&HiggsError::ResidentModelMismatch {
+                    requested: requested.to_owned(),
+                    resident: resident.to_owned(),
+                }));
+            }
         }
         let request_id = req.params.get("request_id").cloned().unwrap_or(Value::Null);
         // The serve layer serialized the request's OpenAI `messages`
@@ -461,10 +485,12 @@ mod tests {
     fn load_then_chat_streams() {
         let path = "/models/google/gemma-4-12b/gemma-4-12b-Q4_K_M.gguf";
         let mut input = load_line(2, "google/gemma-4-12b", path, json!({}));
+        // `model` matches the loaded id: the resident-model bind check passes and
+        // generation proceeds exactly as before.
         input.push_str(&req_line(
             3,
             M_CHAT,
-            json!({"request_id": 7, "messages_json": "[{\"role\":\"user\",\"content\":\"hi\"}]"}),
+            json!({"request_id": 7, "model": "google/gemma-4-12b", "messages_json": "[{\"role\":\"user\",\"content\":\"hi\"}]"}),
         ));
 
         let (frames, calls) = serve_with_fake(&input);
@@ -502,6 +528,50 @@ mod tests {
         assert_eq!(calls.len(), 2, "calls: {calls:?}");
         assert_eq!(calls[0], format!("load {path}"), "calls: {calls:?}");
         assert_eq!(calls[1], "chat");
+    }
+
+    #[test]
+    fn chat_for_swapped_model_is_hg018() {
+        // Load `google/gemma-4-12b`, then chat requesting a DIFFERENT model id —
+        // simulating a concurrent JIT swap between the serve layer's resolution
+        // and this dispatch. The worker must refuse with [HG018] and NOT generate
+        // (serving the resident model for a request bound to another id would be
+        // the wrong-model bug). The matching-model case is covered by
+        // `load_then_chat_streams`.
+        let path = "/models/google/gemma-4-12b/gemma-4-12b-Q4_K_M.gguf";
+        let mut input = load_line(2, "google/gemma-4-12b", path, json!({}));
+        input.push_str(&req_line(
+            3,
+            M_CHAT,
+            json!({"request_id": 7, "model": "org/other", "messages_json": "[]"}),
+        ));
+
+        let (frames, calls) = serve_with_fake(&input);
+        // Frame 0 is the load response; frame 1 is the chat error (no chunks, no
+        // chat response).
+        assert_eq!(frames.len(), 2, "load ok + chat error only: {frames:?}");
+        let RpcFrame::Response(resp) = &frames[1] else {
+            panic!("expected chat error response")
+        };
+        assert_eq!(resp.id, 3);
+        let err = resp.error.as_ref().expect("expected error");
+        assert!(
+            err.message.contains("[HG018]"),
+            "message was: {}",
+            err.message
+        );
+        // The worker-origin code must ride in `data.code` so the HTTP boundary
+        // maps it to 503.
+        assert_eq!(
+            err.data.as_ref().and_then(|d| d.get("code")),
+            Some(&json!("HG018")),
+            "data carries the worker code: {:?}",
+            err.data
+        );
+        // Engine loaded but NEVER ran chat for the mismatched model.
+        let calls = calls.lock();
+        assert_eq!(calls.len(), 1, "load only, no chat: {calls:?}");
+        assert_eq!(calls[0], format!("load {path}"));
     }
 
     #[test]

@@ -285,9 +285,13 @@ pub(super) async fn v1_chat_completions(
 
     // Gate + validation: the named model must be loaded, and sampling / prompt /
     // content checks pass — each maps to its own status. Any failure short-circuits.
-    if let Err(resp) = gate_and_validate(&higgs, &req).await {
-        return resp;
-    }
+    // Returns the resolved (now-resident) model id, which binds the chat dispatch:
+    // the worker rejects (HG018) if a concurrent JIT load swaps it out before
+    // generation, so a swap errors instead of serving the wrong model.
+    let resolved_model = match gate_and_validate(&higgs, &req).await {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
 
     // Opt-in prompt logging: when "Log Incoming Tokens" is on, emit ONE INFO
     // line carrying the (capped) incoming prompt CONTENT. Fires after the
@@ -313,7 +317,13 @@ pub(super) async fn v1_chat_completions(
     let temperature = req.temperature.unwrap_or(0.7);
 
     let (deltas, outcome) = match higgs
-        .chat_stream(messages_json, max_tokens, temperature, tools_json)
+        .chat_stream(
+            resolved_model,
+            messages_json,
+            max_tokens,
+            temperature,
+            tools_json,
+        )
         .await
     {
         Ok(pair) => pair,
@@ -460,7 +470,9 @@ async fn ensure_loaded(higgs: &Arc<Higgs>, model: &str) -> Result<LoadedInfo, Re
 /// Run the pre-dispatch gate and request validation for a chat request:
 /// loaded-model check, sampling-param ranges, prompt-vs-context fit, and the
 /// v1 text-only content check. Returns `Err(response)` with the first failing
-/// gate's mapped response; `Ok(())` when the request may be dispatched.
+/// gate's mapped response; on success returns the resolved (now-resident) model
+/// id, which the caller threads into the chat dispatch so the worker can reject
+/// (HG018) a model swapped out by a concurrent JIT load before generation.
 ///
 /// higgs is spawn-on-load. With JIT off, an unloaded or unknown model —
 /// including the idle no-worker state and a crashed-worker state — falls through
@@ -471,7 +483,7 @@ async fn ensure_loaded(higgs: &Arc<Higgs>, model: &str) -> Result<LoadedInfo, Re
 async fn gate_and_validate(
     higgs: &Arc<Higgs>,
     req: &CreateChatCompletionRequest,
-) -> Result<(), Response> {
+) -> Result<String, Response> {
     // Loaded-model gate (JIT-aware): resolve the model that will serve this
     // request, loading it on demand when JIT is on. Returns the LoadedInfo for
     // the now-resident requested model, or the mapped error response.
@@ -501,7 +513,9 @@ async fn gate_and_validate(
         tracing::warn!(detail = %reject, "higgs: chat request rejected");
         return Err(v1_bad_request(&reject).into_response());
     }
-    Ok(())
+    // The resolved model id (its `.id` is the model the gate proved resident),
+    // returned so the caller binds the chat to it (worker HG018 check).
+    Ok(loaded.id)
 }
 
 /// Serialize the OpenAI `messages` array verbatim for the chat template — the

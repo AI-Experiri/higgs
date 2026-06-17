@@ -29,7 +29,7 @@ launcher), which constructs `Higgs`, serves the router on an ephemeral
 │  serve/      Axum router (/v1 + /api/higgs/) │  PURE RUST
 │  rpc.rs      NDJSON JSON-RPC 2.0 codec       │  (cannot crash
 │  worker/     Re-exec'd subprocess            │   the host)
-│  diagnostic  HiggsError HG001–HG017       │
+│  diagnostic  HiggsError HG001–HG018       │
 └───────────────────┬──────────────────────────┘
                     │ stdio (NDJSON JSON-RPC 2.0)
                     │ ONLY while a model is loaded
@@ -680,6 +680,19 @@ POST /v1/chat/completions, model not resident
        │
        └─ unknown id (not scanned) ──► 404 [HG002] ModelNotFound
 ```
+
+**Resident-model binding (concurrent-swap safety).** The serve layer proves the
+requested model resident (loading it if needed), then releases the `lifecycle`
+lock before dispatching the chat. Under concurrent load, another request's JIT
+load can swap the resident model out in that window (only-keep-last). To prevent
+serving the **wrong** model, each chat is bound to the model it resolved
+against: the resolved id rides the M_CHAT params, and the worker — the only
+layer that knows the truly-resident id at generation time — refuses with
+`503 [HG018] ResidentModelMismatch` if they differ rather than generate. HG018 is
+**retryable**: the client's retry re-JITs the requested model. This does not
+serialize whole generations under the lifecycle lock (which would block all
+chats during a generation) — the swap-thrash under alternating-model load is the
+accepted only-keep-last tradeoff; the binding check only guarantees correctness.
 
 `/v1/models` is unchanged — it always lists **loaded** models only, never the
 JIT-reachable on-disk catalog. This server-behavior namespace

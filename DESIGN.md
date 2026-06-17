@@ -41,7 +41,7 @@
 │  rpc.rs        NDJSON JSON-RPC 2.0 codec                    │
 │  worker/       Re-exec'd subprocess: engine only (no model   │
 │                catalog — scan is host-side; path comes in M_LOAD)│
-│  diagnostic.rs HiggsError HG001–HG016                      │
+│  diagnostic.rs HiggsError HG001–HG018                      │
 └──────────────────────────┬──────────────────────────────────┘
                            │ stdio (NDJSON JSON-RPC 2.0)
                            │ ONLY while a model is loaded
@@ -387,6 +387,8 @@
   │  HG014 ServerBusy          │  503     │
   │  HG015 InvalidModelId      │  400     │
   │  HG016 ChatTimeout         │  504     │
+  │  HG017 InsufficientMemory  │  503     │
+  │  HG018 ResidentModelMismatch│ 503     │
   │  anything else             │  500     │
   └────────────────────────────┴──────────┘
 
