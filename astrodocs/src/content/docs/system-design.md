@@ -125,8 +125,28 @@ trait HiggsEngine: Send {
         params: &GenParams,
         sink: &mut dyn FnMut(&str),   // token callback
     ) -> Result<(String, &'static str), HiggsError>;
+    fn probe(&self, path: &str) -> (bool, Option<String>);
+    fn devices(&self) -> Vec<GpuDevice>;  // ggml backend-device enumeration
 }
 ```
+
+### Hardware enumeration — M_SYSINFO
+
+`devices()` enumerates the host's compute devices through ggml's **own**
+backend-device FFI (`ggml_backend_dev_count` / `_get` / `_name` / `_description`
+/ `_type` / `_memory`), bound in `llama_cpp_sys_2` and called only from
+`worker/engine/llamacpp.rs`. The worker is where the engine (and Metal) is linked,
+so it is the correct host for this — engine-native and ready for future remote
+workers. The **M_SYSINFO** RPC (`higgs/sysinfo`) replies `{ gpus: [GpuDevice, …] }`;
+it is cheap, read-only, and never mutates the resident-model slot.
+
+The host runs M_SYSINFO in a **separate, transient, crash-isolated worker**
+(`Supervisor::sysinfo`, same pattern as `probe_paths`), never the serving worker,
+and `Higgs::sysinfo()` caches the result (hardware is static-ish). On
+spawn/EOF/timeout the device list is empty (HG021) — `GET /api/higgs/system` still
+returns hardware/runtime. The host-side `fits_vram(model_size, vram_total,
+headroom)` decision is built from the summed GPU VRAM using the existing
+`MEMORY_HEADROOM_FRACTION`.
 
 v1 ships `LlamaCppEngine`. The trait exists so future backends (MLX, etc.) can be
 swapped without touching the RPC or supervisor layers.

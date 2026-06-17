@@ -569,8 +569,25 @@ purely informational — there is **no mutating counterpart**.
 
 ```json
 {
-  "hardware": { "...": "host CPU / RAM / GPU" },
-  "runtime": { "backend": "llama.cpp", "engine": "...", "version": "...", "binding": "..." },
+  "hardware": {
+    "cpu_name": "Apple M3 Max",
+    "arch": "aarch64",
+    "cpu_cores": 16,
+    "ram_total_bytes": 137438953472,
+    "ram_used_bytes": 40000000000,
+    "cpu_usage_percent": 12.5,
+    "gpus": [
+      {
+        "name": "Metal",
+        "description": "Apple M3 Max",
+        "kind": "Gpu",
+        "vram_total_bytes": 103079215104,
+        "vram_free_bytes": 80000000000
+      }
+    ],
+    "vram_total_bytes": 103079215104
+  },
+  "runtime": { "backend": "Metal", "engine": "llama.cpp", "version": "...", "binding": "..." },
   "config": {
     "bind_host": "127.0.0.1",
     "lmstudio_dirs": ["/home/user/.cache/lm-studio/models"],
@@ -585,6 +602,18 @@ purely informational — there is **no mutating counterpart**.
 `config` (`HiggsServerConfig`) is built by `Higgs::server_config()` — a pure read,
 no worker RPC. `bind_host` is always `"127.0.0.1"`; `default_ctx_cap` is `32768`
 (the auto-context cap); `gpu_layers: 4294967295` (`u32::MAX`) means "offload all".
+
+**`hardware.gpus` / `hardware.vram_total_bytes`** — the compute devices the
+**worker** enumerated via ggml's own backend-device FFI
+(`ggml_backend_dev_*`), gathered for the host the worker runs on. Each `GpuDevice`
+carries `name`, `description`, `kind` (`Cpu` / `Gpu` / `Accel`), and device memory
+(`vram_total_bytes` / `vram_free_bytes`). `vram_total_bytes` at the hardware level
+sums only the **GPU** devices' totals (`0` when none). The host gathers this once
+through a transient, crash-isolated sysinfo worker (M_SYSINFO; HG021 on failure →
+empty list) and caches it; a failed gather still returns full hardware/runtime
+without devices. `fits_vram(model_size, vram_total, memory_headroom_fraction)` is
+the host-side VRAM fit decision built from this (reuses the existing
+`MEMORY_HEADROOM_FRACTION`; no GPU ⇒ falls back to the RAM headroom guard).
 
 **curl:**
 

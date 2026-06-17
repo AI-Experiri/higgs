@@ -201,4 +201,10 @@ pub trait HiggsEngine: Send {
     /// verbatim error string (e.g. `"unknown model architecture: 'gemma4'"`)
     /// when it fails — that exact reason is what the UI shows as the mismatch.
     fn probe(&self, path: &str) -> (bool, Option<String>);
+
+    /// Enumerate the host's compute devices (CPU/GPU/accel) as this engine sees
+    /// them. Cheap and read-only — no model load, no resident-state mutation —
+    /// so it is safe to call at any time, including on a fresh worker. Returns an
+    /// empty vec when the engine exposes no devices.
+    fn devices(&self) -> Vec<crate::system::GpuDevice>;
 }

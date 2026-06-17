@@ -405,6 +405,13 @@ pub struct Higgs {
     /// deferred). A plain `parking_lot::Mutex` over a `HashMap` — held only for the
     /// map read/insert, never across `.await`.
     probe_cache: parking_lot::Mutex<std::collections::HashMap<SupportKey, SupportVerdict>>,
+    /// Cached host device list gathered once via a transient sysinfo worker (see
+    /// [`Supervisor::sysinfo`](crate::supervisor::Supervisor::sysinfo)). Hardware
+    /// is static-ish, so it is gathered on first request and reused; `None` until
+    /// the first successful gather. A failed gather leaves it `None` so a later
+    /// request retries. A plain `parking_lot::Mutex` — held only for the
+    /// read/insert, never across `.await`.
+    device_cache: parking_lot::Mutex<Option<Vec<crate::system::GpuDevice>>>,
 }
 
 impl Higgs {
@@ -440,6 +447,7 @@ impl Higgs {
             loaded_idle_ttl_override: std::sync::atomic::AtomicU64::new(0),
             serving_enabled: std::sync::atomic::AtomicBool::new(true),
             probe_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            device_cache: parking_lot::Mutex::new(None),
         }
     }
 
@@ -977,6 +985,29 @@ impl Higgs {
         }
     }
 
+    /// Host compute devices (CPU/GPU/accel), gathered once via a transient
+    /// sysinfo worker and cached. Hardware is static-ish, so a cache hit returns
+    /// immediately; a miss spawns a crash-isolated transient worker, runs
+    /// M_SYSINFO, caches the result, and returns it. A gather failure returns an
+    /// empty `Vec` and leaves the cache empty so a later call retries — `GET
+    /// /api/higgs/system` still returns hardware/runtime without devices.
+    ///
+    /// This is the canonical home for the gathered device list; the
+    /// `SystemInfo::gather` path takes it as input rather than reading FFI itself
+    /// (the FFI lives in the worker, not the host).
+    pub async fn sysinfo(&self) -> Vec<crate::system::GpuDevice> {
+        if let Some(cached) = self.device_cache.lock().clone() {
+            return cached;
+        }
+        let gpus = self.sup.sysinfo().await;
+        // Cache only a non-empty result: an empty list usually means the gather
+        // failed (spawn/EOF/timeout), so leave the cache empty to retry later.
+        if !gpus.is_empty() {
+            *self.device_cache.lock() = Some(gpus.clone());
+        }
+        gpus
+    }
+
     /// Test-only: build a `Higgs` over a pre-built (mock) supervisor.
     ///
     /// Lets sibling modules (`serve`) reuse the duplex mock seam without
@@ -997,6 +1028,7 @@ impl Higgs {
             loaded_idle_ttl_override: std::sync::atomic::AtomicU64::new(0),
             serving_enabled: std::sync::atomic::AtomicBool::new(true),
             probe_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            device_cache: parking_lot::Mutex::new(None),
         }
     }
 
@@ -1411,6 +1443,7 @@ mod tests {
             loaded_idle_ttl_override: std::sync::atomic::AtomicU64::new(0),
             serving_enabled: std::sync::atomic::AtomicBool::new(true),
             probe_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            device_cache: parking_lot::Mutex::new(None),
         };
         let ev = crate::worker::engine::llamacpp::engine_version();
         // Seed a HIT for (llama, Q4_K_M, <this engine version>).
@@ -1469,6 +1502,7 @@ mod tests {
             loaded_idle_ttl_override: std::sync::atomic::AtomicU64::new(0),
             serving_enabled: std::sync::atomic::AtomicBool::new(true),
             probe_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            device_cache: parking_lot::Mutex::new(None),
         };
         // Take the only permit and hold it.
         let held = Arc::clone(&higgs.inference_gate)
@@ -1791,6 +1825,7 @@ mod tests {
             loaded_idle_ttl_override: std::sync::atomic::AtomicU64::new(0),
             serving_enabled: std::sync::atomic::AtomicBool::new(true),
             probe_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            device_cache: parking_lot::Mutex::new(None),
         };
         let mut events_rx = higgs.events();
         // `load`/`status` run a host-side scan (on a blocking thread) before each
@@ -1874,6 +1909,7 @@ mod tests {
             loaded_idle_ttl_override: std::sync::atomic::AtomicU64::new(0),
             serving_enabled: std::sync::atomic::AtomicBool::new(true),
             probe_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            device_cache: parking_lot::Mutex::new(None),
         };
 
         // `status` runs a host-side scan (on a blocking thread) before M_STATUS,
@@ -1949,6 +1985,7 @@ mod tests {
             loaded_idle_ttl_override: std::sync::atomic::AtomicU64::new(0),
             serving_enabled: std::sync::atomic::AtomicBool::new(true),
             probe_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            device_cache: parking_lot::Mutex::new(None),
         };
 
         // Drive the load. `load` first runs a host-side scan (on a blocking
@@ -1999,6 +2036,7 @@ mod tests {
             loaded_idle_ttl_override: std::sync::atomic::AtomicU64::new(0),
             serving_enabled: std::sync::atomic::AtomicBool::new(true),
             probe_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            device_cache: parking_lot::Mutex::new(None),
         };
 
         let (mut rx, handle) = higgs
@@ -2085,6 +2123,7 @@ mod tests {
             loaded_idle_ttl_override: std::sync::atomic::AtomicU64::new(0),
             serving_enabled: std::sync::atomic::AtomicBool::new(true),
             probe_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            device_cache: parking_lot::Mutex::new(None),
         };
 
         // chat_stream registers the sink then the spawned task encounters dead worker.

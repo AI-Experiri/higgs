@@ -18,6 +18,7 @@ use llama_cpp_2::token::LlamaToken;
 
 use super::{FlashAttn, GenParams, HiggsEngine, KvCacheKind, LoadParams};
 use crate::diagnostic::HiggsError;
+use crate::system::{DeviceKind, GpuDevice};
 use crate::worker::tool_parser::{ToolCallParser, ToolCallStreamFilter, ToolParserRegistry};
 
 /// Process-wide llama.cpp backend handle — the FFI global init must run
@@ -45,6 +46,73 @@ pub fn engine_version() -> String {
         std::ffi::CStr::from_ptr(llama_cpp_sys_2::ggml_version())
             .to_string_lossy()
             .into_owned()
+    }
+}
+
+/// Map ggml's raw backend-device type to the engine-agnostic [`DeviceKind`].
+///
+/// The raw values are `GGML_BACKEND_DEVICE_TYPE_CPU` (0), `_GPU` (1), `_ACCEL`
+/// (2). Any unknown future value is treated as an accelerator. Confined to this
+/// file per the engine boundary.
+fn device_type_to_kind(raw: llama_cpp_sys_2::ggml_backend_dev_type) -> DeviceKind {
+    match raw {
+        llama_cpp_sys_2::GGML_BACKEND_DEVICE_TYPE_CPU => DeviceKind::Cpu,
+        llama_cpp_sys_2::GGML_BACKEND_DEVICE_TYPE_GPU => DeviceKind::Gpu,
+        _ => DeviceKind::Accel,
+    }
+}
+
+/// Read one ggml backend device's name, description, kind, and memory.
+///
+/// SAFETY: `dev` is a valid `ggml_backend_dev_t` obtained from
+/// `ggml_backend_dev_get(i)` for `i < ggml_backend_dev_count()`. `name`/
+/// `description` return static, NUL-terminated C strings owned by the engine
+/// (never freed by us); `ggml_backend_dev_memory` writes two `usize` out-params
+/// and never fails. All calls are read-only and allocate nothing engine-side.
+unsafe fn read_device(dev: llama_cpp_sys_2::ggml_backend_dev_t) -> GpuDevice {
+    let name = std::ffi::CStr::from_ptr(llama_cpp_sys_2::ggml_backend_dev_name(dev))
+        .to_string_lossy()
+        .into_owned();
+    let description = std::ffi::CStr::from_ptr(llama_cpp_sys_2::ggml_backend_dev_description(dev))
+        .to_string_lossy()
+        .into_owned();
+    let kind = device_type_to_kind(llama_cpp_sys_2::ggml_backend_dev_type(dev));
+    let mut free: usize = 0;
+    let mut total: usize = 0;
+    llama_cpp_sys_2::ggml_backend_dev_memory(dev, &mut free, &mut total);
+    GpuDevice {
+        name,
+        description,
+        kind,
+        vram_total_bytes: total as u64,
+        vram_free_bytes: free as u64,
+    }
+}
+
+/// Enumerate every compute device ggml's loaded backends expose.
+///
+/// Engine-native: queries ggml's own backend-device registry, so the result
+/// reflects exactly what llama.cpp will run on (Metal on macOS, CPU otherwise).
+/// The llama.cpp backend is initialized first via [`backend`] — device
+/// registration happens at backend init, so a cold call (no model loaded) still
+/// sees every device. A device that fails to report is skipped, never panics.
+pub fn device_info() -> Vec<GpuDevice> {
+    // Ensure ggml's backends are registered before enumerating.
+    let _ = backend();
+    // SAFETY: `ggml_backend_dev_count` takes no arguments and returns the number
+    // of registered devices; each index `< count` is valid for
+    // `ggml_backend_dev_get`, which returns a non-null device handle.
+    unsafe {
+        let count = llama_cpp_sys_2::ggml_backend_dev_count();
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            let dev = llama_cpp_sys_2::ggml_backend_dev_get(i);
+            if dev.is_null() {
+                continue;
+            }
+            out.push(read_device(dev));
+        }
+        out
     }
 }
 
@@ -120,6 +188,10 @@ impl HiggsEngine for LlamaCppEngine {
             // mismatch the UI shows (e.g. "unknown model architecture: 'gemma4'").
             Err(e) => (false, Some(e.to_string())),
         }
+    }
+
+    fn devices(&self) -> Vec<GpuDevice> {
+        device_info()
     }
 
     fn chat(

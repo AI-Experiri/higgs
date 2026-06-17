@@ -44,7 +44,8 @@ use tracing::{info, warn};
 use crate::diagnostic::HiggsError;
 use crate::log_bus::LogBus;
 use crate::rpc::{self, RpcFrame, RpcNotification, RpcRequest};
-use crate::worker::{M_LOAD, M_PROBE, M_SHUTDOWN, N_CHAT_CHUNK};
+use crate::system::GpuDevice;
+use crate::worker::{M_LOAD, M_PROBE, M_SHUTDOWN, M_SYSINFO, N_CHAT_CHUNK};
 
 /// How long `stop()` waits for the worker to exit on its own (after stdin
 /// closes) before SIGKILL-ing it. Generous enough for the child to free a
@@ -86,6 +87,12 @@ pub(crate) const CHAT_RPC_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// must not hang the support sweep. On expiry the path's verdict is
 /// `(false, Some("probe timed out loading <path>"))` and the sweep moves on.
 const PROBE_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Bound on the single M_SYSINFO round-trip in [`Supervisor::sysinfo`]. Device
+/// enumeration is a cheap FFI registry read with no model load, so it completes
+/// near-instantly; the bound exists only so a wedged transient worker can never
+/// hang the `GET /api/higgs/system` handler. On expiry the device list is empty.
+const SYSINFO_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 higgs_ts! {
     /// Events the host application subscribes to.
@@ -526,6 +533,54 @@ impl Supervisor {
         out
     }
 
+    /// Enumerate the host's compute devices in a SEPARATE, transient worker —
+    /// fully isolated from the serving worker (`self.inner`), exactly like
+    /// [`probe_paths`](Self::probe_paths).
+    ///
+    /// Spawns one fresh worker via the same factory (`production_factory(bus,
+    /// "sysinfo")`), runs a single M_SYSINFO round-trip on its raw stdio (no
+    /// persistent reader/writer tasks, no `pending`/`chat_sinks` involvement),
+    /// then reaps the child. The serving worker is never touched, so this can
+    /// never evict a resident model or interfere with in-flight generation. On
+    /// spawn failure / EOF / timeout the result is an empty `Vec` ([HG021]) — the
+    /// caller still returns hardware/runtime without devices, never hangs.
+    pub(crate) async fn sysinfo(&self) -> Vec<GpuDevice> {
+        let halves = match (self.inner.factory)(self.inner.bus.clone(), "sysinfo") {
+            Ok(h) => h,
+            Err(e) => {
+                warn!(error = %e, "higgs: sysinfo worker spawn failed");
+                return Vec::new();
+            }
+        };
+        let mut write = halves.write;
+        let mut lines = BufReader::new(halves.read).lines();
+
+        let gpus =
+            match tokio::time::timeout(SYSINFO_RPC_TIMEOUT, sysinfo_one(&mut write, &mut lines))
+                .await
+            {
+                Ok(v) => v,
+                Err(_) => {
+                    warn!("higgs: sysinfo RPC timed out");
+                    Vec::new()
+                }
+            };
+
+        // Reap the transient worker (same shape as `probe_paths`): close stdin so
+        // the worker exits its loop, then wait/kill so it never lingers.
+        drop(write);
+        if let Some(mut child) = halves.proc {
+            match tokio::time::timeout(WORKER_EXIT_TIMEOUT, child.wait()).await {
+                Ok(_) => {}
+                Err(_) => {
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                }
+            }
+        }
+        gpus
+    }
+
     /// Gracefully shut down the worker, then wait for the process to exit.
     ///
     /// Sets the deliberate-stop flag so death does not trigger respawn, sends a
@@ -779,6 +834,62 @@ async fn probe_one(
                     Some(format!("probe worker read error loading {path}: {e}")),
                     String::new(),
                 );
+            }
+        }
+    }
+}
+
+/// One synchronous M_SYSINFO round-trip on the transient sysinfo worker's raw
+/// stdio. Mirrors [`probe_one`]: encodes the request with the same codec, writes
+/// it, then reads lines until the matching response (id 1), skipping strays.
+/// Returns the worker's `gpus` list, or an empty `Vec` on any write/EOF/decode
+/// failure ([HG021] semantics — never hangs the sweep).
+async fn sysinfo_one(
+    write: &mut WriteHalf,
+    lines: &mut tokio::io::Lines<BufReader<ReadHalf>>,
+) -> Vec<GpuDevice> {
+    let id: u64 = 1;
+    let line = rpc::encode(&RpcFrame::Request(RpcRequest {
+        jsonrpc: "2.0".into(),
+        id,
+        method: M_SYSINFO.to_string(),
+        params: Value::Null,
+    }));
+    if write.write_all(line.as_bytes()).await.is_err()
+        || write.write_all(b"\n").await.is_err()
+        || write.flush().await.is_err()
+    {
+        warn!("higgs: sysinfo worker pipe broken");
+        return Vec::new();
+    }
+    loop {
+        match lines.next_line().await {
+            Ok(Some(l)) if l.trim().is_empty() => continue,
+            Ok(Some(l)) => match rpc::decode(&l) {
+                Ok(RpcFrame::Response(resp)) if resp.id == id => {
+                    if let Some(err) = resp.error {
+                        warn!(detail = %err.message, "higgs: sysinfo worker returned an error");
+                        return Vec::new();
+                    }
+                    let result = resp.result.unwrap_or(Value::Null);
+                    // Deserialize the typed device list; a shape mismatch yields
+                    // an empty list rather than a panic.
+                    return result
+                        .get("gpus")
+                        .cloned()
+                        .and_then(|g| serde_json::from_value::<Vec<GpuDevice>>(g).ok())
+                        .unwrap_or_default();
+                }
+                Ok(_) => continue,
+                Err(_) => continue,
+            },
+            Ok(None) => {
+                warn!("higgs: sysinfo worker exited before replying");
+                return Vec::new();
+            }
+            Err(e) => {
+                warn!(error = %e, "higgs: sysinfo worker read error");
+                return Vec::new();
             }
         }
     }

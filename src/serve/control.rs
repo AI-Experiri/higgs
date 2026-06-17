@@ -479,7 +479,11 @@ pub(super) async fn control_system(State(higgs): State<Arc<Higgs>>) -> Json<Syst
     // Snapshot the read-only server config (cheap lock, no I/O) on the async
     // thread, then move it into the blocking gather (which samples CPU load).
     let config = higgs.server_config();
-    let info = tokio::task::spawn_blocking(move || SystemInfo::gather(config))
+    // Gather the worker-reported devices first (async — a transient worker RPC),
+    // then fold them into the blocking hardware/runtime snapshot. An empty list
+    // (no worker reachable) still yields a complete hardware/runtime response.
+    let gpus = higgs.sysinfo().await;
+    let info = tokio::task::spawn_blocking(move || SystemInfo::gather(config, gpus))
         .await
         .expect("system info gather task");
     Json(info)

@@ -176,6 +176,15 @@ pub enum HiggsError {
     #[snafu(display("[HG020] probe worker failed: {context}"))]
     #[diagnostic(code(HG020))]
     ProbeWorkerFailed { context: String },
+
+    /// The transient sysinfo worker could not enumerate devices: it failed to
+    /// spawn, its stdio closed before replying, or the M_SYSINFO RPC timed out.
+    /// A device-enumeration infrastructure failure — surfaced as an empty device
+    /// list so `GET /api/higgs/system` still returns hardware/runtime rather than
+    /// failing; `context` names the stage that failed.
+    #[snafu(display("[HG021] sysinfo worker failed: {context}"))]
+    #[diagnostic(code(HG021))]
+    SysinfoWorkerFailed { context: String },
 }
 
 #[cfg(test)]

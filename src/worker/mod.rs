@@ -24,6 +24,10 @@ pub const M_SHUTDOWN: &str = "higgs/shutdown";
 /// Probe a GGUF for engine loadability (Gate 1) without disturbing the resident
 /// model. Reply carries `{loadable, reason, engine_version}`.
 pub const M_PROBE: &str = "higgs/probe";
+/// Enumerate the host's compute devices via the engine's backend-device FFI.
+/// Cheap and read-only (no model load, no resident-state mutation). Reply
+/// carries `{gpus: [GpuDevice, …]}`.
+pub const M_SYSINFO: &str = "higgs/sysinfo";
 /// Streaming notification carrying one content delta for an in-flight chat.
 pub const N_CHAT_CHUNK: &str = "higgs/chat/chunk";
 
@@ -137,6 +141,7 @@ impl WorkerState {
             }
             M_CHAT => self.handle_chat(req, writer),
             M_PROBE => Ok(self.handle_probe(req)),
+            M_SYSINFO => Ok(self.handle_sysinfo()),
             other => Err(RpcError {
                 code: -32601,
                 message: format!("unknown method {other}"),
@@ -247,6 +252,15 @@ impl WorkerState {
             "reason": reason,
             "engine_version": engine::llamacpp::engine_version(),
         })
+    }
+
+    /// Enumerate the host's compute devices via the engine's backend-device FFI
+    /// and reply with `{gpus: [GpuDevice, …]}`. Cheap and read-only: it loads no
+    /// model and never mutates the resident-model slot, so it is safe on a fresh
+    /// transient worker.
+    fn handle_sysinfo(&self) -> Value {
+        let gpus = self.engine.devices();
+        json!({ "gpus": gpus })
     }
 
     /// Run one chat completion, streaming each content delta as an
@@ -429,6 +443,18 @@ mod tests {
             } else {
                 (true, None)
             }
+        }
+
+        fn devices(&self) -> Vec<crate::system::GpuDevice> {
+            self.calls.lock().push("devices".into());
+            // Scripted single CPU device — no real FFI in the unit test.
+            vec![crate::system::GpuDevice {
+                name: "CPU".into(),
+                description: "fake cpu".into(),
+                kind: crate::system::DeviceKind::Cpu,
+                vram_total_bytes: 0,
+                vram_free_bytes: 0,
+            }]
         }
 
         fn chat(
@@ -716,6 +742,31 @@ mod tests {
         let calls = calls.lock();
         assert_eq!(calls.len(), 2);
         assert!(calls[0].starts_with("probe "));
+    }
+
+    #[test]
+    fn sysinfo_returns_devices() {
+        // M_SYSINFO dispatches to the engine's `devices()` and replies with the
+        // scripted device list under `gpus`, touching no model state.
+        let input = req_line(2, M_SYSINFO, json!(null));
+        let (frames, calls) = serve_with_fake(&input);
+        assert_eq!(frames.len(), 1);
+        let RpcFrame::Response(resp) = &frames[0] else {
+            panic!("expected response")
+        };
+        assert_eq!(resp.id, 2);
+        assert!(
+            resp.error.is_none(),
+            "sysinfo must succeed: {:?}",
+            resp.error
+        );
+        let gpus = resp.result.as_ref().unwrap()["gpus"].as_array().unwrap();
+        assert_eq!(gpus.len(), 1);
+        assert_eq!(gpus[0]["name"], "CPU");
+        assert_eq!(gpus[0]["kind"], "Cpu");
+        // It enumerated devices and never loaded/chatted.
+        let calls = calls.lock();
+        assert_eq!(*calls, vec!["devices".to_string()]);
     }
 
     #[test]
