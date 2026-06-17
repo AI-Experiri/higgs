@@ -466,7 +466,6 @@ mod tests {
         use axum::extract::{Query, State};
         use axum::response::IntoResponse;
         use futures::StreamExt;
-        use http_body_util::BodyExt;
         use std::sync::Arc;
         use std::time::Duration;
 
