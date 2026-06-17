@@ -196,6 +196,8 @@ SECURITY WARNING. The embedded (jigglebot) path always binds ephemeral loopback.
 | respawn attempts per death | 1 | supervisor restarts once; factory failure is terminal |
 | graceful stop timeout | 2 seconds | `Higgs::stop()` — hardcoded |
 | `/api/higgs/logs` + `/logs/stream` default tail / replay | 200 lines | `DEFAULT_LOG_LINES` (`LogsQuery.n` default) |
+| verbose serve logging | `false` (default) | runtime `AtomicBool` on the `Higgs` facade — **not** persisted to disk/config; toggled at runtime via `PUT /api/higgs/logs/settings` (`LogSettings { verbose, log_incoming_tokens }`), read via `GET /api/higgs/logs/settings`. When on, each completed `POST /v1/chat/completions` (stream + non-stream) emits one extra `higgs: served …` INFO line into the Developer Logs. |
+| log incoming tokens | `false` (default) | second runtime `AtomicBool` on the `Higgs` facade — **not** persisted; set via the same `PUT /api/higgs/logs/settings` (both flags carried). When on, each chat request emits one extra `higgs: incoming …` INFO line carrying the flattened incoming prompt CONTENT, capped to 800 chars. **Explicit opt-in that logs prompt content, overriding the redact-by-default policy.** |
 
 ---
 

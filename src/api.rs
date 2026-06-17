@@ -329,6 +329,20 @@ pub struct Higgs {
     /// `parking_lot::Mutex` — read/written for a single `Instant` copy only,
     /// never held across `.await`.
     last_activity: parking_lot::Mutex<std::time::Instant>,
+    /// Runtime "Verbose Logging" toggle for the serve layer. When `true`, the
+    /// chat path emits an extra INFO `higgs:`-target completion line per request
+    /// (token count, finish reason, elapsed) so the Developer Logs show serving
+    /// activity, not just request entry. A plain atomic — set/read in isolation,
+    /// no critical section, never across `.await`. Defaults to `false`.
+    verbose: std::sync::atomic::AtomicBool,
+    /// Runtime "Log Incoming Tokens" toggle for the serve layer. When `true`, the
+    /// chat path emits an extra INFO `higgs:`-target line per request carrying the
+    /// (capped) flattened incoming prompt CONTENT so the Developer Logs show the
+    /// actual prompt. This is the explicit OPT-IN that overrides the redact-by-
+    /// default policy (no prompt content at info); default `false`, so the
+    /// redaction policy is unchanged unless the user turns this on. A plain atomic
+    /// — set/read in isolation, no critical section, never across `.await`.
+    log_incoming_tokens: std::sync::atomic::AtomicBool,
 }
 
 impl Higgs {
@@ -356,7 +370,32 @@ impl Higgs {
             lifecycle: tokio::sync::Mutex::new(()),
             inference_gate: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_INFERENCE)),
             last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
+            verbose: std::sync::atomic::AtomicBool::new(false),
+            log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Whether serve-layer "Verbose Logging" is on (the chat completion line).
+    pub fn verbose(&self) -> bool {
+        self.verbose.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Turn serve-layer "Verbose Logging" on or off at runtime.
+    pub fn set_verbose(&self, v: bool) {
+        self.verbose.store(v, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether serve-layer "Log Incoming Tokens" is on (the incoming-prompt line).
+    pub fn log_incoming_tokens(&self) -> bool {
+        self.log_incoming_tokens
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Turn serve-layer "Log Incoming Tokens" on or off at runtime. Enabling it
+    /// opts into logging prompt CONTENT, overriding the redact-by-default policy.
+    pub fn set_log_incoming_tokens(&self, v: bool) {
+        self.log_incoming_tokens
+            .store(v, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Bring up control only — does NOT spawn a worker.
@@ -712,6 +751,8 @@ impl Higgs {
             lifecycle: tokio::sync::Mutex::new(()),
             inference_gate: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_INFERENCE)),
             last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
+            verbose: std::sync::atomic::AtomicBool::new(false),
+            log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1092,6 +1133,8 @@ mod tests {
             // One-slot gate so the test deterministically fills it.
             inference_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
+            verbose: std::sync::atomic::AtomicBool::new(false),
+            log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
         };
         // Take the only permit and hold it.
         let held = Arc::clone(&higgs.inference_gate)
@@ -1157,6 +1200,39 @@ mod tests {
             headroom_fraction: MEMORY_HEADROOM_FRACTION,
         };
         assert!(err.to_string().starts_with("[HG017]"));
+    }
+
+    // ── Verbose toggle: default false, set/get round-trip ────────────────────
+
+    #[test]
+    fn verbose_defaults_false_and_round_trips() {
+        let higgs = Higgs::new(HiggsConfig::default());
+        assert!(!higgs.verbose(), "verbose defaults to false");
+        higgs.set_verbose(true);
+        assert!(higgs.verbose(), "set_verbose(true) is observed");
+        higgs.set_verbose(false);
+        assert!(!higgs.verbose(), "set_verbose(false) is observed");
+    }
+
+    // ── Log-incoming-tokens toggle: default false, set/get round-trip ─────────
+
+    #[test]
+    fn log_incoming_tokens_defaults_false_and_round_trips() {
+        let higgs = Higgs::new(HiggsConfig::default());
+        assert!(
+            !higgs.log_incoming_tokens(),
+            "log_incoming_tokens defaults to false"
+        );
+        higgs.set_log_incoming_tokens(true);
+        assert!(
+            higgs.log_incoming_tokens(),
+            "set_log_incoming_tokens(true) is observed"
+        );
+        higgs.set_log_incoming_tokens(false);
+        assert!(
+            !higgs.log_incoming_tokens(),
+            "set_log_incoming_tokens(false) is observed"
+        );
     }
 
     // ── Test 1: default config paths ─────────────────────────────────────────
@@ -1241,6 +1317,8 @@ mod tests {
                 crate::api::MAX_CONCURRENT_INFERENCE,
             )),
             last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
+            verbose: std::sync::atomic::AtomicBool::new(false),
+            log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
         };
         let mut events_rx = higgs.events();
         // `load`/`status` run a host-side scan (on a blocking thread) before each
@@ -1316,6 +1394,8 @@ mod tests {
                 crate::api::MAX_CONCURRENT_INFERENCE,
             )),
             last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
+            verbose: std::sync::atomic::AtomicBool::new(false),
+            log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
         };
 
         // `status` runs a host-side scan (on a blocking thread) before M_STATUS,
@@ -1383,6 +1463,8 @@ mod tests {
                 crate::api::MAX_CONCURRENT_INFERENCE,
             )),
             last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
+            verbose: std::sync::atomic::AtomicBool::new(false),
+            log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
         };
 
         // Drive the load. `load` first runs a host-side scan (on a blocking
@@ -1425,6 +1507,8 @@ mod tests {
                 crate::api::MAX_CONCURRENT_INFERENCE,
             )),
             last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
+            verbose: std::sync::atomic::AtomicBool::new(false),
+            log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
         };
 
         let (mut rx, handle) = higgs
@@ -1502,6 +1586,8 @@ mod tests {
                 crate::api::MAX_CONCURRENT_INFERENCE,
             )),
             last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
+            verbose: std::sync::atomic::AtomicBool::new(false),
+            log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
         };
 
         // chat_stream registers the sink then the spawned task encounters dead worker.

@@ -226,6 +226,44 @@ into the bus — so serve-layer request events (e.g. `higgs: GET /v1/models`) no
 appear in the Developer Logs. Only the tracing `message` field is captured (no
 structured fields, no prompt content — redaction-safe).
 
+### Verbose serve logging (runtime toggle)
+
+Serving logs are gated behind a runtime **verbose** toggle — an `AtomicBool` on
+the `Higgs` facade, default `false`, **not** persisted to disk/config, flipped via
+`PUT /api/higgs/logs/settings` (read back with `GET /api/higgs/logs/settings`).
+
+When verbose is ON, every completed chat completion on `POST
+/v1/chat/completions` — **both** the streaming and non-streaming paths — emits one
+extra INFO line on the `higgs` tracing target, so `HiggsLogLayer` mirrors it into
+the Developer Logs:
+
+```
+higgs: served org/model — 12 tok, finish=length, 1234ms
+```
+
+When verbose is OFF (the default), nothing extra is logged — only the existing
+request-entry line (`higgs: POST /v1/chat/completions`) appears.
+
+### Log incoming tokens (runtime toggle — opt-in prompt content)
+
+A second `AtomicBool` on the `Higgs` facade, `log_incoming_tokens` — default
+`false`, **not** persisted, set via the same `PUT /api/higgs/logs/settings`
+(which carries both flags). When ON, every chat request emits one extra INFO line
+on the `higgs` target carrying the flattened incoming prompt CONTENT, capped to
+the first 800 chars (`…` suffix when longer) so one request can't flood the log
+ring:
+
+```
+higgs: incoming org/model — 42 chars: hello there
+```
+
+This deliberately logs prompt **content** and is the **explicit opt-in that
+overrides the redact-by-default policy** (the boundary otherwise keeps prompt
+content out of the logs). Default `false`, so the redaction-by-default posture is
+unchanged unless the user turns this on. The line fires after the loaded-model +
+content gate (only valid requests are logged), before dispatch. When OFF, nothing
+extra is logged.
+
 Wiring: the caller creates the `LogBus` **before** the tracing subscriber,
 installs `HiggsLogLayer::new(bus.clone())` on it, and passes the same
 `Arc<LogBus>` to `Higgs::with_log_bus(config, bus)`. `Higgs::new` instead builds

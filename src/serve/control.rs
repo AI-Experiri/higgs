@@ -17,7 +17,7 @@ use tokio::sync::{broadcast, mpsc};
 use super::http_status;
 use super::wire::{
     HiggsErrorResponse, HiggsLoadRequest, HiggsLoadResponse, HiggsLogsResponse, HiggsModelEntry,
-    HiggsModelsResponse, HiggsOk, HiggsVersionResponse,
+    HiggsModelsResponse, HiggsOk, HiggsVersionResponse, LogSettings,
 };
 use crate::api::Higgs;
 use crate::diagnostic::HiggsError;
@@ -225,6 +225,33 @@ pub(super) async fn control_logs(
     Json(HiggsLogsResponse {
         lines: higgs.logs(q.n.unwrap_or(DEFAULT_LOG_LINES)),
     })
+}
+
+/// `GET /api/higgs/logs/settings` — current Developer-Log toggle state
+/// ("Verbose Logging" and "Log Incoming Tokens").
+pub(super) async fn control_logs_settings(State(higgs): State<Arc<Higgs>>) -> Json<LogSettings> {
+    tracing::info!("higgs: GET /api/higgs/logs/settings");
+    Json(LogSettings {
+        verbose: higgs.verbose(),
+        log_incoming_tokens: higgs.log_incoming_tokens(),
+    })
+}
+
+/// `PUT /api/higgs/logs/settings` — set both Developer-Log toggles ("Verbose
+/// Logging" and "Log Incoming Tokens"). A state-changing control op, so it logs
+/// at `warn` with the new values.
+pub(super) async fn control_set_logs_settings(
+    State(higgs): State<Arc<Higgs>>,
+    Json(body): Json<LogSettings>,
+) -> Json<HiggsOk> {
+    tracing::warn!(
+        verbose = body.verbose,
+        log_incoming_tokens = body.log_incoming_tokens,
+        "higgs: set developer-log toggles"
+    );
+    higgs.set_verbose(body.verbose);
+    higgs.set_log_incoming_tokens(body.log_incoming_tokens);
+    Json(HiggsOk::new())
 }
 
 /// `GET /api/higgs/logs/stream?n=200` — LIVE Developer Logs over SSE.
@@ -650,6 +677,96 @@ mod tests {
         assert!(
             v.get("ram").is_some() || v.get("cpu").is_some() || v.is_object(),
             "system info is a populated object: {v}"
+        );
+    }
+
+    // ── logs settings: GET reflects default; PUT toggles verbose ─────────────
+
+    #[tokio::test]
+    async fn logs_settings_get_default_and_put_toggles() {
+        let (sup, _test_write, _test_read, _ring) = make_supervisor();
+        let app = make_app(sup);
+
+        // GET defaults to verbose:false.
+        let resp = app
+            .clone()
+            .oneshot(get("/api/higgs/logs/settings"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(v["verbose"], false, "verbose defaults to false");
+        assert_eq!(
+            v["log_incoming_tokens"], false,
+            "log_incoming_tokens defaults to false"
+        );
+
+        // PUT both flags true returns {"status":"ok"}.
+        let resp = app
+            .clone()
+            .oneshot(put_json(
+                "/api/higgs/logs/settings",
+                &json!({"verbose": true, "log_incoming_tokens": true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(v["status"], "ok");
+
+        // GET now reflects the new state for both flags.
+        let resp = app.oneshot(get("/api/higgs/logs/settings")).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(v["verbose"], true, "PUT toggled verbose on");
+        assert_eq!(
+            v["log_incoming_tokens"], true,
+            "PUT toggled log_incoming_tokens on"
+        );
+    }
+
+    // ── verbose gate: served line appears only when verbose is on ─────────────
+
+    #[tokio::test]
+    async fn verbose_gate_round_trips_through_handlers() {
+        use super::{control_logs_settings, control_set_logs_settings};
+        use crate::api::Higgs;
+        use axum::extract::State;
+        use std::sync::Arc;
+
+        let (sup, _test_write, _test_read, _ring) = make_supervisor();
+        let higgs = Arc::new(Higgs::with_supervisor(
+            Arc::new(sup),
+            crate::api::HiggsConfig::default(),
+        ));
+
+        // GET handler reflects the default-off state.
+        assert!(
+            !control_logs_settings(State(higgs.clone())).await.0.verbose,
+            "verbose off by default"
+        );
+
+        // PUT handler flips it on; the chat path's gate (`higgs.verbose()`) now
+        // returns true, so the served line would be emitted (format asserted in
+        // v1's `served_message_format`).
+        let ok = control_set_logs_settings(
+            State(higgs.clone()),
+            axum::Json(crate::serve::LogSettings {
+                verbose: true,
+                log_incoming_tokens: true,
+            }),
+        )
+        .await;
+        assert_eq!(ok.0.status, "ok");
+        assert!(higgs.verbose(), "PUT enabled the chat verbose gate");
+        assert!(
+            higgs.log_incoming_tokens(),
+            "PUT enabled the incoming-tokens gate"
+        );
+        let got = control_logs_settings(State(higgs.clone())).await.0;
+        assert!(got.verbose, "GET reflects verbose on");
+        assert!(
+            got.log_incoming_tokens,
+            "GET reflects log_incoming_tokens on"
         );
     }
 

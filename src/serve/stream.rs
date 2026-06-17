@@ -32,9 +32,13 @@ pub(crate) fn chat_sse(
     created: u32,
     deltas: mpsc::UnboundedReceiver<String>,
     outcome: JoinHandle<Result<ChatOutcome, HiggsError>>,
+    verbose: bool,
+    started: std::time::Instant,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let (tx, rx) = mpsc::unbounded_channel::<String>();
-    tokio::spawn(assemble(id, model, created, deltas, outcome, tx));
+    tokio::spawn(assemble(
+        id, model, created, deltas, outcome, tx, verbose, started,
+    ));
     let stream = futures::stream::unfold(rx, |mut rx| async move {
         rx.recv()
             .await
@@ -57,6 +61,8 @@ async fn assemble(
     deltas: mpsc::UnboundedReceiver<String>,
     outcome: JoinHandle<Result<ChatOutcome, HiggsError>>,
     tx: mpsc::UnboundedSender<String>,
+    verbose: bool,
+    started: std::time::Instant,
 ) {
     let send = |payload: String| {
         // client disconnected — sends discard silently; assemble still runs to outcome so the spawned task joins clean
@@ -76,7 +82,15 @@ async fn assemble(
     let joined = drain_deltas(&id, &model, created, deltas, outcome, &send).await;
 
     match joined {
-        Ok(Ok(out)) => emit_outcome(&id, &model, created, &out, &send),
+        Ok(Ok(out)) => {
+            // Verbose serving line fires here — the streaming path's final
+            // outcome is known. Same `higgs: served …` line as the
+            // non-streaming path (shared `v1::log_served`).
+            if verbose {
+                super::v1::log_served(&model, &out.finish_reason, out.completion_tokens, started);
+            }
+            emit_outcome(&id, &model, created, &out, &send);
+        }
         Ok(Err(err)) => {
             tracing::warn!(error = %err, "higgs: chat stream failed mid-generation");
             send(super::v1::v1_envelope_json(
@@ -271,6 +285,8 @@ mod tests {
             deltas,
             outcome,
             tx,
+            false,
+            std::time::Instant::now(),
         )
         .await;
         let mut out = Vec::new();

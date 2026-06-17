@@ -185,6 +185,18 @@ pub(crate) fn post_json(uri: &str, body: &serde_json::Value) -> Request<Body> {
         .unwrap()
 }
 
+/// A `PUT` request to `uri` with a JSON body. Carries a loopback `Host` so it
+/// passes the serve-layer DNS-rebinding guard (`host_guard`).
+pub(crate) fn put_json(uri: &str, body: &serde_json::Value) -> Request<Body> {
+    Request::builder()
+        .method("PUT")
+        .uri(uri)
+        .header("host", "127.0.0.1")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
 /// Collect a response body into bytes.
 pub(crate) async fn body_bytes(resp: Response) -> Vec<u8> {
     resp.into_body()

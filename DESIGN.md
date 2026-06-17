@@ -260,6 +260,27 @@
   Higgs::with_log_bus(config, bus). Higgs::new builds its own internal bus
   (worker stderr only — no serve-event capture).
   Supervisor::spawn(bus) holds the bus; the stderr reader calls bus.push.
+
+  DEV-LOG runtime toggles — LogSettings { verbose, log_incoming_tokens }:
+    Higgs facade holds two AtomicBools (default false; NOT persisted).
+    PUT /api/higgs/logs/settings carries BOTH and sets both; GET reads both.
+
+    VERBOSE serve-completion line:
+      verbose ON  → each completed POST /v1/chat/completions (stream + non-stream)
+                    emits one extra INFO line on the `higgs` target →
+                    HiggsLogLayer → Developer Logs:
+                      higgs: served <model> — <N> tok, finish=<reason>, <ms>ms
+      verbose OFF → only the existing entry line `higgs: POST /v1/chat/completions`.
+
+    LOG INCOMING TOKENS (opt-in prompt content):
+      log_incoming_tokens ON  → each chat request emits one extra INFO line on the
+                    `higgs` target carrying the flattened incoming prompt CONTENT,
+                    capped to 800 chars (`…` when longer); fires after the
+                    loaded-model + content gate, before dispatch:
+                      higgs: incoming <model> — <N> chars: <preview>
+                    This is the EXPLICIT OPT-IN that overrides the redact-by-default
+                    policy (no prompt content at info).
+      log_incoming_tokens OFF → nothing extra; redaction-by-default intact.
 ```
 
 ---
@@ -294,6 +315,11 @@
   │  GET  /api/higgs/logs    │  Dev-log snapshot tail (?n=200)     │
   │  GET  /api/higgs/logs/stream │  SSE replay-then-live dev logs  │
   │                          │  (?n=200; no-timeout router)         │
+  │  GET  /api/higgs/logs/settings │ LogSettings {verbose,         │
+  │                          │  log_incoming_tokens} (read)         │
+  │  PUT  /api/higgs/logs/settings │ set both (runtime, not        │
+  │                          │  persisted) → gate serve-done +      │
+  │                          │  incoming-prompt lines               │
   │  POST /api/higgs/worker/stop  │  Graceful shutdown (2 s)       │
   │  GET  /api/higgs/version │  Build version + engine info        │
   └──────────────────────────┴──────────────────────────────────────┘

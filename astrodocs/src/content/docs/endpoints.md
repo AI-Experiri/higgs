@@ -10,7 +10,7 @@ higgs exposes two route groups:
 | Group | Purpose |
 |-------|---------|
 | `/v1/*` | OpenAI-compatible inference — chat clients, OpenAI SDK drop-ins |
-| `/api/higgs/*` | Control plane — scan, load, unload, status, system, logs (snapshot + SSE stream), worker stop, version |
+| `/api/higgs/*` | Control plane — scan, load, unload, status, system, logs (snapshot + SSE stream + verbose toggle), worker stop, version |
 
 All routes are mounted by `higgs::serve::router(Arc<Higgs>)`.
 
@@ -567,6 +567,74 @@ data: 2026-06-15 12:00:01 [INFO] higgs: GET /v1/models
 
 ```sh
 curl -N "http://localhost:8081/api/higgs/logs/stream?n=50"
+```
+
+---
+
+### GET /api/higgs/logs/settings
+
+Current developer-log settings. Both flags are in-process **runtime** toggles
+(`AtomicBool`s on the `Higgs` facade) — **not** persisted to disk or config, so
+they reset to `false` on restart.
+
+- `verbose` gates the extra serve-layer **completion** log line on the chat path
+  (off by default).
+- `log_incoming_tokens` gates an extra serve-layer **incoming-prompt** line that
+  logs prompt CONTENT (off by default). It is the explicit opt-in that overrides
+  the redact-by-default policy (no prompt content at info) — see PUT below.
+
+**Response (200):**
+
+```json
+{ "verbose": false, "log_incoming_tokens": false }
+```
+
+**curl:**
+
+```sh
+curl http://localhost:8081/api/higgs/logs/settings
+```
+
+---
+
+### PUT /api/higgs/logs/settings
+
+Set the developer-log settings. The body carries **both** flags and both are
+set, so toggling one preserves the other.
+
+With `verbose: true`, every completed `POST /v1/chat/completions` (streaming and
+non-streaming) emits ONE extra INFO line on the `higgs` tracing target — `higgs:
+served <model> — <N> tok, finish=<reason>, <ms>ms` — which the `HiggsLogLayer`
+mirrors into the Developer Logs.
+
+With `log_incoming_tokens: true`, every chat request emits ONE extra INFO line —
+`higgs: incoming <model> — <N> chars: <preview>` — carrying the flattened
+incoming prompt CONTENT, capped to the first 800 chars (`…` suffix when longer)
+so one request can't flood the log ring. **This is an explicit opt-in that logs
+prompt content, overriding the otherwise redact-by-default policy** (no prompt
+content at info). Default `false`, so redaction is unchanged unless turned on.
+
+With both `false` (the default) only the existing request-entry line (`higgs:
+POST /v1/chat/completions`) appears.
+
+**Request body:**
+
+```json
+{ "verbose": true, "log_incoming_tokens": true }
+```
+
+**Response (200):**
+
+```json
+{ "status": "ok" }
+```
+
+**curl:**
+
+```sh
+curl -X PUT -H "Content-Type: application/json" \
+  -d '{"verbose":true,"log_incoming_tokens":true}' \
+  http://localhost:8081/api/higgs/logs/settings
 ```
 
 ---

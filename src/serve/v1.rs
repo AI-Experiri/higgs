@@ -140,6 +140,84 @@ fn v1_internal(message: &str) -> (StatusCode, Json<WrappedError>) {
     v1_envelope_response(StatusCode::INTERNAL_SERVER_ERROR, message)
 }
 
+/// Emit the "Verbose Logging" serving line for a completed chat. ONE INFO
+/// event on the `higgs` target so [`HiggsLogLayer`](crate::log_bus::HiggsLogLayer)
+/// mirrors it into the live Developer Logs.
+///
+/// The log layer captures only the event's `message` field (structured fields
+/// are deliberately dropped — no prompt content reaches the logs), so the token
+/// count, finish reason, and elapsed ms are baked INTO the message text. Shared
+/// by the non-streaming path here and the streaming path in `stream`, so both
+/// produce the identical `higgs: served …` line. Called only when
+/// [`Higgs::verbose`](crate::api::Higgs::verbose) is true.
+pub(super) fn log_served(
+    model: &str,
+    finish_reason: &str,
+    completion_tokens: u32,
+    started: std::time::Instant,
+) {
+    let ms = started.elapsed().as_millis();
+    // The whole line is the `message` (the only field the log layer captures).
+    tracing::info!(
+        "{}",
+        served_message(model, finish_reason, completion_tokens, ms)
+    );
+}
+
+/// The verbose serving line text, e.g.
+/// `higgs: served org/model — 12 tok, finish=length, 1234ms`. Built here (pure,
+/// no tracing) so the exact Developer-Log wording is unit-testable and the
+/// numbers are guaranteed to land in the captured `message`.
+fn served_message(model: &str, finish_reason: &str, completion_tokens: u32, ms: u128) -> String {
+    format!("higgs: served {model} — {completion_tokens} tok, finish={finish_reason}, {ms}ms")
+}
+
+/// Max characters of the incoming prompt preview baked into the "Log Incoming
+/// Tokens" line. Caps a single request so one large prompt can't flood the log
+/// ring; the full prompt still goes to the model unchanged. 800 chars is a
+/// generous one-line preview (most chat turns fit) while bounding the worst case.
+const INCOMING_PREVIEW_CHARS: usize = 800;
+
+/// Emit the "Log Incoming Tokens" line for a chat request: ONE INFO event on the
+/// `higgs` target carrying the flattened incoming prompt, capped to
+/// [`INCOMING_PREVIEW_CHARS`]. The log layer captures only the event `message`,
+/// so the prompt is baked INTO the message text (that is why it appears at all).
+/// Called only when [`Higgs::log_incoming_tokens`](crate::api::Higgs::log_incoming_tokens)
+/// is true — the explicit opt-in that logs prompt CONTENT, overriding the
+/// redact-by-default policy. Reuses [`messages_to_pairs`] for flattening; a
+/// non-text body (already rejected by the gate) degrades to an empty preview.
+fn log_incoming(model: &str, messages: &[ChatCompletionRequestMessage]) {
+    tracing::info!("{}", incoming_message(model, messages));
+}
+
+/// The incoming-prompt line text, e.g.
+/// `higgs: incoming org/model — 42 chars: hello there`. Built here (pure, no
+/// tracing) so the wording and the cap are unit-testable. `chars` is the
+/// flattened prompt's full char length (pre-cap); `preview` is its first
+/// [`INCOMING_PREVIEW_CHARS`] chars with a `…` suffix when truncated.
+fn incoming_message(model: &str, messages: &[ChatCompletionRequestMessage]) -> String {
+    // Flatten via the same (role, content) extraction the handler validates with;
+    // join roles' text with spaces into one previewable line. A rejected non-text
+    // body never reaches here (the gate rejects it first) — degrade to empty.
+    let flat = messages_to_pairs(messages)
+        .map(|pairs| {
+            pairs
+                .iter()
+                .map(|(_, content)| content.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+    let chars = flat.chars().count();
+    let preview: String = if chars > INCOMING_PREVIEW_CHARS {
+        let head: String = flat.chars().take(INCOMING_PREVIEW_CHARS).collect();
+        format!("{head}…")
+    } else {
+        flat
+    };
+    format!("higgs: incoming {model} — {chars} chars: {preview}")
+}
+
 /// Current Unix time in whole seconds (OpenAI `created` field).
 fn now_secs() -> u32 {
     std::time::SystemTime::now()
@@ -196,11 +274,22 @@ pub(super) async fn v1_chat_completions(
     Json(req): Json<CreateChatCompletionRequest>,
 ) -> Response {
     tracing::info!(model = %req.model, stream = req.stream.unwrap_or(false), "higgs: POST /v1/chat/completions");
+    // Start the serve clock now so the optional verbose completion line can
+    // report wall-clock elapsed (gate + validation + generation) per request.
+    let started = std::time::Instant::now();
 
     // Gate + validation: the named model must be loaded, and sampling / prompt /
     // content checks pass — each maps to its own status. Any failure short-circuits.
     if let Err(resp) = gate_and_validate(&higgs, &req).await {
         return resp;
+    }
+
+    // Opt-in prompt logging: when "Log Incoming Tokens" is on, emit ONE INFO
+    // line carrying the (capped) incoming prompt CONTENT. Fires after the
+    // loaded-model + content gate so only valid requests are logged, before
+    // dispatch. When off, nothing extra is logged (redact-by-default intact).
+    if higgs.log_incoming_tokens() {
+        log_incoming(&req.model, &req.messages);
     }
 
     // Serialize the OpenAI `messages` and `tools` arrays for the chat template,
@@ -230,13 +319,36 @@ pub(super) async fn v1_chat_completions(
     };
 
     if req.stream.unwrap_or(false) {
-        stream::chat_sse(chatcmpl_id(), req.model, now_secs(), deltas, outcome).into_response()
+        // Verbose serving line for the streaming path fires once the final
+        // outcome is known inside the SSE assembly (see `stream::chat_sse`);
+        // pass the gate so it logs only when verbose is on.
+        let model = req.model.clone();
+        stream::chat_sse(
+            chatcmpl_id(),
+            model,
+            now_secs(),
+            deltas,
+            outcome,
+            higgs.verbose(),
+            started,
+        )
+        .into_response()
     } else {
         // Non-streaming: ChatOutcome.content is the canonical full text; the
         // delta receiver is dropped (the worker-side sender no-ops once closed).
         drop(deltas);
         match outcome.await {
-            Ok(Ok(out)) => Json(chat_response(req.model, &out)).into_response(),
+            Ok(Ok(out)) => {
+                if higgs.verbose() {
+                    log_served(
+                        &req.model,
+                        &out.finish_reason,
+                        out.completion_tokens,
+                        started,
+                    );
+                }
+                Json(chat_response(req.model, &out)).into_response()
+            }
             Ok(Err(err)) => {
                 tracing::warn!(error = %err, "higgs: chat failed");
                 v1_error(&err).into_response()
@@ -635,6 +747,60 @@ mod tests {
 
     fn parse_messages(v: serde_json::Value) -> Vec<ChatCompletionRequestMessage> {
         serde_json::from_value(v).expect("messages deserialize")
+    }
+
+    // ── served_message: verbose serving line wording ────────────────────────
+
+    #[test]
+    fn served_message_format() {
+        // The numbers must land in the message text (the log layer captures
+        // only `message`), so they're greppable in the Developer Logs.
+        assert_eq!(
+            served_message("org/model", "length", 12, 1234),
+            "higgs: served org/model — 12 tok, finish=length, 1234ms"
+        );
+        assert_eq!(
+            served_message("ollama/llama3:8b", "stop", 0, 7),
+            "higgs: served ollama/llama3:8b — 0 tok, finish=stop, 7ms"
+        );
+    }
+
+    // ── incoming_message: log-incoming-tokens line wording + cap ─────────────
+
+    #[test]
+    fn incoming_message_format_and_cap() {
+        // The flattened prompt content lands in the message text (the log layer
+        // captures only `message`), so it's greppable in the Developer Logs.
+        let msgs = parse_messages(json!([
+            {"role": "system", "content": "be brief"},
+            {"role": "user", "content": "hello there"}
+        ]));
+        assert_eq!(
+            incoming_message("org/model", &msgs),
+            "higgs: incoming org/model — 20 chars: be brief hello there"
+        );
+
+        // A prompt longer than the cap is truncated to INCOMING_PREVIEW_CHARS
+        // with a `…` suffix, while `chars` reports the full pre-cap length so one
+        // request can't flood the log ring.
+        let big = "x".repeat(INCOMING_PREVIEW_CHARS + 50);
+        let msgs = parse_messages(json!([{"role": "user", "content": big}]));
+        let line = incoming_message("org/model", &msgs);
+        assert!(
+            line.starts_with(&format!(
+                "higgs: incoming org/model — {} chars: ",
+                INCOMING_PREVIEW_CHARS + 50
+            )),
+            "full char count reported: {line}"
+        );
+        assert!(line.ends_with('…'), "truncation marker present: {line}");
+        let preview = line.rsplit("chars: ").next().unwrap();
+        // Capped preview: INCOMING_PREVIEW_CHARS chars + the `…` suffix.
+        assert_eq!(
+            preview.chars().count(),
+            INCOMING_PREVIEW_CHARS + 1,
+            "preview capped to INCOMING_PREVIEW_CHARS + ellipsis"
+        );
     }
 
     // ── redact_paths: client-facing /v1 error sanitization ───────────────────

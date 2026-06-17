@@ -163,6 +163,10 @@ pub fn router(higgs: Arc<Higgs>) -> Router {
         .route("/api/higgs/status", get(control::control_status))
         .route("/api/higgs/system", get(control::control_system))
         .route("/api/higgs/logs", get(control::control_logs))
+        .route(
+            "/api/higgs/logs/settings",
+            get(control::control_logs_settings).put(control::control_set_logs_settings),
+        )
         .route("/api/higgs/worker/stop", post(control::control_worker_stop))
         .route("/api/higgs/version", get(control::control_version))
         .layer(TimeoutLayer::with_status_code(
@@ -277,7 +281,7 @@ fn local_cors() -> CorsLayer {
         .allow_origin(AllowOrigin::predicate(|origin: &HeaderValue, _req| {
             is_local_origin(origin)
         }))
-        .allow_methods([Method::GET, Method::POST])
+        .allow_methods([Method::GET, Method::POST, Method::PUT])
         .allow_headers(tower_http::cors::Any)
 }
 

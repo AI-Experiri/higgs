@@ -156,6 +156,24 @@ higgs_ts! {
 }
 
 higgs_ts! {
+    /// Body for `GET`/`PUT /api/higgs/logs/settings`: the runtime Developer-Log
+    /// toggles. `GET` returns the current state of both; `PUT` carries both and
+    /// sets both. The log settings higgs actually backs.
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    pub struct LogSettings {
+        /// Whether the serve-layer verbose serving line is enabled — when `true`,
+        /// the chat path emits an extra `higgs: served …` completion line per
+        /// request into the Developer Logs.
+        pub verbose: bool,
+        /// Whether the serve-layer incoming-prompt line is enabled — when `true`,
+        /// the chat path emits a `higgs: incoming …` line carrying the (capped)
+        /// prompt CONTENT per request. This is the explicit opt-in that overrides
+        /// the redact-by-default policy; default `false`.
+        pub log_incoming_tokens: bool,
+    }
+}
+
+higgs_ts! {
     /// Error body for control routes: the rendered `HiggsError` display
     /// (diagnostic code included), as `{"error":"<display>"}`.
     #[derive(Debug, serde::Serialize)]
