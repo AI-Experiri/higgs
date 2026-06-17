@@ -450,6 +450,19 @@ impl Higgs {
             .store(v, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Whether the Developer Logs are in un-redacted DEBUG mode — the log layer
+    /// then emits non-message structured fields (incl. prompt content). Off by
+    /// default. Lives on the [`LogBus`] (the layer's only handle); delegated here.
+    pub fn log_show_fields(&self) -> bool {
+        self.sup.log_show_fields()
+    }
+
+    /// Toggle the un-redacted DEBUG log mode at runtime. Enabling it surfaces ALL
+    /// structured log fields — including prompt CONTENT — for debugging.
+    pub fn set_log_show_fields(&self, v: bool) {
+        self.sup.set_log_show_fields(v);
+    }
+
     /// Whether serve-layer "Just-in-Time loading" is on (default `true`). When
     /// on, a chat for a scanned-but-unloaded model loads it on demand instead of
     /// returning `[HG003]`.

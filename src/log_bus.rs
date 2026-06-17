@@ -61,6 +61,11 @@ pub struct LogBus {
     ring: Mutex<VecDeque<String>>,
     /// Live fan-out of every pushed line to current SSE subscribers.
     tx: broadcast::Sender<String>,
+    /// DEBUG toggle, OFF by default. When `true`, [`HiggsLogLayer`] also emits
+    /// non-message/non-`error` structured fields — INCLUDING prompt content —
+    /// so logs can be debugged un-redacted. The flag lives here (not on `Higgs`)
+    /// because the layer holds only the bus. Default off = the redaction policy.
+    show_fields: std::sync::atomic::AtomicBool,
 }
 
 impl LogBus {
@@ -70,7 +75,20 @@ impl LogBus {
         Self {
             ring: Mutex::new(VecDeque::with_capacity(RING_CAP)),
             tx,
+            show_fields: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Whether the layer emits non-message structured fields (incl. prompt
+    /// content) — the un-redacted DEBUG mode. Off by default.
+    pub fn show_fields(&self) -> bool {
+        self.show_fields.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Toggle the un-redacted DEBUG mode at runtime.
+    pub fn set_show_fields(&self, v: bool) {
+        self.show_fields
+            .store(v, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Append `line` to the history ring (evicting the oldest when full) and
@@ -142,6 +160,9 @@ impl<B> HiggsLogLayer<B> {
 struct MessageVisitor {
     message: String,
     error: Option<String>,
+    /// Every OTHER field (`key`, value). Collected always, but emitted ONLY when
+    /// the bus is in un-redacted DEBUG mode — these may contain prompt content.
+    extra: Vec<(String, String)>,
 }
 
 impl Visit for MessageVisitor {
@@ -149,7 +170,7 @@ impl Visit for MessageVisitor {
         match field.name() {
             "message" => self.message = format!("{value:?}"),
             "error" => self.error = Some(format!("{value:?}")),
-            _ => {}
+            name => self.extra.push((name.to_owned(), format!("{value:?}"))),
         }
     }
 
@@ -157,7 +178,7 @@ impl Visit for MessageVisitor {
         match field.name() {
             "message" => self.message = value.to_owned(),
             "error" => self.error = Some(value.to_owned()),
-            _ => {}
+            name => self.extra.push((name.to_owned(), value.to_owned())),
         }
     }
 }
@@ -204,16 +225,20 @@ where
         if visitor.message.is_empty() {
             return;
         }
-        let line = match visitor.error {
-            Some(err) => format!(
-                "{} [{}] {} — {}",
-                timestamp(),
-                meta.level(),
-                visitor.message,
-                err
-            ),
-            None => format!("{} [{}] {}", timestamp(), meta.level(), visitor.message),
-        };
+        let mut line = format!("{} [{}] {}", timestamp(), meta.level(), visitor.message);
+        // The typed `error` diagnostic is ALWAYS shown — it never carries prompt
+        // content and is the whole point of debuggable failures.
+        if let Some(err) = &visitor.error {
+            line.push_str(" — ");
+            line.push_str(err);
+        }
+        // DEBUG mode only: append every other field, which MAY include prompt
+        // content. Redacted (dropped) by default.
+        if self.bus.show_fields() {
+            for (k, v) in &visitor.extra {
+                line.push_str(&format!(" {k}={v}"));
+            }
+        }
         self.bus.push(line);
     }
 }
@@ -321,7 +346,29 @@ mod tests {
         );
         assert!(
             !line.contains("secret user prompt content"),
-            "non-error fields stay redacted (no prompt content): {line}"
+            "non-error fields stay redacted by default (no prompt content): {line}"
+        );
+    }
+
+    #[test]
+    fn layer_show_fields_unredacts_for_debug() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let bus = Arc::new(LogBus::new());
+        bus.set_show_fields(true); // DEBUG mode on
+        let subscriber = tracing_subscriber::registry().with(HiggsLogLayer::new(bus.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(
+                target: "higgs::test",
+                prompt = "the actual user prompt",
+                "higgs: chat"
+            );
+        });
+        let snap = bus.snapshot(10);
+        assert_eq!(snap.len(), 1);
+        assert!(
+            snap[0].contains("prompt=the actual user prompt"),
+            "show mode appends other fields incl. prompt content: {}",
+            snap[0]
         );
     }
 

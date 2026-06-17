@@ -177,6 +177,12 @@ higgs_ts! {
         /// prompt CONTENT per request. This is the explicit opt-in that overrides
         /// the redact-by-default policy; default `false`.
         pub log_incoming_tokens: bool,
+        /// DEBUG: when `true`, the Developer-Log layer also emits non-message
+        /// structured fields — INCLUDING prompt CONTENT — un-redacting the logs
+        /// for debugging. Off by default. `#[serde(default)]` so older PUT bodies
+        /// that omit it deserialize as `false`.
+        #[serde(default)]
+        pub show_log_fields: bool,
     }
 }
 

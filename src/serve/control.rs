@@ -251,6 +251,7 @@ pub(super) async fn control_logs_settings(State(higgs): State<Arc<Higgs>>) -> Js
     Json(LogSettings {
         verbose: higgs.verbose(),
         log_incoming_tokens: higgs.log_incoming_tokens(),
+        show_log_fields: higgs.log_show_fields(),
     })
 }
 
@@ -264,10 +265,12 @@ pub(super) async fn control_set_logs_settings(
     tracing::warn!(
         verbose = body.verbose,
         log_incoming_tokens = body.log_incoming_tokens,
+        show_log_fields = body.show_log_fields,
         "higgs: set developer-log toggles"
     );
     higgs.set_verbose(body.verbose);
     higgs.set_log_incoming_tokens(body.log_incoming_tokens);
+    higgs.set_log_show_fields(body.show_log_fields);
     Json(HiggsOk::new())
 }
 
@@ -752,13 +755,17 @@ mod tests {
             v["log_incoming_tokens"], false,
             "log_incoming_tokens defaults to false"
         );
+        assert_eq!(
+            v["show_log_fields"], false,
+            "show_log_fields defaults to false (redact)"
+        );
 
-        // PUT both flags true returns {"status":"ok"}.
+        // PUT all flags true returns {"status":"ok"}.
         let resp = app
             .clone()
             .oneshot(put_json(
                 "/api/higgs/logs/settings",
-                &json!({"verbose": true, "log_incoming_tokens": true}),
+                &json!({"verbose": true, "log_incoming_tokens": true, "show_log_fields": true}),
             ))
             .await
             .unwrap();
@@ -766,7 +773,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
         assert_eq!(v["status"], "ok");
 
-        // GET now reflects the new state for both flags.
+        // GET now reflects the new state for all flags.
         let resp = app.oneshot(get("/api/higgs/logs/settings")).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
         assert_eq!(v["verbose"], true, "PUT toggled verbose on");
@@ -774,6 +781,7 @@ mod tests {
             v["log_incoming_tokens"], true,
             "PUT toggled log_incoming_tokens on"
         );
+        assert_eq!(v["show_log_fields"], true, "PUT toggled show_log_fields on");
     }
 
     // ── runtime settings: GET reflects default (JIT on); PUT toggles JIT ─────
@@ -897,6 +905,7 @@ mod tests {
             axum::Json(crate::serve::LogSettings {
                 verbose: true,
                 log_incoming_tokens: true,
+                show_log_fields: false,
             }),
         )
         .await;

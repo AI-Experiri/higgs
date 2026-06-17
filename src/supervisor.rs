@@ -271,6 +271,17 @@ impl Supervisor {
         self.inner.bus.subscribe()
     }
 
+    /// Whether Developer Logs are in un-redacted DEBUG mode (show structured
+    /// fields incl. prompt content). Off by default.
+    pub fn log_show_fields(&self) -> bool {
+        self.inner.bus.show_fields()
+    }
+
+    /// Toggle the un-redacted DEBUG log mode.
+    pub fn set_log_show_fields(&self, v: bool) {
+        self.inner.bus.set_show_fields(v);
+    }
+
     /// Spawn a worker (named `higgs(<model>)` in `ps`) and start the reader task.
     ///
     /// Called by `load()` when no worker is live. `model` is stamped into the
