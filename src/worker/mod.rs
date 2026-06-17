@@ -174,10 +174,27 @@ impl WorkerState {
             tracing::warn!("higgs: ctx_len=0 requested; using default 4096");
             ctx_len = 4096;
         }
+        // The three base fields keep their specific defaults (gpu_layers=all,
+        // threads=4) via `u32_param`; the optional overrides deserialize from
+        // the same params object (each is `#[serde(default)]` → `None` when
+        // absent, so a quick-load carries no overrides — current behavior).
+        let opts: engine::LoadParams =
+            serde_json::from_value(req.params.clone()).unwrap_or_default();
         let params = engine::LoadParams {
             ctx_len,
             gpu_layers: u32_param(&req.params, "gpu_layers", u32::MAX),
             threads: u32_param(&req.params, "threads", 4),
+            use_mmap: opts.use_mmap,
+            use_mlock: opts.use_mlock,
+            n_batch: opts.n_batch,
+            n_ubatch: opts.n_ubatch,
+            offload_kqv: opts.offload_kqv,
+            rope_freq_base: opts.rope_freq_base,
+            rope_freq_scale: opts.rope_freq_scale,
+            flash_attn: opts.flash_attn,
+            type_k: opts.type_k,
+            type_v: opts.type_v,
+            seed: opts.seed,
         };
         // Scan moved host-side: the host resolves the GGUF path and passes it in
         // `params.path`. The worker holds no catalog of its own.

@@ -61,6 +61,34 @@ An embedding host may override any field when it constructs `HiggsConfig`.
 | `default_load.gpu_layers` | `u32` | `u32::MAX` | `u32::MAX` means all layers offloaded (LM Studio "max" semantics) |
 | `default_load.threads` | `u32` | `available_cpus - 2` (min 1) | Worker threads during generation; computed from `std::thread::available_parallelism()` |
 
+### Optional per-load overrides (`LoadParams`)
+
+Beyond the three base fields above, a load request may pin any of the following
+engine knobs. Each is `Option`: **absent = engine default = pre-expansion
+behavior**. Each maps to a single `llama-cpp-2` 0.1.139 call (applied only in
+`worker/engine/llamacpp.rs`).
+
+| Field | Type | Maps to | Default when absent |
+|-------|------|---------|---------------------|
+| `use_mmap` | `Option<bool>` | `LlamaModelParams::with_use_mmap` | engine default |
+| `use_mlock` | `Option<bool>` | `LlamaModelParams::with_use_mlock` | engine default |
+| `n_batch` | `Option<u32>` | `LlamaContextParams::with_n_batch` | `ctx_len.max(1)` |
+| `n_ubatch` | `Option<u32>` | `LlamaContextParams::with_n_ubatch` | engine default |
+| `offload_kqv` | `Option<bool>` | `LlamaContextParams::with_offload_kqv` | engine default |
+| `rope_freq_base` | `Option<f32>` | `LlamaContextParams::with_rope_freq_base` | GGUF trained value |
+| `rope_freq_scale` | `Option<f32>` | `LlamaContextParams::with_rope_freq_scale` | GGUF trained value |
+| `flash_attn` | `Option<FlashAttn>` (`auto`/`off`/`on`) | `with_flash_attention_policy` (-1/0/1) | engine default |
+| `type_k` | `Option<KvCacheKind>` (F32/F16/Q8_0/Q5_1/Q5_0/Q4_1/Q4_0) | `LlamaContextParams::with_type_k` | F16 |
+| `type_v` | `Option<KvCacheKind>` (same set) | `LlamaContextParams::with_type_v` | F16 |
+| `seed` | `Option<u32>` | `LlamaSampler::dist(seed)` | fresh random seed per request |
+
+**Omitted / deferred** (invent nothing):
+
+- **Unified KV cache** (`kv_unified`) — OMITTED: no safe setter in `llama-cpp-2`
+  0.1.139.
+- **Max concurrent sequences** (`n_seq_max > 1`) — DEFERRED: needs a decode-loop
+  rework; sequence handling is unchanged this pass.
+
 ---
 
 ## Effective Config (read-only surface)

@@ -92,6 +92,7 @@ impl Default for HiggsConfig {
                 ctx_len: 4096,
                 gpu_layers: u32::MAX,
                 threads,
+                ..Default::default()
             },
         }
     }
@@ -443,13 +444,16 @@ impl Higgs {
                 p.ctx_len = (train as u32).min(DEFAULT_CTX_CAP);
             }
         }
-        let req_params = json!({
-            "id": id,
-            "path": model.path,
-            "ctx_len": p.ctx_len,
-            "gpu_layers": p.gpu_layers,
-            "threads": p.threads,
-        });
+        // Serialize the full LoadParams (base + every optional override) and
+        // merge `id`/`path` in. Absent optionals (`skip_serializing_if`) simply
+        // don't appear, so a quick-load carries exactly the three base fields —
+        // the worker then sees no overrides and reproduces current behavior.
+        let mut req_params =
+            serde_json::to_value(&p).expect("LoadParams serializes to a JSON object");
+        if let Some(obj) = req_params.as_object_mut() {
+            obj.insert("id".into(), json!(id));
+            obj.insert("path".into(), json!(model.path));
+        }
         // Spawn-on-load: if no worker is live, bring one up named `higgs(<id>)`
         // before sending M_LOAD. A redundant call while a worker is running is a
         // no-op (single-reader invariant in the supervisor).

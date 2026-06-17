@@ -336,12 +336,53 @@ resolved host-side and carried into the worker. Load parameters fall back to
   "id": "org/model-name",
   "ctx_len": 4096,
   "gpu_layers": 4294967295,
-  "threads": 4
+  "threads": 4,
+  "use_mmap": true,
+  "use_mlock": false,
+  "n_batch": 2048,
+  "n_ubatch": 512,
+  "offload_kqv": true,
+  "rope_freq_base": 10000.0,
+  "rope_freq_scale": 1.0,
+  "flash_attn": "auto",
+  "type_k": "F16",
+  "type_v": "F16",
+  "seed": 42
 }
 ```
 
-All fields except `id` are optional.
+All fields except `id` are optional. Sending NO load field is a fully-default
+load (`HiggsConfig.default_load` plus the auto context cap). The moment any
+field is present, the three base fields (`ctx_len`/`gpu_layers`/`threads`) fall
+back to `default_load` and every other field that is **absent** uses the engine
+default — i.e. omitting an optional reproduces the pre-expansion behavior
+exactly.
+
 `gpu_layers: 4294967295` (`u32::MAX`) means "offload all layers" (LM Studio "max" semantics).
+
+**Expanded load parameters** (each maps to one `llama-cpp-2` 0.1.139 call):
+
+| Field             | Type                                            | Maps to (`llama-cpp-2`)                  | Default when absent                          |
+| ----------------- | ----------------------------------------------- | ---------------------------------------- | -------------------------------------------- |
+| `use_mmap`        | bool                                            | `LlamaModelParams::with_use_mmap`        | engine default                               |
+| `use_mlock`       | bool                                            | `LlamaModelParams::with_use_mlock`       | engine default                               |
+| `n_batch`         | number                                          | `LlamaContextParams::with_n_batch`       | `ctx_len.max(1)` (one-shot prefill)          |
+| `n_ubatch`        | number                                          | `LlamaContextParams::with_n_ubatch`      | engine default                               |
+| `offload_kqv`     | bool                                            | `LlamaContextParams::with_offload_kqv`   | engine default                               |
+| `rope_freq_base`  | number                                          | `LlamaContextParams::with_rope_freq_base`| GGUF trained value                           |
+| `rope_freq_scale` | number                                          | `LlamaContextParams::with_rope_freq_scale`| GGUF trained value                          |
+| `flash_attn`      | `"auto"` \| `"off"` \| `"on"`                   | `with_flash_attention_policy` (-1/0/1)   | engine default                               |
+| `type_k`          | `F32`\|`F16`\|`Q8_0`\|`Q5_1`\|`Q5_0`\|`Q4_1`\|`Q4_0` | `LlamaContextParams::with_type_k`   | F16                                          |
+| `type_v`          | same as `type_k`                                | `LlamaContextParams::with_type_v`        | F16                                          |
+| `seed`            | number                                          | `LlamaSampler::dist(seed)`               | fresh random seed per request                |
+
+**Omitted / deferred:**
+
+- **Unified KV cache** (`kv_unified`) — OMITTED: `llama-cpp-2` 0.1.139 exposes no
+  safe setter for it. Not faked.
+- **Max concurrent sequences** (`n_seq_max > 1`) — DEFERRED: requires reworking
+  the single-sequence decode loop. Out of scope for this pass; sequence handling
+  is unchanged.
 
 The `id` is validated before anything is resolved or spawned:
 

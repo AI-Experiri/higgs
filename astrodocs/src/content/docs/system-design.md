@@ -137,6 +137,37 @@ uses its own prompt format without host-side template management.
 Context fit-check runs before sampling: if `prompt_tokens + max_gen > n_ctx` the call
 returns `HG005 ContextOverflow` instead of silently truncating or hanging.
 
+### Load parameters (`LoadParams`)
+
+`LoadParams` carries three always-present base fields (`ctx_len`, `gpu_layers`,
+`threads`) plus a set of **optional** engine knobs. Each optional is `None` by
+default, and `None` means "use the llama.cpp engine default" — so a quick-load
+(only the base fields pinned) reproduces the original behavior exactly. Each
+optional maps to one concrete `llama-cpp-2` 0.1.139 builder call, applied **only**
+inside `worker/engine/llamacpp.rs` (the single file allowed to name
+`llama_cpp_2` / `llama_cpp_sys_2`):
+
+- **Model params** (in `load()`): `use_mmap` → `with_use_mmap`,
+  `use_mlock` → `with_use_mlock`.
+- **Context params** (in `run_decode()`): `n_batch` → `with_n_batch`
+  (falls back to `ctx_len.max(1)`), `n_ubatch` → `with_n_ubatch`,
+  `offload_kqv` → `with_offload_kqv`, `rope_freq_base` → `with_rope_freq_base`,
+  `rope_freq_scale` → `with_rope_freq_scale`,
+  `flash_attn` (`FlashAttn::{Auto,Off,On}` → -1/0/1) →
+  `with_flash_attention_policy`, `type_k`/`type_v`
+  (`KvCacheKind` → `llama_cpp_2::context::params::KvCacheType`) →
+  `with_type_k`/`with_type_v`.
+- **Sampler** (in `run_decode()`): `seed` threads into `LlamaSampler::dist(seed)`
+  for reproducible generation; `None` keeps the per-request random seed.
+
+The engine-agnostic enums `FlashAttn` and `KvCacheKind` live in
+`worker/engine/mod.rs`; the `llama_cpp_2` types they map to never escape
+`llamacpp.rs`.
+
+**Omitted / deferred** (invent nothing): unified KV cache (`kv_unified`) is
+OMITTED — 0.1.139 has no safe setter; multi-sequence (`n_seq_max > 1`) is
+DEFERRED — it needs a decode-loop rework and is out of scope for this pass.
+
 ---
 
 ## Model Scan Flow

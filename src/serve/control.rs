@@ -134,14 +134,44 @@ pub(super) async fn control_load(
     Json(req): Json<HiggsLoadRequest>,
 ) -> Response {
     tracing::warn!(id = %req.id, "higgs: loading model");
-    let params = if req.ctx_len.is_none() && req.gpu_layers.is_none() && req.threads.is_none() {
-        None // fully default load — Higgs::load applies default_load itself
+    // A request with NO load parameter at all is a fully-default load —
+    // `Higgs::load` applies `default_load` itself (and ctx_len auto-cap). The
+    // moment ANY field is pinned, build a LoadParams: the three base fields fall
+    // back to `default_load`, every optional override passes through verbatim
+    // (absent = `None` = engine default).
+    let any_pinned = req.ctx_len.is_some()
+        || req.gpu_layers.is_some()
+        || req.threads.is_some()
+        || req.use_mmap.is_some()
+        || req.use_mlock.is_some()
+        || req.n_batch.is_some()
+        || req.n_ubatch.is_some()
+        || req.offload_kqv.is_some()
+        || req.rope_freq_base.is_some()
+        || req.rope_freq_scale.is_some()
+        || req.flash_attn.is_some()
+        || req.type_k.is_some()
+        || req.type_v.is_some()
+        || req.seed.is_some();
+    let params = if !any_pinned {
+        None
     } else {
         let base = higgs.default_load();
         Some(LoadParams {
             ctx_len: req.ctx_len.unwrap_or(base.ctx_len),
             gpu_layers: req.gpu_layers.unwrap_or(base.gpu_layers),
             threads: req.threads.unwrap_or(base.threads),
+            use_mmap: req.use_mmap,
+            use_mlock: req.use_mlock,
+            n_batch: req.n_batch,
+            n_ubatch: req.n_ubatch,
+            offload_kqv: req.offload_kqv,
+            rope_freq_base: req.rope_freq_base,
+            rope_freq_scale: req.rope_freq_scale,
+            flash_attn: req.flash_attn,
+            type_k: req.type_k,
+            type_v: req.type_v,
+            seed: req.seed,
         })
     };
     match higgs.load(&req.id, params).await {

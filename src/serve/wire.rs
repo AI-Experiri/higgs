@@ -4,6 +4,7 @@
 //! re-exported from `frontend/src/lib/types.ts`. The `/v1` surface uses
 //! `async-openai` wire types verbatim, so only the control shapes live here.
 
+use crate::worker::engine::{FlashAttn, KvCacheKind};
 use crate::worker::models::HiggsModel;
 
 higgs_ts! {
@@ -81,6 +82,55 @@ higgs_ts! {
         #[ts(type = "number")]
         #[ts(optional)]
         pub threads: Option<u32>,
+        /// Memory-map the GGUF instead of reading it into RAM.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub use_mmap: Option<bool>,
+        /// Lock model pages in RAM (prevent swap).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub use_mlock: Option<bool>,
+        /// Logical batch size for prompt decode.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(type = "number")]
+        #[ts(optional)]
+        pub n_batch: Option<u32>,
+        /// Physical (micro) batch size.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(type = "number")]
+        #[ts(optional)]
+        pub n_ubatch: Option<u32>,
+        /// Offload the KV cache & KQV ops to the GPU.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub offload_kqv: Option<bool>,
+        /// RoPE base frequency override.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(type = "number")]
+        #[ts(optional)]
+        pub rope_freq_base: Option<f32>,
+        /// RoPE frequency scale (context extension).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(type = "number")]
+        #[ts(optional)]
+        pub rope_freq_scale: Option<f32>,
+        /// Flash-attention policy.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub flash_attn: Option<FlashAttn>,
+        /// KV cache key data type.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub type_k: Option<KvCacheKind>,
+        /// KV cache value data type.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub type_v: Option<KvCacheKind>,
+        /// Sampler RNG seed for reproducible generation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(type = "number")]
+        #[ts(optional)]
+        pub seed: Option<u32>,
     }
 }
 

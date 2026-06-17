@@ -83,7 +83,14 @@
         │     <binary> --higgs-worker, argv0 = higgs(<M>) (≤64 chars)
         │     (stdin/stdout piped; stderr → ring buffer, cap 2000)
         │     writer task owns stdin; reader task owns stdout
-        ├─ send M_LOAD { id, path, ctx_len, gpu_layers, threads }
+        ├─ send M_LOAD { id, path, <full LoadParams> }
+        │     base: ctx_len, gpu_layers, threads
+        │     optional overrides (absent ⇒ engine default ⇒ prior behavior):
+        │       use_mmap, use_mlock, n_batch, n_ubatch, offload_kqv,
+        │       rope_freq_base, rope_freq_scale, flash_attn (auto/off/on),
+        │       type_k, type_v (KV cache GGML type), seed
+        │     applied per-field via llama-cpp-2 0.1.139 builder calls in
+        │     worker/engine/llamacpp.rs (only file naming llama_cpp_2)
         │     fail → clear_last_load + stop() (tear worker back down)
         └─ ok   → record_last_load(params) + emit ModelLoaded
 

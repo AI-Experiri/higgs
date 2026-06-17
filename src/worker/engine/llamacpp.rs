@@ -7,7 +7,7 @@
 use std::num::NonZeroU32;
 use std::sync::OnceLock;
 
-use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::context::params::{KvCacheType, LlamaContextParams};
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
@@ -16,7 +16,7 @@ use llama_cpp_2::openai::OpenAIChatTemplateParams;
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
 
-use super::{GenParams, HiggsEngine, LoadParams};
+use super::{FlashAttn, GenParams, HiggsEngine, KvCacheKind, LoadParams};
 use crate::diagnostic::HiggsError;
 use crate::worker::tool_parser::{ToolCallParser, ToolCallStreamFilter, ToolParserRegistry};
 
@@ -70,7 +70,14 @@ impl HiggsEngine for LlamaCppEngine {
     fn load(&mut self, path: &str, params: &LoadParams) -> Result<(), HiggsError> {
         // Drop any resident model first — one loaded model at a time (v1).
         self.loaded = None;
-        let model_params = LlamaModelParams::default().with_n_gpu_layers(params.gpu_layers);
+        let mut model_params = LlamaModelParams::default().with_n_gpu_layers(params.gpu_layers);
+        // Optional model-params overrides — absent (None) leaves the engine default.
+        if let Some(b) = params.use_mmap {
+            model_params = model_params.with_use_mmap(b);
+        }
+        if let Some(b) = params.use_mlock {
+            model_params = model_params.with_use_mlock(b);
+        }
         let model = LlamaModel::load_from_file(backend(), path, &model_params).map_err(|e| {
             HiggsError::EngineLoadFailed {
                 id: path.to_string(),
@@ -184,6 +191,32 @@ impl LlamaCppEngine {
     }
 }
 
+/// Map the engine-agnostic [`FlashAttn`] policy to the raw `llama_cpp_sys_2`
+/// value llama.cpp expects (AUTO = -1, DISABLED = 0, ENABLED = 1). The sys type
+/// is a plain integer alias; confined to this file per the engine boundary.
+fn flash_attn_to_sys(fa: FlashAttn) -> llama_cpp_sys_2::llama_flash_attn_type {
+    let raw: i32 = match fa {
+        FlashAttn::Auto => -1,
+        FlashAttn::Off => 0,
+        FlashAttn::On => 1,
+    };
+    raw as llama_cpp_sys_2::llama_flash_attn_type
+}
+
+/// Map the engine-agnostic [`KvCacheKind`] to `llama_cpp_2`'s [`KvCacheType`].
+/// Confined to this file per the engine boundary.
+fn kv_cache_to_llama(k: KvCacheKind) -> KvCacheType {
+    match k {
+        KvCacheKind::F32 => KvCacheType::F32,
+        KvCacheKind::F16 => KvCacheType::F16,
+        KvCacheKind::Q8_0 => KvCacheType::Q8_0,
+        KvCacheKind::Q5_1 => KvCacheType::Q5_1,
+        KvCacheKind::Q5_0 => KvCacheType::Q5_0,
+        KvCacheKind::Q4_1 => KvCacheType::Q4_1,
+        KvCacheKind::Q4_0 => KvCacheType::Q4_0,
+    }
+}
+
 /// Construct a `GenerationFailed` diagnostic for a named decode stage.
 fn gen_fail(stage: &'static str, reason: &impl ToString) -> HiggsError {
     HiggsError::GenerationFailed {
@@ -292,12 +325,38 @@ fn run_decode(
     sink: &mut dyn FnMut(&str),
 ) -> Result<DecodeOutput, HiggsError> {
     let model = &loaded.model;
-    let threads = i32::try_from(loaded.params.threads).unwrap_or(i32::MAX);
-    let ctx_params = LlamaContextParams::default()
-        .with_n_ctx(NonZeroU32::new(loaded.params.ctx_len))
-        .with_n_batch(loaded.params.ctx_len.max(1))
+    let lp = &loaded.params;
+    let threads = i32::try_from(lp.threads).unwrap_or(i32::MAX);
+    // n_batch: use the pinned value when present, else the current default
+    // (ctx_len.max(1) — one-shot prefill of any fit-checked prompt).
+    let n_batch = lp.n_batch.unwrap_or_else(|| lp.ctx_len.max(1));
+    let mut ctx_params = LlamaContextParams::default()
+        .with_n_ctx(NonZeroU32::new(lp.ctx_len))
+        .with_n_batch(n_batch)
         .with_n_threads(threads)
         .with_n_threads_batch(threads);
+    // Optional context-params overrides — absent (None) leaves the engine default.
+    if let Some(n) = lp.n_ubatch {
+        ctx_params = ctx_params.with_n_ubatch(n);
+    }
+    if let Some(b) = lp.offload_kqv {
+        ctx_params = ctx_params.with_offload_kqv(b);
+    }
+    if let Some(f) = lp.rope_freq_base {
+        ctx_params = ctx_params.with_rope_freq_base(f);
+    }
+    if let Some(f) = lp.rope_freq_scale {
+        ctx_params = ctx_params.with_rope_freq_scale(f);
+    }
+    if let Some(fa) = lp.flash_attn {
+        ctx_params = ctx_params.with_flash_attention_policy(flash_attn_to_sys(fa));
+    }
+    if let Some(k) = lp.type_k {
+        ctx_params = ctx_params.with_type_k(kv_cache_to_llama(k));
+    }
+    if let Some(v) = lp.type_v {
+        ctx_params = ctx_params.with_type_v(kv_cache_to_llama(v));
+    }
     let mut ctx = model
         .new_context(backend(), ctx_params)
         .map_err(|e| gen_fail("create context", &e))?;
@@ -314,14 +373,17 @@ fn run_decode(
     ctx.decode(&mut batch)
         .map_err(|e| gen_fail("prompt decode", &e))?;
 
-    // Greedy when temperature is zero, else temp + dist with real per-request
-    // entropy (F5: was hardcoded seed 1234 — fully deterministic across requests).
+    // Greedy when temperature is zero, else temp + dist. The dist seed is the
+    // load-pinned `seed` when set (reproducible generation), else a fresh random
+    // seed per request (F5: was hardcoded 1234 — fully deterministic; None here
+    // preserves that per-request-entropy behavior).
+    let seed = lp.seed.unwrap_or_else(rand::random::<u32>);
     let mut sampler = if params.temperature <= 0.0 {
         LlamaSampler::chain_simple([LlamaSampler::greedy()])
     } else {
         LlamaSampler::chain_simple([
             LlamaSampler::temp(params.temperature),
-            LlamaSampler::dist(rand::random::<u32>()),
+            LlamaSampler::dist(seed),
         ])
     };
 
@@ -464,6 +526,7 @@ mod tests {
                 ctx_len: 2048,
                 gpu_layers: u32::MAX,
                 threads: 4,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -494,5 +557,120 @@ mod tests {
         );
         e.unload();
         assert!(!e.is_loaded());
+    }
+
+    /// `FlashAttn` maps to the exact llama.cpp raw values (AUTO=-1, OFF=0, ON=1).
+    #[test]
+    fn flash_attn_maps_to_sys_values() {
+        assert_eq!(flash_attn_to_sys(FlashAttn::Auto) as i32, -1);
+        assert_eq!(flash_attn_to_sys(FlashAttn::Off) as i32, 0);
+        assert_eq!(flash_attn_to_sys(FlashAttn::On) as i32, 1);
+    }
+
+    /// Every `KvCacheKind` maps to its matching `llama_cpp_2` `KvCacheType`.
+    #[test]
+    fn kv_cache_maps_to_llama_types() {
+        // KvCacheType is not PartialEq; match on the result to assert the arm.
+        for (kind, ok) in [
+            (
+                KvCacheKind::F32,
+                matches!(kv_cache_to_llama(KvCacheKind::F32), KvCacheType::F32),
+            ),
+            (
+                KvCacheKind::F16,
+                matches!(kv_cache_to_llama(KvCacheKind::F16), KvCacheType::F16),
+            ),
+            (
+                KvCacheKind::Q8_0,
+                matches!(kv_cache_to_llama(KvCacheKind::Q8_0), KvCacheType::Q8_0),
+            ),
+            (
+                KvCacheKind::Q5_1,
+                matches!(kv_cache_to_llama(KvCacheKind::Q5_1), KvCacheType::Q5_1),
+            ),
+            (
+                KvCacheKind::Q5_0,
+                matches!(kv_cache_to_llama(KvCacheKind::Q5_0), KvCacheType::Q5_0),
+            ),
+            (
+                KvCacheKind::Q4_1,
+                matches!(kv_cache_to_llama(KvCacheKind::Q4_1), KvCacheType::Q4_1),
+            ),
+            (
+                KvCacheKind::Q4_0,
+                matches!(kv_cache_to_llama(KvCacheKind::Q4_0), KvCacheType::Q4_0),
+            ),
+        ] {
+            assert!(ok, "{kind:?} mapped to the wrong KvCacheType");
+        }
+    }
+
+    /// An all-default `LoadParams` leaves every optional as `None`, so the
+    /// pre-expansion (quick-load) code path is reproduced exactly.
+    #[test]
+    fn default_load_params_leave_optionals_none() {
+        let p = LoadParams {
+            ctx_len: 4096,
+            gpu_layers: u32::MAX,
+            threads: 4,
+            ..Default::default()
+        };
+        assert!(p.use_mmap.is_none());
+        assert!(p.use_mlock.is_none());
+        assert!(p.n_batch.is_none());
+        assert!(p.n_ubatch.is_none());
+        assert!(p.offload_kqv.is_none());
+        assert!(p.rope_freq_base.is_none());
+        assert!(p.rope_freq_scale.is_none());
+        assert!(p.flash_attn.is_none());
+        assert!(p.type_k.is_none());
+        assert!(p.type_v.is_none());
+        assert!(p.seed.is_none());
+    }
+
+    /// Full serde round-trip of an expanded `LoadParams` (all fields set), and
+    /// the absent-optionals shape (only base fields serialize).
+    #[test]
+    fn load_params_serde_round_trip() {
+        let full = LoadParams {
+            ctx_len: 8192,
+            gpu_layers: 32,
+            threads: 6,
+            use_mmap: Some(false),
+            use_mlock: Some(true),
+            n_batch: Some(1024),
+            n_ubatch: Some(256),
+            offload_kqv: Some(false),
+            rope_freq_base: Some(10000.0),
+            rope_freq_scale: Some(0.5),
+            flash_attn: Some(FlashAttn::On),
+            type_k: Some(KvCacheKind::Q8_0),
+            type_v: Some(KvCacheKind::F16),
+            seed: Some(42),
+        };
+        let json = serde_json::to_string(&full).unwrap();
+        let back: LoadParams = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.flash_attn, Some(FlashAttn::On));
+        assert_eq!(back.type_k, Some(KvCacheKind::Q8_0));
+        assert_eq!(back.seed, Some(42));
+        assert_eq!(back.n_batch, Some(1024));
+        assert_eq!(back.use_mmap, Some(false));
+
+        // FlashAttn serializes lowercase ("on"/"off"/"auto").
+        assert_eq!(serde_json::to_string(&FlashAttn::Auto).unwrap(), "\"auto\"");
+
+        // Absent optionals: only the three base fields appear on the wire.
+        let bare = LoadParams {
+            ctx_len: 4096,
+            gpu_layers: u32::MAX,
+            threads: 4,
+            ..Default::default()
+        };
+        let bare_json: serde_json::Value = serde_json::to_value(&bare).unwrap();
+        let obj = bare_json.as_object().unwrap();
+        assert_eq!(obj.len(), 3, "absent optionals must not serialize: {obj:?}");
+        // A bare object deserializes back with all optionals None (quick-load).
+        let bare_back: LoadParams = serde_json::from_value(bare_json).unwrap();
+        assert!(bare_back.seed.is_none() && bare_back.flash_attn.is_none());
     }
 }
