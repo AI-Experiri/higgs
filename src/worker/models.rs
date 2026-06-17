@@ -274,6 +274,9 @@ fn scan_lmstudio(root: &Path, out: &mut Vec<HiggsModel>) -> Result<(), HiggsErro
                     HiggsModelSource::LmStudio,
                 );
                 enrich_gguf_metadata(&mut model);
+                if is_projector_sidecar(&fname, model.arch.as_deref()) {
+                    continue;
+                }
                 out.push(model);
             }
         }
@@ -388,6 +391,9 @@ fn scan_hf_cache(root: &Path, out: &mut Vec<HiggsModel>) -> Result<(), HiggsErro
                     HiggsModelSource::HfCache,
                 );
                 enrich_gguf_metadata(&mut model);
+                if is_projector_sidecar(&fname, model.arch.as_deref()) {
+                    continue;
+                }
                 out.push(model);
             }
         }
@@ -506,6 +512,10 @@ fn scan_ollama(root: &Path, out: &mut Vec<HiggsModel>) -> Result<(), HiggsError>
             HiggsModelSource::Ollama,
         );
         enrich_gguf_metadata(&mut model);
+        // Ollama blobs are content-hashed (no filename) — detect projectors by arch.
+        if is_projector_sidecar("", model.arch.as_deref()) {
+            continue;
+        }
         out.push(model);
     }
 
@@ -545,6 +555,18 @@ fn collect_manifest_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Higg
 // ---------------------------------------------------------------------------
 // Quant parsing
 // ---------------------------------------------------------------------------
+
+/// True when a scanned GGUF is a multimodal **projector sidecar** (a vision/audio
+/// encoder shipped alongside a chat model), not a loadable chat model.
+///
+/// llama.cpp names these `mmproj-*.gguf` and their GGUF `general.architecture` is
+/// `"clip"`. They share their parent repo's id (`{org}/{model}`), so listing them
+/// as standalone models both collides ids and offers a non-servable row. They are
+/// excluded from scan results; the projector is consumed implicitly when the
+/// parent multimodal model is loaded.
+fn is_projector_sidecar(fname: &str, arch: Option<&str>) -> bool {
+    arch == Some("clip") || fname.to_ascii_lowercase().contains("mmproj")
+}
 
 /// Parse a quantization tag from a GGUF filename.
 ///
@@ -692,6 +714,18 @@ mod tests {
         assert_eq!(quant_from_filename("m-Q4_K_M.gguf"), Some("Q4_K_M".into()));
         assert_eq!(quant_from_filename("m.f16.gguf"), Some("f16".into()));
         assert_eq!(quant_from_filename("notgguf.bin"), None);
+    }
+
+    #[test]
+    fn projector_sidecars_excluded() {
+        // arch "clip" → projector regardless of name
+        assert!(is_projector_sidecar("model-Q8_0.gguf", Some("clip")));
+        // mmproj filename → projector even if arch is unreadable
+        assert!(is_projector_sidecar("mmproj-model-BF16.gguf", None));
+        assert!(is_projector_sidecar("MMPROJ-Model.GGUF", None));
+        // a real chat model is not a projector
+        assert!(!is_projector_sidecar("model-Q8_0.gguf", Some("gemma4")));
+        assert!(!is_projector_sidecar("model-Q4_K_M.gguf", None));
     }
 
     /// Build a minimal valid GGUF file in memory using the ggus writer API and
