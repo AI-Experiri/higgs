@@ -5,6 +5,7 @@
 - [Worker Lifecycle](#worker-lifecycle)
 - [Chat Request Sequence](#chat-request-sequence)
 - [Model Scan Flow](#model-scan-flow)
+- [Developer Log Bus](#developer-log-bus)
 - [Endpoint Surface Map](#endpoint-surface-map)
 
 ---
@@ -222,6 +223,40 @@
 
 ---
 
+## Developer Log Bus
+
+```
+  TWO SOURCES                          LogBus (log_bus.rs)        TWO SINKS
+  ───────────                          ─── SINGLE HOME ───        ─────────
+
+  worker child stderr ──┐                                   ┌─ GET /api/higgs/logs
+   (supervisor reader    │                                  │     snapshot(n)
+    task: bus.push)      │      ┌──────────────────────┐    │     → ring tail (n lines)
+                         ├─push─▶│ history ring         │────┤
+  HiggsLogLayer ─────────┘      │   cap RING_CAP 2000   │    │
+   tracing events whose         │   (snapshot source)  │    └─ GET /api/higgs/logs/stream
+   target starts "higgs"        ├──────────────────────┤        SSE (no http timeout)
+   formatted:                   │ broadcast::Sender    │        control_logs_stream:
+   YYYY-MM-DD HH:MM:SS          │   <String>           │──live──▶ subscribe FIRST
+   [LEVEL] message              │   cap BROADCAST_CAP  │          then replay last n ring
+   (message field ONLY —        │       256 (live tap) │          then stream live lines
+    no fields, no prompt =      └──────────────────────┘          one line = one data: frame
+    redaction-safe)                                               Lagged → warn + marker,
+                                                                  keep streaming
+  Every line enters via LogBus::push(line):
+    append to ring  +  send on broadcast   (one place, both sinks fed)
+
+  subscribe_logs() → broadcast::Receiver        snapshot(n) → last n ring lines
+
+  Construction: caller builds LogBus BEFORE the tracing subscriber, installs
+  HiggsLogLayer::new(bus.clone()) on it, passes the same Arc to
+  Higgs::with_log_bus(config, bus). Higgs::new builds its own internal bus
+  (worker stderr only — no serve-event capture).
+  Supervisor::spawn(bus) holds the bus; the stderr reader calls bus.push.
+```
+
+---
+
 ## Endpoint Surface Map
 
 ```
@@ -249,7 +284,9 @@
   │                          │              models_on_disk}         │
   │  GET  /api/higgs/system  │  SystemInfo {hardware, runtime,     │
   │                          │  config: HiggsServerConfig}(read-only)│
-  │  GET  /api/higgs/logs    │  Worker stderr tail (?n=200)        │
+  │  GET  /api/higgs/logs    │  Dev-log snapshot tail (?n=200)     │
+  │  GET  /api/higgs/logs/stream │  SSE replay-then-live dev logs  │
+  │                          │  (?n=200; no-timeout router)         │
   │  POST /api/higgs/worker/stop  │  Graceful shutdown (2 s)       │
   │  GET  /api/higgs/version │  Build version + engine info        │
   └──────────────────────────┴──────────────────────────────────────┘
@@ -269,6 +306,7 @@
   │  ── split by route ──                                             │
   │  /api/higgs/* + /v1/models : TimeoutLayer(CONTROL_TIMEOUT 120 s)  │
   │  /v1/chat/completions      : NO http timeout — SSE must not abort │
+  │  /api/higgs/logs/stream    : NO http timeout — SSE log stream     │
   └──────────────────────────────────────────────────────────────────┘
   Non-loopback HIGGS_BIND (standalone bin) → startup SECURITY WARNING.
 

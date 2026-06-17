@@ -161,12 +161,13 @@ SECURITY WARNING. The embedded (jigglebot) path always binds ephemeral loopback.
 
 | Item | Value | Source |
 |------|-------|--------|
-| stderr ring buffer cap | 2000 lines | `supervisor.rs` — hardcoded |
+| dev-log history ring cap | 2000 lines | `log_bus.rs` — `RING_CAP` (snapshot source for `/api/higgs/logs` + SSE replay) |
+| dev-log live broadcast cap | 256 | `log_bus.rs` — `BROADCAST_CAP` (live tap for `/api/higgs/logs/stream`) |
 | event broadcast channel cap | 64 | `supervisor.rs` — hardcoded |
 | respawn backoff | 1 second | `supervisor.rs` — hardcoded |
 | respawn attempts per death | 1 | supervisor restarts once; factory failure is terminal |
 | graceful stop timeout | 2 seconds | `Higgs::stop()` — hardcoded |
-| `/api/higgs/logs` default tail | 200 lines | `LogsQuery.n` default |
+| `/api/higgs/logs` + `/logs/stream` default tail / replay | 200 lines | `DEFAULT_LOG_LINES` (`LogsQuery.n` default) |
 
 ---
 

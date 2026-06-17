@@ -10,7 +10,7 @@ higgs exposes two route groups:
 | Group | Purpose |
 |-------|---------|
 | `/v1/*` | OpenAI-compatible inference — chat clients, OpenAI SDK drop-ins |
-| `/api/higgs/*` | Control plane — scan, load, unload, status, system, logs, worker stop, version |
+| `/api/higgs/*` | Control plane — scan, load, unload, status, system, logs (snapshot + SSE stream), worker stop, version |
 
 All routes are mounted by `higgs::serve::router(Arc<Higgs>)`.
 
@@ -470,7 +470,11 @@ curl http://localhost:8081/api/higgs/system
 
 ### GET /api/higgs/logs
 
-Worker stderr tail. Useful for diagnosing load failures and llama.cpp output.
+Developer-log snapshot tail. Useful for diagnosing load failures and llama.cpp
+output. Lines come from the `LogBus` history ring, which holds both worker child
+stderr **and** captured `higgs`-targeted serve-layer tracing events (e.g. request
+lines like `higgs: GET /v1/models`). This is a one-shot tail — use
+`/api/higgs/logs/stream` for live updates.
 
 **Query:** `?n=200` (default 200 lines)
 
@@ -489,6 +493,39 @@ Worker stderr tail. Useful for diagnosing load failures and llama.cpp output.
 
 ```sh
 curl "http://localhost:8081/api/higgs/logs?n=50"
+```
+
+---
+
+### GET /api/higgs/logs/stream
+
+Live developer-log stream over **Server-Sent Events** (`text/event-stream`). The
+handler subscribes to the `LogBus` live broadcast **first**, then replays the last
+`n` lines from the history ring, then streams new lines as they arrive — so no
+line is missed between the snapshot and the live tap. Each log line is one SSE
+`data:` frame. The stream feeds the Developer Logs terminal in the higgs pane.
+
+It is registered on the **no-timeout** streaming router (like
+`/v1/chat/completions`) so a long-lived stream is never aborted at the HTTP layer.
+If the broadcast lags (a slow consumer drops lines), the handler emits a
+`[log stream lagged — dropped N lines]` marker frame and keeps streaming.
+
+**Query:** `?n=200` (lines to replay before going live; default 200)
+
+**Response (200, `text/event-stream`):**
+
+```
+data: llama_model_load: loading model from /path/to/model.gguf
+
+data: llama_model_load: model size = 4.20 GB
+
+data: 2026-06-15 12:00:01 [INFO] higgs: GET /v1/models
+```
+
+**curl:**
+
+```sh
+curl -N "http://localhost:8081/api/higgs/logs/stream?n=50"
 ```
 
 ---
@@ -523,7 +560,7 @@ Every request — both surfaces — passes through a shared middleware stack
 |-------|-----------|--------------|
 | **Host header** | DNS-rebinding guard: the `Host` header's host portion (sans `:port`) must be loopback (`127.0.0.1` / `localhost` / `::1` / `[::1]`). A missing Host is also rejected (ollama behavior). | **403** `[HG012] forbidden host: <host>` |
 | **Body size** | `MAX_BODY_BYTES` = 32 MB via axum `DefaultBodyLimit`. | **413** |
-| **Control timeout** | `CONTROL_TIMEOUT` = 120 s `tower_http::timeout::TimeoutLayer`, applied **only** to `/api/higgs/*` and `/v1/models`. | **408** |
+| **Control timeout** | `CONTROL_TIMEOUT` = 120 s `tower_http::timeout::TimeoutLayer`, applied **only** to `/api/higgs/*` and `/v1/models` — **except** the SSE routes (`/v1/chat/completions`, `/api/higgs/logs/stream`), which are on the no-timeout router. | **408** |
 | **Panic recovery** | `tower_http::catch_panic::CatchPanicLayer` — a handler panic is caught and rendered. | **500** (connection survives) |
 
 **Why the timeout skips chat streaming.** `POST /v1/chat/completions` is **not**

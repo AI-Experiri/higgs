@@ -5,7 +5,6 @@
 //! handler tests drive the real router without a real worker process. Shared by
 //! both surfaces' test modules via `super::test_support::*`.
 
-use std::collections::VecDeque;
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -22,26 +21,27 @@ use tokio::io::AsyncWriteExt;
 use super::router;
 use crate::api::{Higgs, HiggsConfig};
 use crate::diagnostic::HiggsError;
+use crate::log_bus::LogBus;
 use crate::rpc::{encode, RpcFrame, RpcResponse};
 use crate::supervisor::{Supervisor, WorkerHalves};
 
-/// Build a `Supervisor` plus duplex test handles and its captured log ring.
+/// Build a `Supervisor` plus duplex test handles and its captured [`LogBus`].
 pub(crate) fn make_supervisor() -> (
     Supervisor,
     tokio::io::DuplexStream, // test_write: write responses → supervisor reads
     tokio::io::DuplexStream, // test_read:  supervisor writes requests → test reads
-    Arc<Mutex<VecDeque<String>>>, // stderr ring (push lines for logs tests)
+    Arc<LogBus>,             // log bus (push lines for logs tests)
 ) {
     let (sup_write, test_read) = tokio::io::duplex(64 * 1024);
     let (test_write, sup_read) = tokio::io::duplex(64 * 1024);
 
     let sup_write_cell = Arc::new(Mutex::new(Some(sup_write)));
     let sup_read_cell = Arc::new(Mutex::new(Some(sup_read)));
-    let ring_cell: Arc<Mutex<Option<Arc<Mutex<VecDeque<String>>>>>> = Arc::new(Mutex::new(None));
-    let ring_capture = Arc::clone(&ring_cell);
+    let bus_cell: Arc<Mutex<Option<Arc<LogBus>>>> = Arc::new(Mutex::new(None));
+    let bus_capture = Arc::clone(&bus_cell);
 
-    let sup = Supervisor::with_factory(Box::new(move |ring, _model| {
-        *ring_capture.lock() = Some(ring);
+    let sup = Supervisor::with_factory(Box::new(move |bus, _model| {
+        *bus_capture.lock() = Some(bus);
         let write = sup_write_cell
             .lock()
             .take()
@@ -62,8 +62,8 @@ pub(crate) fn make_supervisor() -> (
     }));
 
     sup.start_for("test-model").expect("mock start");
-    let ring = ring_cell.lock().take().expect("factory ran on start");
-    (sup, test_write, test_read, ring)
+    let bus = bus_cell.lock().take().expect("factory ran on start");
+    (sup, test_write, test_read, bus)
 }
 
 /// Build a `Supervisor` that has NEVER spawned a worker — its factory is never

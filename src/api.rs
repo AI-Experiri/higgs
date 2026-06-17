@@ -15,6 +15,7 @@ use tokio::sync::{broadcast, mpsc};
 use tracing::warn;
 
 use crate::diagnostic::HiggsError;
+use crate::log_bus::LogBus;
 use crate::supervisor::{HiggsEvent, Supervisor};
 use crate::worker::engine::LoadParams;
 use crate::worker::models::HiggsModel;
@@ -330,12 +331,26 @@ pub struct Higgs {
 }
 
 impl Higgs {
-    /// Construct the facade WITHOUT spawning the worker.
+    /// Construct the facade WITHOUT spawning the worker, owning a fresh
+    /// [`LogBus`]. The serve-layer [`HiggsLogLayer`](crate::log_bus::HiggsLogLayer)
+    /// is NOT wired to this internal bus — request events won't appear in the
+    /// Developer Logs. Use [`with_log_bus`](Self::with_log_bus) when the caller
+    /// installs the tracing layer.
     ///
     /// Call [`start`](Self::start) when the host is ready.
     pub fn new(config: HiggsConfig) -> Self {
+        Self::with_log_bus(config, Arc::new(LogBus::new()))
+    }
+
+    /// Construct the facade WITHOUT spawning the worker, sharing `bus` with the
+    /// caller's serve-layer [`HiggsLogLayer`](crate::log_bus::HiggsLogLayer).
+    ///
+    /// Worker stderr and captured serve-layer request events then flow into the
+    /// same Developer-Log history+stream. The caller is responsible for
+    /// installing `HiggsLogLayer::new(bus.clone())` on its tracing subscriber.
+    pub fn with_log_bus(config: HiggsConfig, bus: Arc<LogBus>) -> Self {
         Self {
-            sup: Arc::new(Supervisor::spawn()),
+            sup: Arc::new(Supervisor::spawn(bus)),
             config: parking_lot::Mutex::new(config),
             lifecycle: tokio::sync::Mutex::new(()),
             inference_gate: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_INFERENCE)),
@@ -634,9 +649,17 @@ impl Higgs {
         self.sup.events()
     }
 
-    /// Return up to `n` recent stderr log lines from the worker (oldest first).
+    /// Return up to `n` recent Developer-Log lines (oldest first) — worker
+    /// stderr plus captured serve-layer request events.
     pub fn logs(&self, n: usize) -> Vec<String> {
         self.sup.logs(n)
+    }
+
+    /// Subscribe to live Developer-Log lines pushed after this call. The SSE
+    /// log-stream handler pairs this with [`logs`](Self::logs) for
+    /// replay-then-live delivery.
+    pub fn subscribe_logs(&self) -> tokio::sync::broadcast::Receiver<String> {
+        self.sup.subscribe_logs()
     }
 
     /// Snapshot of the configured default load parameters.

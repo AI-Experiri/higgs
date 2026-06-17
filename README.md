@@ -14,16 +14,19 @@ The inference engine (llama.cpp) runs inside a **worker process** created by re-
 
 Because higgs carries its own HTTP router, any Axum host can mount it with one call and get a `/v1/chat/completions` endpoint backed by a local GGUF model.
 
+Developer Logs are served two ways. `LogBus` is the single home for every log line: worker child stderr AND captured serve-layer tracing events both enter via `LogBus::push`, which appends to a bounded history ring and broadcasts to live subscribers in one place. `HiggsLogLayer` is a `tracing` layer that captures `higgs`-targeted events (e.g. request lines like `higgs: GET /v1/models`, message field only — redaction-safe) into the bus. `GET /api/higgs/logs` returns a snapshot tail; `GET /api/higgs/logs/stream` is an SSE stream that replays the recent tail then streams new lines live.
+
 ## Files
 
 | Path | What it does |
 |------|-------------|
 | `src/lib.rs` | Crate root — re-exports `Higgs`, `HiggsConfig`, `HiggsError`, `HiggsEvent` |
 | `src/api.rs` | `Higgs` facade and `HiggsConfig` — the host-facing API; `HiggsStatus`, `LoadedInfo`, `ChatOutcome`, `HiggsServerConfig` (read-only effective config surfaced by `Higgs::server_config()`) |
+| `src/log_bus.rs` | `LogBus` (single home for Developer-Log lines: bounded history ring + live broadcast tap) and `HiggsLogLayer` (a `tracing` layer that pushes `higgs`-targeted events into the bus) |
 | `src/diagnostic.rs` | `HiggsError` enum with diagnostic codes HG001–HG011 |
 | `src/rpc.rs` | NDJSON JSON-RPC 2.0 encode/decode — the supervisor↔worker wire protocol |
 | `src/supervisor.rs` | Worker process supervisor: spawn, restart, request correlation, chat-chunk routing |
-| `src/serve/mod.rs` | Axum router: `/v1/models`, `/v1/chat/completions`, `/api/higgs/*` control routes |
+| `src/serve/mod.rs` | Axum router: `/v1/models`, `/v1/chat/completions`, `/api/higgs/*` control routes (incl. the no-timeout SSE log stream) |
 | `src/serve/stream.rs` | SSE assembly for streaming chat completions (OpenAI chunk protocol) |
 | `src/worker/mod.rs` | Worker entry point — JSON-RPC dispatch loop, `worker_main()` |
 | `src/worker/models.rs` | Model discovery across LM Studio, HuggingFace cache, and Ollama stores; `HiggsModel`, `ModelStore` |

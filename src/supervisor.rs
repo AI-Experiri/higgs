@@ -29,7 +29,7 @@
 //! serialises concurrent callers onto the single writer task — same pattern as
 //! rmcp's `TokioChildProcess` / LSP client writers.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -42,6 +42,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{info, warn};
 
 use crate::diagnostic::HiggsError;
+use crate::log_bus::LogBus;
 use crate::rpc::{self, RpcFrame, RpcNotification, RpcRequest};
 use crate::worker::{M_LOAD, M_SHUTDOWN, N_CHAT_CHUNK};
 
@@ -130,9 +131,8 @@ pub(crate) struct WorkerHalves {
 /// The `&str` model argument is the model id to be loaded; the production impl
 /// stamps it into the worker's argv0 (`higgs(<model>)`) so the process is
 /// identifiable in `ps`. It is cosmetic only — the model still loads via M_LOAD.
-type HalvesFactory = Box<
-    dyn Fn(Arc<Mutex<VecDeque<String>>>, &str) -> Result<WorkerHalves, HiggsError> + Send + Sync,
->;
+type HalvesFactory =
+    Box<dyn Fn(Arc<LogBus>, &str) -> Result<WorkerHalves, HiggsError> + Send + Sync>;
 
 /// Shared supervisor state.
 struct Inner {
@@ -155,9 +155,12 @@ struct Inner {
     next_id: AtomicU64,
     /// Broadcast channel for lifecycle events (cap 64).
     events_tx: broadcast::Sender<HiggsEvent>,
-    /// Ring buffer of recent stderr lines (cap 2000).
-    /// `Arc`-wrapped so the factory closure can clone the handle.
-    stderr_ring: Arc<Mutex<VecDeque<String>>>,
+    /// Single home for Developer-Log lines: bounded history ring (the `logs(n)`
+    /// snapshot source) plus a live broadcast tap (the SSE-stream source). Both
+    /// the worker stderr reader and the serve-layer tracing [`HiggsLogLayer`]
+    /// push lines through this one bus. `Arc`-wrapped so the factory closure
+    /// can clone the handle and so the caller's tracing layer shares it.
+    bus: Arc<LogBus>,
     /// Params of the last successful `higgs/load`; replayed after restart.
     last_load: Mutex<Option<Value>>,
     /// Set on `stop()` — suppresses respawn after death.
@@ -206,14 +209,18 @@ impl Supervisor {
     /// Create a supervisor using the production child-process factory.
     ///
     /// Does not spawn the worker yet; the first `load()` calls `start_for()`.
-    pub(crate) fn spawn() -> Self {
+    ///
+    /// `bus` is the shared [`LogBus`] the caller also feeds with the serve-layer
+    /// [`HiggsLogLayer`], so worker stderr and request-event lines land in one
+    /// place.
+    pub(crate) fn spawn(bus: Arc<LogBus>) -> Self {
         let (events_tx, _) = broadcast::channel(64);
         let inner = Arc::new(Inner {
             pending: Mutex::new(HashMap::new()),
             chat_sinks: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             events_tx,
-            stderr_ring: Arc::new(Mutex::new(VecDeque::with_capacity(2000))),
+            bus,
             last_load: Mutex::new(None),
             stopped: AtomicBool::new(false),
             running: AtomicBool::new(false),
@@ -236,7 +243,7 @@ impl Supervisor {
             chat_sinks: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             events_tx,
-            stderr_ring: Arc::new(Mutex::new(VecDeque::with_capacity(2000))),
+            bus: Arc::new(LogBus::new()),
             last_load: Mutex::new(None),
             stopped: AtomicBool::new(false),
             running: AtomicBool::new(false),
@@ -252,11 +259,16 @@ impl Supervisor {
         self.inner.events_tx.subscribe()
     }
 
-    /// Return up to `n` recent stderr lines from the worker (oldest first).
+    /// Return up to `n` recent Developer-Log lines (oldest first) — worker
+    /// stderr plus captured serve-layer events.
     pub fn logs(&self, n: usize) -> Vec<String> {
-        let ring = self.inner.stderr_ring.lock();
-        let skip = ring.len().saturating_sub(n);
-        ring.iter().skip(skip).cloned().collect()
+        self.inner.bus.snapshot(n)
+    }
+
+    /// Subscribe to live Developer-Log lines pushed after this call. Pair with
+    /// [`logs`](Self::logs) for replay-then-live SSE delivery.
+    pub fn subscribe_logs(&self) -> broadcast::Receiver<String> {
+        self.inner.bus.subscribe()
     }
 
     /// Spawn a worker (named `higgs(<model>)` in `ps`) and start the reader task.
@@ -560,7 +572,7 @@ impl Supervisor {
         // Reset the deliberate-stop flag so the new worker's reader_task
         // will auto-restart on unexpected death (stop→start cycle fix).
         self.inner.stopped.store(false, Ordering::Relaxed);
-        let halves = match (self.inner.factory)(self.inner.stderr_ring.clone(), model) {
+        let halves = match (self.inner.factory)(self.inner.bus.clone(), model) {
             Ok(h) => h,
             Err(e) => {
                 // Spawn failed: release the running flag so a later retry can spawn.
@@ -717,7 +729,7 @@ fn spawn_replacement(inner: &Arc<Inner>) -> Result<WorkerHalves, HiggsError> {
         .as_ref()
         .and_then(|p| p.get("id").and_then(|v| v.as_str()).map(ToOwned::to_owned))
         .unwrap_or_default();
-    (inner.factory)(inner.stderr_ring.clone(), &model)
+    (inner.factory)(inner.bus.clone(), &model)
 }
 
 /// Reap the OLD child currently stored in `inner.proc` (if any).
@@ -969,10 +981,7 @@ async fn replay_load_await(inner: &Arc<Inner>, params: Value) -> Result<(), Higg
 /// Takes owned `ChildStdin` and `ChildStdout` halves — independently owned
 /// by construction, no mutex between reader and writer.
 /// Wires a blocking stderr drain task to fill the ring.
-fn production_factory(
-    stderr_ring: Arc<Mutex<VecDeque<String>>>,
-    model: &str,
-) -> Result<WorkerHalves, HiggsError> {
+fn production_factory(bus: Arc<LogBus>, model: &str) -> Result<WorkerHalves, HiggsError> {
     let exe = std::env::current_exe().map_err(|e| HiggsError::WorkerSpawnFailed { source: e })?;
     let mut cmd = Command::new(exe);
     // Stamp argv0 as `higgs(<model>)` so the worker is identifiable in `ps`.
@@ -1004,11 +1013,11 @@ fn production_factory(
     tokio::spawn(async move {
         let mut lines = tokio::io::BufReader::new(stderr).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            let mut ring = stderr_ring.lock();
-            if ring.len() == 2000 {
-                ring.pop_front();
-            }
-            ring.push_back(line);
+            // Single home: append to the history ring AND fan out to live SSE
+            // subscribers in one call. Worker stderr is verbatim — the worker
+            // never logs prompt content (redaction policy holds upstream), so
+            // no further sanitization is applied here.
+            bus.push(line);
         }
     });
 
@@ -1406,23 +1415,17 @@ mod tests {
 
     #[tokio::test]
     async fn logs_ring_caps() {
-        // Verify ring-cap logic directly on a standalone ring (the production
-        // path fills this via a stderr drain thread; the mechanics are identical).
-        let ring: Arc<Mutex<VecDeque<String>>> =
-            Arc::new(Mutex::new(VecDeque::with_capacity(2000)));
-
+        // The supervisor's log history caps at the LogBus ring capacity (2000);
+        // the production path fills it via the stderr drain task. Drive the same
+        // bus the supervisor exposes and confirm the cap + oldest-first tail.
+        let (sup, _tw, _tr) = make_supervisor();
         for i in 0..2100usize {
-            let mut r = ring.lock();
-            if r.len() == 2000 {
-                r.pop_front();
-            }
-            r.push_back(format!("line-{i}"));
+            sup.inner.bus.push(format!("line-{i}"));
         }
-
-        let r = ring.lock();
-        assert_eq!(r.len(), 2000);
+        let snap = sup.logs(usize::MAX);
+        assert_eq!(snap.len(), 2000);
         // 2100 pushed, 100 dropped → oldest remaining is line-100.
-        assert_eq!(r.front().unwrap(), "line-100");
+        assert_eq!(snap.first().unwrap(), "line-100");
     }
 
     // ─── Test 6: restart replays the load (scan is host-side) + emits ModelLoaded ─
@@ -1584,12 +1587,9 @@ mod tests {
     #[tokio::test]
     async fn logs_tail_and_clamp() {
         let (sup, _tw, _tr) = make_supervisor();
-        {
-            let mut ring = sup.inner.stderr_ring.lock();
-            ring.push_back("a".to_owned());
-            ring.push_back("b".to_owned());
-            ring.push_back("c".to_owned());
-        }
+        sup.inner.bus.push("a".to_owned());
+        sup.inner.bus.push("b".to_owned());
+        sup.inner.bus.push("c".to_owned());
         // Tail of 2 → last two, oldest first.
         assert_eq!(sup.logs(2), vec!["b".to_owned(), "c".to_owned()]);
         // n larger than the ring → all lines, no panic.

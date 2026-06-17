@@ -23,6 +23,8 @@ use std::sync::Arc;
 
 use higgs::{Higgs, HiggsConfig};
 use tokio::signal;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 fn main() {
     // Worker role: detect BEFORE tracing/anything writes stdout — the worker
@@ -32,11 +34,17 @@ fn main() {
         return;
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
+    // Single home for Developer-Log lines: worker stderr + serve-layer events.
+    // Created before the subscriber so the HiggsLogLayer and the Higgs facade
+    // can share it.
+    let log_bus = Arc::new(higgs::LogBus::new());
+    tracing_subscriber::registry()
+        .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        .with(higgs::HiggsLogLayer::new(log_bus.clone()))
+        .with(tracing_subscriber::fmt::layer())
         .init();
 
     let bind = std::env::var("HIGGS_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
@@ -79,7 +87,7 @@ fn main() {
         .expect("build tokio runtime");
 
     rt.block_on(async move {
-        let higgs = Arc::new(Higgs::new(HiggsConfig::default()));
+        let higgs = Arc::new(Higgs::with_log_bus(HiggsConfig::default(), log_bus));
         if let Err(e) = higgs.start().await {
             tracing::error!(error = %e, "higgs failed to start (worker spawn)");
             std::process::exit(1);

@@ -66,7 +66,8 @@ once at its true origin):
 
 | Method | What it does |
 |--------|-------------|
-| `Higgs::new(config)` | Construct without spawning the worker |
+| `Higgs::new(config)` | Construct without spawning the worker (builds its own internal `LogBus` — worker stderr only, no serve-event capture) |
+| `Higgs::with_log_bus(config, bus)` | Construct sharing a caller-supplied `Arc<LogBus>` — used when the caller also installs `HiggsLogLayer` on its tracing subscriber so serve-layer events reach the dev logs |
 | `start()` | Near-no-op — control surface only; spawns **no** worker |
 | `stop()` | Kill the worker (2 s graceful timeout) + clear load-replay state |
 | `scan()` | Host-side scan of model dirs (no worker), return `Vec<HiggsModel>` |
@@ -75,7 +76,8 @@ once at its true origin):
 | `status()` | `HiggsStatus { worker_alive, loaded, models_on_disk }` |
 | `chat_stream(messages, max_tokens, temp)` | Returns `(delta_rx, outcome_handle)` |
 | `events()` | Subscribe to `HiggsEvent` broadcast |
-| `logs(n)` | Last n worker stderr lines |
+| `logs(n)` | Last n developer-log lines (`LogBus` snapshot) |
+| `subscribe_logs()` | Live `broadcast::Receiver<String>` of new developer-log lines |
 
 ---
 
@@ -164,6 +166,43 @@ ModelStore::scan(lmstudio_roots, hf_roots, ollama_roots)   (host process)
   Missing root: silently skipped
   Unreadable root: HG001 ModelDirUnreadable
 ```
+
+---
+
+## Developer Logs (LogBus)
+
+`LogBus` (`log_bus.rs`) is the **single home** for every developer-log line. Two
+sources feed it; two endpoints read it.
+
+```
+SOURCES                            LogBus                       ENDPOINTS
+  worker child stderr ──┐      ┌──────────────────────┐
+   (supervisor reader   ├─push─▶ history ring (2000)   │──snapshot(n)──▶ GET /api/higgs/logs
+    task → bus.push)    │      │   (snapshot source)  │
+                        │      ├──────────────────────┤
+  HiggsLogLayer ────────┘      │ broadcast tap (256)  │──subscribe──▶ GET /api/higgs/logs/stream
+   (tracing layer, target      └──────────────────────┘                (SSE: subscribe first,
+    starts "higgs")                                                      replay last n, then live)
+
+LogBus::push(line) appends to the ring AND sends on the broadcast — one place,
+both sinks fed.
+```
+
+Before this, only worker stderr reached the dev logs. `HiggsLogLayer` is a
+`tracing_subscriber::Layer` that captures events whose target starts with
+`higgs`, formats each as `YYYY-MM-DD HH:MM:SS [LEVEL] message`, and pushes it
+into the bus — so serve-layer request events (e.g. `higgs: GET /v1/models`) now
+appear in the Developer Logs. Only the tracing `message` field is captured (no
+structured fields, no prompt content — redaction-safe).
+
+Wiring: the caller creates the `LogBus` **before** the tracing subscriber,
+installs `HiggsLogLayer::new(bus.clone())` on it, and passes the same
+`Arc<LogBus>` to `Higgs::with_log_bus(config, bus)`. `Higgs::new` instead builds
+its own internal bus (worker stderr only). The supervisor holds the bus
+(`Supervisor::spawn(bus)`); its stderr reader calls `bus.push`, `logs(n)`
+delegates to `bus.snapshot(n)`, and `subscribe_logs()` returns `bus.subscribe()`.
+The SSE handler handles broadcast `Lagged` gracefully (warns, emits a marker
+line, keeps streaming).
 
 ---
 
@@ -277,7 +316,10 @@ init_app() (lib.rs)
   │
   config.higgs_base_url = higgs::launch().await   ← BEFORE provider load
   │    │
-  │    ├─ Arc::new(Higgs::new(HiggsConfig::default()))   ← facade, no worker
+  │    ├─ Arc::new(Higgs::with_log_bus(HiggsConfig::default(), bus))  ← facade,
+  │    │     no worker; shares the process-global LogBus whose HiggsLogLayer
+  │    │     main.rs already installed (via jigglebot_server::higgs::log_layer())
+  │    │     so serve-layer events reach the Developer Logs
   │    ├─ bind 127.0.0.1:0  → readback ephemeral addr
   │    ├─ spawn serve_with_shutdown(router)  (detached, owns Arc for the
   │    │     process lifetime — control surface up FIRST, survives a dead worker)
