@@ -131,6 +131,13 @@ higgs_ts! {
         #[ts(type = "number")]
         #[ts(optional)]
         pub seed: Option<u32>,
+        /// Per-load idle-TTL override in minutes. When set, the idle reaper uses
+        /// this instead of the global TTL for THIS loaded model. Absent = use
+        /// global. HOST-SIDE only — never forwarded to the worker/engine.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(type = "number")]
+        #[ts(optional)]
+        pub idle_ttl_minutes: Option<u64>,
     }
 }
 
@@ -197,6 +204,12 @@ higgs_ts! {
         /// when [`auto_unload_idle`](Self::auto_unload_idle) is `true`.
         #[ts(type = "number")]
         pub idle_ttl_minutes: u64,
+        /// Whether the `/v1` inference surface is serving (default `true`). When
+        /// `false`, the `/v1` inference endpoints return `[HG019]` → 503 while the
+        /// `/api/higgs/*` control surface stays reachable so the server can be
+        /// re-enabled. Read by the chat boundary on each request, so a change
+        /// takes effect without a restart.
+        pub serving_enabled: bool,
     }
 }
 

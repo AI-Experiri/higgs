@@ -175,11 +175,17 @@ pub(super) async fn control_load(
         })
     };
     match higgs.load(&req.id, params).await {
-        Ok(()) => Json(HiggsLoadResponse {
-            status: HiggsOk::new(),
-            id: req.id,
-        })
-        .into_response(),
+        Ok(()) => {
+            // Record the per-load idle-TTL override (HOST-SIDE only). It takes
+            // precedence over the global TTL in the idle reaper for THIS model
+            // and is cleared on unload. Absent = use the global TTL.
+            higgs.set_loaded_idle_ttl_override(req.idle_ttl_minutes);
+            Json(HiggsLoadResponse {
+                status: HiggsOk::new(),
+                id: req.id,
+            })
+            .into_response()
+        }
         Err(err) => {
             tracing::warn!(id = %req.id, error = %err, "higgs: load failed");
             control_error(&err).into_response()
@@ -264,6 +270,7 @@ pub(super) async fn control_settings(
         jit_enabled: higgs.jit_enabled(),
         auto_unload_idle: higgs.auto_unload_idle(),
         idle_ttl_minutes: higgs.idle_ttl_minutes(),
+        serving_enabled: higgs.serving_enabled(),
     })
 }
 
@@ -278,11 +285,13 @@ pub(super) async fn control_set_settings(
         jit_enabled = body.jit_enabled,
         auto_unload_idle = body.auto_unload_idle,
         idle_ttl_minutes = body.idle_ttl_minutes,
+        serving_enabled = body.serving_enabled,
         "higgs: set runtime server-behavior flags"
     );
     higgs.set_jit_enabled(body.jit_enabled);
     higgs.set_auto_unload_idle(body.auto_unload_idle);
     higgs.set_idle_ttl_minutes(body.idle_ttl_minutes);
+    higgs.set_serving_enabled(body.serving_enabled);
     Json(HiggsOk::new())
 }
 
@@ -774,8 +783,9 @@ mod tests {
         assert_eq!(v["jit_enabled"], true, "JIT defaults to on");
         assert_eq!(v["auto_unload_idle"], true, "auto-unload defaults to on");
         assert_eq!(v["idle_ttl_minutes"], 5, "TTL defaults to 5 minutes");
+        assert_eq!(v["serving_enabled"], true, "serving defaults to on");
 
-        // PUT all three (JIT off, auto-unload off, TTL 30) returns {"status":"ok"}.
+        // PUT all four (JIT off, auto-unload off, TTL 30, serving off) returns ok.
         let resp = app
             .clone()
             .oneshot(put_json(
@@ -784,6 +794,7 @@ mod tests {
                     "jit_enabled": false,
                     "auto_unload_idle": false,
                     "idle_ttl_minutes": 30,
+                    "serving_enabled": false,
                 }),
             ))
             .await
@@ -798,6 +809,7 @@ mod tests {
         assert_eq!(v["jit_enabled"], false, "PUT toggled JIT off");
         assert_eq!(v["auto_unload_idle"], false, "PUT toggled auto-unload off");
         assert_eq!(v["idle_ttl_minutes"], 30, "PUT set TTL to 30 minutes");
+        assert_eq!(v["serving_enabled"], false, "PUT toggled serving off");
     }
 
     // ── settings handlers: round-trip through the typed GET/PUT pair ──────────
@@ -829,6 +841,7 @@ mod tests {
                 jit_enabled: false,
                 auto_unload_idle: false,
                 idle_ttl_minutes: 30,
+                serving_enabled: false,
             }),
         )
         .await;
@@ -836,10 +849,12 @@ mod tests {
         assert!(!higgs.jit_enabled(), "PUT disabled the JIT gate");
         assert!(!higgs.auto_unload_idle(), "PUT disabled idle auto-unload");
         assert_eq!(higgs.idle_ttl_minutes(), 30, "PUT set the idle TTL");
+        assert!(!higgs.serving_enabled(), "PUT disabled serving");
         let got = control_settings(State(higgs.clone())).await.0;
         assert!(!got.jit_enabled, "GET reflects JIT off");
         assert!(!got.auto_unload_idle, "GET reflects auto-unload off");
         assert_eq!(got.idle_ttl_minutes, 30, "GET reflects the new TTL");
+        assert!(!got.serving_enabled, "GET reflects serving off");
     }
 
     // ── verbose gate: served line appears only when verbose is on ─────────────

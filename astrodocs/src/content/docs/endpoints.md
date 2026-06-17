@@ -39,6 +39,7 @@ The same status table applies to both surfaces:
 | HG016 ChatTimeout | 504 |
 | HG017 InsufficientMemory | 503 |
 | HG018 ResidentModelMismatch | 503 |
+| HG019 ServingDisabled | 503 |
 | anything else | 500 |
 
 **`/v1` error envelope:**
@@ -373,7 +374,8 @@ resolved host-side and carried into the worker. Load parameters fall back to
   "flash_attn": "auto",
   "type_k": "F16",
   "type_v": "F16",
-  "seed": 42
+  "seed": 42,
+  "idle_ttl_minutes": 30
 }
 ```
 
@@ -385,6 +387,10 @@ default — i.e. omitting an optional reproduces the pre-expansion behavior
 exactly.
 
 `gpu_layers: 4294967295` (`u32::MAX`) means "offload all layers" (LM Studio "max" semantics).
+
+`idle_ttl_minutes` is a **host-side per-load idle-TTL override** (NOT a load
+param sent to the worker): when set, the idle reaper uses it instead of the
+global `idle_ttl_minutes` for this loaded model. Cleared on unload.
 
 **Expanded load parameters** (each maps to one `llama-cpp-2` 0.1.139 call):
 
@@ -449,8 +455,11 @@ The model is **also** auto-unloaded after the runtime `idle_ttl_minutes` (defaul
 background idle reaper frees memory on an idle host through this same path. The
 reaper reads `idle_ttl_minutes` and `auto_unload_idle` each tick (settable via
 `PUT /api/higgs/settings`), so auto-unload can be turned off entirely or its TTL
-changed without a restart. The reaper never unloads while a request is in flight,
-and any chat resets the idle timer.
+changed without a restart. A **per-load override** — `idle_ttl_minutes` on the
+`POST /api/higgs/models/load` body — takes precedence over the global TTL for the
+currently-loaded model (host-side only, never sent to the worker); it is cleared
+on unload. The reaper never unloads while a request is in flight, and any chat
+resets the idle timer.
 
 **Response (200):**
 
@@ -619,10 +628,16 @@ are runtime-mutable atoms read by the idle reaper **each tick**. When
 uses `idle_ttl_minutes` minutes as the TTL. A change via `PUT` takes effect
 without a restart.
 
+`serving_enabled` (`AtomicBool`, default `true`) gates the `/v1` **inference**
+surface. When `false`, `POST /v1/chat/completions` is refused at the boundary
+with `503 [HG019] ServingDisabled` (before any loaded-model gate or worker RPC),
+while every `/api/higgs/*` control route — including this one — stays reachable
+so the server can be re-enabled. It does **not** unbind the listener.
+
 **Response (200) — `HiggsRuntimeSettings`:**
 
 ```json
-{ "jit_enabled": true, "auto_unload_idle": true, "idle_ttl_minutes": 5 }
+{ "jit_enabled": true, "auto_unload_idle": true, "idle_ttl_minutes": 5, "serving_enabled": true }
 ```
 
 **curl:**
@@ -636,12 +651,12 @@ curl http://localhost:8081/api/higgs/settings
 ### PUT /api/higgs/settings
 
 Set the server-behavior runtime settings. The body carries
-`HiggsRuntimeSettings { jit_enabled, auto_unload_idle, idle_ttl_minutes }`.
+`HiggsRuntimeSettings { jit_enabled, auto_unload_idle, idle_ttl_minutes, serving_enabled }`.
 
 **Request body — `HiggsRuntimeSettings`:**
 
 ```json
-{ "jit_enabled": false, "auto_unload_idle": true, "idle_ttl_minutes": 5 }
+{ "jit_enabled": false, "auto_unload_idle": true, "idle_ttl_minutes": 5, "serving_enabled": true }
 ```
 
 **Response (200) — `HiggsOk`:**
@@ -654,7 +669,7 @@ Set the server-behavior runtime settings. The body carries
 
 ```sh
 curl -X PUT -H "Content-Type: application/json" \
-  -d '{"jit_enabled":false,"auto_unload_idle":true,"idle_ttl_minutes":5}' \
+  -d '{"jit_enabled":false,"auto_unload_idle":true,"idle_ttl_minutes":5,"serving_enabled":true}' \
   http://localhost:8081/api/higgs/settings
 ```
 

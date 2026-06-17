@@ -156,6 +156,15 @@ pub enum HiggsError {
     ))]
     #[diagnostic(code(HG018))]
     ResidentModelMismatch { requested: String, resident: String },
+
+    /// The `/v1` inference surface is disabled (server "serving" toggled off).
+    /// Rejected at the chat boundary (HTTP 503) before the loaded-model gate, so
+    /// no inference runs while serving is off. The `/api/higgs/*` control surface
+    /// stays reachable so the user can re-enable serving. Non-fatal and
+    /// retryable: a retry after re-enabling succeeds.
+    #[snafu(display("[HG019] serving is disabled — enable the server to accept requests"))]
+    #[diagnostic(code(HG019))]
+    ServingDisabled,
 }
 
 #[cfg(test)]
@@ -204,6 +213,9 @@ mod tests {
         }
         .to_string()
         .starts_with("[HG017]"));
+        assert!(HiggsError::ServingDisabled
+            .to_string()
+            .starts_with("[HG019]"));
     }
 
     #[test]

@@ -29,7 +29,7 @@ launcher), which constructs `Higgs`, serves the router on an ephemeral
 │  serve/      Axum router (/v1 + /api/higgs/) │  PURE RUST
 │  rpc.rs      NDJSON JSON-RPC 2.0 codec       │  (cannot crash
 │  worker/     Re-exec'd subprocess            │   the host)
-│  diagnostic  HiggsError HG001–HG018       │
+│  diagnostic  HiggsError HG001–HG019       │
 └───────────────────┬──────────────────────────┘
                     │ stdio (NDJSON JSON-RPC 2.0)
                     │ ONLY while a model is loaded
@@ -538,10 +538,14 @@ host. Every `IDLE_REAP_INTERVAL` (30 s) it reads two **live runtime atoms** off
 the `Higgs` facade each tick: `auto_unload_idle` (default `true`) and
 `idle_ttl_minutes` (default `5`, seeded from `IDLE_UNLOAD_TTL_MINUTES` /
 `IDLE_UNLOAD_TTL` — ollama's `keep_alive` default). When `auto_unload_idle` is
-`false` it never reaps; otherwise it compares `now − last_activity` against
-`idle_ttl_minutes` minutes. Both are settable via `PUT /api/higgs/settings`, so a
-Server-Settings change takes effect without a restart (the const remains only as
-the default seed). `last_activity` is stamped at the top of every `chat_stream`.
+`false` it never reaps; otherwise it compares `now − last_activity` against the
+effective TTL. The effective TTL is the **per-load override**
+(`loaded_idle_ttl_override`, set from the `idle_ttl_minutes` field on the load
+request and cleared on unload — host-side only, never sent to the worker) when
+present, else the global `idle_ttl_minutes`. Both globals are settable via
+`PUT /api/higgs/settings`, so a Server-Settings change takes effect without a
+restart (the const remains only as the default seed). `last_activity` is stamped
+at the top of every `chat_stream`.
 The reaper never unloads
 mid-generation: it unloads only when the inference admission semaphore is fully
 open (zero in-flight requests) and a model is actually loaded, and it reuses the
@@ -698,6 +702,18 @@ accepted only-keep-last tradeoff; the binding check only guarantees correctness.
 JIT-reachable on-disk catalog. This server-behavior namespace
 (`/api/higgs/settings`) is separate from the developer-log toggles
 (`/api/higgs/logs/settings`) and is designed to grow more flags over time.
+
+### Serving on/off
+
+`serving_enabled` is a runtime `AtomicBool` on the `Higgs` facade, **ON by
+default**, toggled via `PUT /api/higgs/settings` and read via `GET`. higgs's
+listener is nested in the gateway, so "off" cannot unbind it; the honest meaning
+is that the `/v1` **inference** endpoints refuse while the `/api/higgs/*` control
+surface (status, models, settings, logs, load/unload) stays reachable so the
+server can be re-enabled. `POST /v1/chat/completions` checks the gate **first**
+— before the loaded-model gate, any JIT load, or any worker RPC — and returns
+`503 [HG019] ServingDisabled` when off. `GET /v1/models` is **not** gated. Like
+the other runtime flags it is not persisted and resets to `true` on restart.
 
 ### Inference admission gate
 

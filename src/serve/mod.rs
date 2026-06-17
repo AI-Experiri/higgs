@@ -93,7 +93,7 @@ pub use wire::*;
 
 /// Map a `HiggsError` to its HTTP status — the single status table shared by
 /// both surfaces and the SSE path: HG002/HG003 → 404, HG005/HG013/HG015 → 400,
-/// HG006/HG007/HG014/HG017/HG018 → 503, HG016 → 504, else 500.
+/// HG006/HG007/HG014/HG017/HG018/HG019 → 503, HG016 → 504, else 500.
 pub(crate) fn http_status(err: &HiggsError) -> StatusCode {
     match err {
         HiggsError::ModelNotFound { .. } | HiggsError::ModelNotLoaded { .. } => {
@@ -107,7 +107,8 @@ pub(crate) fn http_status(err: &HiggsError) -> StatusCode {
         HiggsError::WorkerSpawnFailed { .. }
         | HiggsError::WorkerDead { .. }
         | HiggsError::ServerBusy { .. }
-        | HiggsError::InsufficientMemory { .. } => StatusCode::SERVICE_UNAVAILABLE,
+        | HiggsError::InsufficientMemory { .. }
+        | HiggsError::ServingDisabled => StatusCode::SERVICE_UNAVAILABLE,
         // A wedged-but-alive worker that didn't finish generation in time.
         HiggsError::ChatTimeout { .. } => StatusCode::GATEWAY_TIMEOUT,
         // A worker-reported error carries the worker's origin diagnostic code;
@@ -525,6 +526,11 @@ mod tests {
                 available_bytes: 4_000_000_000,
                 headroom_fraction: 0.8,
             }),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        // Serving disabled is a retryable capacity 503 (re-enable then retry).
+        assert_eq!(
+            http_status(&HiggsError::ServingDisabled),
             StatusCode::SERVICE_UNAVAILABLE
         );
     }

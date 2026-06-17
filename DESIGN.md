@@ -41,7 +41,7 @@
 │  rpc.rs        NDJSON JSON-RPC 2.0 codec                    │
 │  worker/       Re-exec'd subprocess: engine only (no model   │
 │                catalog — scan is host-side; path comes in M_LOAD)│
-│  diagnostic.rs HiggsError HG001–HG018                      │
+│  diagnostic.rs HiggsError HG001–HG019                      │
 └──────────────────────────┬──────────────────────────────────┘
                            │ stdio (NDJSON JSON-RPC 2.0)
                            │ ONLY while a model is loaded
@@ -73,7 +73,9 @@
         every IDLE_REAP_INTERVAL (30 s) it reads two LIVE runtime atoms:
           auto_unload_idle (default true) — false ⇒ skip, never reap
           idle_ttl_minutes (default 5, seeded IDLE_UNLOAD_TTL_MINUTES/_TTL)
-        if auto_unload_idle AND now − last_activity > idle_ttl_minutes min
+          loaded_idle_ttl_override (per-load, set from load req, clear on unload)
+            → effective TTL = override if set, else global idle_ttl_minutes
+        if auto_unload_idle AND now − last_activity > effective TTL min
         AND inference gate fully open (no in-flight) AND a model is loaded
         → unload() (reuses the unload path below). Atoms are PUT-settable
         (/api/higgs/settings) so changes apply without restart.
@@ -329,9 +331,9 @@
   │  GET  /api/higgs/system  │  SystemInfo {hardware, runtime,     │
   │                          │  config: HiggsServerConfig}(read-only)│
   │  GET  /api/higgs/settings│  HiggsRuntimeSettings {jit_enabled,  │
-  │                          │  auto_unload_idle, idle_ttl_minutes}  │
-  │                          │  (server-behavior ns; grows) (read) │
-  │  PUT  /api/higgs/settings│  set all three (runtime atoms,       │
+  │                          │  auto_unload_idle, idle_ttl_minutes,  │
+  │                          │  serving_enabled} (server ns) (read) │
+  │  PUT  /api/higgs/settings│  set all four (runtime atoms,        │
   │                          │  not persisted) → HiggsOk            │
   │  GET  /api/higgs/logs    │  Dev-log snapshot tail (?n=200)     │
   │  GET  /api/higgs/logs/stream │  SSE replay-then-live dev logs  │
@@ -389,6 +391,7 @@
   │  HG016 ChatTimeout         │  504     │
   │  HG017 InsufficientMemory  │  503     │
   │  HG018 ResidentModelMismatch│ 503     │
+  │  HG019 ServingDisabled     │  503     │
   │  anything else             │  500     │
   └────────────────────────────┴──────────┘
 

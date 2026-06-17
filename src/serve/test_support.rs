@@ -132,6 +132,18 @@ pub(crate) fn make_app_jit_off(sup: Supervisor) -> Router {
     router(higgs)
 }
 
+/// Wrap a mock supervisor in a `Higgs` facade with serving turned OFF, and
+/// build the router. Used by the `/v1` test that asserts the serving-disabled
+/// HG019 503 path (the `/v1` inference surface refuses while serving is off).
+pub(crate) fn make_app_serving_off(sup: Supervisor) -> Router {
+    let higgs = Arc::new(Higgs::with_supervisor(
+        Arc::new(sup),
+        HiggsConfig::default(),
+    ));
+    higgs.set_serving_enabled(false);
+    router(higgs)
+}
+
 /// Build a JIT-enabled (default) app whose host-side `scan()` reads
 /// `lmstudio_dirs`, returning both the router and the `Arc<Higgs>` so a test can
 /// assert facade state (e.g. the loaded model after a JIT swap).

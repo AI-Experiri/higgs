@@ -283,6 +283,17 @@ pub(super) async fn v1_chat_completions(
     // report wall-clock elapsed (gate + validation + generation) per request.
     let started = std::time::Instant::now();
 
+    // Serving gate: when serving is toggled off, the /v1 inference surface
+    // refuses with [HG019] → 503 (rendered the same way as every other chat-
+    // boundary HiggsError). The /api/higgs/* control surface stays reachable so
+    // the user can re-enable. Checked before the loaded-model gate so no JIT
+    // load or worker RPC runs while serving is off.
+    if !higgs.serving_enabled() {
+        let err = HiggsError::ServingDisabled;
+        tracing::warn!(model = %req.model, "higgs: chat refused — serving disabled");
+        return v1_error(&err).into_response();
+    }
+
     // Gate + validation: the named model must be loaded, and sampling / prompt /
     // content checks pass — each maps to its own status. Any failure short-circuits.
     // Returns the resolved (now-resident) model id, which binds the chat dispatch:
@@ -1030,6 +1041,35 @@ mod tests {
         assert!(
             body.contains("invalid_request_error"),
             "envelope type present: {body}"
+        );
+    }
+
+    // ── Serving disabled: /v1 chat → 503 HG019 (control surface stays up) ────
+    //
+    // With serving toggled off, a chat request is refused at the boundary with
+    // HG019 → 503 BEFORE any loaded-model gate or worker RPC. Mirrors the
+    // unloaded-model boundary test but asserts the serving gate fires first (no
+    // M_STATUS is sent — the idle supervisor would fail it, but the gate returns
+    // before reaching it).
+
+    #[tokio::test]
+    async fn chat_serving_disabled_503_hg019() {
+        let app = make_app_serving_off(make_idle_supervisor());
+        let req = post_json(
+            "/v1/chat/completions",
+            &json!({"model": "org/model", "messages": [{"role": "user", "content": "hi"}]}),
+        );
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "serving off → 503, not 404/500"
+        );
+        let body = String::from_utf8(body_bytes(resp).await).unwrap();
+        assert!(body.contains("[HG019]"), "carries HG019: {body}");
+        assert!(
+            body.contains("server_error"),
+            "503 envelope type is server_error: {body}"
         );
     }
 

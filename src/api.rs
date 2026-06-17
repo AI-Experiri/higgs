@@ -204,6 +204,12 @@ higgs_ts! {
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         pub has_chat_template: Option<bool>,
+        /// Active per-load idle-TTL override in minutes, if one was set at load
+        /// time. Absent when the loaded model uses the global idle TTL.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(type = "number")]
+        #[ts(optional)]
+        pub idle_ttl_minutes: Option<u64>,
     }
 }
 
@@ -371,6 +377,19 @@ pub struct Higgs {
     /// change takes effect without restart. A plain atomic — set/read in
     /// isolation, never across `.await`.
     idle_ttl_minutes: std::sync::atomic::AtomicU64,
+    /// Per-load idle-TTL override, in minutes (HOST-SIDE only — never sent to the
+    /// worker). `0` means "no override"; any non-zero value takes precedence over
+    /// [`idle_ttl_minutes`](Self::idle_ttl_minutes) in the idle reaper for the
+    /// CURRENTLY-loaded model. Set at load time from the load request and cleared
+    /// on unload so a stale override never outlives its model. A plain atomic —
+    /// set/read in isolation, never across `.await`.
+    loaded_idle_ttl_override: std::sync::atomic::AtomicU64,
+    /// Runtime "serving on/off" gate for the `/v1` inference surface. When `false`,
+    /// the `/v1` inference endpoints return `[HG019]` → 503 while the
+    /// `/api/higgs/*` control surface stays reachable so the user can re-enable.
+    /// Defaults to `true` (serving on). A plain atomic — set/read in isolation,
+    /// never across `.await`.
+    serving_enabled: std::sync::atomic::AtomicBool,
 }
 
 impl Higgs {
@@ -403,6 +422,8 @@ impl Higgs {
             jit_enabled: std::sync::atomic::AtomicBool::new(true),
             auto_unload_idle: std::sync::atomic::AtomicBool::new(true),
             idle_ttl_minutes: std::sync::atomic::AtomicU64::new(IDLE_UNLOAD_TTL_MINUTES),
+            loaded_idle_ttl_override: std::sync::atomic::AtomicU64::new(0),
+            serving_enabled: std::sync::atomic::AtomicBool::new(true),
         }
     }
 
@@ -471,6 +492,44 @@ impl Higgs {
             .store(minutes, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Active per-load idle-TTL override in minutes, or `None` when no override
+    /// is set. Set at load time from the load request and cleared on unload, so
+    /// it reflects only the currently-loaded model. `0` in the atomic means "no
+    /// override" and reads back as `None`.
+    pub fn loaded_idle_ttl_override(&self) -> Option<u64> {
+        match self
+            .loaded_idle_ttl_override
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            0 => None,
+            n => Some(n),
+        }
+    }
+
+    /// Set (or clear, with `None`) the per-load idle-TTL override in minutes. The
+    /// idle reaper prefers this over [`idle_ttl_minutes`](Self::idle_ttl_minutes)
+    /// for the currently-loaded model. `None` stores `0` (no override).
+    pub fn set_loaded_idle_ttl_override(&self, minutes: Option<u64>) {
+        self.loaded_idle_ttl_override
+            .store(minutes.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the `/v1` inference surface is currently serving (default `true`).
+    /// When `false`, the `/v1` inference endpoints return `[HG019]` → 503 while
+    /// the `/api/higgs/*` control surface stays reachable.
+    pub fn serving_enabled(&self) -> bool {
+        self.serving_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Turn `/v1` inference serving on or off at runtime. Read by the chat
+    /// boundary on each request, so a change takes effect immediately without a
+    /// restart; the control surface is unaffected.
+    pub fn set_serving_enabled(&self, v: bool) {
+        self.serving_enabled
+            .store(v, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Bring up control only — does NOT spawn a worker.
     ///
     /// A worker is spawned lazily by [`load`](Self::load) (spawn-on-load,
@@ -497,6 +556,9 @@ impl Higgs {
         let _lifecycle = self.lifecycle.lock().await;
         self.sup.clear_last_load();
         self.sup.stop().await;
+        // A deliberate worker stop unloads the model — drop any per-load idle-TTL
+        // override so it never applies to a model loaded after a restart.
+        self.set_loaded_idle_ttl_override(None);
     }
 
     /// Scan all configured model directories and return the discovered models.
@@ -613,6 +675,9 @@ impl Higgs {
         // so the death triggers no respawn, drains stdin, and reaps the process.
         let _ = self.sup.request(M_UNLOAD, serde_json::Value::Null).await;
         self.sup.stop().await;
+        // Clear the per-load idle-TTL override so it never outlives its model: a
+        // stale override must not apply to the next loaded model.
+        self.set_loaded_idle_ttl_override(None);
         self.sup.emit(HiggsEvent::ModelUnloaded { id });
         Ok(())
     }
@@ -654,6 +719,7 @@ impl Higgs {
                 max_context_length: scanned.and_then(|m| m.ctx_train),
                 size_bytes: scanned.map(|m| m.size_bytes),
                 has_chat_template: scanned.map(|m| m.has_chat_template),
+                idle_ttl_minutes: self.loaded_idle_ttl_override(),
                 id,
             })
         });
@@ -836,6 +902,8 @@ impl Higgs {
             jit_enabled: std::sync::atomic::AtomicBool::new(true),
             auto_unload_idle: std::sync::atomic::AtomicBool::new(true),
             idle_ttl_minutes: std::sync::atomic::AtomicU64::new(IDLE_UNLOAD_TTL_MINUTES),
+            loaded_idle_ttl_override: std::sync::atomic::AtomicU64::new(0),
+            serving_enabled: std::sync::atomic::AtomicBool::new(true),
         }
     }
 
@@ -1007,7 +1075,9 @@ fn guard_memory_headroom(id: &str, needed_bytes: u64) -> Result<(), HiggsError> 
 /// ([`Higgs::auto_unload_idle`], [`Higgs::idle_ttl_minutes`]) on EVERY tick, so a
 /// Server-Settings change takes effect without a restart: when auto-unload is
 /// off the reaper skips entirely, and the TTL is `idle_ttl_minutes` minutes
-/// (seeded from [`IDLE_UNLOAD_TTL`]).
+/// (seeded from [`IDLE_UNLOAD_TTL`]). A per-load override
+/// ([`Higgs::loaded_idle_ttl_override`], set at load time and cleared on unload)
+/// takes precedence over the global TTL for the currently-loaded model.
 ///
 /// Holds a `Weak<Higgs>` so it terminates when the host drops its `Arc<Higgs>`.
 /// It never unloads mid-generation and never races a just-admitted chat: the
@@ -1032,9 +1102,15 @@ async fn idle_reaper(weak: std::sync::Weak<Higgs>) {
         if !higgs.auto_unload_idle() {
             continue;
         }
-        // Read the runtime TTL each tick (minutes → Duration), seeded from
-        // IDLE_UNLOAD_TTL, so a live change to the TTL takes effect immediately.
-        let ttl = std::time::Duration::from_secs(higgs.idle_ttl_minutes() * 60);
+        // Read the effective TTL each tick (minutes → Duration). A per-load
+        // override (set at load time, cleared on unload) wins over the global
+        // runtime TTL for the currently-loaded model; otherwise the global TTL
+        // (seeded from IDLE_UNLOAD_TTL) applies. Read each tick so a live change
+        // to either takes effect immediately.
+        let mins = higgs
+            .loaded_idle_ttl_override()
+            .unwrap_or_else(|| higgs.idle_ttl_minutes());
+        let ttl = std::time::Duration::from_secs(mins * 60);
         // Copy the idle instant out under the lock, then drop the guard before
         // any await (never hold a parking_lot lock across .await).
         let idle_for = {
@@ -1235,6 +1311,8 @@ mod tests {
             jit_enabled: std::sync::atomic::AtomicBool::new(true),
             auto_unload_idle: std::sync::atomic::AtomicBool::new(true),
             idle_ttl_minutes: std::sync::atomic::AtomicU64::new(IDLE_UNLOAD_TTL_MINUTES),
+            loaded_idle_ttl_override: std::sync::atomic::AtomicU64::new(0),
+            serving_enabled: std::sync::atomic::AtomicBool::new(true),
         };
         // Take the only permit and hold it.
         let held = Arc::clone(&higgs.inference_gate)
@@ -1374,6 +1452,65 @@ mod tests {
         assert_eq!(higgs.idle_ttl_minutes(), 30, "set_idle_ttl_minutes(30)");
     }
 
+    // ── Per-load idle-TTL override: default None, set/clear round-trip ────────
+
+    #[test]
+    fn loaded_idle_ttl_override_defaults_none_and_round_trips() {
+        let higgs = Higgs::new(HiggsConfig::default());
+        // No override by default (0 in the atomic reads back as None).
+        assert_eq!(
+            higgs.loaded_idle_ttl_override(),
+            None,
+            "override defaults to None"
+        );
+        // Set an override → reads back as Some(n).
+        higgs.set_loaded_idle_ttl_override(Some(30));
+        assert_eq!(
+            higgs.loaded_idle_ttl_override(),
+            Some(30),
+            "set Some(30) is observed"
+        );
+        // Clear with None → back to None.
+        higgs.set_loaded_idle_ttl_override(None);
+        assert_eq!(
+            higgs.loaded_idle_ttl_override(),
+            None,
+            "set None clears the override"
+        );
+    }
+
+    /// The reaper's effective-TTL expression prefers the per-load override over
+    /// the global `idle_ttl_minutes` — the exact `unwrap_or_else` the reaper runs.
+    #[test]
+    fn reaper_prefers_loaded_override_over_global_ttl() {
+        let higgs = Higgs::new(HiggsConfig::default());
+        // Global TTL is 5 (the default); with no override the effective value is
+        // the global TTL.
+        let effective = |h: &Higgs| {
+            h.loaded_idle_ttl_override()
+                .unwrap_or_else(|| h.idle_ttl_minutes())
+        };
+        assert_eq!(effective(&higgs), 5, "no override → global TTL (5)");
+        // With an override set, it wins regardless of the global TTL.
+        higgs.set_loaded_idle_ttl_override(Some(42));
+        assert_eq!(effective(&higgs), 42, "override (42) wins over global");
+        // Clearing the override falls back to the global TTL again.
+        higgs.set_loaded_idle_ttl_override(None);
+        assert_eq!(effective(&higgs), 5, "cleared → global TTL (5) again");
+    }
+
+    // ── Serving on/off gate: default true, set/get round-trip ─────────────────
+
+    #[test]
+    fn serving_enabled_defaults_true_and_round_trips() {
+        let higgs = Higgs::new(HiggsConfig::default());
+        assert!(higgs.serving_enabled(), "serving defaults to ON (true)");
+        higgs.set_serving_enabled(false);
+        assert!(!higgs.serving_enabled(), "set_serving_enabled(false)");
+        higgs.set_serving_enabled(true);
+        assert!(higgs.serving_enabled(), "set_serving_enabled(true)");
+    }
+
     // ── Reaper respects the runtime auto-unload toggle and TTL ────────────────
     //
     // The reaper reads `auto_unload_idle` and `idle_ttl_minutes` from the live
@@ -1495,6 +1632,8 @@ mod tests {
             jit_enabled: std::sync::atomic::AtomicBool::new(true),
             auto_unload_idle: std::sync::atomic::AtomicBool::new(true),
             idle_ttl_minutes: std::sync::atomic::AtomicU64::new(IDLE_UNLOAD_TTL_MINUTES),
+            loaded_idle_ttl_override: std::sync::atomic::AtomicU64::new(0),
+            serving_enabled: std::sync::atomic::AtomicBool::new(true),
         };
         let mut events_rx = higgs.events();
         // `load`/`status` run a host-side scan (on a blocking thread) before each
@@ -1575,6 +1714,8 @@ mod tests {
             jit_enabled: std::sync::atomic::AtomicBool::new(true),
             auto_unload_idle: std::sync::atomic::AtomicBool::new(true),
             idle_ttl_minutes: std::sync::atomic::AtomicU64::new(IDLE_UNLOAD_TTL_MINUTES),
+            loaded_idle_ttl_override: std::sync::atomic::AtomicU64::new(0),
+            serving_enabled: std::sync::atomic::AtomicBool::new(true),
         };
 
         // `status` runs a host-side scan (on a blocking thread) before M_STATUS,
@@ -1647,6 +1788,8 @@ mod tests {
             jit_enabled: std::sync::atomic::AtomicBool::new(true),
             auto_unload_idle: std::sync::atomic::AtomicBool::new(true),
             idle_ttl_minutes: std::sync::atomic::AtomicU64::new(IDLE_UNLOAD_TTL_MINUTES),
+            loaded_idle_ttl_override: std::sync::atomic::AtomicU64::new(0),
+            serving_enabled: std::sync::atomic::AtomicBool::new(true),
         };
 
         // Drive the load. `load` first runs a host-side scan (on a blocking
@@ -1694,6 +1837,8 @@ mod tests {
             jit_enabled: std::sync::atomic::AtomicBool::new(true),
             auto_unload_idle: std::sync::atomic::AtomicBool::new(true),
             idle_ttl_minutes: std::sync::atomic::AtomicU64::new(IDLE_UNLOAD_TTL_MINUTES),
+            loaded_idle_ttl_override: std::sync::atomic::AtomicU64::new(0),
+            serving_enabled: std::sync::atomic::AtomicBool::new(true),
         };
 
         let (mut rx, handle) = higgs
@@ -1777,6 +1922,8 @@ mod tests {
             jit_enabled: std::sync::atomic::AtomicBool::new(true),
             auto_unload_idle: std::sync::atomic::AtomicBool::new(true),
             idle_ttl_minutes: std::sync::atomic::AtomicU64::new(IDLE_UNLOAD_TTL_MINUTES),
+            loaded_idle_ttl_override: std::sync::atomic::AtomicU64::new(0),
+            serving_enabled: std::sync::atomic::AtomicBool::new(true),
         };
 
         // chat_stream registers the sink then the spawned task encounters dead worker.
