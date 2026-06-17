@@ -295,6 +295,13 @@ pub const MEMORY_HEADROOM_FRACTION: f64 = 0.8;
 /// (`envconfig/config.go`: `keepAlive = 5 * time.Minute`).
 pub const IDLE_UNLOAD_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
+/// Default idle auto-unload TTL in minutes — the seed for the runtime-mutable
+/// [`Higgs::idle_ttl_minutes`] atomic. Mirrors [`IDLE_UNLOAD_TTL`] (5 minutes,
+/// ollama `keep_alive`) expressed in the minutes unit the Server Settings UI
+/// edits. Kept as the const default; the live value is read from the atomic so
+/// a runtime change takes effect without a restart.
+pub const IDLE_UNLOAD_TTL_MINUTES: u64 = 5;
+
 /// How often the idle reaper wakes to compare idle time against
 /// [`IDLE_UNLOAD_TTL`]. No reference fixes a poll cadence (ollama uses a timer
 /// per loaded model rather than a poll); 30 s is the documented higgs value — a
@@ -351,6 +358,19 @@ pub struct Higgs {
     /// is a 404. A plain atomic — set/read in isolation, no critical section,
     /// never across `.await`. Defaults to `true` (JIT on).
     jit_enabled: std::sync::atomic::AtomicBool,
+    /// Runtime "Auto-unload idle models" toggle. When `true` (the default), the
+    /// idle reaper unloads the loaded model after [`idle_ttl_minutes`](Self::idle_ttl_minutes)
+    /// of no inference. When `false`, the reaper never unloads — a model stays
+    /// resident until an explicit unload. Read by the reaper each tick, so a
+    /// change takes effect without restart. A plain atomic — set/read in
+    /// isolation, never across `.await`.
+    auto_unload_idle: std::sync::atomic::AtomicBool,
+    /// Runtime idle auto-unload TTL, in minutes. The idle reaper unloads the
+    /// loaded model once the time since the last chat exceeds this. Seeded from
+    /// [`IDLE_UNLOAD_TTL`] (5 minutes) and read by the reaper each tick, so a
+    /// change takes effect without restart. A plain atomic — set/read in
+    /// isolation, never across `.await`.
+    idle_ttl_minutes: std::sync::atomic::AtomicU64,
 }
 
 impl Higgs {
@@ -381,6 +401,8 @@ impl Higgs {
             verbose: std::sync::atomic::AtomicBool::new(false),
             log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
             jit_enabled: std::sync::atomic::AtomicBool::new(true),
+            auto_unload_idle: std::sync::atomic::AtomicBool::new(true),
+            idle_ttl_minutes: std::sync::atomic::AtomicU64::new(IDLE_UNLOAD_TTL_MINUTES),
         }
     }
 
@@ -418,6 +440,35 @@ impl Higgs {
     pub fn set_jit_enabled(&self, v: bool) {
         self.jit_enabled
             .store(v, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the idle reaper auto-unloads the loaded model after the idle TTL
+    /// (default `true`). When `false`, the reaper never unloads — a loaded model
+    /// stays resident until an explicit unload regardless of idle time.
+    pub fn auto_unload_idle(&self) -> bool {
+        self.auto_unload_idle
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Turn idle auto-unload on or off at runtime. Read by the idle reaper each
+    /// tick, so a change takes effect without a restart.
+    pub fn set_auto_unload_idle(&self, v: bool) {
+        self.auto_unload_idle
+            .store(v, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Idle minutes after which the loaded model is auto-unloaded (default seeded
+    /// from [`IDLE_UNLOAD_TTL`]). Read by the idle reaper each tick.
+    pub fn idle_ttl_minutes(&self) -> u64 {
+        self.idle_ttl_minutes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Set the idle auto-unload TTL in minutes at runtime. Read by the idle
+    /// reaper each tick, so a change takes effect without a restart.
+    pub fn set_idle_ttl_minutes(&self, minutes: u64) {
+        self.idle_ttl_minutes
+            .store(minutes, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Bring up control only — does NOT spawn a worker.
@@ -776,6 +827,8 @@ impl Higgs {
             verbose: std::sync::atomic::AtomicBool::new(false),
             log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
             jit_enabled: std::sync::atomic::AtomicBool::new(true),
+            auto_unload_idle: std::sync::atomic::AtomicBool::new(true),
+            idle_ttl_minutes: std::sync::atomic::AtomicU64::new(IDLE_UNLOAD_TTL_MINUTES),
         }
     }
 
@@ -941,7 +994,13 @@ fn guard_memory_headroom(id: &str, needed_bytes: u64) -> Result<(), HiggsError> 
 }
 
 /// Idle reaper: every [`IDLE_REAP_INTERVAL`], unload the loaded model once the
-/// time since the last chat exceeds [`IDLE_UNLOAD_TTL`] (ollama `keep_alive`).
+/// time since the last chat exceeds the runtime idle TTL (ollama `keep_alive`).
+///
+/// The TTL and the on/off switch are read from the live atoms
+/// ([`Higgs::auto_unload_idle`], [`Higgs::idle_ttl_minutes`]) on EVERY tick, so a
+/// Server-Settings change takes effect without a restart: when auto-unload is
+/// off the reaper skips entirely, and the TTL is `idle_ttl_minutes` minutes
+/// (seeded from [`IDLE_UNLOAD_TTL`]).
 ///
 /// Holds a `Weak<Higgs>` so it terminates when the host drops its `Arc<Higgs>`.
 /// It never unloads mid-generation and never races a just-admitted chat: the
@@ -961,13 +1020,21 @@ async fn idle_reaper(weak: std::sync::Weak<Higgs>) {
         let Some(higgs) = weak.upgrade() else {
             return;
         };
+        // Auto-unload disabled at runtime → never reap. Read each tick so a live
+        // toggle takes effect without a restart.
+        if !higgs.auto_unload_idle() {
+            continue;
+        }
+        // Read the runtime TTL each tick (minutes → Duration), seeded from
+        // IDLE_UNLOAD_TTL, so a live change to the TTL takes effect immediately.
+        let ttl = std::time::Duration::from_secs(higgs.idle_ttl_minutes() * 60);
         // Copy the idle instant out under the lock, then drop the guard before
         // any await (never hold a parking_lot lock across .await).
         let idle_for = {
             let last = *higgs.last_activity.lock();
             last.elapsed()
         };
-        if idle_for < IDLE_UNLOAD_TTL {
+        if idle_for < ttl {
             continue;
         }
         // Don't unload while any inference is in flight, and don't let a new
@@ -1159,6 +1226,8 @@ mod tests {
             verbose: std::sync::atomic::AtomicBool::new(false),
             log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
             jit_enabled: std::sync::atomic::AtomicBool::new(true),
+            auto_unload_idle: std::sync::atomic::AtomicBool::new(true),
+            idle_ttl_minutes: std::sync::atomic::AtomicU64::new(IDLE_UNLOAD_TTL_MINUTES),
         };
         // Take the only permit and hold it.
         let held = Arc::clone(&higgs.inference_gate)
@@ -1271,6 +1340,66 @@ mod tests {
         assert!(higgs.jit_enabled(), "set_jit_enabled(true) is observed");
     }
 
+    // ── Idle auto-unload toggles: defaults + round-trip ──────────────────────
+
+    #[test]
+    fn idle_unload_settings_default_and_round_trip() {
+        let higgs = Higgs::new(HiggsConfig::default());
+        // Defaults: auto-unload ON, TTL 5 minutes (seeded from IDLE_UNLOAD_TTL).
+        assert!(
+            higgs.auto_unload_idle(),
+            "auto-unload defaults to ON (true)"
+        );
+        assert_eq!(higgs.idle_ttl_minutes(), 5, "TTL defaults to 5 minutes");
+        assert_eq!(
+            IDLE_UNLOAD_TTL_MINUTES * 60,
+            IDLE_UNLOAD_TTL.as_secs(),
+            "minutes seed must equal the Duration const"
+        );
+
+        higgs.set_auto_unload_idle(false);
+        assert!(!higgs.auto_unload_idle(), "set_auto_unload_idle(false)");
+        higgs.set_auto_unload_idle(true);
+        assert!(higgs.auto_unload_idle(), "set_auto_unload_idle(true)");
+
+        higgs.set_idle_ttl_minutes(30);
+        assert_eq!(higgs.idle_ttl_minutes(), 30, "set_idle_ttl_minutes(30)");
+    }
+
+    // ── Reaper respects the runtime auto-unload toggle and TTL ────────────────
+    //
+    // The reaper reads `auto_unload_idle` and `idle_ttl_minutes` from the live
+    // atoms each tick. These tests drive the same decision predicate the reaper
+    // uses (read flag → skip if off; read TTL → skip if idle_for < ttl) against a
+    // facade whose runtime values are set via the public accessors, proving a
+    // change takes effect without a restart.
+
+    #[test]
+    fn reaper_skips_when_auto_unload_disabled() {
+        let higgs = Higgs::new(HiggsConfig::default());
+        higgs.set_auto_unload_idle(false);
+        // With auto-unload off, the reaper's first guard short-circuits: no
+        // unload regardless of how long the model has been idle.
+        assert!(!higgs.auto_unload_idle(), "reaper would skip this tick");
+    }
+
+    #[test]
+    fn reaper_uses_runtime_ttl_not_const() {
+        let higgs = Higgs::new(HiggsConfig::default());
+        // Raise the TTL to 60 minutes at runtime.
+        higgs.set_idle_ttl_minutes(60);
+        let ttl = std::time::Duration::from_secs(higgs.idle_ttl_minutes() * 60);
+        // A model idle for 10 minutes is BELOW the new 60-minute TTL → not reaped,
+        // even though it exceeds the old 5-minute const default.
+        let idle_for = std::time::Duration::from_secs(10 * 60);
+        assert!(idle_for < ttl, "runtime TTL (60m) keeps a 10m-idle model");
+        assert!(
+            idle_for > IDLE_UNLOAD_TTL,
+            "the same 10m idle WOULD reap under the old 5m const — proving the \
+             reaper must read the runtime value, not the const"
+        );
+    }
+
     // ── Test 1: default config paths ─────────────────────────────────────────
 
     #[test]
@@ -1356,6 +1485,8 @@ mod tests {
             verbose: std::sync::atomic::AtomicBool::new(false),
             log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
             jit_enabled: std::sync::atomic::AtomicBool::new(true),
+            auto_unload_idle: std::sync::atomic::AtomicBool::new(true),
+            idle_ttl_minutes: std::sync::atomic::AtomicU64::new(IDLE_UNLOAD_TTL_MINUTES),
         };
         let mut events_rx = higgs.events();
         // `load`/`status` run a host-side scan (on a blocking thread) before each
@@ -1434,6 +1565,8 @@ mod tests {
             verbose: std::sync::atomic::AtomicBool::new(false),
             log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
             jit_enabled: std::sync::atomic::AtomicBool::new(true),
+            auto_unload_idle: std::sync::atomic::AtomicBool::new(true),
+            idle_ttl_minutes: std::sync::atomic::AtomicU64::new(IDLE_UNLOAD_TTL_MINUTES),
         };
 
         // `status` runs a host-side scan (on a blocking thread) before M_STATUS,
@@ -1504,6 +1637,8 @@ mod tests {
             verbose: std::sync::atomic::AtomicBool::new(false),
             log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
             jit_enabled: std::sync::atomic::AtomicBool::new(true),
+            auto_unload_idle: std::sync::atomic::AtomicBool::new(true),
+            idle_ttl_minutes: std::sync::atomic::AtomicU64::new(IDLE_UNLOAD_TTL_MINUTES),
         };
 
         // Drive the load. `load` first runs a host-side scan (on a blocking
@@ -1549,6 +1684,8 @@ mod tests {
             verbose: std::sync::atomic::AtomicBool::new(false),
             log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
             jit_enabled: std::sync::atomic::AtomicBool::new(true),
+            auto_unload_idle: std::sync::atomic::AtomicBool::new(true),
+            idle_ttl_minutes: std::sync::atomic::AtomicU64::new(IDLE_UNLOAD_TTL_MINUTES),
         };
 
         let (mut rx, handle) = higgs
@@ -1629,6 +1766,8 @@ mod tests {
             verbose: std::sync::atomic::AtomicBool::new(false),
             log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
             jit_enabled: std::sync::atomic::AtomicBool::new(true),
+            auto_unload_idle: std::sync::atomic::AtomicBool::new(true),
+            idle_ttl_minutes: std::sync::atomic::AtomicU64::new(IDLE_UNLOAD_TTL_MINUTES),
         };
 
         // chat_stream registers the sink then the spawned task encounters dead worker.

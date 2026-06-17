@@ -70,9 +70,13 @@
   └──────────────┴──────────────────────────────────────────────┘
 
   Higgs::start() also SPAWNS the idle reaper task (holds Weak<Higgs>):
-        every IDLE_REAP_INTERVAL (30 s), if now − last_activity > IDLE_UNLOAD_TTL
-        (5 min, ollama keep_alive) AND inference gate fully open (no in-flight)
-        AND a model is loaded → unload() (reuses the unload path below).
+        every IDLE_REAP_INTERVAL (30 s) it reads two LIVE runtime atoms:
+          auto_unload_idle (default true) — false ⇒ skip, never reap
+          idle_ttl_minutes (default 5, seeded IDLE_UNLOAD_TTL_MINUTES/_TTL)
+        if auto_unload_idle AND now − last_activity > idle_ttl_minutes min
+        AND inference gate fully open (no in-flight) AND a model is loaded
+        → unload() (reuses the unload path below). Atoms are PUT-settable
+        (/api/higgs/settings) so changes apply without restart.
         Self-terminates when the host drops its Arc<Higgs>.
 
   load(M)   (lifecycle mutex held for the whole body)
@@ -324,10 +328,11 @@
   │                          │              models_on_disk}         │
   │  GET  /api/higgs/system  │  SystemInfo {hardware, runtime,     │
   │                          │  config: HiggsServerConfig}(read-only)│
-  │  GET  /api/higgs/settings│  HiggsRuntimeSettings {jit_enabled} │
+  │  GET  /api/higgs/settings│  HiggsRuntimeSettings {jit_enabled,  │
+  │                          │  auto_unload_idle, idle_ttl_minutes}  │
   │                          │  (server-behavior ns; grows) (read) │
-  │  PUT  /api/higgs/settings│  set jit_enabled (runtime AtomicBool,│
-  │                          │  default true, not persisted) → HiggsOk│
+  │  PUT  /api/higgs/settings│  set all three (runtime atoms,       │
+  │                          │  not persisted) → HiggsOk            │
   │  GET  /api/higgs/logs    │  Dev-log snapshot tail (?n=200)     │
   │  GET  /api/higgs/logs/stream │  SSE replay-then-live dev logs  │
   │                          │  (?n=200; no-timeout router)         │

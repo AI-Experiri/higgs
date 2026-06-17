@@ -533,10 +533,16 @@ headroom").
 ### Idle auto-unload (keep_alive TTL)
 
 `Higgs::start()` spawns an **idle reaper** background task that auto-unloads the
-loaded model after `IDLE_UNLOAD_TTL` (5 minutes — ollama's `keep_alive` default)
-with no inference, freeing memory on an idle host. Every `IDLE_REAP_INTERVAL`
-(30 s) it compares `now − last_activity` against the TTL. `last_activity` is
-stamped at the top of every `chat_stream`. The reaper never unloads
+loaded model after the idle TTL with no inference, freeing memory on an idle
+host. Every `IDLE_REAP_INTERVAL` (30 s) it reads two **live runtime atoms** off
+the `Higgs` facade each tick: `auto_unload_idle` (default `true`) and
+`idle_ttl_minutes` (default `5`, seeded from `IDLE_UNLOAD_TTL_MINUTES` /
+`IDLE_UNLOAD_TTL` — ollama's `keep_alive` default). When `auto_unload_idle` is
+`false` it never reaps; otherwise it compares `now − last_activity` against
+`idle_ttl_minutes` minutes. Both are settable via `PUT /api/higgs/settings`, so a
+Server-Settings change takes effect without a restart (the const remains only as
+the default seed). `last_activity` is stamped at the top of every `chat_stream`.
+The reaper never unloads
 mid-generation: it unloads only when the inference admission semaphore is fully
 open (zero in-flight requests) and a model is actually loaded, and it reuses the
 ordinary `unload()` path (which takes the lifecycle mutex, so it serializes

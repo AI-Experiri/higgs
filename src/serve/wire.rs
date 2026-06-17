@@ -187,6 +187,16 @@ higgs_ts! {
         /// instead of returning a 404. When `false`, an unloaded model is a 404
         /// (explicit-load only).
         pub jit_enabled: bool,
+        /// Whether the idle reaper auto-unloads the loaded model after the idle
+        /// TTL (default `true`). When `false`, a loaded model stays resident
+        /// until an explicit unload regardless of idle time. Read by the reaper
+        /// each tick, so a change takes effect without a restart.
+        pub auto_unload_idle: bool,
+        /// Idle minutes after which the loaded model is auto-unloaded (default
+        /// 5, ollama `keep_alive`). Read by the reaper each tick. Only in effect
+        /// when [`auto_unload_idle`](Self::auto_unload_idle) is `true`.
+        #[ts(type = "number")]
+        pub idle_ttl_minutes: u64,
     }
 }
 

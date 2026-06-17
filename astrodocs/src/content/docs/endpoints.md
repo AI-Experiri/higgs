@@ -433,10 +433,13 @@ curl -X POST -H "Content-Type: application/json" \
 Unload the current model. This **kills the worker process** (kill-on-unload), so
 after this there is no higgs worker until the next load.
 
-The model is **also** auto-unloaded after 5 minutes (`IDLE_UNLOAD_TTL`, ollama's
-`keep_alive` default) with no chat request — a background idle reaper frees
-memory on an idle host through this same path. The reaper never unloads while a
-request is in flight, and any chat resets the idle timer.
+The model is **also** auto-unloaded after the runtime `idle_ttl_minutes` (default
+5 — `IDLE_UNLOAD_TTL`, ollama's `keep_alive` default) with no chat request — a
+background idle reaper frees memory on an idle host through this same path. The
+reaper reads `idle_ttl_minutes` and `auto_unload_idle` each tick (settable via
+`PUT /api/higgs/settings`), so auto-unload can be turned off entirely or its TTL
+changed without a restart. The reaper never unloads while a request is in flight,
+and any chat resets the idle timer.
 
 **Response (200):**
 
@@ -598,10 +601,17 @@ defaulting to `true` — **not** persisted to disk or config. When `true`, a
 on-demand load (only-keep-last swap) before serving; when `false`, an unloaded
 model is `404 [HG003] ModelNotLoaded`.
 
+`auto_unload_idle` (`AtomicBool`, default `true`) and `idle_ttl_minutes`
+(`AtomicU64`, default `5`, seeded from `IDLE_UNLOAD_TTL_MINUTES` / `IDLE_UNLOAD_TTL`)
+are runtime-mutable atoms read by the idle reaper **each tick**. When
+`auto_unload_idle` is `false` the reaper skips unloading entirely; otherwise it
+uses `idle_ttl_minutes` minutes as the TTL. A change via `PUT` takes effect
+without a restart.
+
 **Response (200) — `HiggsRuntimeSettings`:**
 
 ```json
-{ "jit_enabled": true }
+{ "jit_enabled": true, "auto_unload_idle": true, "idle_ttl_minutes": 5 }
 ```
 
 **curl:**
@@ -615,12 +625,12 @@ curl http://localhost:8081/api/higgs/settings
 ### PUT /api/higgs/settings
 
 Set the server-behavior runtime settings. The body carries
-`HiggsRuntimeSettings { jit_enabled }`.
+`HiggsRuntimeSettings { jit_enabled, auto_unload_idle, idle_ttl_minutes }`.
 
 **Request body — `HiggsRuntimeSettings`:**
 
 ```json
-{ "jit_enabled": false }
+{ "jit_enabled": false, "auto_unload_idle": true, "idle_ttl_minutes": 5 }
 ```
 
 **Response (200) — `HiggsOk`:**
@@ -633,7 +643,7 @@ Set the server-behavior runtime settings. The body carries
 
 ```sh
 curl -X PUT -H "Content-Type: application/json" \
-  -d '{"jit_enabled":false}' \
+  -d '{"jit_enabled":false,"auto_unload_idle":true,"idle_ttl_minutes":5}' \
   http://localhost:8081/api/higgs/settings
 ```
 

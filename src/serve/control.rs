@@ -262,6 +262,8 @@ pub(super) async fn control_settings(
     tracing::info!("higgs: GET /api/higgs/settings");
     Json(HiggsRuntimeSettings {
         jit_enabled: higgs.jit_enabled(),
+        auto_unload_idle: higgs.auto_unload_idle(),
+        idle_ttl_minutes: higgs.idle_ttl_minutes(),
     })
 }
 
@@ -274,9 +276,13 @@ pub(super) async fn control_set_settings(
 ) -> Json<HiggsOk> {
     tracing::warn!(
         jit_enabled = body.jit_enabled,
+        auto_unload_idle = body.auto_unload_idle,
+        idle_ttl_minutes = body.idle_ttl_minutes,
         "higgs: set runtime server-behavior flags"
     );
     higgs.set_jit_enabled(body.jit_enabled);
+    higgs.set_auto_unload_idle(body.auto_unload_idle);
+    higgs.set_idle_ttl_minutes(body.idle_ttl_minutes);
     Json(HiggsOk::new())
 }
 
@@ -757,7 +763,7 @@ mod tests {
         let (sup, _test_write, _test_read, _ring) = make_supervisor();
         let app = make_app(sup);
 
-        // GET defaults to jit_enabled:true (JIT on by default).
+        // GET defaults: JIT on, auto-unload on, TTL 5 minutes.
         let resp = app
             .clone()
             .oneshot(get("/api/higgs/settings"))
@@ -766,13 +772,19 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
         assert_eq!(v["jit_enabled"], true, "JIT defaults to on");
+        assert_eq!(v["auto_unload_idle"], true, "auto-unload defaults to on");
+        assert_eq!(v["idle_ttl_minutes"], 5, "TTL defaults to 5 minutes");
 
-        // PUT jit_enabled:false returns {"status":"ok"}.
+        // PUT all three (JIT off, auto-unload off, TTL 30) returns {"status":"ok"}.
         let resp = app
             .clone()
             .oneshot(put_json(
                 "/api/higgs/settings",
-                &json!({"jit_enabled": false}),
+                &json!({
+                    "jit_enabled": false,
+                    "auto_unload_idle": false,
+                    "idle_ttl_minutes": 30,
+                }),
             ))
             .await
             .unwrap();
@@ -780,10 +792,12 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
         assert_eq!(v["status"], "ok");
 
-        // GET now reflects the new state.
+        // GET now reflects all three new values.
         let resp = app.oneshot(get("/api/higgs/settings")).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
         assert_eq!(v["jit_enabled"], false, "PUT toggled JIT off");
+        assert_eq!(v["auto_unload_idle"], false, "PUT toggled auto-unload off");
+        assert_eq!(v["idle_ttl_minutes"], 30, "PUT set TTL to 30 minutes");
     }
 
     // ── settings handlers: round-trip through the typed GET/PUT pair ──────────
@@ -811,15 +825,21 @@ mod tests {
         // now returns false, so an unloaded model is a 404 (explicit-load).
         let ok = control_set_settings(
             State(higgs.clone()),
-            axum::Json(crate::serve::HiggsRuntimeSettings { jit_enabled: false }),
+            axum::Json(crate::serve::HiggsRuntimeSettings {
+                jit_enabled: false,
+                auto_unload_idle: false,
+                idle_ttl_minutes: 30,
+            }),
         )
         .await;
         assert_eq!(ok.0.status, "ok");
         assert!(!higgs.jit_enabled(), "PUT disabled the JIT gate");
-        assert!(
-            !control_settings(State(higgs.clone())).await.0.jit_enabled,
-            "GET reflects JIT off"
-        );
+        assert!(!higgs.auto_unload_idle(), "PUT disabled idle auto-unload");
+        assert_eq!(higgs.idle_ttl_minutes(), 30, "PUT set the idle TTL");
+        let got = control_settings(State(higgs.clone())).await.0;
+        assert!(!got.jit_enabled, "GET reflects JIT off");
+        assert!(!got.auto_unload_idle, "GET reflects auto-unload off");
+        assert_eq!(got.idle_ttl_minutes, 30, "GET reflects the new TTL");
     }
 
     // ── verbose gate: served line appears only when verbose is on ─────────────
