@@ -17,7 +17,7 @@ use tokio::sync::{broadcast, mpsc};
 use super::http_status;
 use super::wire::{
     HiggsErrorResponse, HiggsLoadRequest, HiggsLoadResponse, HiggsLogsResponse, HiggsModelEntry,
-    HiggsModelsResponse, HiggsOk, HiggsVersionResponse, LogSettings,
+    HiggsModelsResponse, HiggsOk, HiggsRuntimeSettings, HiggsVersionResponse, LogSettings,
 };
 use crate::api::Higgs;
 use crate::diagnostic::HiggsError;
@@ -251,6 +251,32 @@ pub(super) async fn control_set_logs_settings(
     );
     higgs.set_verbose(body.verbose);
     higgs.set_log_incoming_tokens(body.log_incoming_tokens);
+    Json(HiggsOk::new())
+}
+
+/// `GET /api/higgs/settings` — current runtime server-behavior flags
+/// (just-in-time loading).
+pub(super) async fn control_settings(
+    State(higgs): State<Arc<Higgs>>,
+) -> Json<HiggsRuntimeSettings> {
+    tracing::info!("higgs: GET /api/higgs/settings");
+    Json(HiggsRuntimeSettings {
+        jit_enabled: higgs.jit_enabled(),
+    })
+}
+
+/// `PUT /api/higgs/settings` — set the runtime server-behavior flags
+/// (just-in-time loading). A state-changing control op, so it logs at `warn`
+/// with the new value.
+pub(super) async fn control_set_settings(
+    State(higgs): State<Arc<Higgs>>,
+    Json(body): Json<HiggsRuntimeSettings>,
+) -> Json<HiggsOk> {
+    tracing::warn!(
+        jit_enabled = body.jit_enabled,
+        "higgs: set runtime server-behavior flags"
+    );
+    higgs.set_jit_enabled(body.jit_enabled);
     Json(HiggsOk::new())
 }
 
@@ -721,6 +747,78 @@ mod tests {
         assert_eq!(
             v["log_incoming_tokens"], true,
             "PUT toggled log_incoming_tokens on"
+        );
+    }
+
+    // ── runtime settings: GET reflects default (JIT on); PUT toggles JIT ─────
+
+    #[tokio::test]
+    async fn settings_get_default_and_put_toggles_jit() {
+        let (sup, _test_write, _test_read, _ring) = make_supervisor();
+        let app = make_app(sup);
+
+        // GET defaults to jit_enabled:true (JIT on by default).
+        let resp = app
+            .clone()
+            .oneshot(get("/api/higgs/settings"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(v["jit_enabled"], true, "JIT defaults to on");
+
+        // PUT jit_enabled:false returns {"status":"ok"}.
+        let resp = app
+            .clone()
+            .oneshot(put_json(
+                "/api/higgs/settings",
+                &json!({"jit_enabled": false}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(v["status"], "ok");
+
+        // GET now reflects the new state.
+        let resp = app.oneshot(get("/api/higgs/settings")).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(v["jit_enabled"], false, "PUT toggled JIT off");
+    }
+
+    // ── settings handlers: round-trip through the typed GET/PUT pair ──────────
+
+    #[tokio::test]
+    async fn settings_handlers_round_trip() {
+        use super::{control_set_settings, control_settings};
+        use crate::api::Higgs;
+        use axum::extract::State;
+        use std::sync::Arc;
+
+        let (sup, _test_write, _test_read, _ring) = make_supervisor();
+        let higgs = Arc::new(Higgs::with_supervisor(
+            Arc::new(sup),
+            crate::api::HiggsConfig::default(),
+        ));
+
+        // GET handler reflects the default-on state.
+        assert!(
+            control_settings(State(higgs.clone())).await.0.jit_enabled,
+            "JIT on by default"
+        );
+
+        // PUT handler flips it off; the chat path's gate (`higgs.jit_enabled()`)
+        // now returns false, so an unloaded model is a 404 (explicit-load).
+        let ok = control_set_settings(
+            State(higgs.clone()),
+            axum::Json(crate::serve::HiggsRuntimeSettings { jit_enabled: false }),
+        )
+        .await;
+        assert_eq!(ok.0.status, "ok");
+        assert!(!higgs.jit_enabled(), "PUT disabled the JIT gate");
+        assert!(
+            !control_settings(State(higgs.clone())).await.0.jit_enabled,
+            "GET reflects JIT off"
         );
     }
 

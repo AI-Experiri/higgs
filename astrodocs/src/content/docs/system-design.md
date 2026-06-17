@@ -462,9 +462,11 @@ llama.cpp worker (via stdio RPC; spawned on load)
 
 If higgs is already attached to an agent and the user loads a *different* model
 from the Higgs pane (which only POSTs to `/api/higgs/models/load`), that agent's
-pre-built pool keeps the old model id and chat fails (`[HG003]`) until the
-provider is re-selected (which re-syncs + rebuilds). Auto-rebuilding attached
-pools on a pane-driven load is a future enhancement.
+pre-built pool keeps the old model id. With JIT on (default), a chat carrying
+that stale id re-loads it on demand (only-keep-last swap) — undoing the
+pane-driven load; with JIT off, the chat fails (`[HG003]`) until the provider is
+re-selected (which re-syncs + rebuilds). Auto-rebuilding attached pools on a
+pane-driven load is a future enhancement.
 
 ---
 
@@ -632,17 +634,51 @@ not an error condition:
   an empty `{"data":[]}` when nothing is loaded. An empty list is the correct
   OpenAI answer for "nothing can serve chat right now"; `/v1/models` never gates
   on `worker_alive`.
-- **`POST /v1/chat/completions`** for an unloaded or unknown model is `404
-  [HG003] ModelNotLoaded`. Because "no worker" == "nothing loaded", the idle
-  state and a crashed-worker state both fall through this same `404` gate — the
-  `/v1` surface **never** emits a worker-down `503`.
+- **`POST /v1/chat/completions`** routing depends on the **JIT flag**
+  (`jit_enabled`, ON by default — see below):
+  - **JIT on, model scanned-but-unloaded** → higgs loads it on demand
+    (only-keep-last swap) and serves. A failed JIT load surfaces the real mapped
+    load error (`503 [HG017]`, `400`, spawn failure), **not** a silent `404`.
+  - **JIT on, unknown id** (not in the on-disk catalog) → `404 [HG002]
+    ModelNotFound` — higgs never tries to load an id it hasn't scanned.
+  - **JIT off** → an unloaded model is `404 [HG003] ModelNotLoaded`. Because "no
+    worker" == "nothing loaded", the idle state and a crashed-worker state both
+    fall through this same `404` gate — the `/v1` surface **never** emits a
+    worker-down `503`.
 
 This is a deliberate decision: the `/v1` surface answers strictly in OpenAI
-terms (a model is loaded or it is not). The control surface still tells the truth
-about the worker — `GET /api/higgs/status` exposes `worker_alive` for
-diagnostics. A crashed worker therefore presents on `/v1` as an empty
-`/v1/models` and a `404` chat, while `/api/higgs/status` shows
-`worker_alive:false`.
+terms. The control surface still tells the truth about the worker — `GET
+/api/higgs/status` exposes `worker_alive` for diagnostics.
+
+### JIT (just-in-time) loading
+
+JIT is a runtime `AtomicBool` on the `Higgs` facade, **ON by default** and
+toggled via `PUT /api/higgs/settings` (`HiggsRuntimeSettings { jit_enabled }`),
+read via `GET /api/higgs/settings`. It is **not** persisted to disk/config — it
+resets to `true` on restart.
+
+```
+POST /v1/chat/completions, model not resident
+  │
+  ├─ jit_enabled == false ──────────────────► 404 [HG003] ModelNotLoaded
+  │
+  └─ jit_enabled == true
+       ├─ model in on-disk catalog ──► Higgs::load(model)   ← only-keep-last:
+       │                                  swaps out any resident model,
+       │                                  same load() path → RAM-headroom (HG017),
+       │                                  charset/path guards (HG015) all apply;
+       │                                  a failed load surfaces the real error
+       │                                  (503/400/…), NOT a silent 404.
+       │                                  INFO: "higgs: JIT loading {model} (was {prev})"
+       │                                  → then serve the chat normally
+       │
+       └─ unknown id (not scanned) ──► 404 [HG002] ModelNotFound
+```
+
+`/v1/models` is unchanged — it always lists **loaded** models only, never the
+JIT-reachable on-disk catalog. This server-behavior namespace
+(`/api/higgs/settings`) is separate from the developer-log toggles
+(`/api/higgs/logs/settings`) and is designed to grow more flags over time.
 
 ### Inference admission gate
 

@@ -65,7 +65,8 @@
 
   ┌──────────────┬──────────────────────────────────────────────┐
   │ nothing      │  ZERO higgs worker processes (zero idle RAM). │
-  │ loaded       │  chat for an unloaded model → 404 (no worker).│
+  │ loaded       │  chat for an unloaded model: JIT on (default) │
+  │              │  → load+serve; JIT off → 404 (no worker).     │
   └──────────────┴──────────────────────────────────────────────┘
 
   Higgs::start() also SPAWNS the idle reaper task (holds Weak<Higgs>):
@@ -128,9 +129,16 @@
        ▼
   serve::mod  v1_chat_completions()
        │
-       ├─── status check: is model loaded?  (gate_and_validate)
-       │         HG003 → 404 if not — covers unloaded, idle (no worker),
-       │         AND crashed-worker; /v1 never emits a worker-down 503
+       ├─── status check: is model resident?  (gate_and_validate)
+       │      not resident → branch on jit_enabled (AtomicBool, default true):
+       │        JIT on,  scanned id  → Higgs::load() (only-keep-last swap),
+       │                                then serve. failed load → real mapped
+       │                                error (503 HG017 / 400 / …), NOT 404.
+       │                                INFO "higgs: JIT loading {m} (was {prev})"
+       │        JIT on,  unknown id  → 404 HG002 ModelNotFound (never loads it)
+       │        JIT off, unloaded    → 404 HG003 ModelNotLoaded — covers idle
+       │                                (no worker) AND crashed-worker;
+       │                                /v1 never emits a worker-down 503
        │
        ├─── validate_sampling()   (temp/top_p/n=1/penalties/max_tokens; vllm ranges)
        │         HG013 → 400 if out of range
@@ -294,12 +302,16 @@
   │  GET  /v1/models         │  Loaded models only (ListModelResponse)│
   │                          │  idle (no worker) → 200 {"data":[]}  │
   │  POST /v1/chat/completions│  stream or non-stream               │
-  │                          │  unloaded/idle/crashed → 404 HG003   │
+  │                          │  not resident → JIT branch (default on):│
+  │                          │   JIT on, scanned  → load+serve         │
+  │                          │   JIT on, unknown  → 404 HG002          │
+  │                          │   JIT off          → 404 HG003          │
   │                          │  OpenAI error envelope on failure    │
   └──────────────────────────┴──────────────────────────────────────┘
   /v1 NEVER returns 503 worker-down: spawn-on-load means "no worker" ==
-  "nothing loaded", so a crashed worker presents as empty /v1/models +
-  404 chat. GET /api/higgs/status still exposes worker_alive for diagnostics.
+  "nothing loaded", so (JIT off) a crashed worker presents as empty
+  /v1/models + 404 chat. A failed JIT load surfaces the real mapped error
+  (503 HG017 / 400 / …), not 404. GET /api/higgs/status exposes worker_alive.
 
   ┌─────────────────────────────────────────────────────────────────┐
   │  /api/higgs/*  (control)                                        │
@@ -312,6 +324,10 @@
   │                          │              models_on_disk}         │
   │  GET  /api/higgs/system  │  SystemInfo {hardware, runtime,     │
   │                          │  config: HiggsServerConfig}(read-only)│
+  │  GET  /api/higgs/settings│  HiggsRuntimeSettings {jit_enabled} │
+  │                          │  (server-behavior ns; grows) (read) │
+  │  PUT  /api/higgs/settings│  set jit_enabled (runtime AtomicBool,│
+  │                          │  default true, not persisted) → HiggsOk│
   │  GET  /api/higgs/logs    │  Dev-log snapshot tail (?n=200)     │
   │  GET  /api/higgs/logs/stream │  SSE replay-then-live dev logs  │
   │                          │  (?n=200; no-timeout router)         │

@@ -120,6 +120,35 @@ pub(crate) fn make_app_with_lmstudio(sup: Supervisor, dir: std::path::PathBuf) -
     router(Arc::new(Higgs::with_supervisor(Arc::new(sup), cfg)))
 }
 
+/// Wrap a mock supervisor in a `Higgs` facade with JIT turned OFF, and build
+/// the router. Used by the `/v1` tests that assert the explicit-load HG003 404
+/// path (the behavior when just-in-time loading is disabled).
+pub(crate) fn make_app_jit_off(sup: Supervisor) -> Router {
+    let higgs = Arc::new(Higgs::with_supervisor(
+        Arc::new(sup),
+        HiggsConfig::default(),
+    ));
+    higgs.set_jit_enabled(false);
+    router(higgs)
+}
+
+/// Build a JIT-enabled (default) app whose host-side `scan()` reads
+/// `lmstudio_dirs`, returning both the router and the `Arc<Higgs>` so a test can
+/// assert facade state (e.g. the loaded model after a JIT swap).
+pub(crate) fn make_app_with_lmstudio_handle(
+    sup: Supervisor,
+    dir: std::path::PathBuf,
+) -> (Router, Arc<Higgs>) {
+    let cfg = HiggsConfig {
+        lmstudio_dirs: vec![dir],
+        hf_dirs: vec![],
+        ollama_dirs: vec![],
+        default_load: HiggsConfig::default().default_load,
+    };
+    let higgs = Arc::new(Higgs::with_supervisor(Arc::new(sup), cfg));
+    (router(Arc::clone(&higgs)), higgs)
+}
+
 /// Write a minimal valid GGUF file (arch=llama, ctx=4096, chat template) at
 /// `<root>/<id>/model-Q4_K_M.gguf` so a host-side scan discovers `id` with
 /// enriched metadata. Returns nothing; the caller owns the temp dir.

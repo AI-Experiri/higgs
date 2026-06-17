@@ -135,11 +135,26 @@ curl http://localhost:8081/v1/models
 
 ### POST /v1/chat/completions
 
-Chat with the loaded model. Requires a model to be loaded first (`POST
-/api/higgs/models/load`). An unloaded or unknown model is a `404 [HG003]
-ModelNotLoaded`. Because higgs is spawn-on-load ("no worker" == "nothing
-loaded"), the idle state and a crashed-worker state both surface as this same
-`404` — the `/v1` surface never returns a worker-down `503`.
+Chat with a model. **JIT (just-in-time) loading is ON by default** (a
+runtime-toggleable flag — see `GET`/`PUT /api/higgs/settings`):
+
+- **JIT on (default), model scanned-on-disk but not resident** — higgs loads it
+  on demand and then serves the chat. higgs is **only-keep-last** (one model at a
+  time), so a request for model `B` while `A` is resident swaps `A` out and ends
+  with `B` resident. The JIT load goes through the same `Higgs::load()` path, so
+  the RAM-headroom guard (`[HG017]`), charset guard (`[HG015]`), and
+  path-within-roots guard (`[HG015]`) all still apply — a JIT load that fails
+  surfaces the **real** mapped load error (`503 [HG017]`, `400`, worker spawn
+  failure, etc.), **not** a silent `404`. A single INFO line is emitted per JIT
+  load: `higgs: JIT loading {model} (was {prev})` (`prev` is `none` if nothing
+  was loaded).
+- **JIT on, unknown model id** (not in the on-disk catalog) — `404 [HG002]
+  ModelNotFound`. higgs never tries to load an id it hasn't scanned.
+- **JIT off** — an unloaded model is `404 [HG003] ModelNotLoaded` (the explicit
+  load-only behavior; load first via `POST /api/higgs/models/load`). Because
+  higgs is spawn-on-load ("no worker" == "nothing loaded"), the idle state and a
+  crashed-worker state both surface as this same `404` — the `/v1` surface never
+  returns a worker-down `503`.
 
 v1 is **text-only** — image, audio, and file content parts are rejected with 400.
 Both `max_tokens` (deprecated) and `max_completion_tokens` are accepted; the newer field wins.
@@ -567,6 +582,59 @@ data: 2026-06-15 12:00:01 [INFO] higgs: GET /v1/models
 
 ```sh
 curl -N "http://localhost:8081/api/higgs/logs/stream?n=50"
+```
+
+---
+
+### GET /api/higgs/settings
+
+Current **server-behavior** runtime settings. This namespace is distinct from
+`/api/higgs/logs/settings` (developer-log toggles) and is designed to grow as
+more server-behavior flags are added.
+
+`jit_enabled` is an in-process runtime `AtomicBool` on the `Higgs` facade
+defaulting to `true` — **not** persisted to disk or config. When `true`, a
+`POST /v1/chat/completions` for a scanned-but-unloaded model triggers an
+on-demand load (only-keep-last swap) before serving; when `false`, an unloaded
+model is `404 [HG003] ModelNotLoaded`.
+
+**Response (200) — `HiggsRuntimeSettings`:**
+
+```json
+{ "jit_enabled": true }
+```
+
+**curl:**
+
+```sh
+curl http://localhost:8081/api/higgs/settings
+```
+
+---
+
+### PUT /api/higgs/settings
+
+Set the server-behavior runtime settings. The body carries
+`HiggsRuntimeSettings { jit_enabled }`.
+
+**Request body — `HiggsRuntimeSettings`:**
+
+```json
+{ "jit_enabled": false }
+```
+
+**Response (200) — `HiggsOk`:**
+
+```json
+{ "status": "ok" }
+```
+
+**curl:**
+
+```sh
+curl -X PUT -H "Content-Type: application/json" \
+  -d '{"jit_enabled":false}' \
+  http://localhost:8081/api/higgs/settings
 ```
 
 ---

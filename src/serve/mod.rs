@@ -167,6 +167,10 @@ pub fn router(higgs: Arc<Higgs>) -> Router {
             "/api/higgs/logs/settings",
             get(control::control_logs_settings).put(control::control_set_logs_settings),
         )
+        .route(
+            "/api/higgs/settings",
+            get(control::control_settings).put(control::control_set_settings),
+        )
         .route("/api/higgs/worker/stop", post(control::control_worker_stop))
         .route("/api/higgs/version", get(control::control_version))
         .layer(TimeoutLayer::with_status_code(

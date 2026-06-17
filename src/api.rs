@@ -343,6 +343,14 @@ pub struct Higgs {
     /// redaction policy is unchanged unless the user turns this on. A plain atomic
     /// — set/read in isolation, no critical section, never across `.await`.
     log_incoming_tokens: std::sync::atomic::AtomicBool,
+    /// Runtime "Just-in-Time loading" toggle for the serve layer. When `true`
+    /// (the default), a chat request for a scanned-but-unloaded model triggers an
+    /// on-demand [`load`](Self::load) — swapping out any currently-resident model
+    /// (higgs serves one model at a time) — instead of the `[HG003]` 404. When
+    /// `false`, the chat path keeps the explicit-load behavior: an unloaded model
+    /// is a 404. A plain atomic — set/read in isolation, no critical section,
+    /// never across `.await`. Defaults to `true` (JIT on).
+    jit_enabled: std::sync::atomic::AtomicBool,
 }
 
 impl Higgs {
@@ -372,6 +380,7 @@ impl Higgs {
             last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
             verbose: std::sync::atomic::AtomicBool::new(false),
             log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
+            jit_enabled: std::sync::atomic::AtomicBool::new(true),
         }
     }
 
@@ -395,6 +404,19 @@ impl Higgs {
     /// opts into logging prompt CONTENT, overriding the redact-by-default policy.
     pub fn set_log_incoming_tokens(&self, v: bool) {
         self.log_incoming_tokens
+            .store(v, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether serve-layer "Just-in-Time loading" is on (default `true`). When
+    /// on, a chat for a scanned-but-unloaded model loads it on demand instead of
+    /// returning `[HG003]`.
+    pub fn jit_enabled(&self) -> bool {
+        self.jit_enabled.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Turn serve-layer "Just-in-Time loading" on or off at runtime.
+    pub fn set_jit_enabled(&self, v: bool) {
+        self.jit_enabled
             .store(v, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -753,6 +775,7 @@ impl Higgs {
             last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
             verbose: std::sync::atomic::AtomicBool::new(false),
             log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
+            jit_enabled: std::sync::atomic::AtomicBool::new(true),
         }
     }
 
@@ -1135,6 +1158,7 @@ mod tests {
             last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
             verbose: std::sync::atomic::AtomicBool::new(false),
             log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
+            jit_enabled: std::sync::atomic::AtomicBool::new(true),
         };
         // Take the only permit and hold it.
         let held = Arc::clone(&higgs.inference_gate)
@@ -1235,6 +1259,18 @@ mod tests {
         );
     }
 
+    // ── JIT toggle: default TRUE, set/get round-trip ────────────────────────
+
+    #[test]
+    fn jit_enabled_defaults_true_and_round_trips() {
+        let higgs = Higgs::new(HiggsConfig::default());
+        assert!(higgs.jit_enabled(), "JIT defaults to ON (true)");
+        higgs.set_jit_enabled(false);
+        assert!(!higgs.jit_enabled(), "set_jit_enabled(false) is observed");
+        higgs.set_jit_enabled(true);
+        assert!(higgs.jit_enabled(), "set_jit_enabled(true) is observed");
+    }
+
     // ── Test 1: default config paths ─────────────────────────────────────────
 
     #[test]
@@ -1319,6 +1355,7 @@ mod tests {
             last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
             verbose: std::sync::atomic::AtomicBool::new(false),
             log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
+            jit_enabled: std::sync::atomic::AtomicBool::new(true),
         };
         let mut events_rx = higgs.events();
         // `load`/`status` run a host-side scan (on a blocking thread) before each
@@ -1396,6 +1433,7 @@ mod tests {
             last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
             verbose: std::sync::atomic::AtomicBool::new(false),
             log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
+            jit_enabled: std::sync::atomic::AtomicBool::new(true),
         };
 
         // `status` runs a host-side scan (on a blocking thread) before M_STATUS,
@@ -1465,6 +1503,7 @@ mod tests {
             last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
             verbose: std::sync::atomic::AtomicBool::new(false),
             log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
+            jit_enabled: std::sync::atomic::AtomicBool::new(true),
         };
 
         // Drive the load. `load` first runs a host-side scan (on a blocking
@@ -1509,6 +1548,7 @@ mod tests {
             last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
             verbose: std::sync::atomic::AtomicBool::new(false),
             log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
+            jit_enabled: std::sync::atomic::AtomicBool::new(true),
         };
 
         let (mut rx, handle) = higgs
@@ -1588,6 +1628,7 @@ mod tests {
             last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
             verbose: std::sync::atomic::AtomicBool::new(false),
             log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
+            jit_enabled: std::sync::atomic::AtomicBool::new(true),
         };
 
         // chat_stream registers the sink then the spawned task encounters dead worker.

@@ -22,7 +22,7 @@ description: Current request-keyed routing design and deferred parallel-executio
 | Supervisor routing | Per-request `mpsc::unbounded_channel` keyed by `request_id` |
 | Concurrent callers | Accepted; serialised at the worker; each caller's deltas are isolated |
 | Control RPC bound | `scan`/`load`/`status`/`unload` capped at 120 s; chat is unbounded (capped by `max_tokens`) |
-| Rejection policy | None — no 409, no busy signal. Chat for an unloaded model → 404 (no worker) |
+| Rejection policy | None — no 409, no busy signal. Chat for an unloaded model: JIT on (default) → on-demand load (only-keep-last swap) then serve; JIT off → `404 [HG003]`; unknown id → `404 [HG002]` |
 
 ### Request-keyed routing flow
 

@@ -2,9 +2,11 @@
 //! `POST /v1/chat/completions`.
 //!
 //! All bodies are `async-openai` wire types verbatim — nothing hand-rolled.
-//! `/v1/models` lists LOADED models only (no JIT in v1: chat against an
-//! unloaded model is a 404). Errors render as the OpenAI envelope
-//! `{"error":{message,type,code}}`.
+//! `/v1/models` lists LOADED models only. Chat has JIT (just-in-time loading)
+//! ON by default: a request for a scanned-but-unloaded model loads it on demand
+//! (swapping out any resident model — higgs serves one at a time) before
+//! serving; with JIT off, chat against an unloaded model is a 404. Errors render
+//! as the OpenAI envelope `{"error":{message,type,code}}`.
 
 use std::sync::Arc;
 
@@ -30,7 +32,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
-use crate::api::{ChatOutcome, Higgs};
+use crate::api::{ChatOutcome, Higgs, LoadedInfo};
 use crate::diagnostic::HiggsError;
 
 use super::http_status;
@@ -267,8 +269,11 @@ pub(super) async fn v1_models(State(higgs): State<Arc<Higgs>>) -> Response {
     }
 }
 
-/// `POST /v1/chat/completions` — no JIT in v1: the named model must already
-/// be loaded; unknown and on-disk-but-unloaded ids both get the HG003 404.
+/// `POST /v1/chat/completions`. With JIT on (the default), a request for a
+/// scanned-but-unloaded model loads it on demand (swapping out any resident
+/// model — higgs serves one at a time) before serving. With JIT off, the named
+/// model must already be loaded: unknown and on-disk-but-unloaded ids both get
+/// the HG003 404.
 pub(super) async fn v1_chat_completions(
     State(higgs): State<Arc<Higgs>>,
     Json(req): Json<CreateChatCompletionRequest>,
@@ -362,19 +367,22 @@ pub(super) async fn v1_chat_completions(
     }
 }
 
-/// Run the pre-dispatch gate and request validation for a chat request:
-/// loaded-model check, sampling-param ranges, prompt-vs-context fit, and the
-/// v1 text-only content check. Returns `Err(response)` with the first failing
-/// gate's mapped response; `Ok(())` when the request may be dispatched.
+/// Resolve the model that will serve this chat, loading it on demand when JIT
+/// is on. Returns the [`LoadedInfo`] of the now-resident requested model, or an
+/// `Err(response)` carrying the mapped failure.
 ///
-/// higgs is spawn-on-load, so an unloaded or unknown model — including the idle
-/// no-worker state and a crashed-worker state — falls through to the HG003 404
-/// `ModelNotLoaded` gate. There is no separate worker-down 503 on this surface;
-/// `GET /api/higgs/status` exposes `worker_alive` for diagnostics instead.
-async fn gate_and_validate(
-    higgs: &Arc<Higgs>,
-    req: &CreateChatCompletionRequest,
-) -> Result<(), Response> {
+/// - Requested model already loaded → returns its [`LoadedInfo`] (no load).
+/// - Not loaded and JIT OFF → 404 `[HG003]` `ModelNotLoaded` (explicit-load).
+/// - Not loaded and JIT ON → JIT path: the id must be a scanned model
+///   (`[HG002]` `ModelNotFound` → 404 otherwise — never attempt to load an
+///   unknown id), then [`Higgs::load`] loads it with host defaults. higgs serves
+///   one model at a time, so the worker's M_LOAD swaps out any resident model —
+///   a request for B while A is loaded ends with B resident (only-keep-last).
+///   `load()` takes the lifecycle mutex, serializing concurrent JIT loads. A
+///   load failure (insufficient memory `[HG017]` → 503, bad GGUF, worker spawn
+///   failure, …) surfaces as its mapped error — NOT a silent 404. On success the
+///   post-load status carries the now-loaded model.
+async fn ensure_loaded(higgs: &Arc<Higgs>, model: &str) -> Result<LoadedInfo, Response> {
     let status = match higgs.status().await {
         Ok(s) => s,
         Err(err) => {
@@ -382,16 +390,92 @@ async fn gate_and_validate(
             return Err(v1_error(&err).into_response());
         }
     };
-    // Loaded-model gate: an unloaded/unknown model — and, since spawn-on-load
-    // means "no worker" == "nothing loaded", the idle and crashed-worker states
-    // too — is a client "model not loaded" 404 [HG003].
-    let Some(loaded) = status.loaded.filter(|l| l.id == req.model) else {
+    // Capture the currently-resident model id (for the JIT swap log line) before
+    // the match consumes `status.loaded`.
+    let prev = status.loaded.as_ref().map(|l| l.id.clone());
+    // Already loaded — serve as today, no load.
+    if let Some(loaded) = status.loaded.filter(|l| l.id == model) {
+        return Ok(loaded);
+    }
+
+    // Not loaded. With JIT off, keep the explicit-load behavior: 404 [HG003].
+    if !higgs.jit_enabled() {
         let err = HiggsError::ModelNotLoaded {
-            id: req.model.clone(),
+            id: model.to_owned(),
         };
-        tracing::warn!(model = %req.model, "higgs: chat for unloaded model");
+        tracing::warn!(model = %model, "higgs: chat for unloaded model (JIT off)");
         return Err(v1_error(&err).into_response());
+    }
+
+    // JIT path. The requested id must be a scanned model — never try to load an
+    // unknown id (that is a [HG002] 404, not a load attempt).
+    let scanned = match higgs.scan().await {
+        Ok(models) => models,
+        Err(err) => {
+            tracing::warn!(error = %err, "higgs: JIT scan failed");
+            return Err(v1_error(&err).into_response());
+        }
     };
+    if !scanned.iter().any(|m| m.id == model) {
+        let err = HiggsError::ModelNotFound {
+            id: model.to_owned(),
+        };
+        tracing::warn!(model = %model, "higgs: JIT chat for unknown model");
+        return Err(v1_error(&err).into_response());
+    }
+
+    // Load on demand (host defaults). One always-on INFO line so the swap is
+    // visible in the Developer Logs. `prev` is the model being swapped out, if any.
+    tracing::info!(
+        "higgs: JIT loading {model} (was {})",
+        prev.as_deref().unwrap_or("none")
+    );
+    if let Err(err) = higgs.load(model, None).await {
+        tracing::warn!(model = %model, error = %err, "higgs: JIT load failed");
+        return Err(v1_error(&err).into_response());
+    }
+
+    // Re-fetch status: the requested model must now be resident.
+    let status = match higgs.status().await {
+        Ok(s) => s,
+        Err(err) => {
+            tracing::warn!(error = %err, "higgs: post-JIT status check failed");
+            return Err(v1_error(&err).into_response());
+        }
+    };
+    match status.loaded.filter(|l| l.id == model) {
+        Some(loaded) => Ok(loaded),
+        None => {
+            // Load reported success but the model isn't resident — surface the
+            // real not-loaded condition rather than a spurious success.
+            let err = HiggsError::ModelNotLoaded {
+                id: model.to_owned(),
+            };
+            tracing::warn!(model = %model, "higgs: JIT load succeeded but model not resident");
+            Err(v1_error(&err).into_response())
+        }
+    }
+}
+
+/// Run the pre-dispatch gate and request validation for a chat request:
+/// loaded-model check, sampling-param ranges, prompt-vs-context fit, and the
+/// v1 text-only content check. Returns `Err(response)` with the first failing
+/// gate's mapped response; `Ok(())` when the request may be dispatched.
+///
+/// higgs is spawn-on-load. With JIT off, an unloaded or unknown model —
+/// including the idle no-worker state and a crashed-worker state — falls through
+/// to the HG003 404 `ModelNotLoaded` gate. With JIT on (the default), a
+/// scanned-but-unloaded model is loaded on demand here (see [`ensure_loaded`])
+/// before validation. There is no separate worker-down 503 on this surface;
+/// `GET /api/higgs/status` exposes `worker_alive` for diagnostics instead.
+async fn gate_and_validate(
+    higgs: &Arc<Higgs>,
+    req: &CreateChatCompletionRequest,
+) -> Result<(), Response> {
+    // Loaded-model gate (JIT-aware): resolve the model that will serve this
+    // request, loading it on demand when JIT is on. Returns the LoadedInfo for
+    // the now-resident requested model, or the mapped error response.
+    let loaded = ensure_loaded(higgs, &req.model).await?;
 
     // Validate sampling params (temperature/top_p/n/penalties/max_tokens) BEFORE
     // dispatching to the worker — out-of-range → 400 [HG013]. Ranges mirror vllm.
@@ -895,12 +979,13 @@ mod tests {
         assert_eq!(list.data[0].owned_by, "higgs");
     }
 
-    // ── Test 3: chat against an unloaded model → 404 HG003 envelope ──────────
+    // ── Test 3: JIT OFF + chat against an unloaded model → 404 HG003 envelope ─
 
     #[tokio::test]
     async fn chat_unloaded_404_hg003() {
         let (sup, mut test_write, test_read, _ring) = make_supervisor();
-        let app = make_app(sup);
+        // JIT off: an unloaded model is the explicit-load HG003 404 (not a JIT load).
+        let app = make_app_jit_off(sup);
 
         let req = post_json(
             "/v1/chat/completions",
@@ -959,7 +1044,8 @@ mod tests {
 
     #[tokio::test]
     async fn v1_chat_idle_no_worker_404_hg003() {
-        let app = make_app(make_idle_supervisor());
+        // JIT off: idle chat is the explicit-load HG003 404, not a JIT attempt.
+        let app = make_app_jit_off(make_idle_supervisor());
         let req = post_json(
             "/v1/chat/completions",
             &json!({"model": "org/model", "messages": [{"role": "user", "content": "hi"}]}),
@@ -973,6 +1059,107 @@ mod tests {
         let body = String::from_utf8(body_bytes(resp).await).unwrap();
         assert!(body.contains("[HG003]"), "carries HG003: {body}");
         assert!(body.contains("model_not_found"), "envelope code: {body}");
+    }
+
+    // ── JIT ON + unknown model → 404 HG002 (no load attempt) ─────────────────
+    //
+    // JIT is on by default. A chat for an id absent from the scan must NOT
+    // attempt a load — it is a ModelNotFound 404 [HG002]. The idle supervisor
+    // never spawns and the default config dirs hold no fixture, so the scan is
+    // empty and the id is unknown.
+
+    #[tokio::test]
+    async fn v1_chat_jit_on_unknown_model_404_hg002() {
+        // Default app → JIT on. Empty temp config so the scan finds nothing.
+        let dir = tempfile::TempDir::new().unwrap();
+        let app = make_app_with_lmstudio(make_idle_supervisor(), dir.path().to_path_buf());
+        let req = post_json(
+            "/v1/chat/completions",
+            &json!({"model": "org/unknown", "messages": [{"role": "user", "content": "hi"}]}),
+        );
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "JIT + unknown id is 404 model-not-found"
+        );
+        let body = String::from_utf8(body_bytes(resp).await).unwrap();
+        assert!(
+            body.contains("[HG002]"),
+            "carries HG002 (not HG003): {body}"
+        );
+        assert!(body.contains("model_not_found"), "envelope code: {body}");
+    }
+
+    // ── JIT ON + scanned-but-unloaded model → loads on demand, then serves ───
+    //
+    // JIT is on by default. A chat for a scanned model that isn't currently
+    // loaded must trigger a load (M_LOAD) and then serve. The mock RPC sequence
+    // proves the JIT load path is taken: M_STATUS (nothing loaded) → M_LOAD (the
+    // JIT swap) → M_STATUS (now resident) → M_CHAT. With only-keep-last, after
+    // the M_LOAD the requested model is the resident one.
+
+    #[tokio::test]
+    async fn v1_chat_jit_on_scanned_loads_then_serves() {
+        let (sup, mut test_write, test_read, _ring) = make_supervisor();
+        // Host-side scan must discover `org/model` so the JIT path loads it.
+        let dir = tempfile::TempDir::new().unwrap();
+        write_gguf_fixture(dir.path(), "org/model");
+        let app = make_app_with_lmstudio(sup, dir.path().to_path_buf());
+
+        let req = post_json(
+            "/v1/chat/completions",
+            &json!({"model": "org/model", "messages": [{"role": "user", "content": "hi"}]}),
+        );
+        // Read-driven mock: respond to each RPC only after its request line is
+        // read. RPC 1 = M_STATUS (nothing loaded) → triggers JIT; RPC 2 = M_LOAD
+        // (the swap) → ok; RPC 3 = M_STATUS (now loaded org/model); RPC 4 =
+        // M_CHAT → the completion.
+        let mut lines = BufReader::new(test_read).lines();
+        let (resp, load_line) = tokio::join!(app.oneshot(req), async {
+            lines
+                .next_line()
+                .await
+                .unwrap()
+                .expect("M_STATUS #1 request");
+            write_response(
+                &mut test_write,
+                1,
+                json!({"loaded": null, "models_scanned": 1}),
+            )
+            .await;
+            let load_line = lines.next_line().await.unwrap().expect("M_LOAD request");
+            write_response(&mut test_write, 2, json!({"id": "org/model"})).await; // load ok
+            lines
+                .next_line()
+                .await
+                .unwrap()
+                .expect("M_STATUS #2 request");
+            write_response(&mut test_write, 3, loaded_status_json()).await; // now loaded
+            lines.next_line().await.unwrap().expect("M_CHAT request");
+            write_response(
+                &mut test_write,
+                4,
+                json!({"content": "hello", "finish_reason": "stop", "prompt_tokens": 3, "completion_tokens": 5}),
+            )
+            .await;
+            load_line
+        });
+        let resp = resp.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "JIT load then serve returns 200"
+        );
+        // The JIT load issued an M_LOAD for the requested model (the swap target).
+        let v: serde_json::Value = serde_json::from_str(&load_line).unwrap();
+        assert_eq!(v["method"], "higgs/load");
+        assert_eq!(v["params"]["id"], "org/model");
+
+        let chat: CreateChatCompletionResponse =
+            serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(chat.model, "org/model");
+        assert_eq!(chat.choices[0].message.content.as_deref(), Some("hello"));
     }
 
     // ── Test 4: non-streaming chat returns ChatOutcome.content ───────────────

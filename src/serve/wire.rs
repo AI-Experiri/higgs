@@ -174,6 +174,23 @@ higgs_ts! {
 }
 
 higgs_ts! {
+    /// Body for `GET`/`PUT /api/higgs/settings`: the runtime server-behavior
+    /// flags higgs actually backs. `GET` returns the current state; `PUT` carries
+    /// it and sets it. Distinct from [`LogSettings`] (Developer-Log toggles) —
+    /// this is the server-behavior namespace, designed to grow as more runtime
+    /// flags (e.g. a server on/off) are added.
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    pub struct HiggsRuntimeSettings {
+        /// Whether just-in-time model loading is enabled. When `true` (the
+        /// default), a chat request for a scanned-but-unloaded model loads it on
+        /// demand — swapping out any resident model (higgs serves one at a time) —
+        /// instead of returning a 404. When `false`, an unloaded model is a 404
+        /// (explicit-load only).
+        pub jit_enabled: bool,
+    }
+}
+
+higgs_ts! {
     /// Error body for control routes: the rendered `HiggsError` display
     /// (diagnostic code included), as `{"error":"<display>"}`.
     #[derive(Debug, serde::Serialize)]
