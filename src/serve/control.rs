@@ -174,12 +174,21 @@ pub(super) async fn control_load(
             seed: req.seed,
         })
     };
+    let started = std::time::Instant::now();
     match higgs.load(&req.id, params).await {
         Ok(()) => {
             // Record the per-load idle-TTL override (HOST-SIDE only). It takes
             // precedence over the global TTL in the idle reaper for THIS model
             // and is cleared on unload. Absent = use the global TTL.
             higgs.set_loaded_idle_ttl_override(req.idle_ttl_minutes);
+            // Completion line — bookends the "loading model" start line in the
+            // Developer Logs. id + elapsed go in the MESSAGE so they render in the
+            // console (the log layer captures the message + the `error` field only).
+            tracing::info!(
+                "higgs: model loaded: {} ({} ms)",
+                req.id,
+                started.elapsed().as_millis()
+            );
             Json(HiggsLoadResponse {
                 status: HiggsOk::new(),
                 id: req.id,
@@ -187,6 +196,8 @@ pub(super) async fn control_load(
             .into_response()
         }
         Err(err) => {
+            // `error = %err` carries the full typed reason (worker RPC → HG004
+            // engine-load failure → llama.cpp detail); the log layer appends it.
             tracing::warn!(id = %req.id, error = %err, "higgs: load failed");
             control_error(&err).into_response()
         }

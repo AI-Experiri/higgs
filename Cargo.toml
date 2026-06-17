@@ -46,7 +46,7 @@ sysinfo = "0.32"
 # non-streaming control routes only — never the SSE chat stream.
 tower-http = { version = "0.6", features = ["cors", "catch-panic", "limit", "timeout"] }
 # Structured logs for the `higgs-server` binary.
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 
 [dev-dependencies]
 # test-util: paused-clock control (tokio::time::advance) so the 600 s chat-RPC

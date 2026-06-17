@@ -131,25 +131,33 @@ impl<B> HiggsLogLayer<B> {
     }
 }
 
-/// Collects the `message` field of a tracing event into a single string. Only
-/// the message is captured — structured fields and, critically, any prompt
-/// CONTENT are NOT serialized into the Developer Logs (redaction policy: no
-/// prompt content at info level).
+/// Collects the `message` and `error` fields of a tracing event. The `message`
+/// is the human line; the `error` field — used by `warn!(error = %err, …)` —
+/// carries typed diagnostic detail (e.g. a llama.cpp model-load failure reason)
+/// and is appended so failures are debuggable in the Developer Logs. NO other
+/// structured field is captured: critically, prompt CONTENT is never serialized
+/// (redaction policy). `error` is exempt because it is always a typed
+/// `[HGxxx] …` diagnostic, never user/prompt content.
 #[derive(Default)]
 struct MessageVisitor {
     message: String,
+    error: Option<String>,
 }
 
 impl Visit for MessageVisitor {
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        if field.name() == "message" {
-            self.message = format!("{value:?}");
+        match field.name() {
+            "message" => self.message = format!("{value:?}"),
+            "error" => self.error = Some(format!("{value:?}")),
+            _ => {}
         }
     }
 
     fn record_str(&mut self, field: &Field, value: &str) {
-        if field.name() == "message" {
-            self.message = value.to_owned();
+        match field.name() {
+            "message" => self.message = value.to_owned(),
+            "error" => self.error = Some(value.to_owned()),
+            _ => {}
         }
     }
 }
@@ -196,7 +204,16 @@ where
         if visitor.message.is_empty() {
             return;
         }
-        let line = format!("{} [{}] {}", timestamp(), meta.level(), visitor.message);
+        let line = match visitor.error {
+            Some(err) => format!(
+                "{} [{}] {} — {}",
+                timestamp(),
+                meta.level(),
+                visitor.message,
+                err
+            ),
+            None => format!("{} [{}] {}", timestamp(), meta.level(), visitor.message),
+        };
         self.bus.push(line);
     }
 }
@@ -273,6 +290,39 @@ mod tests {
         // After Lagged the receiver recovers and yields the still-buffered tail.
         let next = rx.recv().await.expect("recovers after lag");
         assert!(next.starts_with('l'));
+    }
+
+    #[test]
+    fn layer_captures_error_field_and_redacts_other_fields() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let bus = Arc::new(LogBus::new());
+        let subscriber = tracing_subscriber::registry().with(HiggsLogLayer::new(bus.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            // A higgs-target load failure: the typed reason rides the `error` field.
+            tracing::warn!(
+                target: "higgs::test",
+                error = "[HG004] engine failed to load m.gguf: out of memory",
+                prompt = "secret user prompt content",
+                "higgs: load failed"
+            );
+            // Wrong target — must be dropped entirely.
+            tracing::info!(target: "not_higgs", "should be ignored");
+        });
+        let snap = bus.snapshot(10);
+        assert_eq!(snap.len(), 1, "only the higgs-target event is captured");
+        let line = &snap[0];
+        assert!(
+            line.contains("higgs: load failed"),
+            "message present: {line}"
+        );
+        assert!(
+            line.contains("[HG004] engine failed to load m.gguf: out of memory"),
+            "error field appended so failures are debuggable: {line}"
+        );
+        assert!(
+            !line.contains("secret user prompt content"),
+            "non-error fields stay redacted (no prompt content): {line}"
+        );
     }
 
     #[test]
