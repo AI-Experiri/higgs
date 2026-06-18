@@ -144,23 +144,6 @@ pub(crate) fn make_app_serving_off(sup: Supervisor) -> Router {
     router(higgs)
 }
 
-/// Build a JIT-enabled (default) app whose host-side `scan()` reads
-/// `lmstudio_dirs`, returning both the router and the `Arc<Higgs>` so a test can
-/// assert facade state (e.g. the loaded model after a JIT swap).
-pub(crate) fn make_app_with_lmstudio_handle(
-    sup: Supervisor,
-    dir: std::path::PathBuf,
-) -> (Router, Arc<Higgs>) {
-    let cfg = HiggsConfig {
-        lmstudio_dirs: vec![dir],
-        hf_dirs: vec![],
-        ollama_dirs: vec![],
-        default_load: HiggsConfig::default().default_load,
-    };
-    let higgs = Arc::new(Higgs::with_supervisor(Arc::new(sup), cfg));
-    (router(Arc::clone(&higgs)), higgs)
-}
-
 /// Write a minimal valid GGUF file (arch=llama, ctx=4096, chat template) at
 /// `<root>/<id>/model-Q4_K_M.gguf` so a host-side scan discovers `id` with
 /// enriched metadata. Returns nothing; the caller owns the temp dir.
