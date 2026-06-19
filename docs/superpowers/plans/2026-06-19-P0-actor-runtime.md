@@ -392,87 +392,37 @@ git commit -m "refactor(supervisor): adopt actor::ReplyDemux for RPC correlation
 
 ---
 
-## Task 4: `Worker` rides the tokio + `spawn_blocking` runtime
+## Task 4: ~~`Worker` rides the tokio + `spawn_blocking` runtime~~ — **DEFERRED TO P2**
 
-Move `worker_main` off its hand-rolled sync `stdin.lock()` loop onto a current-thread tokio runtime that bridges async stdio into the **unchanged** `serve_state` via `SyncIoBridge` inside `spawn_blocking` (so the blocking FFI `engine.chat` runs on a blocking thread). This is the §5.3 bridge pattern, previewed. `serve`, `serve_state`, `WorkerState`, and every handler stay byte-for-byte identical — so all worker tests (`worker/mod.rs:408-859`) and the `tests/worker_roundtrip.rs` integration test pass unchanged.
+**Decision (2026-06-19, validated independently by codex against tokio docs): DEFER.**
 
-**Files:**
-- Modify: `src/worker/mod.rs` — `worker_main` (`:41-46`) ONLY
-- Modify: `Cargo.toml` — ensure `tokio_util` with feature `io`
-- Test: existing worker tests + `tests/worker_roundtrip.rs` (unchanged)
+The original plan ported `worker_main` to a `new_current_thread` tokio runtime that bridges
+`tokio::io::stdin/stdout` into `serve_state` via `SyncIoBridge` inside `spawn_blocking`. This
+is **wrong for P0** on three counts:
 
-- [ ] **Step 1: Confirm `SyncIoBridge` availability**
+1. **No consumer (YAGNI).** The worker owns plain process stdio and `serve_state` is already
+   synchronous. Wrapping stdio in tokio only to bridge it straight back to sync `BufRead`/`Write`
+   adds a runtime + blocking thread + shutdown/cancellation edge cases for **zero** user-visible
+   capability. The async consumer that *justifies* `SyncIoBridge` is the **iroh QUIC bridge in
+   P2** (§5.3) — not today's stdin/stdout worker.
+2. **Correctness hazard.** Per tokio's own docs, `Handle::block_on` does **not** drive the I/O
+   driver on a `current_thread` runtime unless another thread is concurrently driving it with
+   `Runtime::block_on`. So `SyncIoBridge` from a `spawn_blocking` thread under a current-thread
+   runtime is fragile/deadlock-prone. It only works cleanly under the **multi-thread** runtime
+   the node will already have in P2.
+3. **Industry standard.** `SyncIoBridge` is for consuming *async* byte streams from sync code
+   when you're already in an async system; `spawn_blocking` is for work that *finishes*, not a
+   long-lived blocking loop. Neither applies to the P0 worker.
 
-Run: `rg -n "tokio_util|tokio-util" Cargo.toml`
-If `tokio-util` is absent or lacks the `io` feature, add to `Cargo.toml [dependencies]`:
+**Where it goes instead:** P2's node DATA path bridges async iroh `RecvStream`/`SendStream`
+into the unchanged `serve_state` via `SyncIoBridge` (one per worker stream) inside
+`spawn_blocking`, under the node's **multi-thread** runtime — exactly §5.3. That is its real,
+testable-end-to-end home. The roadmap's P2 entry is updated to own this.
 
-```toml
-tokio-util = { version = "0.7", features = ["io"] }
-```
+**P0 keeps `worker_main` as pure `std::io`** (unchanged). The genuinely reusable, now-proven
+P0 assets are `actor.rs` (`Actor`/`spawn_actor`) + `ReplyDemux` (adopted by `Supervisor`).
 
-(Verify the workspace's pinned tokio-util version with `cargo tree -p tokio-util 2>/dev/null | head -1` and match it.)
-
-- [ ] **Step 2: Run the baseline worker tests (capture green state)**
-
-Run: `cargo test --lib worker:: 2>&1 | tail -15 && cargo test --test worker_roundtrip 2>&1 | tail -15`
-Expected: PASS (record counts).
-
-- [ ] **Step 3: Rewrite `worker_main` to the runtime bridge**
-
-Replace `worker_main` (`worker/mod.rs:41-46`) with:
-
-```rust
-pub fn worker_main() {
-    engine::llamacpp::logging::install_worker_logging();
-
-    // Minimal current-thread tokio runtime: the worker stays a separate, crash-isolated
-    // process; it just rides the same async runtime as the rest of higgs. The blocking
-    // FFI (engine.chat) runs inside spawn_blocking, off the runtime's reactor thread.
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("higgs worker: failed to build tokio runtime");
-
-    runtime.block_on(async {
-        let stdin = tokio::io::stdin();
-        let stdout = tokio::io::stdout();
-        // Bridge async stdio → the unchanged sync serve_state (std::io BufRead/Write),
-        // running the whole sync serve loop on a blocking thread (§5.3 preview).
-        let handle = tokio::task::spawn_blocking(move || {
-            let reader = std::io::BufReader::new(tokio_util::io::SyncIoBridge::new(stdin));
-            let writer = tokio_util::io::SyncIoBridge::new(stdout);
-            serve(reader, writer);
-        });
-        let _ = handle.await;
-    });
-}
-```
-
-> `serve` (`:49-51`) takes `impl BufRead, impl Write`. `SyncIoBridge<R: AsyncRead>` impls `std::io::Read`; wrap it in `BufReader` to get `BufRead`. `SyncIoBridge<W: AsyncWrite>` impls `std::io::Write` directly. **`SyncIoBridge` must be constructed/used inside `spawn_blocking`** (its calls block the thread). Do not touch `serve`/`serve_state`/`WorkerState`.
-
-- [ ] **Step 4: Build**
-
-Run: `cargo build 2>&1 | tail -20`
-Expected: clean compile.
-
-- [ ] **Step 5: Run the worker tests + integration roundtrip — unchanged, all green**
-
-Run: `cargo test --lib worker:: 2>&1 | tail -15 && cargo test --test worker_roundtrip 2>&1 | tail -15`
-Expected: PASS, same counts as Step 2. `tests/worker_roundtrip.rs` re-execs the real binary and drives `worker_main()` on real pipes (M_STATUS + M_SHUTDOWN) — this exercises the new runtime path end to end.
-
-- [ ] **Step 6: Full gate**
-
-Run: `scripts/coverage.sh 2>&1 | tail -15`
-Expected: PASS, ≥ 90%.
-
-- [ ] **Step 7: Lint + codex review loop + commit**
-
-Run: `cargo clippy --all-targets 2>&1 | tail -20` → no new warnings. Run the codex review loop until convergence. Then:
-
-```bash
-git add src/worker/mod.rs Cargo.toml Cargo.lock
-git commit -m "refactor(worker): run worker_main on tokio + spawn_blocking via SyncIoBridge (§5.3 preview)"
-```
+_No code, build, or test action for this task — it is intentionally empty._
 
 ---
 
@@ -493,10 +443,10 @@ Expected: no warnings.
 - [ ] **Step 3: Confirm the P0 contract**
 
 Verify by inspection / `git diff main --stat`:
-- No public signature on `Supervisor` / `Higgs` / `worker` changed (only internals + `worker_main` body).
-- No wire/NDJSON change.
+- No public signature on `Supervisor` / `Higgs` / `worker` changed (only internals).
+- No wire/NDJSON change. `worker_main` is unchanged (worker port deferred to P2).
 - `src/actor.rs` exists with `trait Actor`, `spawn_actor`, `ReplyDemux`, all unit-tested.
-- `Supervisor` uses `ReplyDemux`; `Worker` runs on the tokio runtime.
+- `Supervisor` uses `ReplyDemux`.
 
 - [ ] **Step 4: Smoke the real binary (optional but recommended)**
 
@@ -515,7 +465,8 @@ git commit -m "docs(plan): P0 actor runtime complete; roadmap updated"
 
 ## Self-Review (against the spec §2.5 + §10-P0)
 
-- **Spec coverage:** §2.5 "one shared `actor` module, written once" → Task 1 (`trait Actor`+`spawn_actor`). §2.5 "reply-demux ... written once and shared" → Task 2 (`ReplyDemux`) + Task 3 (Supervisor adopts it). §10-P0 "port Worker (minimal tokio runtime + spawn_blocking FFI) so Supervisor + Worker share ONE runtime" → Task 4. §10-P0 "existing supervisor + worker tests stay green ... no behaviour change, no duplicated loop" → the P0 contract + Tasks 3/4 baseline-vs-after checks + Task 5.
+- **Spec coverage:** §2.5 "one shared `actor` module, written once" → Task 1 (`trait Actor`+`spawn_actor`). §2.5 "reply-demux ... written once and shared" → Task 2 (`ReplyDemux`) + Task 3 (Supervisor adopts it). §10-P0 "existing supervisor + worker tests stay green ... no behaviour change, no duplicated loop" → the P0 contract + Task 3 baseline-vs-after checks + Task 5.
+- **Deferred to P2 (YAGNI + correctness, validated by codex):** The worker port (§10-P0 "port Worker ... minimal tokio runtime + spawn_blocking FFI") moves to P2 — see Task 4 above. The §5.3 `SyncIoBridge` bridge has no consumer until the node bridges iroh streams, and is unsound under a current-thread runtime; P2's multi-thread node runtime is its correct home.
 - **Deferred (YAGNI, honestly flagged):** The typed `spawn_actor` *mailbox* gets its first real consumers — `NodeRuntime` and the per-node transport — in P2/P3, where genuinely new actors exist. P0 writes `spawn_actor` once and proves it with a unit test (Task 1) rather than forcing Supervisor's already-working reader/writer tasks into a typed-message rewrite that would risk the no-behaviour-change contract for no functional gain. `ReplyDemux` *is* consumed now (Task 3). This matches the spec's "reuse `Supervisor` as the per-worker unit (unchanged)" intent.
 - **Placeholder scan:** none — every code step has real code.
 - **Type consistency:** `ReplyDemux` methods (`register_pending`/`remove_pending`/`correlate`/`fail_all_pending`/`register_sink`/`remove_sink`/`route_chunk`) are used with identical names in Tasks 2 and 3. `spawn_actor`/`Handle::send` consistent across Task 1.
