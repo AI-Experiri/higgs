@@ -13,7 +13,7 @@
 //! ## Wiring
 //!
 //! The bus is created by the caller (the embedded server's `main`, or the
-//! standalone `higgs-server` binary), BEFORE the tracing subscriber is built,
+//! standalone `higgs` binary), BEFORE the tracing subscriber is built,
 //! then shared two ways:
 //!
 //! ```text

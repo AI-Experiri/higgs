@@ -69,7 +69,7 @@ sysinfo = "0.32"
 # Recovery). limit: caps request-body size (MAX_BODY_BYTES). timeout: bounds
 # non-streaming control routes only — never the SSE chat stream.
 tower-http = { version = "0.6", features = ["cors", "catch-panic", "limit", "timeout"] }
-# Structured logs for the `higgs-server` binary.
+# Structured logs for the `higgs` binary.
 tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 
 [dev-dependencies]
@@ -79,7 +79,7 @@ tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
-# HTTP client for the black-box integration tests (spawn higgs-server, drive /v1
+# HTTP client for the black-box integration tests (spawn higgs, drive /v1
 # + /api/higgs over real HTTP). rustls to avoid a system OpenSSL dependency.
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 # SIGTERM the spawned server for graceful shutdown (so its coverage profile

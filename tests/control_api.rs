@@ -1,6 +1,6 @@
 //! Black-box integration test for higgs's `/api/higgs/*` control surface.
 //!
-//! Spawns the real `higgs-server` binary and drives the full control lifecycle
+//! Spawns the real `higgs` binary and drives the full control lifecycle
 //! over HTTP against an on-disk Nemotron model: scan → load → status/models →
 //! version/logs/by-id → unload. `#[ignore]` because it loads a multi-GB GGUF;
 //! run with `cargo test -p higgs --test control_api -- --ignored`.
@@ -10,7 +10,7 @@ mod common;
 use common::{nemotron_id, spawn};
 
 #[tokio::test]
-#[ignore = "integration: spawns higgs-server + loads a real GGUF (run with --ignored)"]
+#[ignore = "integration: spawns higgs + loads a real GGUF (run with --ignored)"]
 async fn control_api_lifecycle() {
     let srv = spawn(11500).await;
     let c = reqwest::Client::new();

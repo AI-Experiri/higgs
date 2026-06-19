@@ -1,6 +1,6 @@
 //! Black-box integration test for higgs's OpenAI `/v1/*` inference surface.
 //!
-//! Spawns the real `higgs-server`, loads a Nemotron model, and exercises chat
+//! Spawns the real `higgs`, loads a Nemotron model, and exercises chat
 //! (non-streaming + streaming) and tool calling (non-streaming + streaming)
 //! plus `/v1/models`. `#[ignore]` because it loads a multi-GB GGUF and runs real
 //! generation; run with `cargo test -p higgs --test inference -- --ignored`.
@@ -27,7 +27,7 @@ fn weather_tool() -> Value {
 }
 
 #[tokio::test]
-#[ignore = "integration: spawns higgs-server + loads a real GGUF, runs generation (run with --ignored)"]
+#[ignore = "integration: spawns higgs + loads a real GGUF, runs generation (run with --ignored)"]
 async fn inference_and_tools() {
     let srv = spawn(11501).await;
     let c = reqwest::Client::new();

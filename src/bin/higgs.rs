@@ -1,4 +1,4 @@
-//! `higgs-server` — the standalone higgs runtime as its own process.
+//! `higgs` — the standalone higgs runtime as its own process.
 //!
 //! higgs is a self-contained local-model server (OpenAI `/v1/*` + its own
 //! `/api/higgs/*` control surface). It owns its whole HTTP surface on its own
@@ -15,8 +15,8 @@
 //!   RUST_LOG     tracing filter    (default `info`)
 //!
 //! ```text
-//! higgs-server                       # 127.0.0.1:11434
-//! HIGGS_BIND=0.0.0.0 HIGGS_PORT=1234 higgs-server   # LAN-reachable on :1234
+//! higgs                       # 127.0.0.1:11434
+//! HIGGS_BIND=0.0.0.0 HIGGS_PORT=1234 higgs   # LAN-reachable on :1234
 //! ```
 
 use std::sync::Arc;
@@ -100,12 +100,12 @@ fn main() {
             .await
             .unwrap_or_else(|e| panic!("bind {addr}: {e}"));
 
-        tracing::info!(%addr, "higgs-server listening — /v1 (OpenAI) + /api/higgs (control)");
+        tracing::info!(%addr, "higgs listening — /v1 (OpenAI) + /api/higgs (control)");
         // Graceful shutdown on SIGTERM/Ctrl-C: drain requests, then stop the
         // worker. The crate owns the shutdown semantics (serve_with_shutdown).
         if let Err(e) = higgs::serve::serve_with_shutdown(higgs, listener, shutdown_signal()).await
         {
-            tracing::error!(error = %e, "higgs-server serve failed");
+            tracing::error!(error = %e, "higgs serve failed");
             std::process::exit(1);
         }
     });

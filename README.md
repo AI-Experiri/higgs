@@ -8,7 +8,7 @@
 
 higgs is jigglebot's in-app local model runtime. It is a standalone Rust crate — it imports nothing from any other jigglebot crate. Point it at a directory of GGUF files and it runs OpenAI-compatible inference in the same process, accessible over a regular HTTP server.
 
-In production, higgs runs **embedded in-process** inside the jigglebot server: the `backend/server/src/higgs/` launcher owns the `Arc<Higgs>` and serves higgs's own router on an ephemeral `127.0.0.1` port. The standalone `higgs-server` binary still exists, but only for dev / standalone use. Either way, the control surface (router + facade) is pure Rust and cannot crash the host — only the worker is a separate process.
+In production, higgs runs **embedded in-process** inside the jigglebot server: the `backend/server/src/higgs/` launcher owns the `Arc<Higgs>` and serves higgs's own router on an ephemeral `127.0.0.1` port. The standalone `higgs` binary still exists, but only for dev / standalone use. Either way, the control surface (router + facade) is pure Rust and cannot crash the host — only the worker is a separate process.
 
 The inference engine (llama.cpp) runs inside a **worker process** created by re-executing the host binary with `--higgs-worker`. The worker speaks newline-delimited JSON-RPC 2.0 on stdio. The worker is **spawned on load and killed on unload**: with nothing loaded there is zero worker process (zero idle RAM); loading a model spawns exactly one worker named `higgs(<model>)`. If a live worker crashes mid-use, the supervisor restarts it once and replays the last load, so the model is available again without host intervention. Model scanning runs host-side (pure Rust, no worker), so the model list is always available even with no worker.
 

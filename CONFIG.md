@@ -25,20 +25,20 @@ and seeded as a runtime-only provider — see
 embedded path reads no `HIGGS_*` env vars and binds no fixed port (so it never
 collides with a separately-running higgs/Ollama on 11434).
 
-**Standalone / dev: the `higgs-server` binary** (`src/bin/higgs-server.rs`) runs
+**Standalone / dev: the `higgs` binary** (`src/bin/higgs.rs`) runs
 higgs as its own process with a fixed bind/port. It is NOT the production path.
 It reads three environment variables; everything else comes from
 `HiggsConfig::default()` (there is no config file at this layer).
 
 | Env var | Default | Effect | Where |
 |---------|---------|--------|-------|
-| `HIGGS_BIND` | `127.0.0.1` | Bind address. A non-loopback value (`0.0.0.0`, a LAN IP) exposes the **no-auth** surface LAN-wide and logs a prominent `tracing::warn!` SECURITY WARNING at startup. | `higgs-server` only |
-| `HIGGS_PORT` | `11434` | Listen port. | `higgs-server` only |
+| `HIGGS_BIND` | `127.0.0.1` | Bind address. A non-loopback value (`0.0.0.0`, a LAN IP) exposes the **no-auth** surface LAN-wide and logs a prominent `tracing::warn!` SECURITY WARNING at startup. | `higgs` only |
+| `HIGGS_PORT` | `11434` | Listen port. | `higgs` only |
 | `RUST_LOG` | `info` | tracing filter. | both |
 
 ```sh
-higgs-server                                      # 127.0.0.1:11434 (standalone)
-HIGGS_BIND=0.0.0.0 HIGGS_PORT=1234 higgs-server   # LAN-reachable on :1234
+higgs                                      # 127.0.0.1:11434 (standalone)
+HIGGS_BIND=0.0.0.0 HIGGS_PORT=1234 higgs   # LAN-reachable on :1234
 ```
 
 A host that embeds the crate directly (as jigglebot does) constructs its own
@@ -49,7 +49,7 @@ defaults.
 
 ## HiggsConfig Fields
 
-Defaults from `HiggsConfig::default()` — what the `higgs-server` binary uses.
+Defaults from `HiggsConfig::default()` — what the `higgs` binary uses.
 An embedding host may override any field when it constructs `HiggsConfig`.
 
 | Field | Type | Default | Notes |

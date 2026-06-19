@@ -865,7 +865,7 @@ behind the same hardening stack.
 
 ### Non-loopback bind: SECURITY WARNING
 
-The standalone `higgs-server` binary honors `HIGGS_BIND`. A **non-loopback**
+The standalone `higgs` binary honors `HIGGS_BIND`. A **non-loopback**
 value (e.g. `0.0.0.0`) is allowed but logs a prominent startup **SECURITY
 WARNING**: higgs has no auth, and the Host guard + CORS only protect *browser*
 clients — any non-browser client on the network can reach the API directly. The

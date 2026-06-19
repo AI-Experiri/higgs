@@ -231,7 +231,7 @@ fn host_allowed(headers: &HeaderMap) -> Result<(), String> {
 /// `localhost`, any IPv4 in `127.0.0.0/8`, or IPv6 `::1` / `[::1]`. The host
 /// portion is the part before the final `:port`, with IPv6 brackets handled
 /// (`[::1]:11434`). The `127.0.0.0/8` acceptance matches `is_loopback_bind` in
-/// the `higgs-server` binary, so any loopback bind the binary permits without a
+/// the `higgs` binary, so any loopback bind the binary permits without a
 /// warning is also reachable through the Host guard.
 fn is_loopback_host(host_port: &str) -> bool {
     // Bracketed IPv6: `[::1]` or `[::1]:port`.
@@ -261,7 +261,7 @@ fn is_loopback_host(host_port: &str) -> bool {
 /// Serve the higgs router on `listener`, shutting down **gracefully** when
 /// `shutdown` resolves: in-flight requests drain, then the worker is stopped
 /// via [`Higgs::stop`]. The single graceful-shutdown entry point for any host —
-/// the `higgs-server` binary wires it to SIGTERM/Ctrl-C; tests pass their own
+/// the `higgs` binary wires it to SIGTERM/Ctrl-C; tests pass their own
 /// future. Returns the serve I/O error, if any.
 pub async fn serve_with_shutdown(
     higgs: Arc<Higgs>,
