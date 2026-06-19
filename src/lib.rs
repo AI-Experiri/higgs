@@ -13,6 +13,7 @@ mod ts_export;
 
 pub mod actor;
 pub mod api;
+pub mod auth;
 pub mod diagnostic;
 pub mod home;
 pub mod node;
