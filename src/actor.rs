@@ -64,12 +64,10 @@ pub(crate) fn spawn_actor<A: Actor>(mut state: A) -> Handle<A::Msg> {
 /// NOT use this. Internally `Arc`-shared so a read-loop and the calling tasks see one
 /// map. See `DESIGN-remote.md` §2.5.
 #[derive(Clone)]
-#[allow(dead_code)] // consumed by Supervisor in the next task (P0 Task 3)
 pub(crate) struct ReplyDemux {
     inner: Arc<DemuxInner>,
 }
 
-#[allow(dead_code)] // consumed by Supervisor in the next task (P0 Task 3)
 struct DemuxInner {
     /// Request id → response waiter (RPC correlation).
     pending: Mutex<HashMap<u64, oneshot::Sender<RpcResponse>>>,
@@ -77,7 +75,6 @@ struct DemuxInner {
     chat_sinks: Mutex<HashMap<u64, mpsc::UnboundedSender<String>>>,
 }
 
-#[allow(dead_code)] // consumed by Supervisor in the next task (P0 Task 3)
 impl ReplyDemux {
     pub(crate) fn new() -> Self {
         ReplyDemux {
@@ -130,6 +127,23 @@ impl ReplyDemux {
         if let Some(tx) = self.inner.chat_sinks.lock().get(&request_id) {
             let _ = tx.send(delta.to_string());
         }
+    }
+
+    /// Death: drop every chat sink, closing each receiver (ends in-flight streams).
+    pub(crate) fn clear_sinks(&self) {
+        self.inner.chat_sinks.lock().clear();
+    }
+
+    /// Number of live chat sinks (in-flight streaming requests; test introspection).
+    #[cfg(test)]
+    pub(crate) fn active_sink_count(&self) -> usize {
+        self.inner.chat_sinks.lock().len()
+    }
+
+    /// Number of outstanding pending requests (test introspection only).
+    #[cfg(test)]
+    pub(crate) fn pending_count(&self) -> usize {
+        self.inner.pending.lock().len()
     }
 }
 

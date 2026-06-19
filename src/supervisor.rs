@@ -29,7 +29,6 @@
 //! serialises concurrent callers onto the single writer task — same pattern as
 //! rmcp's `TokioChildProcess` / LSP client writers.
 
-use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -38,7 +37,7 @@ use parking_lot::Mutex;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc};
 use tracing::{info, warn};
 
 use crate::diagnostic::HiggsError;
@@ -150,21 +149,14 @@ type HalvesFactory =
 
 /// Shared supervisor state.
 struct Inner {
-    /// Pending request id → oneshot reply channel.
-    /// Lock held for insert/remove only — never across `.await`.
-    pending: Mutex<HashMap<u64, oneshot::Sender<rpc::RpcResponse>>>,
-    /// Per-request chat-chunk sinks keyed by the M_CHAT request id.
-    ///
-    /// When the worker emits an `N_CHAT_CHUNK` notification it echoes the
-    /// `request_id` from the original M_CHAT params.  Each concurrent caller
-    /// registers its own `mpsc::unbounded_channel` here before sending the
-    /// M_CHAT request; `route_notification` delivers each delta to the
-    /// matching sink.  Sinks are removed on completion or error.
-    ///
-    /// Worker execution is still serialised (single-threaded stdin loop); the
-    /// map just ensures each caller gets ONLY its own deltas with no clobber.
-    /// Lock held for insert/remove/lookup only — never across `.await`.
-    chat_sinks: Mutex<HashMap<u64, mpsc::UnboundedSender<String>>>,
+    /// RPC reply-demux: request-id → response correlation, plus per-request
+    /// chat-chunk sinks keyed by the M_CHAT `request_id`. The shared
+    /// [`crate::actor::ReplyDemux`] (the same demux the per-node iroh transport
+    /// reuses in P3). Each concurrent caller registers its own sink before sending
+    /// M_CHAT, so the worker's echoed-`request_id` `N_CHAT_CHUNK` notifications
+    /// route to ONLY that caller — worker execution stays serialised, the demux
+    /// just prevents cross-caller clobber.
+    demux: crate::actor::ReplyDemux,
     /// Monotonically increasing request id counter.
     next_id: AtomicU64,
     /// Broadcast channel for lifecycle events (cap 64).
@@ -230,8 +222,7 @@ impl Supervisor {
     pub(crate) fn spawn(bus: Arc<LogBus>) -> Self {
         let (events_tx, _) = broadcast::channel(64);
         let inner = Arc::new(Inner {
-            pending: Mutex::new(HashMap::new()),
-            chat_sinks: Mutex::new(HashMap::new()),
+            demux: crate::actor::ReplyDemux::new(),
             next_id: AtomicU64::new(1),
             events_tx,
             bus,
@@ -253,8 +244,7 @@ impl Supervisor {
     pub(crate) fn with_factory(factory: HalvesFactory) -> Self {
         let (events_tx, _) = broadcast::channel(64);
         let inner = Arc::new(Inner {
-            pending: Mutex::new(HashMap::new()),
-            chat_sinks: Mutex::new(HashMap::new()),
+            demux: crate::actor::ReplyDemux::new(),
             next_id: AtomicU64::new(1),
             events_tx,
             bus: Arc::new(LogBus::new()),
@@ -359,7 +349,7 @@ impl Supervisor {
             Err(_) => {
                 // Timed out: drop the orphaned pending entry so it doesn't leak,
                 // and surface a worker-unavailable error rather than hanging.
-                self.inner.pending.lock().remove(&id);
+                self.inner.demux.remove_pending(id);
                 warn!(method, "higgs: control RPC timed out");
                 Err(HiggsError::WorkerDead {
                     context: format!("{method} timed out after {CONTROL_RPC_TIMEOUT:?}"),
@@ -384,7 +374,7 @@ impl Supervisor {
         match tokio::time::timeout(CHAT_RPC_TIMEOUT, self.send_request(id, method, params)).await {
             Ok(result) => result,
             Err(_) => {
-                self.inner.pending.lock().remove(&id);
+                self.inner.demux.remove_pending(id);
                 warn!(method, "higgs: chat RPC timed out");
                 Err(HiggsError::ChatTimeout {
                     elapsed: CHAT_RPC_TIMEOUT,
@@ -400,9 +390,7 @@ impl Supervisor {
     /// channel and their own deltas routed independently.  The caller must
     /// call [`remove_chat_sink`](Self::remove_chat_sink) when done.
     pub(crate) fn register_chat_sink(&self, request_id: u64) -> mpsc::UnboundedReceiver<String> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        self.inner.chat_sinks.lock().insert(request_id, tx);
-        rx
+        self.inner.demux.register_sink(request_id)
     }
 
     /// Remove the chat-chunk sink for `request_id`.
@@ -410,7 +398,7 @@ impl Supervisor {
     /// Called on completion or error to release the map entry.  The dropped
     /// sender closes the receiver, signalling end-of-stream to the consumer.
     pub(crate) fn remove_chat_sink(&self, request_id: u64) {
-        self.inner.chat_sinks.lock().remove(&request_id);
+        self.inner.demux.remove_sink(request_id);
     }
 
     /// Drive one chat (M_CHAT) request end to end, owning the full RPC plumbing.
@@ -681,7 +669,7 @@ impl Supervisor {
     /// Return the number of active chat sinks (for test introspection).
     #[cfg(test)]
     pub(crate) fn chat_sinks_count(&self) -> usize {
-        self.inner.chat_sinks.lock().len()
+        self.inner.demux.active_sink_count()
     }
 
     // ── private ──────────────────────────────────────────────────────────────
@@ -697,10 +685,7 @@ impl Supervisor {
         method: &str,
         params: Value,
     ) -> Result<Value, HiggsError> {
-        let (tx, rx) = oneshot::channel();
-        {
-            self.inner.pending.lock().insert(id, tx);
-        }
+        let rx = self.inner.demux.register_pending(id);
         let line = rpc::encode(&RpcFrame::Request(RpcRequest {
             jsonrpc: "2.0".into(),
             id,
@@ -717,7 +702,7 @@ impl Supervisor {
             }
         };
         if send_result.is_err() {
-            self.inner.pending.lock().remove(&id);
+            self.inner.demux.remove_pending(id);
             return Err(HiggsError::WorkerDead {
                 context: "no worker running".into(),
             });
@@ -1109,24 +1094,17 @@ fn install_writer(inner: &Arc<Inner>, write: WriteHalf) {
 /// Decode one line and dispatch to the appropriate handler.
 fn dispatch(inner: &Arc<Inner>, line: &str) {
     match rpc::decode(line) {
-        Ok(RpcFrame::Response(resp)) => correlate(inner, resp),
+        Ok(RpcFrame::Response(resp)) => inner.demux.correlate(resp),
         Ok(RpcFrame::Notification(notif)) => route_notification(inner, &notif),
         Ok(RpcFrame::Request(_)) => { /* workers never send requests */ }
         Err(e) => warn!(error = %e, "higgs: dropped malformed worker line"),
     }
 }
 
-/// Route a response to the waiting oneshot by id.
-fn correlate(inner: &Arc<Inner>, resp: rpc::RpcResponse) {
-    if let Some(tx) = inner.pending.lock().remove(&resp.id) {
-        let _ = tx.send(resp);
-    }
-}
-
 /// Route a `higgs/chat/chunk` notification to the matching per-request sink.
 ///
 /// The notification params carry `request_id` (echoed from the M_CHAT request)
-/// and `delta`.  The sink map is looked up by `request_id`; if no entry exists
+/// and `delta`.  The demux is looked up by `request_id`; if no entry exists
 /// (sink already removed or unknown id) the chunk is silently dropped.
 fn route_notification(inner: &Arc<Inner>, notif: &RpcNotification) {
     if notif.method != N_CHAT_CHUNK {
@@ -1142,11 +1120,7 @@ fn route_notification(inner: &Arc<Inner>, notif: &RpcNotification) {
     let Some(delta) = notif.params.get("delta").and_then(|v| v.as_str()) else {
         return;
     };
-    let delta = delta.to_string();
-    let sinks = inner.chat_sinks.lock();
-    if let Some(tx) = sinks.get(&request_id) {
-        let _ = tx.send(delta);
-    }
+    inner.demux.route_chunk(request_id, delta);
 }
 
 /// Handle worker death: fail all pending requests, clear write channel, and
@@ -1157,15 +1131,12 @@ fn route_notification(inner: &Arc<Inner>, notif: &RpcNotification) {
 /// shutdown is not a death event). This enforces four-pillar pillar 3: log once
 /// at origin, not at every boundary that observes the same event.
 fn on_worker_death(inner: &Arc<Inner>, reason: Option<String>, deliberate: bool) {
-    // Drain and drop all pending senders — the rx.await in `request` sees Err.
-    let drained: Vec<_> = inner.pending.lock().drain().collect();
-    for (_id, tx) in drained {
-        drop(tx);
-    }
+    // Fail all pending requests — the rx.await in `request` sees Err.
+    inner.demux.fail_all_pending();
     // Drop the write sender — the writer task exits when channel closes.
     *inner.write_tx.lock() = None;
     // Drop all chat sinks — closes each receiver, ending all in-flight streams.
-    inner.chat_sinks.lock().clear();
+    inner.demux.clear_sinks();
 
     if deliberate {
         // Clean stop: no event, no warn — the shutdown was requested.
@@ -1234,8 +1205,7 @@ async fn replay_rpc_await(
     params: Value,
 ) -> Result<Value, HiggsError> {
     let id = inner.next_id.fetch_add(1, Ordering::Relaxed);
-    let (tx, rx) = oneshot::channel();
-    inner.pending.lock().insert(id, tx);
+    let rx = inner.demux.register_pending(id);
 
     let line = rpc::encode(&RpcFrame::Request(RpcRequest {
         jsonrpc: "2.0".into(),
@@ -1252,7 +1222,7 @@ async fn replay_rpc_await(
         }
     };
     if send_result.is_err() {
-        inner.pending.lock().remove(&id);
+        inner.demux.remove_pending(id);
         return Err(HiggsError::WorkerDead {
             context: format!("replay {method}: no worker running"),
         });
@@ -1285,7 +1255,7 @@ async fn replay_rpc_await(
             context: format!("replay {method}: worker died before response"),
         }),
         Err(_) => {
-            inner.pending.lock().remove(&id);
+            inner.demux.remove_pending(id);
             warn!(method, "higgs: replay RPC timed out");
             Err(HiggsError::WorkerDead {
                 context: format!("replay {method} timed out after {CONTROL_RPC_TIMEOUT:?}"),
@@ -1651,9 +1621,8 @@ mod tests {
 
         // Register a pending request directly (bypass the network send so
         // the pending entry exists before EOF arrives).
-        let (reply_tx, reply_rx) = oneshot::channel::<rpc::RpcResponse>();
         let pending_id = sup.inner.next_id.fetch_add(1, Ordering::Relaxed);
-        sup.inner.pending.lock().insert(pending_id, reply_tx);
+        let reply_rx = sup.inner.demux.register_pending(pending_id);
 
         // Give the reader task time to start.
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -1721,7 +1690,7 @@ mod tests {
         assert!(matches!(err, HiggsError::ChatTimeout { .. }), "got {err}");
         assert!(err.to_string().starts_with("[HG016]"));
         // The orphaned pending entry was removed (no leak).
-        assert!(sup.inner.pending.lock().is_empty());
+        assert_eq!(sup.inner.demux.pending_count(), 0);
     }
 
     // ─── Test 4: worker RPC error maps to HG009 ──────────────────────────────
@@ -2303,7 +2272,7 @@ mod tests {
         assert!(matches!(err, HiggsError::WorkerDead { .. }), "got {err}");
         assert!(err.to_string().contains("timed out"), "display: {err}");
         // Orphaned pending entry removed — no leak.
-        assert!(sup.inner.pending.lock().is_empty());
+        assert_eq!(sup.inner.demux.pending_count(), 0);
     }
 
     // ─── send_request(): worker dies before responding → WorkerDead ──────────
@@ -2325,11 +2294,10 @@ mod tests {
         });
         // Let the request register its pending entry + send its frame.
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-        // Drain the pending sender (what on_worker_death does on death) →
-        // dropping it closes the oneshot, so rx.await returns Err.
-        let drained: Vec<_> = sup.inner.pending.lock().drain().collect();
-        assert_eq!(drained.len(), 1, "exactly one pending request");
-        drop(drained);
+        // Fail the pending request (what on_worker_death does on death) →
+        // dropping its sender closes the oneshot, so rx.await returns Err.
+        assert_eq!(sup.inner.demux.pending_count(), 1, "exactly one pending request");
+        sup.inner.demux.fail_all_pending();
         let err = task.await.expect("task").expect_err("worker died before response");
         assert!(
             err.to_string().contains("worker died before response"),
@@ -2345,7 +2313,7 @@ mod tests {
         let sup = failing_supervisor();
         let err = sup.request("higgs/status", json!({})).await.unwrap_err();
         assert!(err.to_string().contains("[HG007]"), "display: {err}");
-        assert!(sup.inner.pending.lock().is_empty(), "pending must be cleaned");
+        assert_eq!(sup.inner.demux.pending_count(), 0, "pending must be cleaned");
     }
 
     // ─── do_spawn(): factory failure surfaces the error, running flag released ─
@@ -2411,7 +2379,7 @@ mod tests {
         dispatch(&sup.inner, "{not valid json");
         dispatch(&sup.inner, "");
         // Pending map untouched, no panic.
-        assert!(sup.inner.pending.lock().is_empty());
+        assert_eq!(sup.inner.demux.pending_count(), 0);
     }
 
     // ─── on_worker_death(): deliberate stop is silent; drains pending+sinks ───
@@ -2419,16 +2387,15 @@ mod tests {
     #[tokio::test]
     async fn on_worker_death_deliberate_is_silent() {
         let (sup, _tw, _tr) = make_supervisor();
-        // Seed a pending entry and a chat sink so the drain branches execute.
-        let (tx, rx) = oneshot::channel::<rpc::RpcResponse>();
-        sup.inner.pending.lock().insert(77, tx);
+        // Seed a pending entry and a chat sink so the clear branches execute.
+        let rx = sup.inner.demux.register_pending(77);
         let mut sink_rx = sup.register_chat_sink(88);
         assert_eq!(sup.chat_sinks_count(), 1);
 
         on_worker_death(&sup.inner, None, true);
 
-        // pending drained (oneshot closed), sinks cleared, write_tx None.
-        assert!(sup.inner.pending.lock().is_empty());
+        // pending failed (oneshot closed), sinks cleared, write_tx None.
+        assert_eq!(sup.inner.demux.pending_count(), 0);
         assert_eq!(sup.chat_sinks_count(), 0);
         assert!(sup.inner.write_tx.lock().is_none());
         assert!(rx.await.is_err(), "pending oneshot closed");
@@ -2522,7 +2489,7 @@ mod tests {
             .await
             .expect_err("no worker → WorkerDead");
         assert!(err.to_string().contains("no worker running"), "got {err}");
-        assert!(sup.inner.pending.lock().is_empty());
+        assert_eq!(sup.inner.demux.pending_count(), 0);
     }
 
     // ─── replay_rpc_await(): worker dies before response → WorkerDead ─────────
@@ -2533,10 +2500,9 @@ mod tests {
         let inner = Arc::clone(&sup.inner);
         let fut = tokio::spawn(async move { replay_rpc_await(&inner, M_LOAD, json!({})).await });
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        // Drain the pending sender so rx resolves Err (worker death simulation).
-        let drained: Vec<_> = sup.inner.pending.lock().drain().collect();
-        assert_eq!(drained.len(), 1);
-        drop(drained);
+        // Fail the pending request so rx resolves Err (worker death simulation).
+        assert_eq!(sup.inner.demux.pending_count(), 1);
+        sup.inner.demux.fail_all_pending();
         let err = fut.await.expect("task").expect_err("worker died");
         assert!(
             err.to_string().contains("worker died before response"),
@@ -2560,7 +2526,7 @@ mod tests {
         tokio::time::advance(CONTROL_RPC_TIMEOUT + std::time::Duration::from_secs(1)).await;
         let err = fut.await.expect("task").expect_err("must time out");
         assert!(err.to_string().contains("timed out"), "got {err}");
-        assert!(sup.inner.pending.lock().is_empty(), "orphan removed");
+        assert_eq!(sup.inner.demux.pending_count(), 0, "orphan removed");
     }
 
     // ─── replay_rpc_await(): worker RPC error → WorkerRpc with worker_code ────
