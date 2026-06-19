@@ -11,6 +11,7 @@
 #[macro_use]
 mod ts_export;
 
+pub mod actor;
 pub mod api;
 pub mod diagnostic;
 pub mod log_bus;
