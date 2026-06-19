@@ -9,10 +9,19 @@
 //! `--higgs-worker` (Chromium model). That flag is detected before anything
 //! touches stdout, because `worker_main()` owns stdin/stdout for NDJSON JSON-RPC.
 //!
+//! This `main()` is a THIN wrapper: it handles the `--higgs-worker` re-exec
+//! role, installs the tracing subscriber, parses the bind/port env, then hands
+//! off to [`higgs::run_standalone`], which owns the construct→start→bind→serve
+//! flow (and is unit-tested in-process — see `src/standalone.rs`).
+//!
 //! Configuration (env):
-//!   HIGGS_BIND   bind address      (default `127.0.0.1` — localhost only)
-//!   HIGGS_PORT   listen port       (default `11434`)
-//!   RUST_LOG     tracing filter    (default `info`)
+//!   HIGGS_BIND        bind address  (default `127.0.0.1` — localhost only)
+//!   HIGGS_PORT        listen port   (default `11434`)
+//!   HIGGS_MODEL_DIR   extra model scan root in LM-Studio layout
+//!                     (`<dir>/{org}/{model}/*.gguf`), appended to the default
+//!                     scan dirs. Lets an operator (or CI) point higgs at an
+//!                     arbitrary model directory without editing config.
+//!   RUST_LOG          tracing filter (default `info`)
 //!
 //! ```text
 //! higgs                       # 127.0.0.1:11434
@@ -21,8 +30,7 @@
 
 use std::sync::Arc;
 
-use higgs::{Higgs, HiggsConfig};
-use tokio::signal;
+use higgs::{run_standalone, shutdown_signal, HiggsConfig, StandaloneConfig};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::Layer;
@@ -37,7 +45,7 @@ fn main() {
 
     // Single home for Developer-Log lines: worker stderr + serve-layer events.
     // Created before the subscriber so the HiggsLogLayer and the Higgs facade
-    // can share it.
+    // (built inside run_standalone) can share it.
     let log_bus = Arc::new(higgs::LogBus::new());
     // Per-layer filters so the higgs log layer can admit higgs DEBUG (verbose
     // mode) without flooding fmt; info-level filter applied to fmt individually.
@@ -66,95 +74,36 @@ fn main() {
         }),
         Err(_) => 11434,
     };
-    let addr = format!("{bind}:{port}");
-
-    // SECURITY WARNING on a non-loopback bind (vllm's startup warning). higgs
-    // has NO auth — its control surface (`/api/higgs/*`) and OpenAI `/v1` are
-    // open to anyone who can reach the port. The DNS-rebinding Host guard + CORS
-    // only protect *browser* clients; a non-loopback bind exposes the surface to
-    // any non-browser client on the network. The embedded path always binds
-    // loopback — this only fires for the standalone bin.
-    if !is_loopback_bind(&bind) {
-        tracing::warn!(
-            %bind,
-            "SECURITY WARNING: higgs is binding to a NON-LOOPBACK address. The \
-             no-auth control + /v1 surface is exposed beyond localhost; CORS and \
-             the Host guard do not protect non-browser clients. Bind 127.0.0.1 \
-             unless you intend a LAN-reachable server."
-        );
-    }
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("build tokio runtime");
 
-    rt.block_on(async move {
-        let higgs = Arc::new(Higgs::with_log_bus(HiggsConfig::default(), log_bus));
-        if let Err(e) = higgs.start().await {
-            tracing::error!(error = %e, "higgs failed to start (worker spawn)");
-            std::process::exit(1);
+    // Optional extra scan root (operator/CI override). Appended as an LM-Studio
+    // root so a single `<dir>/{org}/{model}/*.gguf` tree is discovered without
+    // editing the default config dirs.
+    let mut higgs_config = HiggsConfig::default();
+    if let Ok(dir) = std::env::var("HIGGS_MODEL_DIR") {
+        if !dir.is_empty() {
+            tracing::info!(dir = %dir, "higgs: adding HIGGS_MODEL_DIR to LM-Studio scan roots");
+            higgs_config.lmstudio_dirs.push(std::path::PathBuf::from(dir));
         }
+    }
 
-        let listener = tokio::net::TcpListener::bind(&addr)
-            .await
-            .unwrap_or_else(|e| panic!("bind {addr}: {e}"));
-
-        tracing::info!(%addr, "higgs listening — /v1 (OpenAI) + /api/higgs (control)");
+    rt.block_on(async move {
+        let config = StandaloneConfig {
+            bind,
+            port,
+            higgs: higgs_config,
+            log_bus,
+        };
         // Graceful shutdown on SIGTERM/Ctrl-C: drain requests, then stop the
-        // worker. The crate owns the shutdown semantics (serve_with_shutdown).
-        if let Err(e) = higgs::serve::serve_with_shutdown(higgs, listener, shutdown_signal()).await
-        {
-            tracing::error!(error = %e, "higgs serve failed");
+        // worker. run_standalone owns construct→start→bind→serve; we render any
+        // failure and exit non-zero (it never calls process::exit itself).
+        if let Err(e) = run_standalone(config, shutdown_signal()).await {
+            tracing::error!(error = %e, "higgs failed");
             std::process::exit(1);
         }
     });
-}
-
-/// Whether `bind` names a loopback address (no security warning needed).
-/// Anything else (`0.0.0.0`, a LAN IP, a public IP, `::`) is non-loopback.
-fn is_loopback_bind(bind: &str) -> bool {
-    bind == "127.0.0.1"
-        || bind == "localhost"
-        || bind == "::1"
-        || bind == "[::1]"
-        || bind.starts_with("127.")
-}
-
-/// Resolve when the process is asked to terminate — SIGTERM (the standard
-/// supervisor/`kill` signal) or Ctrl-C. Graceful shutdown lets in-flight
-/// requests finish and runs normal at-exit handlers (which, under coverage
-/// instrumentation, flush this process's profile).
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        let _ = signal::ctrl_c().await;
-    };
-    #[cfg(unix)]
-    let terminate = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("install SIGTERM handler")
-            .recv()
-            .await;
-    };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::is_loopback_bind;
-
-    #[test]
-    fn loopback_bind_detection() {
-        for b in ["127.0.0.1", "localhost", "::1", "[::1]", "127.0.0.5"] {
-            assert!(is_loopback_bind(b), "{b} is loopback");
-        }
-        for b in ["0.0.0.0", "10.0.0.5", "192.168.1.10", "::", "203.0.113.1"] {
-            assert!(!is_loopback_bind(b), "{b} is non-loopback");
-        }
-    }
 }

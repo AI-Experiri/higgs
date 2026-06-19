@@ -16,6 +16,7 @@ pub mod diagnostic;
 pub mod log_bus;
 pub mod rpc;
 pub mod serve;
+pub mod standalone;
 pub mod supervisor;
 pub mod system;
 pub mod worker;
@@ -23,6 +24,7 @@ pub mod worker;
 pub use api::{Higgs, HiggsConfig};
 pub use diagnostic::HiggsError;
 pub use log_bus::{log_filter, HiggsLogLayer, LogBus};
+pub use standalone::{run_standalone, shutdown_signal, StandaloneConfig};
 pub use supervisor::HiggsEvent;
 
 /// The `llama-cpp-2` Rust binding crate version bundled with this build.

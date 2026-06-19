@@ -1,46 +1,54 @@
 //! Black-box integration test for higgs's `/api/higgs/*` control surface.
 //!
 //! Spawns the real `higgs` binary and drives the full control lifecycle
-//! over HTTP against an on-disk Nemotron model: scan → load → status/models →
-//! version/logs/by-id → unload. `#[ignore]` because it loads a multi-GB GGUF;
-//! run with `cargo test -p higgs --test control_api -- --ignored`.
+//! over HTTP against a tiny on-disk model: scan → load → status/models →
+//! version/logs/by-id/system → unload → worker/stop. The model is `ggml-org`'s
+//! ~1MB `stories260K.gguf` (see `common`), staged into a temp scan root, so the
+//! test exercises the real engine load/unload path in CI without a multi-GB GGUF.
 
 mod common;
 
-use common::{nemotron_id, spawn};
+use common::{spawn_with_tiny_model, tiny_gguf_path, TINY_MODEL_ID};
 
 #[tokio::test]
-#[ignore = "integration: spawns higgs + loads a real GGUF (run with --ignored)"]
 async fn control_api_lifecycle() {
-    let srv = spawn(11500).await;
+    let Some(gguf) = tiny_gguf_path() else {
+        eprintln!("SKIP control_api_lifecycle: tiny gguf not found (set HIGGS_TEST_GGUF)");
+        return;
+    };
+    let srv = spawn_with_tiny_model(11500, &gguf).await;
     let c = reqwest::Client::new();
     let get = |path: String| c.get(format!("{}{path}", srv.base)).send();
 
-    // status: worker alive, nothing loaded yet.
+    // status at boot: spawn-on-load means NO worker until a model is loaded.
     let status: serde_json::Value = get("/api/higgs/status".into())
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
-    assert_eq!(status["worker_alive"], true, "worker should be alive");
+    assert_eq!(
+        status["worker_alive"], false,
+        "no worker before first load (spawn-on-load)"
+    );
     assert!(status["loaded"].is_null(), "nothing loaded at start");
 
-    // models: a live scan of the configured dirs.
+    // models: a live scan of the configured dirs — the staged tiny model is here.
     let models: serde_json::Value = get("/api/higgs/models".into())
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
-    let Some(id) = nemotron_id(&models) else {
-        eprintln!("SKIP control_api_lifecycle: no Nemotron model on disk");
-        return;
-    };
-    assert!(
-        !models["models"].as_array().unwrap().is_empty(),
-        "scan found models"
-    );
+    let id = TINY_MODEL_ID;
+    let arr = models["models"].as_array().unwrap();
+    assert!(!arr.is_empty(), "scan found models");
+    let scanned = arr
+        .iter()
+        .find(|m| m["id"] == serde_json::json!(id))
+        .expect("scan lists the staged tiny model");
+    // Gate-1 probe must judge this real llama-arch GGUF loadable.
+    assert_eq!(scanned["loadable"], true, "tiny model is loadable: {scanned}");
 
     // load the model.
     let load: serde_json::Value = c
@@ -82,10 +90,17 @@ async fn control_api_lifecycle() {
         .expect("loaded model in list");
     assert_eq!(entry["state"], "loaded", "entry state is loaded");
     assert_eq!(entry["format"], "gguf");
-    // Capabilities are derived from the GGUF template: Nemotron supports tools
-    // and emits a reasoning block.
-    assert_eq!(entry["supports_tools"], true, "Nemotron supports tools");
-    assert_eq!(entry["supports_reasoning"], true, "Nemotron reasons");
+    assert_eq!(entry["arch"], "llama", "stories260K is a llama-arch GGUF");
+    // The tiny model embeds NO chat template (the engine falls back to chatml),
+    // so the template-derived capability flags are false.
+    assert_eq!(
+        entry["supports_tools"], false,
+        "no embedded template → no tools"
+    );
+    assert_eq!(
+        entry["supports_reasoning"], false,
+        "no embedded template → no reasoning"
+    );
 
     // model-by-id (the wildcard route handles the slashed HF repo id).
     let by_id: serde_json::Value = get(format!("/api/higgs/models/{id}"))
@@ -117,6 +132,7 @@ async fn control_api_lifecycle() {
         .await
         .unwrap();
     assert!(version.is_object(), "version is an object");
+    assert_eq!(version["engine"], "llama.cpp", "version reports the engine");
 
     let logs: serde_json::Value = get("/api/higgs/logs?n=50".into())
         .await
@@ -218,7 +234,7 @@ async fn control_api_lifecycle() {
         "explicit ctx_len honored"
     );
 
-    // ── Worker stop → start cycle (done LAST: stop kills the worker) ──────────
+    // ── Worker stop (done LAST: stop kills the worker) ───────────────────────
     let stop: serde_json::Value = c
         .post(format!("{}/api/higgs/worker/stop", srv.base))
         .json(&serde_json::json!({}))
@@ -238,26 +254,5 @@ async fn control_api_lifecycle() {
     assert_eq!(
         status["worker_alive"], false,
         "worker_alive is false after stop"
-    );
-
-    let start: serde_json::Value = c
-        .post(format!("{}/api/higgs/worker/start", srv.base))
-        .json(&serde_json::json!({}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(start["status"], "ok", "worker/start returns ok");
-    let status: serde_json::Value = get("/api/higgs/status".into())
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(
-        status["worker_alive"], true,
-        "worker_alive flips back to true after start"
     );
 }

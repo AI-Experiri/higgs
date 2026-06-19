@@ -1,16 +1,23 @@
 //! Black-box integration test for higgs's OpenAI `/v1/*` inference surface.
 //!
-//! Spawns the real `higgs`, loads a Nemotron model, and exercises chat
-//! (non-streaming + streaming) and tool calling (non-streaming + streaming)
-//! plus `/v1/models`. `#[ignore]` because it loads a multi-GB GGUF and runs real
-//! generation; run with `cargo test -p higgs --test inference -- --ignored`.
+//! Spawns the real `higgs`, loads a tiny on-disk model, and exercises chat
+//! (non-streaming + streaming) plus `/v1/models` and the request-validation
+//! paths. The model is `ggml-org`'s ~1MB `stories260K.gguf` (see `common`): a
+//! real llama-arch toy GGUF that loads and generates, so the full template →
+//! tokenize → decode → detokenize engine path is covered in CI.
+//!
+//! The tiny model embeds NO chat template (the engine falls back to chatml) and
+//! has no tool-call training, so tool calling is covered at the REQUEST-path
+//! level — tools are offered and accepted, the response is well-formed, and no
+//! tool-call markup leaks into the stream — without asserting the toy model
+//! emits a real structured call (which only a tool-trained model would).
 
 mod common;
 
-use common::{nemotron_id, spawn};
+use common::{spawn_with_tiny_model, tiny_gguf_path, TINY_MODEL_ID};
 use serde_json::{json, Value};
 
-/// The get_weather tool used by the tool-calling assertions.
+/// The get_weather tool used by the tool-path assertions.
 fn weather_tool() -> Value {
     json!({
         "type": "function",
@@ -27,12 +34,16 @@ fn weather_tool() -> Value {
 }
 
 #[tokio::test]
-#[ignore = "integration: spawns higgs + loads a real GGUF, runs generation (run with --ignored)"]
 async fn inference_and_tools() {
-    let srv = spawn(11501).await;
+    let Some(gguf) = tiny_gguf_path() else {
+        eprintln!("SKIP inference_and_tools: tiny gguf not found (set HIGGS_TEST_GGUF)");
+        return;
+    };
+    let srv = spawn_with_tiny_model(11501, &gguf).await;
     let c = reqwest::Client::new();
+    let id = TINY_MODEL_ID;
 
-    // Load Nemotron (or skip if it isn't installed).
+    // The staged tiny model is discoverable via the live scan.
     let models: Value = c
         .get(format!("{}/api/higgs/models", srv.base))
         .send()
@@ -41,10 +52,14 @@ async fn inference_and_tools() {
         .json()
         .await
         .unwrap();
-    let Some(id) = nemotron_id(&models) else {
-        eprintln!("SKIP inference_and_tools: no Nemotron model on disk");
-        return;
-    };
+    assert!(
+        models["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["id"] == json!(id)),
+        "scan lists the staged tiny model"
+    );
 
     // ── /v1/models is EMPTY before any model is loaded ────────────────────────
     let empty: Value = c
@@ -61,18 +76,20 @@ async fn inference_and_tools() {
         "/v1/models is empty with nothing loaded"
     );
 
-    // ── Chat for an unloaded model → 404 OpenAI error envelope ────────────────
-    let unloaded = c
+    // ── Chat for an UNKNOWN model id → 404 OpenAI error envelope ──────────────
+    // JIT is on by default, but JIT only loads a SCANNED id; an unknown id is a
+    // 404 `model_not_found`, never a load attempt.
+    let unknown = c
         .post(format!("{}/v1/chat/completions", srv.base))
         .json(&json!({
-            "model": id, "stream": false,
+            "model": "no-such-org/no-such-model", "stream": false,
             "messages": [{ "role": "user", "content": "hi" }]
         }))
         .send()
         .await
         .unwrap();
-    assert_eq!(unloaded.status(), 404, "chat for unloaded model is 404");
-    let env: Value = unloaded.json().await.unwrap();
+    assert_eq!(unknown.status(), 404, "chat for unknown model is 404");
+    let env: Value = unknown.json().await.unwrap();
     assert_eq!(
         env["error"]["code"], "model_not_found",
         "404 envelope codes model_not_found: {env:?}"
@@ -82,6 +99,28 @@ async fn inference_and_tools() {
         "404 is an invalid_request_error"
     );
 
+    // ── JIT auto-load: chat for a SCANNED-but-unloaded model loads it on demand.
+    // This exercises the v1 JIT path (scan → load → serve) end-to-end against the
+    // real engine, distinct from the explicit `/api/higgs/models/load` below.
+    let jit: Value = c
+        .post(format!("{}/v1/chat/completions", srv.base))
+        .json(&json!({
+            "model": id, "stream": false,
+            "messages": [{ "role": "user", "content": "hi" }]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        jit["choices"][0]["message"]["content"].is_string(),
+        "JIT-loaded chat returns content: {jit:?}"
+    );
+
+    // Explicitly (re)load via the control surface — idempotent when already
+    // resident; keeps the rest of the test on the explicit-load contract.
     let load = c
         .post(format!("{}/api/higgs/models/load", srv.base))
         .json(&json!({ "id": id }))
@@ -222,33 +261,6 @@ async fn inference_and_tools() {
         "non-text part is an invalid_request_error: {img_env:?}"
     );
 
-    // ── A tool is offered but the prompt should NOT trigger one ───────────────
-    let resp: Value = chat(json!({
-        "model": id, "stream": false,
-        "messages": [{ "role": "user", "content": "Just say hi back, one word." }],
-        "tools": [weather_tool()]
-    }))
-    .await
-    .unwrap()
-    .json()
-    .await
-    .unwrap();
-    let choice = &resp["choices"][0];
-    assert!(
-        choice["message"]["tool_calls"].is_null(),
-        "plain greeting does not call a tool: {choice:?}"
-    );
-    assert!(
-        choice["message"]["content"]
-            .as_str()
-            .is_some_and(|s| !s.is_empty()),
-        "no-tool turn still returns content"
-    );
-    assert_ne!(
-        choice["finish_reason"], "tool_calls",
-        "no-tool turn does not finish with tool_calls"
-    );
-
     // ── Malformed request: missing `model` field → 4xx (no 5xx, no panic) ─────
     let bad = c
         .post(format!("{}/v1/chat/completions", srv.base))
@@ -264,37 +276,41 @@ async fn inference_and_tools() {
         bad.status()
     );
 
-    // ── Non-streaming tool call ───────────────────────────────────────────
-    let resp: Value = chat(json!({
+    // ── Tool REQUEST path (non-streaming) ─────────────────────────────────────
+    // The tiny model has no tool training, so we don't require a structured call;
+    // we require the tools-bearing request to succeed and return a well-formed
+    // choice (either plain content or a tool_calls array — never both empty).
+    let resp = chat(json!({
         "model": id, "stream": false,
         "messages": [{ "role": "user", "content": "What is the weather in Paris? Use the get_weather tool." }],
         "tools": [weather_tool()]
     }))
     .await
-    .unwrap()
-    .json()
-    .await
     .unwrap();
-    let choice = &resp["choices"][0];
-    let calls = choice["message"]["tool_calls"]
-        .as_array()
-        .expect("tool_calls present");
-    assert_eq!(calls.len(), 1, "exactly one tool call");
-    assert_eq!(
-        calls[0]["function"]["name"], "get_weather",
-        "calls get_weather"
-    );
-    let args = calls[0]["function"]["arguments"].as_str().unwrap();
     assert!(
-        args.to_lowercase().contains("paris"),
-        "arguments mention Paris: {args}"
+        resp.status().is_success(),
+        "tools-bearing request succeeds, got {}",
+        resp.status()
     );
-    assert_eq!(
-        choice["finish_reason"], "tool_calls",
-        "finish_reason tool_calls"
+    let resp: Value = resp.json().await.unwrap();
+    let choice = &resp["choices"][0];
+    let has_content = choice["message"]["content"]
+        .as_str()
+        .is_some_and(|s| !s.is_empty());
+    let has_calls = choice["message"]["tool_calls"].is_array();
+    assert!(
+        has_content || has_calls,
+        "tools turn returns content or tool_calls: {choice:?}"
+    );
+    assert!(
+        matches!(
+            choice["finish_reason"].as_str(),
+            Some("stop") | Some("length") | Some("tool_calls")
+        ),
+        "tools-turn finish_reason is a known reason: {choice:?}"
     );
 
-    // ── Streaming plain chat ──────────────────────────────────────────────
+    // ── Streaming plain chat (SSE) ────────────────────────────────────────────
     let body = chat(json!({
         "model": id, "stream": true,
         "messages": [{ "role": "user", "content": "Count to three." }]
@@ -310,8 +326,15 @@ async fn inference_and_tools() {
         body.contains("\"content\""),
         "stream carries content deltas"
     );
+    assert!(
+        body.contains("chat.completion.chunk"),
+        "stream chunks carry the chunk object type"
+    );
 
-    // ── Streaming tool call ───────────────────────────────────────────────
+    // ── Streaming tool request (SSE) ──────────────────────────────────────────
+    // The structured tool call depends on tool training the toy model lacks, so
+    // we assert the stream is well-formed and never leaks raw tool-call markup
+    // into the content deltas — the invariant that must hold for ANY model.
     let body = chat(json!({
         "model": id, "stream": true,
         "messages": [{ "role": "user", "content": "What is the weather in Paris? Use the get_weather tool." }],
@@ -322,18 +345,10 @@ async fn inference_and_tools() {
     .text()
     .await
     .unwrap();
-    // The tool-call envelope must NOT leak into content deltas.
+    assert!(body.contains("data:"), "tool stream has data lines");
+    assert!(body.contains("[DONE]"), "tool stream terminates with [DONE]");
     assert!(
         !body.contains("<tool_call>") && !body.contains("<function="),
         "no tool-call markup leaks into the stream"
     );
-    assert!(
-        body.contains("tool_calls"),
-        "stream emits a tool_calls delta"
-    );
-    assert!(
-        body.contains("\"finish_reason\":\"tool_calls\""),
-        "stream finishes with tool_calls"
-    );
-    assert!(body.contains("[DONE]"), "stream terminates with [DONE]");
 }
