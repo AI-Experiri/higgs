@@ -34,6 +34,10 @@ unnecessary_to_owned = "warn"
 tokio = { version = "1", features = ["full"] }
 # Default OS-specific directories (home, config, cache, data). 246M downloads.
 dirs = "5"
+# iroh p2p QUIC transport for the remote-worker feature (hub↔node). 1.0, vetted §3.0.
+iroh = "1.0"
+iroh-base = "1.0"
+iroh-tickets = "1.0"
 axum = { version = "0.8" }
 # OpenAI wire types ONLY (no HTTP client): /v1 request/response/chunk shapes
 # come from this crate verbatim — never hand-rolled.
