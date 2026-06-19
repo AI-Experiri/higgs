@@ -1,6 +1,8 @@
 # higgs — Remote-Worker Design (iroh)
 
 Status: **design spec, pre-code** (task #11). Branch `feat/iroh-remote`.
+Rev 2 (2026-06-19): deps vetted on crates.io (§3.0, all ≥100k dl); `WorkerId` LOCKED to `u32`
+(so `LogSource` stays `Copy`); node identity — hostname / OS / IP — added (§4.2.1).
 Read alongside `DESIGN.md` (local worker lifecycle), `CONFIG.md` (config surface),
 `src/supervisor.rs` / `src/worker/mod.rs` / `src/api.rs` / `src/rpc.rs` /
 `src/log_bus.rs` / `src/system.rs` / `src/diagnostic.rs` (the seam). **Invent nothing**
@@ -15,7 +17,9 @@ keep-last). This doc marks reuse vs net-new at every seam.
 - [1. Goal + Topology](#1-goal--topology)
 - [2. Reuse vs Net-New](#2-reuse-vs-net-new)
 - [3. iroh Transport](#3-iroh-transport)
+  - [3.0 Vetted dependencies (Crate-First)](#30-vetted-dependencies-crate-first)
 - [4. The Wire — HELLO + M_* + Streams](#4-the-wire--hello--m_--streams)
+  - [4.2.1 Node identity — name / OS / IP](#421-node-identity--name--os--ip-for-display)
 - [5. The higgs Seam — file:line](#5-the-higgs-seam--fileline)
 - [6. LogSource 2→N](#6-logsource-2n)
 - [7. Auth — Two Surfaces](#7-auth--two-surfaces)
@@ -44,7 +48,7 @@ at the node layer** (§2).
    │   ~/.higgs/endpoint.key      │   iroh QUIC    │   allowlist { N_a, N_b, … }     │
    │   NodeRuntime (NEW):         │  (relay +      │   /v1 + /api/higgs/* + UI       │
    │     HashMap<WorkerId,        │   hole-punch)  │   per-node iroh transport (NEW) │
-   │       Arc<Supervisor>>       │                │   HashMap<NodeId,NodeInventory> │
+   │       Arc<Supervisor>>       │                │   HashMap<NodeId,NodeView>      │
    │     each Supervisor → 1 child │                └────────────────┬───────────────┘
    └──────────────┬───────────────┘                                 ▲
                   │ N× stdio NDJSON  (one per worker)     external client (OpenAI SDK)
@@ -169,6 +173,67 @@ correlation, chat routing, writer/reader tasks, codec, and restart FSM consume *
 boxed dyn halves — none know the bytes now cross a QUIC stream. iroh enters here exactly as
 `production_factory` captures `current_exe()` and nothing else.
 
+### 2.5 The actor model — one hand-rolled runtime, not a crate (Crate-First, assessed)
+
+higgs's worker management **is** an actor model, built **hand-rolled on tokio channels** — the
+same methodology as jigglebot's agent layer (`backend/engine`: tokio mpsc/oneshot/broadcast; **no
+actor-framework crate anywhere in the workspace**). To avoid re-hand-rolling the loop per actor,
+the mailbox + receive-loop + spawn + shutdown machinery is factored into **one shared `actor`
+module, written once**, and every actor builds on it:
+
+```rust
+// src/actor.rs (NEW, foundational) — the runtime is written ONCE:
+trait Actor { type Msg; async fn handle(&mut self, msg: Self::Msg); }
+fn spawn_actor<A: Actor>(state: A) -> Handle<A::Msg>;   // mailbox + recv loop + shutdown
+```
+
+Each actor contributes only its **own message set + `handle`** — "serve different messages based
+on what it does." Nobody re-implements the loop:
+
+| actor | role | `Msg` it handles | contributes | reuses |
+|---|---|---|---|---|
+| **Worker** | server (child process) | `WorkerReq`: Load·Chat·Unload·Sysinfo·Probe | `handle` = dispatch the engine | `spawn_actor` |
+| **Supervisor** | RPC client (parent) | `SupCmd`: Request·Chat·Stop·SetVerbose | `handle` = forward + register `pending` | `spawn_actor` + reply-demux\* |
+| **NodeRuntime** | node supervisor | `NodeOp`: Load·Unload·Kill·Scan·Pull·Sysinfo | `handle` = registry + lifecycle ops | `spawn_actor` |
+| **per-node transport** | RPC client (hub) | hub→node ops | `handle` = forward over iroh | `spawn_actor` + reply-demux\* |
+
+\*reply-demux = the client half (a reader task correlating inbound replies → `pending` /
+`chat_sinks`); also written **once** and shared by the two RPC clients (Supervisor + transport).
+The Worker is a server — replies inline, no demux. State stays per-actor: `Supervisor` keeps
+pending/chat_sinks/proc (:152-201); `Worker` keeps `WorkerState{engine,loaded}`
+(worker/mod.rs:110-114). Each is "an isolated unit waiting on its mailbox, reacting, holding
+state" — the actor definition; the worker is the purest (a share-nothing OS process,
+crash-isolated by re-exec).
+
+> **Worker rides the same runtime.** To use `spawn_actor`, the worker process runs a minimal tokio
+> runtime and its blocking FFI (`engine.chat`) goes through `spawn_blocking` — already the pattern
+> the remote data path uses (§5.3). It stays a separate, crash-isolated process; it just shares
+> the actor runtime instead of a hand-rolled sync stdin loop. **Foundational refactor lands first
+> (P0):** factor `actor.rs` out of today's `Supervisor`, then port `Worker`, `NodeRuntime`, and the
+> transport onto it.
+
+**Why one hand-rolled runtime, NOT an actor-framework or job-queue crate** (apalis, asynq,
+taskflow-rs, distributed-scheduler, pueue, ractor, actix, processmanager — assessed 2026-06-19):
+a small `trait Actor` + `spawn_actor` over tokio *is* the whole runtime; a framework adds a
+dependency + paradigm absent from the workspace and *still* doesn't supervise the hard part:
+
+| crate class | manages | why it's the wrong tool here |
+|---|---|---|
+| job queue (apalis, asynq, taskflow-rs) | stateless tasks pulled from a broker, run to completion | a worker is a persistent GPU process with a *streaming* bidi RPC channel, not a discrete job; forces a Redis/Postgres/AMQP broker the p2p design has no place for |
+| cluster scheduler (distributed-scheduler) | cron tasks across a cluster via Redis/etcd/Consul | no cluster, no coordination store — iroh is the transport |
+| CLI daemon (pueue) | shell commands in a local queue | a CLI tool, not an embeddable library |
+| actor framework (ractor, actix, processmanager) | **in-process** tokio actors / tasks | supervises in-process objects, not an external OS child holding VRAM; one-msg→one-reply fights streaming `N_CHAT_CHUNK`; the real failure mode is child `exit()`, not an actor panic. Our `spawn_actor` is smaller, fits the external-process + streaming reality, and matches the workspace methodology |
+
+`RpcFrame` (the wire) + the transport-generic `HalvesFactory` seam (§2.1, §2.4) stay the shared
+substrate; `NodeRuntime` adds only the registry + routing as another `Actor`. **The only external
+crates this feature needs are transport (`iroh`) and model download (`hf-hub`)** (§3.0).
+
+> **One real (optional) slot.** An `M_PULL` HuggingFace download IS a genuine discrete,
+> run-to-completion job, so `apalis` with a **SQLite backend (no new broker)** could add
+> retry/backoff + resume-across-restart to the *download path only* — it never touches worker
+> supervision, chat RPC, or routing. Deferred: `hf-hub` alone covers P4b; adopt `apalis` only if
+> resumable downloads become a requirement.
+
 ---
 
 ## 3. iroh Transport
@@ -179,6 +244,38 @@ rides raw `open_bi`/`accept_bi` streams directly (confirmed VIABLE, §2.4, §3.3
 deps must be added — none present today (verified: `Cargo.toml` `[dependencies]` has no
 iroh/quinn/iroh-tickets/iroh-base). **`iroh-tickets` is a SEPARATE crate** — `EndpointTicket`
 is NOT re-exported by iroh core (§3.2).
+
+### 3.0 Vetted dependencies (Crate-First)
+
+Every net-new crate was checked on crates.io (2026-06-19) per the Crate-First rule; **all are
+≥100k all-time downloads** — none fell under the bar. Lowest of the set is `iroh-tickets`
+(125k), unavoidable (`EndpointTicket` is not re-exported by iroh core) and from the same iroh
+1.0 release as the rest. `WorkerId` and node-IP need **no crate at all** (see notes).
+
+| crate | role | all-time dl | phase |
+|---|---|---|---|
+| `iroh` | QUIC p2p transport | 918k | P1 |
+| `iroh-base` | `SecretKey` / `EndpointId` / `EndpointAddr` | 924k | P1 |
+| `iroh-tickets` | `EndpointTicket` (pairing string) | 125k | P1 |
+| `toml` | node `config.toml` parse | 694M | P2 |
+| `hf-hub` | `M_PULL` model download | 10.2M | P4b |
+| `sha2` | API-key SHA-256 hash | 695M | P5 |
+| `subtle` | constant-time key compare | 541M | P5 |
+| `qrcode` *(optional)* | pairing QR (else plain ticket string) | 15.5M | P6 |
+| `minisign-verify` *(deferred)* | update-artifact signature verify | 8.2M | #18 |
+
+**Deliberately NO crate (use a primitive / existing dep) — each also closes a risk:**
+- **`WorkerId` = `u32` newtype** (`Copy`) — *not* `smol_str`/`compact_str`. Wire carries it as a
+  number (`"worker_id": 1`). A `u32` is `Copy`, so `LogSource` stays `Copy` (closes risk #5) —
+  see §5.4a / §6.
+- **Node IP = iroh `Connection::paths()` → `Path::remote_addr()`** (`TransportAddr::Ip(SocketAddr)`;
+  `Path::is_ip()`/`is_relay()` = direct-vs-relay) — *not* `local-ip-address` / `if-addrs`. iroh
+  already discovers direct LAN/WAN socket addrs during NAT traversal (§4.2.1).
+- **hostname / OS = `sysinfo`** (already a dep) — `System::host_name()` / `name()` /
+  `os_version()`, folded into `HardwareInfo` (§4.2.1).
+
+`reqwest` (already a dev-dep) is pulled in by `hf-hub` as its async HTTP client; promote it to a
+normal dependency only if a direct HTTP call outside `hf-hub` is ever needed.
 
 > **iroh 1.0 API reference (verified against live docs.rs — no PROVISIONAL items remain):**
 > - Identity = **`EndpointId`** (`= PublicKey`); **`NodeId` does NOT exist in iroh.** In this
@@ -200,6 +297,10 @@ is NOT re-exported by iroh core (§3.2).
 > - Streams = `Connection::open_bi()`/`accept_bi()` are **named futures** (not `async fn`);
 >   `.await -> Result<(SendStream, RecvStream), ConnectionError>`. `SendStream`: tokio
 >   `AsyncWrite`; `RecvStream`: tokio `AsyncRead`; both boxable (§3.3).
+> - Peer address = **`Connection::paths() -> PathList`**, iterate `Path`; `Path::remote_addr() ->
+>   &TransportAddr` (`Ip(SocketAddr)` | `Relay(RelayUrl)`); `Path::is_ip()` / `is_relay()` for
+>   direct-vs-relay. **No `Connection`-level address accessor; `ConnectionType` was REMOVED in 1.0**
+>   (used by §4.2.1 `NodeView`).
 > - Accept loop = `Endpoint::accept().await -> Option<Incoming>` → `incoming.await? ->
 >   Connection`; gate on `Connection::remote_id()` AFTER the await (§3.2). ALPN via builder
 >   `alpns(Vec<Vec<u8>>)`.
@@ -432,7 +533,7 @@ calling `Supervisor::request`.
 | Const | Method | Sent by | Params | Hub does (on receive) |
 |---|---|---|---|---|
 | `M_HELLO` | `higgs/node/hello` | node → hub | `HelloParams` | gate (pairing/allowlist §7) → reply `HelloResult` |
-| `M_INVENTORY` | `higgs/node/inventory` | node → hub (push) | `NodeInventory` `{reason:"boot"\|"refresh"}` | store in `HashMap<NodeId,NodeInventory>`; reply `StatusOk` |
+| `M_INVENTORY` | `higgs/node/inventory` | node → hub (push) | `NodeInventory` `{reason:"boot"\|"refresh"}` | store into `HashMap<NodeId,NodeView>` (wraps it, §4.2.1); reply `StatusOk` |
 
 ```jsonc
 // NodeInventory — push payload. reason:"boot" = first full report;
@@ -440,18 +541,62 @@ calling `Supervisor::request`.
 // (no separate heartbeat — iroh keepalive carries liveness, §3.4). Composes existing
 // types verbatim — no parallel struct:
 { "node_id":"z32…", "label":"studio-mac", "software_version":"0.4.2",
-  "hardware": HardwareInfo,             // src/system.rs:57  — UNCHANGED
-  "runtime":  RuntimeInfo,              // src/system.rs:86  — UNCHANGED
+  "hardware": HardwareInfo,             // src/system.rs:57  — +hostname/os_name/os_version (§4.2.1), now Deserialize
+  "runtime":  RuntimeInfo,              // src/system.rs:86  — now Deserialize (hub parses remote inventory)
   "models_on_disk": [ HiggsModel, … ],  // src/worker/models.rs — UNCHANGED (read-only scan)
   "cpu_usage_percent": 41.0, "ram_used_bytes": 9000000000,   // refresh deltas
-  "workers": [ { "worker_id":"w-1", "loaded": LoadedInfo } ] }  // LoadedInfo src/api.rs:170 UNCHANGED
+  "workers": [ { "worker_id":1, "loaded": LoadedInfo } ] }   // worker_id:u32 (§5.4a); LoadedInfo src/api.rs:170 UNCHANGED
 ```
 `M_INVENTORY` is push-style so the hub's view is event-driven, not poll. The hub keeps
-`HashMap<NodeId, NodeInventory>` — the single home for the fleet view that `/api/higgs/nodes`
-(UI panel) renders. `worker_id` is a `WorkerId` (§5.4a) owned by the node's `NodeRuntime`
-registry; **`HardwareInfo`/`RuntimeInfo` come from `SystemInfo::gather(config, gpus)`
-(`system.rs:125`), NOT from `Higgs::sysinfo` (which returns only `Vec<GpuDevice>`)** — see
-fix C in §4.2(b).
+`HashMap<NodeId, NodeView>` (`NodeView` = `NodeInventory` + hub-observed addr/path, §4.2.1) —
+the single home for the fleet view that `/api/higgs/nodes` (UI panel) renders. `worker_id` is a
+`WorkerId` (§5.4a, `u32`) owned by the node's `NodeRuntime` registry; **`HardwareInfo`/
+`RuntimeInfo` come from `SystemInfo::gather(config, gpus)` (`system.rs:125`), NOT from
+`Higgs::sysinfo` (which returns only `Vec<GpuDevice>`)** — see fix C in §4.2(b).
+
+### 4.2.1 Node identity — name / OS / IP (for display)
+
+The fleet UI shows, per node: **machine name, OS, hardware, and the address that reaches it.**
+Split by **single home** — node-gathered facts vs hub-observed facts:
+
+```
+  NODE-GATHERED  (rides in NodeInventory.hardware; ALSO enriches local /api/higgs/system)
+    HardwareInfo gains 3 fields, gathered in SystemInfo::gather (system.rs:125) via sysinfo:
+      hostname    = System::host_name()    // "studio-mac"
+      os_name     = System::name()         // "macOS" / "Ubuntu"
+      os_version  = System::os_version()   // "15.5" / "22.04"
+    (HardwareInfo already carries cpu_name, arch, cpu_cores, RAM, gpus[], vram — unchanged.)
+
+  HUB-OBSERVED  (transport knowledge — NEVER in the node-gathered inventory)
+    NodeView wraps the inventory with what ONLY the hub knows, from the live iroh connection.
+    iroh 1.0 conns are MULTIPATH — read the address per PATH (no Connection-level accessor):
+      conn.paths() → Path::remote_addr() -> &TransportAddr     // Ip(SocketAddr) | Relay(RelayUrl)
+      observed_addr = the Ip(SocketAddr) of the active path    // "73.12.4.8:51820"
+      path          = Path::is_ip() ? Direct : Relay           // ConnectionType REMOVED in 1.0
+```
+
+```rust
+// hub fleet map entry: NodeView, not bare NodeInventory. observed_addr/path are HUB facts
+// (one home, hub side); `inventory` is the NODE's self-report. Never merge the two.
+pub struct NodeView {
+    pub inventory:     NodeInventory,  // node-gathered (hardware incl. hostname/os, workers, models)
+    pub observed_addr: String,         // Path::remote_addr() (TransportAddr::Ip) — NEVER node-self-reported
+    pub path:          NodePath,       // Direct | Relay  (iroh connection type)
+    pub online:        bool,
+    pub last_seen_ms:  u64,
+}
+pub enum NodePath { Direct, Relay }
+```
+Why IP is hub-side and not a `NodeInventory` field: a node's own private `192.168.x` is often
+meaningless to the hub user; the address that actually *reaches* it — and whether the path is
+direct or relayed — is known only at the hub's `Connection`. **No `local-ip-address` crate** —
+iroh already did the discovery during NAT traversal (§3.0).
+
+> **Deserialize note.** `HardwareInfo`/`RuntimeInfo` derive `Serialize` only today
+> (`system.rs:56,85`); the hub must DESERIALIZE them out of remote inventory, so both gain
+> `#[derive(Deserialize)]` (`GpuDevice`/`DeviceKind` already have it). One-line derive change,
+> P4. The 3 new `HardwareInfo` fields are `Option<String>` (`#[ts(optional)]`) — `host_name()`
+> et al. return `Option` and a headless host may have none.
 
 **(b) hub → node — lifecycle ops (the HUB is the caller; the node dispatches):** the hub
 *sends* these over the control stream via its per-node iroh requester; the node's
@@ -500,7 +645,7 @@ operation, then replies. **None reach `WorkerState`** — they live one layer up
 > "No model catalog — scanning is host-side and the GGUF path arrives in the M_LOAD params"
 > (`worker/mod.rs:108`); "Scan moved host-side… the worker holds no catalog of its own"
 > (`worker/mod.rs:228`). There is **no HF download anywhere in higgs today.** `M_PULL` requires
-> a **NEW downloader + progress subsystem** (hf-hub or equivalent, §4.4). It downloads into
+> a **NEW downloader + progress subsystem** (via `hf-hub`, §3.0/§4.4). It downloads into
 > higgs's **OWN** `~/.higgs/models/` dir (or HF cache) — **NEVER** into the read-only scanned
 > LM-Studio / HF-cache / Ollama dirs. `M_PULL` is excluded from any "reuse verbatim" claim.
 
@@ -536,7 +681,7 @@ Method = **existing `M_CHAT = "higgs/chat"`**, notification = **existing
 the per-node iroh transport** (§2.3) — not the hub's local-worker Supervisor. The hub→node
 `M_CHAT` params add one routing field:
 ```jsonc
-{ "request_id":7, "worker_id":"w-1",     // worker_id = NEW: selects the node-local worker
+{ "request_id":7, "worker_id":1,         // worker_id = NEW (u32): selects the node-local worker
   "model":"org/model-a", "messages_json":"[…]", "max_tokens":512,
   "temperature":0.7, "tools":null }
 ```
@@ -677,7 +822,7 @@ New module **`src/node.rs`** (sibling to `supervisor.rs`) owns both sides:
 - **hub side (NEW):** `remote_factory` (§5.1); the paired-node registry (`NodeId →
   EndpointAddr/ticket`); the **per-node iroh transport** with its OWN pending/correlation,
   keyed by `NodeId`, routing per `(NodeId, WorkerId)` (§2.3, fix B — **distinct from the
-  hub's local-worker Supervisor**); the `HashMap<NodeId, NodeInventory>` fleet view; the
+  hub's local-worker Supervisor**); the `HashMap<NodeId, NodeView>` fleet view (§4.2.1); the
   hub→node outbound calls; inbound HELLO/inventory dispatch (§5.4c).
 - **node side (NEW):** `Endpoint::bind`, accept loop → post-HELLO gate + HELLO-stalled timer
   (§3.2.1), the node's outbound requester to the hub (sends hello/inventory, §5.4c), and the
@@ -715,28 +860,24 @@ live in a new `remote` module:
 | `M_SYSINFO` | `SystemInfo::gather(config, Higgs::sysinfo)` (fix C) | `Higgs::sysinfo`=`Vec<GpuDevice>` (`api.rs:996`) folded by `gather` (`system.rs:125`) |
 | `M_PULL` | **NEW HF downloader** → `~/.higgs/models/` (fix D) | NET-NEW; progress on data plane (§4.4) |
 
-> **`WorkerId` — NEW newtype, the per-node worker key (fix, multi-worker).** Single home =
-> the node's `NodeRuntime` registry. **Pick ONE representation and keep type and wire
-> consistent.** This doc uses a **compact string id** (`"w-1"`, `"w-2"`, …) on the wire, so
-> `WorkerId` wraps a small string-like value:
+> **`WorkerId` — NEW newtype, the per-node worker key. LOCKED: `u32` (fix, multi-worker).**
+> Single home = the node's `NodeRuntime` registry. Decided via Crate-First (§3.0): a `u32`
+> newtype needs **no string crate** (no `smol_str`/`compact_str`) AND is `Copy`, so it keeps
+> `LogSource` `Copy` (§6) with zero ripple. The wire carries it **as a number**:
 > ```rust
-> #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-> pub struct WorkerId(SmolStr);   // wire shows "w-1" → WorkerId wraps a compact string
+> #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+> pub struct WorkerId(u32);        // wire: "worker_id": 1   (UI may RENDER it as "w-1")
 > ```
-> Lifecycle: **assigned on `M_LOAD`** (new worker spawned), **freed on `M_UNLOAD`/`M_KILL`**.
-> It keys both the data-stream routing (§4.3) and `LogSource::RemoteWorker` (§6).
+> Lifecycle: **assigned on `M_LOAD`** (monotonic per node, new worker spawned), **freed on
+> `M_UNLOAD`/`M_KILL`**. It keys both the data-stream routing (§4.3) and
+> `LogSource::RemoteWorker` (§6).
 >
-> **`Copy` tension (fix G/§6).** A string-backed `WorkerId` is **not `Copy`**, so
-> `LogSource::RemoteWorker{node,worker}` would demote `LogSource` from `Copy` to `Clone` and
-> ripple to `LogLine.source` + `broadcast::Sender<LogLine>` (by-value consumers). Two options,
-> **decide in P4:** (1) keep the compact-string wire and accept the **`Copy`→`Clone`
-> demotion** — `LogSource` becomes `Clone`, `LogLine.source` and the broadcast clone instead
-> of copy (cheap, one-line per site); or (2) make `WorkerId` a `Copy` `u32` newtype and emit
-> it on the wire **as a number** (`"worker_id": 1`), keeping `LogSource` `Copy`. Either is
-> internally consistent; **what is forbidden is u32-in-memory + "w-1"-on-the-wire (the
-> contradiction this revision removes).** Default recommendation: **(1) compact string +
-> `Clone` demotion** — readable wire/logs, the clone cost is negligible, and the demotion is a
-> bounded mechanical change.
+> **`Copy` — RESOLVED, no tension.** `WorkerId(u32)` is `Copy` and `NodeId(EndpointId)` is
+> `Copy` (32-byte key), so `LogSource::RemoteWorker{node,worker}` is `Copy` and `LogSource`
+> keeps its `#[derive(Copy)]` unchanged — no demotion to `Clone`, no ripple to `LogLine.source`
+> or `broadcast::Sender<LogLine>` (§6). The string `"w-1"` is a **display rendering only**; the
+> type and the wire are `u32`. The forbidden state — `u32` in memory but `"w-1"` on the wire —
+> does **not** occur here: the wire is numeric.
 
 #### 5.4b Per-worker DATA dispatch (reuse `serve_state`)
 
@@ -788,24 +929,20 @@ Two fixed rings back it (`LogBus`, `log_bus.rs`): `serve` + `worker` as
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct NodeId(iroh::EndpointId);
 
-// WorkerId is the SAME type as §5.4a. Its Copy-ness drives LogSource's Copy-ness:
-//   default plan = compact-string WorkerId → NOT Copy → LogSource demotes Copy→Clone.
-//   alt = u32 WorkerId (Copy) + numeric wire → LogSource STAYS Copy.
-
-pub enum LogSource {                                  // Copy IFF WorkerId is Copy
+// WorkerId is the SAME type as §5.4a — LOCKED u32 (Copy). Both fields Copy ⇒ LogSource Copy.
+pub enum LogSource {                                  // STAYS Copy (NodeId Copy + WorkerId u32 Copy)
     Serve,
     Worker,                                           // local worker — UNCHANGED (single-node back-compat)
     RemoteWorker { node: NodeId, worker: WorkerId },  // NEW
 }
 ```
 
-> **`Copy`/`Clone` decision (fix G, ties to §5.4a).** With the default **compact-string
-> `WorkerId`**, `LogSource` loses `Copy` and becomes `Clone`. By-value consumers
-> (`LogLine.source` `:81`, `broadcast::Sender<LogLine>`) keep compiling — they `clone()` a
-> tiny enum (NodeId is 32 bytes Copy, WorkerId is a SmolStr) instead of copying. **This is the
-> stated demotion + by-value-consumer note** the design owes: it is a bounded mechanical
-> change, no architectural ripple. If P4 instead picks a `u32` `WorkerId` (+ numeric wire),
-> `LogSource` stays `Copy` and nothing demotes. Pick one in P4; both are consistent.
+> **`Copy` decision (fix G, ties to §5.4a) — RESOLVED: `LogSource` stays `Copy`.** Because
+> `WorkerId` is locked to `u32` (§3.0/§5.4a — needs no string crate and is `Copy`) and `NodeId`
+> wraps iroh's `EndpointId` (32-byte key, `Copy`), `RemoteWorker{node,worker}` is `Copy`, so
+> `LogSource` keeps its `#[derive(Copy)]` unchanged. **No demotion to `Clone`, no ripple** to
+> `LogLine.source` (`:81`) or `broadcast::Sender<LogLine>` — they keep copying a tiny enum. The
+> earlier compact-string option (which would have forced `Copy`→`Clone`) is dropped.
 
 Every match-on-source site and its change:
 
@@ -871,7 +1008,7 @@ Reconnects present **no token** — pure allowlist membership.
   "scopes":["chat","models"],                          // chat | models | admin
   "created_ms":1750000000000, "last_used_ms":1750000500000, "disabled":false }
 ```
-Middleware hashes the presented bearer, constant-time compares, checks scope + `disabled`,
+Middleware hashes the presented bearer (`sha2`), constant-time compares (`subtle`, §3.0), checks scope + `disabled`,
 reuses the existing `/v1` error envelope. `admin` scope gates `/api/higgs/*` mutations + node
 management.
 
@@ -1013,6 +1150,16 @@ Each phase is independently shippable and gated by `quality.sh`. **Net-new node 
 sub-phase.**
 
 ```
+P0  Actor runtime (foundational) src/actor.rs: `trait Actor { type Msg; handle }` + `spawn_actor`
+    ─────────────────────────    (mailbox + recv loop + shutdown, written ONCE) + the client
+                                 reply-demux helper (reader task → pending/chat_sinks, §2.5).
+                                 Factor it out of today's Supervisor; port Worker onto it (minimal
+                                 tokio runtime + spawn_blocking FFI) so Supervisor + Worker share
+                                 ONE runtime. NodeRuntime + per-node transport (P2/P3) are then just
+                                 more `Actor` impls. NO new dep (tokio only).
+                                 Verify: existing supervisor + worker tests stay green on the shared
+                                 runtime; no behaviour change, no duplicated loop.
+
 P1  Pairing + handshake  (#12)   TASK 1 (FIRST): scaffold the iroh Endpoint + SecretKey
     ─────────────────────────    persistence (~/.higgs/endpoint.key) + pairing/HELLO against the
                                  CONFIRMED iroh 1.0 API (names verified, §3 reference; no
@@ -1032,7 +1179,7 @@ P1  Pairing + handshake  (#12)   TASK 1 (FIRST): scaffold the iroh Endpoint + Se
 
 P2  Node mode + NodeRuntime (#13) src/node.rs: bind + accept loop + post-HELLO gate + NEW
     ─────────────────────────    NodeRuntime { HashMap<WorkerId, Arc<Supervisor>> } + WorkerId
-                                 newtype (pick ONE repr, §5.4a) + node-side CONTROL dispatch
+                                 newtype (u32, LOCKED §3.0/§5.4a) + node-side CONTROL dispatch
                                  (§5.4a — registry ops, NOT WorkerState) + outbound hello/inventory
                                  requester (§5.4c). DATA bridge per worker → serve_state
                                  (SyncIoBridge per stream in spawn_blocking). --node / node connect.
@@ -1051,8 +1198,9 @@ P3  Hub seam + relay      (#14)  remote_factory + spawn_remote ctor; WorkerProc 
 
 P4  Inventory + LogSource (#15)  M_INVENTORY{boot|refresh} (NO M_HEARTBEAT — deltas fold into
     ─────────────────────────    refresh, iroh keepalive = liveness) / M_SCAN;
-                                 HashMap<NodeId,NodeInventory>; LogSource::RemoteWorker{node,worker}
-                                 (decide Copy-vs-Clone with the WorkerId repr, §5.4a/§6) + keyed
+                                 HashMap<NodeId,NodeView> (+hostname/os/IP §4.2.1; HW/RT gain
+                                 Deserialize); LogSource::RemoteWorker{node,worker}
+                                 (stays Copy — WorkerId u32, §6) + keyed
                                  remote ring map + eviction on unload/kill/retire (§6.1);
                                  LogSource::parse node arm; N_LOG_LINE relay.
                                  Per-node ?source=node:<id>:<worker> selector.
@@ -1060,7 +1208,7 @@ P4  Inventory + LogSource (#15)  M_INVENTORY{boot|refresh} (NO M_HEARTBEAT — d
                                  a killed worker's ring is reclaimed.
 
 P4b M_PULL downloader     (#15b) NEW HF downloader sub-phase (fix D — no download exists today):
-    ─────────────────────────    hf-hub (or equiv) → ~/.higgs/models/ ONLY; N_PROGRESS on the data
+    ─────────────────────────    `hf-hub` (§3.0) → ~/.higgs/models/ ONLY; N_PROGRESS on the data
                                  plane; HG025 DownloadFailed. Never writes scanned dirs.
                                  Verify: M_PULL downloads a GGUF into ~/.higgs/models, progress streams,
                                  a subsequent M_SCAN/M_LOAD sees it.
@@ -1069,10 +1217,10 @@ P5  Bearer auth           (#16)  api_keys.json + SHA-256 middleware on /v1 + /ap
     ─────────────────────────    scopes (chat|models|admin); keys CLI. 401 envelope.
                                  Verify: scoped key allows chat, admin gates node mgmt.
 
-P6  UI                    (#17)  /api/higgs/nodes panel (fleet view from NodeInventory map);
-    ─────────────────────────    pairing QR flow; per-node + per-worker load/unload/kill;
-                                 keys management pane. ts-rs exports for
-                                 NodeInventory/HelloResult/LogSource.
+P6  UI                    (#17)  /api/higgs/nodes panel (fleet view from NodeView map — incl.
+    ─────────────────────────    observed_addr + path, §4.2.1); pairing QR flow; per-node +
+                                 per-worker load/unload/kill; keys management pane. ts-rs exports
+                                 for NodeView + NodeInventory + NodePath / HelloResult / LogSource.
                                  Verify (Playwright): pair a node, load 2 workers, chat, see logs.
 
 (#18  M_UPDATE)                  Reserved this design (§9): const + capability + pubkey table +
@@ -1087,9 +1235,9 @@ P6  UI                    (#17)  /api/higgs/nodes panel (fleet view from NodeInv
 |---|---|---|
 | 1 | **No remote SIGKILL** | A node behind NAT cannot be force-killed by the hub. `WorkerProc::force_kill` for remote = close the QUIC conn; the node's own supervisor SIGKILLs the local worker. If the node is unreachable, the hub can only retire it (HG027) — actual reap is best-effort. **Accepted.** |
 | 2 | **Relay latency** | First chat token over a relay path (pre-hole-punch) adds RTT. iroh upgrades to direct transparently; measure P50/P99 first-token in P3. If relay-only paths dominate, document a self-hosted relay (`presets::Minimal` + `RelayMode::Custom`). |
-| 3 | **Type-publish seam** | `NodeInventory`/`HelloResult`/`HelloParams`/`LogSource` cross to the frontend only at P6. Until then they are crate-internal serde shapes. When published, add `higgs_ts!` exports (barrel rules unchanged). Do not export pre-P6. |
-| 4 | **`WorkerId` repr + lifecycle** | NEW newtype, single home = `NodeRuntime` registry. **One repr only — compact string (`"w-1"`) on wire + in memory (default), OR `u32` + numeric wire — never mixed (§5.4a, §6).** Assigned on `M_LOAD`, freed on `M_UNLOAD`/`M_KILL`. Must survive a node-side respawn (restart FSM) so the hub's data stream + request_id table (§4.3) stay valid, OR the hub re-opens the stream on `WorkerId` change. Resolve in P2/P3 — prefer stable id across respawn. |
-| 5 | **`LogSource` Copy demotion** | Compact-string `WorkerId` ⇒ `LogSource` not `Copy` ⇒ **demote to `Clone`**; by-value consumers (`LogLine.source` `:81`, `broadcast::Sender<LogLine>`) clone a tiny enum — bounded mechanical change (§6). Alt `u32` `WorkerId` keeps `Copy`. Decide with the repr in P4. |
+| 3 | **Type-publish seam** | `NodeView` (+ `NodeInventory`/`NodePath`)/`HelloResult`/`HelloParams`/`LogSource` cross to the frontend only at P6. Until then they are crate-internal serde shapes. When published, add `higgs_ts!` exports (barrel rules unchanged). Do not export pre-P6. |
+| 4 | **`WorkerId` repr + lifecycle** | **LOCKED: `u32` newtype (§3.0/§5.4a)** — no string crate, `Copy`, numeric wire (`"worker_id":1`). Single home = `NodeRuntime` registry; assigned on `M_LOAD`, freed on `M_UNLOAD`/`M_KILL`. Must survive a node-side respawn (restart FSM) so the hub's data stream + request_id table (§4.3) stay valid, OR the hub re-opens the stream on `WorkerId` change — resolve the respawn-stability detail in P3 (prefer a stable id across respawn). |
+| 5 | **`LogSource` Copy** | **RESOLVED: stays `Copy`.** `WorkerId` locked to `u32` (`Copy`) + `NodeId` wraps `EndpointId` (`Copy`) ⇒ `RemoteWorker` is `Copy` ⇒ no demotion, no change to `LogLine.source` (`:81`) / `broadcast::Sender<LogLine>` (§6). |
 | 6 | **`accept_bi()` first-write + HELLO-stalled** | Opener must write HELLO immediately or the acceptor hangs (§3.3); a peer that completes QUIC then never sends HELLO is dropped after `HELLO_DEADLINE` (HG028, §3.2.1) to bound the pre-auth window. Both covered by P1 integration tests. |
 | 7 | **Pairing-token transport** | Token TTL + single-use guards a leaked QR. Token never grants more than "add my EndpointId to the allowlist." A stolen token = one rogue node id, revocable by removing it from `pairings.json`. **Accepted** with the standard revocation path. |
 | 8 | **iroh 1.0 API surface** | **VERIFIED against docs.rs (iroh 1.0.0) — no PROVISIONAL items remain.** `EndpointTicket::endpoint_addr()` (from the separate `iroh-tickets` crate) and `EndpointAddr::with_relay_url`/`with_addrs`/`with_ip_addr` (NO `with_direct_addresses`) are confirmed. Identity is `EndpointId` (iroh has no `NodeId`); gate accessor is `Connection::remote_id()`. Full confirmed list in §3 reference + §10-P1. |
@@ -1104,10 +1252,12 @@ P6  UI                    (#17)  /api/higgs/nodes panel (fleet view from NodeInv
 `src/worker/mod.rs` (M_* vocab + `serve_state` + read-only-scan note), `src/rpc.rs`
 (RpcFrame wire), `src/log_bus.rs` (LogSource), `src/api.rs` (`Higgs` facade — `sysinfo`
 returns `Vec<GpuDevice>` at :996, `scan` at :604, `load` only-keep-last :363), `src/system.rs`
-(`SystemInfo::gather(config, gpus)` :125 → HardwareInfo :57 / RuntimeInfo :86) +
+(`SystemInfo::gather(config, gpus)` :125 → HardwareInfo :57 +hostname/os_name/os_version,
+RuntimeInfo :86; both gain `Deserialize` for remote inventory, §4.2.1) +
 `src/worker/models.rs` (HiggsModel scan, LoadedInfo at api.rs:170), `src/bin/higgs.rs`
 (role selector :33; bin = `higgs`), `src/serve/control.rs` (logs filter :44),
 `src/diagnostic.rs` (HG codes — max HG021 at :185, remote adds HG022–HG028), **new
 `src/node.rs`** (Endpoint + `NodeRuntime` registry + per-node iroh transport + remote_factory),
-**new `src/auth.rs`** (pairings.json / api_keys.json), `Cargo.toml` (add iroh / iroh-tickets /
-iroh-base 1.0 + an HF-download crate for M_PULL).
+**new `src/auth.rs`** (pairings.json / api_keys.json), `Cargo.toml` (add — all vetted ≥100k dl,
+§3.0: iroh + iroh-base + iroh-tickets 1.0 [P1], toml [P2], hf-hub [P4b], sha2 + subtle [P5],
+qrcode optional [P6], minisign-verify deferred [#18]; `WorkerId`=u32 + node-IP need NO crate).
