@@ -21,6 +21,11 @@ use crate::diagnostic::HiggsError;
 use crate::system::{DeviceKind, GpuDevice};
 use crate::worker::tool_parser::{ToolCallParser, ToolCallStreamFilter, ToolParserRegistry};
 
+/// This engine's log control: the worker-side `tracing` subscriber install, the
+/// llama.cpp/ggml level + module filters, and the live verbose toggle. All
+/// llama.cpp log filtering lives here — a different engine ships its own.
+pub mod logging;
+
 /// Process-wide llama.cpp backend handle — the FFI global init must run
 /// exactly once per process.
 static BACKEND: OnceLock<LlamaBackend> = OnceLock::new();

@@ -25,6 +25,7 @@ use higgs::{Higgs, HiggsConfig};
 use tokio::signal;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::Layer;
 
 fn main() {
     // Worker role: detect BEFORE tracing/anything writes stdout — the worker
@@ -38,13 +39,15 @@ fn main() {
     // Created before the subscriber so the HiggsLogLayer and the Higgs facade
     // can share it.
     let log_bus = Arc::new(higgs::LogBus::new());
+    // Per-layer filters so the higgs log layer can admit higgs DEBUG (verbose
+    // mode) without flooding fmt; info-level filter applied to fmt individually.
+    let env = || {
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+    };
     tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with(higgs::HiggsLogLayer::new(log_bus.clone()))
-        .with(tracing_subscriber::fmt::layer())
+        .with(higgs::HiggsLogLayer::new(log_bus.clone()).with_filter(higgs::log_filter()))
+        .with(tracing_subscriber::fmt::layer().with_filter(env()))
         .init();
 
     let bind = std::env::var("HIGGS_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());

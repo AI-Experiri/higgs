@@ -629,7 +629,7 @@ fn chat_response(model: String, out: &ChatOutcome) -> CreateChatCompletionRespon
         usage: Some(CompletionUsage {
             prompt_tokens: out.prompt_tokens,
             completion_tokens: out.completion_tokens,
-            total_tokens: out.prompt_tokens + out.completion_tokens,
+            total_tokens: out.prompt_tokens.saturating_add(out.completion_tokens),
             ..Default::default()
         }),
     }

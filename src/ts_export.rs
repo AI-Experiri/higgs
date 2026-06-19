@@ -5,9 +5,10 @@
 //! and injects the export attribute — keeping the path in exactly ONE place.
 //! Change the literal in the macro below to relocate every higgs `.ts` file.
 //!
-//! All higgs generated types land in `frontend/src/lib/generated/higgs/` — a
-//! higgs-owned subfolder, kept separate from jigglebot's own generated types so
-//! the boundary is visible at a glance.
+//! All higgs generated types land in the crate-local `bindings/higgs/` dir.
+//! higgs is a standalone crate, so it emits its TypeScript into its own tree;
+//! embedders (e.g. jigglebot) consume these as published/vendored types rather
+//! than higgs reaching into the embedder's frontend.
 
 /// Wrap a higgs ts-rs type so it derives [`ts_rs::TS`] and exports to the single
 /// higgs generated dir. Apply to every higgs type that crosses to the frontend.
@@ -23,7 +24,7 @@ macro_rules! higgs_ts {
     ) => {
         $(#[$meta])*
         #[derive(ts_rs::TS)]
-        #[ts(export, export_to = "../../../frontend/src/lib/generated/higgs/")]
+        #[ts(export, export_to = "higgs/")]
         $vis struct $name { $($body)* }
     };
     (
@@ -32,7 +33,7 @@ macro_rules! higgs_ts {
     ) => {
         $(#[$meta])*
         #[derive(ts_rs::TS)]
-        #[ts(export, export_to = "../../../frontend/src/lib/generated/higgs/")]
+        #[ts(export, export_to = "higgs/")]
         $vis enum $name { $($body)* }
     };
 }

@@ -190,7 +190,8 @@ fn enrich_gguf_metadata(model: &mut HiggsModel) {
     let template = gguf.tokenizer_chat_template().ok();
     model.has_chat_template = template.is_some();
     if let Some(t) = template {
-        model.supports_tools = t.contains("tool_call") || t.contains("tools");
+        model.supports_tools =
+            t.contains("tool_call") || t.contains("[TOOL_CALLS]") || t.contains("<function");
         model.supports_reasoning = t.contains("</think>")
             || t.contains("<think>")
             || t.to_lowercase().contains("thinking");
@@ -348,8 +349,13 @@ fn scan_lmstudio(root: &Path, out: &mut Vec<HiggsModel>) -> Result<(), HiggsErro
                     quant,
                     HiggsModelSource::LmStudio,
                 );
+                // Filename-based projector exclusion BEFORE the mmap+parse cost.
+                if is_projector_sidecar(&fname, None) {
+                    continue;
+                }
                 enrich_gguf_metadata(&mut model);
-                if is_projector_sidecar(&fname, model.arch.as_deref()) {
+                // Arch-based exclusion needs the parsed `general.architecture`.
+                if is_projector_sidecar("", model.arch.as_deref()) {
                     continue;
                 }
                 out.push(model);
@@ -465,8 +471,13 @@ fn scan_hf_cache(root: &Path, out: &mut Vec<HiggsModel>) -> Result<(), HiggsErro
                     quant,
                     HiggsModelSource::HfCache,
                 );
+                // Filename-based projector exclusion BEFORE the mmap+parse cost.
+                if is_projector_sidecar(&fname, None) {
+                    continue;
+                }
                 enrich_gguf_metadata(&mut model);
-                if is_projector_sidecar(&fname, model.arch.as_deref()) {
+                // Arch-based exclusion needs the parsed `general.architecture`.
+                if is_projector_sidecar("", model.arch.as_deref()) {
                     continue;
                 }
                 out.push(model);

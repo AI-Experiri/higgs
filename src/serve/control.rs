@@ -21,6 +21,7 @@ use super::wire::{
 };
 use crate::api::Higgs;
 use crate::diagnostic::HiggsError;
+use crate::log_bus::LogSource;
 use crate::system::SystemInfo;
 use crate::worker::engine::LoadParams;
 use crate::worker::models::HiggsModel;
@@ -32,6 +33,16 @@ use crate::LLAMA_CPP_2_VERSION;
 pub(super) struct LogsQuery {
     /// Maximum number of history lines to return / replay (default 200).
     n: Option<usize>,
+    /// Restrict to one origin: `serve` (higgs control plane) or `worker` (the
+    /// model worker's stderr). Absent/unknown = both merged.
+    source: Option<String>,
+}
+
+impl LogsQuery {
+    /// The parsed [`LogSource`] filter (`None` = all sources).
+    fn filter(&self) -> Option<LogSource> {
+        self.source.as_deref().and_then(LogSource::parse)
+    }
 }
 
 /// Default history depth for the logs snapshot and the SSE replay prefix.
@@ -323,7 +334,7 @@ pub(super) async fn control_logs(
         "higgs: GET /api/higgs/logs"
     );
     Json(HiggsLogsResponse {
-        lines: higgs.logs(q.n.unwrap_or(DEFAULT_LOG_LINES)),
+        lines: higgs.logs(q.n.unwrap_or(DEFAULT_LOG_LINES), q.filter()),
     })
 }
 
@@ -406,12 +417,13 @@ pub(super) async fn control_logs_stream(
     Query(q): Query<LogsQuery>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let n = q.n.unwrap_or(DEFAULT_LOG_LINES);
+    let filter = q.filter();
     tracing::info!(n, "higgs: GET /api/higgs/logs/stream");
 
     // Subscribe BEFORE snapshotting so no line slips between replay and live —
     // a line that lands in this window is duplicated at worst, never lost.
     let mut rx = higgs.subscribe_logs();
-    let replay = higgs.logs(n);
+    let replay = higgs.logs(n, filter);
 
     // Pump replay-then-live lines into a channel, then `unfold` the receiver —
     // the same Sse construction shape as the chat SSE path (`serve::stream`).
@@ -425,7 +437,13 @@ pub(super) async fn control_logs_stream(
         loop {
             match rx.recv().await {
                 Ok(line) => {
-                    if tx.send(line).is_err() {
+                    // Drop lines from other sources when a `?source=` filter is set.
+                    if let Some(f) = filter {
+                        if line.source != f {
+                            continue;
+                        }
+                    }
+                    if tx.send(line.text).is_err() {
                         return; // client disconnected
                     }
                 }
@@ -492,6 +510,7 @@ pub(super) async fn control_system(State(higgs): State<Arc<Higgs>>) -> Json<Syst
 #[cfg(test)]
 mod tests {
     use super::super::test_support::*;
+    use crate::log_bus::LogSource;
     use axum::http::StatusCode;
     use serde_json::json;
     use std::time::Duration;
@@ -686,9 +705,9 @@ mod tests {
     #[tokio::test]
     async fn logs_endpoint_shapes() {
         let (sup, _test_write, _test_read, bus) = make_supervisor();
-        bus.push("line one".to_owned());
-        bus.push("line two".to_owned());
-        bus.push("line three".to_owned());
+        bus.push(LogSource::Serve, "line one".to_owned());
+        bus.push(LogSource::Serve, "line two".to_owned());
+        bus.push(LogSource::Serve, "line three".to_owned());
         let app = make_app(sup);
 
         let resp = app.oneshot(get("/api/higgs/logs?n=2")).await.unwrap();
@@ -698,6 +717,52 @@ mod tests {
             v["lines"],
             json!(["line two", "line three"]),
             "tail of n, oldest first"
+        );
+    }
+
+    /// `?source=serve|worker` routes the two log origins to separate consoles —
+    /// end-to-end through the HTTP snapshot handler.
+    #[tokio::test]
+    async fn logs_endpoint_filters_by_source() {
+        let (sup, _test_write, _test_read, bus) = make_supervisor();
+        bus.push(LogSource::Serve, "higgs: GET /v1/models".to_owned());
+        bus.push(LogSource::Worker, "ggml_metal_init: loaded".to_owned());
+        bus.push(LogSource::Serve, "higgs: loading model".to_owned());
+        let app = make_app(sup);
+
+        // ?source=worker → only the worker stderr line.
+        let resp = app
+            .clone()
+            .oneshot(get("/api/higgs/logs?source=worker"))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(
+            v["lines"],
+            json!(["ggml_metal_init: loaded"]),
+            "worker only"
+        );
+
+        // ?source=serve → only the higgs control-plane lines, in push order.
+        let resp = app
+            .clone()
+            .oneshot(get("/api/higgs/logs?source=serve"))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(
+            v["lines"],
+            json!(["higgs: GET /v1/models", "higgs: loading model"]),
+            "serve only"
+        );
+
+        // No filter → all three, merged in push order.
+        let resp = app.oneshot(get("/api/higgs/logs")).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(
+            v["lines"].as_array().map(Vec::len),
+            Some(3),
+            "no filter = all sources merged"
         );
     }
 
@@ -715,16 +780,22 @@ mod tests {
 
         let (sup, _test_write, _test_read, bus) = make_supervisor();
         // Seed history BEFORE the request — this is the replay prefix.
-        bus.push("hist-1".to_owned());
-        bus.push("hist-2".to_owned());
+        bus.push(LogSource::Serve, "hist-1".to_owned());
+        bus.push(LogSource::Serve, "hist-2".to_owned());
 
         let higgs = Arc::new(Higgs::with_supervisor(
             Arc::new(sup),
             HiggsConfig::default(),
         ));
-        let resp = control_logs_stream(State(higgs.clone()), Query(LogsQuery { n: Some(10) }))
-            .await
-            .into_response();
+        let resp = control_logs_stream(
+            State(higgs.clone()),
+            Query(LogsQuery {
+                n: Some(10),
+                source: None,
+            }),
+        )
+        .await
+        .into_response();
         assert_eq!(
             resp.headers()
                 .get(axum::http::header::CONTENT_TYPE)
@@ -753,7 +824,7 @@ mod tests {
 
         // After replay the stream is parked on the live receiver. Push a new line
         // and it must arrive as a frame — proving live delivery, not closure.
-        bus.push("live-1".to_owned());
+        bus.push(LogSource::Serve, "live-1".to_owned());
         let mut live_seen = String::new();
         while !live_seen.contains("live-1") {
             let frame = tokio::time::timeout(Duration::from_secs(2), body.next())
@@ -767,7 +838,7 @@ mod tests {
 
         // The replay source itself is ordered oldest-first ahead of the live line.
         assert_eq!(
-            higgs.logs(10),
+            higgs.logs(10, None),
             vec![
                 "hist-1".to_owned(),
                 "hist-2".to_owned(),

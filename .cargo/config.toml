@@ -1,0 +1,18 @@
+# higgs standalone build config.
+#
+# - lld linker: faster link step on Mach-O (Apple Silicon).
+# - FFI env for llama-cpp-sys-2 / bindgen — REQUIRED, applied to every cargo
+#   invocation + build script so higgs always builds, not just one script.
+#     - clang's target MUST be the clang spelling `arm64-apple-darwin`. The Rust
+#       triple `aarch64-apple-darwin` is rejected ("Unsupported architecture"),
+#       leaving libclang a 4-byte pointer → bindgen's host pointer-width assert
+#       panics (left==right, 4 vs 8).
+#     - `-isysroot $SDKROOT` lets clang resolve the macOS SDK headers.
+#   SDK path is hardcoded (cargo `[env]` can't run `xcrun`); update if Xcode moves.
+
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-fuse-ld=/opt/homebrew/bin/ld64.lld"]
+
+[env]
+SDKROOT = "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
+BINDGEN_EXTRA_CLANG_ARGS = "--target=arm64-apple-darwin -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"

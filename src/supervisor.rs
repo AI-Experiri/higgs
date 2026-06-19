@@ -42,10 +42,10 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{info, warn};
 
 use crate::diagnostic::HiggsError;
-use crate::log_bus::LogBus;
+use crate::log_bus::{LogBus, LogLine, LogSource};
 use crate::rpc::{self, RpcFrame, RpcNotification, RpcRequest};
 use crate::system::GpuDevice;
-use crate::worker::{M_LOAD, M_PROBE, M_SHUTDOWN, M_SYSINFO, N_CHAT_CHUNK};
+use crate::worker::{M_LOAD, M_LOG_LEVEL, M_PROBE, M_SHUTDOWN, M_SYSINFO, N_CHAT_CHUNK};
 
 /// How long `stop()` waits for the worker to exit on its own (after stdin
 /// closes) before SIGKILL-ing it. Generous enough for the child to free a
@@ -273,16 +273,47 @@ impl Supervisor {
         self.inner.events_tx.subscribe()
     }
 
-    /// Return up to `n` recent Developer-Log lines (oldest first) — worker
-    /// stderr plus captured serve-layer events.
-    pub fn logs(&self, n: usize) -> Vec<String> {
-        self.inner.bus.snapshot(n)
+    /// Return up to `n` recent Developer-Log lines (oldest first), optionally
+    /// restricted to one [`LogSource`] (`None` = worker stderr + serve events).
+    pub fn logs(&self, n: usize, filter: Option<LogSource>) -> Vec<String> {
+        self.inner.bus.snapshot(n, filter)
     }
 
     /// Subscribe to live Developer-Log lines pushed after this call. Pair with
-    /// [`logs`](Self::logs) for replay-then-live SSE delivery.
-    pub fn subscribe_logs(&self) -> broadcast::Receiver<String> {
+    /// [`logs`](Self::logs) for replay-then-live SSE delivery; filter by
+    /// [`LogLine::source`].
+    pub fn subscribe_logs(&self) -> broadcast::Receiver<LogLine> {
         self.inner.bus.subscribe()
+    }
+
+    /// The "Verbose Logging" toggle (single home on the [`LogBus`]). Read by the
+    /// serve layer and the worker stderr drain.
+    pub fn log_verbose(&self) -> bool {
+        self.inner.bus.verbose()
+    }
+
+    /// Set the "Verbose Logging" toggle.
+    pub fn set_log_verbose(&self, v: bool) {
+        self.inner.bus.set_verbose(v);
+    }
+
+    /// Push the verbose level to the running worker so its engine-log filter
+    /// flips live (INFO+ ↔ DEBUG+). Fire-and-forget: writes the M_LOG_LEVEL frame
+    /// and does NOT register a pending entry or await a reply — a non-critical
+    /// control must never block the settings handler on the worker. The worker's
+    /// reply (if any) arrives id-less-of-pending and is harmlessly dropped. No
+    /// worker → `write_tx` is `None` → nothing sent (the next spawn seeds the
+    /// level from `HIGGS_WORKER_VERBOSE`).
+    pub fn set_worker_verbose(&self, v: bool) {
+        let line = rpc::encode(&RpcFrame::Request(RpcRequest {
+            jsonrpc: "2.0".into(),
+            id: self.alloc_request_id(),
+            method: M_LOG_LEVEL.to_string(),
+            params: serde_json::json!({ "verbose": v }),
+        }));
+        if let Some(tx) = self.inner.write_tx.lock().as_ref() {
+            let _ = tx.send(line);
+        }
     }
 
     /// Whether Developer Logs are in un-redacted DEBUG mode (show structured
@@ -1288,6 +1319,13 @@ fn production_factory(bus: Arc<LogBus>, model: &str) -> Result<WorkerHalves, Hig
     // turning a normal not-found into a spawn failure. RPC `id` is unaffected.
     let label: String = model.chars().take(64).collect();
     cmd.arg0(format!("higgs({label})"));
+    // Seed the new worker's engine-log verbosity from the current toggle, so a
+    // worker spawned while Verbose Logging is on starts at DEBUG (live toggles
+    // thereafter go via the M_LOG_LEVEL RPC).
+    cmd.env(
+        "HIGGS_WORKER_VERBOSE",
+        if bus.verbose() { "1" } else { "0" },
+    );
     let mut child = cmd
         .arg("--higgs-worker")
         .stdin(Stdio::piped())
@@ -1309,11 +1347,9 @@ fn production_factory(bus: Arc<LogBus>, model: &str) -> Result<WorkerHalves, Hig
     tokio::spawn(async move {
         let mut lines = tokio::io::BufReader::new(stderr).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            // Single home: append to the history ring AND fan out to live SSE
-            // subscribers in one call. Worker stderr is verbatim — the worker
-            // never logs prompt content (redaction policy holds upstream), so
-            // no further sanitization is applied here.
-            bus.push(line);
+            // Tagged `Worker` so it streams in the worker-only debug console;
+            // appends to the history ring AND fans out to live SSE subscribers.
+            bus.push(LogSource::Worker, line);
         }
     });
 
@@ -1716,9 +1752,9 @@ mod tests {
         // bus the supervisor exposes and confirm the cap + oldest-first tail.
         let (sup, _tw, _tr) = make_supervisor();
         for i in 0..2100usize {
-            sup.inner.bus.push(format!("line-{i}"));
+            sup.inner.bus.push(LogSource::Worker, format!("line-{i}"));
         }
-        let snap = sup.logs(usize::MAX);
+        let snap = sup.logs(usize::MAX, None);
         assert_eq!(snap.len(), 2000);
         // 2100 pushed, 100 dropped → oldest remaining is line-100.
         assert_eq!(snap.first().unwrap(), "line-100");
@@ -1883,18 +1919,18 @@ mod tests {
     #[tokio::test]
     async fn logs_tail_and_clamp() {
         let (sup, _tw, _tr) = make_supervisor();
-        sup.inner.bus.push("a".to_owned());
-        sup.inner.bus.push("b".to_owned());
-        sup.inner.bus.push("c".to_owned());
+        sup.inner.bus.push(LogSource::Worker, "a".to_owned());
+        sup.inner.bus.push(LogSource::Worker, "b".to_owned());
+        sup.inner.bus.push(LogSource::Worker, "c".to_owned());
         // Tail of 2 → last two, oldest first.
-        assert_eq!(sup.logs(2), vec!["b".to_owned(), "c".to_owned()]);
+        assert_eq!(sup.logs(2, None), vec!["b".to_owned(), "c".to_owned()]);
         // n larger than the ring → all lines, no panic.
         assert_eq!(
-            sup.logs(100),
+            sup.logs(100, None),
             vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]
         );
         // n == 0 → empty.
-        assert!(sup.logs(0).is_empty());
+        assert!(sup.logs(0, None).is_empty());
     }
 
     /// `record_last_load` persists replay params, and `alloc_request_id` hands

@@ -1,0 +1,13 @@
+# Rust
+/target
+
+# Astro docs site
+astrodocs/node_modules
+astrodocs/dist
+astrodocs/.astro
+
+# macOS
+.DS_Store
+
+# NOTE: bindings/ (generated TS types) IS committed — it's the published type
+# surface embedders (jigglebot) consume. Do not ignore it.

@@ -631,7 +631,14 @@ stderr **and** captured `higgs`-targeted serve-layer tracing events (e.g. reques
 lines like `higgs: GET /v1/models`). This is a one-shot tail — use
 `/api/higgs/logs/stream` for live updates.
 
-**Query:** `?n=200` (default 200 lines)
+**Query:**
+
+- `?n=200` — number of history lines (default 200).
+- `?source=serve|worker` — restrict to one origin: `serve` (the higgs control
+  plane + its worker interactions) or `worker` (the model worker's own stderr).
+  Omit for both merged. Each buffered line is tagged with its origin in the
+  `LogBus`; the filter is applied server-side and the wire shape is unchanged
+  (still `{ "lines": string[] }`).
 
 **Response (200):**
 

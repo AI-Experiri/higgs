@@ -15,7 +15,7 @@ use tokio::sync::{broadcast, mpsc};
 use tracing::warn;
 
 use crate::diagnostic::HiggsError;
-use crate::log_bus::LogBus;
+use crate::log_bus::{LogBus, LogLine, LogSource};
 use crate::supervisor::{HiggsEvent, Supervisor};
 use crate::worker::engine::LoadParams;
 use crate::worker::models::HiggsModel;
@@ -350,12 +350,6 @@ pub struct Higgs {
     /// `parking_lot::Mutex` — read/written for a single `Instant` copy only,
     /// never held across `.await`.
     last_activity: parking_lot::Mutex<std::time::Instant>,
-    /// Runtime "Verbose Logging" toggle for the serve layer. When `true`, the
-    /// chat path emits an extra INFO `higgs:`-target completion line per request
-    /// (token count, finish reason, elapsed) so the Developer Logs show serving
-    /// activity, not just request entry. A plain atomic — set/read in isolation,
-    /// no critical section, never across `.await`. Defaults to `false`.
-    verbose: std::sync::atomic::AtomicBool,
     /// Runtime "Log Incoming Tokens" toggle for the serve layer. When `true`, the
     /// chat path emits an extra INFO `higgs:`-target line per request carrying the
     /// (capped) flattened incoming prompt CONTENT so the Developer Logs show the
@@ -439,7 +433,6 @@ impl Higgs {
             lifecycle: tokio::sync::Mutex::new(()),
             inference_gate: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_INFERENCE)),
             last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
-            verbose: std::sync::atomic::AtomicBool::new(false),
             log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
             jit_enabled: std::sync::atomic::AtomicBool::new(true),
             auto_unload_idle: std::sync::atomic::AtomicBool::new(true),
@@ -451,14 +444,19 @@ impl Higgs {
         }
     }
 
-    /// Whether serve-layer "Verbose Logging" is on (the chat completion line).
+    /// Whether "Verbose Logging" is on. Single home is the [`LogBus`] (read by
+    /// the serve completion line AND the worker drain); delegated via the supervisor.
     pub fn verbose(&self) -> bool {
-        self.verbose.load(std::sync::atomic::Ordering::Relaxed)
+        self.sup.log_verbose()
     }
 
-    /// Turn serve-layer "Verbose Logging" on or off at runtime.
+    /// Turn "Verbose Logging" on or off at runtime. Sets the one-home flag (the
+    /// serve layer + log layer pick it up instantly) AND fire-and-forget pushes
+    /// the level to the running worker so its llama.cpp engine-log filter flips
+    /// (INFO+ ↔ DEBUG+) live, without a reload or blocking the caller.
     pub fn set_verbose(&self, v: bool) {
-        self.verbose.store(v, std::sync::atomic::Ordering::Relaxed);
+        self.sup.set_log_verbose(v);
+        self.sup.set_worker_verbose(v);
     }
 
     /// Whether serve-layer "Log Incoming Tokens" is on (the incoming-prompt line).
@@ -938,16 +936,16 @@ impl Higgs {
         self.sup.events()
     }
 
-    /// Return up to `n` recent Developer-Log lines (oldest first) — worker
-    /// stderr plus captured serve-layer request events.
-    pub fn logs(&self, n: usize) -> Vec<String> {
-        self.sup.logs(n)
+    /// Return up to `n` recent Developer-Log lines (oldest first), optionally
+    /// restricted to one [`LogSource`] (`None` = worker stderr + serve events).
+    pub fn logs(&self, n: usize, filter: Option<LogSource>) -> Vec<String> {
+        self.sup.logs(n, filter)
     }
 
     /// Subscribe to live Developer-Log lines pushed after this call. The SSE
     /// log-stream handler pairs this with [`logs`](Self::logs) for
-    /// replay-then-live delivery.
-    pub fn subscribe_logs(&self) -> tokio::sync::broadcast::Receiver<String> {
+    /// replay-then-live delivery; filter each by [`LogLine::source`].
+    pub fn subscribe_logs(&self) -> tokio::sync::broadcast::Receiver<LogLine> {
         self.sup.subscribe_logs()
     }
 
@@ -1020,7 +1018,6 @@ impl Higgs {
             lifecycle: tokio::sync::Mutex::new(()),
             inference_gate: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_INFERENCE)),
             last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
-            verbose: std::sync::atomic::AtomicBool::new(false),
             log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
             jit_enabled: std::sync::atomic::AtomicBool::new(true),
             auto_unload_idle: std::sync::atomic::AtomicBool::new(true),
@@ -1435,7 +1432,6 @@ mod tests {
             lifecycle: tokio::sync::Mutex::new(()),
             inference_gate: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_INFERENCE)),
             last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
-            verbose: std::sync::atomic::AtomicBool::new(false),
             log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
             jit_enabled: std::sync::atomic::AtomicBool::new(true),
             auto_unload_idle: std::sync::atomic::AtomicBool::new(true),
@@ -1494,7 +1490,6 @@ mod tests {
             // One-slot gate so the test deterministically fills it.
             inference_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
-            verbose: std::sync::atomic::AtomicBool::new(false),
             log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
             jit_enabled: std::sync::atomic::AtomicBool::new(true),
             auto_unload_idle: std::sync::atomic::AtomicBool::new(true),
@@ -1817,7 +1812,6 @@ mod tests {
                 crate::api::MAX_CONCURRENT_INFERENCE,
             )),
             last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
-            verbose: std::sync::atomic::AtomicBool::new(false),
             log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
             jit_enabled: std::sync::atomic::AtomicBool::new(true),
             auto_unload_idle: std::sync::atomic::AtomicBool::new(true),
@@ -1901,7 +1895,6 @@ mod tests {
                 crate::api::MAX_CONCURRENT_INFERENCE,
             )),
             last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
-            verbose: std::sync::atomic::AtomicBool::new(false),
             log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
             jit_enabled: std::sync::atomic::AtomicBool::new(true),
             auto_unload_idle: std::sync::atomic::AtomicBool::new(true),
@@ -1977,7 +1970,6 @@ mod tests {
                 crate::api::MAX_CONCURRENT_INFERENCE,
             )),
             last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
-            verbose: std::sync::atomic::AtomicBool::new(false),
             log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
             jit_enabled: std::sync::atomic::AtomicBool::new(true),
             auto_unload_idle: std::sync::atomic::AtomicBool::new(true),
@@ -2028,7 +2020,6 @@ mod tests {
                 crate::api::MAX_CONCURRENT_INFERENCE,
             )),
             last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
-            verbose: std::sync::atomic::AtomicBool::new(false),
             log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
             jit_enabled: std::sync::atomic::AtomicBool::new(true),
             auto_unload_idle: std::sync::atomic::AtomicBool::new(true),
@@ -2115,7 +2106,6 @@ mod tests {
                 crate::api::MAX_CONCURRENT_INFERENCE,
             )),
             last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
-            verbose: std::sync::atomic::AtomicBool::new(false),
             log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
             jit_enabled: std::sync::atomic::AtomicBool::new(true),
             auto_unload_idle: std::sync::atomic::AtomicBool::new(true),

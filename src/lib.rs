@@ -22,7 +22,7 @@ pub mod worker;
 
 pub use api::{Higgs, HiggsConfig};
 pub use diagnostic::HiggsError;
-pub use log_bus::{HiggsLogLayer, LogBus};
+pub use log_bus::{log_filter, HiggsLogLayer, LogBus};
 pub use supervisor::HiggsEvent;
 
 /// The `llama-cpp-2` Rust binding crate version bundled with this build.

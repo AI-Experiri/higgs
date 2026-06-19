@@ -28,12 +28,18 @@ pub const M_PROBE: &str = "higgs/probe";
 /// Cheap and read-only (no model load, no resident-state mutation). Reply
 /// carries `{gpus: [GpuDevice, …]}`.
 pub const M_SYSINFO: &str = "higgs/sysinfo";
+/// Set the worker's log verbosity at runtime: `{verbose: bool}`. `false` (normal)
+/// = llama.cpp INFO+; `true` (verbose) = DEBUG+. Flips the engine-log level
+/// filter live so the user's "Verbose Logging" toggle takes effect without a
+/// reload. Reply is empty `{}`.
+pub const M_LOG_LEVEL: &str = "higgs/log_level";
 /// Streaming notification carrying one content delta for an in-flight chat.
 pub const N_CHAT_CHUNK: &str = "higgs/chat/chunk";
 
 /// Entry point for the `--higgs-worker` role: serve JSON-RPC on stdio until
 /// `higgs/shutdown` or stdin EOF. Called by the HOST binary's main().
 pub fn worker_main() {
+    engine::llamacpp::logging::install_worker_logging();
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     serve(stdin.lock(), stdout.lock());
@@ -142,6 +148,15 @@ impl WorkerState {
             M_CHAT => self.handle_chat(req, writer),
             M_PROBE => Ok(self.handle_probe(req)),
             M_SYSINFO => Ok(self.handle_sysinfo()),
+            M_LOG_LEVEL => {
+                let verbose = req
+                    .params
+                    .get("verbose")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                engine::llamacpp::logging::set_engine_verbose(verbose);
+                Ok(json!({}))
+            }
             other => Err(RpcError {
                 code: -32601,
                 message: format!("unknown method {other}"),
@@ -187,8 +202,13 @@ impl WorkerState {
         // threads=4) via `u32_param`; the optional overrides deserialize from
         // the same params object (each is `#[serde(default)]` → `None` when
         // absent, so a quick-load carries no overrides — current behavior).
-        let opts: engine::LoadParams =
-            serde_json::from_value(req.params.clone()).unwrap_or_default();
+        let opts: engine::LoadParams = match serde_json::from_value(req.params.clone()) {
+            Ok(opts) => opts,
+            Err(e) => {
+                tracing::warn!(error = %e, "ignoring malformed higgs load overrides");
+                engine::LoadParams::default()
+            }
+        };
         let params = engine::LoadParams {
             ctx_len,
             gpu_layers: u32_param(&req.params, "gpu_layers", u32::MAX),

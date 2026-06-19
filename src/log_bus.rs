@@ -1,12 +1,14 @@
 //! The single home for higgs Developer-Log lines.
 //!
-//! A [`LogBus`] holds BOTH the bounded history ring (the snapshot source for
+//! A [`LogBus`] holds a bounded history ring PER source (the snapshot source for
 //! `GET /api/higgs/logs`) and a live broadcast tap (the source for the
 //! `GET /api/higgs/logs/stream` SSE endpoint). Every line — worker child stderr
-//! AND higgs serve-layer `tracing` events — enters through [`LogBus::push`],
-//! which appends to the ring and sends on the broadcast in one place. There is
-//! no second store: the ring is history, the broadcast is the live fan-out of
-//! the same lines.
+//! ([`LogSource::Worker`]) AND higgs serve-layer `tracing` events
+//! ([`LogSource::Serve`]) — enters through [`LogBus::push`], which appends to
+//! that source's ring and sends the tagged line on the broadcast. Separate rings
+//! mean a chatty worker (e.g. a model load dumping thousands of llama.cpp
+//! metadata lines) never evicts the serve history, so the Developer-Logs console
+//! stays populated while the Worker console scrolls.
 //!
 //! ## Wiring
 //!
@@ -47,25 +49,81 @@ const BROADCAST_CAP: usize = 256;
 /// the bus — never the host application's unrelated spans.
 const HIGGS_TARGET_PREFIX: &str = "higgs";
 
-/// The single home for higgs Developer-Log lines: a bounded history ring plus a
-/// live broadcast tap. Every log line enters via [`push`](Self::push).
+/// Origin of a Developer-Log line, so the worker's output can be streamed
+/// separately from higgs's own control-plane lines (e.g. a Worker-only debug
+/// console). higgs runs one worker at a time today, so `Worker` carries no id;
+/// when remote / multi-worker supervision lands this extends to a per-worker
+/// label and the `?source=` filter to a per-worker selector.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogSource {
+    /// higgs serve-layer / control-plane tracing (the `higgs: …` lines).
+    Serve,
+    /// The model worker process's stderr (llama.cpp / ggml output).
+    Worker,
+}
+
+impl LogSource {
+    /// Parse a `?source=` query value; `None` (absent/unknown) means all sources.
+    pub fn parse(s: &str) -> Option<LogSource> {
+        match s {
+            "serve" => Some(LogSource::Serve),
+            "worker" => Some(LogSource::Worker),
+            _ => None,
+        }
+    }
+}
+
+/// A buffered Developer-Log line tagged with its [`LogSource`]. The history ring
+/// and the live broadcast both carry these so a subscriber can filter by source.
+#[derive(Clone, Debug)]
+pub struct LogLine {
+    /// Where the line came from.
+    pub source: LogSource,
+    /// The formatted line text (what the UI renders).
+    pub text: String,
+}
+
+/// Up to `n` most-recent line texts from one history ring (oldest first).
+fn last_n(ring: &VecDeque<(u64, String)>, n: usize) -> Vec<String> {
+    let skip = ring.len().saturating_sub(n);
+    ring.iter().skip(skip).map(|(_, t)| t.clone()).collect()
+}
+
+/// The single home for higgs Developer-Log lines: a bounded history ring PER
+/// source plus a live broadcast tap. Every log line enters via [`push`](Self::push).
+///
+/// Per-source rings (not one shared ring) so a chatty worker — e.g. a model
+/// load dumping thousands of llama.cpp metadata lines — can't evict the
+/// serve-layer history (or vice-versa); each `?source=` console keeps its own
+/// independent `RING_CAP` of history.
 ///
 /// Cloneable handle semantics are provided by wrapping in `Arc` at the call
-/// site (`Arc<LogBus>`); the broadcast `Sender` and the `Mutex<VecDeque>` are
+/// site (`Arc<LogBus>`); the broadcast `Sender` and the `Mutex<VecDeque>`s are
 /// the shared state.
 #[derive(Debug)]
 pub struct LogBus {
-    /// Bounded history of recent lines (oldest first). Snapshot source for
-    /// `logs(n)`. A `parking_lot::Mutex` held only for push/read of the deque —
-    /// never across `.await`.
-    ring: Mutex<VecDeque<String>>,
+    /// Serve-layer history ring (`(seq, text)`, oldest first). `parking_lot`
+    /// mutex held only for push/read — never across `.await`.
+    serve: Mutex<VecDeque<(u64, String)>>,
+    /// Worker-stderr history ring (`(seq, text)`, oldest first).
+    worker: Mutex<VecDeque<(u64, String)>>,
+    /// Monotonic line counter — stamps every push so an unfiltered (`None`)
+    /// snapshot can re-interleave the two rings in arrival order.
+    seq: std::sync::atomic::AtomicU64,
     /// Live fan-out of every pushed line to current SSE subscribers.
-    tx: broadcast::Sender<String>,
+    tx: broadcast::Sender<LogLine>,
     /// DEBUG toggle, OFF by default. When `true`, [`HiggsLogLayer`] also emits
     /// non-message/non-`error` structured fields — INCLUDING prompt content —
     /// so logs can be debugged un-redacted. The flag lives here (not on `Higgs`)
     /// because the layer holds only the bus. Default off = the redaction policy.
     show_fields: std::sync::atomic::AtomicBool,
+    /// "Verbose Logging" toggle, OFF by default. The single home for the user
+    /// setting that means *show verbose logs*: read by the serve layer (extra
+    /// per-request completion line, via `Higgs::verbose`) AND by the worker
+    /// stderr drain — when `false` it drops llama.cpp's per-load metadata/tensor
+    /// dump (keeping warnings/errors); when `true` it streams every worker line.
+    /// Lives here so the drain (which holds only the bus) can read it.
+    verbose: std::sync::atomic::AtomicBool,
 }
 
 impl LogBus {
@@ -73,9 +131,12 @@ impl LogBus {
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(BROADCAST_CAP);
         Self {
-            ring: Mutex::new(VecDeque::with_capacity(RING_CAP)),
+            serve: Mutex::new(VecDeque::with_capacity(RING_CAP)),
+            worker: Mutex::new(VecDeque::with_capacity(RING_CAP)),
+            seq: std::sync::atomic::AtomicU64::new(0),
             tx,
             show_fields: std::sync::atomic::AtomicBool::new(false),
+            verbose: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -91,31 +152,71 @@ impl LogBus {
             .store(v, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Append `line` to the history ring (evicting the oldest when full) and
-    /// fan it out to live subscribers. A send with no subscribers is a no-op —
-    /// the line still lands in the ring for later snapshot/replay.
-    pub fn push(&self, line: String) {
+    /// Whether "Verbose Logging" is on — drives the serve-layer extra line and
+    /// the worker drain's keep-everything vs drop-the-dump behavior. Off by default.
+    pub fn verbose(&self) -> bool {
+        self.verbose.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Toggle "Verbose Logging" at runtime.
+    pub fn set_verbose(&self, v: bool) {
+        self.verbose.store(v, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Append `text` to its `source` history ring (evicting that ring's oldest
+    /// when full) and fan it out to live subscribers. A send with no subscribers
+    /// is a no-op — the line still lands in the ring for replay.
+    // TODO(C1): `text` is cloned twice (ring String + broadcast LogLine.text).
+    // Switching the ring tuple + LogLine.text to `Arc<str>` does NOT remove the
+    // alloc: the SSE wire boundary (serve/control.rs) and snapshot()/last_n()
+    // both hand out owned `String`s, so an Arc would just reintroduce a
+    // `.to_string()` on the live path. Skipped — no net win without reworking
+    // the String-typed log stream channel.
+    pub fn push(&self, source: LogSource, text: String) {
+        let seq = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         {
-            let mut ring = self.ring.lock();
-            if ring.len() == RING_CAP {
+            let mut ring = match source {
+                LogSource::Serve => self.serve.lock(),
+                LogSource::Worker => self.worker.lock(),
+            };
+            while ring.len() >= RING_CAP {
                 ring.pop_front();
             }
-            ring.push_back(line.clone());
+            ring.push_back((seq, text.clone()));
         }
         // Err means zero subscribers — fine; the ring already has the line.
-        let _ = self.tx.send(line);
+        let _ = self.tx.send(LogLine { source, text });
     }
 
-    /// Up to `n` most-recent lines from the history ring (oldest first).
-    pub fn snapshot(&self, n: usize) -> Vec<String> {
-        let ring = self.ring.lock();
-        let skip = ring.len().saturating_sub(n);
-        ring.iter().skip(skip).cloned().collect()
+    /// Up to `n` most-recent line texts (oldest first), restricted to one
+    /// [`LogSource`] or, with `None`, the two rings re-interleaved by arrival.
+    pub fn snapshot(&self, n: usize, filter: Option<LogSource>) -> Vec<String> {
+        match filter {
+            Some(LogSource::Serve) => last_n(&self.serve.lock(), n),
+            Some(LogSource::Worker) => last_n(&self.worker.lock(), n),
+            None => {
+                // Always lock serve then worker (consistent order — no deadlock).
+                let serve = self.serve.lock();
+                let worker = self.worker.lock();
+                let mut all: Vec<(u64, &str)> = serve
+                    .iter()
+                    .chain(worker.iter())
+                    .map(|(q, t)| (*q, t.as_str()))
+                    .collect();
+                all.sort_by_key(|(q, _)| *q);
+                let skip = all.len().saturating_sub(n);
+                all.into_iter()
+                    .skip(skip)
+                    .map(|(_, t)| t.to_owned())
+                    .collect()
+            }
+        }
     }
 
-    /// Subscribe to live lines pushed AFTER this call. Pair with
-    /// [`snapshot`](Self::snapshot) for replay-then-live delivery.
-    pub fn subscribe(&self) -> broadcast::Receiver<String> {
+    /// Subscribe to live [`LogLine`]s pushed AFTER this call. Pair with
+    /// [`snapshot`](Self::snapshot) for replay-then-live delivery; filter the
+    /// received lines by [`LogLine::source`].
+    pub fn subscribe(&self) -> broadcast::Receiver<LogLine> {
         self.tx.subscribe()
     }
 }
@@ -220,6 +321,12 @@ where
         if !meta.target().starts_with(HIGGS_TARGET_PREFIX) {
             return;
         }
+        // "Verbose Logging" level gate for the Developer-Logs (serve) console:
+        // off → INFO+ only; on → also DEBUG/TRACE. (DEBUG/TRACE only reach here
+        // when the subscriber's per-layer filter admits them — see `log_filter`.)
+        if !self.bus.verbose() && *meta.level() > tracing::Level::INFO {
+            return;
+        }
         let mut visitor = MessageVisitor::default();
         event.record(&mut visitor);
         if visitor.message.is_empty() {
@@ -239,8 +346,23 @@ where
                 line.push_str(&format!(" {k}={v}"));
             }
         }
-        self.bus.push(line);
+        // Serve-layer tracing — the higgs main-server view (incl. its worker
+        // interactions); the worker's own stderr is tagged Worker at its drain.
+        self.bus.push(LogSource::Serve, line);
     }
+}
+
+/// Per-layer filter to install on the [`HiggsLogLayer`] so it admits
+/// `higgs`-target events down to DEBUG — independent of the global subscriber
+/// filter — letting "Verbose Logging" surface higgs DEBUG in the Developer-Logs
+/// console (the layer's own gate then drops DEBUG/TRACE unless verbose). Scoped
+/// to the `higgs` target only, so no other target's DEBUG is generated. Install
+/// as `HiggsLogLayer::new(bus).with_filter(log_filter())`.
+pub fn log_filter() -> tracing_subscriber::filter::Targets {
+    tracing_subscriber::filter::Targets::new().with_target(
+        HIGGS_TARGET_PREFIX,
+        tracing::level_filters::LevelFilter::DEBUG,
+    )
 }
 
 #[cfg(test)]
@@ -252,30 +374,77 @@ mod tests {
     fn push_writes_ring_and_broadcast() {
         let bus = Arc::new(LogBus::new());
         let mut rx = bus.subscribe();
-        bus.push("line-1".to_owned());
+        bus.push(LogSource::Serve, "line-1".to_owned());
         // Ring captured it (snapshot history).
-        assert_eq!(bus.snapshot(10), vec!["line-1".to_owned()]);
+        assert_eq!(bus.snapshot(10, None), vec!["line-1".to_owned()]);
         // Broadcast delivered the same line to the live subscriber.
-        assert_eq!(rx.try_recv().unwrap(), "line-1");
+        assert_eq!(rx.try_recv().unwrap().text, "line-1");
     }
 
     #[test]
     fn snapshot_returns_last_n_oldest_first() {
         let bus = LogBus::new();
         for i in 0..5 {
-            bus.push(format!("l{i}"));
+            bus.push(LogSource::Serve, format!("l{i}"));
         }
-        assert_eq!(bus.snapshot(2), vec!["l3".to_owned(), "l4".to_owned()]);
-        assert_eq!(bus.snapshot(0), Vec::<String>::new());
+        assert_eq!(
+            bus.snapshot(2, None),
+            vec!["l3".to_owned(), "l4".to_owned()]
+        );
+        assert_eq!(bus.snapshot(0, None), Vec::<String>::new());
+    }
+
+    #[test]
+    fn snapshot_filters_by_source() {
+        let bus = LogBus::new();
+        bus.push(LogSource::Serve, "serve-1".to_owned());
+        bus.push(LogSource::Worker, "worker-1".to_owned());
+        bus.push(LogSource::Serve, "serve-2".to_owned());
+        assert_eq!(bus.snapshot(10, None).len(), 3, "no filter = all sources");
+        assert_eq!(
+            bus.snapshot(10, Some(LogSource::Worker)),
+            vec!["worker-1".to_owned()]
+        );
+        assert_eq!(
+            bus.snapshot(10, Some(LogSource::Serve)),
+            vec!["serve-1".to_owned(), "serve-2".to_owned()]
+        );
+    }
+
+    #[test]
+    fn worker_flood_does_not_evict_serve_history() {
+        // The bug: a single shared ring let worker model-load spam evict every
+        // serve line, leaving the Developer Logs console empty. Per-source rings
+        // keep each console's history independent.
+        let bus = LogBus::new();
+        bus.push(LogSource::Serve, "higgs: GET /v1/models".to_owned());
+        bus.push(LogSource::Serve, "higgs: loading model".to_owned());
+        for i in 0..(RING_CAP + 500) {
+            bus.push(LogSource::Worker, format!("ggml line {i}"));
+        }
+        // Serve history survives the worker flood intact.
+        assert_eq!(
+            bus.snapshot(10, Some(LogSource::Serve)),
+            vec![
+                "higgs: GET /v1/models".to_owned(),
+                "higgs: loading model".to_owned()
+            ],
+            "serve lines must not be evicted by worker output"
+        );
+        // The worker ring is still bounded (capped, not unbounded).
+        assert_eq!(
+            bus.snapshot(usize::MAX, Some(LogSource::Worker)).len(),
+            RING_CAP
+        );
     }
 
     #[test]
     fn ring_evicts_oldest_at_capacity() {
         let bus = LogBus::new();
         for i in 0..(RING_CAP + 5) {
-            bus.push(format!("l{i}"));
+            bus.push(LogSource::Worker, format!("l{i}"));
         }
-        let snap = bus.snapshot(RING_CAP + 100);
+        let snap = bus.snapshot(RING_CAP + 100, None);
         assert_eq!(snap.len(), RING_CAP);
         // Oldest 5 were evicted; first surviving line is l5.
         assert_eq!(snap[0], "l5");
@@ -284,15 +453,15 @@ mod tests {
     #[test]
     fn subscriber_only_sees_lines_after_subscribe() {
         let bus = LogBus::new();
-        bus.push("before".to_owned());
+        bus.push(LogSource::Serve, "before".to_owned());
         let mut rx = bus.subscribe();
-        bus.push("after".to_owned());
+        bus.push(LogSource::Serve, "after".to_owned());
         // "before" is NOT delivered live (it predates the subscription); it is
         // only available via the snapshot replay.
-        assert_eq!(rx.try_recv().unwrap(), "after");
+        assert_eq!(rx.try_recv().unwrap().text, "after");
         assert!(rx.try_recv().is_err());
         assert_eq!(
-            bus.snapshot(10),
+            bus.snapshot(10, None),
             vec!["before".to_owned(), "after".to_owned()]
         );
     }
@@ -304,7 +473,7 @@ mod tests {
         // Overflow the broadcast channel without draining — the slow subscriber
         // falls behind and the next recv reports Lagged rather than crashing.
         for i in 0..(BROADCAST_CAP + 10) {
-            bus.push(format!("l{i}"));
+            bus.push(LogSource::Worker, format!("l{i}"));
         }
         match rx.recv().await {
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
@@ -314,7 +483,7 @@ mod tests {
         }
         // After Lagged the receiver recovers and yields the still-buffered tail.
         let next = rx.recv().await.expect("recovers after lag");
-        assert!(next.starts_with('l'));
+        assert!(next.text.starts_with('l'));
     }
 
     #[test]
@@ -333,7 +502,7 @@ mod tests {
             // Wrong target — must be dropped entirely.
             tracing::info!(target: "not_higgs", "should be ignored");
         });
-        let snap = bus.snapshot(10);
+        let snap = bus.snapshot(10, None);
         assert_eq!(snap.len(), 1, "only the higgs-target event is captured");
         let line = &snap[0];
         assert!(
@@ -363,7 +532,7 @@ mod tests {
                 "higgs: chat"
             );
         });
-        let snap = bus.snapshot(10);
+        let snap = bus.snapshot(10, None);
         assert_eq!(snap.len(), 1);
         assert!(
             snap[0].contains("prompt=the actual user prompt"),

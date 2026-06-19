@@ -5,6 +5,30 @@ edition = "2021"
 description = "In-app local model runtime: OpenAI-compatible serving over llama.cpp with crash-isolated worker"
 license = "MIT"
 
+# higgs is its own single-crate workspace (extracted from jigglebot). This makes
+# `[lints] workspace = true` resolve standalone and lets the crate build/release
+# on its own; embedders (jigglebot) depend on it via a path/git dependency.
+[workspace]
+
+[profile.dev]
+incremental = false
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[workspace.lints.clippy]
+# Correctness — hard errors
+uninit_assumed_init = "deny"
+# Style — warnings that nudge toward idiomatic Rust
+needless_pass_by_value = "warn"
+redundant_closure_for_method_calls = "warn"
+cloned_instead_of_copied = "warn"
+manual_string_new = "warn"
+implicit_clone = "warn"
+# Perf
+unnecessary_to_owned = "warn"
+
 [dependencies]
 # full: supervisor needs rt+sync+time+io, worker needs rt+process+io — Tasks 2-12 use all of it
 tokio = { version = "1", features = ["full"] }
