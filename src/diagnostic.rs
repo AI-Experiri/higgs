@@ -185,6 +185,35 @@ pub enum HiggsError {
     #[snafu(display("[HG021] sysinfo worker failed: {context}"))]
     #[diagnostic(code(HG021))]
     SysinfoWorkerFailed { context: String },
+
+    /// A presented pairing token was expired, already used, or unknown. Non-fatal:
+    /// the dialing node is turned away but the hub keeps listening (§7.1).
+    #[snafu(display("[HG022] pairing token invalid (expired, used, or unknown): {detail}"))]
+    #[diagnostic(code(HG022))]
+    PairingTokenInvalid { detail: String },
+
+    /// No protocol version both peers accept. Fatal for this connection: the hub
+    /// returns this then closes the stream, telling the node's UI "you must update"
+    /// rather than "network broke" (§4.1).
+    #[snafu(display("[HG023] no agreed protocol version: peer speaks {peer:?}, we accept {ours:?}"))]
+    #[diagnostic(code(HG023), severity(Error))]
+    VersionMismatch { peer: Vec<u32>, ours: Vec<u32> },
+
+    /// The peer is not in the allowlist and presented no valid pairing token. The
+    /// one path that admits a new id is a valid token; otherwise this. Non-fatal (§7.1).
+    #[snafu(display(
+        "[HG024] peer {endpoint_id} is not in the allowlist and presented no valid pairing token"
+    ))]
+    #[diagnostic(code(HG024))]
+    NotAllowlisted { endpoint_id: String },
+
+    /// QUIC/TLS completed but the peer sent no HELLO within the deadline — a
+    /// pre-auth-DoS guard that bounds half-open admitted connections (§3.2.1). Non-fatal.
+    #[snafu(display(
+        "[HG028] peer {endpoint_id} completed QUIC but sent no HELLO within {window}s; dropped"
+    ))]
+    #[diagnostic(code(HG028))]
+    HandshakeStalled { endpoint_id: String, window: u64 },
 }
 
 #[cfg(test)]
@@ -249,6 +278,27 @@ mod tests {
         let e = HiggsError::WorkerSpawnFailed {
             source: std::io::Error::new(std::io::ErrorKind::NotFound, "no exe"),
         };
+        assert_eq!(e.severity(), Some(miette::Severity::Error));
+    }
+
+    #[test]
+    fn remote_gate_codes_render() {
+        assert!(HiggsError::PairingTokenInvalid { detail: "expired".into() }
+            .to_string()
+            .starts_with("[HG022]"));
+        assert!(HiggsError::NotAllowlisted { endpoint_id: "z32".into() }
+            .to_string()
+            .starts_with("[HG024]"));
+        assert!(HiggsError::HandshakeStalled { endpoint_id: "z32".into(), window: 5 }
+            .to_string()
+            .starts_with("[HG028]"));
+    }
+
+    #[test]
+    fn version_mismatch_is_fatal() {
+        use miette::Diagnostic;
+        let e = HiggsError::VersionMismatch { peer: vec![2], ours: vec![1] };
+        assert!(e.to_string().starts_with("[HG023]"));
         assert_eq!(e.severity(), Some(miette::Severity::Error));
     }
 }
