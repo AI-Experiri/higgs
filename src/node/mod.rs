@@ -7,6 +7,7 @@
 
 pub mod cli;
 pub mod identity;
+pub mod runtime;
 pub mod worker_id;
 
 use std::time::Duration;

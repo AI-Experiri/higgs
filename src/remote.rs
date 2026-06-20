@@ -93,7 +93,13 @@ pub struct HelloResult {
 }
 
 /// `higgs/node/load` params — spawn a NEW worker for model `id` (host-resolved).
+///
+/// `deny_unknown_fields`: a control RPC must reject params the node can't honor rather
+/// than silently drop them (e.g. a hub sending `idle_ttl_minutes` to a node with no idle
+/// reaper). Forward-compat for *optional* peer features rides the HELLO capabilities map,
+/// not silently-ignored load fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeLoadParams {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -102,10 +108,10 @@ pub struct NodeLoadParams {
     pub gpu_layers: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threads: Option<u32>,
-    /// Per-load idle-unload override (minutes), mirroring the local load API so a remote
-    /// load honors the caller's TTL instead of falling back to the node's global default.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub idle_ttl_minutes: Option<u64>,
+    // NOTE: no `idle_ttl_minutes` yet. A per-load idle TTL requires a node-side idle
+    // reaper (the local TTL lives in the host `Higgs` reaper, not the worker). The wire
+    // field and its enforcement land together in a later phase, so the node never accepts
+    // a TTL it would silently fail to honor.
 }
 
 /// `{ "worker_id": <u32> }` — the target selector for `unload`/`kill`/`status`.
@@ -229,15 +235,20 @@ mod tests {
             ctx_len: Some(4096),
             gpu_layers: None,
             threads: None,
-            idle_ttl_minutes: Some(30),
         };
         let s = serde_json::to_string(&p).unwrap();
         let back: NodeLoadParams = serde_json::from_str(&s).unwrap();
         assert_eq!(back.id, "org/m");
         assert_eq!(back.ctx_len, Some(4096));
-        assert_eq!(back.idle_ttl_minutes, Some(30));
         // absent optionals don't serialize
         assert!(!s.contains("gpu_layers"));
+    }
+
+    #[test]
+    fn load_params_reject_unhonorable_fields() {
+        // A node with no idle reaper must reject (not silently drop) a TTL param.
+        let with_ttl = r#"{"id":"m","idle_ttl_minutes":30}"#;
+        assert!(serde_json::from_str::<NodeLoadParams>(with_ttl).is_err());
     }
 
     #[test]

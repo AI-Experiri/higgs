@@ -29,12 +29,11 @@ fn parse_secret(bytes: &[u8]) -> std::io::Result<SecretKey> {
 }
 
 /// Generate and persist a new secret with a temp-file + atomic-publish protocol, so
-/// concurrent first-starts never expose a partial key and never clobber each other:
-///   1. write the full key to a unique private temp file (complete + flushed),
-///   2. `hard_link` it to `endpoint.key` — atomic, fails `AlreadyExists` if a peer
-///      already published, and only ever exposes the complete file,
-///   3. remove the temp.
-/// If a peer won the race, adopt THAT key — all processes agree on one stable id.
+/// concurrent first-starts never expose a partial key and never clobber each other.
+/// We write the full key to a unique private temp file (complete + flushed), then
+/// `hard_link` it to `endpoint.key` (atomic; fails `AlreadyExists` if a peer already
+/// published, and only ever exposes the complete file), then remove the temp. If a peer
+/// won the race, we adopt THAT key — all processes agree on one stable id.
 fn create_secret(path: &Path) -> std::io::Result<SecretKey> {
     let sk = SecretKey::generate();
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));

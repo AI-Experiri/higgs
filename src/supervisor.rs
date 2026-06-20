@@ -144,7 +144,7 @@ pub(crate) struct WorkerHalves {
 /// The `&str` model argument is the model id to be loaded; the production impl
 /// stamps it into the worker's argv0 (`higgs(<model>)`) so the process is
 /// identifiable in `ps`. It is cosmetic only — the model still loads via M_LOAD.
-type HalvesFactory =
+pub(crate) type HalvesFactory =
     Box<dyn Fn(Arc<LogBus>, &str) -> Result<WorkerHalves, HiggsError> + Send + Sync>;
 
 /// Shared supervisor state.

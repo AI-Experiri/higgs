@@ -1131,7 +1131,7 @@ fn validate_repo_id(id: &str) -> Result<(), HiggsError> {
 /// `HiggsConfig`). Returns `false` when `path` itself cannot be canonicalized
 /// (e.g. it does not exist) — a non-existent resolved model path is not a valid
 /// load target.
-fn path_within_roots(path: &str, roots: &[PathBuf]) -> bool {
+pub(crate) fn path_within_roots(path: &str, roots: &[PathBuf]) -> bool {
     let Ok(canon_path) = std::fs::canonicalize(path) else {
         return false;
     };
@@ -1171,7 +1171,7 @@ fn fits_in_memory(needed_bytes: u64, available_bytes: u64) -> bool {
 /// with `Err` [HG017] `InsufficientMemory` → 503 (retryable) instead of
 /// OOM-killing the worker (an opaque [HG004]/[HG006]). The same `sysinfo` path
 /// that backs `GET /api/higgs/system` reads available memory.
-fn guard_memory_headroom(id: &str, needed_bytes: u64) -> Result<(), HiggsError> {
+pub(crate) fn guard_memory_headroom(id: &str, needed_bytes: u64) -> Result<(), HiggsError> {
     let available = available_system_memory();
     if fits_in_memory(needed_bytes, available) {
         return Ok(());
