@@ -8,6 +8,7 @@
 pub mod cli;
 pub mod control;
 pub mod data;
+pub mod fleet;
 pub mod identity;
 pub mod runtime;
 pub mod transport;

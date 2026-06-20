@@ -108,19 +108,25 @@ pub(crate) fn http_status(err: &HiggsError) -> StatusCode {
         | HiggsError::WorkerDead { .. }
         | HiggsError::ServerBusy { .. }
         | HiggsError::InsufficientMemory { .. }
+        // A retired/unreachable remote node is infrastructure-down — retryable.
+        | HiggsError::NodeUnreachable { .. }
         | HiggsError::ServingDisabled => StatusCode::SERVICE_UNAVAILABLE,
         // A wedged-but-alive worker that didn't finish generation in time.
         HiggsError::ChatTimeout { .. } => StatusCode::GATEWAY_TIMEOUT,
         // A worker-reported error carries the worker's origin diagnostic code;
-        // map by it so a worker-side HG002/HG003/HG005/HG006/HG007 reaches the
-        // client as its true status instead of a generic 500.
+        // map by it so a worker-side code (local OR propagated from a remote node)
+        // reaches the client as its true status instead of a generic 500.
         HiggsError::WorkerRpc { worker_code, .. } => match worker_code.as_deref() {
             Some("HG002") | Some("HG003") => StatusCode::NOT_FOUND,
             Some("HG005") => StatusCode::BAD_REQUEST,
-            // HG006/HG007: worker down. HG018: the resolved model was swapped
-            // out by a concurrent JIT load before generation (transient) — the
-            // client should retry, which re-JITs the requested model.
-            Some("HG006") | Some("HG007") | Some("HG018") => StatusCode::SERVICE_UNAVAILABLE,
+            // HG006/HG007: worker down. HG017: remote node couldn't fit the model.
+            // HG018: the resolved model was swapped out by a concurrent JIT load
+            // (transient) — the client should retry, which re-JITs the model.
+            Some("HG006") | Some("HG007") | Some("HG017") | Some("HG018") => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+            // HG016: a remote chat that timed out, propagated as a worker code.
+            Some("HG016") => StatusCode::GATEWAY_TIMEOUT,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         },
         _ => StatusCode::INTERNAL_SERVER_ERROR,

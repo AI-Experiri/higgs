@@ -40,6 +40,18 @@ impl NodeTransport {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Resolves when the underlying connection closes (peer death, idle drop, transport
+    /// error) — used by the fleet to retire a node and clear its routes.
+    pub async fn closed(&self) {
+        let _ = self.conn.closed().await;
+    }
+
+    /// Explicitly close the connection (on retire / session replace) — also wakes any
+    /// `closed()` watcher so it can release its handle and free the connection.
+    pub fn close(&self) {
+        self.conn.close(0u32.into(), b"retired");
+    }
+
     /// Issue one `higgs/node/*` control RPC on a fresh bidi stream and await its response.
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, HiggsError> {
         let id = self.alloc_id();

@@ -214,6 +214,13 @@ pub enum HiggsError {
     ))]
     #[diagnostic(code(HG028))]
     HandshakeStalled { endpoint_id: String, window: u64 },
+
+    /// A paired node became unreachable (connection closed, dial failed, or a wedged
+    /// worker escalation exhausted) and was retired from the fleet. Non-fatal,
+    /// best-effort (§3.4, §3.4.1).
+    #[snafu(display("[HG027] node {endpoint_id} unreachable; retired from fleet: {detail}"))]
+    #[diagnostic(code(HG027))]
+    NodeUnreachable { endpoint_id: String, detail: String },
 }
 
 #[cfg(test)]
@@ -292,6 +299,9 @@ mod tests {
         assert!(HiggsError::HandshakeStalled { endpoint_id: "z32".into(), window: 5 }
             .to_string()
             .starts_with("[HG028]"));
+        assert!(HiggsError::NodeUnreachable { endpoint_id: "z32".into(), detail: "closed".into() }
+            .to_string()
+            .starts_with("[HG027]"));
     }
 
     #[test]
