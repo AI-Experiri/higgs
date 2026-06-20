@@ -26,6 +26,34 @@ pub(crate) fn fake_worker_factory() -> HalvesFactory {
             let mut lines = BufReader::new(wr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let Ok(RpcFrame::Request(r)) = rpc::decode(&line) else { continue };
+                // M_CHAT streams N_CHAT_CHUNK notifications (echoing request_id) then a
+                // final response, mirroring the real worker — so the chat relay/transport
+                // can be exercised without llama.cpp.
+                if r.method == crate::worker::M_CHAT {
+                    let request_id = r.params.get("request_id").cloned().unwrap_or(Value::Null);
+                    for delta in ["he", "llo"] {
+                        let note = crate::rpc::RpcNotification {
+                            jsonrpc: "2.0".into(),
+                            method: crate::worker::N_CHAT_CHUNK.into(),
+                            params: json!({ "request_id": request_id, "delta": delta }),
+                        };
+                        let line = format!("{}\n", rpc::encode(&RpcFrame::Notification(note)));
+                        if ww.write_all(line.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                    let resp = RpcResponse {
+                        jsonrpc: "2.0".into(),
+                        id: r.id,
+                        result: Some(json!({ "content": "hello", "finish_reason": "stop" })),
+                        error: None,
+                    };
+                    let line = format!("{}\n", rpc::encode(&RpcFrame::Response(resp)));
+                    if ww.write_all(line.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
                 let result = match r.method.as_str() {
                     crate::worker::M_LOAD => {
                         json!({ "id": r.params.get("id").cloned().unwrap_or(Value::Null) })

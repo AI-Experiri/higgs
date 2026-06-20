@@ -10,6 +10,7 @@ pub mod control;
 pub mod data;
 pub mod identity;
 pub mod runtime;
+pub mod transport;
 pub mod worker_id;
 
 #[cfg(test)]
