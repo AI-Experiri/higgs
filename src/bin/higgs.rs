@@ -43,6 +43,23 @@ fn main() {
         return;
     }
 
+    // Remote-worker roles/subcommands (iroh). Each runs to completion and exits,
+    // before the default server path below.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let remote = match args.first().map(String::as_str) {
+        Some("--node") => Some(higgs::node::cli::run_node_daemon()),
+        Some("link") => Some(higgs::node::cli::run_link(&args[1..])),
+        Some("node") => Some(higgs::node::cli::run_node(&args[1..])),
+        _ => None,
+    };
+    if let Some(result) = remote {
+        if let Err(e) = result {
+            eprintln!("higgs: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     // Single home for Developer-Log lines: worker stderr + serve-layer events.
     // Created before the subscriber so the HiggsLogLayer and the Higgs facade
     // (built inside run_standalone) can share it.

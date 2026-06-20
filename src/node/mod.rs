@@ -5,6 +5,7 @@
 //! allowlist or a one-time pairing token, persist the pairing, reply. The node dials
 //! and sends HELLO first (`dial_and_hello`). Chat/data streams arrive in P2/P3.
 
+pub mod cli;
 pub mod identity;
 
 use std::time::Duration;
