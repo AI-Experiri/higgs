@@ -6,6 +6,7 @@
 //! and sends HELLO first (`dial_and_hello`). Chat/data streams arrive in P2/P3.
 
 pub mod cli;
+pub mod control;
 pub mod identity;
 pub mod runtime;
 pub mod worker_id;

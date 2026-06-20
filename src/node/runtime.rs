@@ -206,6 +206,22 @@ impl NodeRuntime {
         self.get(id)?.request(M_STATUS, Value::Null).await
     }
 
+    /// Node-level model catalog (`{ "models": [HiggsModel, …] }`) from a fresh scan of the
+    /// node's roots. Read-only; the blocking scan runs off the executor.
+    pub async fn scan(&self) -> Result<Value, HiggsError> {
+        let lmstudio = self.config.lmstudio_dirs.clone();
+        let hf = self.config.hf_dirs.clone();
+        let ollama = self.config.ollama_dirs.clone();
+        let models = tokio::task::spawn_blocking(move || {
+            let mut store = ModelStore::default();
+            store.scan(&lmstudio, &hf, &ollama)?;
+            Ok::<Value, HiggsError>(json!({ "models": store.models() }))
+        })
+        .await
+        .map_err(|e| HiggsError::WorkerDead { context: format!("scan task failed: {e}") })??;
+        Ok(models)
+    }
+
     /// Node-level device list (`{ "gpus": [...] }`), gathered from a transient worker —
     /// the node, not a specific resident worker. Full `{hardware, runtime}` via
     /// `SystemInfo::gather` lands with inventory in P4.
