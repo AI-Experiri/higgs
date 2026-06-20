@@ -27,7 +27,7 @@
 //! already owns and wires the subscriber. No process global, no `common`
 //! dependency.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use parking_lot::Mutex;
 use tokio::sync::broadcast;
@@ -36,8 +36,14 @@ use tracing::{Event, Subscriber};
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::Layer;
 
+use crate::node::node_id::NodeId;
+use crate::node::worker_id::WorkerId;
+
 /// History-ring capacity (lines). Matches the prior `stderr_ring` cap.
 const RING_CAP: usize = 2000;
+
+/// One source's bounded history ring: `(seq, text)` entries, oldest first.
+type Ring = VecDeque<(u64, String)>;
 
 /// Live-broadcast channel capacity (lines). A slow SSE subscriber that falls
 /// this far behind is dropped to `Lagged`; the SSE handler skips the gap and
@@ -51,24 +57,36 @@ const HIGGS_TARGET_PREFIX: &str = "higgs";
 
 /// Origin of a Developer-Log line, so the worker's output can be streamed
 /// separately from higgs's own control-plane lines (e.g. a Worker-only debug
-/// console). higgs runs one worker at a time today, so `Worker` carries no id;
-/// when remote / multi-worker supervision lands this extends to a per-worker
-/// label and the `?source=` filter to a per-worker selector.
+/// console). The hub's LOCAL child stderr is `Worker`; a REMOTE node's worker
+/// stderr (relayed over iroh, P4) is `RemoteWorker { node, worker }` so two
+/// nodes' workers stay separable. Stays `Copy` (both ids are `u32` newtypes) so
+/// it can ride the broadcast/ring cheaply.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LogSource {
     /// higgs serve-layer / control-plane tracing (the `higgs: …` lines).
     Serve,
-    /// The model worker process's stderr (llama.cpp / ggml output).
+    /// The LOCAL model worker process's stderr (llama.cpp / ggml output).
     Worker,
+    /// A remote node's worker stderr, relayed over iroh and keyed by which node +
+    /// which worker on it (`?source=node:<node>:<worker>`).
+    RemoteWorker { node: NodeId, worker: WorkerId },
 }
 
 impl LogSource {
     /// Parse a `?source=` query value; `None` (absent/unknown) means all sources.
+    /// Remote selector form: `node:<node-id>:<worker-id>` (e.g. `node:1:2`).
     pub fn parse(s: &str) -> Option<LogSource> {
         match s {
             "serve" => Some(LogSource::Serve),
             "worker" => Some(LogSource::Worker),
-            _ => None,
+            _ => {
+                let rest = s.strip_prefix("node:")?;
+                let (n, w) = rest.split_once(':')?;
+                Some(LogSource::RemoteWorker {
+                    node: NodeId(n.parse().ok()?),
+                    worker: WorkerId(w.parse().ok()?),
+                })
+            }
         }
     }
 }
@@ -83,8 +101,16 @@ pub struct LogLine {
     pub text: String,
 }
 
+/// Append `(seq, text)` to a history ring, evicting the oldest at `RING_CAP`.
+fn push_ring(ring: &mut Ring, seq: u64, text: String) {
+    while ring.len() >= RING_CAP {
+        ring.pop_front();
+    }
+    ring.push_back((seq, text));
+}
+
 /// Up to `n` most-recent line texts from one history ring (oldest first).
-fn last_n(ring: &VecDeque<(u64, String)>, n: usize) -> Vec<String> {
+fn last_n(ring: &Ring, n: usize) -> Vec<String> {
     let skip = ring.len().saturating_sub(n);
     ring.iter().skip(skip).map(|(_, t)| t.clone()).collect()
 }
@@ -104,9 +130,13 @@ fn last_n(ring: &VecDeque<(u64, String)>, n: usize) -> Vec<String> {
 pub struct LogBus {
     /// Serve-layer history ring (`(seq, text)`, oldest first). `parking_lot`
     /// mutex held only for push/read — never across `.await`.
-    serve: Mutex<VecDeque<(u64, String)>>,
+    serve: Mutex<Ring>,
     /// Worker-stderr history ring (`(seq, text)`, oldest first).
-    worker: Mutex<VecDeque<(u64, String)>>,
+    worker: Mutex<Ring>,
+    /// Per-(node,worker) remote-stderr history rings, created on the first relayed
+    /// line and reclaimed by [`evict_remote`](Self::evict_remote) on unload/kill/retire
+    /// so a dead worker's ring doesn't leak. Each ring is independently `RING_CAP`-bounded.
+    remote: Mutex<HashMap<(NodeId, WorkerId), Ring>>,
     /// Monotonic line counter — stamps every push so an unfiltered (`None`)
     /// snapshot can re-interleave the two rings in arrival order.
     seq: std::sync::atomic::AtomicU64,
@@ -133,6 +163,7 @@ impl LogBus {
         Self {
             serve: Mutex::new(VecDeque::with_capacity(RING_CAP)),
             worker: Mutex::new(VecDeque::with_capacity(RING_CAP)),
+            remote: Mutex::new(HashMap::new()),
             seq: std::sync::atomic::AtomicU64::new(0),
             tx,
             show_fields: std::sync::atomic::AtomicBool::new(false),
@@ -174,18 +205,23 @@ impl LogBus {
     // the String-typed log stream channel.
     pub fn push(&self, source: LogSource, text: String) {
         let seq = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        {
-            let mut ring = match source {
-                LogSource::Serve => self.serve.lock(),
-                LogSource::Worker => self.worker.lock(),
-            };
-            while ring.len() >= RING_CAP {
-                ring.pop_front();
+        match source {
+            LogSource::Serve => push_ring(&mut self.serve.lock(), seq, text.clone()),
+            LogSource::Worker => push_ring(&mut self.worker.lock(), seq, text.clone()),
+            LogSource::RemoteWorker { node, worker } => {
+                let mut remote = self.remote.lock();
+                let ring = remote.entry((node, worker)).or_default();
+                push_ring(ring, seq, text.clone());
             }
-            ring.push_back((seq, text.clone()));
         }
         // Err means zero subscribers — fine; the ring already has the line.
         let _ = self.tx.send(LogLine { source, text });
+    }
+
+    /// Reclaim a remote worker's history ring (called on remote unload/kill/node retire),
+    /// so a finished worker's lines don't linger forever. A no-op if it never logged.
+    pub fn evict_remote(&self, node: NodeId, worker: WorkerId) {
+        self.remote.lock().remove(&(node, worker));
     }
 
     /// Up to `n` most-recent line texts (oldest first), restricted to one
@@ -194,13 +230,21 @@ impl LogBus {
         match filter {
             Some(LogSource::Serve) => last_n(&self.serve.lock(), n),
             Some(LogSource::Worker) => last_n(&self.worker.lock(), n),
+            Some(LogSource::RemoteWorker { node, worker }) => self
+                .remote
+                .lock()
+                .get(&(node, worker))
+                .map(|ring| last_n(ring, n))
+                .unwrap_or_default(),
             None => {
-                // Always lock serve then worker (consistent order — no deadlock).
+                // Always lock in a consistent order (serve, worker, remote) — no deadlock.
                 let serve = self.serve.lock();
                 let worker = self.worker.lock();
+                let remote = self.remote.lock();
                 let mut all: Vec<(u64, &str)> = serve
                     .iter()
                     .chain(worker.iter())
+                    .chain(remote.values().flat_map(|r| r.iter()))
                     .map(|(q, t)| (*q, t.as_str()))
                     .collect();
                 all.sort_by_key(|(q, _)| *q);
@@ -539,6 +583,57 @@ mod tests {
             "show mode appends other fields incl. prompt content: {}",
             snap[0]
         );
+    }
+
+    #[test]
+    fn parses_remote_node_source_selector() {
+        assert_eq!(
+            LogSource::parse("node:1:2"),
+            Some(LogSource::RemoteWorker { node: NodeId(1), worker: WorkerId(2) })
+        );
+        // Malformed selectors fall back to "all sources" (None).
+        assert_eq!(LogSource::parse("node:1"), None);
+        assert_eq!(LogSource::parse("node:x:2"), None);
+        assert_eq!(LogSource::parse("bogus"), None);
+    }
+
+    #[test]
+    fn remote_worker_lines_are_keyed_and_separable() {
+        let bus = LogBus::new();
+        let a = LogSource::RemoteWorker { node: NodeId(1), worker: WorkerId(1) };
+        let b = LogSource::RemoteWorker { node: NodeId(2), worker: WorkerId(1) };
+        bus.push(a, "a-line".to_owned());
+        bus.push(b, "b-line".to_owned());
+        bus.push(a, "a-line-2".to_owned());
+        assert_eq!(bus.snapshot(10, Some(a)), vec!["a-line".to_owned(), "a-line-2".to_owned()]);
+        assert_eq!(bus.snapshot(10, Some(b)), vec!["b-line".to_owned()]);
+        // Unfiltered interleaves both remote workers in arrival order.
+        assert_eq!(
+            bus.snapshot(10, None),
+            vec!["a-line".to_owned(), "b-line".to_owned(), "a-line-2".to_owned()]
+        );
+    }
+
+    #[test]
+    fn evict_remote_reclaims_a_dead_workers_ring() {
+        let bus = LogBus::new();
+        let a = LogSource::RemoteWorker { node: NodeId(1), worker: WorkerId(7) };
+        bus.push(a, "x".to_owned());
+        assert_eq!(bus.snapshot(10, Some(a)).len(), 1);
+        bus.evict_remote(NodeId(1), WorkerId(7));
+        assert!(bus.snapshot(10, Some(a)).is_empty(), "ring reclaimed");
+        // Evicting an unknown worker is a harmless no-op.
+        bus.evict_remote(NodeId(9), WorkerId(9));
+    }
+
+    #[test]
+    fn remote_ring_is_capacity_bounded() {
+        let bus = LogBus::new();
+        let a = LogSource::RemoteWorker { node: NodeId(1), worker: WorkerId(1) };
+        for i in 0..(RING_CAP + 10) {
+            bus.push(a, format!("l{i}"));
+        }
+        assert_eq!(bus.snapshot(usize::MAX, Some(a)).len(), RING_CAP);
     }
 
     #[test]
