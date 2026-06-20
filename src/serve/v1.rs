@@ -246,7 +246,7 @@ pub(super) async fn v1_models(State(higgs): State<Arc<Higgs>>) -> Response {
     tracing::info!("higgs: GET /v1/models");
     match higgs.status().await {
         Ok(status) => {
-            let data = status
+            let mut data: Vec<Model> = status
                 .loaded
                 .into_iter()
                 .map(|l| Model {
@@ -256,6 +256,20 @@ pub(super) async fn v1_models(State(higgs): State<Arc<Higgs>>) -> Response {
                     owned_by: "higgs".to_owned(),
                 })
                 .collect();
+            // Also advertise remote-resident models — they are valid chat targets routed
+            // through the fleet (skip any already listed by the local worker).
+            if let Some(fleet) = higgs.fleet() {
+                for id in fleet.routed_models() {
+                    if !data.iter().any(|m| m.id == id) {
+                        data.push(Model {
+                            id,
+                            object: "model".to_owned(),
+                            created: now_secs(),
+                            owned_by: "higgs".to_owned(),
+                        });
+                    }
+                }
+            }
             Json(ListModelResponse {
                 object: "list".to_owned(),
                 data,
@@ -404,6 +418,25 @@ pub(super) async fn v1_chat_completions(
 ///   failure, …) surfaces as its mapped error — NOT a silent 404. On success the
 ///   post-load status carries the now-loaded model.
 async fn ensure_loaded(higgs: &Arc<Higgs>, model: &str) -> Result<LoadedInfo, Response> {
+    // Remote-resident model: the fleet routes the chat to its node, so skip the LOCAL
+    // loaded/scan gate (which would 404 it as HG003/HG002). The remote worker enforces the
+    // exact prompt-vs-context check (HG005), so we report a permissive `ctx_len` here and
+    // defer prompt-fit to it.
+    if higgs.fleet().is_some_and(|f| f.is_remote(model)) {
+        return Ok(LoadedInfo {
+            id: model.to_owned(),
+            ctx_len: u32::MAX,
+            gpu_layers: 0,
+            threads: 0,
+            arch: None,
+            quant: None,
+            max_context_length: None,
+            size_bytes: None,
+            has_chat_template: None,
+            idle_ttl_minutes: None,
+        });
+    }
+
     let status = match higgs.status().await {
         Ok(s) => s,
         Err(err) => {

@@ -229,6 +229,25 @@ higgs_ts! {
     }
 }
 
+/// Build a [`ChatOutcome`] from a worker `M_CHAT` result `Value` (same shape whether the
+/// worker is local or relayed from a remote node).
+pub(crate) fn chat_outcome_from_value(result: &serde_json::Value) -> ChatOutcome {
+    ChatOutcome {
+        content: result.get("content").and_then(|v| v.as_str()).unwrap_or("").to_owned(),
+        finish_reason: result
+            .get("finish_reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("stop")
+            .to_owned(),
+        tool_calls: result.get("tool_calls").filter(|v| !v.is_null()).cloned(),
+        prompt_tokens: result.get("prompt_tokens").and_then(serde_json::Value::as_u64).unwrap_or(0) as u32,
+        completion_tokens: result
+            .get("completion_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as u32,
+    }
+}
+
 /// Final outcome of a completed chat request.
 #[derive(Debug, Clone)]
 pub struct ChatOutcome {
@@ -406,6 +425,11 @@ pub struct Higgs {
     /// request retries. A plain `parking_lot::Mutex` — held only for the
     /// read/insert, never across `.await`.
     device_cache: parking_lot::Mutex<Option<Vec<crate::system::GpuDevice>>>,
+    /// The remote fleet (paired nodes + model routing), installed when the hub runs an
+    /// iroh listener. `None` for a pure-local higgs. `/v1` chat for a remote-resident model
+    /// routes through this instead of the local `Supervisor` (the two correlation domains
+    /// stay separate, DESIGN-remote.md §2.3).
+    fleet: parking_lot::Mutex<Option<Arc<crate::node::fleet::HubFleet>>>,
 }
 
 impl Higgs {
@@ -441,7 +465,19 @@ impl Higgs {
             serving_enabled: std::sync::atomic::AtomicBool::new(true),
             probe_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             device_cache: parking_lot::Mutex::new(None),
+            fleet: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// Install the remote fleet (hub mode) — `/v1` chat for a remote-resident model then
+    /// routes through it. Idempotent; replaces any prior fleet.
+    pub fn set_fleet(&self, fleet: Arc<crate::node::fleet::HubFleet>) {
+        *self.fleet.lock() = Some(fleet);
+    }
+
+    /// The installed remote fleet, if any (hub mode).
+    pub fn fleet(&self) -> Option<Arc<crate::node::fleet::HubFleet>> {
+        self.fleet.lock().clone()
     }
 
     /// Whether "Verbose Logging" is on. Single home is the [`LogBus`] (read by
@@ -870,6 +906,25 @@ impl Higgs {
         // a busy server is by definition not idle. Lock held for one `Instant`
         // write only, never across `.await`.
         *self.last_activity.lock() = std::time::Instant::now();
+
+        // Remote routing: if a fleet is installed and this model lives on a remote node,
+        // relay the chat over that node's transport instead of the local worker. Remote
+        // capacity is the node's concern, so this bypasses the LOCAL admission gate. The
+        // remote final `Value` has the same shape as a local worker result.
+        // Bind the clone to a `let` so the parking_lot guard drops HERE, not held across
+        // the `.await` below (an `if let` scrutinee temporary would, making this !Send).
+        let fleet = self.fleet.lock().clone();
+        if let Some(fleet) = fleet {
+            if fleet.is_remote(&model) {
+                let (rx, fut) = fleet
+                    .chat(&model, messages_json, max_tokens, temperature, tools_json)
+                    .await?;
+                let handle =
+                    tokio::spawn(async move { Ok(chat_outcome_from_value(&fut.await?)) });
+                return Ok((rx, handle));
+            }
+        }
+
         // Admission gate: bound concurrent in-flight inference so the no-auth
         // server can't be flooded. A full gate is a capacity signal (HTTP 503),
         // not a failure — the client may retry. The owned permit is moved into
@@ -897,35 +952,7 @@ impl Higgs {
             let _permit = permit;
             let result = call.await;
 
-            let result = result?;
-
-            let content = result
-                .get("content")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
-            let finish_reason = result
-                .get("finish_reason")
-                .and_then(|v| v.as_str())
-                .unwrap_or("stop")
-                .to_owned();
-            let prompt_tokens = result
-                .get("prompt_tokens")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0) as u32;
-            let completion_tokens = result
-                .get("completion_tokens")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0) as u32;
-            let tool_calls = result.get("tool_calls").filter(|v| !v.is_null()).cloned();
-
-            Ok(ChatOutcome {
-                content,
-                finish_reason,
-                tool_calls,
-                prompt_tokens,
-                completion_tokens,
-            })
+            Ok(chat_outcome_from_value(&result?))
         });
 
         Ok((rx, handle))
@@ -1026,6 +1053,7 @@ impl Higgs {
             serving_enabled: std::sync::atomic::AtomicBool::new(true),
             probe_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             device_cache: parking_lot::Mutex::new(None),
+            fleet: parking_lot::Mutex::new(None),
         }
     }
 
@@ -1440,6 +1468,7 @@ mod tests {
             serving_enabled: std::sync::atomic::AtomicBool::new(true),
             probe_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             device_cache: parking_lot::Mutex::new(None),
+            fleet: parking_lot::Mutex::new(None),
         };
         let ev = crate::worker::engine::llamacpp::engine_version();
         // Seed a HIT for (llama, Q4_K_M, <this engine version>).
@@ -1498,6 +1527,7 @@ mod tests {
             serving_enabled: std::sync::atomic::AtomicBool::new(true),
             probe_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             device_cache: parking_lot::Mutex::new(None),
+            fleet: parking_lot::Mutex::new(None),
         };
         // Take the only permit and hold it.
         let held = Arc::clone(&higgs.inference_gate)
@@ -1820,6 +1850,7 @@ mod tests {
             serving_enabled: std::sync::atomic::AtomicBool::new(true),
             probe_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             device_cache: parking_lot::Mutex::new(None),
+            fleet: parking_lot::Mutex::new(None),
         };
         let mut events_rx = higgs.events();
         // `load`/`status` run a host-side scan (on a blocking thread) before each
@@ -1903,6 +1934,7 @@ mod tests {
             serving_enabled: std::sync::atomic::AtomicBool::new(true),
             probe_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             device_cache: parking_lot::Mutex::new(None),
+            fleet: parking_lot::Mutex::new(None),
         };
 
         // `status` runs a host-side scan (on a blocking thread) before M_STATUS,
@@ -1978,6 +2010,7 @@ mod tests {
             serving_enabled: std::sync::atomic::AtomicBool::new(true),
             probe_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             device_cache: parking_lot::Mutex::new(None),
+            fleet: parking_lot::Mutex::new(None),
         };
 
         // Drive the load. `load` first runs a host-side scan (on a blocking
@@ -2028,6 +2061,7 @@ mod tests {
             serving_enabled: std::sync::atomic::AtomicBool::new(true),
             probe_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             device_cache: parking_lot::Mutex::new(None),
+            fleet: parking_lot::Mutex::new(None),
         };
 
         let (mut rx, handle) = higgs
@@ -2114,6 +2148,7 @@ mod tests {
             serving_enabled: std::sync::atomic::AtomicBool::new(true),
             probe_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             device_cache: parking_lot::Mutex::new(None),
+            fleet: parking_lot::Mutex::new(None),
         };
 
         // chat_stream registers the sink then the spawned task encounters dead worker.

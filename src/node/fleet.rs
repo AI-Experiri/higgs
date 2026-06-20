@@ -219,6 +219,22 @@ impl HubFleet {
         self.routes.lock().contains_key(model)
     }
 
+    /// Remote-resident model ids whose node is CURRENTLY connected (for `/v1/models`
+    /// discovery = servable now). A route whose node is disconnected is hidden — chat to it
+    /// would fail with HG027 until the node reconnects.
+    pub fn routed_models(&self) -> Vec<String> {
+        let nodes = self.nodes.lock();
+        let mut v: Vec<_> = self
+            .routes
+            .lock()
+            .iter()
+            .filter(|(_, (node, _))| nodes.contains_key(node))
+            .map(|(model, _)| model.clone())
+            .collect();
+        v.sort();
+        v
+    }
+
     /// Relay a chat to the remote worker hosting `model`. Returns the streamed-delta
     /// receiver + a future resolving to the final result. A worker-gone failure drops the
     /// route (so retries re-resolve); a dead transport drops the transport (HG027).
