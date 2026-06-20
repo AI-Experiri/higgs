@@ -100,56 +100,10 @@ fn err_from(id: u64, e: &HiggsError) -> RpcResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::log_bus::LogBus;
-    use crate::node::runtime::{NodeConfig, NodeRuntime};
-    use crate::rpc::{self, RpcFrame};
-    use crate::supervisor::{Supervisor, WorkerHalves};
-    use crate::worker::{M_LOAD, M_STATUS, M_SYSINFO};
-    use std::sync::Arc;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-
-    fn fake_worker_factory() -> crate::supervisor::HalvesFactory {
-        Box::new(|_bus, _model| {
-            let (sup_end, worker_end) = tokio::io::duplex(64 * 1024);
-            let (sup_r, sup_w) = tokio::io::split(sup_end);
-            let (wr, mut ww) = tokio::io::split(worker_end);
-            tokio::spawn(async move {
-                let mut lines = BufReader::new(wr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let Ok(RpcFrame::Request(r)) = rpc::decode(&line) else { continue };
-                    let result = match r.method.as_str() {
-                        M_LOAD => json!({ "id": r.params.get("id").cloned().unwrap_or(Value::Null) }),
-                        M_STATUS => json!({ "loaded": Value::Null }),
-                        M_SYSINFO => json!({ "gpus": [] }),
-                        crate::worker::M_SHUTDOWN => break,
-                        _ => json!({}),
-                    };
-                    let resp = RpcResponse {
-                        jsonrpc: "2.0".into(),
-                        id: r.id,
-                        result: Some(result),
-                        error: None,
-                    };
-                    let line = format!("{}\n", rpc::encode(&RpcFrame::Response(resp)));
-                    if ww.write_all(line.as_bytes()).await.is_err() {
-                        break;
-                    }
-                }
-            });
-            Ok(WorkerHalves { write: Box::new(sup_w), read: Box::new(sup_r), proc: None })
-        })
-    }
+    use crate::node::test_support::fake_runtime as fake_runtime_with_dirs;
 
     fn fake_runtime() -> NodeRuntime {
-        NodeRuntime::with_spawner(
-            NodeConfig {
-                bus: Arc::new(LogBus::new()),
-                lmstudio_dirs: vec![],
-                hf_dirs: vec![],
-                ollama_dirs: vec![],
-            },
-            Box::new(|_bus| Supervisor::with_factory(fake_worker_factory())),
-        )
+        fake_runtime_with_dirs(vec![])
     }
 
     fn req(id: u64, method: &str, params: Value) -> RpcRequest {

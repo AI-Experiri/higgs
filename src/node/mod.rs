@@ -11,6 +11,11 @@ pub mod identity;
 pub mod runtime;
 pub mod worker_id;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+#[cfg(test)]
+mod e2e_tests;
+
 use std::time::Duration;
 
 use iroh::endpoint::Connection;
