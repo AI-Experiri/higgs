@@ -313,12 +313,42 @@ pub async fn connect_node(
 /// stream or connection closes. Control (`higgs/node/*`) routes to the `NodeRuntime`; the
 /// chat data relay (`higgs/chat`) lands in P3. Returns when the connection closes.
 pub async fn serve_node(conn: Connection, rt: std::sync::Arc<crate::node::runtime::NodeRuntime>) {
+    // Relay resident workers' stderr to the hub on a dedicated uni stream for THIS
+    // connection. Runs until the connection closes (a reconnect starts a fresh relay).
+    let relay = tokio::spawn(relay_worker_logs(conn.clone(), rt.clone()));
     // Each iteration accepts a hub-opened stream; the loop ends when the connection
     // closes (caller decides whether to reconnect).
     while let Ok((send, recv)) = conn.accept_bi().await {
         let rt = rt.clone();
         let conn = conn.clone();
         tokio::spawn(handle_node_stream(rt, conn, send, recv));
+    }
+    relay.abort(); // connection closed — stop relaying logs for it
+}
+
+/// Node side: drain the runtime's per-worker log relay onto a uni stream to the hub as
+/// `N_LOG_LINE` notifications. Returns when the connection drops (the uni write fails) or
+/// the runtime's relay sender goes away. Best-effort: a lagged hub drops the gap.
+async fn relay_worker_logs(
+    conn: Connection,
+    rt: std::sync::Arc<crate::node::runtime::NodeRuntime>,
+) {
+    let Ok(mut send) = conn.open_uni().await else { return };
+    let mut logs = rt.subscribe_logs();
+    loop {
+        let (worker_id, line) = match logs.recv().await {
+            Ok(entry) => entry,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        };
+        let note = crate::rpc::RpcNotification {
+            jsonrpc: "2.0".into(),
+            method: crate::remote::N_LOG_LINE.into(),
+            params: serde_json::json!({ "worker_id": worker_id.0, "line": line }),
+        };
+        if write_frame(&mut send, &RpcFrame::Notification(note)).await.is_err() {
+            return; // connection gone
+        }
     }
 }
 

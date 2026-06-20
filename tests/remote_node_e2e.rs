@@ -21,7 +21,9 @@ use serde_json::{json, Value};
 
 use higgs::auth::{Allowlist, PairingTokens};
 use higgs::node::{gate_connection, GateOutcome, HELLO_DEADLINE};
-use higgs::remote::{ALPN, M_NODE_LOAD, M_NODE_STATUS, M_NODE_SYSINFO};
+use higgs::remote::{
+    ALPN, M_NODE_KILL, M_NODE_LOAD, M_NODE_SCAN, M_NODE_STATUS, M_NODE_SYSINFO, M_NODE_UNLOAD,
+};
 use higgs::rpc::{self, RpcFrame, RpcRequest, RpcResponse};
 use higgs::worker::{M_CHAT, N_CHAT_CHUNK};
 
@@ -180,5 +182,50 @@ async fn remote_node_full_workflow_over_iroh() {
     // Either streamed chunks arrived, or the content is non-empty (both prove generation).
     let content = result["content"].as_str().unwrap_or("");
     assert!(!chunks.is_empty() || !content.is_empty(), "tokens were generated");
+
+    // 5. scan: the node enumerates its own on-disk catalog (lists the staged model).
+    let scan = node_rpc(&conn, 10, M_NODE_SCAN, json!({})).await;
+    assert!(scan.error.is_none(), "scan ok: {scan:?}");
+    let models = scan.result.unwrap();
+    let listed = models["models"].as_array().expect("models array");
+    assert!(
+        listed.iter().any(|m| m["id"] == TINY_MODEL_ID),
+        "scan lists the staged model: {listed:?}"
+    );
+
+    // 6. a SECOND concurrent worker for the same model (multi-worker on one node), with the
+    //    full optional load surface (ctx_len/gpu_layers/threads) to exercise param forwarding.
+    let load2 = node_rpc(
+        &conn,
+        11,
+        M_NODE_LOAD,
+        json!({ "id": TINY_MODEL_ID, "ctx_len": 512, "gpu_layers": 0, "threads": 2 }),
+    )
+    .await;
+    assert!(load2.error.is_none(), "second load ok: {load2:?}");
+    let worker2 = load2.result.unwrap()["worker_id"].as_u64().expect("worker_id 2");
+    assert_ne!(worker2, worker_id, "second load is a distinct worker");
+
+    // 7. error paths over the real link: status on an unknown worker, and load of a model
+    //    that isn't on disk — both surface a typed JSON-RPC error, not a hang.
+    let bad_status = node_rpc(&conn, 12, M_NODE_STATUS, json!({ "worker_id": 9999 })).await;
+    assert!(bad_status.error.is_some(), "unknown worker status errors");
+    let bad_load = node_rpc(&conn, 13, M_NODE_LOAD, json!({ "id": "no-such/model" })).await;
+    let err = bad_load.error.expect("missing model errors");
+    assert_eq!(
+        err.data.as_ref().and_then(|d| d["code"].as_str()),
+        Some("HG002"),
+        "missing model → HG002: {err:?}"
+    );
+
+    // 8. unload one worker, force-kill the other — both free their ids cleanly.
+    let unload = node_rpc(&conn, 14, M_NODE_UNLOAD, json!({ "worker_id": worker_id })).await;
+    assert!(unload.error.is_none(), "unload ok: {unload:?}");
+    let kill = node_rpc(&conn, 15, M_NODE_KILL, json!({ "worker_id": worker2 })).await;
+    assert!(kill.error.is_none(), "kill ok: {kill:?}");
+    // The unloaded worker id is now gone (status errors).
+    let gone = node_rpc(&conn, 16, M_NODE_STATUS, json!({ "worker_id": worker_id })).await;
+    assert!(gone.error.is_some(), "unloaded worker is gone");
+
     let _ = std::io::stderr().flush();
 }

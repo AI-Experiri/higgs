@@ -11,9 +11,10 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use serde_json::{json, Value};
+use tokio::sync::broadcast;
 
 use crate::diagnostic::HiggsError;
-use crate::log_bus::LogBus;
+use crate::log_bus::{LogBus, LogSource};
 use crate::node::worker_id::{WorkerId, WorkerRegistry};
 use crate::remote::NodeLoadParams;
 use crate::supervisor::Supervisor;
@@ -57,11 +58,21 @@ impl Drop for StopOnDrop {
     }
 }
 
+/// Capacity of the node→hub log relay broadcast. A hub that falls this far behind drops
+/// the gap (Lagged) and keeps streaming — log relay is best-effort, never back-pressures
+/// a worker.
+const LOG_RELAY_CAP: usize = 1024;
+
 /// The node orchestrator: N concurrent Supervisors, one child each.
 pub struct NodeRuntime {
     registry: Mutex<WorkerRegistry<Arc<Supervisor>>>,
     spawner: SupervisorSpawner,
     config: NodeConfig,
+    /// Fan-out of every resident worker's stderr line, tagged with its `WorkerId`, to the
+    /// CURRENT hub connection's relay task (`serve_node` subscribes per connection). Persists
+    /// across reconnects with the runtime; a line emitted while no hub is connected is
+    /// dropped (no subscriber).
+    log_tx: broadcast::Sender<(WorkerId, String)>,
 }
 
 impl NodeRuntime {
@@ -72,7 +83,14 @@ impl NodeRuntime {
 
     /// Runtime with an injected supervisor spawner (tests).
     pub(crate) fn with_spawner(config: NodeConfig, spawner: SupervisorSpawner) -> Self {
-        Self { registry: Mutex::new(WorkerRegistry::new()), spawner, config }
+        let (log_tx, _) = broadcast::channel(LOG_RELAY_CAP);
+        Self { registry: Mutex::new(WorkerRegistry::new()), spawner, config, log_tx }
+    }
+
+    /// Subscribe to the per-worker stderr relay (`(worker_id, line)`). The node's
+    /// `serve_node` drains this onto a uni stream to the hub as `N_LOG_LINE`.
+    pub fn subscribe_logs(&self) -> broadcast::Receiver<(WorkerId, String)> {
+        self.log_tx.subscribe()
     }
 
     /// Live worker ids, ascending.
@@ -151,7 +169,18 @@ impl NodeRuntime {
         ctx_train: Option<u64>,
         params: &NodeLoadParams,
     ) -> Result<(WorkerId, Value), HiggsError> {
-        let sup = Arc::new((self.spawner)(self.config.bus.clone()));
+        // Each worker gets its OWN LogBus so its stderr can be relayed tagged with the
+        // worker's id (the node has no UI of its own; the shared bus can't distinguish
+        // workers). Subscribe BEFORE start so the load-time output is captured (buffered up
+        // to the broadcast cap), then republish each line to the node-level relay once the
+        // id is known.
+        let wbus = Arc::new(LogBus::new());
+        // Inherit the node's verbose setting so the worker stderr drain keeps (or drops) the
+        // llama.cpp metadata dump consistently with the operator's choice — the relayed
+        // lines then match what a local worker would show.
+        wbus.set_verbose(self.config.bus.verbose());
+        let mut worker_logs = wbus.subscribe();
+        let sup = Arc::new((self.spawner)(wbus));
         // Until the worker is committed to the registry, any early return — error OR
         // cancellation (hub disconnect/timeout while M_LOAD awaits) — must reap it.
         let guard = StopOnDrop::new(sup.clone());
@@ -178,6 +207,22 @@ impl NodeRuntime {
         sup.record_last_load(load_params);
         let id = self.registry.lock().insert(sup);
         guard.commit(); // handed off to the registry — don't reap
+        // Relay this worker's stderr to the current hub, tagged with its id. The task ends
+        // when the worker's bus is dropped (worker unloaded/killed → `recv` returns Closed),
+        // so it never outlives the worker.
+        let relay = self.log_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                match worker_logs.recv().await {
+                    Ok(line) if matches!(line.source, LogSource::Worker) => {
+                        let _ = relay.send((id, line.text));
+                    }
+                    Ok(_) => {} // non-worker line on a worker bus: ignore
+                    Err(broadcast::error::RecvError::Lagged(_)) => {} // dropped gap; keep going
+                    Err(broadcast::error::RecvError::Closed) => break, // worker gone
+                }
+            }
+        });
         Ok((id, loaded))
     }
 

@@ -218,10 +218,17 @@ impl LogBus {
         let _ = self.tx.send(LogLine { source, text });
     }
 
-    /// Reclaim a remote worker's history ring (called on remote unload/kill/node retire),
-    /// so a finished worker's lines don't linger forever. A no-op if it never logged.
+    /// Reclaim a remote worker's history ring (called on remote unload/kill), so a finished
+    /// worker's lines don't linger forever. A no-op if it never logged.
     pub fn evict_remote(&self, node: NodeId, worker: WorkerId) {
         self.remote.lock().remove(&(node, worker));
+    }
+
+    /// Reclaim ALL of a node's remote rings (called on node retire) — including those of
+    /// workers no longer on a current route (e.g. a worker displaced by a reload), which a
+    /// per-worker eviction would miss.
+    pub fn evict_node(&self, node: NodeId) {
+        self.remote.lock().retain(|(n, _), _| *n != node);
     }
 
     /// Up to `n` most-recent line texts (oldest first), restricted to one
@@ -624,6 +631,21 @@ mod tests {
         assert!(bus.snapshot(10, Some(a)).is_empty(), "ring reclaimed");
         // Evicting an unknown worker is a harmless no-op.
         bus.evict_remote(NodeId(9), WorkerId(9));
+    }
+
+    #[test]
+    fn evict_node_reclaims_all_of_a_nodes_rings() {
+        let bus = LogBus::new();
+        let w1 = LogSource::RemoteWorker { node: NodeId(1), worker: WorkerId(1) };
+        let w2 = LogSource::RemoteWorker { node: NodeId(1), worker: WorkerId(2) };
+        let other = LogSource::RemoteWorker { node: NodeId(2), worker: WorkerId(1) };
+        bus.push(w1, "a".to_owned());
+        bus.push(w2, "b".to_owned()); // a displaced worker's ring, off any current route
+        bus.push(other, "c".to_owned());
+        bus.evict_node(NodeId(1));
+        assert!(bus.snapshot(10, Some(w1)).is_empty(), "node 1 worker 1 reclaimed");
+        assert!(bus.snapshot(10, Some(w2)).is_empty(), "node 1 worker 2 reclaimed too");
+        assert_eq!(bus.snapshot(10, Some(other)), vec!["c".to_owned()], "other node untouched");
     }
 
     #[test]

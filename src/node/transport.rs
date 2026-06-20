@@ -40,6 +40,12 @@ impl NodeTransport {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// A clone of the underlying connection, for the fleet's node→hub log-relay reader
+    /// (which accepts the node's uni stream of `N_LOG_LINE` frames).
+    pub(crate) fn connection(&self) -> Connection {
+        self.conn.clone()
+    }
+
     /// Resolves when the underlying connection closes (peer death, idle drop, transport
     /// error) — used by the fleet to retire a node and clear its routes.
     pub async fn closed(&self) {

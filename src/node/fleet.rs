@@ -16,14 +16,19 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use iroh::endpoint::Connection;
 use parking_lot::Mutex;
 use serde_json::json;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
 
 use crate::diagnostic::HiggsError;
+use crate::log_bus::{LogBus, LogSource};
+use crate::node::node_id::{NodeId, NodeIdAllocator};
 use crate::node::transport::NodeTransport;
 use crate::node::worker_id::WorkerId;
-use crate::remote::{M_NODE_KILL, M_NODE_LOAD, M_NODE_UNLOAD};
+use crate::remote::{M_NODE_KILL, M_NODE_LOAD, M_NODE_UNLOAD, N_LOG_LINE};
+use crate::rpc::{self, RpcFrame};
 
 /// A node key — the peer's canonical `EndpointId` string (same form as the allowlist).
 pub type NodeKey = String;
@@ -43,23 +48,50 @@ fn route_invalidating(e: &HiggsError) -> bool {
 }
 
 /// The hub's view of its remote fleet.
-#[derive(Default)]
 pub struct HubFleet {
     /// Currently-connected nodes → their live transport (absent while disconnected).
     nodes: Mutex<HashMap<NodeKey, Arc<NodeTransport>>>,
     /// Durable routes: `model → (node, worker)`, survive reconnect.
     routes: Mutex<HashMap<String, (NodeKey, WorkerId)>>,
+    /// Stable hub-local [`NodeId`] per `EndpointId`, for `LogSource::RemoteWorker` tagging.
+    node_ids: Mutex<NodeIdAllocator>,
+    /// The hub's Developer-Log bus: relayed remote worker stderr lands here under
+    /// `LogSource::RemoteWorker { node, worker }` so it shares the operator's log console.
+    bus: Arc<LogBus>,
 }
 
 impl HubFleet {
-    pub fn new() -> Self {
-        Self::default()
+    /// Build a fleet that files relayed remote logs into `bus` (the hub's own `LogBus`, the
+    /// one its serve layer reads — so remote worker output appears in the same console).
+    pub fn new(bus: Arc<LogBus>) -> Self {
+        Self {
+            nodes: Mutex::new(HashMap::new()),
+            routes: Mutex::new(HashMap::new()),
+            node_ids: Mutex::new(NodeIdAllocator::new()),
+            bus,
+        }
+    }
+
+    /// The stable hub-local [`NodeId`] for a node key, if it has ever been admitted.
+    pub fn node_id(&self, node: &str) -> Option<NodeId> {
+        self.node_ids.lock().get(node)
+    }
+
+    /// The hub Developer-Log bus this fleet relays remote worker stderr into.
+    pub fn bus(&self) -> &Arc<LogBus> {
+        &self.bus
     }
 
     /// Register/replace a paired node's transport (after the hub admits its HELLO). Routes
     /// are KEPT across reconnect (the node's workers persist). Closes any prior transport
     /// and spawns a watcher that drops the transport (only) when its connection closes.
     pub fn add_node(self: &Arc<Self>, node: NodeKey, transport: Arc<NodeTransport>) {
+        // Mint (or reuse) this node's stable NodeId so relayed logs tag consistently.
+        let node_id = self.node_ids.lock().assign(&node);
+        // Read the node's relayed worker stderr (its uni stream) into the hub bus for THIS
+        // connection; ends when the connection closes (accept_uni errors).
+        tokio::spawn(read_remote_logs(transport.connection(), node_id, self.bus.clone()));
+
         let replaced = self.nodes.lock().insert(node.clone(), transport.clone());
         if let Some(old) = replaced {
             old.close(); // free the old connection + wake its close-watcher
@@ -100,6 +132,11 @@ impl HubFleet {
     pub fn retire(&self, node: &str) {
         if let Some(t) = self.nodes.lock().remove(node) {
             t.close();
+        }
+        // Reclaim ALL of this node's relayed-log rings — including any worker displaced by a
+        // reload that's no longer on a current route (a per-route walk would miss those).
+        if let Some(nid) = self.node_id(node) {
+            self.bus.evict_node(nid);
         }
         self.routes.lock().retain(|_, (n, _)| n != node);
     }
@@ -178,8 +215,12 @@ impl HubFleet {
         Ok(new.1)
     }
 
-    /// Best-effort unload of a displaced worker via its node's CURRENT transport.
+    /// Best-effort unload of a displaced worker via its node's CURRENT transport, also
+    /// reclaiming its relayed-log ring so a reload doesn't leak the old worker's lines.
     async fn best_effort_unload(&self, route: &(NodeKey, WorkerId)) {
+        if let Some(nid) = self.node_id(&route.0) {
+            self.bus.evict_remote(nid, route.1);
+        }
         if let Ok(t) = self.transport(&route.0) {
             let _ = t.request(M_NODE_UNLOAD, json!({ "worker_id": route.1 .0 })).await;
         }
@@ -205,6 +246,10 @@ impl HubFleet {
         let res = transport.request(method, json!({ "worker_id": worker.0 })).await;
         if res.is_ok() || res.as_ref().err().is_some_and(route_invalidating) {
             self.remove_route_if(model, &(node.clone(), worker));
+            // The worker is gone — reclaim its relayed-log ring on the hub bus.
+            if let Some(nid) = self.node_id(&node) {
+                self.bus.evict_remote(nid, worker);
+            }
         }
         res.map(|_| ()).map_err(|e| self.handle_op_error(&node, &transport, e))
     }
@@ -279,6 +324,38 @@ impl HubFleet {
     }
 }
 
+/// Accept the node's uni stream(s) of `N_LOG_LINE` notifications and file each line into the
+/// hub bus under `LogSource::RemoteWorker { node, worker }`. Returns when the connection
+/// closes. Best-effort: a malformed frame is skipped, not fatal.
+async fn read_remote_logs(conn: Connection, node: NodeId, bus: Arc<LogBus>) {
+    while let Ok(recv) = conn.accept_uni().await {
+        let bus = bus.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(recv).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let Ok(RpcFrame::Notification(n)) = rpc::decode(&line) else { continue };
+                if n.method != N_LOG_LINE {
+                    continue;
+                }
+                // The wire documents a u32 worker id; reject (skip) a malformed out-of-range
+                // value rather than wrapping it and mis-filing the line under another worker.
+                let worker = n
+                    .params
+                    .get("worker_id")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|w| u32::try_from(w).ok());
+                let text = n.params.get("line").and_then(|v| v.as_str());
+                if let (Some(w), Some(t)) = (worker, text) {
+                    bus.push(
+                        LogSource::RemoteWorker { node, worker: WorkerId(w) },
+                        t.to_string(),
+                    );
+                }
+            }
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,7 +378,7 @@ mod tests {
         let conn = hub.accept().await.expect("incoming").await.expect("conn");
         std::mem::forget(hub);
 
-        let fleet = Arc::new(HubFleet::new());
+        let fleet = Arc::new(HubFleet::new(Arc::new(crate::log_bus::LogBus::new())));
         fleet.add_node(node_key.clone(), Arc::new(NodeTransport::new(conn)));
         (fleet, node_key, model_id, root)
     }
@@ -375,7 +452,7 @@ mod tests {
 
     #[tokio::test]
     async fn ops_on_unknown_node_are_unreachable() {
-        let fleet = Arc::new(HubFleet::new());
+        let fleet = Arc::new(HubFleet::new(Arc::new(crate::log_bus::LogBus::new())));
         let err = fleet.load("ghost", "m").await.unwrap_err();
         assert!(err.to_string().starts_with("[HG027]"), "got {err}");
     }

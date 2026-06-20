@@ -18,6 +18,13 @@ pub const ALPN: &[u8] = b"higgs/remote/1";
 /// HELLO — the first control-stream frame (node → hub).
 pub const M_HELLO: &str = "higgs/node/hello";
 
+/// `N_LOG_LINE` — a node → hub notification carrying ONE remote worker stderr line,
+/// pushed on a dedicated uni stream the node opens after HELLO. The hub files it into its
+/// `LogBus` under `LogSource::RemoteWorker { node, worker }` so the operator sees a remote
+/// node's worker output in the same Developer-Logs console as local output
+/// (DESIGN-remote.md §4.2, P4). Params: `{ "worker_id": <u32>, "line": <string> }`.
+pub const N_LOG_LINE: &str = "higgs/node/log_line";
+
 /// Control-plane methods (hub → node), all namespaced `higgs/node/*` so a reader never
 /// confuses a hub→node op with a node→worker `higgs/*` op (DESIGN-remote.md §4.2, flag #1).
 pub const M_NODE_LOAD: &str = "higgs/node/load";

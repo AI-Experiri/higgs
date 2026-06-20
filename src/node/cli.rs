@@ -80,8 +80,16 @@ fn run_link_pair() -> Result<()> {
         println!("on the node:  higgs node connect {ticket} {token}");
         println!("listening for dials (Ctrl-C to stop)…");
 
+        // SIGINT/SIGTERM ends the accept loop and returns cleanly so the process runs its
+        // at-exit handlers (and, under coverage, flushes its profile) rather than dying mid-accept.
+        let shutdown = crate::shutdown_signal();
+        tokio::pin!(shutdown);
         loop {
-            let Some(incoming) = endpoint.accept().await else { break };
+            let incoming = tokio::select! {
+                _ = &mut shutdown => break,
+                incoming = endpoint.accept() => incoming,
+            };
+            let Some(incoming) = incoming else { break };
             let conn = match incoming.await {
                 Ok(c) => c,
                 Err(e) => {
@@ -183,8 +191,14 @@ pub fn run_node_daemon(args: &[String]) -> Result<()> {
                 hc.lmstudio_dirs.push(std::path::PathBuf::from(dir));
             }
         }
+        // A node has no UI; its worker stderr is relayed to the hub. HIGGS_VERBOSE=1 keeps
+        // the full llama.cpp dump (default off drops the per-load metadata flood).
+        let bus = Arc::new(crate::log_bus::LogBus::new());
+        if std::env::var("HIGGS_VERBOSE").is_ok_and(|v| v == "1" || v == "true") {
+            bus.set_verbose(true);
+        }
         let node = Arc::new(NodeRuntime::new(NodeConfig {
-            bus: Arc::new(crate::log_bus::LogBus::new()),
+            bus,
             lmstudio_dirs: hc.lmstudio_dirs,
             hf_dirs: hc.hf_dirs,
             ollama_dirs: hc.ollama_dirs,
