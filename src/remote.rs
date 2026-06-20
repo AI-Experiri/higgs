@@ -18,6 +18,15 @@ pub const ALPN: &[u8] = b"higgs/remote/1";
 /// HELLO — the first control-stream frame (node → hub).
 pub const M_HELLO: &str = "higgs/node/hello";
 
+/// Control-plane methods (hub → node), all namespaced `higgs/node/*` so a reader never
+/// confuses a hub→node op with a node→worker `higgs/*` op (DESIGN-remote.md §4.2, flag #1).
+pub const M_NODE_LOAD: &str = "higgs/node/load";
+pub const M_NODE_UNLOAD: &str = "higgs/node/unload";
+pub const M_NODE_KILL: &str = "higgs/node/kill";
+pub const M_NODE_SCAN: &str = "higgs/node/scan";
+pub const M_NODE_SYSINFO: &str = "higgs/node/sysinfo";
+pub const M_NODE_STATUS: &str = "higgs/node/status";
+
 /// The wire-protocol majors this build speaks.
 pub const PROTOCOL_VERSIONS: &[u32] = &[1];
 /// The lowest major this build still accepts.
@@ -81,6 +90,38 @@ pub struct HelloResult {
     /// Open capability map (e.g. `update_push`, `log_aggregate`).
     #[serde(default)]
     pub capabilities: Capabilities,
+}
+
+/// `higgs/node/load` params — spawn a NEW worker for model `id` (host-resolved).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeLoadParams {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ctx_len: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_layers: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threads: Option<u32>,
+    /// Per-load idle-unload override (minutes), mirroring the local load API so a remote
+    /// load honors the caller's TTL instead of falling back to the node's global default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_ttl_minutes: Option<u64>,
+}
+
+/// `{ "worker_id": <u32> }` — the target selector for `unload`/`kill`/`status`.
+/// (`sysinfo` is node-level and takes `{}`; `load`'s result is [`NodeLoadResult`].)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerRef {
+    pub worker_id: u32,
+}
+
+/// `higgs/node/load` result: the assigned `worker_id` plus the worker's load result
+/// (`loaded`) passed through verbatim (`{id, ...}` today; richer `LoadedInfo` later) —
+/// no new shape invented, matching DESIGN-remote.md §4.2.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeLoadResult {
+    pub worker_id: u32,
+    pub loaded: serde_json::Value,
 }
 
 /// No agreed protocol version (maps to HG023, a fatal typed close).
@@ -169,6 +210,50 @@ mod tests {
         p.pairing_token = None;
         let s = serde_json::to_string(&p).unwrap();
         assert!(!s.contains("pairing_token"), "absent token must not serialize");
+    }
+
+    #[test]
+    fn node_method_consts_are_namespaced() {
+        assert_eq!(M_NODE_LOAD, "higgs/node/load");
+        assert_eq!(M_NODE_UNLOAD, "higgs/node/unload");
+        assert_eq!(M_NODE_KILL, "higgs/node/kill");
+        assert_eq!(M_NODE_SCAN, "higgs/node/scan");
+        assert_eq!(M_NODE_SYSINFO, "higgs/node/sysinfo");
+        assert_eq!(M_NODE_STATUS, "higgs/node/status");
+    }
+
+    #[test]
+    fn load_params_roundtrip() {
+        let p = NodeLoadParams {
+            id: "org/m".into(),
+            ctx_len: Some(4096),
+            gpu_layers: None,
+            threads: None,
+            idle_ttl_minutes: Some(30),
+        };
+        let s = serde_json::to_string(&p).unwrap();
+        let back: NodeLoadParams = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.id, "org/m");
+        assert_eq!(back.ctx_len, Some(4096));
+        assert_eq!(back.idle_ttl_minutes, Some(30));
+        // absent optionals don't serialize
+        assert!(!s.contains("gpu_layers"));
+    }
+
+    #[test]
+    fn worker_ref_roundtrip() {
+        let r = WorkerRef { worker_id: 7 };
+        let back: WorkerRef = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(back.worker_id, 7);
+    }
+
+    #[test]
+    fn node_load_result_carries_worker_id_and_loaded() {
+        let r = NodeLoadResult { worker_id: 3, loaded: serde_json::json!({"id":"m"}) };
+        let back: NodeLoadResult =
+            serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(back.worker_id, 3);
+        assert_eq!(back.loaded["id"], "m");
     }
 
     #[test]
