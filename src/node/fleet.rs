@@ -342,6 +342,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unload_then_kill_drop_routes() {
+        let (fleet, node_key, model_id, _root) = fleet_with_one_node().await;
+        fleet.load(&node_key, &model_id).await.unwrap();
+        fleet.unload(&model_id).await.unwrap();
+        assert!(!fleet.is_remote(&model_id), "unload drops the route");
+
+        fleet.load(&node_key, &model_id).await.unwrap();
+        fleet.kill(&model_id).await.unwrap();
+        assert!(!fleet.is_remote(&model_id), "kill drops the route");
+    }
+
+    #[tokio::test]
+    async fn unload_and_chat_unrouted_model_error() {
+        let (fleet, _node_key, _model_id, _root) = fleet_with_one_node().await;
+        assert!(fleet.unload("nope/none").await.is_err());
+        assert!(fleet.kill("nope/none").await.is_err());
+        assert!(fleet.resolve("nope/none").is_none());
+        assert!(fleet.chat("nope/none", "[]".into(), 8, 0.0, None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn routed_models_lists_connected_only() {
+        let (fleet, node_key, model_id, _root) = fleet_with_one_node().await;
+        assert!(fleet.routed_models().is_empty());
+        fleet.load(&node_key, &model_id).await.unwrap();
+        assert_eq!(fleet.routed_models(), vec![model_id.clone()]);
+        // After retiring the node, the route is gone → not advertised.
+        fleet.retire(&node_key);
+        assert!(fleet.routed_models().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ops_on_unknown_node_are_unreachable() {
+        let fleet = Arc::new(HubFleet::new());
+        let err = fleet.load("ghost", "m").await.unwrap_err();
+        assert!(err.to_string().starts_with("[HG027]"), "got {err}");
+    }
+
+    #[tokio::test]
     async fn retire_drops_node_and_routes() {
         let (fleet, node_key, model_id, _root) = fleet_with_one_node().await;
         fleet.load(&node_key, &model_id).await.unwrap();

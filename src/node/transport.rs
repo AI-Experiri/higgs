@@ -217,6 +217,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn control_request_error_maps_worker_code() {
+        // Loading an id with no on-disk model → node replies HG002, surfaced as WorkerRpc
+        // carrying the origin code (extract_result mapping).
+        let (t, _model_id, _root) = paired_transport().await;
+        let err = t.request(M_NODE_LOAD, json!({ "id": "missing/model" })).await.unwrap_err();
+        match err {
+            HiggsError::WorkerRpc { worker_code, .. } => assert_eq!(worker_code.as_deref(), Some("HG002")),
+            other => panic!("expected WorkerRpc, got {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_unknown_worker_errors() {
+        // Chat to a worker id that doesn't exist → the node's relay reports it; the chat
+        // future resolves to an error rather than streaming.
+        let (t, _model_id, _root) = paired_transport().await;
+        let (_rx, fut) = t.chat(999, "m".into(), "[]".into(), 8, 0.0, None).await.unwrap();
+        assert!(fut.await.is_err(), "unknown worker → chat error");
+    }
+
+    #[tokio::test]
     async fn chat_streams_chunks_then_final() {
         let (t, model_id, _root) = paired_transport().await;
         let worker_id =
