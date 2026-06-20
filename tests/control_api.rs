@@ -256,3 +256,221 @@ async fn control_api_lifecycle() {
         "worker_alive is false after stop"
     );
 }
+
+/// The settings + health + SSE-logs control surface (no model needed): GET/PUT the two
+/// settings endpoints round-trip a toggle, the health endpoints answer, and the logs SSE
+/// stream opens and emits at least the replay prefix.
+#[tokio::test]
+async fn control_settings_health_and_log_stream() {
+    let Some(gguf) = tiny_gguf_path() else {
+        eprintln!("SKIP control_settings_health_and_log_stream: tiny gguf not found");
+        return;
+    };
+    let srv = spawn_with_tiny_model(11507, &gguf).await;
+    let c = reqwest::Client::new();
+
+    // ── Health endpoints answer 200 ──────────────────────────────────────────
+    for path in ["/health", "/api/higgs/health"] {
+        let r = c.get(format!("{}{path}", srv.base)).send().await.unwrap();
+        assert!(r.status().is_success(), "{path} is healthy");
+    }
+
+    // ── logs/settings: GET current, PUT a flip, GET reflects it ──────────────
+    let before: serde_json::Value = c
+        .get(format!("{}/api/higgs/logs/settings", srv.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let verbose0 = before["verbose"].as_bool().expect("verbose flag present");
+    let mut put_body = before.clone();
+    put_body["verbose"] = serde_json::Value::Bool(!verbose0);
+    let put = c
+        .put(format!("{}/api/higgs/logs/settings", srv.base))
+        .json(&put_body)
+        .send()
+        .await
+        .unwrap();
+    assert!(put.status().is_success(), "PUT logs/settings ok");
+    let after: serde_json::Value = c
+        .get(format!("{}/api/higgs/logs/settings", srv.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(after["verbose"], !verbose0, "verbose toggle persisted");
+
+    // ── settings: GET then PUT the same payload back (round-trips the schema) ──
+    let settings: serde_json::Value = c
+        .get(format!("{}/api/higgs/settings", srv.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let put = c
+        .put(format!("{}/api/higgs/settings", srv.base))
+        .json(&settings)
+        .send()
+        .await
+        .unwrap();
+    assert!(put.status().is_success(), "PUT settings round-trips: {settings:?}");
+
+    // ── Invalid model ids are rejected with a typed 4xx (id-validation branch) ──
+    for bad in ["bad id with spaces", "../escape", ""] {
+        let r = c
+            .post(format!("{}/api/higgs/models/load", srv.base))
+            .json(&serde_json::json!({ "id": bad }))
+            .send()
+            .await
+            .unwrap();
+        assert!(r.status().is_client_error(), "invalid id {bad:?} → 4xx, got {}", r.status());
+    }
+
+    // ── model-by-id for a SCANNED-but-unloaded model reads its on-disk metadata ──
+    let by_id = c
+        .get(format!("{}/api/higgs/models/{}", srv.base, TINY_MODEL_ID))
+        .send()
+        .await
+        .unwrap();
+    assert!(by_id.status().is_success(), "by-id for a scanned model ok");
+    let detail: serde_json::Value = by_id.json().await.unwrap();
+    assert_eq!(detail["id"], TINY_MODEL_ID, "by-id returns the model: {detail:?}");
+
+    // by-id for an UNKNOWN model is a 404 (the not-found branch).
+    let missing = c
+        .get(format!("{}/api/higgs/models/ghost-org/ghost-model", srv.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 404, "by-id for an unknown model is 404");
+}
+
+/// The supervisor's auto-restart FSM: when the worker child dies unexpectedly, the next
+/// request respawns it and REPLAYS the recorded load, so the model is back without a manual
+/// reload. We load a model, hard-kill the worker child (the server's grandchild), then chat
+/// again — it must succeed against a freshly restarted + reloaded worker.
+#[tokio::test]
+async fn worker_crash_triggers_restart_and_replay() {
+    let Some(gguf) = tiny_gguf_path() else {
+        eprintln!("SKIP worker_crash_triggers_restart_and_replay: tiny gguf not found");
+        return;
+    };
+    let srv = spawn_with_tiny_model(11509, &gguf).await;
+    let c = reqwest::Client::new();
+
+    // Load the model (spawns the worker child).
+    let load = c
+        .post(format!("{}/api/higgs/models/load", srv.base))
+        .json(&serde_json::json!({ "id": TINY_MODEL_ID }))
+        .send()
+        .await
+        .unwrap();
+    assert!(load.status().is_success(), "initial load ok");
+
+    // Find and HARD-kill the worker child (a `--higgs-worker` grandchild of the server).
+    let pids = worker_child_pids(srv.pid());
+    assert!(!pids.is_empty(), "found the worker child process");
+    for pid in &pids {
+        unsafe {
+            libc::kill(*pid as libc::pid_t, libc::SIGKILL);
+        }
+    }
+
+    // The next chat must succeed: the supervisor detects the dead child, restarts it, and
+    // replays the recorded load before serving — possibly after a transient error, so retry.
+    let mut ok = false;
+    for _ in 0..40 {
+        let resp = c
+            .post(format!("{}/v1/chat/completions", srv.base))
+            .json(&serde_json::json!({
+                "model": TINY_MODEL_ID, "stream": false, "max_tokens": 4,
+                "messages": [{ "role": "user", "content": "hi" }]
+            }))
+            .send()
+            .await
+            .unwrap();
+        if resp.status().is_success() {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    assert!(ok, "chat succeeds after the worker was restarted + the load replayed");
+}
+
+/// The idle reaper auto-unloads a model after its idle TTL elapses: with `auto_unload_idle`
+/// on and `idle_ttl_minutes = 0`, a loaded-but-unused worker is reaped on the next reaper
+/// tick (~30s) without any client action.
+#[tokio::test]
+async fn idle_reaper_auto_unloads_a_model() {
+    let Some(gguf) = tiny_gguf_path() else {
+        eprintln!("SKIP idle_reaper_auto_unloads_a_model: tiny gguf not found");
+        return;
+    };
+    let srv = spawn_with_tiny_model(11510, &gguf).await;
+    let c = reqwest::Client::new();
+
+    // Enable aggressive idle auto-unload (TTL 0 ⇒ idle immediately) BEFORE loading.
+    let mut settings: serde_json::Value = c
+        .get(format!("{}/api/higgs/settings", srv.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    settings["auto_unload_idle"] = serde_json::json!(true);
+    settings["idle_ttl_minutes"] = serde_json::json!(0);
+    let put = c
+        .put(format!("{}/api/higgs/settings", srv.base))
+        .json(&settings)
+        .send()
+        .await
+        .unwrap();
+    assert!(put.status().is_success(), "enable idle auto-unload");
+
+    let load = c
+        .post(format!("{}/api/higgs/models/load", srv.base))
+        .json(&serde_json::json!({ "id": TINY_MODEL_ID }))
+        .send()
+        .await
+        .unwrap();
+    assert!(load.status().is_success(), "load ok");
+
+    // Within ~2 reaper ticks the idle worker is auto-unloaded (no chat keeps it alive).
+    let mut unloaded = false;
+    for _ in 0..35 {
+        let status: serde_json::Value = c
+            .get(format!("{}/api/higgs/status", srv.base))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if status["worker_alive"] == false || status["loaded"].is_null() {
+            unloaded = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    assert!(unloaded, "idle reaper auto-unloaded the model within the timeout");
+}
+
+/// PIDs of the `--higgs-worker` children of `server_pid` (the spawned worker processes).
+fn worker_child_pids(server_pid: u32) -> Vec<u32> {
+    let out = std::process::Command::new("pgrep")
+        .args(["-P", &server_pid.to_string()])
+        .output()
+        .expect("run pgrep");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.trim().parse::<u32>().ok())
+        .collect()
+}

@@ -60,6 +60,13 @@ impl Drop for ServerGuard {
     }
 }
 
+impl ServerGuard {
+    /// The spawned `higgs` server process pid (for tests that need to find its worker child).
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+}
+
 /// Stage `gguf` into a temp LM-Studio layout (`<tmp>/higgs-test/stories260k/`)
 /// so the scanner discovers it under [`TINY_MODEL_ID`]. Returns the temp dir
 /// (the scan root) — keep it alive for the server's lifetime. The GGUF is

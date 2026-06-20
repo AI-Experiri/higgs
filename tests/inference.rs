@@ -351,4 +351,143 @@ async fn inference_and_tools() {
         !body.contains("<tool_call>") && !body.contains("<function="),
         "no tool-call markup leaks into the stream"
     );
+
+    // ── Sampling-parameter passthrough (non-streaming) ────────────────────────
+    // A request carrying the full OpenAI sampling surface must parse and succeed —
+    // exercises the param-extraction branches in the /v1 handler.
+    let resp: Value = chat(json!({
+        "model": id, "stream": false,
+        "messages": [{ "role": "user", "content": "Tell a very short story." }],
+        "max_tokens": 16,
+        "temperature": 0.8,
+        "top_p": 0.95,
+        "presence_penalty": 0.1,
+        "frequency_penalty": 0.1,
+        "seed": 42,
+        "stop": ["\n\n"]
+    }))
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert!(
+        resp["choices"][0]["message"]["content"].is_string(),
+        "sampling-param request returns content: {resp:?}"
+    );
+
+    // ── Streaming with usage accounting (stream_options.include_usage) ─────────
+    let body = chat(json!({
+        "model": id, "stream": true,
+        "messages": [{ "role": "user", "content": "Hello there." }],
+        "max_tokens": 8,
+        "stream_options": { "include_usage": true }
+    }))
+    .await
+    .unwrap()
+    .text()
+    .await
+    .unwrap();
+    assert!(body.contains("[DONE]"), "usage stream terminates with [DONE]");
+    assert!(
+        body.contains("usage") || body.contains("completion_tokens"),
+        "include_usage emits a usage block: {body}"
+    );
+
+    // ── Streaming request for an UNKNOWN model → error before any stream opens ──
+    let unknown_stream = c
+        .post(format!("{}/v1/chat/completions", srv.base))
+        .json(&json!({
+            "model": "no-such-org/no-such-model", "stream": true,
+            "messages": [{ "role": "user", "content": "hi" }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown_stream.status(), 404, "streaming unknown model is 404 (pre-stream error)");
+
+    // ── Zero max_tokens exercises the boundary branch (clamped or rejected, never 5xx) ──
+    let zero = c
+        .post(format!("{}/v1/chat/completions", srv.base))
+        .json(&json!({
+            "model": id, "stream": false, "max_tokens": 0,
+            "messages": [{ "role": "user", "content": "hi" }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(!zero.status().is_server_error(), "max_tokens=0 must not 5xx, got {}", zero.status());
+
+    // ── Token logging ON + a tool-result conversation ─────────────────────────
+    // Turning on "Log Incoming Tokens" exercises the prompt/response logging path; the
+    // multi-turn history (assistant tool_call → tool result) exercises message + tool
+    // (de)serialization in the /v1 handler.
+    let cur: Value = c
+        .get(format!("{}/api/higgs/logs/settings", srv.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let mut on = cur.clone();
+    on["log_incoming_tokens"] = json!(true);
+    let put = c
+        .put(format!("{}/api/higgs/logs/settings", srv.base))
+        .json(&on)
+        .send()
+        .await
+        .unwrap();
+    assert!(put.status().is_success(), "enable token logging");
+
+    let resp = chat(json!({
+        "model": id, "stream": false, "max_tokens": 8,
+        "messages": [
+            { "role": "system", "content": "You are a weather bot." },
+            { "role": "user", "content": "Weather in Paris?" },
+            { "role": "assistant", "content": null, "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": { "name": "get_weather", "arguments": "{\"city\":\"Paris\"}" }
+            }]},
+            { "role": "tool", "tool_call_id": "call_1", "content": "15C and sunny" },
+            { "role": "user", "content": "Thanks, summarize." }
+        ],
+        "tools": [weather_tool()]
+    }))
+    .await
+    .unwrap();
+    assert!(resp.status().is_success(), "tool-result conversation succeeds: {}", resp.status());
+
+    // A STREAMING chat with token logging still on — exercises the streamed response
+    // logging path (log_served on the SSE branch).
+    let body = chat(json!({
+        "model": id, "stream": true, "max_tokens": 8,
+        "messages": [{ "role": "user", "content": "One more line please." }]
+    }))
+    .await
+    .unwrap()
+    .text()
+    .await
+    .unwrap();
+    assert!(body.contains("[DONE]"), "logged streaming chat still terminates");
+
+    // A stop-sequence request exercises the stop-handling branch; the result must still be
+    // a well-formed completion with a known finish_reason.
+    let resp: Value = chat(json!({
+        "model": id, "stream": false, "max_tokens": 16,
+        "messages": [{ "role": "user", "content": "Say: one two three four five." }],
+        "stop": [" "]
+    }))
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert!(
+        matches!(
+            resp["choices"][0]["finish_reason"].as_str(),
+            Some("stop") | Some("length")
+        ),
+        "stop-sequence chat has a known finish_reason: {resp:?}"
+    );
 }
