@@ -7,6 +7,7 @@
 
 pub mod cli;
 pub mod control;
+pub mod data;
 pub mod identity;
 pub mod runtime;
 pub mod worker_id;
@@ -48,8 +49,20 @@ pub enum GateOutcome {
     Rejected { code: &'static str },
 }
 
+/// The diagnostic code to attach to a JSON-RPC error's `data` for a `HiggsError`,
+/// preferring the worker's ORIGIN code carried in a `WorkerRpc` (e.g. HG003/HG005/HG018)
+/// over the generic boundary code — so the hub maps the true status, exactly as the
+/// local boundary does. Shared by the control dispatch and the chat relay.
+pub(crate) fn worker_origin_code_data(e: &HiggsError) -> Option<serde_json::Value> {
+    use miette::Diagnostic;
+    if let HiggsError::WorkerRpc { worker_code: Some(code), .. } = e {
+        return Some(serde_json::json!({ "code": code }));
+    }
+    e.code().map(|c| serde_json::json!({ "code": c.to_string() }))
+}
+
 /// Write one RPC frame as an NDJSON line to a stream.
-async fn write_frame(send: &mut iroh::endpoint::SendStream, frame: &RpcFrame) -> std::io::Result<()> {
+pub(crate) async fn write_frame(send: &mut iroh::endpoint::SendStream, frame: &RpcFrame) -> std::io::Result<()> {
     send.write_all(format!("{}\n", rpc::encode(frame)).as_bytes()).await?;
     send.flush().await
 }
@@ -319,27 +332,22 @@ async fn handle_node_stream(
             Ok(RpcFrame::Request(r)) => r,
             _ => continue, // ignore non-request frames on this direction
         };
+        if req.method == crate::worker::M_CHAT {
+            // DATA plane: relay the chat to the worker's Supervisor and stream chunks +
+            // final back. `relay_chat` owns the writes and its own cancellation.
+            crate::node::data::relay_chat(&rt, &conn, &mut send, req).await;
+            continue;
+        }
         let resp = if req.method.starts_with("higgs/node/") {
-            // Tie the dispatch to BOTH connection and this stream's liveness: if the hub
-            // drops the connection, or resets/abandons just this stream, cancel the
-            // in-flight request so a partial `load` triggers StopOnDrop cleanup instead of
-            // orphaning a worker whose id the hub will never receive.
+            // CONTROL plane. Tie the dispatch to BOTH connection and this stream's
+            // liveness: if the hub drops the connection, or resets/abandons just this
+            // stream, cancel the in-flight request so a partial `load` triggers
+            // StopOnDrop cleanup instead of orphaning a worker whose id never reached
+            // the hub.
             tokio::select! {
                 r = crate::node::control::dispatch_node_control(&rt, req) => r,
                 _ = conn.closed() => return,
                 _ = send.stopped() => return,
-            }
-        } else if req.method == crate::worker::M_CHAT {
-            // The chat data relay (M_CHAT → Supervisor.chat) lands in P3 with the hub side.
-            RpcResponse {
-                jsonrpc: "2.0".into(),
-                id: req.id,
-                result: None,
-                error: Some(RpcError {
-                    code: -32601,
-                    message: "chat relay not available until P3".into(),
-                    data: None,
-                }),
             }
         } else {
             RpcResponse {

@@ -1,3 +1,4 @@
+#![allow(dead_code)] // shared test helpers; each test binary uses a subset
 //! Shared harness for higgs black-box integration tests.
 //!
 //! Spawns the real `higgs` binary on a localhost port, waits for the
@@ -64,7 +65,7 @@ impl Drop for ServerGuard {
 /// (the scan root) — keep it alive for the server's lifetime. The GGUF is
 /// copied (not symlinked) so it stays inside the scan root and passes higgs's
 /// path-within-roots guard.
-fn stage_tiny_model(gguf: &Path) -> TempDir {
+pub fn stage_tiny_model(gguf: &Path) -> TempDir {
     let dir = TempDir::new().expect("create staging dir");
     let model_dir = dir.path().join("higgs-test").join("stories260k");
     std::fs::create_dir_all(&model_dir).expect("create model dir");

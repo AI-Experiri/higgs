@@ -57,7 +57,10 @@ async fn node_hosts_two_workers_sysinfo_status_over_iroh() {
     // M_SYSINFO (node-level) + M_STATUS (per worker) over iroh.
     let sys = node_rpc(&conn, 3, M_NODE_SYSINFO, json!({})).await;
     assert!(sys.error.is_none(), "sysinfo ok: {sys:?}");
-    assert!(sys.result.unwrap().get("gpus").is_some());
+    let hw = sys.result.unwrap();
+    assert!(hw["hardware"]["cpu_cores"].as_u64().unwrap() > 0, "real cpu cores");
+    assert!(hw["hardware"]["ram_total_bytes"].as_u64().unwrap() > 0, "real ram");
+    assert!(hw["hardware"].get("gpus").is_some(), "gpu list present");
 
     let st = node_rpc(&conn, 4, M_NODE_STATUS, json!({ "worker_id": w1 })).await;
     assert!(st.error.is_none(), "status ok: {st:?}");

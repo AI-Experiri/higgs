@@ -58,9 +58,8 @@ pub struct HelloParams {
 /// keyed on these arrive in later phases.)
 pub fn node_capabilities() -> Capabilities {
     [
-        // `chat` is false until the node data relay lands in P3 — don't advertise a
-        // capability the node would reject at runtime. `download` (M_PULL) is P4b.
-        ("chat", false),
+        ("chat", true),
+        // `download` (M_PULL) is P4b; `log_stream` (N_LOG_LINE relay) is P4.
         ("download", false),
         ("log_stream", false),
         ("update", false),
@@ -130,6 +129,29 @@ pub struct WorkerRef {
 pub struct NodeLoadResult {
     pub worker_id: u32,
     pub loaded: serde_json::Value,
+}
+
+/// Hub → node `M_CHAT` (`higgs/chat`) params on a DATA stream: the worker selector +
+/// the hub's `request_id` (echoed in `N_CHAT_CHUNK`) + the verbatim worker chat fields.
+/// Not `deny_unknown_fields` — chat is a passthrough that may gain optional fields.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeChatParams {
+    pub worker_id: u32,
+    pub request_id: u64,
+    pub model: String,
+    pub messages_json: String,
+    /// Omitted → the worker's default (1024), applied by the relay. (Plain `default`
+    /// would forward 0 = zero-token generation.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<usize>,
+    /// Omitted → the worker's default (0.7), applied by the relay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    /// Serialized OpenAI `tools` array (a JSON string), matching the worker M_CHAT wire
+    /// key `tools` (the value `Supervisor::chat` forwards as `tools_json`). Renamed so a
+    /// hub sending the worker-compatible `tools` field is not silently dropped.
+    #[serde(rename = "tools", default, skip_serializing_if = "Option::is_none")]
+    pub tools_json: Option<String>,
 }
 
 /// No agreed protocol version (maps to HG023, a fatal typed close).
@@ -209,8 +231,7 @@ mod tests {
         let back: HelloParams = serde_json::from_str(&s).unwrap();
         assert_eq!(back.node_id, "z32id");
         assert_eq!(back.pairing_token.as_deref(), Some("htk_abc"));
-        // node advertises chat=false until the P3 relay lands; the key is present.
-        assert_eq!(back.capabilities.get("chat"), Some(&serde_json::Value::Bool(false)));
+        assert_eq!(back.capabilities.get("chat"), Some(&serde_json::Value::Bool(true)));
     }
 
     #[test]

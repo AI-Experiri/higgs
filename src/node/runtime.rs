@@ -222,13 +222,18 @@ impl NodeRuntime {
         Ok(models)
     }
 
-    /// Node-level device list (`{ "gpus": [...] }`), gathered from a transient worker —
-    /// the node, not a specific resident worker. Full `{hardware, runtime}` via
-    /// `SystemInfo::gather` lands with inventory in P4.
+    /// Node-level system info: `{ "hardware": HardwareInfo, "runtime": RuntimeInfo }`.
+    /// The GPU device list is enumerated by a transient worker, then folded with sampled
+    /// CPU/RAM/load into the full hardware snapshot (cpu_name, cores, RAM total/used,
+    /// cpu_usage, gpus, vram) — the params the hub fleet view extracts (§4.2).
     pub async fn sysinfo(&self) -> Result<Value, HiggsError> {
         let sup = (self.spawner)(self.config.bus.clone());
         let gpus = sup.sysinfo().await;
-        Ok(json!({ "gpus": gpus }))
+        let (hardware, runtime) =
+            tokio::task::spawn_blocking(move || crate::system::SystemInfo::gather_hardware_runtime(gpus))
+                .await
+                .map_err(|e| HiggsError::WorkerDead { context: format!("sysinfo task failed: {e}") })?;
+        Ok(json!({ "hardware": hardware, "runtime": runtime }))
     }
 
     /// Look up a worker's Supervisor for the data-plane chat relay (P2 Task 5).

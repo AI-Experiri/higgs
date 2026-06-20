@@ -123,6 +123,14 @@ impl SystemInfo {
     /// folded into the hardware snapshot and its GPU totals summed into
     /// `vram_total_bytes`. Pass an empty vec when no worker could be reached.
     pub fn gather(config: HiggsServerConfig, gpus: Vec<GpuDevice>) -> Self {
+        let (hardware, runtime) = Self::gather_hardware_runtime(gpus);
+        SystemInfo { hardware, runtime, config }
+    }
+
+    /// Sample just the host hardware + runtime (no server config) — used by a node, which
+    /// has no `HiggsServerConfig` but still reports cpu/ram/gpu over `M_NODE_SYSINFO`.
+    /// Blocking (samples CPU over a short interval); call from a blocking context.
+    pub fn gather_hardware_runtime(gpus: Vec<GpuDevice>) -> (HardwareInfo, RuntimeInfo) {
         let mut sys = System::new();
         sys.refresh_memory();
         // CPU usage needs two samples spaced by the platform minimum interval.
@@ -144,29 +152,27 @@ impl SystemInfo {
             .map(|d| d.vram_total_bytes)
             .sum();
 
-        SystemInfo {
-            hardware: HardwareInfo {
-                cpu_name,
-                arch: std::env::consts::ARCH.to_string(),
-                cpu_cores: sys.cpus().len() as u32,
-                ram_total_bytes: sys.total_memory(),
-                ram_used_bytes: sys.used_memory(),
-                cpu_usage_percent: sys.global_cpu_usage(),
-                gpus,
-                vram_total_bytes,
+        let hardware = HardwareInfo {
+            cpu_name,
+            arch: std::env::consts::ARCH.to_string(),
+            cpu_cores: sys.cpus().len() as u32,
+            ram_total_bytes: sys.total_memory(),
+            ram_used_bytes: sys.used_memory(),
+            cpu_usage_percent: sys.global_cpu_usage(),
+            gpus,
+            vram_total_bytes,
+        };
+        let runtime = RuntimeInfo {
+            engine: "llama.cpp".to_string(),
+            backend: if cfg!(target_os = "macos") {
+                "Metal".to_string()
+            } else {
+                "CPU".to_string()
             },
-            runtime: RuntimeInfo {
-                engine: "llama.cpp".to_string(),
-                backend: if cfg!(target_os = "macos") {
-                    "Metal".to_string()
-                } else {
-                    "CPU".to_string()
-                },
-                version: crate::worker::engine::llamacpp::engine_version(),
-                binding: LLAMA_CPP_2_VERSION.to_string(),
-            },
-            config,
-        }
+            version: crate::worker::engine::llamacpp::engine_version(),
+            binding: LLAMA_CPP_2_VERSION.to_string(),
+        };
+        (hardware, runtime)
     }
 }
 

@@ -75,12 +75,18 @@ fn write_secret_exclusive(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 /// Bind an iroh Endpoint with a stable id and our ALPN, ready to dial and accept.
+///
+/// Default is `presets::N0` (public relays + DNS discovery) for WAN/NAT reach. Setting
+/// `HIGGS_IROH_LOCAL=1` switches to a relay-disabled, LAN-local bind (no public relay or
+/// DNS dependency) — used by the cross-process integration test so it stays hermetic;
+/// peers connect via the direct addresses carried in the pairing ticket.
 pub async fn bind_endpoint(sk: SecretKey) -> Result<Endpoint, iroh::endpoint::BindError> {
-    Endpoint::builder(iroh::endpoint::presets::N0)
-        .secret_key(sk)
-        .alpns(vec![ALPN.to_vec()])
-        .bind()
-        .await
+    let builder = if std::env::var_os("HIGGS_IROH_LOCAL").is_some() {
+        Endpoint::builder(iroh::endpoint::presets::Minimal).relay_mode(iroh::RelayMode::Disabled)
+    } else {
+        Endpoint::builder(iroh::endpoint::presets::N0)
+    };
+    builder.secret_key(sk).alpns(vec![ALPN.to_vec()]).bind().await
 }
 
 #[cfg(test)]

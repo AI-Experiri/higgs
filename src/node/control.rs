@@ -90,11 +90,10 @@ fn err(id: u64, code: i64, message: String, data: Option<Value>) -> RpcResponse 
 }
 
 /// Map a `HiggsError` to an RpcError carrying its HG code in `data` (mirrors the
-/// supervisor's worker-error mapping, so the hub can recover the origin status).
+/// supervisor's worker-error mapping, so the hub can recover the origin status — the
+/// worker's own code when the failure came from the worker).
 fn err_from(id: u64, e: &HiggsError) -> RpcResponse {
-    use miette::Diagnostic;
-    let code = e.code().map(|c| c.to_string());
-    err(id, INTERNAL_ERROR, e.to_string(), code.map(|c| json!({ "code": c })))
+    err(id, INTERNAL_ERROR, e.to_string(), crate::node::worker_origin_code_data(e))
 }
 
 #[cfg(test)]
@@ -144,7 +143,7 @@ mod tests {
         // sysinfo is node-level (no worker needed).
         let sysinfo = dispatch_node_control(&rt, req(1, M_NODE_SYSINFO, json!({}))).await;
         assert!(sysinfo.error.is_none());
-        assert!(sysinfo.result.unwrap().get("gpus").is_some());
+        assert!(sysinfo.result.unwrap().get("hardware").is_some());
 
         // status for an unknown worker errors cleanly.
         let status = dispatch_node_control(&rt, req(2, M_NODE_STATUS, json!({ "worker_id": 999 }))).await;
