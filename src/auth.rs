@@ -39,6 +39,11 @@ impl Allowlist {
         self.file.nodes.contains_key(id)
     }
 
+    /// The persisted human label for a paired id, if any.
+    pub fn label(&self, id: &str) -> Option<String> {
+        self.file.nodes.get(id).cloned().flatten()
+    }
+
     /// Add a paired id (idempotent); persists.
     pub fn add(&mut self, id: String, label: Option<String>) -> std::io::Result<()> {
         self.mutate(|nodes| {
@@ -144,13 +149,28 @@ impl PairingTokens {
         tok
     }
 
-    /// Validate a presented token and burn it (single-use). `Ok(())` admits the peer.
-    pub fn validate_and_burn(&mut self, token: &str, now_ms: u64) -> Result<(), TokenError> {
-        match self.live.remove(token) {
+    /// Validate a presented token WITHOUT consuming it. `Ok(())` means it may admit
+    /// the peer; the caller [`burn`](Self::burn)s it only after the pairing persists,
+    /// so a failed save leaves the token usable for a retry.
+    pub fn validate(&self, token: &str, now_ms: u64) -> Result<(), TokenError> {
+        match self.live.get(token) {
             None => Err(TokenError::UnknownOrUsed),
-            Some(expiry) if now_ms > expiry => Err(TokenError::Expired),
+            Some(&expiry) if now_ms > expiry => Err(TokenError::Expired),
             Some(_) => Ok(()),
         }
+    }
+
+    /// Consume a token (single-use). Call after the pairing is durably persisted.
+    pub fn burn(&mut self, token: &str) {
+        self.live.remove(token);
+    }
+
+    /// Validate and burn in one step (convenience for callers with no persistence
+    /// step between the two, e.g. tests).
+    pub fn validate_and_burn(&mut self, token: &str, now_ms: u64) -> Result<(), TokenError> {
+        self.validate(token, now_ms)?;
+        self.burn(token);
+        Ok(())
     }
 }
 
@@ -228,6 +248,18 @@ mod tests {
             tokens.validate_and_burn(&tok, now_ms()),
             Err(TokenError::UnknownOrUsed)
         );
+    }
+
+    #[test]
+    fn validate_does_not_consume_until_burned() {
+        let mut tokens = PairingTokens::new();
+        let tok = tokens.mint(now_ms(), 600_000);
+        // validate is idempotent — the token survives repeated peeks (e.g. a failed save)
+        assert!(tokens.validate(&tok, now_ms()).is_ok());
+        assert!(tokens.validate(&tok, now_ms()).is_ok());
+        tokens.burn(&tok);
+        // now consumed
+        assert_eq!(tokens.validate(&tok, now_ms()), Err(TokenError::UnknownOrUsed));
     }
 
     #[test]
