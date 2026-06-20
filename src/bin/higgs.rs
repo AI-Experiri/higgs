@@ -47,7 +47,7 @@ fn main() {
     // before the default server path below.
     let args: Vec<String> = std::env::args().skip(1).collect();
     let remote = match args.first().map(String::as_str) {
-        Some("--node") => Some(higgs::node::cli::run_node_daemon()),
+        Some("--node") => Some(higgs::node::cli::run_node_daemon(&args[1..])),
         Some("link") => Some(higgs::node::cli::run_link(&args[1..])),
         Some("node") => Some(higgs::node::cli::run_node(&args[1..])),
         _ => None,

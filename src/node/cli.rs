@@ -5,6 +5,7 @@
 //! process couldn't share the token store with a separate listener.
 
 use std::io::{Error, Result};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use iroh_tickets::endpoint::EndpointTicket;
@@ -12,7 +13,8 @@ use iroh_tickets::endpoint::EndpointTicket;
 use crate::auth::{Allowlist, PairingTokens};
 use crate::home::ensure_home;
 use crate::node::identity::{bind_endpoint, load_or_create_secret};
-use crate::node::{gate_connection, dial_and_hello, GateOutcome, HELLO_DEADLINE};
+use crate::node::runtime::{NodeConfig, NodeRuntime};
+use crate::node::{dial_and_hello, gate_connection, GateOutcome, HELLO_DEADLINE};
 
 /// Pairing-token lifetime: 10 minutes (DESIGN-remote.md §7).
 const TOKEN_TTL_MS: u64 = 10 * 60 * 1000;
@@ -152,13 +154,80 @@ fn run_node_connect(args: &[String]) -> Result<()> {
     })
 }
 
-/// `higgs --node` — print this node's identity (the persistent node daemon that
-/// accepts hub control RPCs over the dialed connection arrives in P2).
-pub fn run_node_daemon() -> Result<()> {
+/// `higgs --node [<ticket> [token]]` — run the persistent node daemon: dial the hub,
+/// complete HELLO, then serve its `higgs/node/*` control RPCs, reconnecting with backoff
+/// if the link drops (the EndpointId is stable, so re-pairing isn't needed). With no
+/// ticket, just print this node's identity.
+pub fn run_node_daemon(args: &[String]) -> Result<()> {
     let id = load_or_create_secret(&key_path()?)?.public();
-    println!("higgs node id: {id}");
-    println!("use `higgs node connect <ticket> <token>` to pair with a hub.");
-    Ok(())
+    let Some(ticket_str) = args.first() else {
+        println!("higgs node id: {id}");
+        println!("usage: higgs --node <ticket> [token]   (run as a persistent node)");
+        return Ok(());
+    };
+    let token = args.get(1).cloned();
+    let ticket: EndpointTicket = ticket_str.parse().map_err(Error::other)?;
+    let target = ticket.endpoint_addr().clone();
+
+    let rt = runtime()?;
+    rt.block_on(async {
+        let sk = load_or_create_secret(&key_path()?)?;
+        let endpoint = bind_endpoint(sk).await.map_err(Error::other)?;
+        let self_id = endpoint.id().to_string();
+        // Model roots: the same defaults the standalone runtime uses (standard LM Studio /
+        // HF / Ollama dirs) plus the HIGGS_MODEL_DIR override, so a node can actually
+        // scan/load real models — not an empty set.
+        let mut hc = crate::HiggsConfig::default();
+        if let Ok(dir) = std::env::var("HIGGS_MODEL_DIR") {
+            if !dir.is_empty() {
+                hc.lmstudio_dirs.push(std::path::PathBuf::from(dir));
+            }
+        }
+        let node = Arc::new(NodeRuntime::new(NodeConfig {
+            bus: Arc::new(crate::log_bus::LogBus::new()),
+            lmstudio_dirs: hc.lmstudio_dirs,
+            hf_dirs: hc.hf_dirs,
+            ollama_dirs: hc.ollama_dirs,
+        }));
+        println!("higgs node id: {self_id}; connecting to hub…");
+
+        // The one-time token is sent until a connect SUCCEEDS (HELLO admitted); a failed
+        // attempt (hub offline, relay flake, HELLO timeout) must keep it for retry, or an
+        // unallowlisted node could never pair. Reconnects after success rely on allowlist
+        // membership, so the token is cleared only then.
+        let mut token = token;
+        // SIGINT/SIGTERM ends the loop so we can drain resident workers — a dropped
+        // Supervisor does not reap its child, so an undrained exit would orphan models.
+        let shutdown = crate::shutdown_signal();
+        tokio::pin!(shutdown);
+        loop {
+            tokio::select! {
+                _ = &mut shutdown => break,
+                res = crate::node::connect_node(&endpoint, target.clone(), self_id.clone(), token.clone()) => {
+                    match res {
+                        Ok((conn, hello)) => {
+                            token = None; // admitted — token burned hub-side; don't resend it
+                            println!("paired with hub {} (protocol v{})", hello.node_id, hello.agreed_version);
+                            tokio::select! {
+                                _ = &mut shutdown => break,
+                                _ = crate::node::serve_node(conn, node.clone()) => {
+                                    eprintln!("hub connection closed; reconnecting…");
+                                }
+                            }
+                        }
+                        Err(e) => eprintln!("higgs node: connect failed: {e}"),
+                    }
+                }
+            }
+            tokio::select! {
+                _ = &mut shutdown => break,
+                _ = tokio::time::sleep(Duration::from_secs(3)) => {}
+            }
+        }
+        println!("higgs node: draining resident workers…");
+        node.shutdown_all().await;
+        Ok(())
+    })
 }
 
 #[cfg(test)]

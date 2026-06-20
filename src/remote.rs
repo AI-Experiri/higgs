@@ -58,9 +58,11 @@ pub struct HelloParams {
 /// keyed on these arrive in later phases.)
 pub fn node_capabilities() -> Capabilities {
     [
-        ("chat", true),
-        ("download", true),
-        ("log_stream", true),
+        // `chat` is false until the node data relay lands in P3 — don't advertise a
+        // capability the node would reject at runtime. `download` (M_PULL) is P4b.
+        ("chat", false),
+        ("download", false),
+        ("log_stream", false),
         ("update", false),
     ]
     .into_iter()
@@ -207,7 +209,8 @@ mod tests {
         let back: HelloParams = serde_json::from_str(&s).unwrap();
         assert_eq!(back.node_id, "z32id");
         assert_eq!(back.pairing_token.as_deref(), Some("htk_abc"));
-        assert_eq!(back.capabilities.get("chat"), Some(&serde_json::Value::Bool(true)));
+        // node advertises chat=false until the P3 relay lands; the key is present.
+        assert_eq!(back.capabilities.get("chat"), Some(&serde_json::Value::Bool(false)));
     }
 
     #[test]

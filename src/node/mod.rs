@@ -213,14 +213,27 @@ pub async fn gate_connection(
     GateOutcome::Admitted { agreed_version: agreed }
 }
 
-/// Node side: dial `target`, open the control bi-stream, send HELLO first (satisfying
-/// iroh's "opener writes first" rule), and await the hub's HELLO result.
+/// Node side: dial `target`, complete HELLO, and return the result — the connection is
+/// dropped (one-shot, e.g. `node connect`). For a persistent node use [`connect_node`].
 pub async fn dial_and_hello(
     endpoint: &Endpoint,
     target: impl Into<EndpointAddr>,
     self_id: String,
     pairing_token: Option<String>,
 ) -> std::io::Result<HelloResult> {
+    let (_conn, result) = connect_node(endpoint, target, self_id, pairing_token).await?;
+    Ok(result)
+}
+
+/// Node side: dial `target`, open the control bi-stream, send HELLO first (satisfying
+/// iroh's "opener writes first" rule), await the hub's HELLO result, and return the LIVE
+/// connection so a persistent node can then [`serve_node`] the hub's control RPCs.
+pub async fn connect_node(
+    endpoint: &Endpoint,
+    target: impl Into<EndpointAddr>,
+    self_id: String,
+    pairing_token: Option<String>,
+) -> std::io::Result<(Connection, HelloResult)> {
     use std::io::Error;
     let conn = endpoint.connect(target, ALPN).await.map_err(Error::other)?;
     let (mut send, recv) = conn.open_bi().await.map_err(Error::other)?;
@@ -261,13 +274,82 @@ pub async fn dial_and_hello(
             ))
         }
     };
-    match rpc::decode(&line).map_err(Error::other)? {
+    let result = match rpc::decode(&line).map_err(Error::other)? {
         RpcFrame::Response(resp) => {
             if let Some(err) = resp.error {
                 return Err(Error::other(format!("hub rejected HELLO: {}", err.message)));
             }
-            serde_json::from_value(resp.result.unwrap_or_default()).map_err(Error::other)
+            serde_json::from_value::<HelloResult>(resp.result.unwrap_or_default())
+                .map_err(Error::other)?
         }
-        other => Err(Error::other(format!("unexpected reply frame to HELLO: {other:?}"))),
+        other => return Err(Error::other(format!("unexpected reply frame to HELLO: {other:?}"))),
+    };
+    Ok((conn, result))
+}
+
+/// Node side (persistent): serve the hub's control RPCs. After HELLO the hub opens a bi
+/// stream per request batch; the node accepts each and dispatches frames on it until the
+/// stream or connection closes. Control (`higgs/node/*`) routes to the `NodeRuntime`; the
+/// chat data relay (`higgs/chat`) lands in P3. Returns when the connection closes.
+pub async fn serve_node(conn: Connection, rt: std::sync::Arc<crate::node::runtime::NodeRuntime>) {
+    // Each iteration accepts a hub-opened stream; the loop ends when the connection
+    // closes (caller decides whether to reconnect).
+    while let Ok((send, recv)) = conn.accept_bi().await {
+        let rt = rt.clone();
+        let conn = conn.clone();
+        tokio::spawn(handle_node_stream(rt, conn, send, recv));
+    }
+}
+
+/// Dispatch every frame on one hub-opened stream until it ends.
+async fn handle_node_stream(
+    rt: std::sync::Arc<crate::node::runtime::NodeRuntime>,
+    conn: Connection,
+    mut send: iroh::endpoint::SendStream,
+    recv: iroh::endpoint::RecvStream,
+) {
+    let mut lines = BufReader::new(recv).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let req = match rpc::decode(&line) {
+            Ok(RpcFrame::Request(r)) => r,
+            _ => continue, // ignore non-request frames on this direction
+        };
+        let resp = if req.method.starts_with("higgs/node/") {
+            // Tie the dispatch to BOTH connection and this stream's liveness: if the hub
+            // drops the connection, or resets/abandons just this stream, cancel the
+            // in-flight request so a partial `load` triggers StopOnDrop cleanup instead of
+            // orphaning a worker whose id the hub will never receive.
+            tokio::select! {
+                r = crate::node::control::dispatch_node_control(&rt, req) => r,
+                _ = conn.closed() => return,
+                _ = send.stopped() => return,
+            }
+        } else if req.method == crate::worker::M_CHAT {
+            // The chat data relay (M_CHAT → Supervisor.chat) lands in P3 with the hub side.
+            RpcResponse {
+                jsonrpc: "2.0".into(),
+                id: req.id,
+                result: None,
+                error: Some(RpcError {
+                    code: -32601,
+                    message: "chat relay not available until P3".into(),
+                    data: None,
+                }),
+            }
+        } else {
+            RpcResponse {
+                jsonrpc: "2.0".into(),
+                id: req.id,
+                result: None,
+                error: Some(RpcError {
+                    code: -32601,
+                    message: format!("unknown method {}", req.method),
+                    data: None,
+                }),
+            }
+        };
+        if write_frame(&mut send, &RpcFrame::Response(resp)).await.is_err() {
+            break; // stream gone
+        }
     }
 }

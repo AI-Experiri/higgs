@@ -56,7 +56,11 @@ bridges to the child's sync stdio. So:
   hub's Supervisor transport (P3) and the node's relay (P2), never inside the worker.
   The "P0-deferred worker tokio port" is therefore **eliminated, not deferred** — it was
   never needed.
-- Relay risks to handle (codex): one writer task per stream (chunks then final, no race);
+- **Scope (P2 Task 5, decided during impl):** the node-side **chat data relay** moves to
+  **P3**, where the hub chat side exists to drive it end-to-end (P2 alone can't e2e-test a
+  relay). P2 delivers the control-plane daemon (dial → HELLO → serve `higgs/node/*`), which
+  is exactly what the P2 exit (sysinfo+status over iroh) needs.
+- Relay risks to handle (codex), for P3: one writer task per stream (chunks then final, no race);
   hub-stream `request_id` vs Supervisor-local id are separate namespaces; on stream close,
   drop the chunk receiver (cancel in-flight where possible); on worker error, emit chunks
   then a final error frame.
