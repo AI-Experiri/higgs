@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Coverage gate for higgs — runs BOTH independent gates and fails if EITHER does:
+# Coverage gates for higgs — runs the unit and integration gates SEPARATELY and
+# fails if any selected gate does:
 #
 #   * unit        (cargo test --lib)        line coverage >= 90%   (coverage-unit.sh)
 #   * integration (the tests/ targets only) line coverage >= 75%   (coverage-integration.sh)
@@ -18,17 +19,69 @@
 # Requires cargo-llvm-cov (`cargo install cargo-llvm-cov`). The FFI build env
 # (SDKROOT / BINDGEN_EXTRA_CLANG_ARGS) is supplied by ./.cargo/config.toml.
 #
-# Usage: scripts/coverage.sh            # run both gates (pass/fail)
-#        scripts/coverage.sh --html     # also write HTML reports under target/
+# Usage:
+#   scripts/coverage.sh                      # run BOTH gates (default)
+#   scripts/coverage.sh -u | --unit          # run only the unit gate
+#   scripts/coverage.sh -i | --integration   # run only the integration gate
+#   scripts/coverage.sh --html               # also write HTML report(s) under target/
+#   scripts/coverage.sh -u --open            # unit gate + open its HTML report
+#   scripts/coverage.sh --summary-only       # terse per-file summary
+#   scripts/coverage.sh -h | --help
+#
+# Any flag that isn't a selector below is forwarded verbatim to `cargo llvm-cov`
+# (e.g. --html, --open, --json, --summary-only, --output-dir DIR). With BOTH
+# gates selected, --html/--open run twice and the second overwrites the first's
+# report dir — select a single gate (or pass --output-dir) when you want to keep
+# an HTML report.
 set -euo pipefail
-cd "$(dirname "$0")"
+self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+cd "$(dirname "$self")"
 
-echo "===== UNIT gate (cargo test --lib, >= 90%) ====="
-./coverage-unit.sh "$@"
+usage() { sed -n '/^# Usage:/,/^# report dir/p' "$self" | sed 's/^# \{0,1\}//'; }
+
+select_unit=false
+select_integration=false
+any_select=false
+passthrough=()
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -u|--unit)        select_unit=true;        any_select=true ;;
+    -i|--integration) select_integration=true; any_select=true ;;
+    -h|--help)        usage; exit 0 ;;
+    *)                passthrough+=("$1") ;;
+  esac
+  shift
+done
+
+# No selector given → run both (the gate's default).
+if ! $any_select; then
+  select_unit=true
+  select_integration=true
+fi
+
+# Safe expansion of a possibly-empty array under `set -u` (macOS bash 3.2).
+args=("${passthrough[@]+${passthrough[@]}}")
+
+ran_both=false
+if $select_unit && $select_integration; then
+  ran_both=true
+fi
+
+if $select_unit; then
+  echo "===== UNIT gate (cargo test --lib, >= 90%) ====="
+  ./coverage-unit.sh "${args[@]+${args[@]}}"
+fi
+
+if $select_integration; then
+  $ran_both && echo
+  echo "===== INTEGRATION gate (tests/ only, >= 75%) ====="
+  ./coverage-integration.sh "${args[@]+${args[@]}}"
+fi
 
 echo
-echo "===== INTEGRATION gate (tests/ only, >= 75%) ====="
-./coverage-integration.sh "$@"
-
-echo
-echo "Both coverage gates passed."
+if $ran_both; then
+  echo "Both coverage gates passed."
+else
+  echo "Selected coverage gate passed."
+fi
