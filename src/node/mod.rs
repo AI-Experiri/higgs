@@ -371,6 +371,11 @@ async fn handle_node_stream(
             crate::node::data::relay_chat(&rt, &conn, &mut send, req).await;
             continue;
         }
+        if req.method == crate::remote::M_NODE_PULL {
+            // DATA plane: download a GGUF into ~/.higgs/models/, streaming N_PROGRESS.
+            crate::node::data::relay_pull(&conn, &mut send, req).await;
+            continue;
+        }
         let resp = if req.method.starts_with("higgs/node/") {
             // CONTROL plane. Tie the dispatch to BOTH connection and this stream's
             // liveness: if the hub drops the connection, or resets/abandons just this

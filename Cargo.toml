@@ -79,6 +79,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 # compare so a stored key digest never leaks via timing.
 sha2 = "0.10"
 subtle = "2"
+# Streaming HTTP client for the model downloader (P4b, M_PULL): pulls a GGUF from the
+# HuggingFace resolve URL with progress. rustls to avoid a system OpenSSL dependency.
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
 
 [dev-dependencies]
 # test-util: paused-clock control (tokio::time::advance) so the 600 s chat-RPC

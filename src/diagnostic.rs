@@ -229,6 +229,13 @@ pub enum HiggsError {
     #[snafu(display("[HG026] software update not supported by this build: {detail}"))]
     #[diagnostic(code(HG026))]
     UpdateUnsupported { detail: String },
+
+    /// A model download (`M_PULL`) failed — network error, bad repo/file, HTTP status, or a
+    /// filesystem error writing into `~/.higgs/models/` (§4 P4b). Never partially exposes a
+    /// file: the download writes a temp and renames only on success.
+    #[snafu(display("[HG025] model download failed for {repo}/{file}: {detail}"))]
+    #[diagnostic(code(HG025))]
+    DownloadFailed { repo: String, file: String, detail: String },
 }
 
 #[cfg(test)]

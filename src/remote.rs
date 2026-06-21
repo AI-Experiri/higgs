@@ -43,6 +43,13 @@ pub const M_NODE_INVENTORY: &str = "higgs/node/inventory";
 /// typed `HG026`; the real updater (minisign-verified download + swap) is a later task. The
 /// `update` capability is advertised `false` so a well-behaved peer never sends it.
 pub const M_NODE_UPDATE: &str = "higgs/node/update";
+/// `higgs/node/pull` — DATA-plane request to download a GGUF from HuggingFace into the node's
+/// own `~/.higgs/models/` (P4b). Streams [`N_PROGRESS`] then a final `{ path }`. `HG025` on
+/// failure. A subsequent `M_NODE_SCAN`/`M_NODE_LOAD` then sees the pulled model.
+pub const M_NODE_PULL: &str = "higgs/node/pull";
+/// `N_PROGRESS` — node → hub download-progress notification on the pull stream:
+/// `{ request_id, downloaded, total? }` (`total` omitted when the server sends no length).
+pub const N_PROGRESS: &str = "higgs/node/progress";
 
 /// The wire-protocol majors this build speaks.
 pub const PROTOCOL_VERSIONS: &[u32] = &[1];
@@ -76,9 +83,10 @@ pub struct HelloParams {
 pub fn node_capabilities() -> Capabilities {
     [
         ("chat", true),
-        // `download` (M_PULL) is P4b; `log_stream` (N_LOG_LINE relay) is P4.
-        ("download", false),
-        ("log_stream", false),
+        // `download` (M_PULL, P4b) and `log_stream` (N_LOG_LINE relay, P4) are now implemented;
+        // `update` (M_UPDATE) is still only a stub (#18), so it stays advertised false.
+        ("download", true),
+        ("log_stream", true),
         ("update", false),
     ]
     .into_iter()
@@ -169,6 +177,17 @@ pub struct NodeInventory {
     pub workers: Vec<InventoryWorker>,
     pub hardware: crate::system::HardwareInfo,
     pub runtime: crate::system::RuntimeInfo,
+}
+
+/// Hub → node `M_NODE_PULL` params on a DATA stream: the file to download + the hub's
+/// `request_id` (echoed in every [`N_PROGRESS`]). `revision` defaults to `"main"`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodePullParams {
+    pub request_id: u64,
+    pub repo: String,
+    pub file: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
 }
 
 /// Hub → node `M_CHAT` (`higgs/chat`) params on a DATA stream: the worker selector +

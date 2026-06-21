@@ -15,6 +15,7 @@ pub mod actor;
 pub mod api;
 pub mod auth;
 pub mod diagnostic;
+pub mod download;
 pub mod home;
 pub mod keys;
 pub mod node;

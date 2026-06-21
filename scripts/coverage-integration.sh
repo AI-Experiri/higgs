@@ -34,6 +34,7 @@ exec cargo llvm-cov \
   --test auth \
   --test control_api \
   --test inference \
+  --test pull \
   --test remote_cli \
   --test remote_hub_e2e \
   --test remote_node_e2e \

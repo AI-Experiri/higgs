@@ -191,6 +191,11 @@ pub fn run_node_daemon(args: &[String]) -> Result<()> {
                 hc.lmstudio_dirs.push(std::path::PathBuf::from(dir));
             }
         }
+        // Pulled models (M_PULL) land in ~/.higgs/models/<org>/<model>/*.gguf — an LM-Studio
+        // layout — so add it as a scan root, making a just-pulled model loadable.
+        if let Ok(models) = crate::download::models_dir() {
+            hc.lmstudio_dirs.push(models);
+        }
         // A node has no UI; its worker stderr is relayed to the hub. HIGGS_VERBOSE=1 keeps
         // the full llama.cpp dump (default off drops the per-load metadata flood).
         let bus = Arc::new(crate::log_bus::LogBus::new());
