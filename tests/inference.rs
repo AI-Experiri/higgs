@@ -389,9 +389,24 @@ async fn inference_and_tools() {
     .await
     .unwrap();
     assert!(body.contains("[DONE]"), "usage stream terminates with [DONE]");
+    // Find the terminal usage chunk: a `data:` line whose `usage` is a NON-null object with
+    // real token counts (not the per-chunk `"usage":null`). This is the OpenAI include_usage
+    // contract the genai client relies on for streamed token accounting.
+    let usage_chunk = body
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter(|p| *p != "[DONE]")
+        .filter_map(|p| serde_json::from_str::<Value>(p).ok())
+        .find(|v| v["usage"].is_object())
+        .expect("a chunk carries a non-null usage block");
     assert!(
-        body.contains("usage") || body.contains("completion_tokens"),
-        "include_usage emits a usage block: {body}"
+        usage_chunk["usage"]["completion_tokens"].as_u64().is_some()
+            && usage_chunk["usage"]["prompt_tokens"].as_u64().is_some(),
+        "usage chunk has real prompt+completion token counts: {usage_chunk}"
+    );
+    assert!(
+        usage_chunk["choices"].as_array().is_some_and(Vec::is_empty),
+        "the usage chunk carries no choices (OpenAI convention): {usage_chunk}"
     );
 
     // ── Streaming request for an UNKNOWN model → error before any stream opens ──

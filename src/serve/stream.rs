@@ -10,8 +10,8 @@ use std::convert::Infallible;
 
 use async_openai::types::chat::{
     ChatChoiceStream, ChatCompletionMessageToolCallChunk, ChatCompletionMessageToolCalls,
-    ChatCompletionStreamResponseDelta, CreateChatCompletionStreamResponse, FinishReason,
-    FunctionCallStream, FunctionType, Role,
+    ChatCompletionStreamResponseDelta, CompletionUsage, CreateChatCompletionStreamResponse,
+    FinishReason, FunctionCallStream, FunctionType, Role,
 };
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::Stream;
@@ -26,6 +26,7 @@ use crate::diagnostic::HiggsError;
 /// `deltas` carries worker content chunks; `outcome` resolves when generation
 /// completes. Each emitted payload becomes one `data:` line; the stream closes
 /// after the trailing `data: [DONE]`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn chat_sse(
     id: String,
     model: String,
@@ -34,10 +35,11 @@ pub(crate) fn chat_sse(
     outcome: JoinHandle<Result<ChatOutcome, HiggsError>>,
     verbose: bool,
     started: std::time::Instant,
+    include_usage: bool,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let (tx, rx) = mpsc::unbounded_channel::<String>();
     tokio::spawn(assemble(
-        id, model, created, deltas, outcome, tx, verbose, started,
+        id, model, created, deltas, outcome, tx, verbose, started, include_usage,
     ));
     let stream = futures::stream::unfold(rx, |mut rx| async move {
         rx.recv()
@@ -54,6 +56,7 @@ pub(crate) fn chat_sse(
 /// queued in the channel are drained so no content is lost. On failure the
 /// OpenAI error envelope is emitted as a data event (OpenAI's own mid-stream
 /// error convention), followed by `[DONE]` either way.
+#[allow(clippy::too_many_arguments)]
 async fn assemble(
     id: String,
     model: String,
@@ -63,6 +66,7 @@ async fn assemble(
     tx: mpsc::UnboundedSender<String>,
     verbose: bool,
     started: std::time::Instant,
+    include_usage: bool,
 ) {
     let send = |payload: String| {
         // client disconnected — sends discard silently; assemble still runs to outcome so the spawned task joins clean
@@ -90,6 +94,12 @@ async fn assemble(
                 super::v1::log_served(&model, &out.finish_reason, out.completion_tokens, started);
             }
             emit_outcome(&id, &model, created, &out, &send);
+            // OpenAI `stream_options.include_usage`: after the finish chunk, emit one final
+            // chunk with empty `choices` and the populated `usage` block (real engine token
+            // counts), so a streaming client gets the same accounting as the non-stream path.
+            if include_usage {
+                send(usage_payload(&id, &model, created, out.prompt_tokens, out.completion_tokens));
+            }
         }
         Ok(Err(err)) => {
             tracing::warn!(error = %err, "higgs: chat stream failed mid-generation");
@@ -254,6 +264,28 @@ fn chunk_payload(
     serde_json::to_string(&chunk).expect("chunk serialization cannot fail")
 }
 
+/// Serialize the terminal usage-only chunk for `stream_options.include_usage`: empty
+/// `choices`, populated `usage` (mirrors the non-streaming `usage` block).
+fn usage_payload(id: &str, model: &str, created: u32, prompt_tokens: u32, completion_tokens: u32) -> String {
+    #[allow(deprecated)]
+    let chunk = CreateChatCompletionStreamResponse {
+        id: id.to_owned(),
+        choices: vec![], // OpenAI: the usage-only chunk carries no choices
+        created,
+        model: model.to_owned(),
+        service_tier: None,
+        system_fingerprint: None,
+        object: "chat.completion.chunk".to_owned(),
+        usage: Some(CompletionUsage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens.saturating_add(completion_tokens),
+            ..Default::default()
+        }),
+    };
+    serde_json::to_string(&chunk).expect("usage chunk serialization cannot fail")
+}
+
 /// Map the worker's finish reason string to the OpenAI enum.
 ///
 /// The worker only emits `"stop"` or `"length"` in v1; anything else
@@ -287,6 +319,32 @@ mod tests {
             tx,
             false,
             std::time::Instant::now(),
+            false,
+        )
+        .await;
+        let mut out = Vec::new();
+        while let Ok(p) = rx.try_recv() {
+            out.push(p);
+        }
+        out
+    }
+
+    /// Like [`run_assemble`] but with `include_usage` on (OpenAI usage chunk requested).
+    async fn run_assemble_with_usage(
+        deltas: mpsc::UnboundedReceiver<String>,
+        outcome: JoinHandle<Result<ChatOutcome, HiggsError>>,
+    ) -> Vec<String> {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        assemble(
+            "chatcmpl-t".into(),
+            "org/model".into(),
+            1,
+            deltas,
+            outcome,
+            tx,
+            false,
+            std::time::Instant::now(),
+            true,
         )
         .await;
         let mut out = Vec::new();
@@ -341,6 +399,58 @@ mod tests {
         assert_eq!(finish.choices[0].delta.content, None);
 
         assert_eq!(payloads[4], "[DONE]");
+    }
+
+    #[tokio::test]
+    async fn include_usage_emits_a_terminal_usage_chunk() {
+        let (dtx, drx) = mpsc::unbounded_channel();
+        dtx.send("hi".to_owned()).unwrap();
+        let outcome = tokio::spawn(async {
+            Ok(ChatOutcome {
+                content: "hi".into(),
+                finish_reason: "stop".into(),
+                tool_calls: None,
+                prompt_tokens: 11,
+                completion_tokens: 4,
+            })
+        });
+
+        let payloads = run_assemble_with_usage(drx, outcome).await;
+        // role + delta + finish + usage + [DONE]
+        assert_eq!(payloads.len(), 5, "usage chunk added before [DONE]: {payloads:?}");
+        assert_eq!(payloads[4], "[DONE]");
+
+        let usage_chunk: CreateChatCompletionStreamResponse =
+            serde_json::from_str(&payloads[3]).unwrap();
+        assert!(usage_chunk.choices.is_empty(), "usage chunk has no choices");
+        let usage = usage_chunk.usage.expect("usage block present");
+        assert_eq!(usage.prompt_tokens, 11);
+        assert_eq!(usage.completion_tokens, 4);
+        assert_eq!(usage.total_tokens, 15);
+    }
+
+    #[tokio::test]
+    async fn no_usage_chunk_without_include_usage() {
+        let (dtx, drx) = mpsc::unbounded_channel();
+        dtx.send("hi".to_owned()).unwrap();
+        let outcome = tokio::spawn(async {
+            Ok(ChatOutcome {
+                content: "hi".into(),
+                finish_reason: "stop".into(),
+                tool_calls: None,
+                prompt_tokens: 11,
+                completion_tokens: 4,
+            })
+        });
+        let payloads = run_assemble(drx, outcome).await;
+        // role + delta + finish + [DONE] — NO usage chunk.
+        assert_eq!(payloads.len(), 4, "no usage chunk when not requested: {payloads:?}");
+        assert!(
+            payloads.iter().all(|p| serde_json::from_str::<CreateChatCompletionStreamResponse>(p)
+                .map(|c| c.usage.is_none())
+                .unwrap_or(true)),
+            "no chunk carries a usage block"
+        );
     }
 
     #[tokio::test]
