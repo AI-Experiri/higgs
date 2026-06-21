@@ -44,6 +44,10 @@ pub struct ServerGuard {
     pub base: String,
     /// Staging dir for the tiny model (kept alive for the server's lifetime).
     _model_dir: TempDir,
+    /// Isolated `HIGGS_HOME` (kept alive for the server's lifetime) so the spawned server
+    /// never picks up the developer's / CI's real `~/.higgs` — e.g. an `api_keys.json` that
+    /// would enable auth and 401 these no-token tests.
+    _home: TempDir,
 }
 
 impl Drop for ServerGuard {
@@ -91,10 +95,14 @@ pub fn stage_tiny_model(gguf: &Path) -> TempDir {
 #[allow(clippy::zombie_processes)]
 pub async fn spawn_with_tiny_model(port: u16, gguf: &Path) -> ServerGuard {
     let staged = stage_tiny_model(gguf);
+    // Isolated home so the server never reads the machine's real ~/.higgs (a present
+    // api_keys.json there would turn auth ON and 401 these no-token tests).
+    let home = TempDir::new().expect("create temp HIGGS_HOME");
     let child = Command::new(env!("CARGO_BIN_EXE_higgs"))
         .env("HIGGS_BIND", "127.0.0.1")
         .env("HIGGS_PORT", port.to_string())
         .env("HIGGS_MODEL_DIR", staged.path())
+        .env("HIGGS_HOME", home.path())
         .env("RUST_LOG", "warn")
         .spawn()
         .expect("spawn higgs");
@@ -108,6 +116,7 @@ pub async fn spawn_with_tiny_model(port: u16, gguf: &Path) -> ServerGuard {
                     child,
                     base,
                     _model_dir: staged,
+                    _home: home,
                 };
             }
         }
