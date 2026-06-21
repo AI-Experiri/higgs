@@ -191,10 +191,18 @@ impl Fetcher for HttpFetcher {
 mod tests {
     use super::*;
 
-    /// A no-network fetcher that emits canned chunks + progress.
+    /// A no-network fetcher that emits canned chunks + progress. `report_total` toggles
+    /// whether it advertises a content length (`Some` vs `None`) so both progress arms run.
     struct FakeFetcher {
         chunks: Vec<Vec<u8>>,
         fail_with: Option<String>,
+        report_total: bool,
+    }
+
+    impl FakeFetcher {
+        fn new(chunks: Vec<Vec<u8>>) -> Self {
+            Self { chunks, fail_with: None, report_total: true }
+        }
     }
 
     impl Fetcher for FakeFetcher {
@@ -212,10 +220,22 @@ mod tests {
             for c in &self.chunks {
                 on_chunk(c);
                 done += c.len() as u64;
-                progress(done, Some(total));
+                progress(done, self.report_total.then_some(total));
             }
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn download_handles_unknown_content_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = FakeFetcher { chunks: vec![b"a".to_vec(), b"bc".to_vec()], fail_with: None, report_total: false };
+        let mut seen: Vec<(u64, Option<u64>)> = Vec::new();
+        let p = download(&PullTarget::new("org/m", "x.gguf"), dir.path(), &f, &mut |d, t| seen.push((d, t)))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"abc");
+        assert_eq!(seen, vec![(1, None), (3, None)], "progress with unknown total");
     }
 
     #[test]
@@ -247,7 +267,7 @@ mod tests {
     #[tokio::test]
     async fn download_writes_atomically_and_reports_progress() {
         let dir = tempfile::tempdir().unwrap();
-        let fetcher = FakeFetcher { chunks: vec![b"he".to_vec(), b"llo".to_vec()], fail_with: None };
+        let fetcher = FakeFetcher::new(vec![b"he".to_vec(), b"llo".to_vec()]);
         let mut seen: Vec<(u64, Option<u64>)> = Vec::new();
         let target = PullTarget::new("higgs-test/m", "model.gguf");
         let path = download(&target, dir.path(), &fetcher, &mut |d, t| seen.push((d, t)))
@@ -271,11 +291,11 @@ mod tests {
     async fn download_replaces_an_existing_model_in_place() {
         let dir = tempfile::tempdir().unwrap();
         let target = PullTarget::new("org/m", "x.gguf");
-        let f1 = FakeFetcher { chunks: vec![b"v1".to_vec()], fail_with: None };
+        let f1 = FakeFetcher::new(vec![b"v1".to_vec()]);
         let p1 = download(&target, dir.path(), &f1, &mut |_, _| {}).await.unwrap();
         assert_eq!(std::fs::read(&p1).unwrap(), b"v1");
         // Re-pull replaces the existing file in place (atomic rename over the old model).
-        let f2 = FakeFetcher { chunks: vec![b"v2!".to_vec()], fail_with: None };
+        let f2 = FakeFetcher::new(vec![b"v2!".to_vec()]);
         let p2 = download(&target, dir.path(), &f2, &mut |_, _| {}).await.unwrap();
         assert_eq!(p2, p1, "same destination");
         assert_eq!(std::fs::read(&p2).unwrap(), b"v2!", "model replaced");
@@ -284,7 +304,7 @@ mod tests {
     #[tokio::test]
     async fn download_maps_fetch_error_to_hg025_and_leaves_no_file() {
         let dir = tempfile::tempdir().unwrap();
-        let fetcher = FakeFetcher { chunks: vec![], fail_with: Some("network down".into()) };
+        let fetcher = FakeFetcher { chunks: vec![], fail_with: Some("network down".into()), report_total: true };
         let target = PullTarget::new("org/m", "m.gguf");
         let err = download(&target, dir.path(), &fetcher, &mut |_, _| {}).await.unwrap_err();
         assert!(err.to_string().starts_with("[HG025]"), "got {err}");
