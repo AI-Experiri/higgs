@@ -9,22 +9,58 @@ own Axum app or as a standalone binary — with crash-isolated worker processes,
 pluggable engine layer, and an optional peer-to-peer **remote fleet** that runs
 models on other machines over an encrypted QUIC link.
 
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│  OpenAI client  ─HTTP→  /v1/chat/completions   /v1/models              │
-│  Admin / UI     ─HTTP→  /api/higgs/{status,models,system,nodes,logs}   │
-└───────────────────────────────┬──────────────────────────────────────┘
-                                 │  (pure-Rust router + facade, can't crash)
-                          ┌──────▼───────┐
-                          │    Higgs     │  facade: load / chat / status / logs
-                          └──────┬───────┘
-            local model          │              remote model
-        ┌────────────────────────┴───────────────────────────┐
-        ▼                                                      ▼
-   Supervisor ──stdio JSON-RPC──> worker          HubFleet ──iroh QUIC──> node ──> worker
-        │                         (llama.cpp)                              (another machine)
-        ▼
-   GGUF on disk
+```mermaid
+flowchart LR
+  subgraph clients["&nbsp;CLIENTS&nbsp;"]
+    direction TB
+    oai["OpenAI client<br/><small>/v1/chat/completions · /v1/models</small>"]
+    ui["Admin / UI<br/><small>/api/higgs/*</small>"]
+  end
+
+  subgraph host["&nbsp;HIGGS HOST PROCESS &nbsp;·&nbsp; pure Rust, crash-proof control plane&nbsp;"]
+    direction TB
+    router{{"Axum router<br/><small>/v1 + /api/higgs</small>"}}
+    facade["<b>Higgs</b> facade<br/><small>load · chat · status · logs · scan</small>"]
+    sup["Supervisor<br/><small>spawn · restart · replay</small>"]
+    fleet["HubFleet<br/><small>routes: model → node, worker</small>"]
+    router --> facade
+    facade -->|local| sup
+    facade -->|remote| fleet
+  end
+
+  subgraph wproc["&nbsp;WORKER PROCESS &nbsp;·&nbsp; spawned on load&nbsp;"]
+    worker["llama.cpp engine<br/><small>HiggsEngine (native FFI)</small>"]
+  end
+
+  subgraph remote["&nbsp;REMOTE NODE &nbsp;·&nbsp; another machine&nbsp;"]
+    direction TB
+    nrt["NodeRuntime<br/><small>N concurrent workers</small>"]
+    rworker["worker · llama.cpp"]
+    nrt --> rworker
+  end
+
+  gguf[("GGUF<br/>on disk")]
+  rgguf[("GGUF<br/>on node disk")]
+
+  oai e1@-->|HTTP| router
+  ui e2@-->|HTTP| router
+  sup e3@-->|"stdio JSON-RPC"| worker
+  worker --> gguf
+  fleet e4@==>|"iroh QUIC · encrypted P2P"| nrt
+  rworker --> rgguf
+
+  e1@{ animate: true }
+  e2@{ animate: true }
+  e4@{ animate: true }
+
+  classDef pure fill:#eef2ff,stroke:#6366f1,stroke-width:1.5px,color:#1e1b4b;
+  classDef native fill:#fff7ed,stroke:#f59e0b,stroke-width:1.5px,color:#7c2d12;
+  classDef store fill:#ecfdf5,stroke:#10b981,stroke-width:1.5px,color:#064e3b;
+  classDef client fill:#f1f5f9,stroke:#94a3b8,stroke-width:1.5px,color:#0f172a;
+  class oai,ui client;
+  class router,facade,sup,fleet,nrt pure;
+  class worker,rworker native;
+  class gguf,rgguf store;
 ```
 
 ## Why higgs
