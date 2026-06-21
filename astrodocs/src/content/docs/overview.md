@@ -10,10 +10,10 @@ pluggable engine layer, and an optional peer-to-peer **remote fleet** that runs
 models on other machines over an encrypted QUIC link.
 
 ```mermaid
-flowchart LR
+flowchart TB
   subgraph clients["&nbsp;CLIENTS&nbsp;"]
-    direction TB
-    oai["OpenAI client<br/><small>/v1/chat/completions · /v1/models</small>"]
+    direction LR
+    oai["OpenAI client<br/><small>/v1/chat · /v1/models</small>"]
     ui["Admin / UI<br/><small>/api/higgs/*</small>"]
   end
 
@@ -21,37 +21,32 @@ flowchart LR
     direction TB
     router{{"Axum router<br/><small>/v1 + /api/higgs</small>"}}
     facade["<b>Higgs</b> facade<br/><small>load · chat · status · logs · scan</small>"]
-    sup["Supervisor<br/><small>spawn · restart · replay</small>"]
-    fleet["HubFleet<br/><small>routes: model → node, worker</small>"]
     router --> facade
-    facade -->|local| sup
-    facade -->|remote| fleet
-  end
-
-  subgraph wproc["&nbsp;WORKER PROCESS &nbsp;·&nbsp; spawned on load&nbsp;"]
-    worker["llama.cpp engine<br/><small>HiggsEngine (native FFI)</small>"]
+    facade -->|remote| fleet["HubFleet<br/><small>routes: model → node, worker</small>"]
+    facade -->|local| sup["Supervisor<br/><small>spawn · restart · replay</small>"]
   end
 
   subgraph remote["&nbsp;REMOTE NODE &nbsp;·&nbsp; another machine&nbsp;"]
     direction TB
     nrt["NodeRuntime<br/><small>N concurrent workers</small>"]
     rworker["worker · llama.cpp"]
-    nrt --> rworker
+    rgguf[("GGUF on node disk")]
+    nrt --> rworker --> rgguf
   end
 
-  gguf[("GGUF<br/>on disk")]
-  rgguf[("GGUF<br/>on node disk")]
+  subgraph wproc["&nbsp;WORKER PROCESS &nbsp;·&nbsp; spawned on load&nbsp;"]
+    direction TB
+    worker["llama.cpp engine<br/><small>HiggsEngine (native FFI)</small>"]
+    gguf[("GGUF on disk")]
+    worker --> gguf
+  end
 
-  oai e1@-->|HTTP| router
-  ui e2@-->|HTTP| router
+  clients e1@-->|HTTP| router
+  fleet e2@==>|"iroh QUIC · encrypted P2P"| nrt
   sup e3@-->|"stdio JSON-RPC"| worker
-  worker --> gguf
-  fleet e4@==>|"iroh QUIC · encrypted P2P"| nrt
-  rworker --> rgguf
 
   e1@{ animate: true }
   e2@{ animate: true }
-  e4@{ animate: true }
 
   classDef pure fill:#eef2ff,stroke:#6366f1,stroke-width:1.5px,color:#1e1b4b;
   classDef native fill:#fff7ed,stroke:#f59e0b,stroke-width:1.5px,color:#7c2d12;
