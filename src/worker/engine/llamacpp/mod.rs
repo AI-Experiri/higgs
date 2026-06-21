@@ -199,6 +199,10 @@ impl HiggsEngine for LlamaCppEngine {
         device_info()
     }
 
+    fn version(&self) -> String {
+        engine_version()
+    }
+
     fn chat(
         &mut self,
         messages_json: &str,

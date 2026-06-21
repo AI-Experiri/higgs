@@ -181,6 +181,25 @@ impl NodeRuntime {
         wbus.set_verbose(self.config.bus.verbose());
         let mut worker_logs = wbus.subscribe();
         let sup = Arc::new((self.spawner)(wbus));
+        // Reserve the id NOW and START THE RELAY BEFORE `M_LOAD` — the verbose load-time
+        // stderr burst can far exceed the broadcast capacity, so a relay spawned only after
+        // load returns would see `Lagged` and drop most of the load dump. Draining
+        // concurrently keeps it flowing to the hub. A reserved id that never gets committed
+        // (load failure below) is just a harmless gap (ids are never reused).
+        let id = self.registry.lock().reserve();
+        let relay = self.log_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                match worker_logs.recv().await {
+                    Ok(line) if matches!(line.source, LogSource::Worker) => {
+                        let _ = relay.send((id, line.text));
+                    }
+                    Ok(_) => {} // non-worker line on a worker bus: ignore
+                    Err(broadcast::error::RecvError::Lagged(_)) => {} // dropped gap; keep going
+                    Err(broadcast::error::RecvError::Closed) => break, // worker gone
+                }
+            }
+        });
         // Until the worker is committed to the registry, any early return — error OR
         // cancellation (hub disconnect/timeout while M_LOAD awaits) — must reap it.
         let guard = StopOnDrop::new(sup.clone());
@@ -205,24 +224,10 @@ impl NodeRuntime {
         // respawn — otherwise the replacement child would come back model-less (mirrors
         // the local `Higgs::load` path).
         sup.record_last_load(load_params);
-        let id = self.registry.lock().insert(sup);
+        // Commit the worker under its reserved id (the relay, started above, is already
+        // tagging this worker's stderr with `id`).
+        self.registry.lock().insert_reserved(id, sup);
         guard.commit(); // handed off to the registry — don't reap
-        // Relay this worker's stderr to the current hub, tagged with its id. The task ends
-        // when the worker's bus is dropped (worker unloaded/killed → `recv` returns Closed),
-        // so it never outlives the worker.
-        let relay = self.log_tx.clone();
-        tokio::spawn(async move {
-            loop {
-                match worker_logs.recv().await {
-                    Ok(line) if matches!(line.source, LogSource::Worker) => {
-                        let _ = relay.send((id, line.text));
-                    }
-                    Ok(_) => {} // non-worker line on a worker bus: ignore
-                    Err(broadcast::error::RecvError::Lagged(_)) => {} // dropped gap; keep going
-                    Err(broadcast::error::RecvError::Closed) => break, // worker gone
-                }
-            }
-        });
         Ok((id, loaded))
     }
 

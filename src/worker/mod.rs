@@ -270,7 +270,10 @@ impl WorkerState {
         json!({
             "loadable": loadable,
             "reason": reason,
-            "engine_version": engine::llamacpp::engine_version(),
+            // The SELECTED engine's own version (not hardcoded llamacpp) so the host's
+            // support cache keys verdicts per backend — a pluggable engine isn't cached
+            // under llama.cpp's version.
+            "engine_version": self.engine.version(),
         })
     }
 
@@ -475,6 +478,10 @@ mod tests {
                 vram_total_bytes: 0,
                 vram_free_bytes: 0,
             }]
+        }
+
+        fn version(&self) -> String {
+            "fake-0.0.0".into()
         }
 
         fn chat(

@@ -175,6 +175,13 @@ mod tests {
     /// also exercised; binding `0.0.0.0:0` is fine for a localhost test client.
     #[tokio::test]
     async fn run_standalone_serves_and_shuts_down() {
+        // Isolate HIGGS_HOME so `run_standalone` never loads the dev/CI machine's real
+        // `~/.higgs/api_keys.json` — a present keystore would turn auth ON and 401 the
+        // no-token `/api/higgs/status` poll below. Held for the test's lifetime.
+        let home = tempfile::tempdir().unwrap();
+        // SAFETY: single-process test; HIGGS_HOME is read by run_standalone's key load.
+        unsafe { std::env::set_var("HIGGS_HOME", home.path()) };
+
         // Reserve an ephemeral port, read it back, then drop the listener so
         // run_standalone can bind the same addr. (run_standalone binds itself.)
         let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

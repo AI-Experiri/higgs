@@ -31,10 +31,24 @@ impl<T> WorkerRegistry<T> {
 
     /// Assign the next id and store `value`; returns the new id.
     pub fn insert(&mut self, value: T) -> WorkerId {
-        let id = WorkerId(self.next);
-        self.next += 1;
+        let id = self.reserve();
         self.map.insert(id, value);
         id
+    }
+
+    /// Reserve the next id WITHOUT storing a value, so a caller can wire up id-dependent
+    /// work (e.g. start a log relay tagged with the id) before the value is ready. Commit the
+    /// value later with [`insert_reserved`](Self::insert_reserved). Ids are never reused, so an
+    /// abandoned reservation (e.g. a failed load) just leaves a harmless gap.
+    pub fn reserve(&mut self) -> WorkerId {
+        let id = WorkerId(self.next);
+        self.next += 1;
+        id
+    }
+
+    /// Store `value` under a previously [`reserve`](Self::reserve)d id.
+    pub fn insert_reserved(&mut self, id: WorkerId, value: T) {
+        self.map.insert(id, value);
     }
 
     pub fn get(&self, id: WorkerId) -> Option<&T> {
