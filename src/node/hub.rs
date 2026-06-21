@@ -19,7 +19,7 @@ use crate::log_bus::LogBus;
 use crate::node::fleet::HubFleet;
 use crate::node::identity::{bind_endpoint, load_or_create_secret};
 use crate::node::transport::NodeTransport;
-use crate::node::{gate_connection, GateOutcome, HELLO_DEADLINE};
+use crate::node::{gate_admit, gate_read_hello, GateOutcome, HELLO_DEADLINE};
 
 /// Pairing-token lifetime: 10 minutes (matches the `link pair` CLI / §7).
 const TOKEN_TTL_MS: u64 = 10 * 60 * 1000;
@@ -115,20 +115,30 @@ pub fn spawn_accept_loop(
                     }
                 };
                 let peer = conn.remote_id().to_string();
-                // Hold both locks for the gate (it mutates the allowlist + burns the token);
-                // tokio mutexes are held safely across the HELLO await. Gating serializes,
-                // which is fine for a hub's join rate.
+                // Phase 1 — read + validate HELLO WITHOUT the pairing locks, so a peer that
+                // stalls before/at HELLO can't hold them for the deadline and starve other
+                // joins or `POST /api/higgs/pair`.
+                let handshake = match gate_read_hello(&conn, HELLO_DEADLINE).await {
+                    Ok(h) => h,
+                    Err(GateOutcome::Rejected { code }) => {
+                        tracing::warn!(node = %peer, code, "higgs hub: node rejected (pre-auth)");
+                        return;
+                    }
+                    Err(_) => return,
+                };
+                // Phase 2 — the lock-needing admit decision + reply (fast, in-memory + a
+                // small post-auth write).
                 let outcome = {
                     let mut allow = allow.lock().await;
                     let mut tokens = tokens.lock().await;
-                    gate_connection(
+                    gate_admit(
                         &conn,
+                        handshake,
                         &mut allow,
                         &mut tokens,
                         now_ms(),
                         hub_id,
                         Some("paired-node".into()),
-                        HELLO_DEADLINE,
                     )
                     .await
                 };

@@ -92,24 +92,32 @@ async fn read_hello(recv: iroh::endpoint::RecvStream) -> Option<(u64, HelloParam
     }
 }
 
-/// Hub side: gate one accepted connection. `now_ms`, `hub_id`, and `hello_deadline`
-/// are injected so the function is testable; `label_for_new` labels a new pairing.
-/// Production passes [`HELLO_DEADLINE`].
-pub async fn gate_connection(
+/// A validated pre-auth handshake from [`gate_read_hello`]: the peer passed the deadline,
+/// the identity/role check, and version negotiation. Carries the open send half so the admit
+/// step can reply. Held only briefly — the admit decision consumes it.
+pub(crate) struct Handshake {
+    send: iroh::endpoint::SendStream,
+    id: u64,
+    hello: HelloParams,
+    agreed_version: u32,
+}
+
+/// Hub side, phase 1 (NO allowlist/token locks): accept the peer's HELLO within the deadline
+/// and run the lock-free checks — anti-spoof identity and version negotiation. Returns the
+/// validated [`Handshake`] or a `Rejected` outcome (connection already closed / replied).
+///
+/// Kept lock-free so a peer that completes QUIC but stalls HELLO cannot hold the pairing
+/// locks for the whole deadline and starve other joins (or `POST /api/higgs/pair`). The
+/// lock-needing decision is [`gate_admit`].
+pub(crate) async fn gate_read_hello(
     conn: &Connection,
-    allow: &mut Allowlist,
-    tokens: &mut PairingTokens,
-    now_ms: u64,
-    hub_id: String,
-    label_for_new: Option<String>,
     hello_deadline: Duration,
-) -> GateOutcome {
+) -> Result<Handshake, GateOutcome> {
     let peer = conn.remote_id().to_string();
 
     // Bound the WHOLE pre-HELLO window by the deadline: iroh defers stream creation
     // until the opener writes, so `accept_bi()` itself blocks until the node sends —
-    // a silent peer must be caught here, not only at the read (§3.2.1). The send half
-    // is returned so we can reply on success.
+    // a silent peer must be caught here, not only at the read (§3.2.1).
     let handshake = tokio::time::timeout(hello_deadline, async {
         let (send, recv) = conn.accept_bi().await.ok()?;
         let (id, hello) = read_hello(recv).await?;
@@ -118,20 +126,17 @@ pub async fn gate_connection(
     .await;
 
     let Ok(Some((mut send, id, hello))) = handshake else {
-        // Timeout, dead connection, or no/garbled HELLO — all bound the pre-auth
-        // window and are reported as handshake-stalled.
         let e = HiggsError::HandshakeStalled {
             endpoint_id: peer.clone(),
             window: hello_deadline.as_secs(),
         };
         tracing::warn!(error = %e, "higgs: dropping handshake-stalled peer");
         conn.close(0u32.into(), b"HG028");
-        return GateOutcome::Rejected { code: "HG028" };
+        return Err(GateOutcome::Rejected { code: "HG028" });
     };
 
     // 1. identity: the self-declared node_id MUST equal the TLS-authenticated peer id,
-    //    and the role must be "node" — otherwise a peer is spoofing another identity
-    //    in the first frame (§4.1). Reject before any admit decision.
+    //    and the role must be "node" — otherwise a peer is spoofing another identity (§4.1).
     if hello.role != "node" || hello.node_id != peer {
         tracing::warn!(
             peer,
@@ -140,12 +145,12 @@ pub async fn gate_connection(
             "higgs: rejecting HELLO with mismatched identity/role"
         );
         conn.close(0u32.into(), b"HG024");
-        return GateOutcome::Rejected { code: "HG024" };
+        return Err(GateOutcome::Rejected { code: "HG024" });
     }
 
-    // 2. version negotiation (HG023 — fatal). Write a typed RpcError on the stream
-    //    BEFORE closing so the node sees "you must update", not a bare transport EOF.
-    let agreed = match negotiate_version(
+    // 2. version negotiation (HG023 — fatal). Write a typed RpcError BEFORE closing so the
+    //    node sees "you must update", not a bare transport EOF.
+    let agreed_version = match negotiate_version(
         &hello.protocol_versions,
         hello.min_supported,
         PROTOCOL_VERSIONS,
@@ -166,29 +171,42 @@ pub async fn gate_connection(
                 }),
             };
             let _ = write_frame(&mut send, &RpcFrame::Response(resp)).await;
-            // Finish the stream and let the node read the typed HG023 before teardown:
-            // an immediate conn.close() can discard the unacked frame, leaving the node
-            // with a bare EOF instead of the "you must update" diagnostic.
             let _ = send.finish();
             let _ = tokio::time::timeout(Duration::from_secs(2), conn.closed()).await;
-            // Always tear down a fatal version-mismatched connection, even if the peer
-            // read the error but kept the conn open.
             conn.close(0u32.into(), b"HG023");
-            return GateOutcome::Rejected { code: "HG023" };
+            return Err(GateOutcome::Rejected { code: "HG023" });
         }
     };
 
+    Ok(Handshake { send, id, hello, agreed_version })
+}
+
+/// Hub side, phase 2 (allowlist/token locks held by the caller): admit `handshake` by the
+/// allowlist or a one-time pairing token (persisting + burning), then reply `HelloResult`.
+/// Synchronous in-memory decision + a small post-auth reply — the only part that needs the
+/// pairing locks serialized (§3.2.1). Pair with [`gate_read_hello`].
+pub(crate) async fn gate_admit(
+    conn: &Connection,
+    handshake: Handshake,
+    allow: &mut Allowlist,
+    tokens: &mut PairingTokens,
+    now_ms: u64,
+    hub_id: String,
+    label_for_new: Option<String>,
+) -> GateOutcome {
+    let Handshake { mut send, id, hello, agreed_version } = handshake;
+    let peer = conn.remote_id().to_string();
+
     // 3. allowlist OR a valid one-time pairing token (the only path that admits a
-    //    not-yet-allowlisted id). `assigned_label` is the persisted label for an
-    //    existing pairing, or the new label on first join.
+    //    not-yet-allowlisted id). `assigned_label` is the persisted label for an existing
+    //    pairing, or the new label on first join.
     let assigned_label = if allow.contains(&peer) {
         allow.label(&peer)
     } else {
         match hello.pairing_token.as_deref() {
             Some(tok) => match tokens.validate(tok, now_ms) {
                 Ok(()) => {
-                    // Persist FIRST, then burn — a failed save must leave the token
-                    // usable so the operator can retry after fixing the write error.
+                    // Persist FIRST, then burn — a failed save must leave the token usable.
                     if let Err(e) = allow.add(peer.clone(), label_for_new.clone()) {
                         tracing::error!(error = %e, "higgs: failed to persist new pairing");
                         conn.close(0u32.into(), b"HG024");
@@ -217,7 +235,7 @@ pub async fn gate_connection(
     let result = HelloResult {
         role: "hub".into(),
         node_id: hub_id,
-        agreed_version: agreed,
+        agreed_version,
         software_version: env!("CARGO_PKG_VERSION").into(),
         assigned_label,
         capabilities: hub_capabilities(),
@@ -232,7 +250,30 @@ pub async fn gate_connection(
         tracing::warn!(error = %e, "higgs: failed to send HELLO result");
         return GateOutcome::Rejected { code: "HG027" };
     }
-    GateOutcome::Admitted { agreed_version: agreed }
+    GateOutcome::Admitted { agreed_version }
+}
+
+/// Hub side: gate one accepted connection (read HELLO + admit). `now_ms`, `hub_id`, and
+/// `hello_deadline` are injected so the function is testable; `label_for_new` labels a new
+/// pairing. Production passes [`HELLO_DEADLINE`]. This convenience wrapper holds `allow`/
+/// `tokens` across the whole call; the production hub accept loop instead uses
+/// [`gate_read_hello`] (lock-free) + [`gate_admit`] (locked) so a stalled peer can't starve
+/// other joins.
+pub async fn gate_connection(
+    conn: &Connection,
+    allow: &mut Allowlist,
+    tokens: &mut PairingTokens,
+    now_ms: u64,
+    hub_id: String,
+    label_for_new: Option<String>,
+    hello_deadline: Duration,
+) -> GateOutcome {
+    match gate_read_hello(conn, hello_deadline).await {
+        Ok(handshake) => {
+            gate_admit(conn, handshake, allow, tokens, now_ms, hub_id, label_for_new).await
+        }
+        Err(rejected) => rejected,
+    }
 }
 
 /// Node side: dial `target`, complete HELLO, and return the result — the connection is

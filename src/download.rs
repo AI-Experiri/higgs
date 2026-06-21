@@ -61,30 +61,36 @@ pub fn dest_path(models_root: &Path, repo: &str, file: &str) -> Result<PathBuf, 
         file: file.to_string(),
         detail: detail.to_string(),
     };
-    // repo must be exactly "<org>/<model>" — two non-empty segments, no escapes, no
-    // backslashes (which are path separators on Windows and would nest the download).
+    // repo must be exactly "<org>/<model>", each a SAFE segment (HF's `[A-Za-z0-9._-]`
+    // charset). `is_safe_segment` rejects empties, `.`/`..`, path separators, AND
+    // URL-reserved characters (`#`, `?`, `%`, space, …) — so the segment is both a valid
+    // local dir name and a literal URL path component needing no percent-encoding.
     let segs: Vec<&str> = repo.split('/').collect();
-    if segs.len() != 2
-        || segs.iter().any(|s| s.is_empty() || *s == "." || *s == ".." || s.contains('\\'))
-    {
-        return Err(bad("repo must be '<org>/<model>' (two path segments, no backslashes)"));
+    if segs.len() != 2 || !segs.iter().all(|s| is_safe_segment(s)) {
+        return Err(bad("repo must be '<org>/<model>' (each [A-Za-z0-9._-], no '..'/reserved chars)"));
     }
-    // file must be a single `*.gguf` component (case-insensitive, matching the scanner) —
-    // no subdirectory, no escape.
-    if file.is_empty()
-        || file.contains('/')
-        || file.contains('\\')
-        || file == "."
-        || file == ".."
-        || !file.to_ascii_lowercase().ends_with(".gguf")
-    {
-        return Err(bad("file must be a single '*.gguf' filename (no subdirectory)"));
+    // file must be a single safe `*.gguf` component (case-insensitive) — no subdirectory,
+    // no escape, no URL-reserved chars.
+    if !is_safe_segment(file) || !file.to_ascii_lowercase().ends_with(".gguf") {
+        return Err(bad("file must be a single '*.gguf' name ([A-Za-z0-9._-], no subdir)"));
     }
     let rel = PathBuf::from(repo).join(file);
     if rel.components().any(|c| matches!(c, Component::ParentDir | Component::RootDir | Component::Prefix(_))) {
         return Err(bad("path must be relative with no '..'"));
     }
     Ok(models_root.join(rel))
+}
+
+/// A safe path/URL segment: non-empty, not `.`/`..`, and only `[A-Za-z0-9._-]` — which is
+/// HuggingFace's repo/file charset. This deliberately excludes `/`, `\`, and every
+/// URL-reserved character (`#`, `?`, `%`, `:`, space, …) so a segment is BOTH a valid local
+/// filename and a literal URL path component (no percent-encoding needed, no fragment/query
+/// injection into the resolve URL).
+fn is_safe_segment(s: &str) -> bool {
+    !s.is_empty()
+        && s != "."
+        && s != ".."
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
 /// Download `target` into `models_root` via `fetcher`, streaming progress to `progress`.
@@ -102,6 +108,13 @@ pub async fn download<F: Fetcher>(
     };
 
     let dest = dest_path(models_root, &target.repo, &target.file)?;
+    // The revision rides the URL path too but isn't part of the local dest, so validate it
+    // here: each `/`-separated segment must be safe (allows branch paths like `refs/pr/1`),
+    // keeping reserved chars out of the resolve URL.
+    if !target.revision.split('/').all(is_safe_segment) {
+        return Err(fail(format!("invalid revision {:?} (segments must be [A-Za-z0-9._-])", target.revision)));
+    }
+
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| fail(e.to_string()))?;
     }
@@ -262,6 +275,27 @@ mod tests {
         assert!(dest_path(root, "org", "/abs").is_err(), "no absolute file");
         assert!(dest_path(root, "", "x.gguf").is_err(), "empty repo rejected");
         assert!(dest_path(root, "../m", "x.gguf").is_err(), "parent in org rejected");
+        // URL-reserved characters are rejected (would corrupt the resolve URL).
+        assert!(dest_path(root, "org/m", "x?.gguf").is_err(), "'?' (query) in file rejected");
+        assert!(dest_path(root, "org/m", "x#.gguf").is_err(), "'#' (fragment) in file rejected");
+        assert!(dest_path(root, "or#g/m", "x.gguf").is_err(), "'#' in repo rejected");
+        assert!(dest_path(root, "org/m", "a b.gguf").is_err(), "space in file rejected");
+        // Normal HF charset is fine.
+        assert!(dest_path(root, "TheBloke/Llama-2.7B_GGUF", "model.q4_0.gguf").is_ok());
+    }
+
+    #[tokio::test]
+    async fn download_rejects_unsafe_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = PullTarget::new("org/m", "x.gguf");
+        t.revision = "main#frag".into();
+        let f = FakeFetcher::new(vec![b"x".to_vec()]);
+        let err = download(&t, dir.path(), &f, &mut |_, _| {}).await.unwrap_err();
+        assert!(err.to_string().starts_with("[HG025]"), "reserved char in revision → HG025: {err}");
+        // A branch-path revision with '/' is allowed.
+        t.revision = "refs/pr/1".into();
+        // (won't actually fetch over network in this unit test; the fake fetcher serves it)
+        assert!(download(&t, dir.path(), &f, &mut |_, _| {}).await.is_ok(), "branch-path revision ok");
     }
 
     #[tokio::test]

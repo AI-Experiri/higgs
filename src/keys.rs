@@ -86,7 +86,10 @@ impl ApiKeys {
         }
     }
 
-    /// Persist the keystore to `path` (pretty JSON; atomic temp-file + rename).
+    /// Persist the keystore to `path` (pretty JSON; atomic temp-file + rename). `rename(2)`
+    /// replaces the destination in place on Unix, so repeated `keys add`/`remove` overwrite
+    /// the existing file. (higgs targets Unix/macOS — the llama.cpp FFI build isn't
+    /// Windows-portable — so the non-atomic-rename-replace platform is out of scope.)
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, serde_json::to_vec_pretty(self).expect("api keys serialize"))?;
