@@ -25,7 +25,13 @@ pub async fn dispatch_node_control(rt: &NodeRuntime, req: RpcRequest) -> RpcResp
     match req.method.as_str() {
         M_NODE_LOAD => match parse::<NodeLoadParams>(&req) {
             Ok(params) => match rt.load(params).await {
-                Ok((worker_id, loaded)) => ok(id, NodeLoadResult { worker_id: worker_id.0, loaded }),
+                Ok((worker_id, loaded)) => ok(
+                    id,
+                    NodeLoadResult {
+                        worker_id: worker_id.0,
+                        loaded,
+                    },
+                ),
                 Err(e) => err_from(id, &e),
             },
             Err(resp) => resp(id),
@@ -67,15 +73,24 @@ pub async fn dispatch_node_control(rt: &NodeRuntime, req: RpcRequest) -> RpcResp
         // (the real signature-verified updater is a later task; `update` cap is `false`).
         M_NODE_UPDATE => err_from(
             id,
-            &HiggsError::UpdateUnsupported { detail: "this build ships no updater".into() },
+            &HiggsError::UpdateUnsupported {
+                detail: "this build ships no updater".into(),
+            },
         ),
-        other => err(id, METHOD_NOT_FOUND, format!("unknown control method {other}"), None),
+        other => err(
+            id,
+            METHOD_NOT_FOUND,
+            format!("unknown control method {other}"),
+            None,
+        ),
     }
 }
 
 /// Parse params into `T`; on failure return a closure that builds the INVALID_PARAMS
 /// response for a given request id (so the message names the parse error).
-fn parse<T: serde::de::DeserializeOwned>(req: &RpcRequest) -> Result<T, impl FnOnce(u64) -> RpcResponse> {
+fn parse<T: serde::de::DeserializeOwned>(
+    req: &RpcRequest,
+) -> Result<T, impl FnOnce(u64) -> RpcResponse> {
     serde_json::from_value::<T>(req.params.clone()).map_err(|e| {
         let msg = format!("invalid params: {e}");
         move |id: u64| err(id, INVALID_PARAMS, msg, None)
@@ -83,11 +98,19 @@ fn parse<T: serde::de::DeserializeOwned>(req: &RpcRequest) -> Result<T, impl FnO
 }
 
 fn ok<T: serde::Serialize>(id: u64, value: T) -> RpcResponse {
-    ok_value(id, serde_json::to_value(value).expect("control results serialize"))
+    ok_value(
+        id,
+        serde_json::to_value(value).expect("control results serialize"),
+    )
 }
 
 fn ok_value(id: u64, result: Value) -> RpcResponse {
-    RpcResponse { jsonrpc: "2.0".into(), id, result: Some(result), error: None }
+    RpcResponse {
+        jsonrpc: "2.0".into(),
+        id,
+        result: Some(result),
+        error: None,
+    }
 }
 
 fn err(id: u64, code: i64, message: String, data: Option<Value>) -> RpcResponse {
@@ -95,7 +118,11 @@ fn err(id: u64, code: i64, message: String, data: Option<Value>) -> RpcResponse 
         jsonrpc: "2.0".into(),
         id,
         result: None,
-        error: Some(RpcError { code, message, data }),
+        error: Some(RpcError {
+            code,
+            message,
+            data,
+        }),
     }
 }
 
@@ -103,7 +130,12 @@ fn err(id: u64, code: i64, message: String, data: Option<Value>) -> RpcResponse 
 /// supervisor's worker-error mapping, so the hub can recover the origin status — the
 /// worker's own code when the failure came from the worker).
 fn err_from(id: u64, e: &HiggsError) -> RpcResponse {
-    err(id, INTERNAL_ERROR, e.to_string(), crate::node::worker_origin_code_data(e))
+    err(
+        id,
+        INTERNAL_ERROR,
+        e.to_string(),
+        crate::node::worker_origin_code_data(e),
+    )
 }
 
 #[cfg(test)]
@@ -116,7 +148,12 @@ mod tests {
     }
 
     fn req(id: u64, method: &str, params: Value) -> RpcRequest {
-        RpcRequest { jsonrpc: "2.0".into(), id, method: method.into(), params }
+        RpcRequest {
+            jsonrpc: "2.0".into(),
+            id,
+            method: method.into(),
+            params,
+        }
     }
 
     #[tokio::test]
@@ -141,7 +178,8 @@ mod tests {
     #[tokio::test]
     async fn load_missing_model_maps_hg002() {
         let rt = fake_runtime(); // no model roots → ModelNotFound
-        let resp = dispatch_node_control(&rt, req(1, M_NODE_LOAD, json!({ "id": "missing" }))).await;
+        let resp =
+            dispatch_node_control(&rt, req(1, M_NODE_LOAD, json!({ "id": "missing" }))).await;
         let e = resp.error.unwrap();
         assert_eq!(e.code, INTERNAL_ERROR);
         assert_eq!(e.data.unwrap()["code"], "HG002");
@@ -162,9 +200,15 @@ mod tests {
         let resp = dispatch_node_control(&rt, req(1, M_NODE_INVENTORY, json!({}))).await;
         assert!(resp.error.is_none(), "inventory ok: {resp:?}");
         let inv = resp.result.unwrap();
-        assert!(inv["hardware"]["cpu_cores"].as_u64().unwrap() > 0, "real hw");
+        assert!(
+            inv["hardware"]["cpu_cores"].as_u64().unwrap() > 0,
+            "real hw"
+        );
         assert!(!inv["os"].as_str().unwrap().is_empty(), "os present");
-        assert!(inv["workers"].as_array().unwrap().is_empty(), "no workers loaded");
+        assert!(
+            inv["workers"].as_array().unwrap().is_empty(),
+            "no workers loaded"
+        );
     }
 
     #[tokio::test]
@@ -176,7 +220,8 @@ mod tests {
         assert!(sysinfo.result.unwrap().get("hardware").is_some());
 
         // status for an unknown worker errors cleanly.
-        let status = dispatch_node_control(&rt, req(2, M_NODE_STATUS, json!({ "worker_id": 999 }))).await;
+        let status =
+            dispatch_node_control(&rt, req(2, M_NODE_STATUS, json!({ "worker_id": 999 }))).await;
         assert!(status.error.is_some());
     }
 }

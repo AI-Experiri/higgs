@@ -39,7 +39,15 @@ pub(crate) fn chat_sse(
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let (tx, rx) = mpsc::unbounded_channel::<String>();
     tokio::spawn(assemble(
-        id, model, created, deltas, outcome, tx, verbose, started, include_usage,
+        id,
+        model,
+        created,
+        deltas,
+        outcome,
+        tx,
+        verbose,
+        started,
+        include_usage,
     ));
     let stream = futures::stream::unfold(rx, |mut rx| async move {
         rx.recv()
@@ -98,7 +106,13 @@ async fn assemble(
             // chunk with empty `choices` and the populated `usage` block (real engine token
             // counts), so a streaming client gets the same accounting as the non-stream path.
             if include_usage {
-                send(usage_payload(&id, &model, created, out.prompt_tokens, out.completion_tokens));
+                send(usage_payload(
+                    &id,
+                    &model,
+                    created,
+                    out.prompt_tokens,
+                    out.completion_tokens,
+                ));
             }
         }
         Ok(Err(err)) => {
@@ -266,7 +280,13 @@ fn chunk_payload(
 
 /// Serialize the terminal usage-only chunk for `stream_options.include_usage`: empty
 /// `choices`, populated `usage` (mirrors the non-streaming `usage` block).
-fn usage_payload(id: &str, model: &str, created: u32, prompt_tokens: u32, completion_tokens: u32) -> String {
+fn usage_payload(
+    id: &str,
+    model: &str,
+    created: u32,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+) -> String {
     #[allow(deprecated)]
     let chunk = CreateChatCompletionStreamResponse {
         id: id.to_owned(),
@@ -402,7 +422,11 @@ mod tests {
 
         let payloads = run_assemble_opts(drx, outcome, true).await;
         // role + delta + finish + usage + [DONE]
-        assert_eq!(payloads.len(), 5, "usage chunk added before [DONE]: {payloads:?}");
+        assert_eq!(
+            payloads.len(),
+            5,
+            "usage chunk added before [DONE]: {payloads:?}"
+        );
         assert_eq!(payloads[4], "[DONE]");
 
         let usage_chunk: CreateChatCompletionStreamResponse =
@@ -429,11 +453,17 @@ mod tests {
         });
         let payloads = run_assemble(drx, outcome).await;
         // role + delta + finish + [DONE] — NO usage chunk.
-        assert_eq!(payloads.len(), 4, "no usage chunk when not requested: {payloads:?}");
+        assert_eq!(
+            payloads.len(),
+            4,
+            "no usage chunk when not requested: {payloads:?}"
+        );
         assert!(
-            payloads.iter().all(|p| serde_json::from_str::<CreateChatCompletionStreamResponse>(p)
-                .map(|c| c.usage.is_none())
-                .unwrap_or(true)),
+            payloads.iter().all(
+                |p| serde_json::from_str::<CreateChatCompletionStreamResponse>(p)
+                    .map(|c| c.usage.is_none())
+                    .unwrap_or(true)
+            ),
             "no chunk carries a usage block"
         );
     }

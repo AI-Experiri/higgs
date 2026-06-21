@@ -346,7 +346,10 @@ async fn inference_and_tools() {
     .await
     .unwrap();
     assert!(body.contains("data:"), "tool stream has data lines");
-    assert!(body.contains("[DONE]"), "tool stream terminates with [DONE]");
+    assert!(
+        body.contains("[DONE]"),
+        "tool stream terminates with [DONE]"
+    );
     assert!(
         !body.contains("<tool_call>") && !body.contains("<function="),
         "no tool-call markup leaks into the stream"
@@ -388,7 +391,10 @@ async fn inference_and_tools() {
     .text()
     .await
     .unwrap();
-    assert!(body.contains("[DONE]"), "usage stream terminates with [DONE]");
+    assert!(
+        body.contains("[DONE]"),
+        "usage stream terminates with [DONE]"
+    );
     // Find the terminal usage chunk: a `data:` line whose `usage` is a NON-null object with
     // real token counts (not the per-chunk `"usage":null`). This is the OpenAI include_usage
     // contract the genai client relies on for streamed token accounting.
@@ -419,7 +425,11 @@ async fn inference_and_tools() {
         .send()
         .await
         .unwrap();
-    assert_eq!(unknown_stream.status(), 404, "streaming unknown model is 404 (pre-stream error)");
+    assert_eq!(
+        unknown_stream.status(),
+        404,
+        "streaming unknown model is 404 (pre-stream error)"
+    );
 
     // ── Zero max_tokens exercises the boundary branch (clamped or rejected, never 5xx) ──
     let zero = c
@@ -431,7 +441,11 @@ async fn inference_and_tools() {
         .send()
         .await
         .unwrap();
-    assert!(!zero.status().is_server_error(), "max_tokens=0 must not 5xx, got {}", zero.status());
+    assert!(
+        !zero.status().is_server_error(),
+        "max_tokens=0 must not 5xx, got {}",
+        zero.status()
+    );
 
     // ── Token logging ON + a tool-result conversation ─────────────────────────
     // Turning on "Log Incoming Tokens" exercises the prompt/response logging path; the
@@ -471,7 +485,11 @@ async fn inference_and_tools() {
     }))
     .await
     .unwrap();
-    assert!(resp.status().is_success(), "tool-result conversation succeeds: {}", resp.status());
+    assert!(
+        resp.status().is_success(),
+        "tool-result conversation succeeds: {}",
+        resp.status()
+    );
 
     // A STREAMING chat with token logging still on — exercises the streamed response
     // logging path (log_served on the SSE branch).
@@ -484,7 +502,10 @@ async fn inference_and_tools() {
     .text()
     .await
     .unwrap();
-    assert!(body.contains("[DONE]"), "logged streaming chat still terminates");
+    assert!(
+        body.contains("[DONE]"),
+        "logged streaming chat still terminates"
+    );
 
     // A stop-sequence request exercises the stop-handling branch; the result must still be
     // a well-formed completion with a known finish_reason.

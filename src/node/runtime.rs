@@ -38,7 +38,11 @@ impl NodeConfig {
     /// The three model roots `(lmstudio, hf, ollama)`, cloned for a `spawn_blocking` scan
     /// that must own them. Shared by `resolve_model` and `scan`.
     fn model_dirs(&self) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
-        (self.lmstudio_dirs.clone(), self.hf_dirs.clone(), self.ollama_dirs.clone())
+        (
+            self.lmstudio_dirs.clone(),
+            self.hf_dirs.clone(),
+            self.ollama_dirs.clone(),
+        )
     }
 }
 
@@ -92,7 +96,12 @@ impl NodeRuntime {
     /// Runtime with an injected supervisor spawner (tests).
     pub(crate) fn with_spawner(config: NodeConfig, spawner: SupervisorSpawner) -> Self {
         let (log_tx, _) = broadcast::channel(LOG_RELAY_CAP);
-        Self { registry: Mutex::new(WorkerRegistry::new()), spawner, config, log_tx }
+        Self {
+            registry: Mutex::new(WorkerRegistry::new()),
+            spawner,
+            config,
+            log_tx,
+        }
     }
 
     /// Subscribe to the per-worker stderr relay (`(worker_id, line)`). The node's
@@ -108,15 +117,24 @@ impl NodeRuntime {
 
     /// The "no such worker" error shared by the registry lookups below.
     fn no_worker(id: WorkerId) -> HiggsError {
-        HiggsError::WorkerDead { context: format!("no worker {id}") }
+        HiggsError::WorkerDead {
+            context: format!("no worker {id}"),
+        }
     }
 
     fn get(&self, id: WorkerId) -> Result<Arc<Supervisor>, HiggsError> {
-        self.registry.lock().get(id).cloned().ok_or_else(|| Self::no_worker(id))
+        self.registry
+            .lock()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| Self::no_worker(id))
     }
 
     fn take(&self, id: WorkerId) -> Result<Arc<Supervisor>, HiggsError> {
-        self.registry.lock().remove(id).ok_or_else(|| Self::no_worker(id))
+        self.registry
+            .lock()
+            .remove(id)
+            .ok_or_else(|| Self::no_worker(id))
     }
 
     /// Resolve `id` to its on-disk GGUF `(path, size_bytes, ctx_train)` by scanning the
@@ -134,18 +152,21 @@ impl NodeRuntime {
                 .get(&id)
                 .map(|m| (m.path.clone(), m.size_bytes, m.ctx_train))
                 .ok_or_else(|| HiggsError::ModelNotFound { id: id.clone() })?;
-            let roots: Vec<PathBuf> =
-                lmstudio.into_iter().chain(hf).chain(ollama).collect();
+            let roots: Vec<PathBuf> = lmstudio.into_iter().chain(hf).chain(ollama).collect();
             if !crate::api::path_within_roots(&path, &roots) {
                 return Err(HiggsError::InvalidModelId {
                     id,
-                    reason: format!("resolved path {path} is outside every configured scan directory"),
+                    reason: format!(
+                        "resolved path {path} is outside every configured scan directory"
+                    ),
                 });
             }
             Ok((path, size_bytes, ctx_train))
         })
         .await
-        .map_err(|e| HiggsError::WorkerDead { context: format!("model scan task failed: {e}") })?
+        .map_err(|e| HiggsError::WorkerDead {
+            context: format!("model scan task failed: {e}"),
+        })?
     }
 
     /// Spawn a NEW worker for `params.id` and load the model (net-new multi-worker). The
@@ -224,9 +245,9 @@ impl NodeRuntime {
             "threads": params.threads,
         });
         let loaded = sup.request(M_LOAD, load_params.clone()).await?; // err/cancel → guard reaps
-        // Record the load so the Supervisor's restart FSM replays it on an unexpected
-        // respawn — otherwise the replacement child would come back model-less (mirrors
-        // the local `Higgs::load` path).
+                                                                      // Record the load so the Supervisor's restart FSM replays it on an unexpected
+                                                                      // respawn — otherwise the replacement child would come back model-less (mirrors
+                                                                      // the local `Higgs::load` path).
         sup.record_last_load(load_params);
         // Commit the worker under its reserved id (the relay, started above, is already
         // tagging this worker's stderr with `id`).
@@ -269,7 +290,9 @@ impl NodeRuntime {
             Ok::<Value, HiggsError>(json!({ "models": store.models() }))
         })
         .await
-        .map_err(|e| HiggsError::WorkerDead { context: format!("scan task failed: {e}") })??;
+        .map_err(|e| HiggsError::WorkerDead {
+            context: format!("scan task failed: {e}"),
+        })??;
         Ok(models)
     }
 
@@ -294,9 +317,13 @@ impl NodeRuntime {
     ) -> Result<(crate::system::HardwareInfo, crate::system::RuntimeInfo), HiggsError> {
         let sup = (self.spawner)(self.config.bus.clone());
         let gpus = sup.sysinfo().await;
-        tokio::task::spawn_blocking(move || crate::system::SystemInfo::gather_hardware_runtime(gpus))
-            .await
-            .map_err(|e| HiggsError::WorkerDead { context: format!("{context} task failed: {e}") })
+        tokio::task::spawn_blocking(move || {
+            crate::system::SystemInfo::gather_hardware_runtime(gpus)
+        })
+        .await
+        .map_err(|e| HiggsError::WorkerDead {
+            context: format!("{context} task failed: {e}"),
+        })
     }
 
     /// Full node self-description for `M_NODE_INVENTORY`: host identity + every resident
@@ -322,8 +349,9 @@ impl NodeRuntime {
             hardware,
             runtime,
         };
-        serde_json::to_value(inventory)
-            .map_err(|e| HiggsError::WorkerDead { context: format!("inventory serialize failed: {e}") })
+        serde_json::to_value(inventory).map_err(|e| HiggsError::WorkerDead {
+            context: format!("inventory serialize failed: {e}"),
+        })
     }
 
     /// Look up a worker's Supervisor for the data-plane chat relay (P2 Task 5).
@@ -338,7 +366,10 @@ impl NodeRuntime {
     pub async fn shutdown_all(&self) {
         let sups: Vec<Arc<Supervisor>> = {
             let mut reg = self.registry.lock();
-            reg.ids().into_iter().filter_map(|id| reg.remove(id)).collect()
+            reg.ids()
+                .into_iter()
+                .filter_map(|id| reg.remove(id))
+                .collect()
         };
         // Guard EVERY drained worker up front: if this future is cancelled mid-drain, the
         // still-uncommitted guards reap their children on drop (a dropped Vec<Arc> would
@@ -378,13 +409,20 @@ mod tests {
     }
 
     fn load_params(id: &str) -> NodeLoadParams {
-        NodeLoadParams { id: id.into(), ctx_len: None, gpu_layers: None, threads: None}
+        NodeLoadParams {
+            id: id.into(),
+            ctx_len: None,
+            gpu_layers: None,
+            threads: None,
+        }
     }
 
     // Spawn-and-load with a dummy path (the fake worker accepts any path), exercising the
     // multi-worker spawn/registry path without an on-disk GGUF.
     async fn fake_load(rt: &NodeRuntime, id: &str) -> (WorkerId, Value) {
-        rt.spawn_and_load("/dev/null/fake.gguf", None, &load_params(id)).await.unwrap()
+        rt.spawn_and_load("/dev/null/fake.gguf", None, &load_params(id))
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -413,7 +451,10 @@ mod tests {
         let rt = fake_runtime();
         let err = rt.load(load_params("missing/model")).await.unwrap_err();
         assert!(err.to_string().starts_with("[HG002]"), "got {err}");
-        assert!(rt.worker_ids().is_empty(), "no worker spawned on resolve failure");
+        assert!(
+            rt.worker_ids().is_empty(),
+            "no worker spawned on resolve failure"
+        );
     }
 
     #[tokio::test]
@@ -422,7 +463,10 @@ mod tests {
         let (id, _) = fake_load(&rt, "m").await;
         let status = rt.status(id).await.unwrap();
         assert!(status.get("loaded").is_some());
-        assert!(rt.status(WorkerId(999)).await.is_err(), "unknown worker errors");
+        assert!(
+            rt.status(WorkerId(999)).await.is_err(),
+            "unknown worker errors"
+        );
     }
 
     #[tokio::test]
@@ -439,12 +483,18 @@ mod tests {
         let (wa, _) = fake_load(&rt, "org/a").await;
         fake_load(&rt, "org/b").await;
         let inv = rt.inventory().await.unwrap();
-        assert!(inv["hardware"]["cpu_cores"].as_u64().unwrap() > 0, "real hw");
+        assert!(
+            inv["hardware"]["cpu_cores"].as_u64().unwrap() > 0,
+            "real hw"
+        );
         assert!(!inv["os"].as_str().unwrap().is_empty(), "os present");
         let workers = inv["workers"].as_array().unwrap();
         assert_eq!(workers.len(), 2, "both workers listed");
         // The worker with id `wa` reports model org/a.
-        let a = workers.iter().find(|w| w["worker_id"].as_u64().unwrap() as u32 == wa.0).unwrap();
+        let a = workers
+            .iter()
+            .find(|w| w["worker_id"].as_u64().unwrap() as u32 == wa.0)
+            .unwrap();
         assert_eq!(a["model"], "org/a", "worker reports its model");
     }
 

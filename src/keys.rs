@@ -52,7 +52,9 @@ pub struct ApiKey {
 impl ApiKey {
     /// Does this key satisfy `required`? `Admin` satisfies anything.
     fn grants(&self, required: Scope) -> bool {
-        self.scopes.iter().any(|s| *s == Scope::Admin || *s == required)
+        self.scopes
+            .iter()
+            .any(|s| *s == Scope::Admin || *s == required)
     }
 }
 
@@ -95,7 +97,10 @@ impl ApiKeys {
     /// Windows-portable — so the non-atomic-rename-replace platform is out of scope.)
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(self).expect("api keys serialize"))?;
+        std::fs::write(
+            &tmp,
+            serde_json::to_vec_pretty(self).expect("api keys serialize"),
+        )?;
         std::fs::rename(&tmp, path)
     }
 
@@ -112,7 +117,11 @@ impl ApiKeys {
     pub fn add(&mut self, token: &str, label: String, scopes: Vec<Scope>) -> String {
         let sha256 = hash_token(token);
         self.keys.retain(|k| k.sha256 != sha256); // replace an identical token
-        self.keys.push(ApiKey { sha256: sha256.clone(), label, scopes });
+        self.keys.push(ApiKey {
+            sha256: sha256.clone(),
+            label,
+            scopes,
+        });
         sha256
     }
 
@@ -135,8 +144,8 @@ impl ApiKeys {
         let mut ok = false;
         for k in &self.keys {
             // Constant-time digest equality; only a hex-length match can be equal.
-            let matches = k.sha256.len() == presented.len()
-                && k.sha256.as_bytes().ct_eq(presented).into();
+            let matches =
+                k.sha256.len() == presented.len() && k.sha256.as_bytes().ct_eq(presented).into();
             if matches && k.grants(required) {
                 ok = true;
             }
@@ -155,9 +164,14 @@ fn parse_scopes(s: &str) -> std::io::Result<Vec<Scope>> {
     s.split(',')
         .map(str::trim)
         .filter(|p| !p.is_empty())
-        .map(|p| Scope::parse(p).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("unknown scope {p:?}"))
-        }))
+        .map(|p| {
+            Scope::parse(p).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("unknown scope {p:?}"),
+                )
+            })
+        })
         .collect()
 }
 
@@ -174,11 +188,17 @@ fn run_keys_at(path: &Path, args: &[String]) -> std::io::Result<()> {
     match args.first().map(String::as_str) {
         Some("add") => {
             let label = args.get(1).cloned().ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, "usage: higgs keys add <label> [chat,models]")
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "usage: higgs keys add <label> [chat,models]",
+                )
             })?;
             let scopes = parse_scopes(args.get(2).map(String::as_str).unwrap_or("chat,models"))?;
             if scopes.is_empty() {
-                return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "at least one scope required"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "at least one scope required",
+                ));
             }
             let token = mint_token(rand::random());
             let mut keys = ApiKeys::load(path)?;
@@ -195,14 +215,22 @@ fn run_keys_at(path: &Path, args: &[String]) -> std::io::Result<()> {
                 println!("no API keys configured — the HTTP surface is OPEN");
             } else {
                 for k in keys.iter() {
-                    println!("{:<16} {:?}  sha256:{}…", k.label, k.scopes, &k.sha256[..12]);
+                    println!(
+                        "{:<16} {:?}  sha256:{}…",
+                        k.label,
+                        k.scopes,
+                        &k.sha256[..12]
+                    );
                 }
             }
             Ok(())
         }
         Some("remove") => {
             let label = args.get(1).cloned().ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, "usage: higgs keys remove <label>")
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "usage: higgs keys remove <label>",
+                )
             })?;
             let mut keys = ApiKeys::load(path)?;
             let n = keys.remove_label(&label);
@@ -213,7 +241,10 @@ fn run_keys_at(path: &Path, args: &[String]) -> std::io::Result<()> {
         }
         other => {
             eprintln!("usage: higgs keys <add|list|remove> (got {other:?})");
-            Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "unknown keys subcommand"))
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "unknown keys subcommand",
+            ))
         }
     }
 }
@@ -226,7 +257,10 @@ mod tests {
     fn empty_store_is_open() {
         let ks = ApiKeys::default();
         assert!(ks.is_empty());
-        assert!(ks.authorizes("anything", Scope::Admin), "no keys = auth disabled");
+        assert!(
+            ks.authorizes("anything", Scope::Admin),
+            "no keys = auth disabled"
+        );
     }
 
     #[test]
@@ -234,9 +268,18 @@ mod tests {
         let mut ks = ApiKeys::default();
         ks.add("hgk_chat", "c".into(), vec![Scope::Chat]);
         assert!(ks.authorizes("hgk_chat", Scope::Chat));
-        assert!(!ks.authorizes("hgk_chat", Scope::Models), "chat key can't list models");
-        assert!(!ks.authorizes("hgk_chat", Scope::Admin), "chat key isn't admin");
-        assert!(!ks.authorizes("wrong", Scope::Chat), "unknown token rejected");
+        assert!(
+            !ks.authorizes("hgk_chat", Scope::Models),
+            "chat key can't list models"
+        );
+        assert!(
+            !ks.authorizes("hgk_chat", Scope::Admin),
+            "chat key isn't admin"
+        );
+        assert!(
+            !ks.authorizes("wrong", Scope::Chat),
+            "unknown token rejected"
+        );
     }
 
     #[test]
@@ -253,7 +296,11 @@ mod tests {
         let mut ks = ApiKeys::default();
         ks.add("hgk_x", "first".into(), vec![Scope::Chat]);
         ks.add("hgk_x", "second".into(), vec![Scope::Admin]); // same token, new label/scope
-        assert_eq!(ks.iter().count(), 1, "identical token replaced, not duplicated");
+        assert_eq!(
+            ks.iter().count(),
+            1,
+            "identical token replaced, not duplicated"
+        );
         assert!(ks.authorizes("hgk_x", Scope::Admin));
         assert_eq!(ks.remove_label("second"), 1);
         assert!(ks.is_empty());
@@ -277,7 +324,10 @@ mod tests {
 
     #[test]
     fn parse_scopes_handles_lists_and_rejects_unknown() {
-        assert_eq!(parse_scopes("chat, models").unwrap(), vec![Scope::Chat, Scope::Models]);
+        assert_eq!(
+            parse_scopes("chat, models").unwrap(),
+            vec![Scope::Chat, Scope::Models]
+        );
         assert!(parse_scopes("").unwrap().is_empty());
         assert!(parse_scopes("chat,bogus").is_err());
     }
@@ -318,6 +368,8 @@ mod tests {
         let back = ApiKeys::load(&path).unwrap();
         assert!(back.authorizes("hgk_z", Scope::Models));
         // Missing file → empty/open store.
-        assert!(ApiKeys::load(&dir.path().join("nope.json")).unwrap().is_empty());
+        assert!(ApiKeys::load(&dir.path().join("nope.json"))
+            .unwrap()
+            .is_empty());
     }
 }

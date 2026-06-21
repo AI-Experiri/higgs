@@ -376,7 +376,9 @@ pub(super) async fn control_nodes_load(
         return not_a_hub();
     };
     match fleet.load(&req.node, &req.model).await {
-        Ok(worker) => Json(serde_json::json!({ "status": "ok", "worker_id": worker.0 })).into_response(),
+        Ok(worker) => {
+            Json(serde_json::json!({ "status": "ok", "worker_id": worker.0 })).into_response()
+        }
         Err(err) => control_error(&err).into_response(),
     }
 }
@@ -774,23 +776,35 @@ mod tests {
         let (sup, _test_write, _test_read, _ring) = make_supervisor();
         let app = make_app(sup);
         // No hub installed → pairing is a 409 with an explanatory error.
-        let resp = app.oneshot(post_json("/api/higgs/pair", &json!({}))).await.unwrap();
+        let resp = app
+            .oneshot(post_json("/api/higgs/pair", &json!({})))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::CONFLICT);
         let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-        assert!(v["error"].as_str().unwrap().contains("hub mode"), "explains hub mode: {v}");
+        assert!(
+            v["error"].as_str().unwrap().contains("hub mode"),
+            "explains hub mode: {v}"
+        );
     }
 
     #[tokio::test]
     async fn nodes_load_unload_without_fleet_is_conflict() {
         let (sup, _w, _r, _ring) = make_supervisor();
         let load = make_app(sup)
-            .oneshot(post_json("/api/higgs/nodes/load", &json!({ "node": "n", "model": "m" })))
+            .oneshot(post_json(
+                "/api/higgs/nodes/load",
+                &json!({ "node": "n", "model": "m" }),
+            ))
             .await
             .unwrap();
         assert_eq!(load.status(), StatusCode::CONFLICT, "no fleet → 409");
         let (sup2, _w2, _r2, _ring2) = make_supervisor();
         let unload = make_app(sup2)
-            .oneshot(post_json("/api/higgs/nodes/unload", &json!({ "model": "m" })))
+            .oneshot(post_json(
+                "/api/higgs/nodes/unload",
+                &json!({ "model": "m" }),
+            ))
             .await
             .unwrap();
         assert_eq!(unload.status(), StatusCode::CONFLICT, "no fleet → 409");

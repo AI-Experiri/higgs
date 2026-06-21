@@ -33,7 +33,9 @@ pub(crate) struct Handle<M> {
 
 impl<M> Clone for Handle<M> {
     fn clone(&self) -> Self {
-        Handle { tx: self.tx.clone() }
+        Handle {
+            tx: self.tx.clone(),
+        }
     }
 }
 

@@ -125,7 +125,11 @@ impl HubFleet {
         let node_id = self.node_ids.lock().assign(&node);
         // Read the node's relayed worker stderr (its uni stream) into the hub bus for THIS
         // connection; ends when the connection closes (accept_uni errors).
-        tokio::spawn(read_remote_logs(transport.connection(), node_id, self.bus.clone()));
+        tokio::spawn(read_remote_logs(
+            transport.connection(),
+            node_id,
+            self.bus.clone(),
+        ));
 
         let replaced = self.nodes.lock().insert(node.clone(), transport.clone());
         if let Some(old) = replaced {
@@ -167,13 +171,16 @@ impl HubFleet {
             .request(M_NODE_INVENTORY, json!({}))
             .await
             .map_err(|e| self.handle_op_error(node, &transport, e))?;
-        let inventory: NodeInventory = serde_json::from_value(value).map_err(|e| {
-            HiggsError::WorkerDead { context: format!("node inventory decode failed: {e}") }
-        })?;
+        let inventory: NodeInventory =
+            serde_json::from_value(value).map_err(|e| HiggsError::WorkerDead {
+                context: format!("node inventory decode failed: {e}"),
+            })?;
         // Commit only if no lifecycle op superseded us (epochs locked across the check+store).
         let mut epochs = self.epochs.lock();
         if *epochs.entry(node.to_string()).or_insert(0) == epoch_before {
-            self.inventories.lock().insert(node.to_string(), inventory.clone());
+            self.inventories
+                .lock()
+                .insert(node.to_string(), inventory.clone());
         }
         Ok(inventory)
     }
@@ -213,14 +220,20 @@ impl HubFleet {
     fn drop_transport_if(&self, node: &str, transport: &Arc<NodeTransport>) {
         let removed = {
             let mut nodes = self.nodes.lock();
-            if nodes.get(node).is_some_and(|cur| Arc::ptr_eq(cur, transport)) {
+            if nodes
+                .get(node)
+                .is_some_and(|cur| Arc::ptr_eq(cur, transport))
+            {
                 nodes.remove(node)
             } else {
                 None
             }
         };
         if let Some(t) = removed {
-            tracing::warn!(node, "higgs: node connection dropped; transport removed (routes kept)");
+            tracing::warn!(
+                node,
+                "higgs: node connection dropped; transport removed (routes kept)"
+            );
             // Close so a wedged-but-open connection's close-watcher wakes and releases its
             // Arc (otherwise it would wait on `closed()` forever).
             t.close();
@@ -277,7 +290,10 @@ impl HubFleet {
     /// Resolve `model` to its `(node, worker)` route or fail with HG002 — the precondition
     /// shared by chat/unload/kill.
     fn require_route(&self, model: &str) -> Result<(NodeKey, WorkerId), HiggsError> {
-        self.resolve(model).ok_or_else(|| HiggsError::ModelNotFound { id: model.to_string() })
+        self.resolve(model)
+            .ok_or_else(|| HiggsError::ModelNotFound {
+                id: model.to_string(),
+            })
     }
 
     /// Remove a route only if it STILL equals `expected` — so a route from a concurrent op
@@ -350,7 +366,9 @@ impl HubFleet {
         self.evict_remote_logs(&route.0, route.1);
         match self.transport(&route.0) {
             Ok(t) => {
-                let res = t.request(M_NODE_UNLOAD, json!({ "worker_id": route.1 .0 })).await;
+                let res = t
+                    .request(M_NODE_UNLOAD, json!({ "worker_id": route.1 .0 }))
+                    .await;
                 // Clear the obligation ONLY if the unload landed (Ok) or the node reports the
                 // worker already gone (HG006/HG007). A real failure (transport hiccup mid-
                 // request) means the worker may still be running, so KEEP it pending so the
@@ -419,14 +437,17 @@ impl HubFleet {
     async fn unload_or_kill(&self, model: &str, method: &str) -> Result<(), HiggsError> {
         let (node, worker) = self.require_route(model)?;
         let transport = self.transport(&node)?;
-        let res = transport.request(method, json!({ "worker_id": worker.0 })).await;
+        let res = transport
+            .request(method, json!({ "worker_id": worker.0 }))
+            .await;
         if res.is_ok() || res.as_ref().err().is_some_and(route_invalidating) {
             // remove_route_if reclaims the log ring + bumps the node's generation.
             self.remove_route_if(model, &(node.clone(), worker));
             // Re-sync the fleet view from the node's authoritative state.
             let _ = self.refresh_inventory(&node).await;
         }
-        res.map(|_| ()).map_err(|e| self.handle_op_error(&node, &transport, e))
+        res.map(|_| ())
+            .map_err(|e| self.handle_op_error(&node, &transport, e))
     }
 
     /// Resolve a model to its `(node, worker)`, if routed.
@@ -466,13 +487,23 @@ impl HubFleet {
         temperature: f32,
         tools_json: Option<String>,
     ) -> Result<
-        (mpsc::UnboundedReceiver<String>, impl std::future::Future<Output = Result<serde_json::Value, HiggsError>> + Send),
+        (
+            mpsc::UnboundedReceiver<String>,
+            impl std::future::Future<Output = Result<serde_json::Value, HiggsError>> + Send,
+        ),
         HiggsError,
     > {
         let (node, worker) = self.require_route(model)?;
         let transport = self.transport(&node)?;
         let (rx, fut) = transport
-            .chat(worker.0, model.to_string(), messages_json, max_tokens, temperature, tools_json)
+            .chat(
+                worker.0,
+                model.to_string(),
+                messages_json,
+                max_tokens,
+                temperature,
+                tools_json,
+            )
             .await
             .map_err(|e| self.handle_op_error(&node, &transport, e))?;
 
@@ -502,9 +533,12 @@ impl HubFleet {
 /// Extract the `worker_id` from a node's `M_NODE_LOAD` reply, validating it is present and
 /// fits a `u32` (the wire type) — a missing or out-of-range value is a protocol fault.
 fn parse_worker_id(reply: &serde_json::Value) -> Result<u32, HiggsError> {
-    let raw = reply.get("worker_id").and_then(serde_json::Value::as_u64).ok_or_else(|| {
-        HiggsError::WorkerDead { context: "node load reply missing worker_id".into() }
-    })?;
+    let raw = reply
+        .get("worker_id")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| HiggsError::WorkerDead {
+            context: "node load reply missing worker_id".into(),
+        })?;
     u32::try_from(raw).map_err(|_| HiggsError::WorkerDead {
         context: format!("node load reply worker_id {raw} out of u32 range"),
     })
@@ -519,7 +553,9 @@ async fn read_remote_logs(conn: Connection, node: NodeId, bus: Arc<LogBus>) {
         tokio::spawn(async move {
             let mut lines = BufReader::new(recv).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                let Ok(RpcFrame::Notification(n)) = rpc::decode(&line) else { continue };
+                let Ok(RpcFrame::Notification(n)) = rpc::decode(&line) else {
+                    continue;
+                };
                 if n.method != N_LOG_LINE {
                     continue;
                 }
@@ -533,7 +569,10 @@ async fn read_remote_logs(conn: Connection, node: NodeId, bus: Arc<LogBus>) {
                 let text = n.params.get("line").and_then(|v| v.as_str());
                 if let (Some(w), Some(t)) = (worker, text) {
                     bus.push(
-                        LogSource::RemoteWorker { node, worker: WorkerId(w) },
+                        LogSource::RemoteWorker {
+                            node,
+                            worker: WorkerId(w),
+                        },
                         t.to_string(),
                     );
                 }
@@ -582,7 +621,10 @@ mod tests {
     async fn chat_relays_to_routed_worker() {
         let (fleet, node_key, model_id, _root) = fleet_with_one_node().await;
         fleet.load(&node_key, &model_id).await.unwrap();
-        let (mut rx, fut) = fleet.chat(&model_id, "[]".into(), 8, 0.0, None).await.unwrap();
+        let (mut rx, fut) = fleet
+            .chat(&model_id, "[]".into(), 8, 0.0, None)
+            .await
+            .unwrap();
         let collector = tokio::spawn(async move {
             let mut got = Vec::new();
             while let Some(d) = rx.recv().await {
@@ -622,7 +664,10 @@ mod tests {
         assert!(fleet.unload("nope/none").await.is_err());
         assert!(fleet.kill("nope/none").await.is_err());
         assert!(fleet.resolve("nope/none").is_none());
-        assert!(fleet.chat("nope/none", "[]".into(), 8, 0.0, None).await.is_err());
+        assert!(fleet
+            .chat("nope/none", "[]".into(), 8, 0.0, None)
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -642,9 +687,14 @@ mod tests {
         let w = fleet.load(&node_key, &model_id).await.unwrap();
 
         // An unload owed to a node that ISN'T connected is recorded as pending (not lost).
-        fleet.best_effort_unload(&("offline-node".to_string(), w)).await;
+        fleet
+            .best_effort_unload(&("offline-node".to_string(), w))
+            .await;
         assert!(
-            fleet.pending_unloads.lock().contains(&("offline-node".to_string(), w)),
+            fleet
+                .pending_unloads
+                .lock()
+                .contains(&("offline-node".to_string(), w)),
             "unload to an offline node is recorded as pending"
         );
 
@@ -653,25 +703,41 @@ mod tests {
         fleet.pending_unloads.lock().insert((node_key.clone(), w));
         fleet.reconcile_pending_unloads(&node_key).await;
         assert!(
-            !fleet.pending_unloads.lock().contains(&(node_key.clone(), w)),
+            !fleet
+                .pending_unloads
+                .lock()
+                .contains(&(node_key.clone(), w)),
             "reconnect drains the owed unload"
         );
 
         // A pending unload for a worker the node NO LONGER has (e.g. it restarted) must also
         // be cleared — the node replies worker-gone (HG007), which counts as reconciled.
         // Otherwise it would leak forever and could later kill a same-id worker after restart.
-        fleet.pending_unloads.lock().insert((node_key.clone(), WorkerId(9999)));
+        fleet
+            .pending_unloads
+            .lock()
+            .insert((node_key.clone(), WorkerId(9999)));
         fleet.reconcile_pending_unloads(&node_key).await;
         assert!(
-            !fleet.pending_unloads.lock().contains(&(node_key.clone(), WorkerId(9999))),
+            !fleet
+                .pending_unloads
+                .lock()
+                .contains(&(node_key.clone(), WorkerId(9999))),
             "worker-gone reply clears the owed unload (not left pending forever)"
         );
 
         // Retiring a node clears anything still owed to it.
         fleet.best_effort_unload(&("gone".to_string(), w)).await;
-        assert!(fleet.pending_unloads.lock().contains(&("gone".to_string(), w)));
+        assert!(fleet
+            .pending_unloads
+            .lock()
+            .contains(&("gone".to_string(), w)));
         fleet.retire("gone");
-        assert!(fleet.pending_unloads.lock().iter().all(|(n, _)| n != "gone"));
+        assert!(fleet
+            .pending_unloads
+            .lock()
+            .iter()
+            .all(|(n, _)| n != "gone"));
     }
 
     #[test]
@@ -679,8 +745,13 @@ mod tests {
         // A remote chat that times out (HG016) is NOT a worker-gone / dead-transport signal:
         // the node may be healthy on a long generation. So it must neither drop the route nor
         // (via handle_op_error, which only acts on WorkerDead) tear down the transport.
-        let timeout = HiggsError::ChatTimeout { elapsed: std::time::Duration::from_secs(600) };
-        assert!(!route_invalidating(&timeout), "chat timeout keeps the route");
+        let timeout = HiggsError::ChatTimeout {
+            elapsed: std::time::Duration::from_secs(600),
+        };
+        assert!(
+            !route_invalidating(&timeout),
+            "chat timeout keeps the route"
+        );
         assert!(
             !matches!(timeout, HiggsError::WorkerDead { .. }),
             "chat timeout is not WorkerDead, so handle_op_error passes it through unchanged"
@@ -694,8 +765,14 @@ mod tests {
         let views = fleet.nodes_view();
         assert_eq!(views.len(), 1, "seeded node appears in the view");
         assert_eq!(views[0].endpoint_id, "endpointA");
-        assert!(!views[0].connected, "seeded node is disconnected (no transport yet)");
-        assert!(views[0].inventory.is_none(), "no inventory until it connects");
+        assert!(
+            !views[0].connected,
+            "seeded node is disconnected (no transport yet)"
+        );
+        assert!(
+            views[0].inventory.is_none(),
+            "no inventory until it connects"
+        );
         assert!(fleet.node_id("endpointA").is_some(), "got a stable NodeId");
     }
 
@@ -711,19 +788,37 @@ mod tests {
         let (fleet, node_key, model_id, _root) = fleet_with_one_node().await;
         // Establish the inventory cache BEFORE any load (mirrors the connect-time fetch).
         let inv = fleet.refresh_inventory(&node_key).await.unwrap();
-        assert!(inv.hardware.cpu_cores > 0, "inventory carries real hardware");
+        assert!(
+            inv.hardware.cpu_cores > 0,
+            "inventory carries real hardware"
+        );
 
         // A hub-driven load refreshes the cached view from the node's authoritative state.
         let w = fleet.load(&node_key, &model_id).await.unwrap();
-        let workers = fleet.nodes_view()[0].inventory.as_ref().unwrap().workers.clone();
+        let workers = fleet.nodes_view()[0]
+            .inventory
+            .as_ref()
+            .unwrap()
+            .workers
+            .clone();
         assert!(
-            workers.iter().any(|x| x.worker_id == w.0 && x.model == model_id),
+            workers
+                .iter()
+                .any(|x| x.worker_id == w.0 && x.model == model_id),
             "load refreshes the cached inventory: {workers:?}"
         );
         // Unload refreshes it back out.
         fleet.unload(&model_id).await.unwrap();
-        let workers = fleet.nodes_view()[0].inventory.as_ref().unwrap().workers.clone();
-        assert!(workers.iter().all(|x| x.worker_id != w.0), "unload removes it from the view");
+        let workers = fleet.nodes_view()[0]
+            .inventory
+            .as_ref()
+            .unwrap()
+            .workers
+            .clone();
+        assert!(
+            workers.iter().all(|x| x.worker_id != w.0),
+            "unload removes it from the view"
+        );
 
         let views = fleet.nodes_view();
         assert_eq!(views.len(), 1, "one node in the fleet view");
@@ -737,7 +832,10 @@ mod tests {
         let views = fleet.nodes_view();
         assert_eq!(views.len(), 1, "retired node keeps its durable id slot");
         assert!(!views[0].connected, "retired node is disconnected");
-        assert!(views[0].inventory.is_none(), "retire clears the cached inventory");
+        assert!(
+            views[0].inventory.is_none(),
+            "retire clears the cached inventory"
+        );
     }
 
     #[tokio::test]
@@ -747,6 +845,9 @@ mod tests {
         fleet.retire(&node_key);
         assert!(fleet.node_ids().is_empty());
         assert!(!fleet.is_remote(&model_id));
-        assert!(fleet.chat(&model_id, "[]".into(), 8, 0.0, None).await.is_err());
+        assert!(fleet
+            .chat(&model_id, "[]".into(), 8, 0.0, None)
+            .await
+            .is_err());
     }
 }

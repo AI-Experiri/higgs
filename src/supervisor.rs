@@ -2016,14 +2016,11 @@ mod tests {
         let sup_read_cell = Arc::new(Mutex::new(Some(sup_read)));
         let sup = Supervisor::with_factory(Box::new(move |_ring, _model| {
             Ok(WorkerHalves {
-                write: Box::new(
-                    sup_write_cell
-                        .lock()
-                        .take()
-                        .ok_or_else(|| HiggsError::WorkerSpawnFailed {
-                            source: std::io::Error::other("mock: no more write halves"),
-                        })?,
-                ),
+                write: Box::new(sup_write_cell.lock().take().ok_or_else(|| {
+                    HiggsError::WorkerSpawnFailed {
+                        source: std::io::Error::other("mock: no more write halves"),
+                    }
+                })?),
                 read: Box::new(sup_read_cell.lock().take().ok_or_else(|| {
                     HiggsError::WorkerSpawnFailed {
                         source: std::io::Error::other("mock: no more read halves"),
@@ -2089,7 +2086,10 @@ mod tests {
         let id2 = read_request_id(&mut test_read).await;
         write_line(
             &mut test_write,
-            &ok_response(id2, json!({"loadable": false, "reason": "arch unsupported"})),
+            &ok_response(
+                id2,
+                json!({"loadable": false, "reason": "arch unsupported"}),
+            ),
         )
         .await;
 
@@ -2134,7 +2134,11 @@ mod tests {
         write_line(&mut test_write, "").await;
         write_line(&mut test_write, &chunk_notif(999, "noise")).await;
         // A response for a DIFFERENT id is also skipped (Ok(_) arm).
-        write_line(&mut test_write, &ok_response(id + 7, json!({"loadable": true}))).await;
+        write_line(
+            &mut test_write,
+            &ok_response(id + 7, json!({"loadable": true})),
+        )
+        .await;
         write_line(
             &mut test_write,
             &ok_response(id, json!({"loadable": true, "engine_version": "vX"})),
@@ -2159,7 +2163,10 @@ mod tests {
         let out = probe.await.expect("probe task");
         let (loadable, reason, ev) = &out[0].1;
         assert!(!loadable);
-        assert!(reason.as_deref().unwrap().contains("exited before replying"));
+        assert!(reason
+            .as_deref()
+            .unwrap()
+            .contains("exited before replying"));
         assert!(ev.is_empty());
     }
 
@@ -2173,7 +2180,10 @@ mod tests {
             .await;
         assert_eq!(out.len(), 2);
         for (path, (loadable, reason, ev)) in &out {
-            assert!(!loadable, "path {path} must be non-loadable on spawn failure");
+            assert!(
+                !loadable,
+                "path {path} must be non-loadable on spawn failure"
+            );
             assert!(reason.as_deref().unwrap().contains("spawn failed"));
             assert!(ev.is_empty());
         }
@@ -2306,9 +2316,16 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         // Fail the pending request (what on_worker_death does on death) →
         // dropping its sender closes the oneshot, so rx.await returns Err.
-        assert_eq!(sup.inner.demux.pending_count(), 1, "exactly one pending request");
+        assert_eq!(
+            sup.inner.demux.pending_count(),
+            1,
+            "exactly one pending request"
+        );
         sup.inner.demux.fail_all_pending();
-        let err = task.await.expect("task").expect_err("worker died before response");
+        let err = task
+            .await
+            .expect("task")
+            .expect_err("worker died before response");
         assert!(
             err.to_string().contains("worker died before response"),
             "display: {err}"
@@ -2323,7 +2340,11 @@ mod tests {
         let sup = failing_supervisor();
         let err = sup.request("higgs/status", json!({})).await.unwrap_err();
         assert!(err.to_string().contains("[HG007]"), "display: {err}");
-        assert_eq!(sup.inner.demux.pending_count(), 0, "pending must be cleaned");
+        assert_eq!(
+            sup.inner.demux.pending_count(),
+            0,
+            "pending must be cleaned"
+        );
     }
 
     // ─── do_spawn(): factory failure surfaces the error, running flag released ─
@@ -2332,7 +2353,10 @@ mod tests {
     async fn start_for_spawn_failure_releases_running() {
         let sup = failing_supervisor();
         let err = sup.start_for("org/model").expect_err("spawn must fail");
-        assert!(matches!(err, HiggsError::WorkerSpawnFailed { .. }), "got {err}");
+        assert!(
+            matches!(err, HiggsError::WorkerSpawnFailed { .. }),
+            "got {err}"
+        );
         // running was released, so a later start can retry (and also fail).
         assert!(!sup.inner.running.load(Ordering::Relaxed));
         assert!(sup.start_for("org/model").is_err(), "retry also fails");
@@ -2473,7 +2497,11 @@ mod tests {
         // The replayed M_LOAD is written to the (live) worker transport; reply
         // with an error so replay_load_await returns Err.
         let load_id = read_request_id(&mut test_read).await;
-        write_line(&mut test_write, &err_response(load_id, -32000, "load failed")).await;
+        write_line(
+            &mut test_write,
+            &err_response(load_id, -32000, "load failed"),
+        )
+        .await;
 
         // No ModelLoaded must arrive within a short window.
         let got = tokio::time::timeout(std::time::Duration::from_millis(150), async {
@@ -2628,8 +2656,7 @@ mod tests {
         drop(test_write);
 
         // No WorkerDied event must arrive (deliberate stop is silent).
-        let got =
-            tokio::time::timeout(std::time::Duration::from_millis(300), events.recv()).await;
+        let got = tokio::time::timeout(std::time::Duration::from_millis(300), events.recv()).await;
         assert!(got.is_err(), "deliberate EOF must not broadcast WorkerDied");
         // running released by the post-loop clear.
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -2772,7 +2799,10 @@ mod tests {
         // Give `true` a moment to exit so wait() returns via the clean arm.
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         sup.stop().await;
-        assert!(sup.inner.proc.lock().await.is_none(), "child reaped by stop");
+        assert!(
+            sup.inner.proc.lock().await.is_none(),
+            "child reaped by stop"
+        );
         assert!(!sup.inner.running.load(Ordering::Relaxed));
     }
 }

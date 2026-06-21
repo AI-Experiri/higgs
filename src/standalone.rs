@@ -98,7 +98,10 @@ pub async fn run_standalone(
                 let hub = Arc::new(hub);
                 higgs.set_fleet(hub.fleet.clone());
                 higgs.set_hub(hub.clone());
-                tracing::info!(hub_id = hub.hub_id(), "higgs: HUB mode — accepting node dials");
+                tracing::info!(
+                    hub_id = hub.hub_id(),
+                    "higgs: HUB mode — accepting node dials"
+                );
                 Some(hub)
             }
             Err(e) => return Err(Box::new(e)),
@@ -184,7 +187,9 @@ mod tests {
         // no-token `/api/higgs/status` poll below. Serialize with other env-mutating tests
         // (shared lock) and RESTORE the prior value at the end so nothing leaks. The lock +
         // `home` TempDir are held for the whole test.
-        let _env = crate::TEST_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = tempfile::tempdir().unwrap();
         let prev_home = std::env::var_os("HIGGS_HOME");
         // SAFETY: serialized by TEST_ENV_LOCK; restored before the lock releases.

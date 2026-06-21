@@ -364,8 +364,10 @@ pub(super) async fn v1_chat_completions(
         // pass the gate so it logs only when verbose is on.
         let model = req.model.clone();
         // OpenAI `stream_options: { include_usage: true }` → emit a terminal usage chunk.
-        let include_usage =
-            req.stream_options.as_ref().is_some_and(|o| o.include_usage == Some(true));
+        let include_usage = req
+            .stream_options
+            .as_ref()
+            .is_some_and(|o| o.include_usage == Some(true));
         stream::chat_sse(
             chatcmpl_id(),
             model,

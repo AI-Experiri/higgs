@@ -26,7 +26,10 @@ pub struct WorkerRegistry<T> {
 
 impl<T> WorkerRegistry<T> {
     pub fn new() -> Self {
-        Self { next: 1, map: HashMap::new() }
+        Self {
+            next: 1,
+            map: HashMap::new(),
+        }
     }
 
     /// Assign the next id and store `value`; returns the new id.

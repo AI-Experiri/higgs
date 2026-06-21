@@ -33,7 +33,10 @@ pub struct NodeTransport {
 
 impl NodeTransport {
     pub fn new(conn: Connection) -> Self {
-        Self { conn, next_id: AtomicU64::new(1) }
+        Self {
+            conn,
+            next_id: AtomicU64::new(1),
+        }
     }
 
     fn alloc_id(&self) -> u64 {
@@ -62,8 +65,15 @@ impl NodeTransport {
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, HiggsError> {
         let id = self.alloc_id();
         let (mut send, recv) = self.conn.open_bi().await.map_err(transport_dead)?;
-        let req = RpcRequest { jsonrpc: "2.0".into(), id, method: method.into(), params };
-        write_frame(&mut send, &RpcFrame::Request(req)).await.map_err(transport_dead)?;
+        let req = RpcRequest {
+            jsonrpc: "2.0".into(),
+            id,
+            method: method.into(),
+            params,
+        };
+        write_frame(&mut send, &RpcFrame::Request(req))
+            .await
+            .map_err(transport_dead)?;
         let _ = send.finish();
         let mut lines = BufReader::new(recv).lines();
         let line = match tokio::time::timeout(CONTROL_RPC_TIMEOUT, lines.next_line()).await {
@@ -105,8 +115,15 @@ impl NodeTransport {
         if let (Some(obj), Some(t)) = (params.as_object_mut(), tools_json) {
             obj.insert("tools".into(), Value::String(t));
         }
-        let req = RpcRequest { jsonrpc: "2.0".into(), id, method: M_CHAT.into(), params };
-        write_frame(&mut send, &RpcFrame::Request(req)).await.map_err(transport_dead)?;
+        let req = RpcRequest {
+            jsonrpc: "2.0".into(),
+            id,
+            method: M_CHAT.into(),
+            params,
+        };
+        write_frame(&mut send, &RpcFrame::Request(req))
+            .await
+            .map_err(transport_dead)?;
         let _ = send.finish();
 
         let (tx, rx) = mpsc::unbounded_channel();
@@ -121,14 +138,19 @@ impl NodeTransport {
                                 .map_err(|e| transport_dead(e.to_string()))?
                             {
                                 RpcFrame::Notification(n) if n.method == N_CHAT_CHUNK => {
-                                    if let Some(d) = n.params.get("delta").and_then(|v| v.as_str()) {
+                                    if let Some(d) = n.params.get("delta").and_then(|v| v.as_str())
+                                    {
                                         let _ = tx.send(d.to_string());
                                     }
                                 }
                                 RpcFrame::Response(resp) => break extract_result(M_CHAT, resp),
                                 _ => {}
                             },
-                            None => break Err(transport_dead("node closed the chat stream before final")),
+                            None => {
+                                break Err(transport_dead(
+                                    "node closed the chat stream before final",
+                                ))
+                            }
                         }
                     }
                 };
@@ -139,7 +161,9 @@ impl NodeTransport {
                 // for `WorkerDead`). HG016 is also what the local chat path surfaces.
                 match tokio::time::timeout(CHAT_RPC_TIMEOUT, read).await {
                     Ok(result) => result,
-                    Err(_) => Err(HiggsError::ChatTimeout { elapsed: CHAT_RPC_TIMEOUT }),
+                    Err(_) => Err(HiggsError::ChatTimeout {
+                        elapsed: CHAT_RPC_TIMEOUT,
+                    }),
                 }
             }),
         };
@@ -183,7 +207,9 @@ fn extract_result(method: &str, resp: RpcResponse) -> Result<Value, HiggsError> 
 
 #[allow(clippy::needless_pass_by_value)] // by-value is ergonomic for the varied callers
 fn transport_dead(detail: impl ToString) -> HiggsError {
-    HiggsError::WorkerDead { context: format!("node transport: {}", detail.to_string()) }
+    HiggsError::WorkerDead {
+        context: format!("node transport: {}", detail.to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -218,9 +244,15 @@ mod tests {
     #[tokio::test]
     async fn control_request_roundtrips() {
         let (t, model_id, _root) = paired_transport().await;
-        let loaded = t.request(M_NODE_LOAD, json!({ "id": model_id })).await.unwrap();
+        let loaded = t
+            .request(M_NODE_LOAD, json!({ "id": model_id }))
+            .await
+            .unwrap();
         let worker_id = loaded["worker_id"].as_u64().unwrap();
-        let status = t.request(M_NODE_STATUS, json!({ "worker_id": worker_id })).await.unwrap();
+        let status = t
+            .request(M_NODE_STATUS, json!({ "worker_id": worker_id }))
+            .await
+            .unwrap();
         assert!(status.get("loaded").is_some());
         let sys = t.request(M_NODE_SYSINFO, json!({})).await.unwrap();
         assert!(sys["hardware"]["cpu_cores"].as_u64().unwrap() > 0);
@@ -231,9 +263,14 @@ mod tests {
         // Loading an id with no on-disk model → node replies HG002, surfaced as WorkerRpc
         // carrying the origin code (extract_result mapping).
         let (t, _model_id, _root) = paired_transport().await;
-        let err = t.request(M_NODE_LOAD, json!({ "id": "missing/model" })).await.unwrap_err();
+        let err = t
+            .request(M_NODE_LOAD, json!({ "id": "missing/model" }))
+            .await
+            .unwrap_err();
         match err {
-            HiggsError::WorkerRpc { worker_code, .. } => assert_eq!(worker_code.as_deref(), Some("HG002")),
+            HiggsError::WorkerRpc { worker_code, .. } => {
+                assert_eq!(worker_code.as_deref(), Some("HG002"))
+            }
             other => panic!("expected WorkerRpc, got {other}"),
         }
     }
@@ -243,17 +280,22 @@ mod tests {
         // Chat to a worker id that doesn't exist → the node's relay reports it; the chat
         // future resolves to an error rather than streaming.
         let (t, _model_id, _root) = paired_transport().await;
-        let (_rx, fut) = t.chat(999, "m".into(), "[]".into(), 8, 0.0, None).await.unwrap();
+        let (_rx, fut) = t
+            .chat(999, "m".into(), "[]".into(), 8, 0.0, None)
+            .await
+            .unwrap();
         assert!(fut.await.is_err(), "unknown worker → chat error");
     }
 
     #[tokio::test]
     async fn chat_streams_chunks_then_final() {
         let (t, model_id, _root) = paired_transport().await;
-        let worker_id =
-            t.request(M_NODE_LOAD, json!({ "id": model_id })).await.unwrap()["worker_id"]
-                .as_u64()
-                .unwrap() as u32;
+        let worker_id = t
+            .request(M_NODE_LOAD, json!({ "id": model_id }))
+            .await
+            .unwrap()["worker_id"]
+            .as_u64()
+            .unwrap() as u32;
         let (mut rx, fut) = t
             .chat(worker_id, "higgs-test/m".into(), "[]".into(), 8, 0.0, None)
             .await

@@ -30,7 +30,10 @@ pub struct NodeIdAllocator {
 
 impl NodeIdAllocator {
     pub fn new() -> Self {
-        Self { next: 1, by_endpoint: HashMap::new() }
+        Self {
+            next: 1,
+            by_endpoint: HashMap::new(),
+        }
     }
 
     /// The id for `endpoint_id`, assigning a fresh one on first sight.
@@ -52,8 +55,11 @@ impl NodeIdAllocator {
     /// Every `(endpoint_id, NodeId)` assigned so far, ascending by id — the set of nodes the
     /// hub has ever admitted (connected or not), for the fleet view.
     pub fn all(&self) -> Vec<(String, NodeId)> {
-        let mut v: Vec<_> =
-            self.by_endpoint.iter().map(|(e, id)| (e.clone(), *id)).collect();
+        let mut v: Vec<_> = self
+            .by_endpoint
+            .iter()
+            .map(|(e, id)| (e.clone(), *id))
+            .collect();
         v.sort_by_key(|(_, id)| id.0);
         v
     }

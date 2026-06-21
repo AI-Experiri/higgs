@@ -31,7 +31,14 @@ pub(crate) async fn relay_chat(
     let params: NodeChatParams = match serde_json::from_value(req.params) {
         Ok(p) => p,
         Err(e) => {
-            reply_err(send, req.id, -32602, format!("invalid chat params: {e}"), None).await;
+            reply_err(
+                send,
+                req.id,
+                -32602,
+                format!("invalid chat params: {e}"),
+                None,
+            )
+            .await;
             return;
         }
     };
@@ -122,7 +129,14 @@ async fn pull_stream<F: crate::download::Fetcher + Send + Sync + 'static>(
     let params: crate::remote::NodePullParams = match serde_json::from_value(req.params) {
         Ok(p) => p,
         Err(e) => {
-            reply_err(send, req.id, -32602, format!("invalid pull params: {e}"), None).await;
+            reply_err(
+                send,
+                req.id,
+                -32602,
+                format!("invalid pull params: {e}"),
+                None,
+            )
+            .await;
             return;
         }
     };
@@ -168,7 +182,10 @@ async fn pull_stream<F: crate::download::Fetcher + Send + Sync + 'static>(
     };
     // Flush any progress buffered before the final resolved.
     while let Ok((downloaded, total)) = prog_rx.try_recv() {
-        if write_progress(send, request_id, downloaded, total).await.is_err() {
+        if write_progress(send, request_id, downloaded, total)
+            .await
+            .is_err()
+        {
             return;
         }
     }
@@ -186,7 +203,11 @@ async fn write_notification(
     method: &str,
     params: serde_json::Value,
 ) -> std::io::Result<()> {
-    let note = RpcNotification { jsonrpc: "2.0".into(), method: method.into(), params };
+    let note = RpcNotification {
+        jsonrpc: "2.0".into(),
+        method: method.into(),
+        params,
+    };
     write_frame(send, &RpcFrame::Notification(note)).await
 }
 
@@ -203,12 +224,22 @@ async fn write_progress(
 
 /// Write one `N_CHAT_CHUNK` notification carrying the hub's `request_id` + delta.
 async fn write_chunk(send: &mut SendStream, request_id: u64, delta: &str) -> std::io::Result<()> {
-    write_notification(send, N_CHAT_CHUNK, json!({ "request_id": request_id, "delta": delta })).await
+    write_notification(
+        send,
+        N_CHAT_CHUNK,
+        json!({ "request_id": request_id, "delta": delta }),
+    )
+    .await
 }
 
 /// Write a successful `result` response for request `id`.
 async fn reply_ok(send: &mut SendStream, id: u64, result: serde_json::Value) {
-    let resp = RpcResponse { jsonrpc: "2.0".into(), id, result: Some(result), error: None };
+    let resp = RpcResponse {
+        jsonrpc: "2.0".into(),
+        id,
+        result: Some(result),
+        error: None,
+    };
     let _ = write_frame(send, &RpcFrame::Response(resp)).await;
 }
 
@@ -223,7 +254,11 @@ async fn reply_err(
         jsonrpc: "2.0".into(),
         id,
         result: None,
-        error: Some(RpcError { code, message, data }),
+        error: Some(RpcError {
+            code,
+            message,
+            data,
+        }),
     };
     let _ = write_frame(send, &RpcFrame::Response(resp)).await;
 }
@@ -272,7 +307,9 @@ mod tests {
             let (mut send, recv) = conn.accept_bi().await.unwrap();
             let mut lines = BufReader::new(recv).lines();
             let line = lines.next_line().await.unwrap().unwrap();
-            let RpcFrame::Request(req) = rpc::decode(&line).unwrap() else { panic!("want request") };
+            let RpcFrame::Request(req) = rpc::decode(&line).unwrap() else {
+                panic!("want request")
+            };
             pull_stream(&conn, &mut send, req, FakeFetcher, root).await;
             let _ = send.finish();
             // keep conn alive until the hub reads
@@ -287,7 +324,9 @@ mod tests {
             method: M_NODE_PULL.into(),
             params: json!({ "request_id": 1, "repo": "org/m", "file": "x.gguf" }),
         };
-        send.write_all(format!("{}\n", rpc::encode(&RpcFrame::Request(req))).as_bytes()).await.unwrap();
+        send.write_all(format!("{}\n", rpc::encode(&RpcFrame::Request(req))).as_bytes())
+            .await
+            .unwrap();
         send.finish().unwrap();
 
         let mut lines = BufReader::new(recv).lines();
@@ -302,8 +341,15 @@ mod tests {
         };
         assert!(progress >= 1, "at least one N_PROGRESS");
         assert!(final_resp.error.is_none(), "pull ok: {final_resp:?}");
-        let path = final_resp.result.unwrap()["path"].as_str().unwrap().to_string();
-        assert_eq!(std::fs::read(&path).unwrap(), b"hello", "downloaded bytes written");
+        let path = final_resp.result.unwrap()["path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"hello",
+            "downloaded bytes written"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -318,7 +364,9 @@ mod tests {
             let (mut send, recv) = conn.accept_bi().await.unwrap();
             let mut lines = BufReader::new(recv).lines();
             let line = lines.next_line().await.unwrap().unwrap();
-            let RpcFrame::Request(req) = rpc::decode(&line).unwrap() else { panic!() };
+            let RpcFrame::Request(req) = rpc::decode(&line).unwrap() else {
+                panic!()
+            };
             pull_stream(&conn, &mut send, req, FakeFetcher, root).await;
             let _ = send.finish();
             let _ = conn.closed().await;
@@ -326,12 +374,21 @@ mod tests {
         let conn = hub.connect(node_addr, ALPN).await.unwrap();
         let (mut send, recv) = conn.open_bi().await.unwrap();
         // Missing required fields → invalid params.
-        let req = RpcRequest { jsonrpc: "2.0".into(), id: 9, method: M_NODE_PULL.into(), params: json!({}) };
-        send.write_all(format!("{}\n", rpc::encode(&RpcFrame::Request(req))).as_bytes()).await.unwrap();
+        let req = RpcRequest {
+            jsonrpc: "2.0".into(),
+            id: 9,
+            method: M_NODE_PULL.into(),
+            params: json!({}),
+        };
+        send.write_all(format!("{}\n", rpc::encode(&RpcFrame::Request(req))).as_bytes())
+            .await
+            .unwrap();
         send.finish().unwrap();
         let mut lines = BufReader::new(recv).lines();
         let line = lines.next_line().await.unwrap().unwrap();
-        let RpcFrame::Response(r) = rpc::decode(&line).unwrap() else { panic!() };
+        let RpcFrame::Response(r) = rpc::decode(&line).unwrap() else {
+            panic!()
+        };
         assert_eq!(r.error.unwrap().code, -32602, "invalid params");
     }
 }

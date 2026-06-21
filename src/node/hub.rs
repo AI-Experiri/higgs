@@ -25,7 +25,10 @@ use crate::node::{gate_admit, gate_read_hello, GateOutcome, HELLO_DEADLINE};
 const TOKEN_TTL_MS: u64 = 10 * 60 * 1000;
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 /// A running hub: its endpoint, fleet, and the shared allowlist + token store the accept loop
@@ -64,7 +67,10 @@ pub async fn start_hub(bus: Arc<LogBus>) -> std::io::Result<Hub> {
     // Wait (bounded) for a home relay so tickets minted by the pairing API carry a relay URL
     // and are dialable from outside the hub's LAN (mirrors `link pair`). On a relay-less /
     // local setup this times out and we proceed with whatever direct addresses we have.
-    if tokio::time::timeout(std::time::Duration::from_secs(10), endpoint.online()).await.is_err() {
+    if tokio::time::timeout(std::time::Duration::from_secs(10), endpoint.online())
+        .await
+        .is_err()
+    {
         tracing::warn!(
             "higgs hub: no relay connected yet — pairing tickets may only be dialable on the LAN"
         );
@@ -181,8 +187,9 @@ mod tests {
 
         // Node dials with the one-time token + completes HELLO (admitted + allowlisted).
         let self_id = node_ep.id().to_string();
-        let (_conn, result) =
-            connect_node(&node_ep, hub_addr, self_id.clone(), Some(token)).await.unwrap();
+        let (_conn, result) = connect_node(&node_ep, hub_addr, self_id.clone(), Some(token))
+            .await
+            .unwrap();
         assert_eq!(result.role, "hub");
 
         // The accept loop registers the node in the fleet (poll briefly for the async add).
@@ -204,7 +211,9 @@ mod tests {
         let ep = local_endpoint().await;
         let hub = Hub {
             hub_id: ep.id().to_string(),
-            allow: Arc::new(Mutex::new(Allowlist::load(&home.path().join("p.json")).unwrap())),
+            allow: Arc::new(Mutex::new(
+                Allowlist::load(&home.path().join("p.json")).unwrap(),
+            )),
             tokens: Arc::new(Mutex::new(PairingTokens::new())),
             endpoint: ep,
             fleet: Arc::new(HubFleet::new(Arc::new(LogBus::new()))),

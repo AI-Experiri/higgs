@@ -41,7 +41,13 @@ async fn valid_token_pairs() {
         let incoming = hub.accept().await.expect("incoming");
         let conn = incoming.await.expect("conn");
         let out = gate_connection(
-            &conn, &mut allow, &mut tokens, 2_000, hub_id, Some("studio".into()), HELLO_DEADLINE,
+            &conn,
+            &mut allow,
+            &mut tokens,
+            2_000,
+            hub_id,
+            Some("studio".into()),
+            HELLO_DEADLINE,
         )
         .await;
         // keep conn alive until the node has read its reply
@@ -72,7 +78,16 @@ async fn stranger_without_token_is_rejected_hg024() {
     let hub_task = tokio::spawn(async move {
         let incoming = hub.accept().await.expect("incoming");
         let conn = incoming.await.expect("conn");
-        gate_connection(&conn, &mut allow, &mut tokens, 2_000, hub_id, None, HELLO_DEADLINE).await
+        gate_connection(
+            &conn,
+            &mut allow,
+            &mut tokens,
+            2_000,
+            hub_id,
+            None,
+            HELLO_DEADLINE,
+        )
+        .await
     });
 
     let node_id = node.id().to_string();
@@ -127,13 +142,25 @@ async fn spoofed_node_id_is_rejected() {
     let hub_task = tokio::spawn(async move {
         let incoming = hub.accept().await.expect("incoming");
         let conn = incoming.await.expect("conn");
-        gate_connection(&conn, &mut allow, &mut tokens, 2_000, hub_id, None, HELLO_DEADLINE).await
+        gate_connection(
+            &conn,
+            &mut allow,
+            &mut tokens,
+            2_000,
+            hub_id,
+            None,
+            HELLO_DEADLINE,
+        )
+        .await
     });
 
     // Lie about our identity: pass a bogus self_id that won't match remote_id().
     let res = dial_and_hello(&node, hub_addr, "deadbeef-not-my-id".into(), Some(tok)).await;
     assert!(res.is_err(), "spoofed node_id must be rejected");
-    assert_eq!(hub_task.await.unwrap(), GateOutcome::Rejected { code: "HG024" });
+    assert_eq!(
+        hub_task.await.unwrap(),
+        GateOutcome::Rejected { code: "HG024" }
+    );
 }
 
 #[tokio::test]
@@ -157,15 +184,33 @@ async fn allowlisted_node_reconnects_without_token() {
     let hub_task = tokio::spawn(async move {
         let incoming = hub.accept().await.expect("incoming");
         let conn = incoming.await.expect("conn");
-        let out = gate_connection(&conn, &mut allow, &mut tokens, 2_000, hub_id, None, HELLO_DEADLINE).await;
+        let out = gate_connection(
+            &conn,
+            &mut allow,
+            &mut tokens,
+            2_000,
+            hub_id,
+            None,
+            HELLO_DEADLINE,
+        )
+        .await;
         tokio::time::sleep(Duration::from_millis(100)).await;
         out
     });
 
     // Pre-allowlisted node reconnects with NO token — pure allowlist membership.
-    let res = dial_and_hello(&node, hub_addr, node_id, None).await.expect("admitted");
+    let res = dial_and_hello(&node, hub_addr, node_id, None)
+        .await
+        .expect("admitted");
     assert_eq!(res.agreed_version, 1);
-    assert_eq!(res.assigned_label.as_deref(), Some("known"), "persisted label returned");
-    assert_eq!(hub_task.await.unwrap(), GateOutcome::Admitted { agreed_version: 1 });
+    assert_eq!(
+        res.assigned_label.as_deref(),
+        Some("known"),
+        "persisted label returned"
+    );
+    assert_eq!(
+        hub_task.await.unwrap(),
+        GateOutcome::Admitted { agreed_version: 1 }
+    );
     let _ = std::fs::remove_file(&path);
 }

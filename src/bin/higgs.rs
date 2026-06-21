@@ -105,7 +105,9 @@ fn main() {
     if let Ok(dir) = std::env::var("HIGGS_MODEL_DIR") {
         if !dir.is_empty() {
             tracing::info!(dir = %dir, "higgs: adding HIGGS_MODEL_DIR to LM-Studio scan roots");
-            higgs_config.lmstudio_dirs.push(std::path::PathBuf::from(dir));
+            higgs_config
+                .lmstudio_dirs
+                .push(std::path::PathBuf::from(dir));
         }
     }
 

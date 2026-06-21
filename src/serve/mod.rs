@@ -174,7 +174,10 @@ pub fn router(higgs: Arc<Higgs>) -> Router {
         .route("/api/higgs/system", get(control::control_system))
         .route("/api/higgs/nodes", get(control::control_nodes))
         .route("/api/higgs/nodes/load", post(control::control_nodes_load))
-        .route("/api/higgs/nodes/unload", post(control::control_nodes_unload))
+        .route(
+            "/api/higgs/nodes/unload",
+            post(control::control_nodes_unload),
+        )
         .route("/api/higgs/pair", post(control::control_pair))
         .route("/api/higgs/logs", get(control::control_logs))
         .route(
@@ -266,8 +269,13 @@ fn required_scope(method: &Method, path: &str) -> Option<crate::keys::Scope> {
 
 /// Extract the bearer token from an `Authorization: Bearer <token>` header.
 fn bearer_token(headers: &HeaderMap) -> Option<String> {
-    let v = headers.get(axum::http::header::AUTHORIZATION)?.to_str().ok()?;
-    v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")).map(|t| t.trim().to_string())
+    let v = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
+    v.strip_prefix("Bearer ")
+        .or_else(|| v.strip_prefix("bearer "))
+        .map(|t| t.trim().to_string())
 }
 
 /// The `401` envelope (OpenAI-style `error` object) for a missing/insufficient key.
@@ -392,8 +400,7 @@ fn is_local_origin(origin: &HeaderValue) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        bearer_token, host_allowed, http_status, is_local_origin, is_loopback_host,
-        required_scope,
+        bearer_token, host_allowed, http_status, is_local_origin, is_loopback_host, required_scope,
     };
     use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 
@@ -404,14 +411,35 @@ mod tests {
     fn required_scope_maps_routes() {
         assert_eq!(required_scope(&Method::GET, "/health"), None);
         assert_eq!(required_scope(&Method::GET, "/api/higgs/health"), None);
-        assert_eq!(required_scope(&Method::POST, "/v1/chat/completions"), Some(Scope::Chat));
-        assert_eq!(required_scope(&Method::GET, "/v1/models"), Some(Scope::Models));
-        assert_eq!(required_scope(&Method::GET, "/api/higgs/models"), Some(Scope::Models));
-        assert_eq!(required_scope(&Method::GET, "/api/higgs/models/org/m"), Some(Scope::Models));
+        assert_eq!(
+            required_scope(&Method::POST, "/v1/chat/completions"),
+            Some(Scope::Chat)
+        );
+        assert_eq!(
+            required_scope(&Method::GET, "/v1/models"),
+            Some(Scope::Models)
+        );
+        assert_eq!(
+            required_scope(&Method::GET, "/api/higgs/models"),
+            Some(Scope::Models)
+        );
+        assert_eq!(
+            required_scope(&Method::GET, "/api/higgs/models/org/m"),
+            Some(Scope::Models)
+        );
         // mutations + management → Admin
-        assert_eq!(required_scope(&Method::POST, "/api/higgs/models/load"), Some(Scope::Admin));
-        assert_eq!(required_scope(&Method::GET, "/api/higgs/nodes"), Some(Scope::Admin));
-        assert_eq!(required_scope(&Method::POST, "/api/higgs/models"), Some(Scope::Admin));
+        assert_eq!(
+            required_scope(&Method::POST, "/api/higgs/models/load"),
+            Some(Scope::Admin)
+        );
+        assert_eq!(
+            required_scope(&Method::GET, "/api/higgs/nodes"),
+            Some(Scope::Admin)
+        );
+        assert_eq!(
+            required_scope(&Method::POST, "/api/higgs/models"),
+            Some(Scope::Admin)
+        );
         // unknown path → open (routing 404s it)
         assert_eq!(required_scope(&Method::GET, "/random"), None);
     }
@@ -420,11 +448,20 @@ mod tests {
     fn bearer_token_parses_authorization_header() {
         let mut h = HeaderMap::new();
         assert_eq!(bearer_token(&h), None);
-        h.insert(axum::http::header::AUTHORIZATION, HeaderValue::from_static("Bearer hgk_abc"));
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer hgk_abc"),
+        );
         assert_eq!(bearer_token(&h).as_deref(), Some("hgk_abc"));
-        h.insert(axum::http::header::AUTHORIZATION, HeaderValue::from_static("bearer hgk_xyz"));
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("bearer hgk_xyz"),
+        );
         assert_eq!(bearer_token(&h).as_deref(), Some("hgk_xyz"));
-        h.insert(axum::http::header::AUTHORIZATION, HeaderValue::from_static("Basic zzz"));
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Basic zzz"),
+        );
         assert_eq!(bearer_token(&h), None);
     }
 

@@ -258,7 +258,10 @@ mod tests {
     fn negotiate_fails_with_no_overlap() {
         assert_eq!(
             negotiate_version(&[2], 2, &[1], 1),
-            Err(VersionMismatch { peer: vec![2], ours: vec![1] })
+            Err(VersionMismatch {
+                peer: vec![2],
+                ours: vec![1]
+            })
         );
     }
 
@@ -267,7 +270,10 @@ mod tests {
         // agreed would be 1, but the peer refuses anything below 2.
         assert_eq!(
             negotiate_version(&[1, 2], 2, &[1], 1),
-            Err(VersionMismatch { peer: vec![1, 2], ours: vec![1] })
+            Err(VersionMismatch {
+                peer: vec![1, 2],
+                ours: vec![1]
+            })
         );
     }
 
@@ -290,7 +296,10 @@ mod tests {
         let back: HelloParams = serde_json::from_str(&s).unwrap();
         assert_eq!(back.node_id, "z32id");
         assert_eq!(back.pairing_token.as_deref(), Some("htk_abc"));
-        assert_eq!(back.capabilities.get("chat"), Some(&serde_json::Value::Bool(true)));
+        assert_eq!(
+            back.capabilities.get("chat"),
+            Some(&serde_json::Value::Bool(true))
+        );
     }
 
     #[test]
@@ -298,7 +307,10 @@ mod tests {
         let mut p = sample_params();
         p.pairing_token = None;
         let s = serde_json::to_string(&p).unwrap();
-        assert!(!s.contains("pairing_token"), "absent token must not serialize");
+        assert!(
+            !s.contains("pairing_token"),
+            "absent token must not serialize"
+        );
     }
 
     #[test]
@@ -343,7 +355,10 @@ mod tests {
 
     #[test]
     fn node_load_result_carries_worker_id_and_loaded() {
-        let r = NodeLoadResult { worker_id: 3, loaded: serde_json::json!({"id":"m"}) };
+        let r = NodeLoadResult {
+            worker_id: 3,
+            loaded: serde_json::json!({"id":"m"}),
+        };
         let back: NodeLoadResult =
             serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert_eq!(back.worker_id, 3);
@@ -363,6 +378,9 @@ mod tests {
             "min_supported":1,"software_version":"9.9.9",
             "capabilities":{"telepathy":true,"chat":true}}"#;
         let p2: HelloParams = serde_json::from_str(newer).unwrap();
-        assert_eq!(p2.capabilities.get("telepathy"), Some(&serde_json::Value::Bool(true)));
+        assert_eq!(
+            p2.capabilities.get("telepathy"),
+            Some(&serde_json::Value::Bool(true))
+        );
     }
 }

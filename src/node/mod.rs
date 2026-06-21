@@ -17,9 +17,9 @@ pub mod transport;
 pub mod worker_id;
 
 #[cfg(test)]
-pub(crate) mod test_support;
-#[cfg(test)]
 mod e2e_tests;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 use std::time::Duration;
 
@@ -30,8 +30,8 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use crate::auth::{Allowlist, PairingTokens, TokenError};
 use crate::diagnostic::HiggsError;
 use crate::remote::{
-    hub_capabilities, negotiate_version, node_capabilities, HelloParams, HelloResult, ALPN, M_HELLO,
-    MIN_SUPPORTED, PROTOCOL_VERSIONS,
+    hub_capabilities, negotiate_version, node_capabilities, HelloParams, HelloResult, ALPN,
+    MIN_SUPPORTED, M_HELLO, PROTOCOL_VERSIONS,
 };
 use crate::rpc::{self, RpcError, RpcFrame, RpcRequest, RpcResponse};
 
@@ -59,15 +59,24 @@ pub enum GateOutcome {
 /// local boundary does. Shared by the control dispatch and the chat relay.
 pub(crate) fn worker_origin_code_data(e: &HiggsError) -> Option<serde_json::Value> {
     use miette::Diagnostic;
-    if let HiggsError::WorkerRpc { worker_code: Some(code), .. } = e {
+    if let HiggsError::WorkerRpc {
+        worker_code: Some(code),
+        ..
+    } = e
+    {
         return Some(serde_json::json!({ "code": code }));
     }
-    e.code().map(|c| serde_json::json!({ "code": c.to_string() }))
+    e.code()
+        .map(|c| serde_json::json!({ "code": c.to_string() }))
 }
 
 /// Write one RPC frame as an NDJSON line to a stream.
-pub(crate) async fn write_frame(send: &mut iroh::endpoint::SendStream, frame: &RpcFrame) -> std::io::Result<()> {
-    send.write_all(format!("{}\n", rpc::encode(frame)).as_bytes()).await?;
+pub(crate) async fn write_frame(
+    send: &mut iroh::endpoint::SendStream,
+    frame: &RpcFrame,
+) -> std::io::Result<()> {
+    send.write_all(format!("{}\n", rpc::encode(frame)).as_bytes())
+        .await?;
     send.flush().await
 }
 
@@ -158,7 +167,10 @@ pub(crate) async fn gate_read_hello(
     ) {
         Ok(v) => v,
         Err(mismatch) => {
-            let e = HiggsError::VersionMismatch { peer: mismatch.peer, ours: mismatch.ours };
+            let e = HiggsError::VersionMismatch {
+                peer: mismatch.peer,
+                ours: mismatch.ours,
+            };
             tracing::warn!(error = %e, "higgs: rejecting version-mismatched peer");
             let resp = RpcResponse {
                 jsonrpc: "2.0".into(),
@@ -178,7 +190,12 @@ pub(crate) async fn gate_read_hello(
         }
     };
 
-    Ok(Handshake { send, id, hello, agreed_version })
+    Ok(Handshake {
+        send,
+        id,
+        hello,
+        agreed_version,
+    })
 }
 
 /// Hub side, phase 2 (allowlist/token locks held by the caller): admit `handshake` by the
@@ -194,7 +211,12 @@ pub(crate) async fn gate_admit(
     hub_id: String,
     label_for_new: Option<String>,
 ) -> GateOutcome {
-    let Handshake { mut send, id, hello, agreed_version } = handshake;
+    let Handshake {
+        mut send,
+        id,
+        hello,
+        agreed_version,
+    } = handshake;
     let peer = conn.remote_id().to_string();
 
     // 3. allowlist OR a valid one-time pairing token (the only path that admits a
@@ -216,14 +238,18 @@ pub(crate) async fn gate_admit(
                     label_for_new
                 }
                 Err(TokenError::Expired) | Err(TokenError::UnknownOrUsed) => {
-                    let e = HiggsError::PairingTokenInvalid { detail: "expired/used/unknown".into() };
+                    let e = HiggsError::PairingTokenInvalid {
+                        detail: "expired/used/unknown".into(),
+                    };
                     tracing::warn!(error = %e, peer, "higgs: rejecting bad pairing token");
                     conn.close(0u32.into(), b"HG022");
                     return GateOutcome::Rejected { code: "HG022" };
                 }
             },
             None => {
-                let e = HiggsError::NotAllowlisted { endpoint_id: peer.clone() };
+                let e = HiggsError::NotAllowlisted {
+                    endpoint_id: peer.clone(),
+                };
                 tracing::warn!(error = %e, "higgs: rejecting unknown peer");
                 conn.close(0u32.into(), b"HG024");
                 return GateOutcome::Rejected { code: "HG024" };
@@ -270,7 +296,16 @@ pub async fn gate_connection(
 ) -> GateOutcome {
     match gate_read_hello(conn, hello_deadline).await {
         Ok(handshake) => {
-            gate_admit(conn, handshake, allow, tokens, now_ms, hub_id, label_for_new).await
+            gate_admit(
+                conn,
+                handshake,
+                allow,
+                tokens,
+                now_ms,
+                hub_id,
+                label_for_new,
+            )
+            .await
         }
         Err(rejected) => rejected,
     }
@@ -345,7 +380,11 @@ pub async fn connect_node(
             serde_json::from_value::<HelloResult>(resp.result.unwrap_or_default())
                 .map_err(Error::other)?
         }
-        other => return Err(Error::other(format!("unexpected reply frame to HELLO: {other:?}"))),
+        other => {
+            return Err(Error::other(format!(
+                "unexpected reply frame to HELLO: {other:?}"
+            )))
+        }
     };
     Ok((conn, result))
 }
@@ -375,7 +414,9 @@ async fn relay_worker_logs(
     conn: Connection,
     rt: std::sync::Arc<crate::node::runtime::NodeRuntime>,
 ) {
-    let Ok(mut send) = conn.open_uni().await else { return };
+    let Ok(mut send) = conn.open_uni().await else {
+        return;
+    };
     let mut logs = rt.subscribe_logs();
     loop {
         let (worker_id, line) = match logs.recv().await {
@@ -388,7 +429,10 @@ async fn relay_worker_logs(
             method: crate::remote::N_LOG_LINE.into(),
             params: serde_json::json!({ "worker_id": worker_id.0, "line": line }),
         };
-        if write_frame(&mut send, &RpcFrame::Notification(note)).await.is_err() {
+        if write_frame(&mut send, &RpcFrame::Notification(note))
+            .await
+            .is_err()
+        {
             return; // connection gone
         }
     }
@@ -441,7 +485,10 @@ async fn handle_node_stream(
                 }),
             }
         };
-        if write_frame(&mut send, &RpcFrame::Response(resp)).await.is_err() {
+        if write_frame(&mut send, &RpcFrame::Response(resp))
+            .await
+            .is_err()
+        {
             break; // stream gone
         }
     }

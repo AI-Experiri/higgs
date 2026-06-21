@@ -22,7 +22,11 @@ pub struct PullTarget {
 impl PullTarget {
     /// A target on `main` for `repo`/`file`.
     pub fn new(repo: impl Into<String>, file: impl Into<String>) -> Self {
-        Self { repo: repo.into(), file: file.into(), revision: "main".into() }
+        Self {
+            repo: repo.into(),
+            file: file.into(),
+            revision: "main".into(),
+        }
     }
 }
 
@@ -67,15 +71,24 @@ pub fn dest_path(models_root: &Path, repo: &str, file: &str) -> Result<PathBuf, 
     // local dir name and a literal URL path component needing no percent-encoding.
     let segs: Vec<&str> = repo.split('/').collect();
     if segs.len() != 2 || !segs.iter().all(|s| is_safe_segment(s)) {
-        return Err(bad("repo must be '<org>/<model>' (each [A-Za-z0-9._-], no '..'/reserved chars)"));
+        return Err(bad(
+            "repo must be '<org>/<model>' (each [A-Za-z0-9._-], no '..'/reserved chars)",
+        ));
     }
     // file must be a single safe `*.gguf` component (case-insensitive) — no subdirectory,
     // no escape, no URL-reserved chars.
     if !is_safe_segment(file) || !file.to_ascii_lowercase().ends_with(".gguf") {
-        return Err(bad("file must be a single '*.gguf' name ([A-Za-z0-9._-], no subdir)"));
+        return Err(bad(
+            "file must be a single '*.gguf' name ([A-Za-z0-9._-], no subdir)",
+        ));
     }
     let rel = PathBuf::from(repo).join(file);
-    if rel.components().any(|c| matches!(c, Component::ParentDir | Component::RootDir | Component::Prefix(_))) {
+    if rel.components().any(|c| {
+        matches!(
+            c,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
         return Err(bad("path must be relative with no '..'"));
     }
     Ok(models_root.join(rel))
@@ -90,7 +103,8 @@ fn is_safe_segment(s: &str) -> bool {
     !s.is_empty()
         && s != "."
         && s != ".."
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
 /// Download `target` into `models_root` via `fetcher`, streaming progress to `progress`.
@@ -112,7 +126,10 @@ pub async fn download<F: Fetcher>(
     // here: each `/`-separated segment must be safe (allows branch paths like `refs/pr/1`),
     // keeping reserved chars out of the resolve URL.
     if !target.revision.split('/').all(is_safe_segment) {
-        return Err(fail(format!("invalid revision {:?} (segments must be [A-Za-z0-9._-])", target.revision)));
+        return Err(fail(format!(
+            "invalid revision {:?} (segments must be [A-Za-z0-9._-])",
+            target.revision
+        )));
     }
 
     if let Some(parent) = dest.parent() {
@@ -141,7 +158,9 @@ pub async fn download<F: Fetcher>(
     };
     // Any failure (fetch error OR a write error) removes the temp and surfaces HG025 — never
     // leaving a partial/empty `.part` behind.
-    let failure = fetch_res.err().or_else(|| write_err.map(|e| format!("write failed: {e}")));
+    let failure = fetch_res
+        .err()
+        .or_else(|| write_err.map(|e| format!("write failed: {e}")));
     if let Some(detail) = failure {
         drop(file);
         let _ = std::fs::remove_file(&tmp);
@@ -214,7 +233,11 @@ mod tests {
 
     impl FakeFetcher {
         fn new(chunks: Vec<Vec<u8>>) -> Self {
-            Self { chunks, fail_with: None, report_total: true }
+            Self {
+                chunks,
+                fail_with: None,
+                report_total: true,
+            }
         }
     }
 
@@ -242,13 +265,26 @@ mod tests {
     #[tokio::test]
     async fn download_handles_unknown_content_length() {
         let dir = tempfile::tempdir().unwrap();
-        let f = FakeFetcher { chunks: vec![b"a".to_vec(), b"bc".to_vec()], fail_with: None, report_total: false };
+        let f = FakeFetcher {
+            chunks: vec![b"a".to_vec(), b"bc".to_vec()],
+            fail_with: None,
+            report_total: false,
+        };
         let mut seen: Vec<(u64, Option<u64>)> = Vec::new();
-        let p = download(&PullTarget::new("org/m", "x.gguf"), dir.path(), &f, &mut |d, t| seen.push((d, t)))
-            .await
-            .unwrap();
+        let p = download(
+            &PullTarget::new("org/m", "x.gguf"),
+            dir.path(),
+            &f,
+            &mut |d, t| seen.push((d, t)),
+        )
+        .await
+        .unwrap();
         assert_eq!(std::fs::read(&p).unwrap(), b"abc");
-        assert_eq!(seen, vec![(1, None), (3, None)], "progress with unknown total");
+        assert_eq!(
+            seen,
+            vec![(1, None), (3, None)],
+            "progress with unknown total"
+        );
     }
 
     #[test]
@@ -280,10 +316,19 @@ mod tests {
             ("org/m", "x#.gguf", false, "'#' (fragment) in file"),
             ("or#g/m", "x.gguf", false, "'#' in repo"),
             ("org/m", "a b.gguf", false, "space in file"),
-            ("TheBloke/Llama-2.7B_GGUF", "model.q4_0.gguf", true, "normal HF charset"),
+            (
+                "TheBloke/Llama-2.7B_GGUF",
+                "model.q4_0.gguf",
+                true,
+                "normal HF charset",
+            ),
         ];
         for (repo, file, ok, why) in cases {
-            assert_eq!(dest_path(root, repo, file).is_ok(), *ok, "{why}: {repo:?}/{file:?}");
+            assert_eq!(
+                dest_path(root, repo, file).is_ok(),
+                *ok,
+                "{why}: {repo:?}/{file:?}"
+            );
         }
     }
 
@@ -293,12 +338,20 @@ mod tests {
         let mut t = PullTarget::new("org/m", "x.gguf");
         t.revision = "main#frag".into();
         let f = FakeFetcher::new(vec![b"x".to_vec()]);
-        let err = download(&t, dir.path(), &f, &mut |_, _| {}).await.unwrap_err();
-        assert!(err.to_string().starts_with("[HG025]"), "reserved char in revision → HG025: {err}");
+        let err = download(&t, dir.path(), &f, &mut |_, _| {})
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().starts_with("[HG025]"),
+            "reserved char in revision → HG025: {err}"
+        );
         // A branch-path revision with '/' is allowed.
         t.revision = "refs/pr/1".into();
         // (won't actually fetch over network in this unit test; the fake fetcher serves it)
-        assert!(download(&t, dir.path(), &f, &mut |_, _| {}).await.is_ok(), "branch-path revision ok");
+        assert!(
+            download(&t, dir.path(), &f, &mut |_, _| {}).await.is_ok(),
+            "branch-path revision ok"
+        );
     }
 
     #[tokio::test]
@@ -311,7 +364,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"hello", "bytes written");
-        assert!(path.ends_with("higgs-test/m/model.gguf"), "lands under repo/file: {path:?}");
+        assert!(
+            path.ends_with("higgs-test/m/model.gguf"),
+            "lands under repo/file: {path:?}"
+        );
         assert_eq!(seen.last(), Some(&(5, Some(5))), "final progress = total");
         // No leftover .part temp.
         assert!(!path.with_extension("part").exists(), "temp cleaned up");
@@ -329,11 +385,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let target = PullTarget::new("org/m", "x.gguf");
         let f1 = FakeFetcher::new(vec![b"v1".to_vec()]);
-        let p1 = download(&target, dir.path(), &f1, &mut |_, _| {}).await.unwrap();
+        let p1 = download(&target, dir.path(), &f1, &mut |_, _| {})
+            .await
+            .unwrap();
         assert_eq!(std::fs::read(&p1).unwrap(), b"v1");
         // Re-pull replaces the existing file in place (atomic rename over the old model).
         let f2 = FakeFetcher::new(vec![b"v2!".to_vec()]);
-        let p2 = download(&target, dir.path(), &f2, &mut |_, _| {}).await.unwrap();
+        let p2 = download(&target, dir.path(), &f2, &mut |_, _| {})
+            .await
+            .unwrap();
         assert_eq!(p2, p1, "same destination");
         assert_eq!(std::fs::read(&p2).unwrap(), b"v2!", "model replaced");
     }
@@ -341,9 +401,15 @@ mod tests {
     #[tokio::test]
     async fn download_maps_fetch_error_to_hg025_and_leaves_no_file() {
         let dir = tempfile::tempdir().unwrap();
-        let fetcher = FakeFetcher { chunks: vec![], fail_with: Some("network down".into()), report_total: true };
+        let fetcher = FakeFetcher {
+            chunks: vec![],
+            fail_with: Some("network down".into()),
+            report_total: true,
+        };
         let target = PullTarget::new("org/m", "m.gguf");
-        let err = download(&target, dir.path(), &fetcher, &mut |_, _| {}).await.unwrap_err();
+        let err = download(&target, dir.path(), &fetcher, &mut |_, _| {})
+            .await
+            .unwrap_err();
         assert!(err.to_string().starts_with("[HG025]"), "got {err}");
         let dest = dest_path(dir.path(), "org/m", "m.gguf").unwrap();
         assert!(!dest.exists(), "no file on failure");

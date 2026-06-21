@@ -32,7 +32,8 @@ async fn api_keys_gate_the_http_surface() {
     let mut keys = ApiKeys::default();
     keys.add("hgk_chatkey", "chat".into(), vec![Scope::Chat]);
     keys.add("hgk_adminkey", "admin".into(), vec![Scope::Admin]);
-    keys.save(&home.path().join("api_keys.json")).expect("write keys");
+    keys.save(&home.path().join("api_keys.json"))
+        .expect("write keys");
 
     // Grab an ephemeral free port (bind :0, read it, release) to avoid a fixed-port clash.
     let port = {
@@ -65,12 +66,21 @@ async fn api_keys_gate_the_http_surface() {
     assert!(ready, "server became ready");
 
     // Health is always open (no key).
-    assert!(c.get(format!("{base}/health")).send().await.unwrap().status().is_success());
+    assert!(c
+        .get(format!("{base}/health"))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_success());
 
     // No key → 401 on a gated route, with WWW-Authenticate.
     let no_key = c.get(format!("{base}/v1/models")).send().await.unwrap();
     assert_eq!(no_key.status(), 401, "no key is 401");
-    assert!(no_key.headers().contains_key("www-authenticate"), "challenges with WWW-Authenticate");
+    assert!(
+        no_key.headers().contains_key("www-authenticate"),
+        "challenges with WWW-Authenticate"
+    );
 
     // Chat-scoped key can't list models (needs Models) → 401.
     let chat_on_models = c
@@ -88,7 +98,11 @@ async fn api_keys_gate_the_http_surface() {
         .send()
         .await
         .unwrap();
-    assert!(admin_models.status().is_success(), "admin lists models: {}", admin_models.status());
+    assert!(
+        admin_models.status().is_success(),
+        "admin lists models: {}",
+        admin_models.status()
+    );
 
     // Admin gates management: load without a key → 401; with admin → not 401.
     let load_no_key = c

@@ -28,7 +28,10 @@ impl Drop for NodeProc {
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 async fn hub_endpoint() -> iroh::Endpoint {
@@ -43,7 +46,12 @@ async fn hub_endpoint() -> iroh::Endpoint {
 /// One control RPC (fresh bi stream, single response).
 async fn node_rpc(conn: &Connection, id: u64, method: &str, params: Value) -> RpcResponse {
     let (mut send, recv) = conn.open_bi().await.expect("open control stream");
-    let req = RpcRequest { jsonrpc: "2.0".into(), id, method: method.into(), params };
+    let req = RpcRequest {
+        jsonrpc: "2.0".into(),
+        id,
+        method: method.into(),
+        params,
+    };
     send.write_all(format!("{}\n", rpc::encode(&RpcFrame::Request(req))).as_bytes())
         .await
         .expect("write");
@@ -102,10 +110,19 @@ async fn node_pulls_a_model_over_http_and_scan_sees_it() {
         .expect("incoming");
     let conn = incoming.await.expect("connection");
     let outcome = gate_connection(
-        &conn, &mut allow, &mut tokens, now_ms(), hub_id, Some("test".into()), HELLO_DEADLINE,
+        &conn,
+        &mut allow,
+        &mut tokens,
+        now_ms(),
+        hub_id,
+        Some("test".into()),
+        HELLO_DEADLINE,
     )
     .await;
-    assert!(matches!(outcome, GateOutcome::Admitted { .. }), "admitted: {outcome:?}");
+    assert!(
+        matches!(outcome, GateOutcome::Admitted { .. }),
+        "admitted: {outcome:?}"
+    );
 
     // M_NODE_PULL on a data stream: collect N_PROGRESS + the final {path}.
     let (mut send, recv) = conn.open_bi().await.expect("data stream");
@@ -115,7 +132,9 @@ async fn node_pulls_a_model_over_http_and_scan_sees_it() {
         method: M_NODE_PULL.into(),
         params: json!({ "request_id": 1, "repo": "higgs-test/pulled", "file": "model.gguf" }),
     };
-    send.write_all(format!("{}\n", rpc::encode(&RpcFrame::Request(req))).as_bytes()).await.unwrap();
+    send.write_all(format!("{}\n", rpc::encode(&RpcFrame::Request(req))).as_bytes())
+        .await
+        .unwrap();
     send.finish().unwrap();
 
     let mut lines = BufReader::new(recv).lines();
@@ -129,9 +148,18 @@ async fn node_pulls_a_model_over_http_and_scan_sees_it() {
         }
     };
     assert!(final_resp.error.is_none(), "pull ok: {final_resp:?}");
-    assert!(progress_frames > 0, "at least one N_PROGRESS frame streamed");
-    let path = final_resp.result.unwrap()["path"].as_str().unwrap().to_string();
-    assert!(std::path::Path::new(&path).exists(), "pulled file exists on disk: {path}");
+    assert!(
+        progress_frames > 0,
+        "at least one N_PROGRESS frame streamed"
+    );
+    let path = final_resp.result.unwrap()["path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        std::path::Path::new(&path).exists(),
+        "pulled file exists on disk: {path}"
+    );
 
     // A subsequent scan lists the freshly pulled model.
     let scan = node_rpc(&conn, 2, M_NODE_SCAN, json!({})).await;

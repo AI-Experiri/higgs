@@ -31,7 +31,10 @@ impl Allowlist {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => PairingsFile::default(),
             Err(e) => return Err(e),
         };
-        Ok(Self { path: path.to_path_buf(), file })
+        Ok(Self {
+            path: path.to_path_buf(),
+            file,
+        })
     }
 
     /// Is this EndpointId (canonical string) paired?
@@ -244,7 +247,10 @@ mod tests {
         let mut allow = Allowlist::load(&path).unwrap();
         let err = allow.add(id_str(), None).unwrap_err();
         assert!(err.kind() == std::io::ErrorKind::NotFound || err.raw_os_error().is_some());
-        assert!(!allow.contains(&id_str()), "rolled back: not paired in memory");
+        assert!(
+            !allow.contains(&id_str()),
+            "rolled back: not paired in memory"
+        );
         assert!(allow.is_empty());
     }
 
@@ -270,7 +276,10 @@ mod tests {
         assert!(tokens.validate(&tok, now_ms()).is_ok());
         tokens.burn(&tok);
         // now consumed
-        assert_eq!(tokens.validate(&tok, now_ms()), Err(TokenError::UnknownOrUsed));
+        assert_eq!(
+            tokens.validate(&tok, now_ms()),
+            Err(TokenError::UnknownOrUsed)
+        );
     }
 
     #[test]

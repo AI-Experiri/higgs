@@ -23,7 +23,10 @@ fn parse_secret(bytes: &[u8]) -> std::io::Result<SecretKey> {
     let arr = <[u8; 32]>::try_from(bytes).map_err(|_| {
         // Corrupt key file: fail loudly rather than silently minting a new id
         // (which would silently drop the node out of every hub's allowlist).
-        std::io::Error::new(std::io::ErrorKind::InvalidData, "endpoint.key is not 32 bytes")
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "endpoint.key is not 32 bytes",
+        )
     })?;
     Ok(SecretKey::from_bytes(&arr))
 }
@@ -36,7 +39,10 @@ fn parse_secret(bytes: &[u8]) -> std::io::Result<SecretKey> {
 /// won the race, we adopt THAT key — all processes agree on one stable id.
 fn create_secret(path: &Path) -> std::io::Result<SecretKey> {
     let sk = SecretKey::generate();
-    let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
     let tmp = dir.join(format!(
         "endpoint.key.tmp.{}.{:x}",
         std::process::id(),
@@ -86,7 +92,11 @@ pub async fn bind_endpoint(sk: SecretKey) -> Result<Endpoint, iroh::endpoint::Bi
     } else {
         Endpoint::builder(iroh::endpoint::presets::N0)
     };
-    builder.secret_key(sk).alpns(vec![ALPN.to_vec()]).bind().await
+    builder
+        .secret_key(sk)
+        .alpns(vec![ALPN.to_vec()])
+        .bind()
+        .await
 }
 
 #[cfg(test)]
@@ -132,7 +142,11 @@ mod tests {
         let winner = SecretKey::generate();
         write_secret_exclusive(&path, &winner.to_bytes()).unwrap();
         let adopted = create_secret(&path).unwrap();
-        assert_eq!(adopted.public(), winner.public(), "must adopt the winner's key");
+        assert_eq!(
+            adopted.public(),
+            winner.public(),
+            "must adopt the winner's key"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

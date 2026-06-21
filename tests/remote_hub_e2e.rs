@@ -38,7 +38,10 @@ impl Drop for NodeProc {
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 async fn hub_endpoint() -> iroh::Endpoint {
@@ -96,15 +99,28 @@ async fn hub_v1_chat_routes_to_remote_node() {
         .expect("incoming");
     let conn = incoming.await.expect("connection");
     let peer = conn.remote_id().to_string();
-    let outcome =
-        gate_connection(&conn, &mut allow, &mut tokens, now_ms(), hub_id, Some("test".into()), HELLO_DEADLINE)
-            .await;
-    assert!(matches!(outcome, GateOutcome::Admitted { .. }), "node admitted: {outcome:?}");
+    let outcome = gate_connection(
+        &conn,
+        &mut allow,
+        &mut tokens,
+        now_ms(),
+        hub_id,
+        Some("test".into()),
+        HELLO_DEADLINE,
+    )
+    .await;
+    assert!(
+        matches!(outcome, GateOutcome::Admitted { .. }),
+        "node admitted: {outcome:?}"
+    );
     fleet.add_node(peer.clone(), Arc::new(NodeTransport::new(conn)));
 
     // Load a real model on the node via the fleet → records the route.
     fleet.load(&peer, TINY_MODEL_ID).await.expect("remote load");
-    assert!(fleet.is_remote(TINY_MODEL_ID), "model is now remote-routable");
+    assert!(
+        fleet.is_remote(TINY_MODEL_ID),
+        "model is now remote-routable"
+    );
 
     // The hub's /v1 chat path: chat_stream routes the remote-resident model through the
     // fleet to the node, streaming real tokens back.
@@ -141,7 +157,10 @@ async fn hub_v1_chat_routes_to_remote_node() {
     // the hub's own Developer-Logs console (the shared bus), filterable per remote worker.
     let node_id = fleet.node_id(&peer).expect("node has an assigned NodeId");
     let worker = fleet.resolve(TINY_MODEL_ID).expect("model routed").1;
-    let remote_src = LogSource::RemoteWorker { node: node_id, worker };
+    let remote_src = LogSource::RemoteWorker {
+        node: node_id,
+        worker,
+    };
     // Relay is async (uni stream + load dump); poll briefly for the first relayed line.
     let mut relayed = Vec::new();
     for _ in 0..50 {
@@ -160,8 +179,14 @@ async fn hub_v1_chat_routes_to_remote_node() {
 
     // ── Inventory (P4): the hub fetches the node's self-description and exposes it in the
     // fleet view — host identity, real hardware, and the resident worker → model mapping.
-    let inv = fleet.refresh_inventory(&peer).await.expect("fetch inventory");
-    assert!(inv.hardware.cpu_cores > 0, "inventory carries real cpu cores");
+    let inv = fleet
+        .refresh_inventory(&peer)
+        .await
+        .expect("fetch inventory");
+    assert!(
+        inv.hardware.cpu_cores > 0,
+        "inventory carries real cpu cores"
+    );
     assert_eq!(inv.runtime.engine, "llama.cpp");
     assert!(
         inv.workers.iter().any(|w| w.model == TINY_MODEL_ID),
@@ -170,34 +195,58 @@ async fn hub_v1_chat_routes_to_remote_node() {
     );
     let views = fleet.nodes_view();
     assert!(
-        views.iter().any(|v| v.endpoint_id == peer && v.connected && v.inventory.is_some()),
+        views
+            .iter()
+            .any(|v| v.endpoint_id == peer && v.connected && v.inventory.is_some()),
         "fleet view shows the connected node with its inventory"
     );
 
     // ── Fleet lifecycle over the live link: the model is advertised, then unloaded, then
     // re-loaded + force-killed, then the node is retired — each transition reflected in the
     // hub's routing view, and the remote log ring reclaimed on teardown.
-    assert_eq!(fleet.routed_models(), vec![TINY_MODEL_ID.to_string()], "routed_models lists it");
+    assert_eq!(
+        fleet.routed_models(),
+        vec![TINY_MODEL_ID.to_string()],
+        "routed_models lists it"
+    );
     fleet.unload(TINY_MODEL_ID).await.expect("remote unload");
     assert!(!fleet.is_remote(TINY_MODEL_ID), "unload drops the route");
-    assert!(bus.snapshot(usize::MAX, Some(remote_src)).is_empty(), "unload reclaims the log ring");
+    assert!(
+        bus.snapshot(usize::MAX, Some(remote_src)).is_empty(),
+        "unload reclaims the log ring"
+    );
 
     // Chat to the now-unrouted model errors (no route) rather than hanging.
     assert!(
-        fleet.chat(TINY_MODEL_ID, "[]".into(), 8, 0.0, None).await.is_err(),
+        fleet
+            .chat(TINY_MODEL_ID, "[]".into(), 8, 0.0, None)
+            .await
+            .is_err(),
         "chat to an unrouted model errors"
     );
 
     // Re-load, then force-kill the worker.
-    fleet.load(&peer, TINY_MODEL_ID).await.expect("remote re-load");
-    assert!(fleet.is_remote(TINY_MODEL_ID), "re-loaded model is routable again");
+    fleet
+        .load(&peer, TINY_MODEL_ID)
+        .await
+        .expect("remote re-load");
+    assert!(
+        fleet.is_remote(TINY_MODEL_ID),
+        "re-loaded model is routable again"
+    );
     fleet.kill(TINY_MODEL_ID).await.expect("remote kill");
     assert!(!fleet.is_remote(TINY_MODEL_ID), "kill drops the route");
 
     // Retire the node: its routes + transport are gone, and ops now report unreachable.
-    fleet.load(&peer, TINY_MODEL_ID).await.expect("load before retire");
+    fleet
+        .load(&peer, TINY_MODEL_ID)
+        .await
+        .expect("load before retire");
     fleet.retire(&peer);
-    assert!(fleet.node_ids().is_empty(), "retired node removed from the fleet");
+    assert!(
+        fleet.node_ids().is_empty(),
+        "retired node removed from the fleet"
+    );
     assert!(fleet.routed_models().is_empty(), "retire clears routes");
 }
 
@@ -253,10 +302,19 @@ async fn node_reconnects_and_route_survives() {
         let conn = incoming.await.expect("connection");
         let peer = conn.remote_id().to_string();
         let outcome = gate_connection(
-            &conn, allow, tokens, now_ms(), hub_id.to_string(), Some("test".into()), HELLO_DEADLINE,
+            &conn,
+            allow,
+            tokens,
+            now_ms(),
+            hub_id.to_string(),
+            Some("test".into()),
+            HELLO_DEADLINE,
         )
         .await;
-        assert!(matches!(outcome, GateOutcome::Admitted { .. }), "admitted: {outcome:?}");
+        assert!(
+            matches!(outcome, GateOutcome::Admitted { .. }),
+            "admitted: {outcome:?}"
+        );
         (conn, peer)
     }
 
@@ -303,5 +361,8 @@ async fn node_reconnects_and_route_survives() {
     });
     let outcome = handle.await.expect("join").expect("chat outcome");
     let chunks = collector.await.unwrap();
-    assert!(chunks > 0 || !outcome.content.is_empty(), "post-reconnect chat generated tokens");
+    assert!(
+        chunks > 0 || !outcome.content.is_empty(),
+        "post-reconnect chat generated tokens"
+    );
 }

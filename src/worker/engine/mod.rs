@@ -287,7 +287,10 @@ mod registry_tests {
 
     #[test]
     fn default_is_llamacpp_and_registry_nonempty() {
-        assert!(!engine_names().is_empty(), "at least one engine is registered");
+        assert!(
+            !engine_names().is_empty(),
+            "at least one engine is registered"
+        );
         assert_eq!(default_engine_name(), "llamacpp");
         assert!(engine_names().contains(&"llamacpp"));
     }
@@ -302,6 +305,10 @@ mod registry_tests {
     fn build_falls_back_to_default_for_unknown_or_absent() {
         assert_eq!(build_engine(None).1, "llamacpp");
         assert_eq!(build_engine(Some("")).1, "llamacpp");
-        assert_eq!(build_engine(Some("nope")).1, "llamacpp", "unknown → default");
+        assert_eq!(
+            build_engine(Some("nope")).1,
+            "llamacpp",
+            "unknown → default"
+        );
     }
 }

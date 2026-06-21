@@ -195,7 +195,9 @@ pub enum HiggsError {
     /// No protocol version both peers accept. Fatal for this connection: the hub
     /// returns this then closes the stream, telling the node's UI "you must update"
     /// rather than "network broke" (§4.1).
-    #[snafu(display("[HG023] no agreed protocol version: peer speaks {peer:?}, we accept {ours:?}"))]
+    #[snafu(display(
+        "[HG023] no agreed protocol version: peer speaks {peer:?}, we accept {ours:?}"
+    ))]
     #[diagnostic(code(HG023), severity(Error))]
     VersionMismatch { peer: Vec<u32>, ours: Vec<u32> },
 
@@ -235,7 +237,11 @@ pub enum HiggsError {
     /// file: the download writes a temp and renames only on success.
     #[snafu(display("[HG025] model download failed for {repo}/{file}: {detail}"))]
     #[diagnostic(code(HG025))]
-    DownloadFailed { repo: String, file: String, detail: String },
+    DownloadFailed {
+        repo: String,
+        file: String,
+        detail: String,
+    },
 }
 
 #[cfg(test)]
@@ -305,24 +311,37 @@ mod tests {
 
     #[test]
     fn remote_gate_codes_render() {
-        assert!(HiggsError::PairingTokenInvalid { detail: "expired".into() }
-            .to_string()
-            .starts_with("[HG022]"));
-        assert!(HiggsError::NotAllowlisted { endpoint_id: "z32".into() }
-            .to_string()
-            .starts_with("[HG024]"));
-        assert!(HiggsError::HandshakeStalled { endpoint_id: "z32".into(), window: 5 }
-            .to_string()
-            .starts_with("[HG028]"));
-        assert!(HiggsError::NodeUnreachable { endpoint_id: "z32".into(), detail: "closed".into() }
-            .to_string()
-            .starts_with("[HG027]"));
+        assert!(HiggsError::PairingTokenInvalid {
+            detail: "expired".into()
+        }
+        .to_string()
+        .starts_with("[HG022]"));
+        assert!(HiggsError::NotAllowlisted {
+            endpoint_id: "z32".into()
+        }
+        .to_string()
+        .starts_with("[HG024]"));
+        assert!(HiggsError::HandshakeStalled {
+            endpoint_id: "z32".into(),
+            window: 5
+        }
+        .to_string()
+        .starts_with("[HG028]"));
+        assert!(HiggsError::NodeUnreachable {
+            endpoint_id: "z32".into(),
+            detail: "closed".into()
+        }
+        .to_string()
+        .starts_with("[HG027]"));
     }
 
     #[test]
     fn version_mismatch_is_fatal() {
         use miette::Diagnostic;
-        let e = HiggsError::VersionMismatch { peer: vec![2], ours: vec![1] };
+        let e = HiggsError::VersionMismatch {
+            peer: vec![2],
+            ours: vec![1],
+        };
         assert!(e.to_string().starts_with("[HG023]"));
         assert_eq!(e.severity(), Some(miette::Severity::Error));
     }

@@ -45,7 +45,10 @@ impl Drop for NodeProc {
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 /// Bind the test's hub endpoint: relay-disabled + local, matching the node's
@@ -63,13 +66,22 @@ async fn hub_endpoint() -> iroh::Endpoint {
 async fn node_rpc(conn: &Connection, id: u64, method: &str, params: Value) -> RpcResponse {
     use tokio::io::{AsyncBufReadExt, BufReader};
     let (mut send, recv) = conn.open_bi().await.expect("open control stream");
-    let req = RpcRequest { jsonrpc: "2.0".into(), id, method: method.into(), params };
+    let req = RpcRequest {
+        jsonrpc: "2.0".into(),
+        id,
+        method: method.into(),
+        params,
+    };
     send.write_all(format!("{}\n", rpc::encode(&RpcFrame::Request(req))).as_bytes())
         .await
         .expect("write request");
     send.finish().expect("finish");
     let mut lines = BufReader::new(recv).lines();
-    let line = lines.next_line().await.expect("read").expect("a response line");
+    let line = lines
+        .next_line()
+        .await
+        .expect("read")
+        .expect("a response line");
     match rpc::decode(&line).expect("decode") {
         RpcFrame::Response(r) => r,
         other => panic!("expected response, got {other:?}"),
@@ -77,7 +89,11 @@ async fn node_rpc(conn: &Connection, id: u64, method: &str, params: Value) -> Rp
 }
 
 /// Open a data stream, send `M_CHAT`, collect streamed `N_CHAT_CHUNK` deltas + final.
-async fn node_chat(conn: &Connection, worker_id: u64, request_id: u64) -> (Vec<String>, RpcResponse) {
+async fn node_chat(
+    conn: &Connection,
+    worker_id: u64,
+    request_id: u64,
+) -> (Vec<String>, RpcResponse) {
     use tokio::io::{AsyncBufReadExt, BufReader};
     let (mut send, recv) = conn.open_bi().await.expect("open data stream");
     let req = RpcRequest {
@@ -151,22 +167,40 @@ async fn remote_node_full_workflow_over_iroh() {
         .expect("node dialed within 30s")
         .expect("incoming");
     let conn = incoming.await.expect("connection");
-    let outcome =
-        gate_connection(&conn, &mut allow, &mut tokens, now_ms(), hub_id, Some("test".into()), HELLO_DEADLINE)
-            .await;
-    assert!(matches!(outcome, GateOutcome::Admitted { .. }), "node admitted: {outcome:?}");
+    let outcome = gate_connection(
+        &conn,
+        &mut allow,
+        &mut tokens,
+        now_ms(),
+        hub_id,
+        Some("test".into()),
+        HELLO_DEADLINE,
+    )
+    .await;
+    assert!(
+        matches!(outcome, GateOutcome::Admitted { .. }),
+        "node admitted: {outcome:?}"
+    );
 
     // 1. Load a real model on the node (real llama.cpp child).
     let load = node_rpc(&conn, 1, M_NODE_LOAD, json!({ "id": TINY_MODEL_ID })).await;
     assert!(load.error.is_none(), "load ok: {load:?}");
-    let worker_id = load.result.unwrap()["worker_id"].as_u64().expect("worker_id");
+    let worker_id = load.result.unwrap()["worker_id"]
+        .as_u64()
+        .expect("worker_id");
 
     // 2. sysinfo: real hardware params (cpu cores, ram) extracted from the node.
     let sys = node_rpc(&conn, 2, M_NODE_SYSINFO, json!({})).await;
     assert!(sys.error.is_none(), "sysinfo ok: {sys:?}");
     let sys = sys.result.unwrap();
-    assert!(sys["hardware"]["cpu_cores"].as_u64().unwrap() > 0, "real cpu cores");
-    assert!(sys["hardware"]["ram_total_bytes"].as_u64().unwrap() > 0, "real ram");
+    assert!(
+        sys["hardware"]["cpu_cores"].as_u64().unwrap() > 0,
+        "real cpu cores"
+    );
+    assert!(
+        sys["hardware"]["ram_total_bytes"].as_u64().unwrap() > 0,
+        "real ram"
+    );
     assert!(sys["hardware"].get("gpus").is_some(), "gpu list present");
     assert_eq!(sys["runtime"]["engine"], "llama.cpp");
 
@@ -181,7 +215,10 @@ async fn remote_node_full_workflow_over_iroh() {
     assert!(result.get("content").is_some(), "chat result has content");
     // Either streamed chunks arrived, or the content is non-empty (both prove generation).
     let content = result["content"].as_str().unwrap_or("");
-    assert!(!chunks.is_empty() || !content.is_empty(), "tokens were generated");
+    assert!(
+        !chunks.is_empty() || !content.is_empty(),
+        "tokens were generated"
+    );
 
     // 5. scan: the node enumerates its own on-disk catalog (lists the staged model).
     let scan = node_rpc(&conn, 10, M_NODE_SCAN, json!({})).await;
@@ -203,7 +240,9 @@ async fn remote_node_full_workflow_over_iroh() {
     )
     .await;
     assert!(load2.error.is_none(), "second load ok: {load2:?}");
-    let worker2 = load2.result.unwrap()["worker_id"].as_u64().expect("worker_id 2");
+    let worker2 = load2.result.unwrap()["worker_id"]
+        .as_u64()
+        .expect("worker_id 2");
     assert_ne!(worker2, worker_id, "second load is a distinct worker");
 
     // 7. error paths over the real link: status on an unknown worker, and load of a model

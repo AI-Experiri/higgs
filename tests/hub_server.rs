@@ -70,7 +70,10 @@ async fn hub_server_pairs_a_node_and_lists_it() {
         .unwrap();
     let ticket = pair["ticket"].as_str().expect("ticket").to_string();
     let token = pair["token"].as_str().expect("token").to_string();
-    assert!(!ticket.is_empty() && token.starts_with("htk_"), "got a ticket + token");
+    assert!(
+        !ticket.is_empty() && token.starts_with("htk_"),
+        "got a ticket + token"
+    );
 
     // If a tiny GGUF is available, stage it so the node can actually load a model via the
     // HTTP hub API below; otherwise the pairing-only path still runs.
@@ -102,15 +105,19 @@ async fn hub_server_pairs_a_node_and_lists_it() {
             .json()
             .await
             .unwrap();
-        if nodes.as_array().is_some_and(|a| {
-            a.iter().any(|n| n["connected"] == true)
-        }) {
+        if nodes
+            .as_array()
+            .is_some_and(|a| a.iter().any(|n| n["connected"] == true))
+        {
             connected = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    assert!(connected, "node paired and shows connected in /api/higgs/nodes");
+    assert!(
+        connected,
+        "node paired and shows connected in /api/higgs/nodes"
+    );
 
     // ── HTTP remote-load (only with a GGUF): load a model on the paired node via the new
     // POST /api/higgs/nodes/load, then confirm it's remotely routable in /v1/models. ──
@@ -123,7 +130,10 @@ async fn hub_server_pairs_a_node_and_lists_it() {
             .json()
             .await
             .unwrap();
-        let node_id = nodes[0]["endpoint_id"].as_str().expect("endpoint_id").to_string();
+        let node_id = nodes[0]["endpoint_id"]
+            .as_str()
+            .expect("endpoint_id")
+            .to_string();
 
         let load = c
             .post(format!("{base}/api/higgs/nodes/load"))
@@ -131,7 +141,11 @@ async fn hub_server_pairs_a_node_and_lists_it() {
             .send()
             .await
             .unwrap();
-        assert!(load.status().is_success(), "remote load over HTTP ok: {}", load.status());
+        assert!(
+            load.status().is_success(),
+            "remote load over HTTP ok: {}",
+            load.status()
+        );
 
         // The remote-resident model is now advertised in /v1/models.
         let models: serde_json::Value = c
@@ -143,7 +157,9 @@ async fn hub_server_pairs_a_node_and_lists_it() {
             .await
             .unwrap();
         assert!(
-            models["data"].as_array().is_some_and(|d| d.iter().any(|m| m["id"] == TINY_MODEL_ID)),
+            models["data"]
+                .as_array()
+                .is_some_and(|d| d.iter().any(|m| m["id"] == TINY_MODEL_ID)),
             "remote model routable in /v1/models: {models}"
         );
 
@@ -154,6 +170,10 @@ async fn hub_server_pairs_a_node_and_lists_it() {
             .send()
             .await
             .unwrap();
-        assert!(unload.status().is_success(), "remote unload over HTTP ok: {}", unload.status());
+        assert!(
+            unload.status().is_success(),
+            "remote unload over HTTP ok: {}",
+            unload.status()
+        );
     }
 }

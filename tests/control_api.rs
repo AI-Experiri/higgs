@@ -48,7 +48,10 @@ async fn control_api_lifecycle() {
         .find(|m| m["id"] == serde_json::json!(id))
         .expect("scan lists the staged tiny model");
     // Gate-1 probe must judge this real llama-arch GGUF loadable.
-    assert_eq!(scanned["loadable"], true, "tiny model is loadable: {scanned}");
+    assert_eq!(
+        scanned["loadable"], true,
+        "tiny model is loadable: {scanned}"
+    );
 
     // load the model.
     let load: serde_json::Value = c
@@ -319,7 +322,10 @@ async fn control_settings_health_and_log_stream() {
         .send()
         .await
         .unwrap();
-    assert!(put.status().is_success(), "PUT settings round-trips: {settings:?}");
+    assert!(
+        put.status().is_success(),
+        "PUT settings round-trips: {settings:?}"
+    );
 
     // ── Invalid model ids are rejected with a typed 4xx (id-validation branch) ──
     for bad in ["bad id with spaces", "../escape", ""] {
@@ -329,7 +335,11 @@ async fn control_settings_health_and_log_stream() {
             .send()
             .await
             .unwrap();
-        assert!(r.status().is_client_error(), "invalid id {bad:?} → 4xx, got {}", r.status());
+        assert!(
+            r.status().is_client_error(),
+            "invalid id {bad:?} → 4xx, got {}",
+            r.status()
+        );
     }
 
     // ── model-by-id for a SCANNED-but-unloaded model reads its on-disk metadata ──
@@ -340,11 +350,17 @@ async fn control_settings_health_and_log_stream() {
         .unwrap();
     assert!(by_id.status().is_success(), "by-id for a scanned model ok");
     let detail: serde_json::Value = by_id.json().await.unwrap();
-    assert_eq!(detail["id"], TINY_MODEL_ID, "by-id returns the model: {detail:?}");
+    assert_eq!(
+        detail["id"], TINY_MODEL_ID,
+        "by-id returns the model: {detail:?}"
+    );
 
     // by-id for an UNKNOWN model is a 404 (the not-found branch).
     let missing = c
-        .get(format!("{}/api/higgs/models/ghost-org/ghost-model", srv.base))
+        .get(format!(
+            "{}/api/higgs/models/ghost-org/ghost-model",
+            srv.base
+        ))
         .send()
         .await
         .unwrap();
@@ -401,7 +417,10 @@ async fn worker_crash_triggers_restart_and_replay() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
-    assert!(ok, "chat succeeds after the worker was restarted + the load replayed");
+    assert!(
+        ok,
+        "chat succeeds after the worker was restarted + the load replayed"
+    );
 }
 
 /// The idle reaper auto-unloads a model after its idle TTL elapses: with `auto_unload_idle`
@@ -460,7 +479,10 @@ async fn idle_reaper_auto_unloads_a_model() {
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
-    assert!(unloaded, "idle reaper auto-unloaded the model within the timeout");
+    assert!(
+        unloaded,
+        "idle reaper auto-unloaded the model within the timeout"
+    );
 }
 
 /// PIDs of the `--higgs-worker` children of `server_pid` (the spawned worker processes).

@@ -15,7 +15,10 @@ use higgs::node::{dial_and_hello, gate_connection, GateOutcome, HELLO_DEADLINE};
 use higgs::remote::ALPN;
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 /// Run `higgs <args>` with an isolated HIGGS_HOME (+ hermetic iroh) and capture output.
@@ -35,7 +38,10 @@ fn link_status_prints_identity_and_zero_paired() {
     assert!(out.status.success(), "link status exits 0");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("higgs hub id"), "prints hub id: {stdout}");
-    assert!(stdout.contains("paired nodes : 0"), "no nodes paired yet: {stdout}");
+    assert!(
+        stdout.contains("paired nodes : 0"),
+        "no nodes paired yet: {stdout}"
+    );
 }
 
 #[test]
@@ -55,17 +61,27 @@ fn keys_add_list_remove_via_cli() {
     let add = run_higgs(home.path(), &["keys", "add", "ci", "chat,models"]);
     assert!(add.status.success(), "keys add exits 0");
     let out = String::from_utf8_lossy(&add.stdout);
-    assert!(out.contains("token (shown ONCE"), "prints the minted token: {out}");
+    assert!(
+        out.contains("token (shown ONCE"),
+        "prints the minted token: {out}"
+    );
     assert!(out.contains("hgk_"), "token has the hgk_ prefix");
 
     // list shows it.
     let list = run_higgs(home.path(), &["keys", "list"]);
     assert!(list.status.success());
-    assert!(String::from_utf8_lossy(&list.stdout).contains("ci"), "list shows the key");
+    assert!(
+        String::from_utf8_lossy(&list.stdout).contains("ci"),
+        "list shows the key"
+    );
 
     // remove drops it; a bad scope / missing label / unknown subcommand all fail.
-    assert!(run_higgs(home.path(), &["keys", "remove", "ci"]).status.success());
-    assert!(!run_higgs(home.path(), &["keys", "add", "x", "bogus"]).status.success());
+    assert!(run_higgs(home.path(), &["keys", "remove", "ci"])
+        .status
+        .success());
+    assert!(!run_higgs(home.path(), &["keys", "add", "x", "bogus"])
+        .status
+        .success());
     assert!(!run_higgs(home.path(), &["keys", "add"]).status.success());
     assert!(!run_higgs(home.path(), &["keys", "bogus"]).status.success());
 }
@@ -110,7 +126,13 @@ async fn node_connect_dials_and_pairs_with_a_hub() {
             .expect("incoming");
         let conn = incoming.await.expect("connection");
         let outcome = gate_connection(
-            &conn, &mut allow, &mut tokens, now_ms(), hub_id, Some("cli".into()), HELLO_DEADLINE,
+            &conn,
+            &mut allow,
+            &mut tokens,
+            now_ms(),
+            hub_id,
+            Some("cli".into()),
+            HELLO_DEADLINE,
         )
         .await;
         // Keep the connection alive briefly so the node reads the HELLO result.
@@ -127,10 +149,20 @@ async fn node_connect_dials_and_pairs_with_a_hub() {
     .unwrap();
 
     let outcome = gate.await.unwrap();
-    assert!(matches!(outcome, GateOutcome::Admitted { .. }), "hub admitted the node: {outcome:?}");
-    assert!(out.status.success(), "node connect exits 0: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        matches!(outcome, GateOutcome::Admitted { .. }),
+        "hub admitted the node: {outcome:?}"
+    );
+    assert!(
+        out.status.success(),
+        "node connect exits 0: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("paired with hub"), "node reports pairing: {stdout}");
+    assert!(
+        stdout.contains("paired with hub"),
+        "node reports pairing: {stdout}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -156,7 +188,13 @@ async fn node_connect_with_bad_token_is_rejected() {
             .expect("incoming");
         let conn = incoming.await.expect("connection");
         gate_connection(
-            &conn, &mut allow, &mut tokens, now_ms(), hub_id, Some("cli".into()), HELLO_DEADLINE,
+            &conn,
+            &mut allow,
+            &mut tokens,
+            now_ms(),
+            hub_id,
+            Some("cli".into()),
+            HELLO_DEADLINE,
         )
         .await
     });
@@ -169,8 +207,14 @@ async fn node_connect_with_bad_token_is_rejected() {
     .unwrap();
 
     let outcome = gate.await.unwrap();
-    assert!(matches!(outcome, GateOutcome::Rejected { .. }), "hub rejects a bad token: {outcome:?}");
-    assert!(!out.status.success(), "node connect with a bad token exits non-zero");
+    assert!(
+        matches!(outcome, GateOutcome::Rejected { .. }),
+        "hub rejects a bad token: {outcome:?}"
+    );
+    assert!(
+        !out.status.success(),
+        "node connect with a bad token exits non-zero"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -206,7 +250,10 @@ async fn link_pair_accepts_an_in_process_node_dial() {
         }
     })
     .await;
-    assert!(read.is_ok(), "link pair printed its ticket+token within 30s");
+    assert!(
+        read.is_ok(),
+        "link pair printed its ticket+token within 30s"
+    );
     let ticket: EndpointTicket = ticket.expect("ticket line").parse().expect("valid ticket");
     let token = token.expect("token line");
 

@@ -27,13 +27,17 @@ async fn node_hosts_two_workers_sysinfo_status_over_iroh() {
         std::env::temp_dir().join(format!("higgs-e2e-allow-{}.json", std::process::id()));
     let _ = std::fs::remove_file(&allow_path);
     let mut allow = Allowlist::load(&allow_path).unwrap();
-    allow.add(node_id.clone(), Some("test-node".into())).unwrap();
+    allow
+        .add(node_id.clone(), Some("test-node".into()))
+        .unwrap();
 
     // Node side runs in a task: connect + serve the hub's control RPCs.
     let rt = Arc::new(fake_runtime(vec![model_root.path().to_path_buf()]));
     let rt_node = rt.clone();
     let node_task = tokio::spawn(async move {
-        let (node_conn, _hello) = connect_node(&node, hub_addr, node_id, None).await.expect("connect");
+        let (node_conn, _hello) = connect_node(&node, hub_addr, node_id, None)
+            .await
+            .expect("connect");
         serve_node(node_conn, rt_node).await; // runs until the connection closes
     });
 
@@ -42,9 +46,20 @@ async fn node_hosts_two_workers_sysinfo_status_over_iroh() {
     let incoming = hub.accept().await.expect("incoming");
     let conn = incoming.await.expect("conn");
     let mut tokens = PairingTokens::new();
-    let outcome =
-        gate_connection(&conn, &mut allow, &mut tokens, 1, hub_id, None, HELLO_DEADLINE).await;
-    assert!(matches!(outcome, GateOutcome::Admitted { .. }), "node admitted");
+    let outcome = gate_connection(
+        &conn,
+        &mut allow,
+        &mut tokens,
+        1,
+        hub_id,
+        None,
+        HELLO_DEADLINE,
+    )
+    .await;
+    assert!(
+        matches!(outcome, GateOutcome::Admitted { .. }),
+        "node admitted"
+    );
 
     // Load two workers over iroh.
     let r1 = node_rpc(&conn, 1, M_NODE_LOAD, json!({ "id": model_id })).await;
@@ -58,8 +73,14 @@ async fn node_hosts_two_workers_sysinfo_status_over_iroh() {
     let sys = node_rpc(&conn, 3, M_NODE_SYSINFO, json!({})).await;
     assert!(sys.error.is_none(), "sysinfo ok: {sys:?}");
     let hw = sys.result.unwrap();
-    assert!(hw["hardware"]["cpu_cores"].as_u64().unwrap() > 0, "real cpu cores");
-    assert!(hw["hardware"]["ram_total_bytes"].as_u64().unwrap() > 0, "real ram");
+    assert!(
+        hw["hardware"]["cpu_cores"].as_u64().unwrap() > 0,
+        "real cpu cores"
+    );
+    assert!(
+        hw["hardware"]["ram_total_bytes"].as_u64().unwrap() > 0,
+        "real ram"
+    );
     assert!(hw["hardware"].get("gpus").is_some(), "gpu list present");
 
     let st = node_rpc(&conn, 4, M_NODE_STATUS, json!({ "worker_id": w1 })).await;

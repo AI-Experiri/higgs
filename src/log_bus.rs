@@ -596,7 +596,10 @@ mod tests {
     fn parses_remote_node_source_selector() {
         assert_eq!(
             LogSource::parse("node:1:2"),
-            Some(LogSource::RemoteWorker { node: NodeId(1), worker: WorkerId(2) })
+            Some(LogSource::RemoteWorker {
+                node: NodeId(1),
+                worker: WorkerId(2)
+            })
         );
         // Malformed selectors fall back to "all sources" (None).
         assert_eq!(LogSource::parse("node:1"), None);
@@ -607,24 +610,40 @@ mod tests {
     #[test]
     fn remote_worker_lines_are_keyed_and_separable() {
         let bus = LogBus::new();
-        let a = LogSource::RemoteWorker { node: NodeId(1), worker: WorkerId(1) };
-        let b = LogSource::RemoteWorker { node: NodeId(2), worker: WorkerId(1) };
+        let a = LogSource::RemoteWorker {
+            node: NodeId(1),
+            worker: WorkerId(1),
+        };
+        let b = LogSource::RemoteWorker {
+            node: NodeId(2),
+            worker: WorkerId(1),
+        };
         bus.push(a, "a-line".to_owned());
         bus.push(b, "b-line".to_owned());
         bus.push(a, "a-line-2".to_owned());
-        assert_eq!(bus.snapshot(10, Some(a)), vec!["a-line".to_owned(), "a-line-2".to_owned()]);
+        assert_eq!(
+            bus.snapshot(10, Some(a)),
+            vec!["a-line".to_owned(), "a-line-2".to_owned()]
+        );
         assert_eq!(bus.snapshot(10, Some(b)), vec!["b-line".to_owned()]);
         // Unfiltered interleaves both remote workers in arrival order.
         assert_eq!(
             bus.snapshot(10, None),
-            vec!["a-line".to_owned(), "b-line".to_owned(), "a-line-2".to_owned()]
+            vec![
+                "a-line".to_owned(),
+                "b-line".to_owned(),
+                "a-line-2".to_owned()
+            ]
         );
     }
 
     #[test]
     fn evict_remote_reclaims_a_dead_workers_ring() {
         let bus = LogBus::new();
-        let a = LogSource::RemoteWorker { node: NodeId(1), worker: WorkerId(7) };
+        let a = LogSource::RemoteWorker {
+            node: NodeId(1),
+            worker: WorkerId(7),
+        };
         bus.push(a, "x".to_owned());
         assert_eq!(bus.snapshot(10, Some(a)).len(), 1);
         bus.evict_remote(NodeId(1), WorkerId(7));
@@ -636,22 +655,44 @@ mod tests {
     #[test]
     fn evict_node_reclaims_all_of_a_nodes_rings() {
         let bus = LogBus::new();
-        let w1 = LogSource::RemoteWorker { node: NodeId(1), worker: WorkerId(1) };
-        let w2 = LogSource::RemoteWorker { node: NodeId(1), worker: WorkerId(2) };
-        let other = LogSource::RemoteWorker { node: NodeId(2), worker: WorkerId(1) };
+        let w1 = LogSource::RemoteWorker {
+            node: NodeId(1),
+            worker: WorkerId(1),
+        };
+        let w2 = LogSource::RemoteWorker {
+            node: NodeId(1),
+            worker: WorkerId(2),
+        };
+        let other = LogSource::RemoteWorker {
+            node: NodeId(2),
+            worker: WorkerId(1),
+        };
         bus.push(w1, "a".to_owned());
         bus.push(w2, "b".to_owned()); // a displaced worker's ring, off any current route
         bus.push(other, "c".to_owned());
         bus.evict_node(NodeId(1));
-        assert!(bus.snapshot(10, Some(w1)).is_empty(), "node 1 worker 1 reclaimed");
-        assert!(bus.snapshot(10, Some(w2)).is_empty(), "node 1 worker 2 reclaimed too");
-        assert_eq!(bus.snapshot(10, Some(other)), vec!["c".to_owned()], "other node untouched");
+        assert!(
+            bus.snapshot(10, Some(w1)).is_empty(),
+            "node 1 worker 1 reclaimed"
+        );
+        assert!(
+            bus.snapshot(10, Some(w2)).is_empty(),
+            "node 1 worker 2 reclaimed too"
+        );
+        assert_eq!(
+            bus.snapshot(10, Some(other)),
+            vec!["c".to_owned()],
+            "other node untouched"
+        );
     }
 
     #[test]
     fn remote_ring_is_capacity_bounded() {
         let bus = LogBus::new();
-        let a = LogSource::RemoteWorker { node: NodeId(1), worker: WorkerId(1) };
+        let a = LogSource::RemoteWorker {
+            node: NodeId(1),
+            worker: WorkerId(1),
+        };
         for i in 0..(RING_CAP + 10) {
             bus.push(a, format!("l{i}"));
         }

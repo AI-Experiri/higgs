@@ -25,7 +25,9 @@ pub(crate) fn fake_worker_factory() -> HalvesFactory {
         tokio::spawn(async move {
             let mut lines = BufReader::new(wr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                let Ok(RpcFrame::Request(r)) = rpc::decode(&line) else { continue };
+                let Ok(RpcFrame::Request(r)) = rpc::decode(&line) else {
+                    continue;
+                };
                 // M_CHAT streams N_CHAT_CHUNK notifications (echoing request_id) then a
                 // final response, mirroring the real worker — so the chat relay/transport
                 // can be exercised without llama.cpp.
@@ -75,14 +77,23 @@ pub(crate) fn fake_worker_factory() -> HalvesFactory {
                 }
             }
         });
-        Ok(WorkerHalves { write: Box::new(sup_w), read: Box::new(sup_r), proc: None })
+        Ok(WorkerHalves {
+            write: Box::new(sup_w),
+            read: Box::new(sup_r),
+            proc: None,
+        })
     })
 }
 
 /// A `NodeRuntime` whose workers are fakes (no llama.cpp), scanning `dirs` for models.
 pub(crate) fn fake_runtime(lmstudio_dirs: Vec<PathBuf>) -> NodeRuntime {
     NodeRuntime::with_spawner(
-        NodeConfig { bus: Arc::new(LogBus::new()), lmstudio_dirs, hf_dirs: vec![], ollama_dirs: vec![] },
+        NodeConfig {
+            bus: Arc::new(LogBus::new()),
+            lmstudio_dirs,
+            hf_dirs: vec![],
+            ollama_dirs: vec![],
+        },
         Box::new(|_bus| Supervisor::with_factory(fake_worker_factory())),
     )
 }
@@ -117,13 +128,22 @@ pub(crate) async fn node_rpc(
     params: Value,
 ) -> RpcResponse {
     let (mut send, recv) = conn.open_bi().await.expect("open control stream");
-    let req = RpcRequest { jsonrpc: "2.0".into(), id, method: method.into(), params };
+    let req = RpcRequest {
+        jsonrpc: "2.0".into(),
+        id,
+        method: method.into(),
+        params,
+    };
     send.write_all(format!("{}\n", rpc::encode(&RpcFrame::Request(req))).as_bytes())
         .await
         .expect("write request");
     send.finish().expect("finish");
     let mut lines = BufReader::new(recv).lines();
-    let line = lines.next_line().await.expect("read").expect("a response line");
+    let line = lines
+        .next_line()
+        .await
+        .expect("read")
+        .expect("a response line");
     match rpc::decode(&line).expect("decode response") {
         RpcFrame::Response(r) => r,
         other => panic!("expected response, got {other:?}"),

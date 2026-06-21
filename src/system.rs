@@ -124,7 +124,11 @@ impl SystemInfo {
     /// `vram_total_bytes`. Pass an empty vec when no worker could be reached.
     pub fn gather(config: HiggsServerConfig, gpus: Vec<GpuDevice>) -> Self {
         let (hardware, runtime) = Self::gather_hardware_runtime(gpus);
-        SystemInfo { hardware, runtime, config }
+        SystemInfo {
+            hardware,
+            runtime,
+            config,
+        }
     }
 
     /// Sample just the host hardware + runtime (no server config) — used by a node, which
