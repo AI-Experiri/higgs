@@ -10,7 +10,7 @@ use crate::node::runtime::NodeRuntime;
 use crate::node::worker_id::WorkerId;
 use crate::remote::{
     NodeLoadParams, NodeLoadResult, WorkerRef, M_NODE_INVENTORY, M_NODE_KILL, M_NODE_LOAD,
-    M_NODE_SCAN, M_NODE_STATUS, M_NODE_SYSINFO, M_NODE_UNLOAD,
+    M_NODE_SCAN, M_NODE_STATUS, M_NODE_SYSINFO, M_NODE_UNLOAD, M_NODE_UPDATE,
 };
 use crate::rpc::{RpcError, RpcRequest, RpcResponse};
 
@@ -63,6 +63,12 @@ pub async fn dispatch_node_control(rt: &NodeRuntime, req: RpcRequest) -> RpcResp
             Ok(v) => ok_value(id, v),
             Err(e) => err_from(id, &e),
         },
+        // #18: the update handshake is recognized but unimplemented — typed HG026 refusal
+        // (the real signature-verified updater is a later task; `update` cap is `false`).
+        M_NODE_UPDATE => err_from(
+            id,
+            &HiggsError::UpdateUnsupported { detail: "this build ships no updater".into() },
+        ),
         other => err(id, METHOD_NOT_FOUND, format!("unknown control method {other}"), None),
     }
 }
@@ -139,6 +145,15 @@ mod tests {
         let e = resp.error.unwrap();
         assert_eq!(e.code, INTERNAL_ERROR);
         assert_eq!(e.data.unwrap()["code"], "HG002");
+    }
+
+    #[tokio::test]
+    async fn update_is_recognized_but_refused_hg026() {
+        let rt = fake_runtime();
+        let resp = dispatch_node_control(&rt, req(1, M_NODE_UPDATE, json!({}))).await;
+        let e = resp.error.expect("update refused");
+        assert_eq!(e.code, INTERNAL_ERROR);
+        assert_eq!(e.data.unwrap()["code"], "HG026", "typed update-unsupported");
     }
 
     #[tokio::test]

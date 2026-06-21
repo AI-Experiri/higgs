@@ -38,6 +38,11 @@ pub const M_NODE_STATUS: &str = "higgs/node/status";
 /// snapshot. The hub calls it after admit (and on refresh) to populate its fleet view
 /// (DESIGN-remote.md §4.2.1, P4). Takes `{}`.
 pub const M_NODE_INVENTORY: &str = "higgs/node/inventory";
+/// `higgs/node/update` — RESERVED handshake for a future signature-verified self-update
+/// (DESIGN-remote.md §9, #18). This build only recognizes the method and refuses it with a
+/// typed `HG026`; the real updater (minisign-verified download + swap) is a later task. The
+/// `update` capability is advertised `false` so a well-behaved peer never sends it.
+pub const M_NODE_UPDATE: &str = "higgs/node/update";
 
 /// The wire-protocol majors this build speaks.
 pub const PROTOCOL_VERSIONS: &[u32] = &[1];

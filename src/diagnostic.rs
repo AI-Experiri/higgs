@@ -221,6 +221,14 @@ pub enum HiggsError {
     #[snafu(display("[HG027] node {endpoint_id} unreachable; retired from fleet: {detail}"))]
     #[diagnostic(code(HG027))]
     NodeUnreachable { endpoint_id: String, detail: String },
+
+    /// A peer requested `M_UPDATE` but this build ships only the update *handshake* stub —
+    /// no real updater yet (signature-verified self-update is a later task, §9). The
+    /// capability is advertised as `false`, so a well-behaved peer never sends it; this is
+    /// the typed refusal for one that does anyway.
+    #[snafu(display("[HG026] software update not supported by this build: {detail}"))]
+    #[diagnostic(code(HG026))]
+    UpdateUnsupported { detail: String },
 }
 
 #[cfg(test)]
