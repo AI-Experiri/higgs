@@ -173,14 +173,36 @@ mod tests {
     ///
     /// A non-loopback bind (`0.0.0.0`) is used so the security-warning branch is
     /// also exercised; binding `0.0.0.0:0` is fine for a localhost test client.
+    // TEST_ENV_LOCK (a std Mutex) is intentionally held across awaits to serialize the whole
+    // env-overridden run; this is a #[tokio::test] (current-thread) and the only other holder
+    // is a sync test, so there's no deadlock/Send hazard.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn run_standalone_serves_and_shuts_down() {
         // Isolate HIGGS_HOME so `run_standalone` never loads the dev/CI machine's real
         // `~/.higgs/api_keys.json` — a present keystore would turn auth ON and 401 the
-        // no-token `/api/higgs/status` poll below. Held for the test's lifetime.
+        // no-token `/api/higgs/status` poll below. Serialize with other env-mutating tests
+        // (shared lock) and RESTORE the prior value at the end so nothing leaks. The lock +
+        // `home` TempDir are held for the whole test.
+        let _env = crate::TEST_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = tempfile::tempdir().unwrap();
-        // SAFETY: single-process test; HIGGS_HOME is read by run_standalone's key load.
+        let prev_home = std::env::var_os("HIGGS_HOME");
+        // SAFETY: serialized by TEST_ENV_LOCK; restored before the lock releases.
         unsafe { std::env::set_var("HIGGS_HOME", home.path()) };
+        // Restore on every exit path (drops in reverse order: this runs, then `home`, then lock).
+        struct RestoreHome(Option<std::ffi::OsString>);
+        impl Drop for RestoreHome {
+            fn drop(&mut self) {
+                // SAFETY: still under TEST_ENV_LOCK.
+                unsafe {
+                    match self.0.take() {
+                        Some(v) => std::env::set_var("HIGGS_HOME", v),
+                        None => std::env::remove_var("HIGGS_HOME"),
+                    }
+                }
+            }
+        }
+        let _restore = RestoreHome(prev_home);
 
         // Reserve an ephemeral port, read it back, then drop the listener so
         // run_standalone can bind the same addr. (run_standalone binds itself.)

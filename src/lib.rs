@@ -34,6 +34,13 @@ pub use log_bus::{log_filter, HiggsLogLayer, LogBus};
 pub use standalone::{run_standalone, shutdown_signal, StandaloneConfig};
 pub use supervisor::HiggsEvent;
 
+/// Serializes lib tests that mutate the process-global `HIGGS_HOME` env var (which cargo runs
+/// in parallel threads of one process), so they never read each other's override or a path
+/// whose `TempDir` has been dropped. Each such test takes this lock, snapshots + sets the var,
+/// and restores it before releasing. Test-only.
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The `llama-cpp-2` Rust binding crate version bundled with this build.
 ///
 /// This is the BINDING version, not the engine version — the underlying engine
