@@ -78,6 +78,12 @@ pub struct HubFleet {
     /// The hub's Developer-Log bus: relayed remote worker stderr lands here under
     /// `LogSource::RemoteWorker { node, worker }` so it shares the operator's log console.
     bus: Arc<LogBus>,
+    /// Unloads the hub OWES a node but couldn't deliver because the node was disconnected
+    /// (e.g. a cross-node reload displaced a worker on a node that was offline). Drained on
+    /// the node's next reconnect (`reconcile_pending_unloads`) so the displaced worker is
+    /// reaped instead of leaking RAM/VRAM forever. Distinct from the hub-restart case (no
+    /// pending entries → node-reported workers are preserved, not killed).
+    pending_unloads: Mutex<std::collections::HashSet<(NodeKey, WorkerId)>>,
 }
 
 impl HubFleet {
@@ -91,6 +97,7 @@ impl HubFleet {
             inventories: Mutex::new(HashMap::new()),
             epochs: Mutex::new(HashMap::new()),
             bus,
+            pending_unloads: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -127,11 +134,13 @@ impl HubFleet {
         // Bump the generation on (re)admission so any inventory fetch from a PRIOR connection
         // still in flight can't commit its now-stale result over this fresh one.
         self.bump_epoch(&node);
-        // Fetch the node's inventory for the fleet view (best-effort, off the hot path).
+        // On (re)connect: deliver any unloads owed to this node (displaced-while-offline
+        // workers), THEN refresh the inventory for the fleet view. Best-effort, off the hot path.
         let inv_weak = Arc::downgrade(self);
         let inv_node = node.clone();
         tokio::spawn(async move {
             if let Some(fleet) = inv_weak.upgrade() {
+                fleet.reconcile_pending_unloads(&inv_node).await;
                 let _ = fleet.refresh_inventory(&inv_node).await;
             }
         });
@@ -236,6 +245,8 @@ impl HubFleet {
         // after this removal.
         self.bump_epoch(node);
         self.inventories.lock().remove(node);
+        // The node is gone for good — drop any unloads we were owing it.
+        self.pending_unloads.lock().retain(|(n, _)| n != node);
     }
 
     pub fn node_ids(&self) -> Vec<NodeKey> {
@@ -316,11 +327,10 @@ impl HubFleet {
         let displaced = self.routes.lock().insert(model.to_string(), new.clone());
         if let Some(old) = displaced {
             if old != new {
-                // Unload the worker this load displaced. Best-effort: if the OLD node is
-                // currently disconnected (a cross-node reload during a blip) the unload is
-                // skipped and that worker is reconciled when the node reconnects and reports
-                // its resident workers via M_INVENTORY (P4) — the hub then reaps workers it
-                // no longer has a route for. Not handled with an ad-hoc pending queue here.
+                // Unload the worker this load displaced. If the OLD node is currently
+                // disconnected (a cross-node reload during a blip) the unload is recorded as
+                // a pending unload and delivered when that node reconnects
+                // (`reconcile_pending_unloads`), so the displaced worker is never leaked.
                 self.best_effort_unload(&old).await;
             }
         }
@@ -331,18 +341,53 @@ impl HubFleet {
     }
 
     /// Best-effort unload of a displaced worker via its node's CURRENT transport, also
-    /// reclaiming its relayed-log ring so a reload doesn't leak the old worker's lines.
+    /// reclaiming its relayed-log ring so a reload doesn't leak the old worker's lines. If the
+    /// node is DISCONNECTED the unload can't be delivered, so it's recorded as pending and
+    /// reaped on the node's next reconnect — never silently leaked.
     async fn best_effort_unload(&self, route: &(NodeKey, WorkerId)) {
         if let Some(nid) = self.node_id(&route.0) {
             self.bus.evict_remote(nid, route.1);
         }
-        if let Ok(t) = self.transport(&route.0) {
-            let _ = t.request(M_NODE_UNLOAD, json!({ "worker_id": route.1 .0 })).await;
+        match self.transport(&route.0) {
+            Ok(t) => {
+                let _ = t.request(M_NODE_UNLOAD, json!({ "worker_id": route.1 .0 })).await;
+                self.pending_unloads.lock().remove(route);
+            }
+            // Node offline — owe it the unload until it reconnects.
+            Err(_) => {
+                self.pending_unloads.lock().insert(route.clone());
+            }
         }
         // Re-sync the DISPLACED node's fleet view (it may differ from the load's target node
         // on a cross-node reload, where the caller only refreshes the new node).
         self.bump_epoch(&route.0);
         let _ = self.refresh_inventory(&route.0).await;
+    }
+
+    /// Deliver any unloads owed to `node` (recorded while it was offline), now that it's
+    /// reconnected — so a worker displaced during a disconnect is reaped rather than leaked.
+    /// Only targets workers the hub explicitly tried to unload (never the node's legitimate
+    /// resident workers a fresh hub simply hasn't routed yet).
+    async fn reconcile_pending_unloads(&self, node: &str) {
+        let owed: Vec<WorkerId> = self
+            .pending_unloads
+            .lock()
+            .iter()
+            .filter(|(n, _)| n == node)
+            .map(|(_, w)| *w)
+            .collect();
+        if owed.is_empty() {
+            return;
+        }
+        let Ok(t) = self.transport(node) else { return };
+        for w in owed {
+            if t.request(M_NODE_UNLOAD, json!({ "worker_id": w.0 })).await.is_ok() {
+                self.pending_unloads.lock().remove(&(node.to_string(), w));
+                if let Some(nid) = self.node_id(node) {
+                    self.bus.evict_remote(nid, w);
+                }
+            }
+        }
     }
 
     /// Unload a model's remote worker and drop its route.
@@ -568,6 +613,34 @@ mod tests {
         // After retiring the node, the route is gone → not advertised.
         fleet.retire(&node_key);
         assert!(fleet.routed_models().is_empty());
+    }
+
+    #[tokio::test]
+    async fn displaced_unload_to_offline_node_is_recorded_then_reconciled() {
+        let (fleet, node_key, model_id, _root) = fleet_with_one_node().await;
+        let w = fleet.load(&node_key, &model_id).await.unwrap();
+
+        // An unload owed to a node that ISN'T connected is recorded as pending (not lost).
+        fleet.best_effort_unload(&("offline-node".to_string(), w)).await;
+        assert!(
+            fleet.pending_unloads.lock().contains(&("offline-node".to_string(), w)),
+            "unload to an offline node is recorded as pending"
+        );
+
+        // When a node with a pending unload reconnects, reconciliation delivers it (the
+        // connected fake node answers M_NODE_UNLOAD), clearing the pending entry.
+        fleet.pending_unloads.lock().insert((node_key.clone(), w));
+        fleet.reconcile_pending_unloads(&node_key).await;
+        assert!(
+            !fleet.pending_unloads.lock().contains(&(node_key.clone(), w)),
+            "reconnect drains the owed unload"
+        );
+
+        // Retiring a node clears anything still owed to it.
+        fleet.best_effort_unload(&("gone".to_string(), w)).await;
+        assert!(fleet.pending_unloads.lock().contains(&("gone".to_string(), w)));
+        fleet.retire("gone");
+        assert!(fleet.pending_unloads.lock().iter().all(|(n, _)| n != "gone"));
     }
 
     #[test]
