@@ -23,6 +23,10 @@
 #   scripts/coverage.sh                      # run BOTH gates (default)
 #   scripts/coverage.sh -u | --unit          # run only the unit gate
 #   scripts/coverage.sh -i | --integration   # run only the integration gate
+#
+# When both gates run, BOTH are executed even if the first fails (no early
+# abort), and a combined pass/fail + line-% summary is printed at the end; the
+# script exits non-zero if any selected gate failed.
 #   scripts/coverage.sh --html               # also write HTML report(s) under target/
 #   scripts/coverage.sh -u --open            # unit gate + open its HTML report
 #   scripts/coverage.sh --summary-only       # terse per-file summary
@@ -63,25 +67,60 @@ fi
 # Safe expansion of a possibly-empty array under `set -u` (macOS bash 3.2).
 args=("${passthrough[@]+${passthrough[@]}}")
 
-ran_both=false
-if $select_unit && $select_integration; then
-  ran_both=true
-fi
+# Run a gate WITHOUT aborting on failure, streaming its output while capturing
+# it so we can report the line-% and pass/fail in the end-of-run summary. When
+# both gates run, this lets the second gate run even if the first failed — you
+# always see both results. Records into the parallel summary_* arrays.
+tmpdir="$(mktemp -d)"
+trap 'rm -rf "$tmpdir"' EXIT
+summary_names=()
+summary_pcts=()
+summary_status=()
+overall=0
+
+run_gate() {
+  local name="$1" threshold="$2" script="$3"; shift 3
+  local out="$tmpdir/$name.out" rc pct upper
+  upper="$(printf '%s' "$name" | tr '[:lower:]' '[:upper:]')"
+  echo "===== ${upper} gate (>= ${threshold}%) ====="
+  set +e
+  "$script" "$@" 2>&1 | tee "$out"
+  rc=${PIPESTATUS[0]}
+  set -e
+  # The LAST % column on llvm-cov's TOTAL row is LINES (the gated metric).
+  pct="$(awk '/^TOTAL/ {print $(NF-3)}' "$out" | tail -1)"
+  [ -n "$pct" ] || pct="n/a"
+  summary_names+=("$name")
+  summary_pcts+=("$pct")
+  if [ "$rc" -eq 0 ]; then
+    summary_status+=("PASS")
+  else
+    summary_status+=("FAIL")
+    overall=1
+  fi
+}
 
 if $select_unit; then
-  echo "===== UNIT gate (cargo test --lib, >= 90%) ====="
-  ./coverage-unit.sh "${args[@]+${args[@]}}"
+  run_gate unit 90 ./coverage-unit.sh "${args[@]+${args[@]}}"
 fi
-
 if $select_integration; then
-  $ran_both && echo
-  echo "===== INTEGRATION gate (tests/ only, >= 75%) ====="
-  ./coverage-integration.sh "${args[@]+${args[@]}}"
+  $select_unit && echo
+  run_gate integration 75 ./coverage-integration.sh "${args[@]+${args[@]}}"
 fi
 
+# End-of-run summary: both (or the one selected) gate results together.
 echo
-if $ran_both; then
-  echo "Both coverage gates passed."
+echo "===== COVERAGE SUMMARY ====="
+i=0
+while [ "$i" -lt "${#summary_names[@]}" ]; do
+  printf '  %-12s %-8s lines   %s\n' \
+    "${summary_names[$i]}" "${summary_pcts[$i]}" "${summary_status[$i]}"
+  i=$((i + 1))
+done
+echo
+if [ "$overall" -eq 0 ]; then
+  echo "All selected coverage gates passed."
 else
-  echo "Selected coverage gate passed."
+  echo "One or more coverage gates FAILED."
 fi
+exit "$overall"
