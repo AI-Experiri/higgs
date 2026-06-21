@@ -33,6 +33,11 @@ pub const M_NODE_KILL: &str = "higgs/node/kill";
 pub const M_NODE_SCAN: &str = "higgs/node/scan";
 pub const M_NODE_SYSINFO: &str = "higgs/node/sysinfo";
 pub const M_NODE_STATUS: &str = "higgs/node/status";
+/// `higgs/node/inventory` — a node's full self-description in one call: host identity
+/// (hostname/os), every resident worker (`worker_id` → model), and the hardware/runtime
+/// snapshot. The hub calls it after admit (and on refresh) to populate its fleet view
+/// (DESIGN-remote.md §4.2.1, P4). Takes `{}`.
+pub const M_NODE_INVENTORY: &str = "higgs/node/inventory";
 
 /// The wire-protocol majors this build speaks.
 pub const PROTOCOL_VERSIONS: &[u32] = &[1];
@@ -136,6 +141,29 @@ pub struct WorkerRef {
 pub struct NodeLoadResult {
     pub worker_id: u32,
     pub loaded: serde_json::Value,
+}
+
+/// One resident worker in a node's [`NodeInventory`]: its node-local id and the model it
+/// currently serves.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InventoryWorker {
+    pub worker_id: u32,
+    pub model: String,
+}
+
+/// A node's `M_NODE_INVENTORY` reply: host identity + resident workers + hardware/runtime.
+/// The hub folds this into its per-node `NodeView` (§4.2.1). Hardware/runtime reuse the same
+/// shapes as `M_NODE_SYSINFO` (they gained `Deserialize` for this).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeInventory {
+    /// Node hostname (best-effort; empty if unavailable).
+    pub hostname: String,
+    /// Node OS, e.g. `"macos"` / `"linux"`.
+    pub os: String,
+    /// Every worker resident on the node right now.
+    pub workers: Vec<InventoryWorker>,
+    pub hardware: crate::system::HardwareInfo,
+    pub runtime: crate::system::RuntimeInfo,
 }
 
 /// Hub → node `M_CHAT` (`higgs/chat`) params on a DATA stream: the worker selector +

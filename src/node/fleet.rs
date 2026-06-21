@@ -27,7 +27,9 @@ use crate::log_bus::{LogBus, LogSource};
 use crate::node::node_id::{NodeId, NodeIdAllocator};
 use crate::node::transport::NodeTransport;
 use crate::node::worker_id::WorkerId;
-use crate::remote::{M_NODE_KILL, M_NODE_LOAD, M_NODE_UNLOAD, N_LOG_LINE};
+use crate::remote::{
+    NodeInventory, M_NODE_INVENTORY, M_NODE_KILL, M_NODE_LOAD, M_NODE_UNLOAD, N_LOG_LINE,
+};
 use crate::rpc::{self, RpcFrame};
 
 /// A node key — the peer's canonical `EndpointId` string (same form as the allowlist).
@@ -47,6 +49,17 @@ fn route_invalidating(e: &HiggsError) -> bool {
     )
 }
 
+/// The hub's UI/API view of one paired node: its stable id, endpoint, whether it's currently
+/// connected, and its last-fetched inventory (host + resident workers + hardware/runtime).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct NodeView {
+    pub node_id: u32,
+    pub endpoint_id: String,
+    pub connected: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inventory: Option<NodeInventory>,
+}
+
 /// The hub's view of its remote fleet.
 pub struct HubFleet {
     /// Currently-connected nodes → their live transport (absent while disconnected).
@@ -55,6 +68,13 @@ pub struct HubFleet {
     routes: Mutex<HashMap<String, (NodeKey, WorkerId)>>,
     /// Stable hub-local [`NodeId`] per `EndpointId`, for `LogSource::RemoteWorker` tagging.
     node_ids: Mutex<NodeIdAllocator>,
+    /// Last-fetched inventory per node (host + workers + hw/rt), refreshed on connect and
+    /// after every hub-driven lifecycle change. The node's reply is authoritative.
+    inventories: Mutex<HashMap<NodeKey, NodeInventory>>,
+    /// Per-node lifecycle generation, bumped on every load/unload/kill/route-drop. A
+    /// `refresh_inventory` only commits its (possibly in-flight, now stale) result if this is
+    /// unchanged since it started — so a slow connect-time fetch can't clobber a newer state.
+    epochs: Mutex<HashMap<NodeKey, u64>>,
     /// The hub's Developer-Log bus: relayed remote worker stderr lands here under
     /// `LogSource::RemoteWorker { node, worker }` so it shares the operator's log console.
     bus: Arc<LogBus>,
@@ -68,6 +88,8 @@ impl HubFleet {
             nodes: Mutex::new(HashMap::new()),
             routes: Mutex::new(HashMap::new()),
             node_ids: Mutex::new(NodeIdAllocator::new()),
+            inventories: Mutex::new(HashMap::new()),
+            epochs: Mutex::new(HashMap::new()),
             bus,
         }
     }
@@ -96,6 +118,18 @@ impl HubFleet {
         if let Some(old) = replaced {
             old.close(); // free the old connection + wake its close-watcher
         }
+        // Bump the generation on (re)admission so any inventory fetch from a PRIOR connection
+        // still in flight can't commit its now-stale result over this fresh one.
+        self.bump_epoch(&node);
+        // Fetch the node's inventory for the fleet view (best-effort, off the hot path).
+        let inv_weak = Arc::downgrade(self);
+        let inv_node = node.clone();
+        tokio::spawn(async move {
+            if let Some(fleet) = inv_weak.upgrade() {
+                let _ = fleet.refresh_inventory(&inv_node).await;
+            }
+        });
+
         let weak = Arc::downgrade(self);
         let watched = transport;
         tokio::spawn(async move {
@@ -104,6 +138,59 @@ impl HubFleet {
                 fleet.drop_transport_if(&node, &watched);
             }
         });
+    }
+
+    /// Fetch `node`'s inventory over its live transport and cache it for the fleet view.
+    ///
+    /// Fetch `node`'s inventory over its live transport and cache it for the fleet view. The
+    /// node's `M_NODE_INVENTORY` reply is AUTHORITATIVE (its real resident workers) and stored
+    /// verbatim — except a result is dropped if a lifecycle op changed this node's generation
+    /// while the request was in flight (a newer op's own refresh wins), so a slow connect-time
+    /// fetch can never resurrect a stale worker list.
+    pub async fn refresh_inventory(&self, node: &str) -> Result<NodeInventory, HiggsError> {
+        let epoch_before = self.epoch(node);
+        let transport = self.transport(node)?;
+        let value = transport
+            .request(M_NODE_INVENTORY, json!({}))
+            .await
+            .map_err(|e| self.handle_op_error(node, &transport, e))?;
+        let inventory: NodeInventory = serde_json::from_value(value).map_err(|e| {
+            HiggsError::WorkerDead { context: format!("node inventory decode failed: {e}") }
+        })?;
+        // Commit only if no lifecycle op superseded us (epochs locked across the check+store).
+        let mut epochs = self.epochs.lock();
+        if *epochs.entry(node.to_string()).or_insert(0) == epoch_before {
+            self.inventories.lock().insert(node.to_string(), inventory.clone());
+        }
+        Ok(inventory)
+    }
+
+    /// This node's current lifecycle generation (0 if never touched).
+    fn epoch(&self, node: &str) -> u64 {
+        self.epochs.lock().get(node).copied().unwrap_or(0)
+    }
+
+    /// Bump a node's lifecycle generation — call AFTER mutating its routes so any in-flight
+    /// `refresh_inventory` for it is invalidated and won't commit a pre-change snapshot.
+    fn bump_epoch(&self, node: &str) {
+        *self.epochs.lock().entry(node.to_string()).or_insert(0) += 1;
+    }
+
+    /// The fleet view: one [`NodeView`] per node the hub has ever admitted, with live
+    /// connected state + last-fetched inventory. Sorted by `NodeId` (stable order).
+    pub fn nodes_view(&self) -> Vec<NodeView> {
+        let assigned = self.node_ids.lock().all();
+        let nodes = self.nodes.lock();
+        let inventories = self.inventories.lock();
+        assigned
+            .into_iter()
+            .map(|(endpoint_id, node_id)| NodeView {
+                node_id: node_id.0,
+                connected: nodes.contains_key(&endpoint_id),
+                inventory: inventories.get(&endpoint_id).cloned(),
+                endpoint_id,
+            })
+            .collect()
     }
 
     /// On connection close, remove ONLY the transport — and only if it's still the current
@@ -139,6 +226,10 @@ impl HubFleet {
             self.bus.evict_node(nid);
         }
         self.routes.lock().retain(|_, (n, _)| n != node);
+        // Bump the generation so a refresh already in flight can't reinsert stale inventory
+        // after this removal.
+        self.bump_epoch(node);
+        self.inventories.lock().remove(node);
     }
 
     pub fn node_ids(&self) -> Vec<NodeKey> {
@@ -160,11 +251,26 @@ impl HubFleet {
     }
 
     /// Remove a route only if it STILL equals `expected` — so a route from a concurrent op
-    /// (which awaits a remote RPC) is never clobbered.
+    /// (which awaits a remote RPC) is never clobbered. When the route is actually removed,
+    /// also reclaim the worker's relayed-log ring and drop it from the cached fleet view, so
+    /// EVERY route-drop path (explicit unload/kill AND a chat-time worker-gone) keeps the
+    /// node's logs + `/api/higgs/nodes` consistent.
     fn remove_route_if(&self, model: &str, expected: &(NodeKey, WorkerId)) {
-        let mut routes = self.routes.lock();
-        if routes.get(model) == Some(expected) {
-            routes.remove(model);
+        let removed = {
+            let mut routes = self.routes.lock();
+            if routes.get(model) == Some(expected) {
+                routes.remove(model).is_some()
+            } else {
+                false
+            }
+        };
+        if removed {
+            let (node, worker) = expected;
+            if let Some(nid) = self.node_id(node) {
+                self.bus.evict_remote(nid, *worker);
+            }
+            // Invalidate any in-flight inventory fetch; the caller refreshes after.
+            self.bump_epoch(node);
         }
     }
 
@@ -212,6 +318,9 @@ impl HubFleet {
                 self.best_effort_unload(&old).await;
             }
         }
+        // Refresh the fleet view from the node's authoritative state after the load lands.
+        self.bump_epoch(node);
+        let _ = self.refresh_inventory(node).await;
         Ok(new.1)
     }
 
@@ -224,6 +333,10 @@ impl HubFleet {
         if let Ok(t) = self.transport(&route.0) {
             let _ = t.request(M_NODE_UNLOAD, json!({ "worker_id": route.1 .0 })).await;
         }
+        // Re-sync the DISPLACED node's fleet view (it may differ from the load's target node
+        // on a cross-node reload, where the caller only refreshes the new node).
+        self.bump_epoch(&route.0);
+        let _ = self.refresh_inventory(&route.0).await;
     }
 
     /// Unload a model's remote worker and drop its route.
@@ -245,11 +358,10 @@ impl HubFleet {
         let transport = self.transport(&node)?;
         let res = transport.request(method, json!({ "worker_id": worker.0 })).await;
         if res.is_ok() || res.as_ref().err().is_some_and(route_invalidating) {
+            // remove_route_if reclaims the log ring + bumps the node's generation.
             self.remove_route_if(model, &(node.clone(), worker));
-            // The worker is gone — reclaim its relayed-log ring on the hub bus.
-            if let Some(nid) = self.node_id(&node) {
-                self.bus.evict_remote(nid, worker);
-            }
+            // Re-sync the fleet view from the node's authoritative state.
+            let _ = self.refresh_inventory(&node).await;
         }
         res.map(|_| ()).map_err(|e| self.handle_op_error(&node, &transport, e))
     }
@@ -310,8 +422,10 @@ impl HubFleet {
             match fut.await {
                 Ok(v) => Ok(v),
                 Err(e) if route_invalidating(&e) => {
-                    // Worker gone (node alive) — drop the route so a retry re-resolves.
+                    // Worker gone (node alive) — drop the route so a retry re-resolves, and
+                    // re-sync the fleet view (remove_route_if bumped the node's generation).
                     fleet.remove_route_if(&model, &(node.clone(), worker));
+                    let _ = fleet.refresh_inventory(&node).await;
                     Err(e)
                 }
                 // Transport-level / other failure surfacing mid-stream: drop the dead
@@ -455,6 +569,40 @@ mod tests {
         let fleet = Arc::new(HubFleet::new(Arc::new(crate::log_bus::LogBus::new())));
         let err = fleet.load("ghost", "m").await.unwrap_err();
         assert!(err.to_string().starts_with("[HG027]"), "got {err}");
+    }
+
+    #[tokio::test]
+    async fn nodes_view_reflects_inventory_and_connection() {
+        let (fleet, node_key, model_id, _root) = fleet_with_one_node().await;
+        // Establish the inventory cache BEFORE any load (mirrors the connect-time fetch).
+        let inv = fleet.refresh_inventory(&node_key).await.unwrap();
+        assert!(inv.hardware.cpu_cores > 0, "inventory carries real hardware");
+
+        // A hub-driven load patches the cached view immediately (no second refresh).
+        let w = fleet.load(&node_key, &model_id).await.unwrap();
+        let workers = fleet.nodes_view()[0].inventory.as_ref().unwrap().workers.clone();
+        assert!(
+            workers.iter().any(|x| x.worker_id == w.0 && x.model == model_id),
+            "load patches the cached inventory: {workers:?}"
+        );
+        // Unload patches it back out.
+        fleet.unload(&model_id).await.unwrap();
+        let workers = fleet.nodes_view()[0].inventory.as_ref().unwrap().workers.clone();
+        assert!(workers.iter().all(|x| x.worker_id != w.0), "unload removes it from the view");
+
+        let views = fleet.nodes_view();
+        assert_eq!(views.len(), 1, "one node in the fleet view");
+        let v = &views[0];
+        assert_eq!(v.endpoint_id, node_key);
+        assert!(v.connected, "node is connected");
+        assert!(v.inventory.is_some(), "view carries the fetched inventory");
+
+        // After retire the node is still listed (id is durable) but disconnected + no inventory.
+        fleet.retire(&node_key);
+        let views = fleet.nodes_view();
+        assert_eq!(views.len(), 1, "retired node keeps its durable id slot");
+        assert!(!views[0].connected, "retired node is disconnected");
+        assert!(views[0].inventory.is_none(), "retire clears the cached inventory");
     }
 
     #[tokio::test]

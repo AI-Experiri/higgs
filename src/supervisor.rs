@@ -645,6 +645,16 @@ impl Supervisor {
         *self.inner.last_load.lock() = Some(params);
     }
 
+    /// The model id of the last recorded load (`None` if nothing is loaded). Used by the
+    /// node runtime to report each resident worker's model in `M_NODE_INVENTORY`.
+    pub(crate) fn loaded_model_id(&self) -> Option<String> {
+        self.inner
+            .last_load
+            .lock()
+            .as_ref()
+            .and_then(|p| p.get("id").and_then(Value::as_str).map(str::to_string))
+    }
+
     /// Forget the recorded `higgs/load` replay params — called after an explicit
     /// unload so a later unexpected worker restart does NOT reload the model the
     /// user just unloaded.

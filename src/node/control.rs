@@ -9,8 +9,8 @@ use crate::diagnostic::HiggsError;
 use crate::node::runtime::NodeRuntime;
 use crate::node::worker_id::WorkerId;
 use crate::remote::{
-    NodeLoadParams, NodeLoadResult, WorkerRef, M_NODE_KILL, M_NODE_LOAD, M_NODE_SCAN,
-    M_NODE_STATUS, M_NODE_SYSINFO, M_NODE_UNLOAD,
+    NodeLoadParams, NodeLoadResult, WorkerRef, M_NODE_INVENTORY, M_NODE_KILL, M_NODE_LOAD,
+    M_NODE_SCAN, M_NODE_STATUS, M_NODE_SYSINFO, M_NODE_UNLOAD,
 };
 use crate::rpc::{RpcError, RpcRequest, RpcResponse};
 
@@ -56,6 +56,10 @@ pub async fn dispatch_node_control(rt: &NodeRuntime, req: RpcRequest) -> RpcResp
             Err(e) => err_from(id, &e),
         },
         M_NODE_SCAN => match rt.scan().await {
+            Ok(v) => ok_value(id, v),
+            Err(e) => err_from(id, &e),
+        },
+        M_NODE_INVENTORY => match rt.inventory().await {
             Ok(v) => ok_value(id, v),
             Err(e) => err_from(id, &e),
         },
@@ -135,6 +139,17 @@ mod tests {
         let e = resp.error.unwrap();
         assert_eq!(e.code, INTERNAL_ERROR);
         assert_eq!(e.data.unwrap()["code"], "HG002");
+    }
+
+    #[tokio::test]
+    async fn inventory_dispatch_reports_host_and_no_workers() {
+        let rt = fake_runtime(); // empty registry
+        let resp = dispatch_node_control(&rt, req(1, M_NODE_INVENTORY, json!({}))).await;
+        assert!(resp.error.is_none(), "inventory ok: {resp:?}");
+        let inv = resp.result.unwrap();
+        assert!(inv["hardware"]["cpu_cores"].as_u64().unwrap() > 0, "real hw");
+        assert!(!inv["os"].as_str().unwrap().is_empty(), "os present");
+        assert!(inv["workers"].as_array().unwrap().is_empty(), "no workers loaded");
     }
 
     #[tokio::test]

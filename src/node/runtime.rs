@@ -281,6 +281,38 @@ impl NodeRuntime {
         Ok(json!({ "hardware": hardware, "runtime": runtime }))
     }
 
+    /// Full node self-description for `M_NODE_INVENTORY`: host identity + every resident
+    /// worker (id → model, read from its recorded load) + the hardware/runtime snapshot.
+    pub async fn inventory(&self) -> Result<Value, HiggsError> {
+        let workers: Vec<crate::remote::InventoryWorker> = {
+            let reg = self.registry.lock();
+            reg.ids()
+                .into_iter()
+                .filter_map(|id| {
+                    reg.get(id).map(|sup| crate::remote::InventoryWorker {
+                        worker_id: id.0,
+                        model: sup.loaded_model_id().unwrap_or_default(),
+                    })
+                })
+                .collect()
+        };
+        let sup = (self.spawner)(self.config.bus.clone());
+        let gpus = sup.sysinfo().await;
+        let (hardware, runtime) =
+            tokio::task::spawn_blocking(move || crate::system::SystemInfo::gather_hardware_runtime(gpus))
+                .await
+                .map_err(|e| HiggsError::WorkerDead { context: format!("inventory task failed: {e}") })?;
+        let inventory = crate::remote::NodeInventory {
+            hostname: sysinfo::System::host_name().unwrap_or_default(),
+            os: std::env::consts::OS.to_string(),
+            workers,
+            hardware,
+            runtime,
+        };
+        serde_json::to_value(inventory)
+            .map_err(|e| HiggsError::WorkerDead { context: format!("inventory serialize failed: {e}") })
+    }
+
     /// Look up a worker's Supervisor for the data-plane chat relay (P2 Task 5).
     #[allow(dead_code)] // consumed by the data relay in P2 Task 5
     pub(crate) fn chat_handle(&self, id: WorkerId) -> Result<Arc<Supervisor>, HiggsError> {
@@ -386,6 +418,21 @@ mod tests {
         let (id, _) = fake_load(&rt, "m").await;
         rt.unload(id).await.unwrap();
         assert!(rt.worker_ids().is_empty());
+    }
+
+    #[tokio::test]
+    async fn inventory_lists_resident_workers_with_their_models() {
+        let rt = fake_runtime();
+        let (wa, _) = fake_load(&rt, "org/a").await;
+        fake_load(&rt, "org/b").await;
+        let inv = rt.inventory().await.unwrap();
+        assert!(inv["hardware"]["cpu_cores"].as_u64().unwrap() > 0, "real hw");
+        assert!(!inv["os"].as_str().unwrap().is_empty(), "os present");
+        let workers = inv["workers"].as_array().unwrap();
+        assert_eq!(workers.len(), 2, "both workers listed");
+        // The worker with id `wa` reports model org/a.
+        let a = workers.iter().find(|w| w["worker_id"].as_u64().unwrap() as u32 == wa.0).unwrap();
+        assert_eq!(a["model"], "org/a", "worker reports its model");
     }
 
     #[tokio::test]

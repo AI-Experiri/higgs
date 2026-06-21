@@ -158,6 +158,22 @@ async fn hub_v1_chat_routes_to_remote_node() {
         worker.0
     );
 
+    // ── Inventory (P4): the hub fetches the node's self-description and exposes it in the
+    // fleet view — host identity, real hardware, and the resident worker → model mapping.
+    let inv = fleet.refresh_inventory(&peer).await.expect("fetch inventory");
+    assert!(inv.hardware.cpu_cores > 0, "inventory carries real cpu cores");
+    assert_eq!(inv.runtime.engine, "llama.cpp");
+    assert!(
+        inv.workers.iter().any(|w| w.model == TINY_MODEL_ID),
+        "inventory lists the resident worker's model: {:?}",
+        inv.workers
+    );
+    let views = fleet.nodes_view();
+    assert!(
+        views.iter().any(|v| v.endpoint_id == peer && v.connected && v.inventory.is_some()),
+        "fleet view shows the connected node with its inventory"
+    );
+
     // ── Fleet lifecycle over the live link: the model is advertised, then unloaded, then
     // re-loaded + force-killed, then the node is retired — each transition reflected in the
     // hub's routing view, and the remote log ring reclaimed on teardown.

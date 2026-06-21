@@ -322,6 +322,17 @@ pub(super) async fn control_status(State(higgs): State<Arc<Higgs>>) -> Response 
     }
 }
 
+/// `GET /api/higgs/nodes` — the remote fleet: one entry per paired node with its stable id,
+/// endpoint, connected state, and last-fetched inventory (host + resident workers + hw/rt).
+/// Empty when no `HubFleet` is installed (the hub role is off).
+pub(super) async fn control_nodes(
+    State(higgs): State<Arc<Higgs>>,
+) -> Json<Vec<crate::node::fleet::NodeView>> {
+    tracing::info!("higgs: GET /api/higgs/nodes");
+    let views = higgs.fleet().map(|f| f.nodes_view()).unwrap_or_default();
+    Json(views)
+}
+
 /// `GET /api/higgs/logs?n=200` — Developer-Log tail (worker stderr + captured
 /// serve-layer request events), oldest first. Point-in-time snapshot; for a
 /// live feed use `GET /api/higgs/logs/stream`.

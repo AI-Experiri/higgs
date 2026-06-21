@@ -48,6 +48,15 @@ impl NodeIdAllocator {
     pub fn get(&self, endpoint_id: &str) -> Option<NodeId> {
         self.by_endpoint.get(endpoint_id).copied()
     }
+
+    /// Every `(endpoint_id, NodeId)` assigned so far, ascending by id — the set of nodes the
+    /// hub has ever admitted (connected or not), for the fleet view.
+    pub fn all(&self) -> Vec<(String, NodeId)> {
+        let mut v: Vec<_> =
+            self.by_endpoint.iter().map(|(e, id)| (e.clone(), *id)).collect();
+        v.sort_by_key(|(_, id)| id.0);
+        v
+    }
 }
 
 #[cfg(test)]
@@ -70,5 +79,13 @@ mod tests {
     #[test]
     fn node_id_renders_as_n_prefix() {
         assert_eq!(NodeId(1).to_string(), "n-1");
+    }
+
+    #[test]
+    fn all_lists_assigned_endpoints_ascending() {
+        let mut a = NodeIdAllocator::new();
+        let n1 = a.assign("a");
+        let n2 = a.assign("b");
+        assert_eq!(a.all(), vec![("a".to_string(), n1), ("b".to_string(), n2)]);
     }
 }

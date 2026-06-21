@@ -53,7 +53,7 @@ higgs_ts! {
 
 higgs_ts! {
     /// Host hardware snapshot.
-    #[derive(Debug, Clone, Serialize)]
+    #[derive(Debug, Clone, Serialize, serde::Deserialize)]
     pub struct HardwareInfo {
         /// CPU brand string (e.g. `"Apple M3 Max"`).
         pub cpu_name: String,
@@ -82,7 +82,7 @@ higgs_ts! {
 
 higgs_ts! {
     /// Inference engine/runtime identity.
-    #[derive(Debug, Clone, Serialize)]
+    #[derive(Debug, Clone, Serialize, serde::Deserialize)]
     pub struct RuntimeInfo {
         /// Engine name — always `"llama.cpp"` in v1.
         pub engine: String,
