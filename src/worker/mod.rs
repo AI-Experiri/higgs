@@ -114,12 +114,12 @@ struct WorkerState {
 }
 
 impl WorkerState {
-    /// Production state: llama.cpp engine, nothing loaded.
+    /// Production state: the engine selected by `HIGGS_ENGINE` (default: the first registry
+    /// entry, `llamacpp`), nothing loaded.
     fn new() -> Self {
-        Self {
-            engine: Box::new(engine::llamacpp::LlamaCppEngine::default()),
-            loaded: None,
-        }
+        let (engine, name) = engine::build_engine(std::env::var("HIGGS_ENGINE").ok().as_deref());
+        tracing::info!(engine = name, "higgs: worker engine selected");
+        Self { engine, loaded: None }
     }
 
     /// Test seam: same state shape with an injected engine.

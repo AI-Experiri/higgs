@@ -1,4 +1,22 @@
 //! Engine abstraction. v1: llama.cpp. Future: MLX (mlxcel cxx pattern), other runtimes.
+//!
+//! # Adding a new engine (three steps, no other file changes)
+//!
+//! The worker talks to inference backends ONLY through the [`HiggsEngine`] trait, and picks
+//! one at startup from the [`REGISTRY`]. To add an engine — say `mlx`:
+//!
+//! 1. **Create a submodule** `engine/mlx/mod.rs` with a type implementing [`HiggsEngine`]
+//!    (`load`/`unload`/`is_loaded`/`chat`/`probe`/`devices`). Keep every backend-specific
+//!    dependency (FFI, crates) confined to that submodule — the trait is the only thing the
+//!    rest of higgs sees. Declare it here: `pub mod mlx;`.
+//! 2. **Register it** by adding ONE line to [`REGISTRY`]:
+//!    `EngineEntry { name: "mlx", build: || Box::new(mlx::MlxEngine::default()) }`.
+//! 3. **Select it** at runtime with `HIGGS_ENGINE=mlx` (the worker reads this; the first
+//!    registry entry is the default). Per-model selection can layer on top later.
+//!
+//! That's the whole contract: implement the trait, add a registry line. No edits to the
+//! worker dispatch, the supervisor, the node runtime, or the serve layer — they are all
+//! engine-agnostic above [`HiggsEngine`].
 
 pub mod llamacpp;
 
@@ -207,4 +225,77 @@ pub trait HiggsEngine: Send {
     /// so it is safe to call at any time, including on a fresh worker. Returns an
     /// empty vec when the engine exposes no devices.
     fn devices(&self) -> Vec<crate::system::GpuDevice>;
+}
+
+/// One compiled-in engine: a stable selector name + a zero-arg constructor. The build
+/// closure is a plain `fn` pointer so the registry is a `const` table (no allocation, usable
+/// in tests and tooling).
+pub struct EngineEntry {
+    /// The `HIGGS_ENGINE` value that selects this engine (lowercase, stable).
+    pub name: &'static str,
+    /// Construct a fresh, model-less instance of this engine.
+    pub build: fn() -> Box<dyn HiggsEngine>,
+}
+
+/// Every engine compiled into this build. The FIRST entry is the default. Adding an engine
+/// is one line here (see the module docs) — nothing else in higgs needs to change.
+pub const REGISTRY: &[EngineEntry] = &[EngineEntry {
+    name: "llamacpp",
+    build: || Box::new(llamacpp::LlamaCppEngine::default()),
+}];
+
+/// The default engine's name (the first [`REGISTRY`] entry). Const-true that the registry is
+/// never empty would be nice, but `REGISTRY[0]` already enforces it at build time.
+pub fn default_engine_name() -> &'static str {
+    REGISTRY[0].name
+}
+
+/// The set of selectable engine names, for diagnostics / `--help`.
+pub fn engine_names() -> Vec<&'static str> {
+    REGISTRY.iter().map(|e| e.name).collect()
+}
+
+/// Build the engine selected by `name` (case-insensitive). `None` or an unknown name falls
+/// back to the default (first registry entry); the chosen name is returned so the caller can
+/// log it and warn on an unknown request.
+pub fn build_engine(name: Option<&str>) -> (Box<dyn HiggsEngine>, &'static str) {
+    let requested = name.map(str::trim).filter(|s| !s.is_empty());
+    if let Some(req) = requested {
+        if let Some(entry) = REGISTRY.iter().find(|e| e.name.eq_ignore_ascii_case(req)) {
+            return ((entry.build)(), entry.name);
+        }
+        tracing::warn!(
+            requested = req,
+            default = default_engine_name(),
+            available = ?engine_names(),
+            "higgs: unknown HIGGS_ENGINE; falling back to default"
+        );
+    }
+    let entry = &REGISTRY[0];
+    ((entry.build)(), entry.name)
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+
+    #[test]
+    fn default_is_llamacpp_and_registry_nonempty() {
+        assert!(!engine_names().is_empty(), "at least one engine is registered");
+        assert_eq!(default_engine_name(), "llamacpp");
+        assert!(engine_names().contains(&"llamacpp"));
+    }
+
+    #[test]
+    fn build_selects_by_name_case_insensitively() {
+        let (_e, name) = build_engine(Some("LlamaCpp"));
+        assert_eq!(name, "llamacpp", "case-insensitive match");
+    }
+
+    #[test]
+    fn build_falls_back_to_default_for_unknown_or_absent() {
+        assert_eq!(build_engine(None).1, "llamacpp");
+        assert_eq!(build_engine(Some("")).1, "llamacpp");
+        assert_eq!(build_engine(Some("nope")).1, "llamacpp", "unknown → default");
+    }
 }
