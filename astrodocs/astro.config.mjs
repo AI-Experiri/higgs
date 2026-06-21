@@ -27,6 +27,7 @@ export default defineConfig({
 					label: 'Guides',
 					items: [
 						{ label: 'How to Use', slug: 'how-to-use' },
+						{ label: 'Development', slug: 'development' },
 					],
 				},
 			],

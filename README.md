@@ -286,16 +286,44 @@ and ride the JSON-RPC `error.data.code` so the true origin status survives the h
 ## Testing & Coverage
 
 ```bash
-cargo test                       # unit + integration
-scripts/coverage.sh              # both gates (below)
+scripts/quality.sh               # fast gate: fmt + clippy + test + bindings sync
+cargo test                       # unit + integration only
+scripts/coverage.sh              # both coverage gates with a combined summary
 ```
 
-Two independent coverage gates (`scripts/coverage.sh`):
+### Quality gate (`scripts/quality.sh`)
+
+The fast pre-commit gate. Runs, in order:
+1. `cargo fmt --all` (apply, then `--check`) — the style is pinned in `rustfmt.toml`
+   (`edition 2021`, `max_width 100`); keep changes formatted or the gate fails.
+2. `cargo clippy --all-targets -D warnings`.
+3. `cargo test` — the full suite, which also **regenerates** the ts-rs bindings under
+   `bindings/higgs/` (emitted by the `higgs_ts!` macro's `#[ts(export)]` derive tests).
+4. **Bindings sync** — fails if `bindings/` drifted after the test pass, so a Rust wire-type
+   change can't land without the regenerated TypeScript committed alongside it.
+
+### Coverage gates (`scripts/coverage.sh`)
+
+Two independent gates, run separately:
 - **Unit** (`coverage-unit.sh`): `cargo test --lib`, **≥90% lines** (excludes the daemon `main` + FFI, which only run in a spawned process).
 - **Integration** (`coverage-integration.sh`): the `tests/` targets only, **≥75% lines** (excludes the pure-logic `tool_parser` subtree the unit gate owns).
 
+```bash
+scripts/coverage.sh              # both gates; runs both even if one fails, then a summary
+scripts/coverage.sh -u           # unit gate only          (--unit)
+scripts/coverage.sh -i           # integration gate only   (--integration)
+scripts/coverage.sh -u --open    # unit gate + open its HTML report
+scripts/coverage.sh --html       # write HTML report(s) under target/
+```
+
+Any non-selector flag is forwarded verbatim to `cargo llvm-cov` (`--html`, `--open`, `--json`,
+`--summary-only`, `--output-dir DIR`, …). When both gates run, both execute even if the first
+fails and a combined pass/fail + line-% summary prints at the end; the script exits non-zero if
+any gate failed. Requires `cargo-llvm-cov` (`cargo install cargo-llvm-cov`).
+
 Integration tests spawn the real `higgs` binary and drive it over HTTP + iroh against a real
-~1MB GGUF, exercising spawn → pair → load → chat → unload end to end.
+~1MB GGUF (`HIGGS_TEST_GGUF` overrides the path; tests **skip** when it's absent), exercising
+spawn → pair → load → chat → unload end to end.
 
 ## File Map
 
