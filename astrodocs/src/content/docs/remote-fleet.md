@@ -16,11 +16,25 @@ the repository.
 
 ## Two hops, never one
 
-```
- external client           HUB                          NODE                 WORKER
- POST /v1/chat   ─▶  resolve model → (node, worker)   serve_node loop     llama.cpp child
- (Bearer auth)       gate + per-node transport  ── iroh QUIC ─▶ control / data ── stdio ─▶ engine
-                 ◀── stream chunks back ◀──────────────────────────────────◀── N_CHAT_CHUNK
+```mermaid
+sequenceDiagram
+  participant C as External client
+  participant H as Hub
+  participant N as Node (GPU machine)
+  participant W as llama.cpp worker
+  C->>H: POST /v1/chat (Bearer)
+  H->>H: resolve model → (node, worker)
+  H->>N: M_CHAT over iroh QUIC (encrypted P2P)
+  N->>W: Supervisor::chat (stdio JSON-RPC)
+  loop streaming
+    W-->>N: N_CHAT_CHUNK
+    N-->>H: chunk
+    H-->>C: SSE delta
+  end
+  W-->>N: final result
+  N-->>H: final
+  H-->>C: finish (usage)
+  Note over C,W: the hub never talks to a remote worker directly — always two hops
 ```
 
 The hub **never speaks to a remote worker directly.** It talks to the *node*,

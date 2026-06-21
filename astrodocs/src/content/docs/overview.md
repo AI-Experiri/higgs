@@ -48,10 +48,10 @@ flowchart TB
   e1@{ animate: true }
   e2@{ animate: true }
 
-  classDef pure fill:#eef2ff,stroke:#6366f1,stroke-width:1.5px,color:#1e1b4b;
-  classDef native fill:#fff7ed,stroke:#f59e0b,stroke-width:1.5px,color:#7c2d12;
-  classDef store fill:#ecfdf5,stroke:#10b981,stroke-width:1.5px,color:#064e3b;
-  classDef client fill:#f1f5f9,stroke:#94a3b8,stroke-width:1.5px,color:#0f172a;
+  classDef pure fill:#1f2547,stroke:#818cf8,stroke-width:1.5px,color:#c7d2fe;
+  classDef native fill:#3a2a12,stroke:#fbbf24,stroke-width:1.5px,color:#fde68a;
+  classDef store fill:#0c2e23,stroke:#34d399,stroke-width:1.5px,color:#a7f3d0;
+  classDef client fill:#1f2937,stroke:#9ca3af,stroke-width:1.5px,color:#e5e7eb;
   class oai,ui client;
   class router,facade,sup,fleet,nrt pure;
   class worker,rworker native;

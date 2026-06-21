@@ -10,19 +10,29 @@ export default defineConfig({
 		// Renders ```mermaid code blocks into real SVG diagrams. Must precede
 		// Starlight so it transforms markdown before Starlight processes it.
 		mermaid({
-			theme: 'base',
-			autoTheme: true,
+			theme: 'dark',
+			autoTheme: false,
 			mermaidConfig: {
-				flowchart: { curve: 'basis', htmlLabels: true, padding: 18, nodeSpacing: 55, rankSpacing: 70 },
+				flowchart: { curve: 'basis', htmlLabels: true, padding: 18, nodeSpacing: 55, rankSpacing: 65 },
 				themeVariables: {
 					fontFamily: 'ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif',
 					fontSize: '14px',
-					primaryColor: '#eef2ff',
-					primaryBorderColor: '#6366f1',
-					primaryTextColor: '#1e1b4b',
-					lineColor: '#64748b',
-					clusterBkg: '#f8fafc',
-					clusterBorder: '#cbd5e1',
+					lineColor: '#8b949e',
+					clusterBkg: '#161b22',
+					clusterBorder: '#30363d',
+					titleColor: '#e6edf3',
+					textColor: '#e6edf3',
+					// sequence-diagram palette (matches the flowchart classDefs)
+					actorBkg: '#1f2547',
+					actorBorder: '#818cf8',
+					actorTextColor: '#c7d2fe',
+					signalColor: '#8b949e',
+					signalTextColor: '#e6edf3',
+					labelBoxBkgColor: '#161b22',
+					labelBoxBorderColor: '#30363d',
+					noteBkgColor: '#0c2e23',
+					noteBorderColor: '#34d399',
+					noteTextColor: '#a7f3d0',
 				},
 			},
 		}),

@@ -88,6 +88,30 @@ once at its true origin):
 The llama.cpp FFI runs inside a **re-exec'd copy of the host binary** launched with `--higgs-worker`.
 The supervisor communicates with it over stdio using NDJSON JSON-RPC 2.0.
 
+```mermaid
+flowchart TB
+  subgraph host[" HOST PROCESS · pure Rust "]
+    direction TB
+    facade["Higgs facade"]
+    sup["Supervisor<br/><small>RPC correlation · chat sinks<br/>restart + replay last load</small>"]
+    facade -->|"load / chat / unload"| sup
+  end
+  subgraph child[" WORKER CHILD · re-exec --higgs-worker "]
+    direction TB
+    loop["JSON-RPC dispatch loop"]
+    engine["HiggsEngine<br/><small>llama.cpp FFI</small>"]
+    loop --> engine
+    engine --> gguf[("GGUF")]
+  end
+  sup <-->|"NDJSON JSON-RPC 2.0 over stdio<br/>M_LOAD · M_CHAT · M_STATUS · N_CHAT_CHUNK"| loop
+  classDef pure fill:#1f2547,stroke:#818cf8,stroke-width:1.5px,color:#c7d2fe;
+  classDef native fill:#3a2a12,stroke:#fbbf24,stroke-width:1.5px,color:#fde68a;
+  classDef store fill:#0c2e23,stroke:#34d399,stroke-width:1.5px,color:#a7f3d0;
+  class facade,sup,loop pure;
+  class engine native;
+  class gguf store;
+```
+
 The worker is **spawned on load and killed on unload** — there is no idle worker.
 `start()` spawns nothing. `load(M)` spawns a worker (argv0 `higgs(<M>)`, ≤64
 chars) then sends M_LOAD; `unload()` sends M_UNLOAD then kills it. With nothing
@@ -95,17 +119,23 @@ loaded, zero higgs worker processes exist. A failed load tears the worker back
 down. A `tokio` lifecycle mutex serialises load/unload/stop so spawn-on-load and
 kill-on-unload never interleave.
 
-```
-UNEXPECTED DEATH (stdout EOF / read error, NOT a deliberate stop):
-  deliberate stop?  → do nothing, no event
-  unexpected        → single respawn (1 s backoff)
-                          argv0 re-stamped higgs(<loaded id>); old child reaped
-                          emit WorkerRestarted
-                          then replay higgs/load (bounded RPC timeout)
-                              → emit ModelLoaded only if replay succeeds
-                          (scan is host-side — NO scan replay)
-
-FACTORY FAILURE on respawn → emit WorkerDied, no further retry
+```mermaid
+flowchart TB
+  death(["worker stdout EOF / read error"])
+  death --> q{"deliberate stop?"}
+  q -->|yes| noop["do nothing — no event"]
+  q -->|no| respawn["single respawn (1 s backoff)<br/><small>re-stamp argv0 higgs(&lt;id&gt;) · reap old child</small>"]
+  respawn --> evt["emit WorkerRestarted"]
+  evt --> replay["replay higgs/load<br/><small>bounded RPC timeout · scan is host-side, not replayed</small>"]
+  replay -->|ok| loaded["emit ModelLoaded"]
+  replay -->|fails| dead["emit WorkerDied"]
+  respawn -.->|factory failure| dead2["emit WorkerDied — no further retry"]
+  classDef pure fill:#1f2547,stroke:#818cf8,stroke-width:1.5px,color:#c7d2fe;
+  classDef good fill:#0c2e23,stroke:#34d399,stroke-width:1.5px,color:#a7f3d0;
+  classDef bad fill:#3a1212,stroke:#f87171,stroke-width:1.5px,color:#fecaca;
+  class respawn,evt,replay,noop pure;
+  class loaded good;
+  class dead,dead2 bad;
 ```
 
 The mpsc channel between `Supervisor::request()` callers and the writer task serialises
