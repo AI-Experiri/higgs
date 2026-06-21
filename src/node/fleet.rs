@@ -350,8 +350,17 @@ impl HubFleet {
         }
         match self.transport(&route.0) {
             Ok(t) => {
-                let _ = t.request(M_NODE_UNLOAD, json!({ "worker_id": route.1 .0 })).await;
-                self.pending_unloads.lock().remove(route);
+                let res = t.request(M_NODE_UNLOAD, json!({ "worker_id": route.1 .0 })).await;
+                // Clear the obligation ONLY if the unload landed (Ok) or the node reports the
+                // worker already gone (HG006/HG007). A real failure (transport hiccup mid-
+                // request) means the worker may still be running, so KEEP it pending so the
+                // next reconnect retries — otherwise the displaced worker leaks. Mirrors
+                // `reconcile_pending_unloads`.
+                if res.is_ok() || res.as_ref().err().is_some_and(route_invalidating) {
+                    self.pending_unloads.lock().remove(route);
+                } else {
+                    self.pending_unloads.lock().insert(route.clone());
+                }
             }
             // Node offline — owe it the unload until it reconnects.
             Err(_) => {
