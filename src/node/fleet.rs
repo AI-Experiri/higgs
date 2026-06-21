@@ -571,6 +571,19 @@ mod tests {
     }
 
     #[test]
+    fn chat_timeout_does_not_invalidate_a_route() {
+        // A remote chat that times out (HG016) is NOT a worker-gone / dead-transport signal:
+        // the node may be healthy on a long generation. So it must neither drop the route nor
+        // (via handle_op_error, which only acts on WorkerDead) tear down the transport.
+        let timeout = HiggsError::ChatTimeout { elapsed: std::time::Duration::from_secs(600) };
+        assert!(!route_invalidating(&timeout), "chat timeout keeps the route");
+        assert!(
+            !matches!(timeout, HiggsError::WorkerDead { .. }),
+            "chat timeout is not WorkerDead, so handle_op_error passes it through unchanged"
+        );
+    }
+
+    #[test]
     fn seed_node_lists_a_known_node_as_disconnected() {
         let fleet = Arc::new(HubFleet::new(Arc::new(crate::log_bus::LogBus::new())));
         fleet.seed_node("endpointA");

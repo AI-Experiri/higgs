@@ -133,9 +133,13 @@ impl NodeTransport {
                     }
                 };
                 // Bound a wedged remote inference so the caller's stream can't hang forever.
+                // A timeout is a CHAT timeout (HG016/504), NOT a dead transport: the node and
+                // connection may be perfectly healthy on a long generation, so it must not be
+                // remapped to HG027 or tear down the node (that's `handle_op_error`'s job only
+                // for `WorkerDead`). HG016 is also what the local chat path surfaces.
                 match tokio::time::timeout(CHAT_RPC_TIMEOUT, read).await {
                     Ok(result) => result,
-                    Err(_) => Err(transport_dead("remote chat timed out")),
+                    Err(_) => Err(HiggsError::ChatTimeout { elapsed: CHAT_RPC_TIMEOUT }),
                 }
             }),
         };
