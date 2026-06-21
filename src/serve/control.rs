@@ -357,6 +357,60 @@ pub(super) async fn control_nodes(
     Json(views)
 }
 
+/// `POST /api/higgs/nodes/load` — load a model on a paired node and record the route, so
+/// `/v1/chat/completions` for that model routes there. Admin-scoped. `409` when not a hub.
+#[derive(Deserialize)]
+pub(super) struct NodeLoadHttp {
+    /// Target node's `EndpointId`.
+    node: String,
+    /// HuggingFace repo id to load on that node.
+    model: String,
+}
+
+pub(super) async fn control_nodes_load(
+    State(higgs): State<Arc<Higgs>>,
+    Json(req): Json<NodeLoadHttp>,
+) -> Response {
+    tracing::warn!(node = %req.node, model = %req.model, "higgs: POST /api/higgs/nodes/load");
+    let Some(fleet) = higgs.fleet() else {
+        return not_a_hub();
+    };
+    match fleet.load(&req.node, &req.model).await {
+        Ok(worker) => Json(serde_json::json!({ "status": "ok", "worker_id": worker.0 })).into_response(),
+        Err(err) => control_error(&err).into_response(),
+    }
+}
+
+/// `POST /api/higgs/nodes/unload` — unload a remote-routed model and drop its route.
+#[derive(Deserialize)]
+pub(super) struct NodeUnloadHttp {
+    /// The routed model id to unload from its node.
+    model: String,
+}
+
+pub(super) async fn control_nodes_unload(
+    State(higgs): State<Arc<Higgs>>,
+    Json(req): Json<NodeUnloadHttp>,
+) -> Response {
+    tracing::warn!(model = %req.model, "higgs: POST /api/higgs/nodes/unload");
+    let Some(fleet) = higgs.fleet() else {
+        return not_a_hub();
+    };
+    match fleet.unload(&req.model).await {
+        Ok(()) => Json(serde_json::json!({ "status": "ok" })).into_response(),
+        Err(err) => control_error(&err).into_response(),
+    }
+}
+
+/// The `409` returned by hub-only routes when no fleet is installed.
+fn not_a_hub() -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({ "error": "server is not running in hub mode (set HIGGS_HUB=1)" })),
+    )
+        .into_response()
+}
+
 /// `GET /api/higgs/logs?n=200` — Developer-Log tail (worker stderr + captured
 /// serve-layer request events), oldest first. Point-in-time snapshot; for a
 /// live feed use `GET /api/higgs/logs/stream`.
@@ -724,6 +778,22 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::CONFLICT);
         let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
         assert!(v["error"].as_str().unwrap().contains("hub mode"), "explains hub mode: {v}");
+    }
+
+    #[tokio::test]
+    async fn nodes_load_unload_without_fleet_is_conflict() {
+        let (sup, _w, _r, _ring) = make_supervisor();
+        let load = make_app(sup)
+            .oneshot(post_json("/api/higgs/nodes/load", &json!({ "node": "n", "model": "m" })))
+            .await
+            .unwrap();
+        assert_eq!(load.status(), StatusCode::CONFLICT, "no fleet → 409");
+        let (sup2, _w2, _r2, _ring2) = make_supervisor();
+        let unload = make_app(sup2)
+            .oneshot(post_json("/api/higgs/nodes/unload", &json!({ "model": "m" })))
+            .await
+            .unwrap();
+        assert_eq!(unload.status(), StatusCode::CONFLICT, "no fleet → 409");
     }
 
     // ── Test 9: version endpoint ──────────────────────────────────────────────

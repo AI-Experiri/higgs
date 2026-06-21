@@ -168,7 +168,7 @@ fn run_keys_at(path: &Path, args: &[String]) -> std::io::Result<()> {
     match args.first().map(String::as_str) {
         Some("add") => {
             let label = args.get(1).cloned().ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, "usage: higgs keys add <label> [scopes=chat,models]")
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "usage: higgs keys add <label> [chat,models]")
             })?;
             let scopes = parse_scopes(args.get(2).map(String::as_str).unwrap_or("chat,models"))?;
             if scopes.is_empty() {

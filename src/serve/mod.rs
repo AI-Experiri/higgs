@@ -173,6 +173,8 @@ pub fn router(higgs: Arc<Higgs>) -> Router {
         .route("/api/higgs/status", get(control::control_status))
         .route("/api/higgs/system", get(control::control_system))
         .route("/api/higgs/nodes", get(control::control_nodes))
+        .route("/api/higgs/nodes/load", post(control::control_nodes_load))
+        .route("/api/higgs/nodes/unload", post(control::control_nodes_unload))
         .route("/api/higgs/pair", post(control::control_pair))
         .route("/api/higgs/logs", get(control::control_logs))
         .route(

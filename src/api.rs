@@ -363,6 +363,13 @@ pub struct Higgs {
     /// [`HiggsError::ServerBusy`] (HTTP 503); the owned permit rides the spawned
     /// generation task and releases on its completion (success/error/timeout).
     inference_gate: Arc<tokio::sync::Semaphore>,
+    /// Admission gate for REMOTE (fleet-routed) chats — capped at
+    /// [`MAX_CONCURRENT_INFERENCE`] like the local gate, but SEPARATE so a flood of remote
+    /// requests can't grow hub/node tasks + streams unbounded, AND so it doesn't entangle the
+    /// idle reaper's "acquire all LOCAL permits to unload" logic (remote traffic must not keep
+    /// a local model resident — see `chat_stream`). `None` until a fleet is installed is not
+    /// needed: the gate exists always; it's only used on the remote branch.
+    remote_gate: Arc<tokio::sync::Semaphore>,
     /// Instant of the most recent chat request, stamped at the top of
     /// [`chat_stream`](Self::chat_stream). The idle reaper reads it to decide
     /// when the loaded model has been idle past [`IDLE_UNLOAD_TTL`]. A plain
@@ -463,6 +470,7 @@ impl Higgs {
             config: parking_lot::Mutex::new(config),
             lifecycle: tokio::sync::Mutex::new(()),
             inference_gate: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_INFERENCE)),
+            remote_gate: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_INFERENCE)),
             last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
             log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
             jit_enabled: std::sync::atomic::AtomicBool::new(true),
@@ -931,30 +939,41 @@ impl Higgs {
         ),
         HiggsError,
     > {
-        // Stamp last-activity so the idle reaper never unloads a model that is
-        // actively serving. Done before the admission gate so even a request
-        // that ends up rejected (ServerBusy) still counts as recent activity —
-        // a busy server is by definition not idle. Lock held for one `Instant`
-        // write only, never across `.await`.
-        *self.last_activity.lock() = std::time::Instant::now();
-
-        // Remote routing: if a fleet is installed and this model lives on a remote node,
-        // relay the chat over that node's transport instead of the local worker. Remote
-        // capacity is the node's concern, so this bypasses the LOCAL admission gate. The
-        // remote final `Value` has the same shape as a local worker result.
-        // Bind the clone to a `let` so the parking_lot guard drops HERE, not held across
-        // the `.await` below (an `if let` scrutinee temporary would, making this !Send).
+        // Remote routing FIRST: if a fleet is installed and this model lives on a remote node,
+        // relay the chat over that node's transport. A remote model uses NEITHER the local
+        // worker NOR the local idle timer, so this path does NOT stamp `last_activity` (else
+        // remote traffic would keep an idle LOCAL model resident) and uses a SEPARATE
+        // admission gate. Bind the clone to a `let` so the parking_lot guard drops HERE, not
+        // held across the `.await` (an `if let` scrutinee temporary would make this !Send).
         let fleet = self.fleet.lock().clone();
         if let Some(fleet) = fleet {
             if fleet.is_remote(&model) {
+                // Bound concurrent REMOTE chats — the node-side relay has no semaphore, so
+                // without this a client could open unbounded hub/node generations + streams.
+                // Separate from `inference_gate` so it never blocks the reaper's
+                // acquire-all-LOCAL-permits unload of an idle local model.
+                let permit = Arc::clone(&self.remote_gate).try_acquire_owned().map_err(|_| {
+                    HiggsError::ServerBusy {
+                        in_flight: MAX_CONCURRENT_INFERENCE,
+                        max: MAX_CONCURRENT_INFERENCE,
+                    }
+                })?;
                 let (rx, fut) = fleet
                     .chat(&model, messages_json, max_tokens, temperature, tools_json)
                     .await?;
-                let handle =
-                    tokio::spawn(async move { Ok(chat_outcome_from_value(&fut.await?)) });
+                let handle = tokio::spawn(async move {
+                    let _permit = permit; // held for the whole remote generation
+                    Ok(chat_outcome_from_value(&fut.await?))
+                });
                 return Ok((rx, handle));
             }
         }
+
+        // Local path. Stamp last-activity so the idle reaper never unloads a model that is
+        // actively serving. Done before the admission gate so even a request that ends up
+        // rejected (ServerBusy) still counts as recent activity — a busy server is by
+        // definition not idle. Lock held for one `Instant` write only, never across `.await`.
+        *self.last_activity.lock() = std::time::Instant::now();
 
         // Admission gate: bound concurrent in-flight inference so the no-auth
         // server can't be flooded. A full gate is a capacity signal (HTTP 503),
@@ -1075,6 +1094,7 @@ impl Higgs {
             config: parking_lot::Mutex::new(config),
             lifecycle: tokio::sync::Mutex::new(()),
             inference_gate: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_INFERENCE)),
+            remote_gate: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_INFERENCE)),
             last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
             log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
             jit_enabled: std::sync::atomic::AtomicBool::new(true),
@@ -1492,6 +1512,7 @@ mod tests {
             config: parking_lot::Mutex::new(HiggsConfig::default()),
             lifecycle: tokio::sync::Mutex::new(()),
             inference_gate: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_INFERENCE)),
+            remote_gate: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_INFERENCE)),
             last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
             log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
             jit_enabled: std::sync::atomic::AtomicBool::new(true),
@@ -1553,6 +1574,7 @@ mod tests {
             lifecycle: tokio::sync::Mutex::new(()),
             // One-slot gate so the test deterministically fills it.
             inference_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            remote_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
             log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
             jit_enabled: std::sync::atomic::AtomicBool::new(true),
@@ -1878,6 +1900,7 @@ mod tests {
             inference_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 crate::api::MAX_CONCURRENT_INFERENCE,
             )),
+            remote_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(crate::api::MAX_CONCURRENT_INFERENCE)),
             last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
             log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
             jit_enabled: std::sync::atomic::AtomicBool::new(true),
@@ -1964,6 +1987,7 @@ mod tests {
             inference_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 crate::api::MAX_CONCURRENT_INFERENCE,
             )),
+            remote_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(crate::api::MAX_CONCURRENT_INFERENCE)),
             last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
             log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
             jit_enabled: std::sync::atomic::AtomicBool::new(true),
@@ -2042,6 +2066,7 @@ mod tests {
             inference_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 crate::api::MAX_CONCURRENT_INFERENCE,
             )),
+            remote_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(crate::api::MAX_CONCURRENT_INFERENCE)),
             last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
             log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
             jit_enabled: std::sync::atomic::AtomicBool::new(true),
@@ -2095,6 +2120,7 @@ mod tests {
             inference_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 crate::api::MAX_CONCURRENT_INFERENCE,
             )),
+            remote_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(crate::api::MAX_CONCURRENT_INFERENCE)),
             last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
             log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
             jit_enabled: std::sync::atomic::AtomicBool::new(true),
@@ -2184,6 +2210,7 @@ mod tests {
             inference_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 crate::api::MAX_CONCURRENT_INFERENCE,
             )),
+            remote_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(crate::api::MAX_CONCURRENT_INFERENCE)),
             last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
             log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
             jit_enabled: std::sync::atomic::AtomicBool::new(true),
