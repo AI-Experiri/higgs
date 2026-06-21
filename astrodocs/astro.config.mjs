@@ -11,9 +11,16 @@ export default defineConfig({
 			social: [],
 			sidebar: [
 				{
+					label: 'Introduction',
+					items: [
+						{ label: 'What is higgs?', slug: 'overview' },
+					],
+				},
+				{
 					label: 'Architecture',
 					items: [
 						{ label: 'System Design', slug: 'system-design' },
+						{ label: 'Remote Fleet', slug: 'remote-fleet' },
 						{ label: 'Concurrency model', slug: 'concurrency' },
 					],
 				},

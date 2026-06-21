@@ -16,7 +16,8 @@ consumed by embedders).
 scripts/quality.sh
 ```
 
-It runs, in order, and fails on the first problem:
+It runs these steps, accumulating failures and reporting them all at the end
+(exit non-zero if any failed):
 
 1. **Format** — `cargo fmt --all` (apply, then `--check` to verify). It auto-fixes
    trivial drift, so you rarely need to run `cargo fmt` yourself.

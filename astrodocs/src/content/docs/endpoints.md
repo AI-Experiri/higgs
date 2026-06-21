@@ -9,10 +9,15 @@ higgs exposes two route groups:
 
 | Group | Purpose |
 |-------|---------|
-| `/v1/*` | OpenAI-compatible inference — chat clients, OpenAI SDK drop-ins |
-| `/api/higgs/*` | Control plane — scan, load, unload, status, system, logs (snapshot + SSE stream + verbose toggle), worker stop, version |
+| `/v1/*` | OpenAI-compatible inference — `chat/completions`, `models` — chat clients, OpenAI SDK drop-ins |
+| `/api/higgs/*` | Control plane — `status`, `system`, `version`, model catalog + `models/load`·`unload`, `worker/stop`, `logs` (snapshot + SSE stream) and `logs/settings`, `settings`, plus the fleet surface `nodes`, `nodes/load`·`unload`, and `pair` |
 
 All routes are mounted by `higgs::serve::router(Arc<Higgs>)`.
+
+When [API keys](/system-design/#securing-the-api) are configured, every route
+except the health probes (`/health` and `/api/higgs/health`) requires
+`Authorization: Bearer hgk_…` with a sufficient scope (`chat` / `models` /
+`admin`); a missing or insufficient token gets `401`.
 
 Both surfaces also expose a cheap readiness probe (`GET /health`,
 `GET /api/higgs/health`) and sit behind a shared **serve-layer hardening** stack
@@ -40,7 +45,15 @@ The same status table applies to both surfaces:
 | HG017 InsufficientMemory | 503 |
 | HG018 ResidentModelMismatch | 503 |
 | HG019 ServingDisabled | 503 |
+| HG027 NodeUnreachable | 503 |
+| HG020/HG021/HG025/HG026 (probe/sysinfo/download/update) | 500 |
 | anything else | 500 |
+| missing / insufficient API key | 401 |
+
+The pairing & handshake codes **HG022–HG024** and **HG028** are iroh
+control-plane errors (bad/expired token, no agreed protocol version, not
+allow-listed, no HELLO in time) — they surface on the node-dial path, never as an
+HTTP response.
 
 **`/v1` error envelope:**
 
@@ -59,8 +72,10 @@ The same status table applies to both surfaces:
 
 The `/v1` envelope `message` is **path-redacted**: absolute filesystem paths and
 `host:port` bind addresses are replaced with `<redacted>` before crossing the
-client boundary (diagnostic code, model id, and prose are preserved). No prompt
-CONTENT is logged at `info` on the `/v1` path. The full unredacted message (with
+client boundary (diagnostic code, model id, and prose are preserved). **By
+default** no prompt CONTENT is logged at `info` on the `/v1` path — the
+`log_incoming_tokens` and `show_log_fields` toggles explicitly opt into logging
+prompt/field content. The full unredacted message (with
 paths) is still logged server-side at the origin and returned on the control
 surface below — which is ours, not an interop boundary.
 
@@ -83,17 +98,14 @@ Use `GET /api/higgs/status` for load state.
 Both paths are identical; `/health` is the conventional top-level probe and
 `/api/higgs/health` keeps the control plane self-contained.
 
-**Response (200):**
-
-```json
-{ "status": "ok" }
-```
+**Response:** a bare `200 OK` with an **empty body** (no JSON) — it answers only
+"is the control surface reachable?".
 
 **curl:**
 
 ```sh
-curl http://localhost:8081/health
-curl http://localhost:8081/api/higgs/health
+curl -i http://localhost:11434/health
+curl -i http://localhost:11434/api/higgs/health
 ```
 
 ---
@@ -102,8 +114,9 @@ curl http://localhost:8081/api/higgs/health
 
 ### GET /v1/models
 
-Returns the **loaded** model only. An empty list means no model is currently
-loaded. Use `GET /api/higgs/models` for the full on-disk catalog.
+Returns the **loaded** local model plus any **remotely-routed** models whose node
+is currently connected (servable right now). An empty list means nothing is loaded
+or routable. Use `GET /api/higgs/models` for the full on-disk catalog.
 
 higgs is **spawn-on-load**, so the idle state has no worker; this endpoint still
 returns `200` with `{"data":[]}` then (it never gates on `worker_alive`). A
@@ -130,7 +143,7 @@ exposes `worker_alive` for diagnostics. This surface never returns a worker-down
 **curl:**
 
 ```sh
-curl http://localhost:8081/v1/models
+curl http://localhost:11434/v1/models
 ```
 
 ---
@@ -182,7 +195,10 @@ non-streaming and streaming responses. A malformed `tools` body is a 400.
   `temperature >= 0`, `top_p` in `(0, 1]`, `presence_penalty` &
   `frequency_penalty` in `[-2, 2]`; `n` must be exactly `1` — higgs serves a
   single choice, so `n>1` is rejected), or `max_tokens` /
-  `max_completion_tokens` above the cap of `32768`.
+  `max_completion_tokens` above the cap of `32768`. **Note:** `top_p` and the
+  penalties are range-validated for OpenAI compatibility but **not yet forwarded**
+  to the sampler — only `temperature` and the max-token budget affect generation
+  today (`stop` strings are likewise not applied; `seed` is a load-time param).
 - **400** `[HG005]` — prompt exceeds the loaded model's context window. The
   serve layer early-rejects on a conservative estimate (`prompt_bytes / 4` +
   `max_tokens` vs `ctx_len`); the worker's exact tokenizer check is the
@@ -254,7 +270,7 @@ non-streaming and streaming responses. A malformed `tools` body is a 400.
       "index": 0,
       "message": {
         "role": "assistant",
-        "content": "",
+        "content": null,
         "tool_calls": [
           {
             "id": "call_abc123",
@@ -287,10 +303,16 @@ data: [DONE]
 
 The stream always ends with `data: [DONE]`. On mid-stream errors the OpenAI error envelope is emitted as a `data:` event before `[DONE]`.
 
-**Streaming with a tool call.** The tool-call envelope is suppressed from the
-content deltas; the structured call is sent as a single delta (full name +
-arguments, not argument-by-argument) just before a finish chunk whose reason is
-`tool_calls`:
+**Streaming with a tool call.** For **registry-matched** tool-call formats
+(higgs's built-in parser families — Gemma, Qwen, GLM, DeepSeek, Mistral/Ministral,
+Nemotron) the tool-call envelope
+is suppressed from the content deltas; the structured call is sent as a single
+delta (full name + arguments, not argument-by-argument) just before a finish chunk
+whose reason is `tool_calls`. **Known limitation:** a format the underlying crate's
+primary parser handles but the registry does **not** match (e.g. Llama-3's
+`<|python_tag|>`) installs no stream filter, so its raw markup may appear in
+content deltas — though the final structured `tool_calls` is still returned (and
+non-streaming `content` is unaffected).
 
 ```
 data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk",...,"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
@@ -307,7 +329,7 @@ data: [DONE]
 ```sh
 curl -N -H "Content-Type: application/json" \
   -d '{"model":"org/model","messages":[{"role":"user","content":"hi"}],"stream":true}' \
-  http://localhost:8081/v1/chat/completions
+  http://localhost:11434/v1/chat/completions
 ```
 
 ---
@@ -332,21 +354,29 @@ Live scan of all configured model directories plus the currently loaded model id
       "arch": "llama",
       "ctx_train": 131072,
       "has_chat_template": true,
-      "loadable": true,
-      "tool_calls": true,
+      "supports_tools": true,
+      "supports_reasoning": false,
       "gguf_components": [
         { "key": "general.architecture", "value": "llama" },
         { "key": "general.file_type", "value": "Q4_K_M" },
         { "key": "llama.context_length", "value": "131072" }
-      ]
+      ],
+      "state": "loaded",
+      "format": "gguf",
+      "loadable": true,
+      "tool_calls": true
     }
   ],
   "loaded_id": "org/model-name"
 }
 ```
 
+Each entry is a `HiggsModelEntry`: all `HiggsModel` fields (`#[serde(flatten)]`d
+to the top level) **plus** the control-computed `state` (`"loaded"` /
+`"not-loaded"`), `format` (always `"gguf"`), and the support verdict below.
 `source` is one of `"LmStudio"`, `"HfCache"`, `"Ollama"`.
-`quant`, `arch`, `ctx_train` are omitted when unreadable from the GGUF header.
+`quant`, `arch`, `ctx_train` are omitted when unreadable from the GGUF header;
+`support_reason` is present only when the model isn't fully supported.
 
 #### Model support detection fields
 
@@ -355,7 +385,7 @@ header fields the verdict is computed from:
 
 | Field | Type | Meaning |
 |-------|------|---------|
-| `loadable` | boolean | **Gate 1** — whether higgs's llama.cpp engine can LOAD this model, proved by a real probe of a representative GGUF for the model's `(architecture, quant)` combo. |
+| `loadable` | boolean | **Gate 1** — whether higgs's llama.cpp engine accepts this model's header + architecture, checked by a `vocab_only` probe of a representative GGUF for the model's `(architecture, quant)` combo. (A header/arch check — it won't catch a tensor/quant-level mismatch.) |
 | `tool_calls` | boolean | **Gate 2** — whether higgs has a tool-call parser matching the model's chat template (host-side, zero FFI). |
 | `support_reason` | string (optional) | The EXACT reason a model isn't fully supported. When `!loadable`: the engine's **verbatim** load error (e.g. `"unknown model architecture: 'gemma4'"`). When `loadable && !tool_calls`: the fixed string `"no tool-call parser matches this model's template"`. **Omitted** when the model is fully supported. |
 | `gguf_components` | `GgufComponent[]` | Curated load-relevant GGUF header fields (this field lives on the flattened `HiggsModel` — its single home). Each `GgufComponent = { key: string, value: string }`. |
@@ -391,7 +421,7 @@ specific component.
 **curl:**
 
 ```sh
-curl http://localhost:8081/api/higgs/models
+curl http://localhost:11434/api/higgs/models
 ```
 
 ---
@@ -426,12 +456,14 @@ resolved host-side and carried into the worker. Load parameters fall back to
 }
 ```
 
-All fields except `id` are optional. Sending NO load field is a fully-default
-load (`HiggsConfig.default_load` plus the auto context cap). The moment any
-field is present, the three base fields (`ctx_len`/`gpu_layers`/`threads`) fall
-back to `default_load` and every other field that is **absent** uses the engine
-default — i.e. omitting an optional reproduces the pre-expansion behavior
-exactly.
+All fields except `id` are optional. Sending NO **engine load** field is a
+fully-default load (`HiggsConfig.default_load` plus the auto context cap). The
+moment any engine load field is present, the three base fields
+(`ctx_len`/`gpu_layers`/`threads`) fall back to `default_load` and every other
+field that is **absent** uses the engine default — i.e. omitting an optional
+reproduces the pre-expansion behavior exactly. `idle_ttl_minutes` is **excluded**
+from this check (it's a host-side reaper setting, not an engine param), so a
+request carrying only `idle_ttl_minutes` still takes the fully-default load path.
 
 `gpu_layers: 4294967295` (`u32::MAX`) means "offload all layers" (LM Studio "max" semantics).
 
@@ -487,7 +519,7 @@ The `id` is validated before anything is resolved or spawned:
 ```sh
 curl -X POST -H "Content-Type: application/json" \
   -d '{"id":"org/model-name"}' \
-  http://localhost:8081/api/higgs/models/load
+  http://localhost:11434/api/higgs/models/load
 ```
 
 ---
@@ -517,7 +549,7 @@ resets the idle timer.
 **curl:**
 
 ```sh
-curl -X POST http://localhost:8081/api/higgs/models/unload
+curl -X POST http://localhost:11434/api/higgs/models/unload
 ```
 
 ---
@@ -555,7 +587,7 @@ holds no model catalog); the worker reports only
 **curl:**
 
 ```sh
-curl http://localhost:8081/api/higgs/status
+curl http://localhost:11434/api/higgs/status
 ```
 
 ---
@@ -594,7 +626,16 @@ purely informational — there is **no mutating counterpart**.
     "hf_dirs": ["/home/user/.cache/huggingface/hub"],
     "ollama_dirs": ["/home/user/.ollama/models"],
     "default_load": { "ctx_len": 4096, "gpu_layers": 4294967295, "threads": 4 },
-    "default_ctx_cap": 32768
+    "default_ctx_cap": 32768,
+    "limits": {
+      "max_body_bytes": 33554432,
+      "control_timeout_secs": 120,
+      "chat_timeout_secs": 600,
+      "max_output_tokens": 32768,
+      "max_concurrent_inference": 8,
+      "memory_headroom_fraction": 0.8,
+      "idle_unload_ttl_secs": 300
+    }
   }
 }
 ```
@@ -612,13 +653,14 @@ sums only the **GPU** devices' totals (`0` when none). The host gathers this onc
 through a transient, crash-isolated sysinfo worker (M_SYSINFO; HG021 on failure →
 empty list) and caches it; a failed gather still returns full hardware/runtime
 without devices. `fits_vram(model_size, vram_total, memory_headroom_fraction)` is
-the host-side VRAM fit decision built from this (reuses the existing
-`MEMORY_HEADROOM_FRACTION`; no GPU ⇒ falls back to the RAM headroom guard).
+a host-side VRAM-fit **helper** built from this (reuses the existing
+`MEMORY_HEADROOM_FRACTION`) — it is not auto-applied on load; the enforced pre-load
+check is the RAM headroom guard.
 
 **curl:**
 
 ```sh
-curl http://localhost:8081/api/higgs/system
+curl http://localhost:11434/api/higgs/system
 ```
 
 ---
@@ -634,11 +676,12 @@ lines like `higgs: GET /v1/models`). This is a one-shot tail — use
 **Query:**
 
 - `?n=200` — number of history lines (default 200).
-- `?source=serve|worker` — restrict to one origin: `serve` (the higgs control
-  plane + its worker interactions) or `worker` (the model worker's own stderr).
-  Omit for both merged. Each buffered line is tagged with its origin in the
-  `LogBus`; the filter is applied server-side and the wire shape is unchanged
-  (still `{ "lines": string[] }`).
+- `?source=serve|worker|node:<node-id>:<worker-id>` — restrict to one origin:
+  `serve` (the higgs control plane + its worker interactions), `worker` (the local
+  model worker's own stderr), or a specific **remote worker** by its hub-local
+  numeric `NodeId` and `WorkerId`. Omit for all merged. Each buffered line is
+  tagged with its origin in the `LogBus`; the filter is applied server-side and the
+  wire shape is unchanged (still `{ "lines": string[] }`).
 
 **Response (200):**
 
@@ -654,7 +697,7 @@ lines like `higgs: GET /v1/models`). This is a one-shot tail — use
 **curl:**
 
 ```sh
-curl "http://localhost:8081/api/higgs/logs?n=50"
+curl "http://localhost:11434/api/higgs/logs?n=50"
 ```
 
 ---
@@ -672,7 +715,9 @@ It is registered on the **no-timeout** streaming router (like
 If the broadcast lags (a slow consumer drops lines), the handler emits a
 `[log stream lagged — dropped N lines]` marker frame and keeps streaming.
 
-**Query:** `?n=200` (lines to replay before going live; default 200)
+**Query:** `?n=200` (lines to replay before going live; default 200) and
+`?source=serve|worker|node:<node-id>:<worker-id>` (same origin filter as the
+snapshot `GET /api/higgs/logs`).
 
 **Response (200, `text/event-stream`):**
 
@@ -687,7 +732,7 @@ data: 2026-06-15 12:00:01 [INFO] higgs: GET /v1/models
 **curl:**
 
 ```sh
-curl -N "http://localhost:8081/api/higgs/logs/stream?n=50"
+curl -N "http://localhost:11434/api/higgs/logs/stream?n=50"
 ```
 
 ---
@@ -726,7 +771,7 @@ so the server can be re-enabled. It does **not** unbind the listener.
 **curl:**
 
 ```sh
-curl http://localhost:8081/api/higgs/settings
+curl http://localhost:11434/api/higgs/settings
 ```
 
 ---
@@ -753,41 +798,45 @@ Set the server-behavior runtime settings. The body carries
 ```sh
 curl -X PUT -H "Content-Type: application/json" \
   -d '{"jit_enabled":false,"auto_unload_idle":true,"idle_ttl_minutes":5,"serving_enabled":true}' \
-  http://localhost:8081/api/higgs/settings
+  http://localhost:11434/api/higgs/settings
 ```
 
 ---
 
 ### GET /api/higgs/logs/settings
 
-Current developer-log settings. Both flags are in-process **runtime** toggles
-(`AtomicBool`s on the `Higgs` facade) — **not** persisted to disk or config, so
-they reset to `false` on restart.
+Current developer-log settings. All three are in-process **runtime** toggles —
+**not** persisted to disk or config, so they reset to `false` on restart.
+`verbose` and `show_log_fields` live on the `LogBus`; `log_incoming_tokens` lives
+on the `Higgs` facade — all reached through `Higgs`.
 
 - `verbose` gates the extra serve-layer **completion** log line on the chat path
   (off by default).
 - `log_incoming_tokens` gates an extra serve-layer **incoming-prompt** line that
   logs prompt CONTENT (off by default). It is the explicit opt-in that overrides
   the redact-by-default policy (no prompt content at info) — see PUT below.
+- `show_log_fields` includes a tracing event's **structured fields** in captured
+  log lines (off by default = redact). Turning it on can surface structured field
+  values — including prompt content — so it is an explicit opt-in like the above.
 
 **Response (200):**
 
 ```json
-{ "verbose": false, "log_incoming_tokens": false }
+{ "verbose": false, "log_incoming_tokens": false, "show_log_fields": false }
 ```
 
 **curl:**
 
 ```sh
-curl http://localhost:8081/api/higgs/logs/settings
+curl http://localhost:11434/api/higgs/logs/settings
 ```
 
 ---
 
 ### PUT /api/higgs/logs/settings
 
-Set the developer-log settings. The body carries **both** flags and both are
-set, so toggling one preserves the other.
+Set the developer-log settings. The body carries **all** flags and each is set,
+so toggling one preserves the others.
 
 With `verbose: true`, every completed `POST /v1/chat/completions` (streaming and
 non-streaming) emits ONE extra INFO line on the `higgs` tracing target — `higgs:
@@ -804,10 +853,13 @@ content at info). Default `false`, so redaction is unchanged unless turned on.
 With both `false` (the default) only the existing request-entry line (`higgs:
 POST /v1/chat/completions`) appears.
 
+`show_log_fields: true` likewise includes tracing events' structured field values
+in captured lines (default `false` = redact), which can include prompt content.
+
 **Request body:**
 
 ```json
-{ "verbose": true, "log_incoming_tokens": true }
+{ "verbose": true, "log_incoming_tokens": true, "show_log_fields": true }
 ```
 
 **Response (200):**
@@ -820,15 +872,17 @@ POST /v1/chat/completions`) appears.
 
 ```sh
 curl -X PUT -H "Content-Type: application/json" \
-  -d '{"verbose":true,"log_incoming_tokens":true}' \
-  http://localhost:8081/api/higgs/logs/settings
+  -d '{"verbose":true,"log_incoming_tokens":true,"show_log_fields":true}' \
+  http://localhost:11434/api/higgs/logs/settings
 ```
 
 ---
 
 ### POST /api/higgs/worker/stop
 
-Gracefully shut down the worker (2 second timeout). There is no `/worker/start`
+Gracefully shut down the worker: a best-effort `higgs/shutdown` RPC (2 s timeout),
+then wait up to `WORKER_EXIT_TIMEOUT` (5 s) for the process to exit before a
+force-kill (SIGKILL). There is no `/worker/start`
 counterpart — loading a model **is** the start (it spawns the worker), and
 unloading **is** the stop. Use `POST /api/higgs/models/load` to bring a worker up.
 
@@ -841,20 +895,89 @@ unloading **is** the stop. Use `POST /api/higgs/models/load` to bring a worker u
 **curl:**
 
 ```sh
-curl -X POST http://localhost:8081/api/higgs/worker/stop
+curl -X POST http://localhost:11434/api/higgs/worker/stop
 ```
+
+---
+
+### GET /api/higgs/version
+
+Build + engine versions — no worker needed.
+
+```json
+{ "higgs": "0.1.0", "engine": "llama.cpp", "engine_version": "…", "binding": "0.1.139", "supported_formats": ["gguf"] }
+```
+
+---
+
+### GET /api/higgs/models/{*id}
+
+One model's details (the `{*id}` wildcard captures the full `org/model` slash
+path), including support detection. The handler runs a **fresh scan** per request,
+so `404 [HG002]` means the id is absent from the current on-disk catalog.
+
+---
+
+### GET /api/higgs/nodes
+
+The remote-fleet view (hub mode). Returns one entry per node the hub has ever
+admitted — connected or not — with its stable id, connection state, hardware
+snapshot, and resident workers. Empty when not running as a hub.
+
+```json
+[
+  {
+    "node_id": 1,
+    "endpoint_id": "…",
+    "connected": true,
+    "inventory": { "hostname": "…", "os": "linux", "workers": [ { "worker_id": 1, "model": "org/model" } ], "hardware": { … }, "runtime": { … } }
+  }
+]
+```
+
+---
+
+### POST /api/higgs/nodes/load · /api/higgs/nodes/unload
+
+Load or unload a model on a paired node (hub mode). `load` records a durable route
+so subsequent `/v1/chat/completions` for that model go to the node automatically.
+
+```jsonc
+// POST /api/higgs/nodes/load   { "node": "<endpoint-id>", "model": "org/model" }
+//   → { "status": "ok", "worker_id": 1 }
+// POST /api/higgs/nodes/unload { "model": "org/model" }
+//   → { "status": "ok" }
+```
+
+---
+
+### POST /api/higgs/pair
+
+Mint a single-use node-pairing token (hub mode). Returns a connection ticket, the
+token, and a ready-to-run node command. `409 Conflict` when the server isn't a hub
+— as do the mutating `nodes/load` and `nodes/unload` routes. (`GET /api/higgs/nodes`
+instead returns an empty `[]` when not a hub.)
+
+```json
+{ "hub_id": "…", "ticket": "…", "token": "…", "node_command": "higgs --node <ticket> <token>" }
+```
+
+See [Remote Fleet](/remote-fleet/) for the full pairing flow.
 
 ---
 
 ## Serve-layer hardening
 
 Every request — both surfaces — passes through a shared middleware stack
-(`higgs::serve::router`) following established ollama/vllm practice. higgs has
-**no auth**; these layers are the defense for a loopback no-auth server.
+(`higgs::serve::router`) following established ollama/vllm practice. When
+[API keys](/system-design/#securing-the-api) are configured, a Bearer-token check
+runs **in addition** to these layers (missing/insufficient token → `401`); with no
+keys the surface is unauthenticated and these layers are its defense for a loopback
+deployment.
 
 | Guard | Mechanism | On violation |
 |-------|-----------|--------------|
-| **Host header** | DNS-rebinding guard: the `Host` header's host portion (sans `:port`) must be loopback (`127.0.0.1` / `localhost` / `::1` / `[::1]`). A missing Host is also rejected (ollama behavior). | **403** `[HG012] forbidden host: <host>` |
+| **Host header** | DNS-rebinding guard: the `Host` header's host portion (sans `:port`) must be loopback — any IPv4 in `127.0.0.0/8` (`127.*`), `localhost`, or IPv6 `::1` / `[::1]`. A missing Host is also rejected (ollama behavior). | **403** `[HG012] forbidden host: <host>` |
 | **Body size** | `MAX_BODY_BYTES` = 32 MB via axum `DefaultBodyLimit`. | **413** |
 | **Control timeout** | `CONTROL_TIMEOUT` = 120 s `tower_http::timeout::TimeoutLayer`, applied **only** to `/api/higgs/*` and `/v1/models` — **except** the SSE routes (`/v1/chat/completions`, `/api/higgs/logs/stream`), which are on the no-timeout router. | **408** |
 | **Panic recovery** | `tower_http::catch_panic::CatchPanicLayer` — a handler panic is caught and rendered. | **500** (connection survives) |
@@ -863,17 +986,12 @@ Every request — both surfaces — passes through a shared middleware stack
 under `TimeoutLayer` — an SSE generation must never be aborted at the HTTP layer.
 Its duration is bounded separately by the worker chat-RPC timeout.
 
-**`/v1` 403 envelope (Host guard):**
+**Host-guard 403 body (both surfaces):**
 
-```json
-{
-  "error": {
-    "message": "[HG012] forbidden host: evil.example.com",
-    "type": "invalid_request_error",
-    "code": null
-  }
-}
+The Host guard is middleware that runs **before** route handling, so it returns
+the same response on `/v1` and `/api/higgs/*`: a `403` with a **plain-text** body
+(not a JSON envelope) —
+
+```text
+[HG012] forbidden host: evil.example.com
 ```
-
-The control surface returns the plain `{ "error": "[HG012] forbidden host: …" }`
-envelope.
