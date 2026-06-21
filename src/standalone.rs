@@ -77,7 +77,7 @@ pub async fn run_standalone(
         );
     }
 
-    let higgs = Arc::new(Higgs::with_log_bus(higgs_config, log_bus));
+    let higgs = Arc::new(Higgs::with_log_bus(higgs_config, log_bus.clone()));
     // Load API keys (P5). A MISSING store leaves the surface open by design (embedded host);
     // but a present-yet-unreadable/malformed store, or an unusable home dir, FAILS CLOSED —
     // we abort startup rather than silently serve unauthenticated, since the file's presence
@@ -89,6 +89,24 @@ pub async fn run_standalone(
         tracing::info!(keys = n, "higgs: API-key auth ENABLED");
     }
     higgs.set_api_keys(Arc::new(keys));
+
+    // Hub mode (HIGGS_HUB=1, P3): bind the iroh endpoint, install the fleet, and accept node
+    // dials. `_hub` is kept in scope for the server's lifetime so the endpoint stays bound.
+    let _hub = if std::env::var("HIGGS_HUB").is_ok_and(|v| v == "1" || v == "true") {
+        match crate::node::hub::start_hub(log_bus.clone()).await {
+            Ok(hub) => {
+                let hub = Arc::new(hub);
+                higgs.set_fleet(hub.fleet.clone());
+                higgs.set_hub(hub.clone());
+                tracing::info!(hub_id = hub.hub_id(), "higgs: HUB mode — accepting node dials");
+                Some(hub)
+            }
+            Err(e) => return Err(Box::new(e)),
+        }
+    } else {
+        None
+    };
+
     higgs.start().await?;
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;

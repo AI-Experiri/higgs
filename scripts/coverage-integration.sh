@@ -33,6 +33,7 @@ cd "$(dirname "$0")/.."
 exec cargo llvm-cov \
   --test auth \
   --test control_api \
+  --test hub_server \
   --test inference \
   --test pull \
   --test remote_cli \

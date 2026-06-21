@@ -44,6 +44,12 @@ impl Allowlist {
         self.file.nodes.get(id).cloned().flatten()
     }
 
+    /// Every paired EndpointId (ascending) — used to seed the hub's fleet view with known
+    /// nodes at startup so they appear (disconnected) before they reconnect.
+    pub fn ids(&self) -> Vec<String> {
+        self.file.nodes.keys().cloned().collect()
+    }
+
     /// Add a paired id (idempotent); persists.
     pub fn add(&mut self, id: String, label: Option<String>) -> std::io::Result<()> {
         self.mutate(|nodes| {
@@ -208,9 +214,14 @@ mod tests {
         let reloaded = Allowlist::load(&path).unwrap();
         assert!(reloaded.contains(&id_str()));
 
+        // ids() enumerates paired ids (for fleet seeding).
+        allow.add(id_str(), None).unwrap();
+        assert_eq!(allow.ids(), vec![id_str()], "ids lists the paired node");
+
         allow.remove(&id_str()).unwrap();
         assert!(!allow.contains(&id_str()));
         assert!(allow.is_empty());
+        assert!(allow.ids().is_empty(), "ids empty after removal");
         let _ = std::fs::remove_file(&path);
     }
 

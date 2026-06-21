@@ -9,6 +9,7 @@ pub mod cli;
 pub mod control;
 pub mod data;
 pub mod fleet;
+pub mod hub;
 pub mod identity;
 pub mod node_id;
 pub mod runtime;

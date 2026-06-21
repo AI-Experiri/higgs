@@ -99,6 +99,12 @@ impl HubFleet {
         self.node_ids.lock().get(node)
     }
 
+    /// Pre-register a known (e.g. persisted-allowlisted) node so it appears in the fleet view
+    /// as DISCONNECTED before it reconnects — assigns its stable `NodeId` without a transport.
+    pub fn seed_node(&self, node: &str) {
+        self.node_ids.lock().assign(node);
+    }
+
     /// The hub Developer-Log bus this fleet relays remote worker stderr into.
     pub fn bus(&self) -> &Arc<LogBus> {
         &self.bus
@@ -562,6 +568,18 @@ mod tests {
         // After retiring the node, the route is gone → not advertised.
         fleet.retire(&node_key);
         assert!(fleet.routed_models().is_empty());
+    }
+
+    #[test]
+    fn seed_node_lists_a_known_node_as_disconnected() {
+        let fleet = Arc::new(HubFleet::new(Arc::new(crate::log_bus::LogBus::new())));
+        fleet.seed_node("endpointA");
+        let views = fleet.nodes_view();
+        assert_eq!(views.len(), 1, "seeded node appears in the view");
+        assert_eq!(views[0].endpoint_id, "endpointA");
+        assert!(!views[0].connected, "seeded node is disconnected (no transport yet)");
+        assert!(views[0].inventory.is_none(), "no inventory until it connects");
+        assert!(fleet.node_id("endpointA").is_some(), "got a stable NodeId");
     }
 
     #[tokio::test]

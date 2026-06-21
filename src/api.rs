@@ -434,6 +434,9 @@ pub struct Higgs {
     /// in-process host wants no gate); the standalone binary loads `api_keys.json` at startup.
     /// Swapped wholesale, so a reload is one atomic store.
     api_keys: parking_lot::Mutex<Arc<crate::keys::ApiKeys>>,
+    /// The running hub (P3), when the server is in hub mode — used by the pairing API to mint
+    /// node-join tokens. `None` for a pure-local / non-hub server.
+    hub: parking_lot::Mutex<Option<Arc<crate::node::hub::Hub>>>,
 }
 
 impl Higgs {
@@ -471,6 +474,7 @@ impl Higgs {
             device_cache: parking_lot::Mutex::new(None),
             fleet: parking_lot::Mutex::new(None),
             api_keys: parking_lot::Mutex::new(std::sync::Arc::new(crate::keys::ApiKeys::default())),
+            hub: parking_lot::Mutex::new(None),
         }
     }
 
@@ -495,6 +499,16 @@ impl Higgs {
     /// serve-layer auth middleware on each request.
     pub fn api_keys(&self) -> Arc<crate::keys::ApiKeys> {
         self.api_keys.lock().clone()
+    }
+
+    /// Install the running hub (P3 hub mode) so the pairing API can mint node-join tokens.
+    pub fn set_hub(&self, hub: Arc<crate::node::hub::Hub>) {
+        *self.hub.lock() = Some(hub);
+    }
+
+    /// The running hub, if the server is in hub mode.
+    pub fn hub(&self) -> Option<Arc<crate::node::hub::Hub>> {
+        self.hub.lock().clone()
     }
 
     /// Whether "Verbose Logging" is on. Single home is the [`LogBus`] (read by
@@ -1072,6 +1086,7 @@ impl Higgs {
             device_cache: parking_lot::Mutex::new(None),
             fleet: parking_lot::Mutex::new(None),
             api_keys: parking_lot::Mutex::new(std::sync::Arc::new(crate::keys::ApiKeys::default())),
+            hub: parking_lot::Mutex::new(None),
         }
     }
 
@@ -1488,6 +1503,7 @@ mod tests {
             device_cache: parking_lot::Mutex::new(None),
             fleet: parking_lot::Mutex::new(None),
             api_keys: parking_lot::Mutex::new(std::sync::Arc::new(crate::keys::ApiKeys::default())),
+            hub: parking_lot::Mutex::new(None),
         };
         let ev = crate::worker::engine::llamacpp::engine_version();
         // Seed a HIT for (llama, Q4_K_M, <this engine version>).
@@ -1548,6 +1564,7 @@ mod tests {
             device_cache: parking_lot::Mutex::new(None),
             fleet: parking_lot::Mutex::new(None),
             api_keys: parking_lot::Mutex::new(std::sync::Arc::new(crate::keys::ApiKeys::default())),
+            hub: parking_lot::Mutex::new(None),
         };
         // Take the only permit and hold it.
         let held = Arc::clone(&higgs.inference_gate)
@@ -1872,6 +1889,7 @@ mod tests {
             device_cache: parking_lot::Mutex::new(None),
             fleet: parking_lot::Mutex::new(None),
             api_keys: parking_lot::Mutex::new(std::sync::Arc::new(crate::keys::ApiKeys::default())),
+            hub: parking_lot::Mutex::new(None),
         };
         let mut events_rx = higgs.events();
         // `load`/`status` run a host-side scan (on a blocking thread) before each
@@ -1957,6 +1975,7 @@ mod tests {
             device_cache: parking_lot::Mutex::new(None),
             fleet: parking_lot::Mutex::new(None),
             api_keys: parking_lot::Mutex::new(std::sync::Arc::new(crate::keys::ApiKeys::default())),
+            hub: parking_lot::Mutex::new(None),
         };
 
         // `status` runs a host-side scan (on a blocking thread) before M_STATUS,
@@ -2034,6 +2053,7 @@ mod tests {
             device_cache: parking_lot::Mutex::new(None),
             fleet: parking_lot::Mutex::new(None),
             api_keys: parking_lot::Mutex::new(std::sync::Arc::new(crate::keys::ApiKeys::default())),
+            hub: parking_lot::Mutex::new(None),
         };
 
         // Drive the load. `load` first runs a host-side scan (on a blocking
@@ -2086,6 +2106,7 @@ mod tests {
             device_cache: parking_lot::Mutex::new(None),
             fleet: parking_lot::Mutex::new(None),
             api_keys: parking_lot::Mutex::new(std::sync::Arc::new(crate::keys::ApiKeys::default())),
+            hub: parking_lot::Mutex::new(None),
         };
 
         let (mut rx, handle) = higgs
@@ -2174,6 +2195,7 @@ mod tests {
             device_cache: parking_lot::Mutex::new(None),
             fleet: parking_lot::Mutex::new(None),
             api_keys: parking_lot::Mutex::new(std::sync::Arc::new(crate::keys::ApiKeys::default())),
+            hub: parking_lot::Mutex::new(None),
         };
 
         // chat_stream registers the sink then the spawned task encounters dead worker.

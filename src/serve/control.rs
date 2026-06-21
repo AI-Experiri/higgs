@@ -322,6 +322,30 @@ pub(super) async fn control_status(State(higgs): State<Arc<Higgs>>) -> Response 
     }
 }
 
+/// `POST /api/higgs/pair` — mint a one-time pairing token + a dialable ticket for a new node
+/// (hub mode only). Admin-scoped. The operator runs `higgs --node <ticket> <token>` on the
+/// node; the hub's accept loop admits it. `409` when the server isn't a hub.
+pub(super) async fn control_pair(State(higgs): State<Arc<Higgs>>) -> Response {
+    tracing::warn!("higgs: POST /api/higgs/pair (minting node pairing token)");
+    match higgs.hub() {
+        Some(hub) => {
+            let (ticket, token) = hub.mint_pairing().await;
+            Json(serde_json::json!({
+                "hub_id": hub.hub_id(),
+                "ticket": ticket,
+                "token": token,
+                "node_command": format!("higgs --node {ticket} {token}"),
+            }))
+            .into_response()
+        }
+        None => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "server is not running in hub mode (set HIGGS_HUB=1)" })),
+        )
+            .into_response(),
+    }
+}
+
 /// `GET /api/higgs/nodes` — the remote fleet: one entry per paired node with its stable id,
 /// endpoint, connected state, and last-fetched inventory (host + resident workers + hw/rt).
 /// Empty when no `HubFleet` is installed (the hub role is off).
@@ -689,6 +713,17 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
         assert!(v["error"].as_str().unwrap().contains("[HG002]"));
+    }
+
+    #[tokio::test]
+    async fn pair_without_hub_mode_is_conflict() {
+        let (sup, _test_write, _test_read, _ring) = make_supervisor();
+        let app = make_app(sup);
+        // No hub installed → pairing is a 409 with an explanatory error.
+        let resp = app.oneshot(post_json("/api/higgs/pair", &json!({}))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert!(v["error"].as_str().unwrap().contains("hub mode"), "explains hub mode: {v}");
     }
 
     // ── Test 9: version endpoint ──────────────────────────────────────────────
