@@ -713,14 +713,14 @@ mod tests {
         let inv = fleet.refresh_inventory(&node_key).await.unwrap();
         assert!(inv.hardware.cpu_cores > 0, "inventory carries real hardware");
 
-        // A hub-driven load patches the cached view immediately (no second refresh).
+        // A hub-driven load refreshes the cached view from the node's authoritative state.
         let w = fleet.load(&node_key, &model_id).await.unwrap();
         let workers = fleet.nodes_view()[0].inventory.as_ref().unwrap().workers.clone();
         assert!(
             workers.iter().any(|x| x.worker_id == w.0 && x.model == model_id),
-            "load patches the cached inventory: {workers:?}"
+            "load refreshes the cached inventory: {workers:?}"
         );
-        // Unload patches it back out.
+        // Unload refreshes it back out.
         fleet.unload(&model_id).await.unwrap();
         let workers = fleet.nodes_view()[0].inventory.as_ref().unwrap().workers.clone();
         assert!(workers.iter().all(|x| x.worker_id != w.0), "unload removes it from the view");
