@@ -16,6 +16,7 @@ pub mod api;
 pub mod auth;
 pub mod diagnostic;
 pub mod home;
+pub mod keys;
 pub mod node;
 pub mod remote;
 pub mod log_bus;

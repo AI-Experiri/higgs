@@ -201,6 +201,24 @@ let outcome = done.await??;   // ChatOutcome { content, finish_reason, usage, ..
 | `GET·PUT /api/higgs/settings` · `…/logs/settings` | Runtime + logging toggles |
 | `GET /api/higgs/version` · `/health` | Build version · health check |
 
+## Securing the API
+
+The HTTP surface is **open by default** (intended for loopback / embedded use). To require
+authentication, add API keys — the gate turns on as soon as the first key exists:
+
+```bash
+higgs keys add ci chat,models   # mint a key (scopes: chat | models | admin)
+#   token (shown ONCE …): hgk_…
+higgs keys list
+higgs keys remove ci
+```
+
+Clients then send `Authorization: Bearer hgk_…`. Scopes: `chat` (POST `/v1/chat/completions`),
+`models` (model listing), `admin` (everything, incl. management). Tokens are stored only as a
+SHA-256 digest in `~/.higgs/api_keys.json`. The standalone server loads keys at startup and
+**fails closed** if the file is present but unreadable; **restart higgs** for key changes to
+take effect on a running server. Health checks (`/health`) are always open.
+
 ## Remote Fleet
 
 ```bash

@@ -31,6 +31,7 @@ cd "$(dirname "$0")/.."
 # Enumerate every integration target explicitly (NOT --tests, which would also
 # pull in the lib unit tests and inflate the number). Keep in sync with tests/.
 exec cargo llvm-cov \
+  --test auth \
   --test control_api \
   --test inference \
   --test remote_cli \

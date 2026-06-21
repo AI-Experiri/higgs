@@ -50,6 +50,7 @@ fn main() {
         Some("--node") => Some(higgs::node::cli::run_node_daemon(&args[1..])),
         Some("link") => Some(higgs::node::cli::run_link(&args[1..])),
         Some("node") => Some(higgs::node::cli::run_node(&args[1..])),
+        Some("keys") => Some(higgs::keys::run_keys(&args[1..])),
         _ => None,
     };
     if let Some(result) = remote {

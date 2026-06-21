@@ -195,6 +195,9 @@ pub fn router(higgs: Arc<Higgs>) -> Router {
         .route("/api/higgs/health", get(health))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(CatchPanicLayer::new())
+        // Auth runs AFTER the host guard (outer layers run first): reject a non-loopback
+        // Host before doing any key work. `from_fn_with_state` gives the guard the keystore.
+        .layer(middleware::from_fn_with_state(higgs.clone(), auth_guard))
         .layer(middleware::from_fn(host_guard))
         .layer(local_cors())
         .with_state(higgs)
@@ -215,6 +218,70 @@ async fn host_guard(req: Request, next: Next) -> Response {
             (StatusCode::FORBIDDEN, err.to_string()).into_response()
         }
     }
+}
+
+/// API-key auth (P5): when keys are configured, require a `Authorization: Bearer hgk_…`
+/// with the scope the route needs. An empty keystore disables auth (embedded host). Health
+/// checks are always open. On failure: `401` with an OpenAI-style error envelope +
+/// `WWW-Authenticate: Bearer`.
+async fn auth_guard(
+    axum::extract::State(higgs): axum::extract::State<Arc<Higgs>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let keys = higgs.api_keys();
+    if keys.is_empty() {
+        return next.run(req).await; // auth disabled
+    }
+    let Some(required) = required_scope(req.method(), req.uri().path()) else {
+        return next.run(req).await; // health / unmatched → open (routing handles it)
+    };
+    match bearer_token(req.headers()) {
+        Some(tok) if keys.authorizes(&tok, required) => next.run(req).await,
+        _ => unauthorized(),
+    }
+}
+
+/// The scope a request needs, or `None` for an always-open path (health). Reads: chat →
+/// `Chat`, model listing → `Models`, everything else under `/v1` or `/api/higgs` → `Admin`.
+fn required_scope(method: &Method, path: &str) -> Option<crate::keys::Scope> {
+    use crate::keys::Scope;
+    if path == "/health" || path == "/api/higgs/health" {
+        return None;
+    }
+    if path == "/v1/chat/completions" {
+        return Some(Scope::Chat);
+    }
+    if path == "/v1/models" || (method == Method::GET && path.starts_with("/api/higgs/models")) {
+        return Some(Scope::Models);
+    }
+    if path.starts_with("/v1/") || path.starts_with("/api/higgs/") {
+        return Some(Scope::Admin);
+    }
+    None
+}
+
+/// Extract the bearer token from an `Authorization: Bearer <token>` header.
+fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    let v = headers.get(axum::http::header::AUTHORIZATION)?.to_str().ok()?;
+    v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")).map(|t| t.trim().to_string())
+}
+
+/// The `401` envelope (OpenAI-style `error` object) for a missing/insufficient key.
+fn unauthorized() -> Response {
+    let body = axum::Json(serde_json::json!({
+        "error": {
+            "message": "missing or insufficient API key",
+            "type": "invalid_request_error",
+            "code": "unauthorized",
+        }
+    }));
+    let mut resp = (StatusCode::UNAUTHORIZED, body).into_response();
+    resp.headers_mut().insert(
+        axum::http::header::WWW_AUTHENTICATE,
+        HeaderValue::from_static("Bearer"),
+    );
+    resp
 }
 
 /// Validate the `Host` header: the host portion (sans `:port`) must be a
@@ -321,10 +388,42 @@ fn is_local_origin(origin: &HeaderValue) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{host_allowed, http_status, is_local_origin, is_loopback_host};
-    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    use super::{
+        bearer_token, host_allowed, http_status, is_local_origin, is_loopback_host,
+        required_scope,
+    };
+    use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 
     use crate::diagnostic::HiggsError;
+    use crate::keys::Scope;
+
+    #[test]
+    fn required_scope_maps_routes() {
+        assert_eq!(required_scope(&Method::GET, "/health"), None);
+        assert_eq!(required_scope(&Method::GET, "/api/higgs/health"), None);
+        assert_eq!(required_scope(&Method::POST, "/v1/chat/completions"), Some(Scope::Chat));
+        assert_eq!(required_scope(&Method::GET, "/v1/models"), Some(Scope::Models));
+        assert_eq!(required_scope(&Method::GET, "/api/higgs/models"), Some(Scope::Models));
+        assert_eq!(required_scope(&Method::GET, "/api/higgs/models/org/m"), Some(Scope::Models));
+        // mutations + management → Admin
+        assert_eq!(required_scope(&Method::POST, "/api/higgs/models/load"), Some(Scope::Admin));
+        assert_eq!(required_scope(&Method::GET, "/api/higgs/nodes"), Some(Scope::Admin));
+        assert_eq!(required_scope(&Method::POST, "/api/higgs/models"), Some(Scope::Admin));
+        // unknown path → open (routing 404s it)
+        assert_eq!(required_scope(&Method::GET, "/random"), None);
+    }
+
+    #[test]
+    fn bearer_token_parses_authorization_header() {
+        let mut h = HeaderMap::new();
+        assert_eq!(bearer_token(&h), None);
+        h.insert(axum::http::header::AUTHORIZATION, HeaderValue::from_static("Bearer hgk_abc"));
+        assert_eq!(bearer_token(&h).as_deref(), Some("hgk_abc"));
+        h.insert(axum::http::header::AUTHORIZATION, HeaderValue::from_static("bearer hgk_xyz"));
+        assert_eq!(bearer_token(&h).as_deref(), Some("hgk_xyz"));
+        h.insert(axum::http::header::AUTHORIZATION, HeaderValue::from_static("Basic zzz"));
+        assert_eq!(bearer_token(&h), None);
+    }
 
     #[test]
     fn loopback_host_matcher() {

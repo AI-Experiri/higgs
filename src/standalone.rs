@@ -78,6 +78,17 @@ pub async fn run_standalone(
     }
 
     let higgs = Arc::new(Higgs::with_log_bus(higgs_config, log_bus));
+    // Load API keys (P5). A MISSING store leaves the surface open by design (embedded host);
+    // but a present-yet-unreadable/malformed store, or an unusable home dir, FAILS CLOSED —
+    // we abort startup rather than silently serve unauthenticated, since the file's presence
+    // is exactly what enables protection.
+    let keys_path = crate::keys::keys_path()?;
+    let keys = crate::keys::ApiKeys::load(&keys_path)?;
+    let n = keys.iter().count();
+    if n > 0 {
+        tracing::info!(keys = n, "higgs: API-key auth ENABLED");
+    }
+    higgs.set_api_keys(Arc::new(keys));
     higgs.start().await?;
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;

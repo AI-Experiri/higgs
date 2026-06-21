@@ -49,6 +49,28 @@ fn node_daemon_without_ticket_prints_identity_and_usage() {
 }
 
 #[test]
+fn keys_add_list_remove_via_cli() {
+    let home = tempfile::tempdir().unwrap();
+    // add a key → succeeds and prints a token once.
+    let add = run_higgs(home.path(), &["keys", "add", "ci", "chat,models"]);
+    assert!(add.status.success(), "keys add exits 0");
+    let out = String::from_utf8_lossy(&add.stdout);
+    assert!(out.contains("token (shown ONCE"), "prints the minted token: {out}");
+    assert!(out.contains("hgk_"), "token has the hgk_ prefix");
+
+    // list shows it.
+    let list = run_higgs(home.path(), &["keys", "list"]);
+    assert!(list.status.success());
+    assert!(String::from_utf8_lossy(&list.stdout).contains("ci"), "list shows the key");
+
+    // remove drops it; a bad scope / missing label / unknown subcommand all fail.
+    assert!(run_higgs(home.path(), &["keys", "remove", "ci"]).status.success());
+    assert!(!run_higgs(home.path(), &["keys", "add", "x", "bogus"]).status.success());
+    assert!(!run_higgs(home.path(), &["keys", "add"]).status.success());
+    assert!(!run_higgs(home.path(), &["keys", "bogus"]).status.success());
+}
+
+#[test]
 fn cli_arg_errors_are_nonzero() {
     let home = tempfile::tempdir().unwrap();
     // Unknown subcommands + a malformed ticket all exit non-zero (no panic).
