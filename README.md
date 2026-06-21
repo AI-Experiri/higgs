@@ -222,18 +222,25 @@ take effect on a running server. Health checks (`/health`) are always open.
 ## Remote Fleet
 
 ```bash
-# On the HUB: start pairing — prints a ticket + one-time token
-higgs link pair
-#   higgs hub id : <id>
-#   pairing token: htk_…   (valid 10m, single-use)
-#   ticket       : <ticket>
+# Option A — run the SERVER itself as a hub (recommended): one process serves HTTP
+# AND accepts node dials. Mint a join token over the API:
+HIGGS_HUB=1 higgs                                  # server in hub mode
+curl -X POST localhost:11434/api/higgs/pair        # → { ticket, token, node_command }
 
-# On the NODE: run the persistent daemon, dialing the hub
+# Option B — hand-pair from the CLI (separate accept loop):
+higgs link pair        # prints hub id + a single-use token (10m) + ticket
+higgs link status      # list pairings
+
+# On the NODE: run the persistent daemon, dialing the hub. Pulled/scanned models load here.
 HIGGS_MODEL_DIR=/path/to/models higgs --node <ticket> <token>
 
-# Check pairings
-higgs link status
+# Pull a model onto a node from HuggingFace (lands in the node's ~/.higgs/models/):
+#   issued by the hub over M_NODE_PULL; progress streams as N_PROGRESS.
 ```
+
+With the server in hub mode (`HIGGS_HUB=1`), `GET /api/higgs/nodes` lists every paired
+node (connected or not) with its hardware + resident workers, and `/v1/chat/completions`
+for a remote-resident model is routed there automatically.
 
 Once paired, the hub can load a model on the node (via `HubFleet`/the API) and any
 `/v1/chat/completions` for that model is routed there automatically; `GET /api/higgs/nodes`
