@@ -381,7 +381,14 @@ impl HubFleet {
         }
         let Ok(t) = self.transport(node) else { return };
         for w in owed {
-            if t.request(M_NODE_UNLOAD, json!({ "worker_id": w.0 })).await.is_ok() {
+            let res = t.request(M_NODE_UNLOAD, json!({ "worker_id": w.0 })).await;
+            // Clear on success OR when the node reports the worker already gone
+            // (HG006/HG007) — the owed unload is satisfied either way. Leaving a worker-gone
+            // entry pending would leak forever AND, after a node restart reuses the id for a
+            // DIFFERENT worker, a later reconcile could unload that legitimate worker. (Mirrors
+            // `unload_or_kill`'s clear-on-worker-gone.) A transport error keeps it for the
+            // next reconnect.
+            if res.is_ok() || res.as_ref().err().is_some_and(route_invalidating) {
                 self.pending_unloads.lock().remove(&(node.to_string(), w));
                 if let Some(nid) = self.node_id(node) {
                     self.bus.evict_remote(nid, w);
@@ -634,6 +641,16 @@ mod tests {
         assert!(
             !fleet.pending_unloads.lock().contains(&(node_key.clone(), w)),
             "reconnect drains the owed unload"
+        );
+
+        // A pending unload for a worker the node NO LONGER has (e.g. it restarted) must also
+        // be cleared — the node replies worker-gone (HG007), which counts as reconciled.
+        // Otherwise it would leak forever and could later kill a same-id worker after restart.
+        fleet.pending_unloads.lock().insert((node_key.clone(), WorkerId(9999)));
+        fleet.reconcile_pending_unloads(&node_key).await;
+        assert!(
+            !fleet.pending_unloads.lock().contains(&(node_key.clone(), WorkerId(9999))),
+            "worker-gone reply clears the owed unload (not left pending forever)"
         );
 
         // Retiring a node clears anything still owed to it.
