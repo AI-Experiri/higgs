@@ -304,10 +304,12 @@ pub(crate) fn finish_reason_from(s: &str) -> FinishReason {
 mod tests {
     use super::*;
 
-    /// Collect all payloads `assemble` produces for the given inputs.
-    async fn run_assemble(
+    /// Collect all payloads `assemble` produces for the given inputs. `include_usage`
+    /// toggles the OpenAI `stream_options.include_usage` terminal usage chunk.
+    async fn run_assemble_opts(
         deltas: mpsc::UnboundedReceiver<String>,
         outcome: JoinHandle<Result<ChatOutcome, HiggsError>>,
+        include_usage: bool,
     ) -> Vec<String> {
         let (tx, mut rx) = mpsc::unbounded_channel();
         assemble(
@@ -319,7 +321,7 @@ mod tests {
             tx,
             false,
             std::time::Instant::now(),
-            false,
+            include_usage,
         )
         .await;
         let mut out = Vec::new();
@@ -329,29 +331,12 @@ mod tests {
         out
     }
 
-    /// Like [`run_assemble`] but with `include_usage` on (OpenAI usage chunk requested).
-    async fn run_assemble_with_usage(
+    /// The common case: assemble without the usage chunk.
+    async fn run_assemble(
         deltas: mpsc::UnboundedReceiver<String>,
         outcome: JoinHandle<Result<ChatOutcome, HiggsError>>,
     ) -> Vec<String> {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        assemble(
-            "chatcmpl-t".into(),
-            "org/model".into(),
-            1,
-            deltas,
-            outcome,
-            tx,
-            false,
-            std::time::Instant::now(),
-            true,
-        )
-        .await;
-        let mut out = Vec::new();
-        while let Ok(p) = rx.try_recv() {
-            out.push(p);
-        }
-        out
+        run_assemble_opts(deltas, outcome, false).await
     }
 
     #[test]
@@ -415,7 +400,7 @@ mod tests {
             })
         });
 
-        let payloads = run_assemble_with_usage(drx, outcome).await;
+        let payloads = run_assemble_opts(drx, outcome, true).await;
         // role + delta + finish + usage + [DONE]
         assert_eq!(payloads.len(), 5, "usage chunk added before [DONE]: {payloads:?}");
         assert_eq!(payloads[4], "[DONE]");

@@ -90,16 +90,10 @@ pub(crate) async fn relay_chat(
         }
     }
 
-    let resp = match final_res {
-        Ok(value) => RpcResponse { jsonrpc: "2.0".into(), id: req.id, result: Some(value), error: None },
-        Err(e) => RpcResponse {
-            jsonrpc: "2.0".into(),
-            id: req.id,
-            result: None,
-            error: Some(RpcError { code: -32000, message: e.to_string(), data: hg_data(&e) }),
-        },
-    };
-    let _ = write_frame(send, &RpcFrame::Response(resp)).await;
+    match final_res {
+        Ok(value) => reply_ok(send, req.id, value).await,
+        Err(e) => reply_err(send, req.id, -32000, e.to_string(), hg_data(&e)).await,
+    }
 }
 
 /// Relay one `M_NODE_PULL` request: download the GGUF into `~/.higgs/models/`, streaming
@@ -179,21 +173,21 @@ async fn pull_stream<F: crate::download::Fetcher + Send + Sync + 'static>(
         }
     }
 
-    let resp = match final_res {
-        Ok(path) => RpcResponse {
-            jsonrpc: "2.0".into(),
-            id: req.id,
-            result: Some(json!({ "path": path.to_string_lossy() })),
-            error: None,
-        },
-        Err(e) => RpcResponse {
-            jsonrpc: "2.0".into(),
-            id: req.id,
-            result: None,
-            error: Some(RpcError { code: -32000, message: e.to_string(), data: hg_data(&e) }),
-        },
-    };
-    let _ = write_frame(send, &RpcFrame::Response(resp)).await;
+    match final_res {
+        Ok(path) => reply_ok(send, req.id, json!({ "path": path.to_string_lossy() })).await,
+        Err(e) => reply_err(send, req.id, -32000, e.to_string(), hg_data(&e)).await,
+    }
+}
+
+/// Write one notification frame (`method` + `params`) — the shared body of the typed
+/// `write_progress`/`write_chunk` wrappers below.
+async fn write_notification(
+    send: &mut SendStream,
+    method: &str,
+    params: serde_json::Value,
+) -> std::io::Result<()> {
+    let note = RpcNotification { jsonrpc: "2.0".into(), method: method.into(), params };
+    write_frame(send, &RpcFrame::Notification(note)).await
 }
 
 /// Write one `N_PROGRESS` notification (hub `request_id` + byte counts).
@@ -203,22 +197,19 @@ async fn write_progress(
     downloaded: u64,
     total: Option<u64>,
 ) -> std::io::Result<()> {
-    let note = RpcNotification {
-        jsonrpc: "2.0".into(),
-        method: crate::remote::N_PROGRESS.into(),
-        params: json!({ "request_id": request_id, "downloaded": downloaded, "total": total }),
-    };
-    write_frame(send, &RpcFrame::Notification(note)).await
+    let params = json!({ "request_id": request_id, "downloaded": downloaded, "total": total });
+    write_notification(send, crate::remote::N_PROGRESS, params).await
 }
 
 /// Write one `N_CHAT_CHUNK` notification carrying the hub's `request_id` + delta.
 async fn write_chunk(send: &mut SendStream, request_id: u64, delta: &str) -> std::io::Result<()> {
-    let note = RpcNotification {
-        jsonrpc: "2.0".into(),
-        method: N_CHAT_CHUNK.into(),
-        params: json!({ "request_id": request_id, "delta": delta }),
-    };
-    write_frame(send, &RpcFrame::Notification(note)).await
+    write_notification(send, N_CHAT_CHUNK, json!({ "request_id": request_id, "delta": delta })).await
+}
+
+/// Write a successful `result` response for request `id`.
+async fn reply_ok(send: &mut SendStream, id: u64, result: serde_json::Value) {
+    let resp = RpcResponse { jsonrpc: "2.0".into(), id, result: Some(result), error: None };
+    let _ = write_frame(send, &RpcFrame::Response(resp)).await;
 }
 
 async fn reply_err(

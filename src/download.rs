@@ -262,26 +262,29 @@ mod tests {
     #[test]
     fn dest_path_enforces_scanner_layout_and_rejects_escapes() {
         let root = Path::new("/models");
-        assert!(dest_path(root, "org/m", "x.gguf").is_ok());
-        // Layout: must be <org>/<model>/*.gguf.
-        assert!(dest_path(root, "gpt2", "x.gguf").is_err(), "single-segment repo rejected");
-        assert!(dest_path(root, "a/b/c", "x.gguf").is_err(), "three-segment repo rejected");
-        assert!(dest_path(root, "org/m", "sub/x.gguf").is_err(), "subdir in file rejected");
-        assert!(dest_path(root, "org/m", "x.bin").is_err(), "non-gguf rejected");
-        assert!(dest_path(root, "org/m", "X.GGUF").is_ok(), "uppercase .GGUF accepted");
-        assert!(dest_path(root, "org\\m", "x.gguf").is_err(), "backslash in repo rejected");
-        // Escapes / empties.
-        assert!(dest_path(root, "../etc", "passwd").is_err(), "no parent-dir escape");
-        assert!(dest_path(root, "org", "/abs").is_err(), "no absolute file");
-        assert!(dest_path(root, "", "x.gguf").is_err(), "empty repo rejected");
-        assert!(dest_path(root, "../m", "x.gguf").is_err(), "parent in org rejected");
-        // URL-reserved characters are rejected (would corrupt the resolve URL).
-        assert!(dest_path(root, "org/m", "x?.gguf").is_err(), "'?' (query) in file rejected");
-        assert!(dest_path(root, "org/m", "x#.gguf").is_err(), "'#' (fragment) in file rejected");
-        assert!(dest_path(root, "or#g/m", "x.gguf").is_err(), "'#' in repo rejected");
-        assert!(dest_path(root, "org/m", "a b.gguf").is_err(), "space in file rejected");
-        // Normal HF charset is fine.
-        assert!(dest_path(root, "TheBloke/Llama-2.7B_GGUF", "model.q4_0.gguf").is_ok());
+        // (repo, file, should_succeed, why) — layout is <org>/<model>/*.gguf, and any path
+        // escape / URL-reserved char / empty segment is rejected.
+        let cases: &[(&str, &str, bool, &str)] = &[
+            ("org/m", "x.gguf", true, "canonical <org>/<model>/*.gguf"),
+            ("gpt2", "x.gguf", false, "single-segment repo"),
+            ("a/b/c", "x.gguf", false, "three-segment repo"),
+            ("org/m", "sub/x.gguf", false, "subdir in file"),
+            ("org/m", "x.bin", false, "non-gguf"),
+            ("org/m", "X.GGUF", true, "uppercase .GGUF"),
+            ("org\\m", "x.gguf", false, "backslash in repo"),
+            ("../etc", "passwd", false, "parent-dir escape"),
+            ("org", "/abs", false, "absolute file"),
+            ("", "x.gguf", false, "empty repo"),
+            ("../m", "x.gguf", false, "parent in org"),
+            ("org/m", "x?.gguf", false, "'?' (query) in file"),
+            ("org/m", "x#.gguf", false, "'#' (fragment) in file"),
+            ("or#g/m", "x.gguf", false, "'#' in repo"),
+            ("org/m", "a b.gguf", false, "space in file"),
+            ("TheBloke/Llama-2.7B_GGUF", "model.q4_0.gguf", true, "normal HF charset"),
+        ];
+        for (repo, file, ok, why) in cases {
+            assert_eq!(dest_path(root, repo, file).is_ok(), *ok, "{why}: {repo:?}/{file:?}");
+        }
     }
 
     #[tokio::test]

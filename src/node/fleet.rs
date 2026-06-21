@@ -155,8 +155,6 @@ impl HubFleet {
         });
     }
 
-    /// Fetch `node`'s inventory over its live transport and cache it for the fleet view.
-    ///
     /// Fetch `node`'s inventory over its live transport and cache it for the fleet view. The
     /// node's `M_NODE_INVENTORY` reply is AUTHORITATIVE (its real resident workers) and stored
     /// verbatim — except a result is dropped if a lifecycle op changed this node's generation
@@ -267,6 +265,21 @@ impl HubFleet {
             })
     }
 
+    /// Reclaim a remote worker's relayed-log ring, if the node has a known [`NodeId`].
+    /// Shared by every route-drop / unload path so the hub bus never keeps a gone worker's
+    /// lines.
+    fn evict_remote_logs(&self, node: &str, worker: WorkerId) {
+        if let Some(nid) = self.node_id(node) {
+            self.bus.evict_remote(nid, worker);
+        }
+    }
+
+    /// Resolve `model` to its `(node, worker)` route or fail with HG002 — the precondition
+    /// shared by chat/unload/kill.
+    fn require_route(&self, model: &str) -> Result<(NodeKey, WorkerId), HiggsError> {
+        self.resolve(model).ok_or_else(|| HiggsError::ModelNotFound { id: model.to_string() })
+    }
+
     /// Remove a route only if it STILL equals `expected` — so a route from a concurrent op
     /// (which awaits a remote RPC) is never clobbered. When the route is actually removed,
     /// also reclaim the worker's relayed-log ring and drop it from the cached fleet view, so
@@ -283,9 +296,7 @@ impl HubFleet {
         };
         if removed {
             let (node, worker) = expected;
-            if let Some(nid) = self.node_id(node) {
-                self.bus.evict_remote(nid, *worker);
-            }
+            self.evict_remote_logs(node, *worker);
             // Invalidate any in-flight inventory fetch; the caller refreshes after.
             self.bump_epoch(node);
         }
@@ -314,16 +325,7 @@ impl HubFleet {
             .request(M_NODE_LOAD, json!({ "id": model }))
             .await
             .map_err(|e| self.handle_op_error(node, &transport, e))?;
-        let worker_u64 = result
-            .get("worker_id")
-            .and_then(serde_json::Value::as_u64)
-            .ok_or_else(|| HiggsError::WorkerDead {
-                context: "node load reply missing worker_id".into(),
-            })?;
-        let worker_id = u32::try_from(worker_u64).map_err(|_| HiggsError::WorkerDead {
-            context: format!("node load reply worker_id {worker_u64} out of u32 range"),
-        })?;
-        let new = (node.to_string(), WorkerId(worker_id));
+        let new = (node.to_string(), WorkerId(parse_worker_id(&result)?));
         let displaced = self.routes.lock().insert(model.to_string(), new.clone());
         if let Some(old) = displaced {
             if old != new {
@@ -345,9 +347,7 @@ impl HubFleet {
     /// node is DISCONNECTED the unload can't be delivered, so it's recorded as pending and
     /// reaped on the node's next reconnect — never silently leaked.
     async fn best_effort_unload(&self, route: &(NodeKey, WorkerId)) {
-        if let Some(nid) = self.node_id(&route.0) {
-            self.bus.evict_remote(nid, route.1);
-        }
+        self.evict_remote_logs(&route.0, route.1);
         match self.transport(&route.0) {
             Ok(t) => {
                 let res = t.request(M_NODE_UNLOAD, json!({ "worker_id": route.1 .0 })).await;
@@ -399,9 +399,7 @@ impl HubFleet {
             // next reconnect.
             if res.is_ok() || res.as_ref().err().is_some_and(route_invalidating) {
                 self.pending_unloads.lock().remove(&(node.to_string(), w));
-                if let Some(nid) = self.node_id(node) {
-                    self.bus.evict_remote(nid, w);
-                }
+                self.evict_remote_logs(node, w);
             }
         }
     }
@@ -419,9 +417,7 @@ impl HubFleet {
     /// Shared unload/kill: clear the route on success OR when the node reports the worker
     /// already gone; node-down → HG027 (transport dropped).
     async fn unload_or_kill(&self, model: &str, method: &str) -> Result<(), HiggsError> {
-        let (node, worker) = self.resolve(model).ok_or_else(|| HiggsError::ModelNotFound {
-            id: model.to_string(),
-        })?;
+        let (node, worker) = self.require_route(model)?;
         let transport = self.transport(&node)?;
         let res = transport.request(method, json!({ "worker_id": worker.0 })).await;
         if res.is_ok() || res.as_ref().err().is_some_and(route_invalidating) {
@@ -473,9 +469,7 @@ impl HubFleet {
         (mpsc::UnboundedReceiver<String>, impl std::future::Future<Output = Result<serde_json::Value, HiggsError>> + Send),
         HiggsError,
     > {
-        let (node, worker) = self.resolve(model).ok_or_else(|| HiggsError::ModelNotFound {
-            id: model.to_string(),
-        })?;
+        let (node, worker) = self.require_route(model)?;
         let transport = self.transport(&node)?;
         let (rx, fut) = transport
             .chat(worker.0, model.to_string(), messages_json, max_tokens, temperature, tools_json)
@@ -503,6 +497,17 @@ impl HubFleet {
         };
         Ok((rx, wrapped))
     }
+}
+
+/// Extract the `worker_id` from a node's `M_NODE_LOAD` reply, validating it is present and
+/// fits a `u32` (the wire type) — a missing or out-of-range value is a protocol fault.
+fn parse_worker_id(reply: &serde_json::Value) -> Result<u32, HiggsError> {
+    let raw = reply.get("worker_id").and_then(serde_json::Value::as_u64).ok_or_else(|| {
+        HiggsError::WorkerDead { context: "node load reply missing worker_id".into() }
+    })?;
+    u32::try_from(raw).map_err(|_| HiggsError::WorkerDead {
+        context: format!("node load reply worker_id {raw} out of u32 range"),
+    })
 }
 
 /// Accept the node's uni stream(s) of `N_LOG_LINE` notifications and file each line into the

@@ -63,16 +63,19 @@ pub struct ApiKeys {
     keys: Vec<ApiKey>,
 }
 
+/// Lowercase hex of a byte slice.
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// SHA-256 hex of `token` — the at-rest digest form.
 pub fn hash_token(token: &str) -> String {
-    let digest = Sha256::digest(token.as_bytes());
-    digest.iter().map(|b| format!("{b:02x}")).collect()
+    bytes_to_hex(&Sha256::digest(token.as_bytes()))
 }
 
 /// Generate a fresh opaque token (`hgk_` + 32 url-safe-ish hex chars from 16 random bytes).
 pub fn mint_token(rand_bytes: [u8; 16]) -> String {
-    let hex: String = rand_bytes.iter().map(|b| format!("{b:02x}")).collect();
-    format!("hgk_{hex}")
+    format!("hgk_{}", bytes_to_hex(&rand_bytes))
 }
 
 impl ApiKeys {
@@ -158,6 +161,9 @@ fn parse_scopes(s: &str) -> std::io::Result<Vec<Scope>> {
         .collect()
 }
 
+/// Shown after a mutating `keys` subcommand: changes only take effect on (re)start.
+const RESTART_NOTICE: &str = "↻ restart higgs for this to take effect on a running server.";
+
 /// `higgs keys <add|list|remove>` — manage the API-key store (P5).
 pub fn run_keys(args: &[String]) -> std::io::Result<()> {
     run_keys_at(&keys_path()?, args)
@@ -180,7 +186,7 @@ fn run_keys_at(path: &Path, args: &[String]) -> std::io::Result<()> {
             keys.save(path)?;
             println!("added key {label:?} with scopes {scopes:?}");
             println!("token (shown ONCE — store it now): {token}");
-            println!("↻ restart higgs for this to take effect on a running server.");
+            println!("{RESTART_NOTICE}");
             Ok(())
         }
         Some("list") => {
@@ -202,7 +208,7 @@ fn run_keys_at(path: &Path, args: &[String]) -> std::io::Result<()> {
             let n = keys.remove_label(&label);
             keys.save(path)?;
             println!("removed {n} key(s) labeled {label:?}");
-            println!("↻ restart higgs for this to take effect on a running server.");
+            println!("{RESTART_NOTICE}");
             Ok(())
         }
         other => {

@@ -34,6 +34,14 @@ pub struct NodeConfig {
     pub ollama_dirs: Vec<PathBuf>,
 }
 
+impl NodeConfig {
+    /// The three model roots `(lmstudio, hf, ollama)`, cloned for a `spawn_blocking` scan
+    /// that must own them. Shared by `resolve_model` and `scan`.
+    fn model_dirs(&self) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
+        (self.lmstudio_dirs.clone(), self.hf_dirs.clone(), self.ollama_dirs.clone())
+    }
+}
+
 /// Cancellation-safety guard: a dropped `Supervisor` does NOT reap its child, so if a
 /// lifecycle future is cancelled mid-await the worker would orphan (RAM/VRAM held, no id
 /// to stop it). This guard fires a detached `stop()` on drop unless `commit()` defuses it.
@@ -98,19 +106,17 @@ impl NodeRuntime {
         self.registry.lock().ids()
     }
 
+    /// The "no such worker" error shared by the registry lookups below.
+    fn no_worker(id: WorkerId) -> HiggsError {
+        HiggsError::WorkerDead { context: format!("no worker {id}") }
+    }
+
     fn get(&self, id: WorkerId) -> Result<Arc<Supervisor>, HiggsError> {
-        self.registry
-            .lock()
-            .get(id)
-            .cloned()
-            .ok_or_else(|| HiggsError::WorkerDead { context: format!("no worker {id}") })
+        self.registry.lock().get(id).cloned().ok_or_else(|| Self::no_worker(id))
     }
 
     fn take(&self, id: WorkerId) -> Result<Arc<Supervisor>, HiggsError> {
-        self.registry
-            .lock()
-            .remove(id)
-            .ok_or_else(|| HiggsError::WorkerDead { context: format!("no worker {id}") })
+        self.registry.lock().remove(id).ok_or_else(|| Self::no_worker(id))
     }
 
     /// Resolve `id` to its on-disk GGUF `(path, size_bytes, ctx_train)` by scanning the
@@ -120,9 +126,7 @@ impl NodeRuntime {
     /// canonicalize to within a root (symlink-escape guard, [HG015]). `[HG002]` if absent.
     async fn resolve_model(&self, id: &str) -> Result<(String, u64, Option<u64>), HiggsError> {
         let id = id.to_string();
-        let lmstudio = self.config.lmstudio_dirs.clone();
-        let hf = self.config.hf_dirs.clone();
-        let ollama = self.config.ollama_dirs.clone();
+        let (lmstudio, hf, ollama) = self.config.model_dirs();
         tokio::task::spawn_blocking(move || {
             let mut store = ModelStore::default();
             store.scan(&lmstudio, &hf, &ollama)?;
@@ -241,14 +245,13 @@ impl NodeRuntime {
         Ok(())
     }
 
-    /// Force-kill ONE worker (at this layer the same as unload — `stop()` reaps the
-    /// child; the OS-level distinction is the Supervisor's concern).
+    /// Force-kill ONE worker. At this layer it is the same as [`unload`] — `stop()` reaps
+    /// the child and the OS-level distinction is the Supervisor's concern — so it simply
+    /// delegates rather than duplicating the cancellation-safe stop.
+    ///
+    /// [`unload`]: Self::unload
     pub async fn kill(&self, id: WorkerId) -> Result<(), HiggsError> {
-        let sup = self.take(id)?;
-        let guard = StopOnDrop::new(sup.clone());
-        sup.stop().await;
-        guard.commit();
-        Ok(())
+        self.unload(id).await
     }
 
     /// Per-worker status (forwards `M_STATUS` to that worker's Supervisor).
@@ -259,9 +262,7 @@ impl NodeRuntime {
     /// Node-level model catalog (`{ "models": [HiggsModel, …] }`) from a fresh scan of the
     /// node's roots. Read-only; the blocking scan runs off the executor.
     pub async fn scan(&self) -> Result<Value, HiggsError> {
-        let lmstudio = self.config.lmstudio_dirs.clone();
-        let hf = self.config.hf_dirs.clone();
-        let ollama = self.config.ollama_dirs.clone();
+        let (lmstudio, hf, ollama) = self.config.model_dirs();
         let models = tokio::task::spawn_blocking(move || {
             let mut store = ModelStore::default();
             store.scan(&lmstudio, &hf, &ollama)?;
@@ -277,13 +278,25 @@ impl NodeRuntime {
     /// CPU/RAM/load into the full hardware snapshot (cpu_name, cores, RAM total/used,
     /// cpu_usage, gpus, vram) — the params the hub fleet view extracts (§4.2).
     pub async fn sysinfo(&self) -> Result<Value, HiggsError> {
+        let (hardware, runtime) = self.hardware_runtime("sysinfo").await?;
+        Ok(json!({ "hardware": hardware, "runtime": runtime }))
+    }
+
+    /// Enumerate GPUs via a transient worker, then fold them with sampled CPU/RAM/load
+    /// into the `(hardware, runtime)` snapshot off the executor. Shared by [`sysinfo`] and
+    /// [`inventory`]; `context` names the caller for the task-join error message.
+    ///
+    /// [`sysinfo`]: Self::sysinfo
+    /// [`inventory`]: Self::inventory
+    async fn hardware_runtime(
+        &self,
+        context: &str,
+    ) -> Result<(crate::system::HardwareInfo, crate::system::RuntimeInfo), HiggsError> {
         let sup = (self.spawner)(self.config.bus.clone());
         let gpus = sup.sysinfo().await;
-        let (hardware, runtime) =
-            tokio::task::spawn_blocking(move || crate::system::SystemInfo::gather_hardware_runtime(gpus))
-                .await
-                .map_err(|e| HiggsError::WorkerDead { context: format!("sysinfo task failed: {e}") })?;
-        Ok(json!({ "hardware": hardware, "runtime": runtime }))
+        tokio::task::spawn_blocking(move || crate::system::SystemInfo::gather_hardware_runtime(gpus))
+            .await
+            .map_err(|e| HiggsError::WorkerDead { context: format!("{context} task failed: {e}") })
     }
 
     /// Full node self-description for `M_NODE_INVENTORY`: host identity + every resident
@@ -301,12 +314,7 @@ impl NodeRuntime {
                 })
                 .collect()
         };
-        let sup = (self.spawner)(self.config.bus.clone());
-        let gpus = sup.sysinfo().await;
-        let (hardware, runtime) =
-            tokio::task::spawn_blocking(move || crate::system::SystemInfo::gather_hardware_runtime(gpus))
-                .await
-                .map_err(|e| HiggsError::WorkerDead { context: format!("inventory task failed: {e}") })?;
+        let (hardware, runtime) = self.hardware_runtime("inventory").await?;
         let inventory = crate::remote::NodeInventory {
             hostname: sysinfo::System::host_name().unwrap_or_default(),
             os: std::env::consts::OS.to_string(),
