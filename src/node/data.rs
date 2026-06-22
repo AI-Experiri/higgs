@@ -42,7 +42,7 @@ pub(crate) async fn relay_chat(
             return;
         }
     };
-    let sup = match rt.chat_handle(WorkerId(params.worker_id)).await {
+    let lease = match rt.chat_handle(WorkerId(params.worker_id)).await {
         Ok(s) => s,
         Err(e) => {
             reply_err(send, req.id, -32000, e.to_string(), hg_data(&e)).await;
@@ -52,7 +52,7 @@ pub(crate) async fn relay_chat(
 
     // Apply the worker's own defaults for omitted optional params (1024 / 0.7), so a
     // remote chat with no max_tokens generates normally instead of zero tokens.
-    let (mut chunks, fut) = sup.chat(
+    let (mut chunks, fut) = lease.chat(
         params.model,
         params.messages_json,
         params.max_tokens.unwrap_or(1024),
@@ -63,8 +63,15 @@ pub(crate) async fn relay_chat(
     // sink on ANY outcome. Drive it in its own task so that cleanup runs even if the hub
     // disconnects mid-chat — otherwise an early return here would drop the future and
     // leak the registered sink. Bounded by the supervisor's chat timeout.
+    //
+    // Move the `ChatLease` INTO this task so the worker's in-flight hold (which keeps the
+    // idle reaper from unloading it) lasts until the generation ACTUALLY finishes — not
+    // until `relay_chat` returns. A hub disconnect returns from `relay_chat` early while the
+    // generation keeps running here; dropping the lease only now posts `ChatEnd`, so the
+    // worker can't be idle-reaped mid-generation.
     let (final_tx, final_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
+        let _lease = lease; // held until fut completes
         let _ = final_tx.send(fut.await);
     });
     tokio::pin!(final_rx);

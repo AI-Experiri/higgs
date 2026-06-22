@@ -207,6 +207,7 @@ pub fn run_node_daemon(args: &[String]) -> Result<()> {
             lmstudio_dirs: hc.lmstudio_dirs,
             hf_dirs: hc.hf_dirs,
             ollama_dirs: hc.ollama_dirs,
+            idle_ttl: crate::node::runtime::DEFAULT_IDLE_TTL,
         }));
         println!("higgs node id: {self_id}; connecting to hub…");
 

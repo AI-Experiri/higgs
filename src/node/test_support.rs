@@ -85,14 +85,25 @@ pub(crate) fn fake_worker_factory() -> HalvesFactory {
     })
 }
 
-/// A `NodeRuntime` whose workers are fakes (no llama.cpp), scanning `dirs` for models.
+/// A `NodeRuntime` whose workers are fakes (no llama.cpp), scanning `dirs` for models. Uses
+/// the default (60-min) idle TTL so fast tests never trip the reaper.
 pub(crate) fn fake_runtime(lmstudio_dirs: Vec<PathBuf>) -> NodeRuntime {
+    fake_runtime_with_idle_ttl(lmstudio_dirs, crate::node::runtime::DEFAULT_IDLE_TTL)
+}
+
+/// Like [`fake_runtime`] but with an explicit idle TTL — lets a test drive the node's idle
+/// reaper deterministically with a tiny TTL.
+pub(crate) fn fake_runtime_with_idle_ttl(
+    lmstudio_dirs: Vec<PathBuf>,
+    idle_ttl: std::time::Duration,
+) -> NodeRuntime {
     NodeRuntime::with_spawner(
         NodeConfig {
             bus: Arc::new(LogBus::new()),
             lmstudio_dirs,
             hf_dirs: vec![],
             ollama_dirs: vec![],
+            idle_ttl,
         },
         Arc::new(|_bus| Supervisor::with_factory(fake_worker_factory())),
     )
@@ -156,6 +167,7 @@ pub(crate) fn fake_runtime_load_fails(lmstudio_dirs: Vec<PathBuf>) -> NodeRuntim
             lmstudio_dirs,
             hf_dirs: vec![],
             ollama_dirs: vec![],
+            idle_ttl: crate::node::runtime::DEFAULT_IDLE_TTL,
         },
         Arc::new(|_bus| Supervisor::with_factory(fake_load_failing_factory())),
     )

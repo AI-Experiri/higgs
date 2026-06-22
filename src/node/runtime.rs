@@ -13,8 +13,10 @@
 //! `NodeRuntime` is a thin handle wrapping the mailbox; its methods send a message and
 //! await a oneshot reply.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, oneshot};
@@ -33,13 +35,26 @@ use crate::worker::{M_LOAD, M_STATUS};
 /// fake-worker-backed Supervisor so the registry/ops can be exercised without llama.cpp.
 pub(crate) type SupervisorSpawner = Arc<dyn Fn(Arc<LogBus>) -> Supervisor + Send + Sync>;
 
-/// Node configuration: the model roots the node scans (it owns its own disk) plus the
-/// shared log bus.
+/// Default idle auto-unload TTL: a worker with no chat activity for this long is reaped by
+/// the node's idle reaper. 60 minutes (the uniform local+remote default); configurable per
+/// node via [`NodeConfig::idle_ttl`].
+pub const DEFAULT_IDLE_TTL: Duration = Duration::from_secs(60 * 60);
+
+/// How often the idle reaper wakes, derived from the TTL: a quarter of it, clamped to
+/// `[50ms, 60s]`. So a 60-min TTL polls once a minute (cheap); a tiny test TTL polls fast.
+fn reap_interval(ttl: Duration) -> Duration {
+    (ttl / 4).clamp(Duration::from_millis(50), Duration::from_secs(60))
+}
+
+/// Node configuration: the model roots the node scans (it owns its own disk), the shared log
+/// bus, and the idle auto-unload TTL.
 pub struct NodeConfig {
     pub bus: Arc<LogBus>,
     pub lmstudio_dirs: Vec<PathBuf>,
     pub hf_dirs: Vec<PathBuf>,
     pub ollama_dirs: Vec<PathBuf>,
+    /// Idle auto-unload TTL: a worker idle (no chat) this long is reaped. [`DEFAULT_IDLE_TTL`].
+    pub idle_ttl: Duration,
 }
 
 impl NodeConfig {
@@ -126,8 +141,17 @@ enum NodeMsg {
     },
     ChatHandle {
         id: WorkerId,
-        reply: oneshot::Sender<Result<Arc<Supervisor>, HiggsError>>,
+        reply: oneshot::Sender<Result<ChatLease, HiggsError>>,
     },
+    /// Posted by a [`ChatLease`] on drop: the chat finished (or was abandoned). Decrements the
+    /// worker's in-flight count and re-stamps its last-activity, so the idle reaper measures
+    /// from the END of a generation and never reaps a worker that's still generating.
+    ChatEnd {
+        id: WorkerId,
+    },
+    /// Periodic tick from the idle reaper: unload every resident worker with no in-flight chat
+    /// that has been idle past the TTL.
+    ReapIdle,
     ShutdownAll {
         reply: oneshot::Sender<()>,
     },
@@ -137,6 +161,32 @@ enum NodeMsg {
     ReapDone {
         done: Option<oneshot::Sender<Result<(), HiggsError>>>,
     },
+}
+
+/// A live handle to a worker's [`Supervisor`] for the duration of one chat. Deref-exposes the
+/// `Supervisor` so the relay drives it directly; on drop it posts [`NodeMsg::ChatEnd`] back to
+/// the actor (decrement in-flight + re-stamp activity). Holding the lease for the whole
+/// generation keeps the idle reaper from unloading a worker mid-chat.
+pub(crate) struct ChatLease {
+    sup: Arc<Supervisor>,
+    id: WorkerId,
+    actor: WeakHandle<NodeMsg>,
+}
+
+impl std::ops::Deref for ChatLease {
+    type Target = Supervisor;
+    fn deref(&self) -> &Supervisor {
+        &self.sup
+    }
+}
+
+impl Drop for ChatLease {
+    fn drop(&mut self) {
+        // Best-effort, non-blocking: the actor may already be gone (shutdown).
+        if let Some(h) = self.actor.upgrade() {
+            let _ = h.send(NodeMsg::ChatEnd { id: self.id });
+        }
+    }
 }
 
 /// Private actor state: N concurrent Supervisors (one child each) behind a mailbox.
@@ -176,6 +226,14 @@ struct NodeActor {
     inflight_stops: usize,
     /// `ShutdownAll` callers parked until every load AND every stop has drained.
     shutdown_waiters: Vec<oneshot::Sender<()>>,
+    /// Per-worker last chat activity (stamped on load, and on chat start + end). The idle
+    /// reaper unloads a worker whose entry is older than `idle_ttl` with no in-flight chat.
+    last_activity: HashMap<WorkerId, Instant>,
+    /// Per-worker count of in-flight chats (held via [`ChatLease`]). A worker with a non-zero
+    /// count is never idle-reaped, so a generation longer than the TTL is not killed mid-chat.
+    in_flight: HashMap<WorkerId, u32>,
+    /// Idle auto-unload TTL (from [`NodeConfig::idle_ttl`]).
+    idle_ttl: Duration,
     /// Set once the drain has fully completed. A `ShutdownAll` arriving afterwards answers
     /// immediately (no in-flight work remains to release a fresh waiter).
     shutdown_done: bool,
@@ -258,7 +316,12 @@ impl Actor for NodeActor {
                             // caller vanished mid-commit, reap (tracked) instead of keeping a
                             // worker nobody asked to keep.
                             match reply.send(Ok((id, loaded))) {
-                                Ok(()) => self.registry.insert_reserved(id, sup),
+                                Ok(()) => {
+                                    self.registry.insert_reserved(id, sup);
+                                    // Start the idle clock now (a loaded-but-unused model is
+                                    // idle from load time).
+                                    self.last_activity.insert(id, Instant::now());
+                                }
                                 Err(_) => self.reap(sup, None),
                             }
                         }
@@ -282,7 +345,10 @@ impl Actor for NodeActor {
                     // Removed from the registry synchronously (already invisible); the stop is
                     // tracked so a later shutdown_all awaits it, and the caller's reply fires
                     // when the stop actually completes.
-                    Some(sup) => self.reap(sup, Some(reply)),
+                    Some(sup) => {
+                        self.forget_activity(id);
+                        self.reap(sup, Some(reply));
+                    }
                     None => {
                         let _ = reply.send(Err(no_worker(id)));
                     }
@@ -328,7 +394,56 @@ impl Actor for NodeActor {
                 let _ = reply.send(self.registry.ids());
             }
             NodeMsg::ChatHandle { id, reply } => {
-                let _ = reply.send(self.registry.get(id).cloned().ok_or_else(|| no_worker(id)));
+                let lease = match self.registry.get(id).cloned() {
+                    Some(sup) => {
+                        // Stamp activity + take an in-flight reference for the whole chat.
+                        self.last_activity.insert(id, Instant::now());
+                        *self.in_flight.entry(id).or_insert(0) += 1;
+                        Ok(ChatLease {
+                            sup,
+                            id,
+                            actor: self.self_handle.clone(),
+                        })
+                    }
+                    None => Err(no_worker(id)),
+                };
+                let _ = reply.send(lease);
+            }
+            NodeMsg::ChatEnd { id } => {
+                if self.registry.get(id).is_some() {
+                    if let Some(c) = self.in_flight.get_mut(&id) {
+                        *c = c.saturating_sub(1);
+                    }
+                    // Measure idle from the END of the generation.
+                    self.last_activity.insert(id, Instant::now());
+                } else {
+                    // Worker was unloaded mid-chat — drop its bookkeeping rather than leak it.
+                    self.forget_activity(id);
+                }
+            }
+            NodeMsg::ReapIdle => {
+                // Skip while draining (shutdown reaps everything anyway).
+                if !self.shutting_down {
+                    let ttl = self.idle_ttl;
+                    let idle: Vec<WorkerId> = self
+                        .registry
+                        .ids()
+                        .into_iter()
+                        .filter(|id| {
+                            self.in_flight.get(id).copied().unwrap_or(0) == 0
+                                && self
+                                    .last_activity
+                                    .get(id)
+                                    .is_some_and(|t| t.elapsed() >= ttl)
+                        })
+                        .collect();
+                    for id in idle {
+                        if let Some(sup) = self.registry.remove(id) {
+                            self.forget_activity(id);
+                            self.reap(sup, None);
+                        }
+                    }
+                }
             }
             NodeMsg::ShutdownAll { reply } => {
                 if self.shutdown_done {
@@ -377,11 +492,21 @@ impl Actor for NodeActor {
 impl NodeActor {
     /// Remove every resident worker from the registry, returning them for teardown.
     fn drain(&mut self) -> Vec<Arc<Supervisor>> {
-        self.registry
+        let out = self
+            .registry
             .ids()
             .into_iter()
             .filter_map(|id| self.registry.remove(id))
-            .collect()
+            .collect();
+        self.last_activity.clear();
+        self.in_flight.clear();
+        out
+    }
+
+    /// Drop a worker's idle bookkeeping (called whenever it leaves the registry).
+    fn forget_activity(&mut self, id: WorkerId) {
+        self.last_activity.remove(&id);
+        self.in_flight.remove(&id);
     }
 
     /// Stop a worker on a tracked task. EVERY teardown funnels through here so `shutdown_all`
@@ -674,6 +799,7 @@ impl NodeRuntime {
         let (log_tx, _) = broadcast::channel(LOG_RELAY_CAP);
         let config = Arc::new(config);
         let relay = log_tx.clone();
+        let idle_ttl = config.idle_ttl;
         let handle = spawn_actor_with(move |h| NodeActor {
             registry: WorkerRegistry::new(),
             spawner,
@@ -686,6 +812,28 @@ impl NodeRuntime {
             inflight_stops: 0,
             shutdown_waiters: Vec::new(),
             shutdown_done: false,
+            last_activity: HashMap::new(),
+            in_flight: HashMap::new(),
+            idle_ttl,
+        });
+        // Idle reaper: a WeakHandle so it never keeps the actor alive — it exits the tick the
+        // last real handle drops (upgrade fails).
+        let reaper = handle.downgrade();
+        let interval = reap_interval(idle_ttl);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            tick.tick().await; // the first tick fires immediately — skip it
+            loop {
+                tick.tick().await;
+                match reaper.upgrade() {
+                    Some(h) => {
+                        if h.send(NodeMsg::ReapIdle).is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
         });
         Self { handle, log_tx }
     }
@@ -759,8 +907,9 @@ impl NodeRuntime {
         self.call(|reply| NodeMsg::Inventory { reply }).await
     }
 
-    /// Look up a worker's Supervisor for the data-plane chat relay.
-    pub(crate) async fn chat_handle(&self, id: WorkerId) -> Result<Arc<Supervisor>, HiggsError> {
+    /// Lease a worker's Supervisor for one chat (idle-reaper-safe — see [`ChatLease`]). Hold
+    /// the returned lease for the whole generation; dropping it ends the chat's in-flight hold.
+    pub(crate) async fn chat_handle(&self, id: WorkerId) -> Result<ChatLease, HiggsError> {
         self.call(|reply| NodeMsg::ChatHandle { id, reply }).await
     }
 
@@ -999,6 +1148,60 @@ mod tests {
         assert!(
             rt.worker_ids().await.is_empty(),
             "no worker after a post-shutdown load"
+        );
+    }
+
+    // The idle reaper auto-unloads a worker that has had no chat activity for longer than the
+    // configured TTL.
+    #[tokio::test]
+    async fn idle_worker_is_auto_unloaded_after_ttl() {
+        use crate::node::test_support::fake_runtime_with_idle_ttl;
+        let dir = TempDir::new().expect("staging dir");
+        let model_dir = dir.path().join("org/m");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(model_dir.join("m.gguf"), b"GGUF\x00 dummy").unwrap();
+        let rt = fake_runtime_with_idle_ttl(
+            vec![dir.path().to_path_buf()],
+            std::time::Duration::from_millis(120),
+        );
+        load(&rt, "org/m").await;
+        assert_eq!(rt.worker_ids().await.len(), 1);
+        // Wait past the TTL + a couple reap ticks (interval = ttl/4, clamped ≥ 50ms).
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        assert!(
+            rt.worker_ids().await.is_empty(),
+            "idle worker auto-unloaded after the TTL"
+        );
+    }
+
+    // A chat in flight (the relay holds a ChatLease) keeps a worker resident past the TTL; once
+    // the lease drops, the idle clock restarts from the end of the chat and it is reaped.
+    #[tokio::test]
+    async fn in_flight_chat_prevents_idle_reap() {
+        use crate::node::test_support::fake_runtime_with_idle_ttl;
+        let dir = TempDir::new().expect("staging dir");
+        let model_dir = dir.path().join("org/m");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(model_dir.join("m.gguf"), b"GGUF\x00 dummy").unwrap();
+        let rt = fake_runtime_with_idle_ttl(
+            vec![dir.path().to_path_buf()],
+            std::time::Duration::from_millis(120),
+        );
+        let (id, _) = load(&rt, "org/m").await;
+        // Hold a chat lease across the whole idle window — the worker must NOT be reaped.
+        let lease = rt.chat_handle(id).await.expect("lease");
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(
+            rt.worker_ids().await.len(),
+            1,
+            "in-flight chat keeps the worker resident past the TTL"
+        );
+        // End the chat; now the idle clock runs and the worker is reaped.
+        drop(lease);
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        assert!(
+            rt.worker_ids().await.is_empty(),
+            "worker reaped once the chat ended and it went idle"
         );
     }
 
