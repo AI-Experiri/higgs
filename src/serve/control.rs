@@ -404,6 +404,51 @@ pub(super) async fn control_nodes_unload(
     }
 }
 
+/// `GET /api/higgs/nodes/{node}/models` — a paired node's on-disk model catalog
+/// (`M_NODE_SCAN`), for the remote Load picker + the fleet's not-loaded list. `409` when not
+/// a hub; the node's `{ "models": [HiggsModel, …] }` reply is returned verbatim; HG027 when
+/// the node is disconnected.
+pub(super) async fn control_node_models(
+    State(higgs): State<Arc<Higgs>>,
+    Path(node): Path<String>,
+) -> Response {
+    tracing::info!(node = %node, "higgs: GET /api/higgs/nodes/{{node}}/models");
+    let Some(fleet) = higgs.fleet() else {
+        return not_a_hub();
+    };
+    match fleet.scan_node(&node).await {
+        Ok(catalog) => Json(catalog).into_response(),
+        Err(err) => control_error(&err).into_response(),
+    }
+}
+
+/// `POST /api/higgs/nodes/retire` — retire a node for good: remove it from the persistent
+/// allowlist (so it can't silently re-admit) AND drop it from the fleet. Admin-scoped. `409`
+/// when not a hub.
+#[derive(Deserialize)]
+pub(super) struct NodeRetireHttp {
+    /// The node's `EndpointId` to retire.
+    node: String,
+}
+
+pub(super) async fn control_nodes_retire(
+    State(higgs): State<Arc<Higgs>>,
+    Json(req): Json<NodeRetireHttp>,
+) -> Response {
+    tracing::warn!(node = %req.node, "higgs: POST /api/higgs/nodes/retire");
+    let Some(hub) = higgs.hub() else {
+        return not_a_hub();
+    };
+    match hub.retire(&req.node).await {
+        Ok(()) => Json(serde_json::json!({ "status": "ok" })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("retire failed: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
 /// The `409` returned by hub-only routes when no fleet is installed.
 fn not_a_hub() -> Response {
     (
@@ -1270,5 +1315,36 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
         assert_eq!(v["status"], "ok");
+    }
+
+    // ── nodes/{node}/models + nodes/retire: hub-only routes ──────────────────
+
+    /// Both new fleet routes require hub mode: with no fleet/hub installed they
+    /// answer `409 CONFLICT` (the `not_a_hub` guard), exercising the handler
+    /// wiring + route registration without a live iroh hub.
+    #[tokio::test]
+    async fn node_models_and_retire_require_hub_mode() {
+        let (sup, _w, _r, _ring) = make_supervisor();
+        let app = make_app(sup);
+
+        let resp = app
+            .clone()
+            .oneshot(get("/api/higgs/nodes/somenode/models"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CONFLICT,
+            "node catalog needs a hub"
+        );
+
+        let resp = app
+            .oneshot(post_json(
+                "/api/higgs/nodes/retire",
+                &json!({ "node": "somenode" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "retire needs a hub");
     }
 }

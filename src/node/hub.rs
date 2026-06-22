@@ -55,6 +55,22 @@ impl Hub {
         let ticket = iroh_tickets::endpoint::EndpointTicket::new(self.endpoint.addr()).to_string();
         (ticket, token)
     }
+
+    /// Retire a node for good: remove its `EndpointId` from the persistent allowlist FIRST
+    /// (so a reconnect can't silently re-admit without a fresh pairing token), then drop it
+    /// from the fleet (transport, routes, cached inventory, relayed logs). Idempotent —
+    /// retiring an unknown id no-ops on both. The allowlist write is persisted, so the
+    /// retirement survives a hub restart.
+    pub async fn retire(&self, node: &str) -> std::io::Result<()> {
+        // Hold the allowlist lock across BOTH removals so retire is mutually exclusive with
+        // the accept loop's admit+register critical section (which takes this same lock).
+        // Otherwise a concurrent admit could re-add the node between the allowlist removal and
+        // `fleet.retire`. `fleet.retire` is sync, so no await-under-lock deadlock.
+        let mut allow = self.allow.lock().await;
+        allow.remove(node)?;
+        self.fleet.retire(node);
+        Ok(())
+    }
 }
 
 /// Build the hub from the persistent identity + allowlist under the higgs home dir, bind the
@@ -133,21 +149,24 @@ pub fn spawn_accept_loop(
                     Err(_) => return,
                 };
                 // Phase 2 — the lock-needing admit decision + reply (fast, in-memory + a
-                // small post-auth write).
-                let outcome = {
-                    let mut allow = allow.lock().await;
-                    let mut tokens = tokens.lock().await;
-                    gate_admit(
-                        &conn,
-                        handshake,
-                        &mut allow,
-                        &mut tokens,
-                        now_ms(),
-                        hub_id,
-                        Some("paired-node".into()),
-                    )
-                    .await
-                };
+                // small post-auth write). Registration into the fleet happens INSIDE the same
+                // allowlist critical section as the admit: `Hub::retire` takes this same lock
+                // to remove a node from the allowlist + fleet, so registering under the lock
+                // closes the admit→register window where a concurrent retire could otherwise
+                // re-introduce a just-retired node into the fleet view. `add_node` is sync (no
+                // await), so holding the lock across it can't deadlock.
+                let mut allow = allow.lock().await;
+                let mut tokens = tokens.lock().await;
+                let outcome = gate_admit(
+                    &conn,
+                    handshake,
+                    &mut allow,
+                    &mut tokens,
+                    now_ms(),
+                    hub_id,
+                    Some("paired-node".into()),
+                )
+                .await;
                 match outcome {
                     GateOutcome::Admitted { .. } => {
                         tracing::info!(node = %peer, "higgs hub: node admitted");
@@ -157,6 +176,8 @@ pub fn spawn_accept_loop(
                         tracing::warn!(node = %peer, code, "higgs hub: node rejected");
                     }
                 }
+                drop(allow);
+                drop(tokens);
             });
         }
     });

@@ -119,22 +119,44 @@ async fn hub_server_pairs_a_node_and_lists_it() {
         "node paired and shows connected in /api/higgs/nodes"
     );
 
+    // The paired node's stable EndpointId — used for the catalog + retire routes below.
+    let nodes: serde_json::Value = c
+        .get(format!("{base}/api/higgs/nodes"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let node_id = nodes[0]["endpoint_id"]
+        .as_str()
+        .expect("endpoint_id")
+        .to_string();
+
+    // ── GET /api/higgs/nodes/{node}/models — the node's on-disk catalog (M_NODE_SCAN over
+    // iroh). Always answers 200 with a `models` array; with a staged GGUF it lists the model.
+    let cat = c
+        .get(format!("{base}/api/higgs/nodes/{node_id}/models"))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        cat.status().is_success(),
+        "node catalog ok: {}",
+        cat.status()
+    );
+    let catalog: serde_json::Value = cat.json().await.unwrap();
+    let models = catalog["models"].as_array().expect("models array");
+    if staged.is_some() {
+        assert!(
+            models.iter().any(|m| m["id"] == TINY_MODEL_ID),
+            "remote node catalog lists the staged model: {catalog}"
+        );
+    }
+
     // ── HTTP remote-load (only with a GGUF): load a model on the paired node via the new
     // POST /api/higgs/nodes/load, then confirm it's remotely routable in /v1/models. ──
     if staged.is_some() {
-        let nodes: serde_json::Value = c
-            .get(format!("{base}/api/higgs/nodes"))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        let node_id = nodes[0]["endpoint_id"]
-            .as_str()
-            .expect("endpoint_id")
-            .to_string();
-
         let load = c
             .post(format!("{base}/api/higgs/nodes/load"))
             .json(&serde_json::json!({ "node": node_id, "model": TINY_MODEL_ID }))
@@ -176,4 +198,39 @@ async fn hub_server_pairs_a_node_and_lists_it() {
             unload.status()
         );
     }
+
+    // ── POST /api/higgs/nodes/retire — remove the node from allowlist + fleet. It must
+    // disappear from /api/higgs/nodes entirely (not linger as disconnected). ──
+    let retire = c
+        .post(format!("{base}/api/higgs/nodes/retire"))
+        .json(&serde_json::json!({ "node": node_id }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        retire.status().is_success(),
+        "retire over HTTP ok: {}",
+        retire.status()
+    );
+
+    let mut gone = false;
+    for _ in 0..50 {
+        let nodes: serde_json::Value = c
+            .get(format!("{base}/api/higgs/nodes"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if nodes
+            .as_array()
+            .is_some_and(|a| !a.iter().any(|n| n["endpoint_id"] == node_id))
+        {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(gone, "retired node is removed from /api/higgs/nodes");
 }

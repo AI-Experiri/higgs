@@ -52,6 +52,13 @@ impl NodeIdAllocator {
         self.by_endpoint.get(endpoint_id).copied()
     }
 
+    /// Forget a node's id assignment (operator retire/remove) so it no longer appears in
+    /// [`all`](Self::all). `next` is NOT rewound — ids stay monotonic and never reused, so a
+    /// stale `(node, worker)` reference can't alias a re-added node. No-op if unknown.
+    pub fn remove(&mut self, endpoint_id: &str) {
+        self.by_endpoint.remove(endpoint_id);
+    }
+
     /// Every `(endpoint_id, NodeId)` assigned so far, ascending by id — the set of nodes the
     /// hub has ever admitted (connected or not), for the fleet view.
     pub fn all(&self) -> Vec<(String, NodeId)> {
@@ -93,5 +100,20 @@ mod tests {
         let n1 = a.assign("a");
         let n2 = a.assign("b");
         assert_eq!(a.all(), vec![("a".to_string(), n1), ("b".to_string(), n2)]);
+    }
+
+    #[test]
+    fn remove_drops_the_slot_and_ids_never_reuse() {
+        let mut a = NodeIdAllocator::new();
+        let n1 = a.assign("a");
+        a.assign("b");
+        a.remove("a");
+        assert!(a.get("a").is_none(), "removed endpoint has no id");
+        assert!(a.all().iter().all(|(e, _)| e != "a"), "gone from all()");
+        // Re-adding gets a FRESH id (monotonic, never reused), not n1.
+        let n1b = a.assign("a");
+        assert_ne!(n1, n1b, "re-added node gets a new id");
+        // Removing an unknown endpoint is a no-op.
+        a.remove("nope");
     }
 }

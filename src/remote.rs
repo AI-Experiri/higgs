@@ -156,6 +156,7 @@ pub struct NodeLoadResult {
     pub loaded: serde_json::Value,
 }
 
+higgs_ts! {
 /// One resident worker in a node's [`NodeInventory`]: its node-local id and the model it
 /// currently serves.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -163,7 +164,9 @@ pub struct InventoryWorker {
     pub worker_id: u32,
     pub model: String,
 }
+}
 
+higgs_ts! {
 /// A node's `M_NODE_INVENTORY` reply: host identity + resident workers + hardware/runtime.
 /// The hub folds this into its per-node `NodeView` (§4.2.1). Hardware/runtime reuse the same
 /// shapes as `M_NODE_SYSINFO` (they gained `Deserialize` for this).
@@ -177,6 +180,7 @@ pub struct NodeInventory {
     pub workers: Vec<InventoryWorker>,
     pub hardware: crate::system::HardwareInfo,
     pub runtime: crate::system::RuntimeInfo,
+}
 }
 
 /// Hub → node `M_NODE_PULL` params on a DATA stream: the file to download + the hub's

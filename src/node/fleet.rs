@@ -28,7 +28,8 @@ use crate::node::node_id::{NodeId, NodeIdAllocator};
 use crate::node::transport::NodeTransport;
 use crate::node::worker_id::WorkerId;
 use crate::remote::{
-    NodeInventory, M_NODE_INVENTORY, M_NODE_KILL, M_NODE_LOAD, M_NODE_UNLOAD, N_LOG_LINE,
+    NodeInventory, M_NODE_INVENTORY, M_NODE_KILL, M_NODE_LOAD, M_NODE_SCAN, M_NODE_UNLOAD,
+    N_LOG_LINE,
 };
 use crate::rpc::{self, RpcFrame};
 
@@ -49,6 +50,7 @@ fn route_invalidating(e: &HiggsError) -> bool {
     )
 }
 
+higgs_ts! {
 /// The hub's UI/API view of one paired node: its stable id, endpoint, whether it's currently
 /// connected, and its last-fetched inventory (host + resident workers + hardware/runtime).
 #[derive(Debug, Clone, serde::Serialize)]
@@ -57,7 +59,9 @@ pub struct NodeView {
     pub endpoint_id: String,
     pub connected: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub inventory: Option<NodeInventory>,
+}
 }
 
 /// The hub's view of its remote fleet.
@@ -159,6 +163,19 @@ impl HubFleet {
         });
     }
 
+    /// Fetch `node`'s on-disk model catalog over its live transport (`M_NODE_SCAN`). The
+    /// node's reply (`{ "models": [HiggsModel, …] }`) is the authoritative scan of its own
+    /// disk and is returned verbatim — read-only, no caching, no routes touched. HG027 when
+    /// the node isn't currently connected. Powers the remote Load picker + the fleet's
+    /// not-loaded model list.
+    pub async fn scan_node(&self, node: &str) -> Result<serde_json::Value, HiggsError> {
+        let transport = self.transport(node)?;
+        transport
+            .request(M_NODE_SCAN, json!({}))
+            .await
+            .map_err(|e| self.handle_op_error(node, &transport, e))
+    }
+
     /// Fetch `node`'s inventory over its live transport and cache it for the fleet view. The
     /// node's `M_NODE_INVENTORY` reply is AUTHORITATIVE (its real resident workers) and stored
     /// verbatim — except a result is dropped if a lifecycle op changed this node's generation
@@ -240,8 +257,11 @@ impl HubFleet {
         }
     }
 
-    /// Explicitly retire a node: drop its transport AND its routes (operator action / the
-    /// node is truly gone). Closes the transport.
+    /// Explicitly retire a node: a FULL removal (operator action — the machine is being taken
+    /// out of the fleet). Drops its transport, routes, cached inventory, relayed-log rings,
+    /// owed unloads, AND its durable `NodeId` slot — so it disappears from the fleet view
+    /// entirely (not left as a disconnected entry). Ids stay monotonic (never reused), so a
+    /// re-added machine gets a fresh id. Pairs with the hub removing it from the allowlist.
     pub fn retire(&self, node: &str) {
         if let Some(t) = self.nodes.lock().remove(node) {
             t.close();
@@ -258,6 +278,8 @@ impl HubFleet {
         self.inventories.lock().remove(node);
         // The node is gone for good — drop any unloads we were owing it.
         self.pending_unloads.lock().retain(|(n, _)| n != node);
+        // Forget the durable id slot so the node leaves the fleet view (not left disconnected).
+        self.node_ids.lock().remove(node);
     }
 
     pub fn node_ids(&self) -> Vec<NodeKey> {
@@ -618,6 +640,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scan_node_returns_the_node_catalog() {
+        let (fleet, node_key, model_id, _root) = fleet_with_one_node().await;
+        let catalog = fleet.scan_node(&node_key).await.unwrap();
+        let models = catalog["models"].as_array().expect("models array");
+        assert!(
+            models.iter().any(|m| m["id"] == model_id),
+            "node catalog lists the staged model: {catalog}"
+        );
+        // A disconnected/unknown node is unreachable (HG027).
+        assert!(fleet.scan_node("ghost").await.is_err());
+    }
+
+    #[tokio::test]
     async fn chat_relays_to_routed_worker() {
         let (fleet, node_key, model_id, _root) = fleet_with_one_node().await;
         fleet.load(&node_key, &model_id).await.unwrap();
@@ -827,14 +862,11 @@ mod tests {
         assert!(v.connected, "node is connected");
         assert!(v.inventory.is_some(), "view carries the fetched inventory");
 
-        // After retire the node is still listed (id is durable) but disconnected + no inventory.
+        // Retire is a FULL removal — the node leaves the fleet view entirely.
         fleet.retire(&node_key);
-        let views = fleet.nodes_view();
-        assert_eq!(views.len(), 1, "retired node keeps its durable id slot");
-        assert!(!views[0].connected, "retired node is disconnected");
         assert!(
-            views[0].inventory.is_none(),
-            "retire clears the cached inventory"
+            fleet.nodes_view().is_empty(),
+            "retired node is removed from the view (not left disconnected)"
         );
     }
 
