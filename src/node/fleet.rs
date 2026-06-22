@@ -3,30 +3,37 @@
 //! P3 hub seam).
 //!
 //! **Actor** (P3 of `docs/superpowers/specs/2026-06-22-actor-runtime-design.md`). The fleet
-//! read-model (nodes / routes / node-ids / inventories / per-node generations /
-//! owed-unloads) is **private actor state behind one mailbox — no mutexes**. This dissolves
-//! the old 7-mutex TOCTOU class: every state transition is now a single message handled in
-//! isolation, so two ops can never observe or commit a half-updated table, and the
-//! cross-map snapshot (`nodes_view`) is atomic.
+//! read-model (nodes / instance routes / node-ids / inventories / per-node generations) is
+//! **private actor state behind one mailbox — no mutexes**. This dissolves the old 7-mutex
+//! TOCTOU class: every state transition is now a single message handled in isolation, so two
+//! ops can never observe or commit a half-updated table, and the cross-map snapshot
+//! (`nodes_view`) is atomic.
 //!
 //! Per `CLAUDE.md`, a handler does only fast synchronous state work; the slow iroh RPCs
 //! (`M_NODE_SCAN`/`_INVENTORY`/`_LOAD`/`_UNLOAD`/`_KILL`, chat setup) run in the async
 //! wrapper methods — NOT inside a handler — so a slow load can never head-of-line-block a
 //! retire. The wrapper threads each op as: fast state read → slow RPC (off the actor) →
-//! fast atomic commit message. Compound transitions (route insert↦displaced, inventory
-//! generation-CAS, transport replace+bump, route-drop+log-evict+bump, full retire) are each
-//! one message, so they apply all-or-nothing.
+//! fast atomic commit message. Compound transitions (instance add, inventory generation-CAS,
+//! transport replace+bump, instance-drop+log-evict+bump, full retire) are each one message,
+//! so they apply all-or-nothing.
+//!
+//! **Served instance ids (P3b).** Routes are keyed by INSTANCE — `(node, worker) → raw model`
+//! — so N workers serving the same model coexist (loads are additive, not only-keep-last).
+//! Each instance's SERVED id is a deterministic function of the live set (`org/model`,
+//! `org/model-1`, … sorted by `(node, worker)`), derived on demand by `served_ids`, never
+//! persisted. `/v1` addresses a served id; chat sends the RAW model on the wire (the worker
+//! matches on that, so a served suffix never looks like a model mismatch).
 //!
 //! Generation tokens, not locks: each node carries an `epoch` bumped on every
-//! load/unload/kill/route-drop/(re)admission; a `refresh_inventory` commits its (possibly
+//! load/unload/kill/instance-drop/(re)admission; a `refresh_inventory` commits its (possibly
 //! stale) result only if the epoch is unchanged since it started. The map is private actor
 //! state, so the check+store is a single message — no lock.
 //!
 //! Durable routes, transient transports: the `--node` daemon reuses ONE `NodeRuntime`
-//! across reconnects, so its workers (and ids) persist through a dropped connection. Routes
-//! are therefore keyed by `(node, worker)` and SURVIVE reconnect; only the per-connection
+//! across reconnects, so its workers (and ids) persist through a dropped connection. Instance
+//! routes are keyed by `(node, worker)` and SURVIVE reconnect; only the per-connection
 //! transport comes and goes. A genuine node-process restart leaves stale routes that
-//! self-heal on the first worker-gone error (the node replies HG007 → route dropped). The
+//! self-heal on the first worker-gone error (the node replies HG007 → instance dropped). The
 //! transport handle is compared by `Arc` identity so a stale failure can't drop a freshly
 //! reconnected transport.
 
@@ -95,12 +102,14 @@ enum FleetMsg {
     NodeIds {
         reply: oneshot::Sender<Vec<NodeKey>>,
     },
-    Resolve {
-        model: String,
-        reply: oneshot::Sender<Option<(NodeKey, WorkerId)>>,
+    /// Resolve a SERVED instance id (`org/model`, `org/model-1`, …) to its instance + the
+    /// RAW model the worker actually loaded (needed for the worker's model-match check).
+    ResolveServed {
+        served: String,
+        reply: oneshot::Sender<Option<(NodeKey, WorkerId, String)>>,
     },
     IsRemote {
-        model: String,
+        served: String,
         reply: oneshot::Sender<bool>,
     },
     RoutedModels {
@@ -113,10 +122,6 @@ enum FleetMsg {
     Epoch {
         node: NodeKey,
         reply: oneshot::Sender<u64>,
-    },
-    PendingOwed {
-        node: NodeKey,
-        reply: oneshot::Sender<Vec<WorkerId>>,
     },
     // --- fast atomic writes ---
     SeedNode {
@@ -144,18 +149,31 @@ enum FleetMsg {
         node: NodeKey,
         reply: oneshot::Sender<()>,
     },
-    /// Insert a route, returning any displaced `(node, worker)`. Does NOT bump the epoch (the
-    /// wrapper bumps after the displaced worker is reaped, matching the original ordering).
-    InsertRoute {
+    /// Add an instance `(node, worker) → model`. Loads are ADDITIVE — N workers serving the
+    /// same model coexist as N instances (distinct served ids). Worker ids are unique per
+    /// node, so this never collides except when a restarted node reuses an id (then the stale
+    /// instance is correctly replaced). Does NOT bump the epoch (the wrapper bumps after).
+    AddInstance {
+        node: NodeKey,
+        worker: WorkerId,
         model: String,
-        new: (NodeKey, WorkerId),
-        reply: oneshot::Sender<Option<(NodeKey, WorkerId)>>,
+        reply: oneshot::Sender<()>,
     },
-    /// CAS route-drop: remove only if it still equals `expected`; on removal also reclaim the
-    /// worker's relayed-log ring and bump the node's epoch — all atomic.
-    RemoveRouteIf {
-        model: String,
-        expected: (NodeKey, WorkerId),
+    /// CAS instance-drop: remove `(node, worker)` only if it STILL serves `expected_model`
+    /// (guards against a node restart reusing the id for a DIFFERENT model). On removal also
+    /// reclaim the worker's relayed-log ring and bump the node's epoch — all atomic.
+    ///
+    /// Residual (pre-existing, unchanged from the model-keyed design): if a node PROCESS
+    /// restarts and a fresh load reuses the exact same worker id for the SAME model, a stale
+    /// invalidation could in principle drop the new instance. In practice the restart drops
+    /// the transport first, so an in-flight chat resolves to `WorkerDead` (the transport
+    /// branch, not the `route_invalidating` HG006/7 branch), and `unload`/`kill` re-resolve
+    /// the instance fresh per call — so the window is not readily reachable. A full fix needs
+    /// a per-worker generation token on the wire (deferred).
+    RemoveInstanceIf {
+        node: NodeKey,
+        worker: WorkerId,
+        expected_model: String,
         reply: oneshot::Sender<()>,
     },
     /// Commit a fetched inventory only if the node's epoch is unchanged since the fetch began.
@@ -170,32 +188,17 @@ enum FleetMsg {
         node: NodeKey,
         reply: oneshot::Sender<()>,
     },
-    EvictRemoteLogs {
-        node: NodeKey,
-        worker: WorkerId,
-        reply: oneshot::Sender<()>,
-    },
-    PendingInsert {
-        route: (NodeKey, WorkerId),
-        reply: oneshot::Sender<()>,
-    },
-    PendingRemove {
-        route: (NodeKey, WorkerId),
-        reply: oneshot::Sender<()>,
-    },
-    #[cfg(test)]
-    PendingHas {
-        route: (NodeKey, WorkerId),
-        reply: oneshot::Sender<bool>,
-    },
 }
 
 /// Private actor state: the hub's whole fleet read-model + routing table, owned by one task.
 struct FleetActor {
     /// Currently-connected nodes → their live transport (absent while disconnected).
     nodes: HashMap<NodeKey, Arc<NodeTransport>>,
-    /// Durable routes: `model → (node, worker)`, survive reconnect.
-    routes: HashMap<String, (NodeKey, WorkerId)>,
+    /// The live instance set: `(node, worker) → raw model id`, durable across reconnect. N
+    /// workers serving the same model are N distinct instances; their SERVED ids
+    /// (`org/model`, `org/model-1`, … sorted by `(node, worker)`) are derived on demand by
+    /// [`FleetActor::served_ids`] — a deterministic function of this set, never persisted.
+    routes: HashMap<(NodeKey, WorkerId), String>,
     /// Stable hub-local [`NodeId`] per `EndpointId`, for `LogSource::RemoteWorker` tagging.
     node_ids: NodeIdAllocator,
     /// Last-fetched inventory per node (host + workers + hw/rt). The node's reply is
@@ -205,10 +208,6 @@ struct FleetActor {
     /// `refresh_inventory` only commits its (possibly stale) result if this is unchanged
     /// since it started — so a slow connect-time fetch can't clobber a newer state.
     epochs: HashMap<NodeKey, u64>,
-    /// Unloads the hub OWES a node but couldn't deliver because the node was disconnected.
-    /// Drained on the node's next reconnect (`reconcile_pending_unloads`) so a displaced
-    /// worker is reaped instead of leaking RAM/VRAM forever.
-    pending_unloads: HashSet<(NodeKey, WorkerId)>,
     /// The hub's Developer-Log bus: relayed remote worker stderr lands here under
     /// `LogSource::RemoteWorker { node, worker }` so it shares the operator's log console.
     bus: Arc<LogBus>,
@@ -256,24 +255,66 @@ impl FleetActor {
         }
     }
 
-    /// CAS route-drop (see [`FleetMsg::RemoveRouteIf`]).
-    fn remove_route_if(&mut self, model: &str, expected: &(NodeKey, WorkerId)) {
-        let removed = if self.routes.get(model) == Some(expected) {
-            self.routes.remove(model).is_some()
+    /// CAS instance-drop (see [`FleetMsg::RemoveInstanceIf`]): remove `(node, worker)` only if
+    /// it still serves `expected_model`.
+    fn remove_instance_if(&mut self, node: &str, worker: WorkerId, expected_model: &str) {
+        let key = (node.to_string(), worker);
+        let removed = if self.routes.get(&key).map(String::as_str) == Some(expected_model) {
+            self.routes.remove(&key).is_some()
         } else {
             false
         };
         if removed {
-            let (node, worker) = expected;
-            self.evict_remote_logs(node, *worker);
+            self.evict_remote_logs(node, worker);
             // Invalidate any in-flight inventory fetch; the caller refreshes after.
             self.bump_epoch(node);
         }
     }
 
+    /// Derive the SERVED-instance-id → `(node, worker)` map from the live instance set. The
+    /// nth instance of a model gets `org/model`, `org/model-1`, … . Computed over ALL
+    /// instances (not just connected ones) so a disconnect never renumbers the survivors;
+    /// pure, no persistence.
+    ///
+    /// Collision-free and deterministic: instances are assigned in sorted `(model, node,
+    /// worker)` order against a global taken-set, and a candidate served id that is already
+    /// taken (e.g. a model literally named `org/model-1` clashing with the suffix of a second
+    /// `org/model` instance) bumps to the next free suffix. So EVERY live instance always gets
+    /// a unique, reachable served id — no instance is ever left unaddressable (un-unloadable).
+    fn served_ids(&self) -> HashMap<String, (NodeKey, WorkerId)> {
+        // Sort by (model, node, worker) so the mapping is a stable function of the live set.
+        let mut entries: Vec<(&str, &NodeKey, WorkerId)> = self
+            .routes
+            .iter()
+            .map(|((node, worker), model)| (model.as_str(), node, *worker))
+            .collect();
+        entries.sort_unstable();
+
+        let mut taken: HashSet<String> = HashSet::new();
+        let mut next_suffix: HashMap<&str, usize> = HashMap::new();
+        let mut out = HashMap::new();
+        for (model, node, worker) in entries {
+            let i = next_suffix.entry(model).or_insert(0);
+            // Find the first free served id at or past this model's running suffix.
+            let served = loop {
+                let candidate = if *i == 0 {
+                    model.to_string()
+                } else {
+                    format!("{model}-{i}")
+                };
+                *i += 1;
+                if taken.insert(candidate.clone()) {
+                    break candidate;
+                }
+            };
+            out.insert(served, (node.clone(), worker));
+        }
+        out
+    }
+
     /// Explicitly retire a node: a FULL removal (operator action). Drops its transport,
-    /// routes, cached inventory, relayed-log rings, owed unloads, AND its durable `NodeId`
-    /// slot — all atomically, so the node disappears from the fleet view entirely.
+    /// instances, cached inventory, relayed-log rings, AND its durable `NodeId` slot — all
+    /// atomically, so the node disappears from the fleet view entirely.
     fn retire(&mut self, node: &str) {
         if let Some(t) = self.nodes.remove(node) {
             t.close();
@@ -283,12 +324,10 @@ impl FleetActor {
         if let Some(nid) = self.node_ids.get(node) {
             self.bus.evict_node(nid);
         }
-        self.routes.retain(|_, (n, _)| n != node);
+        self.routes.retain(|(n, _), _| n != node);
         // Bump so a refresh already in flight can't reinsert stale inventory after this.
         self.bump_epoch(node);
         self.inventories.remove(node);
-        // The node is gone for good — drop any unloads we were owing it.
-        self.pending_unloads.retain(|(n, _)| n != node);
         // Forget the durable id slot so the node leaves the fleet view (not left disconnected).
         self.node_ids.remove(node);
     }
@@ -307,13 +346,14 @@ impl FleetActor {
             .collect()
     }
 
-    /// Remote-resident model ids whose node is CURRENTLY connected (servable now), sorted.
+    /// Served instance ids whose node is CURRENTLY connected (servable now), sorted. A served
+    /// id whose node is disconnected is hidden — chat to it would fail HG027 until reconnect.
     fn routed_models(&self) -> Vec<String> {
         let mut v: Vec<_> = self
-            .routes
-            .iter()
+            .served_ids()
+            .into_iter()
             .filter(|(_, (node, _))| self.nodes.contains_key(node))
-            .map(|(model, _)| model.clone())
+            .map(|(served, _)| served)
             .collect();
         v.sort();
         v
@@ -336,11 +376,16 @@ impl Actor for FleetActor {
                 v.sort();
                 let _ = reply.send(v);
             }
-            FleetMsg::Resolve { model, reply } => {
-                let _ = reply.send(self.routes.get(&model).cloned());
+            FleetMsg::ResolveServed { served, reply } => {
+                let resolved = self.served_ids().get(&served).and_then(|(node, worker)| {
+                    self.routes
+                        .get(&(node.clone(), *worker))
+                        .map(|model| (node.clone(), *worker, model.clone()))
+                });
+                let _ = reply.send(resolved);
             }
-            FleetMsg::IsRemote { model, reply } => {
-                let _ = reply.send(self.routes.contains_key(&model));
+            FleetMsg::IsRemote { served, reply } => {
+                let _ = reply.send(self.served_ids().contains_key(&served));
             }
             FleetMsg::RoutedModels { reply } => {
                 let _ = reply.send(self.routed_models());
@@ -355,15 +400,6 @@ impl Actor for FleetActor {
             }
             FleetMsg::Epoch { node, reply } => {
                 let _ = reply.send(self.epoch(&node));
-            }
-            FleetMsg::PendingOwed { node, reply } => {
-                let owed = self
-                    .pending_unloads
-                    .iter()
-                    .filter(|(n, _)| *n == node)
-                    .map(|(_, w)| *w)
-                    .collect();
-                let _ = reply.send(owed);
             }
             FleetMsg::SeedNode { node, reply } => {
                 self.node_ids.assign(&node);
@@ -395,15 +431,22 @@ impl Actor for FleetActor {
                 self.retire(&node);
                 let _ = reply.send(());
             }
-            FleetMsg::InsertRoute { model, new, reply } => {
-                let _ = reply.send(self.routes.insert(model, new));
-            }
-            FleetMsg::RemoveRouteIf {
+            FleetMsg::AddInstance {
+                node,
+                worker,
                 model,
-                expected,
                 reply,
             } => {
-                self.remove_route_if(&model, &expected);
+                self.routes.insert((node, worker), model);
+                let _ = reply.send(());
+            }
+            FleetMsg::RemoveInstanceIf {
+                node,
+                worker,
+                expected_model,
+                reply,
+            } => {
+                self.remove_instance_if(&node, worker, &expected_model);
                 let _ = reply.send(());
             }
             FleetMsg::CommitInventory {
@@ -420,26 +463,6 @@ impl Actor for FleetActor {
             FleetMsg::BumpEpoch { node, reply } => {
                 self.bump_epoch(&node);
                 let _ = reply.send(());
-            }
-            FleetMsg::EvictRemoteLogs {
-                node,
-                worker,
-                reply,
-            } => {
-                self.evict_remote_logs(&node, worker);
-                let _ = reply.send(());
-            }
-            FleetMsg::PendingInsert { route, reply } => {
-                self.pending_unloads.insert(route);
-                let _ = reply.send(());
-            }
-            FleetMsg::PendingRemove { route, reply } => {
-                self.pending_unloads.remove(&route);
-                let _ = reply.send(());
-            }
-            #[cfg(test)]
-            FleetMsg::PendingHas { route, reply } => {
-                let _ = reply.send(self.pending_unloads.contains(&route));
             }
         }
     }
@@ -465,7 +488,6 @@ impl HubFleet {
             node_ids: NodeIdAllocator::new(),
             inventories: HashMap::new(),
             epochs: HashMap::new(),
-            pending_unloads: HashSet::new(),
             bus: bus_for_actor,
         });
         Self { handle, bus }
@@ -539,13 +561,13 @@ impl HubFleet {
         if let Some(old) = replaced {
             old.close(); // free the old connection + wake its close-watcher
         }
-        // On (re)connect: deliver any unloads owed to this node (displaced-while-offline
-        // workers), THEN refresh the inventory for the fleet view. Best-effort, off the hot path.
+        // On (re)connect: refresh the inventory for the fleet view. Best-effort, off the hot
+        // path. (Loads are additive — no displaced workers are ever owed to an offline node —
+        // so there are no pending unloads to reconcile.)
         let inv_weak = Arc::downgrade(self);
         let inv_node = node.clone();
         tokio::spawn(async move {
             if let Some(fleet) = inv_weak.upgrade() {
-                fleet.reconcile_pending_unloads(&inv_node).await;
                 let _ = fleet.refresh_inventory(&inv_node).await;
             }
         });
@@ -637,9 +659,8 @@ impl HubFleet {
     }
 
     /// Explicitly retire a node: a FULL removal (operator action — the machine is being taken
-    /// out of the fleet). Drops its transport, routes, cached inventory, relayed-log rings,
-    /// owed unloads, AND its durable `NodeId` slot. Pairs with the hub removing it from the
-    /// allowlist.
+    /// out of the fleet). Drops its transport, instances, cached inventory, relayed-log rings,
+    /// AND its durable `NodeId` slot. Pairs with the hub removing it from the allowlist.
     pub async fn retire(&self, node: &str) {
         self.ask(|reply| FleetMsg::Retire {
             node: node.to_string(),
@@ -665,31 +686,31 @@ impl HubFleet {
         .unwrap_or_else(|| Err(Self::actor_gone()))
     }
 
-    /// Reclaim a remote worker's relayed-log ring, if the node has a known [`NodeId`].
-    async fn evict_remote_logs(&self, node: &str, worker: WorkerId) {
-        self.ask(|reply| FleetMsg::EvictRemoteLogs {
-            node: node.to_string(),
-            worker,
+    /// Resolve a SERVED instance id to `(node, worker, raw_model)` or fail with HG002. The
+    /// raw model (what the worker actually loaded) is needed for the worker's model-match
+    /// check — the served id (`org/model-1`) would otherwise look like a mismatch (HG018).
+    async fn require_served(
+        &self,
+        served: &str,
+    ) -> Result<(NodeKey, WorkerId, String), HiggsError> {
+        self.ask(|reply| FleetMsg::ResolveServed {
+            served: served.to_string(),
             reply,
         })
-        .await;
+        .await
+        .flatten()
+        .ok_or_else(|| HiggsError::ModelNotFound {
+            id: served.to_string(),
+        })
     }
 
-    /// Resolve `model` to its `(node, worker)` route or fail with HG002.
-    async fn require_route(&self, model: &str) -> Result<(NodeKey, WorkerId), HiggsError> {
-        self.resolve(model)
-            .await
-            .ok_or_else(|| HiggsError::ModelNotFound {
-                id: model.to_string(),
-            })
-    }
-
-    /// CAS route-drop: remove a route only if it STILL equals `expected`; on removal also
-    /// reclaim the worker's relayed-log ring and bump the node's generation (all atomic).
-    async fn remove_route_if(&self, model: &str, expected: &(NodeKey, WorkerId)) {
-        self.ask(|reply| FleetMsg::RemoveRouteIf {
-            model: model.to_string(),
-            expected: expected.clone(),
+    /// CAS instance-drop: remove `(node, worker)` only if it STILL serves `expected_model`; on
+    /// removal also reclaim the worker's relayed-log ring and bump the node's generation.
+    async fn remove_instance_if(&self, node: &str, worker: WorkerId, expected_model: &str) {
+        self.ask(|reply| FleetMsg::RemoveInstanceIf {
+            node: node.to_string(),
+            worker,
+            expected_model: expected_model.to_string(),
             reply,
         })
         .await;
@@ -713,131 +734,50 @@ impl HubFleet {
         e
     }
 
-    /// Load `model` on `node` and record the route. A displaced worker (reload, or a
-    /// concurrent load that lost the race) is unloaded best-effort so it's never orphaned.
+    /// Load `model` on `node` and record a NEW instance. Loads are ADDITIVE: each call spawns
+    /// a fresh worker on the node and adds an instance, so N loads of the same model coexist
+    /// as N served ids (`org/model`, `org/model-1`, …). Returns the new worker's id.
     pub async fn load(&self, node: &str, model: &str) -> Result<WorkerId, HiggsError> {
         let transport = self.transport(node).await?;
         let result = match transport.request(M_NODE_LOAD, json!({ "id": model })).await {
             Ok(v) => v,
             Err(e) => return Err(self.handle_op_error(node, &transport, e).await),
         };
-        let new = (node.to_string(), WorkerId(parse_worker_id(&result)?));
-        let displaced = self
-            .ask(|reply| FleetMsg::InsertRoute {
-                model: model.to_string(),
-                new: new.clone(),
-                reply,
-            })
-            .await
-            .flatten();
-        if let Some(old) = displaced {
-            if old != new {
-                // Unload the worker this load displaced. If the OLD node is currently
-                // disconnected the unload is recorded as pending and delivered on reconnect.
-                self.best_effort_unload(&old).await;
-            }
-        }
+        let worker = WorkerId(parse_worker_id(&result)?);
+        self.ask(|reply| FleetMsg::AddInstance {
+            node: node.to_string(),
+            worker,
+            model: model.to_string(),
+            reply,
+        })
+        .await;
         // Refresh the fleet view from the node's authoritative state after the load lands.
         self.bump_epoch(node).await;
         let _ = self.refresh_inventory(node).await;
-        Ok(new.1)
+        Ok(worker)
     }
 
-    /// Best-effort unload of a displaced worker via its node's CURRENT transport, also
-    /// reclaiming its relayed-log ring. If the node is DISCONNECTED the unload can't be
-    /// delivered, so it's recorded as pending and reaped on the node's next reconnect.
-    async fn best_effort_unload(&self, route: &(NodeKey, WorkerId)) {
-        self.evict_remote_logs(&route.0, route.1).await;
-        match self.transport(&route.0).await {
-            Ok(t) => {
-                let res = t
-                    .request(M_NODE_UNLOAD, json!({ "worker_id": route.1 .0 }))
-                    .await;
-                // Clear the obligation ONLY if the unload landed (Ok) or the node reports the
-                // worker already gone (HG006/HG007). A real failure means the worker may still
-                // be running, so KEEP it pending so the next reconnect retries.
-                if res.is_ok() || res.as_ref().err().is_some_and(route_invalidating) {
-                    self.pending_remove(route).await;
-                } else {
-                    self.pending_insert(route).await;
-                }
-            }
-            // Node offline — owe it the unload until it reconnects.
-            Err(_) => self.pending_insert(route).await,
-        }
-        // Re-sync the DISPLACED node's fleet view (it may differ from the load's target node
-        // on a cross-node reload, where the caller only refreshes the new node).
-        self.bump_epoch(&route.0).await;
-        let _ = self.refresh_inventory(&route.0).await;
+    /// Unload a served instance's remote worker and drop its route.
+    pub async fn unload(&self, served: &str) -> Result<(), HiggsError> {
+        self.unload_or_kill(served, M_NODE_UNLOAD).await
     }
 
-    async fn pending_insert(&self, route: &(NodeKey, WorkerId)) {
-        self.ask(|reply| FleetMsg::PendingInsert {
-            route: route.clone(),
-            reply,
-        })
-        .await;
+    /// Force-kill a served instance's remote worker and drop its route.
+    pub async fn kill(&self, served: &str) -> Result<(), HiggsError> {
+        self.unload_or_kill(served, M_NODE_KILL).await
     }
 
-    async fn pending_remove(&self, route: &(NodeKey, WorkerId)) {
-        self.ask(|reply| FleetMsg::PendingRemove {
-            route: route.clone(),
-            reply,
-        })
-        .await;
-    }
-
-    /// Deliver any unloads owed to `node` (recorded while it was offline), now that it's
-    /// reconnected — so a worker displaced during a disconnect is reaped rather than leaked.
-    /// Only targets workers the hub explicitly tried to unload (never the node's legitimate
-    /// resident workers a fresh hub simply hasn't routed yet).
-    async fn reconcile_pending_unloads(&self, node: &str) {
-        let owed = self
-            .ask(|reply| FleetMsg::PendingOwed {
-                node: node.to_string(),
-                reply,
-            })
-            .await
-            .unwrap_or_default();
-        if owed.is_empty() {
-            return;
-        }
-        let Ok(t) = self.transport(node).await else {
-            return;
-        };
-        for w in owed {
-            let res = t.request(M_NODE_UNLOAD, json!({ "worker_id": w.0 })).await;
-            // Clear on success OR when the node reports the worker already gone (HG006/HG007)
-            // — the owed unload is satisfied either way. A transport error keeps it for the
-            // next reconnect.
-            if res.is_ok() || res.as_ref().err().is_some_and(route_invalidating) {
-                self.pending_remove(&(node.to_string(), w)).await;
-                self.evict_remote_logs(node, w).await;
-            }
-        }
-    }
-
-    /// Unload a model's remote worker and drop its route.
-    pub async fn unload(&self, model: &str) -> Result<(), HiggsError> {
-        self.unload_or_kill(model, M_NODE_UNLOAD).await
-    }
-
-    /// Force-kill a model's remote worker and drop its route.
-    pub async fn kill(&self, model: &str) -> Result<(), HiggsError> {
-        self.unload_or_kill(model, M_NODE_KILL).await
-    }
-
-    /// Shared unload/kill: clear the route on success OR when the node reports the worker
-    /// already gone; node-down → HG027 (transport dropped).
-    async fn unload_or_kill(&self, model: &str, method: &str) -> Result<(), HiggsError> {
-        let (node, worker) = self.require_route(model).await?;
+    /// Shared unload/kill: resolve the served id to its exact instance, clear it on success OR
+    /// when the node reports the worker already gone; node-down → HG027 (transport dropped).
+    async fn unload_or_kill(&self, served: &str, method: &str) -> Result<(), HiggsError> {
+        let (node, worker, model) = self.require_served(served).await?;
         let transport = self.transport(&node).await?;
         let res = transport
             .request(method, json!({ "worker_id": worker.0 }))
             .await;
         if res.is_ok() || res.as_ref().err().is_some_and(route_invalidating) {
-            // remove_route_if reclaims the log ring + bumps the node's generation.
-            self.remove_route_if(model, &(node.clone(), worker)).await;
+            // remove_instance_if reclaims the log ring + bumps the node's generation.
+            self.remove_instance_if(&node, worker, &model).await;
             // Re-sync the fleet view from the node's authoritative state.
             let _ = self.refresh_inventory(&node).await;
         }
@@ -847,28 +787,26 @@ impl HubFleet {
         }
     }
 
-    /// Resolve a model to its `(node, worker)`, if routed.
-    pub async fn resolve(&self, model: &str) -> Option<(NodeKey, WorkerId)> {
-        self.ask(|reply| FleetMsg::Resolve {
-            model: model.to_string(),
-            reply,
-        })
-        .await
-        .flatten()
+    /// Resolve a served instance id to its `(node, worker)`, if routed.
+    pub async fn resolve(&self, served: &str) -> Option<(NodeKey, WorkerId)> {
+        self.require_served(served)
+            .await
+            .ok()
+            .map(|(node, worker, _model)| (node, worker))
     }
 
-    /// Is this model resident on some remote node?
-    pub async fn is_remote(&self, model: &str) -> bool {
+    /// Is this served instance id resident on some remote node?
+    pub async fn is_remote(&self, served: &str) -> bool {
         self.ask(|reply| FleetMsg::IsRemote {
-            model: model.to_string(),
+            served: served.to_string(),
             reply,
         })
         .await
         .unwrap_or(false)
     }
 
-    /// Remote-resident model ids whose node is CURRENTLY connected (for `/v1/models`
-    /// discovery = servable now). A route whose node is disconnected is hidden.
+    /// Served instance ids whose node is CURRENTLY connected (for `/v1/models` discovery =
+    /// servable now). A served id whose node is disconnected is hidden.
     pub async fn routed_models(&self) -> Vec<String> {
         self.ask(|reply| FleetMsg::RoutedModels { reply })
             .await
@@ -884,12 +822,14 @@ impl HubFleet {
         }
     }
 
-    /// Relay a chat to the remote worker hosting `model`. Returns the streamed-delta
-    /// receiver + a future resolving to the final result. A worker-gone failure drops the
-    /// route (so retries re-resolve); a dead transport drops the transport (HG027).
+    /// Relay a chat to the remote worker for `served` (a served instance id). Returns the
+    /// streamed-delta receiver + a future resolving to the final result. The RAW model the
+    /// worker loaded is sent on the wire (the worker matches on that, not the served id). A
+    /// worker-gone failure drops the instance (so retries re-resolve); a dead transport drops
+    /// the transport (HG027).
     pub async fn chat(
         self: &Arc<Self>,
-        model: &str,
+        served: &str,
         messages_json: String,
         max_tokens: usize,
         temperature: f32,
@@ -901,12 +841,12 @@ impl HubFleet {
         ),
         HiggsError,
     > {
-        let (node, worker) = self.require_route(model).await?;
+        let (node, worker, model) = self.require_served(served).await?;
         let transport = self.transport(&node).await?;
         let (rx, fut) = match transport
             .chat(
                 worker.0,
-                model.to_string(),
+                model.clone(),
                 messages_json,
                 max_tokens,
                 temperature,
@@ -919,35 +859,23 @@ impl HubFleet {
         };
 
         let fleet = self.clone();
-        let model = model.to_string();
         let used = transport;
         let wrapped = async move {
             match fut.await {
                 Ok(v) => Ok(v),
                 Err(e) if route_invalidating(&e) => {
-                    // Worker gone (node alive) — drop the route so a retry re-resolves, and
-                    // re-sync the fleet view (remove_route_if bumped the node's generation).
-                    fleet.remove_route_if(&model, &(node.clone(), worker)).await;
+                    // Worker gone (node alive) — drop the instance so a retry re-resolves, and
+                    // re-sync the fleet view (remove_instance_if bumped the node's generation).
+                    fleet.remove_instance_if(&node, worker, &model).await;
                     let _ = fleet.refresh_inventory(&node).await;
                     Err(e)
                 }
                 // Transport-level / other failure surfacing mid-stream: drop the dead
-                // transport (Arc-identity guarded) and remap to HG027. The route is kept.
+                // transport (Arc-identity guarded) and remap to HG027. The instance is kept.
                 Err(e) => Err(fleet.handle_op_error(&node, &used, e).await),
             }
         };
         Ok((rx, wrapped))
-    }
-
-    /// Test-only: is this `(node, worker)` currently an owed unload?
-    #[cfg(test)]
-    async fn pending_has(&self, route: &(NodeKey, WorkerId)) -> bool {
-        self.ask(|reply| FleetMsg::PendingHas {
-            route: route.clone(),
-            reply,
-        })
-        .await
-        .unwrap_or(false)
     }
 }
 
@@ -1074,12 +1002,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reload_retires_prior_worker_and_updates_route() {
+    async fn loads_are_additive_two_instances_get_distinct_served_ids() {
         let (fleet, node_key, model_id, _root) = fleet_with_one_node().await;
         let w1 = fleet.load(&node_key, &model_id).await.unwrap();
         let w2 = fleet.load(&node_key, &model_id).await.unwrap();
-        assert_ne!(w1, w2, "reload spawns a fresh worker (old one unloaded)");
-        assert_eq!(fleet.resolve(&model_id).await, Some((node_key, w2)));
+        assert_ne!(w1, w2, "each load spawns a distinct worker");
+        // Two instances of the same model → two served ids: `org/model` and `org/model-1`,
+        // assigned deterministically by (node, worker) order.
+        let served = format!("{model_id}-1");
+        let mut routed = fleet.routed_models().await;
+        routed.sort();
+        assert_eq!(routed, vec![model_id.clone(), served.clone()]);
+        // Both served ids resolve to the SAME node but DIFFERENT workers.
+        let r0 = fleet.resolve(&model_id).await.unwrap();
+        let r1 = fleet.resolve(&served).await.unwrap();
+        assert_eq!(r0.0, node_key);
+        assert_eq!(r1.0, node_key);
+        assert_ne!(r0.1, r1.1, "distinct workers behind the two served ids");
+        assert_eq!(
+            [r0.1, r1.1]
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>(),
+            [w1, w2]
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>(),
+        );
     }
 
     #[tokio::test]
@@ -1117,47 +1066,53 @@ mod tests {
         assert!(fleet.routed_models().await.is_empty());
     }
 
+    #[test]
+    fn served_ids_are_collision_free_even_when_a_model_name_clashes_with_a_suffix() {
+        // Two `org/model` instances want served ids `org/model` + `org/model-1`; a literal
+        // model `org/model-1` also wants `org/model-1`. Every instance must still get a UNIQUE
+        // reachable served id (no orphaned, un-unloadable worker).
+        let n = |w| ("nodeA".to_string(), WorkerId(w));
+        let mut routes = HashMap::new();
+        routes.insert(n(1), "org/model".to_string());
+        routes.insert(n(2), "org/model".to_string());
+        routes.insert(n(3), "org/model-1".to_string());
+        let actor = FleetActor {
+            nodes: HashMap::new(),
+            routes,
+            node_ids: NodeIdAllocator::new(),
+            inventories: HashMap::new(),
+            epochs: HashMap::new(),
+            bus: Arc::new(crate::log_bus::LogBus::new()),
+        };
+        let served = actor.served_ids();
+        // Three instances → three distinct served ids, each mapping to a distinct worker.
+        assert_eq!(served.len(), 3, "every instance is reachable: {served:?}");
+        let workers: std::collections::HashSet<_> = served.values().map(|(_, w)| *w).collect();
+        assert_eq!(workers.len(), 3, "no two served ids share a worker");
+        // Deterministic: re-deriving yields the same mapping.
+        assert_eq!(actor.served_ids(), served);
+    }
+
     #[tokio::test]
-    async fn displaced_unload_to_offline_node_is_recorded_then_reconciled() {
+    async fn unloading_one_instance_renumbers_the_survivor_to_the_base_served_id() {
         let (fleet, node_key, model_id, _root) = fleet_with_one_node().await;
-        let w = fleet.load(&node_key, &model_id).await.unwrap();
+        let _w1 = fleet.load(&node_key, &model_id).await.unwrap();
+        let _w2 = fleet.load(&node_key, &model_id).await.unwrap();
+        let suffixed = format!("{model_id}-1");
+        assert!(fleet.is_remote(&suffixed).await, "two instances present");
 
-        // An unload owed to a node that ISN'T connected is recorded as pending (not lost).
-        fleet
-            .best_effort_unload(&("offline-node".to_string(), w))
-            .await;
-        assert!(
-            fleet.pending_has(&("offline-node".to_string(), w)).await,
-            "unload to an offline node is recorded as pending"
+        // Unload the BASE served id (the lower (node, worker)). The surviving instance
+        // re-derives to the base served id (no stale `-1` left dangling).
+        fleet.unload(&model_id).await.unwrap();
+        let routed = fleet.routed_models().await;
+        assert_eq!(
+            routed,
+            vec![model_id.clone()],
+            "one instance left, served under the base id: {routed:?}"
         );
-
-        // When a node with a pending unload reconnects, reconciliation delivers it (the
-        // connected fake node answers M_NODE_UNLOAD), clearing the pending entry.
-        fleet.pending_insert(&(node_key.clone(), w)).await;
-        fleet.reconcile_pending_unloads(&node_key).await;
         assert!(
-            !fleet.pending_has(&(node_key.clone(), w)).await,
-            "reconnect drains the owed unload"
-        );
-
-        // A pending unload for a worker the node NO LONGER has (e.g. it restarted) must also
-        // be cleared — the node replies worker-gone (HG007), which counts as reconciled.
-        fleet
-            .pending_insert(&(node_key.clone(), WorkerId(9999)))
-            .await;
-        fleet.reconcile_pending_unloads(&node_key).await;
-        assert!(
-            !fleet.pending_has(&(node_key.clone(), WorkerId(9999))).await,
-            "worker-gone reply clears the owed unload (not left pending forever)"
-        );
-
-        // Retiring a node clears anything still owed to it.
-        fleet.best_effort_unload(&("gone".to_string(), w)).await;
-        assert!(fleet.pending_has(&("gone".to_string(), w)).await);
-        fleet.retire("gone").await;
-        assert!(
-            !fleet.pending_has(&("gone".to_string(), w)).await,
-            "retire clears owed unloads for the node"
+            !fleet.is_remote(&suffixed).await,
+            "the `-1` served id is gone after one instance is unloaded"
         );
     }
 
