@@ -67,7 +67,11 @@ async fn node_hosts_two_workers_sysinfo_status_over_iroh() {
     let r2 = node_rpc(&conn, 2, M_NODE_LOAD, json!({ "id": model_id })).await;
     let w2 = r2.result.expect("load2 ok")["worker_id"].as_u64().unwrap();
     assert_ne!(w1, w2, "two distinct workers");
-    assert_eq!(rt.worker_ids().len(), 2, "node hosts 2 concurrent workers");
+    assert_eq!(
+        rt.worker_ids().await.len(),
+        2,
+        "node hosts 2 concurrent workers"
+    );
 
     // M_SYSINFO (node-level) + M_STATUS (per worker) over iroh.
     let sys = node_rpc(&conn, 3, M_NODE_SYSINFO, json!({})).await;

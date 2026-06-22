@@ -94,7 +94,70 @@ pub(crate) fn fake_runtime(lmstudio_dirs: Vec<PathBuf>) -> NodeRuntime {
             hf_dirs: vec![],
             ollama_dirs: vec![],
         },
-        Box::new(|_bus| Supervisor::with_factory(fake_worker_factory())),
+        Arc::new(|_bus| Supervisor::with_factory(fake_worker_factory())),
+    )
+}
+
+/// A self-responding worker that ERRORS every `M_LOAD` — so a Supervisor built on it spawns
+/// (start succeeds) but the load RPC fails, exercising the node's post-spawn-failure reap
+/// path. All other methods behave like [`fake_worker_factory`].
+pub(crate) fn fake_load_failing_factory() -> HalvesFactory {
+    Box::new(|_bus, _model| {
+        let (sup_end, worker_end) = tokio::io::duplex(64 * 1024);
+        let (sup_r, sup_w) = tokio::io::split(sup_end);
+        let (wr, mut ww) = tokio::io::split(worker_end);
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(wr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let Ok(RpcFrame::Request(r)) = rpc::decode(&line) else {
+                    continue;
+                };
+                if r.method == crate::worker::M_SHUTDOWN {
+                    break;
+                }
+                let resp = if r.method == crate::worker::M_LOAD {
+                    RpcResponse {
+                        jsonrpc: "2.0".into(),
+                        id: r.id,
+                        result: None,
+                        error: Some(crate::rpc::RpcError {
+                            code: -32000,
+                            message: "[HG017] fake load failure".into(),
+                            data: None,
+                        }),
+                    }
+                } else {
+                    RpcResponse {
+                        jsonrpc: "2.0".into(),
+                        id: r.id,
+                        result: Some(json!({})),
+                        error: None,
+                    }
+                };
+                let line = format!("{}\n", rpc::encode(&RpcFrame::Response(resp)));
+                if ww.write_all(line.as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(WorkerHalves {
+            write: Box::new(sup_w),
+            read: Box::new(sup_r),
+            proc: None,
+        })
+    })
+}
+
+/// A `NodeRuntime` whose workers spawn but fail every `M_LOAD` ([`fake_load_failing_factory`]).
+pub(crate) fn fake_runtime_load_fails(lmstudio_dirs: Vec<PathBuf>) -> NodeRuntime {
+    NodeRuntime::with_spawner(
+        NodeConfig {
+            bus: Arc::new(LogBus::new()),
+            lmstudio_dirs,
+            hf_dirs: vec![],
+            ollama_dirs: vec![],
+        },
+        Arc::new(|_bus| Supervisor::with_factory(fake_load_failing_factory())),
     )
 }
 

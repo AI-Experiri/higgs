@@ -12,21 +12,30 @@ use tokio::sync::{mpsc, oneshot};
 use crate::rpc::RpcResponse;
 
 // `Actor` / `spawn_actor` / `Handle` are the generic mailbox runtime, written once
-// here. Their first real consumers are `NodeRuntime` and the per-node iroh transport
-// (P2/P3); `ReplyDemux` (below) is consumed now by `Supervisor`. The `allow(dead_code)`
-// on the not-yet-wired items is removed when P2/P3 land.
+// here. Consumed now by `NodeRuntime` (P1) and `ReplyDemux` by `Supervisor`; the
+// per-node iroh transport joins in P2/P3.
 
 /// An actor: isolated state, reacting to its own typed messages off a mailbox.
 /// `handle` is `async` so an actor may await I/O / `spawn_blocking` inside it.
-#[allow(dead_code)] // consumed by NodeRuntime + per-node transport in P2/P3
+///
+/// **Slow I/O rule (see CLAUDE.md):** a `handle` must NOT `await` a slow downstream
+/// RPC — that would serialize every op behind it. Do only fast synchronous state work
+/// per message; run slow work in a `tokio::spawn` and apply its result via a follow-up
+/// "commit" message sent back through a [`WeakHandle`].
 pub(crate) trait Actor: Send + 'static {
     type Msg: Send + 'static;
     fn handle(&mut self, msg: Self::Msg) -> impl std::future::Future<Output = ()> + Send;
+
+    /// Called once after the mailbox closes (all handles dropped). Default no-op;
+    /// actors owning OS resources (e.g. child workers) override it to drain them —
+    /// unlike `Drop`, this runs in async context so it can `.await` the teardown.
+    fn on_stop(&mut self) -> impl std::future::Future<Output = ()> + Send {
+        async {}
+    }
 }
 
 /// A cloneable handle to an actor's mailbox. When the last clone is dropped the
 /// mailbox closes and the recv loop ends (graceful shutdown).
-#[allow(dead_code)] // consumed by NodeRuntime + per-node transport in P2/P3
 pub(crate) struct Handle<M> {
     tx: mpsc::UnboundedSender<M>,
 }
@@ -41,24 +50,66 @@ impl<M> Clone for Handle<M> {
 
 impl<M> Handle<M> {
     /// Enqueue a message. Errs only after every handle is dropped / the loop ended.
-    #[allow(dead_code)] // consumed by NodeRuntime + per-node transport in P2/P3
     pub(crate) fn send(&self, msg: M) -> Result<(), mpsc::error::SendError<M>> {
         self.tx.send(msg)
+    }
+
+    /// A non-owning handle: it does NOT keep the mailbox open, so an actor can hold one
+    /// to itself (for commit-messages) without preventing its own graceful shutdown.
+    pub(crate) fn downgrade(&self) -> WeakHandle<M> {
+        WeakHandle {
+            tx: self.tx.downgrade(),
+        }
+    }
+}
+
+/// A self-reference an actor keeps to post follow-up commit messages. Upgrades to a
+/// live [`Handle`] only while at least one strong handle survives; once the actor is
+/// shutting down, `upgrade()` returns `None` and the commit is dropped.
+pub(crate) struct WeakHandle<M> {
+    tx: mpsc::WeakUnboundedSender<M>,
+}
+
+impl<M> Clone for WeakHandle<M> {
+    fn clone(&self) -> Self {
+        WeakHandle {
+            tx: self.tx.clone(),
+        }
+    }
+}
+
+impl<M> WeakHandle<M> {
+    /// Upgrade to a live mailbox handle, or `None` if the actor has shut down.
+    pub(crate) fn upgrade(&self) -> Option<Handle<M>> {
+        self.tx.upgrade().map(|tx| Handle { tx })
     }
 }
 
 /// Spawn `state` as an actor: mailbox + recv loop + shutdown-on-last-handle-drop.
 /// The runtime, written ONCE — each actor contributes only `Msg` + `handle`.
-#[allow(dead_code)] // consumed by NodeRuntime + per-node transport in P2/P3
-pub(crate) fn spawn_actor<A: Actor>(mut state: A) -> Handle<A::Msg> {
+#[allow(dead_code)] // direct form kept for actors that need no self-handle (tests; future)
+pub(crate) fn spawn_actor<A: Actor>(state: A) -> Handle<A::Msg> {
+    spawn_actor_with(|_| state)
+}
+
+/// Like [`spawn_actor`], but `build` receives the actor's own [`Handle`] so the state
+/// can stash a [`WeakHandle`] to itself (downgrade it — never store the strong handle,
+/// which would pin the mailbox open forever). This is how an actor posts the commit
+/// messages of the slow-I/O pattern back to itself.
+pub(crate) fn spawn_actor_with<A: Actor>(
+    build: impl FnOnce(Handle<A::Msg>) -> A,
+) -> Handle<A::Msg> {
     let (tx, mut rx) = mpsc::unbounded_channel::<A::Msg>();
+    let handle = Handle { tx };
+    let mut state = build(handle.clone());
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             state.handle(msg).await;
         }
-        // All handles dropped ⇒ graceful shutdown.
+        // All handles dropped ⇒ graceful shutdown: drain owned resources.
+        state.on_stop().await;
     });
-    Handle { tx }
+    handle
 }
 
 /// The reader-side reply-demux shared by every RPC *client* (Supervisor today; the
