@@ -26,7 +26,7 @@ use crate::diagnostic::HiggsError;
 use crate::log_bus::{LogBus, LogSource};
 use crate::node::worker_id::{WorkerId, WorkerRegistry};
 use crate::remote::NodeLoadParams;
-use crate::supervisor::Supervisor;
+use crate::supervisor::{HiggsEvent, Supervisor};
 use crate::worker::models::ModelStore;
 use crate::worker::{M_LOAD, M_STATUS};
 
@@ -98,6 +98,14 @@ impl Drop for StopOnDrop {
 /// a worker.
 const LOG_RELAY_CAP: usize = 1024;
 
+/// Capacity of the lifecycle-event broadcast (ModelLoaded/ModelUnloaded). Small — events are
+/// discrete and consumers (UI/SSE) keep up; a lagging consumer drops the gap.
+const EVENT_CAP: usize = 256;
+
+/// Per-path model-support probe verdicts: `(path, (loadable, reason, engine_version))`.
+/// Mirrors `Supervisor::probe_paths`' return shape.
+pub type ProbeVerdicts = Vec<(String, (bool, Option<String>, String))>;
+
 /// The actor's typed mailbox. Each variant carries a oneshot `reply` the wrapper awaits.
 enum NodeMsg {
     /// Spawn a new worker + load the model. Reserves an id synchronously, runs the slow
@@ -152,6 +160,17 @@ enum NodeMsg {
     /// Periodic tick from the idle reaper: unload every resident worker with no in-flight chat
     /// that has been idle past the TTL.
     ReapIdle,
+    /// Snapshot the resident instances as `(worker, raw model)` — the engine's input to the
+    /// global served-id derivation (P4b).
+    Instances {
+        reply: oneshot::Sender<Vec<(WorkerId, String)>>,
+    },
+    /// Probe GGUF support for `paths` via a transient Supervisor (control-plane; independent of
+    /// resident workers). Mirrors `Supervisor::probe_paths`.
+    Probe {
+        paths: Vec<String>,
+        reply: oneshot::Sender<ProbeVerdicts>,
+    },
     ShutdownAll {
         reply: oneshot::Sender<()>,
     },
@@ -237,9 +256,17 @@ struct NodeActor {
     /// Set once the drain has fully completed. A `ShutdownAll` arriving afterwards answers
     /// immediately (no in-flight work remains to release a fresh waiter).
     shutdown_done: bool,
+    /// Lifecycle event fan-out (ModelLoaded/ModelUnloaded), so the engine's event stream works
+    /// the same for a local NodeRuntime as it did for the single Supervisor (P4b).
+    events_tx: broadcast::Sender<HiggsEvent>,
 }
 
 impl NodeActor {
+    /// Best-effort lifecycle event emit (no subscribers ⇒ dropped).
+    fn emit(&self, ev: HiggsEvent) {
+        let _ = self.events_tx.send(ev);
+    }
+
     /// Snapshot resident workers (id → model) synchronously off the registry — the fast
     /// state read that precedes the slow `hardware_runtime` fetch in `inventory`.
     fn snapshot_workers(&self) -> Vec<crate::remote::InventoryWorker> {
@@ -317,10 +344,12 @@ impl Actor for NodeActor {
                             // worker nobody asked to keep.
                             match reply.send(Ok((id, loaded))) {
                                 Ok(()) => {
+                                    let model = sup.loaded_model_id().unwrap_or_default();
                                     self.registry.insert_reserved(id, sup);
                                     // Start the idle clock now (a loaded-but-unused model is
                                     // idle from load time).
                                     self.last_activity.insert(id, Instant::now());
+                                    self.emit(HiggsEvent::ModelLoaded { id: model });
                                 }
                                 Err(_) => self.reap(sup, None),
                             }
@@ -346,8 +375,10 @@ impl Actor for NodeActor {
                     // tracked so a later shutdown_all awaits it, and the caller's reply fires
                     // when the stop actually completes.
                     Some(sup) => {
+                        let model = sup.loaded_model_id().unwrap_or_default();
                         self.forget_activity(id);
                         self.reap(sup, Some(reply));
+                        self.emit(HiggsEvent::ModelUnloaded { id: model });
                     }
                     None => {
                         let _ = reply.send(Err(no_worker(id)));
@@ -439,11 +470,36 @@ impl Actor for NodeActor {
                         .collect();
                     for id in idle {
                         if let Some(sup) = self.registry.remove(id) {
+                            let model = sup.loaded_model_id().unwrap_or_default();
                             self.forget_activity(id);
                             self.reap(sup, None);
+                            self.emit(HiggsEvent::ModelUnloaded { id: model });
                         }
                     }
                 }
+            }
+            NodeMsg::Instances { reply } => {
+                let _ = reply.send(
+                    self.registry
+                        .ids()
+                        .into_iter()
+                        .filter_map(|id| {
+                            self.registry
+                                .get(id)
+                                .map(|sup| (id, sup.loaded_model_id().unwrap_or_default()))
+                        })
+                        .collect(),
+                );
+            }
+            NodeMsg::Probe { paths, reply } => {
+                // Control-plane probe on a transient Supervisor — independent of resident
+                // workers, so run it off the actor thread.
+                let spawner = self.spawner.clone();
+                let bus = self.config.bus.clone();
+                tokio::spawn(async move {
+                    let sup = (spawner)(bus);
+                    let _ = reply.send(sup.probe_paths(paths).await);
+                });
             }
             NodeMsg::ShutdownAll { reply } => {
                 if self.shutdown_done {
@@ -785,6 +841,10 @@ pub struct NodeRuntime {
     handle: Handle<NodeMsg>,
     /// Kept on the wrapper too so `subscribe_logs` needs no mailbox round-trip.
     log_tx: broadcast::Sender<(WorkerId, String)>,
+    /// Lifecycle-event fan-out, mirrored on the wrapper so `events()` needs no round-trip.
+    events_tx: broadcast::Sender<HiggsEvent>,
+    /// The node's shared Developer-Log bus (P4b: the local engine reads/configures it here).
+    bus: Arc<LogBus>,
 }
 
 impl NodeRuntime {
@@ -797,8 +857,11 @@ impl NodeRuntime {
     /// called from within a Tokio runtime.
     pub(crate) fn with_spawner(config: NodeConfig, spawner: SupervisorSpawner) -> Self {
         let (log_tx, _) = broadcast::channel(LOG_RELAY_CAP);
+        let (events_tx, _) = broadcast::channel(EVENT_CAP);
         let config = Arc::new(config);
+        let bus = config.bus.clone();
         let relay = log_tx.clone();
+        let events_for_actor = events_tx.clone();
         let idle_ttl = config.idle_ttl;
         let handle = spawn_actor_with(move |h| NodeActor {
             registry: WorkerRegistry::new(),
@@ -815,6 +878,7 @@ impl NodeRuntime {
             last_activity: HashMap::new(),
             in_flight: HashMap::new(),
             idle_ttl,
+            events_tx: events_for_actor,
         });
         // Idle reaper: a WeakHandle so it never keeps the actor alive — it exits the tick the
         // last real handle drops (upgrade fails).
@@ -835,7 +899,12 @@ impl NodeRuntime {
                 }
             }
         });
-        Self { handle, log_tx }
+        Self {
+            handle,
+            log_tx,
+            events_tx,
+            bus,
+        }
     }
 
     /// Error returned when the actor mailbox is gone (shutting down / loop ended).
@@ -859,6 +928,39 @@ impl NodeRuntime {
     /// `serve_node` drains this onto a uni stream to the hub as `N_LOG_LINE`.
     pub fn subscribe_logs(&self) -> broadcast::Receiver<(WorkerId, String)> {
         self.log_tx.subscribe()
+    }
+
+    /// Subscribe to lifecycle events (ModelLoaded/ModelUnloaded) — the engine's event stream.
+    pub fn events(&self) -> broadcast::Receiver<HiggsEvent> {
+        self.events_tx.subscribe()
+    }
+
+    /// The node's shared Developer-Log bus (Developer-Logs history + live stream + verbosity).
+    pub fn bus(&self) -> &Arc<LogBus> {
+        &self.bus
+    }
+
+    /// Resident instances as `(worker, raw model)` — the engine's input to global served-id
+    /// derivation. Empty if the actor has stopped.
+    pub async fn instances(&self) -> Vec<(WorkerId, String)> {
+        let (tx, rx) = oneshot::channel();
+        if self.handle.send(NodeMsg::Instances { reply: tx }).is_err() {
+            return Vec::new();
+        }
+        rx.await.unwrap_or_default()
+    }
+
+    /// Probe GGUF support for `paths` (control-plane; via a transient worker).
+    pub async fn probe_paths(&self, paths: Vec<String>) -> ProbeVerdicts {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .handle
+            .send(NodeMsg::Probe { paths, reply: tx })
+            .is_err()
+        {
+            return Vec::new();
+        }
+        rx.await.unwrap_or_default()
     }
 
     /// Live worker ids, ascending (empty if the actor has stopped).
@@ -1149,6 +1251,26 @@ mod tests {
             rt.worker_ids().await.is_empty(),
             "no worker after a post-shutdown load"
         );
+    }
+
+    // `instances()` lists resident (worker, raw model) pairs, and lifecycle events fire on
+    // load/unload — the surface the local engine consumes in P4b.
+    #[tokio::test]
+    async fn instances_and_events_track_load_unload() {
+        let (rt, _dir) = fake_runtime_with_models(&["org/a", "org/b"]);
+        let mut events = rt.events();
+        let (wa, _) = load(&rt, "org/a").await;
+        load(&rt, "org/b").await;
+        let mut insts = rt.instances().await;
+        insts.sort();
+        assert_eq!(insts.len(), 2);
+        assert!(insts.iter().any(|(w, m)| *w == wa && m == "org/a"));
+        // A load emitted a ModelLoaded event.
+        let ev = events.recv().await.unwrap();
+        assert!(matches!(ev, HiggsEvent::ModelLoaded { .. }));
+        // Unload removes the instance and emits ModelUnloaded.
+        rt.unload(wa).await.unwrap();
+        assert_eq!(rt.instances().await.len(), 1);
     }
 
     // The idle reaper auto-unloads a worker that has had no chat activity for longer than the
