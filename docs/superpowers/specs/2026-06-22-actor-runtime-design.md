@@ -63,10 +63,17 @@ Invariants:
 
 - **P1 — Node Runtime → actor.** Convert `NodeRuntime` to a `spawn_actor` actor;
   keep its method API as thin mailbox wrappers. Removes node-side mutexes.
-- **P2 — Supervisor → actor.** Wrap `Supervisor` as an actor. Its `ReplyDemux` is
-  currently shared `Arc` + mutex-protected maps (`actor.rs`), so P2 must **privatize
-  the pending-reply state into the actor** (mailbox-owned), not keep the shared demux
-  — the reader/writer split stays but the correlation map moves behind the mailbox.
+- **P2 — Supervisor: actor assessment.** Assessed per the CLAUDE.md actor rule and
+  found to **already realize the actor model** — single `reader_task` (serialized
+  inbound + death/restart loop), single `writer_task` (outbound mailbox), worker
+  process (executor), and `ReplyDemux` (single-op RPC-client correlation, intentionally
+  bypassing a control mailbox so token chunks don't serialize — the P5 sink-handoff
+  intent). The lone cross-task multi-step mutation (`stop` vs restart) is serialized via
+  the documented `stopped`/`running` ordering, NOT a lock-based check-then-act, so it is
+  not the `HubFleet` TOCTOU class. A literal mailbox rewrite is **not warranted** (no
+  race-elimination gain; would fight the streaming bypass and ripple sync→async across
+  ~20 local-path call sites on the most-hardened file). Decision recorded in the
+  `Supervisor` doc comment; validated by codex (no await-spanning multi-step state race).
 - **P3 — Engine Runtime actor; fold in HubFleet.** Fleet read-model + routing become
   Engine actor state (mutexes deleted); `/v1` + `/api/higgs/*` handlers send engine
   messages. **Dissolves the hub-side races.** Re-key routing by **served instance id**,

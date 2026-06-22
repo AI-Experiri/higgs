@@ -159,6 +159,11 @@ struct Inner {
     demux: crate::actor::ReplyDemux,
     /// Monotonically increasing request id counter.
     next_id: AtomicU64,
+    /// Worker-lifetime generation, bumped by every `do_spawn`. A `reader_task` captures
+    /// its generation at spawn; if a later `do_spawn` (a `start_for` after this worker's
+    /// `stop()`) bumps it, the now-stale reader exits on its next death WITHOUT touching
+    /// the live worker's state — closes the stop()→start_for() stale-reader clobber race.
+    generation: AtomicU64,
     /// Broadcast channel for lifecycle events (cap 64).
     events_tx: broadcast::Sender<HiggsEvent>,
     /// Single home for Developer-Log lines: bounded history ring (the `logs(n)`
@@ -169,6 +174,11 @@ struct Inner {
     bus: Arc<LogBus>,
     /// Params of the last successful `higgs/load`; replayed after restart.
     last_load: Mutex<Option<Value>>,
+    /// Bumped on every `record_last_load`/`clear_last_load`. A crash-restart's async
+    /// `replay_load` captures this; if it changed before the replay fires, an explicit
+    /// load/unload superseded the captured model, so the replay is skipped rather than
+    /// resurrecting a stale model over a newer one.
+    load_epoch: AtomicU64,
     /// Set on `stop()` — suppresses respawn after death.
     stopped: AtomicBool,
     /// True for the entire lifetime of a live worker — from the spawn that
@@ -207,6 +217,73 @@ struct Inner {
 /// Concurrent callers are each routed their own deltas via the keyed sink map;
 /// the worker serialises execution (single-threaded stdin loop) so throughput
 /// is single-sequence but correctness is guaranteed for any number of callers.
+///
+/// ## Actor-model assessment (P2, per CLAUDE.md)
+///
+/// The Supervisor was assessed against the actor requirement and **already realizes
+/// the actor model**; a literal `spawn_actor` mailbox rewrite is deliberately NOT
+/// warranted:
+/// - The **`reader_task`** is a single owning task that loops on the read half and
+///   serially dispatches inbound frames, handles worker death, and drives the entire
+///   restart FSM — i.e. it *is* the supervisor's inbound actor loop. The
+///   single-reader invariant (`Inner::running`) guarantees exactly one such task.
+/// - The **`writer_task`** drains an mpsc of outbound lines and owns stdin — a
+///   textbook outbound mailbox; no mutex sits on the I/O path.
+/// - The **worker process** is the executor and serialises all generation.
+/// - **`ReplyDemux`** is the blessed RPC-client correlation map (see `actor.rs`): its
+///   locks guard *single-op* map insert/remove only — there is no await-spanning
+///   multi-step mutation of those maps, so they cannot exhibit the check-then-act /
+///   TOCTOU race class that makes `Mutex` state unsafe and mandates an actor. Routing
+///   responses/`N_CHAT_CHUNK` chunks directly through the demux (rather than a control
+///   mailbox) is the intended streaming bypass — token deltas must NOT serialize
+///   behind control messages (the P5 sink-handoff intent). The one ordering hazard —
+///   a `send_request` racing `on_worker_death` — is closed by clearing `write_tx`
+///   BEFORE `fail_all_pending` there, so a request issued during worker death fast-fails
+///   instead of waiting out its RPC timeout (see `on_worker_death`).
+/// - The only cross-task multi-step mutation — `stop()` versus the reader's
+///   `attempt_restart` — is serialized by the documented `stopped` (Release/Acquire) +
+///   `running` ordering (the F1/F2 hardening) plus the `generation` tag, not a lock-based
+///   check-then-act, so a stop can never race a respawn into resurrecting an unloaded
+///   worker, and a reader left over from a stopped lifetime can never clobber the next
+///   worker's state (it sees a bumped `generation` and exits).
+/// - `start_for`/`do_spawn` versus `stop()` is NOT internally guarded (do_spawn resets
+///   `stopped=false`); instead it is a **caller-enforced** precondition — the local
+///   `Higgs` serializes both under its `lifecycle` mutex, and the node runtime awaits
+///   `start_for` before committing the Supervisor, so the two never run concurrently on
+///   one Supervisor (see the `do_spawn` body comment). A new caller MUST preserve this.
+///
+/// **Accepted residual (safe-degrading, not a corruption race):** after a *crash*-driven
+/// restart, `replay_load` re-sends `M_LOAD` from a spawned task, so there is a sub-ms
+/// window where the respawned worker is visible (`write_tx` installed) but the model is
+/// not yet resident. A chat that races into that window is rejected `HG003 ModelNotLoaded`
+/// (retryable) rather than served — a transient model-availability window inherent to
+/// crash recovery, with no state corruption/hang/orphan. Closing it would mean
+/// pre-enqueuing the replay into the writer channel before publishing it, restructuring the
+/// hardened replay FSM for marginal gain; left as a documented residual.
+///
+/// A stronger hazard — a stale crash-replay overwriting a NEWER explicit load (resident
+/// model ≠ recorded model) — is closed by the `load_epoch`: `replay_load` captures it and
+/// skips if an explicit load/unload bumped it first. The remaining residual is the tight
+/// sub-window where the newer load's `record_last_load` has not landed when the replay
+/// checks; there the two in-flight `M_LOAD`s race on writer FIFO order. Fully closing that
+/// needs a single serialized load path (a follow-on if it ever matters in practice).
+///
+/// **Teardown-timeout residual class (safe-degrading):** because `stop()` touches
+/// `write_tx` (parking_lot lock) and `proc` (tokio lock) separately rather than under one
+/// guard, a request that races a `stop()` interleaved with a crash-restart can briefly see
+/// a `write_tx` published for an already-reaped child, and resolve via its BOUNDED RPC
+/// timeout instead of fast-failing. No corruption or orphan results — the child is always
+/// reaped, the `generation` guard stops any stale reader from clobbering the next worker,
+/// and the request returns a proper error (just later). Eliminating these sub-windows
+/// entirely requires a single serialized lifecycle owner (the full mailbox-actor
+/// conversion), which the assessment above judges not worth its cost/risk here.
+///
+/// Converting to a literal mailbox would fold the read-half-owning `reader_task` and
+/// the streaming chunk path behind a control mailbox — fighting the bypass design,
+/// rippling sync→async across ~20 `Higgs` (local-path) call sites, and risking the
+/// most-hardened lifecycle FSM — for no race-elimination gain. The genuine lock-based
+/// race class lives in `HubFleet` and is dissolved by folding it into the Engine actor
+/// (P3), which is where that work belongs.
 pub(crate) struct Supervisor {
     inner: Arc<Inner>,
 }
@@ -224,6 +301,8 @@ impl Supervisor {
         let inner = Arc::new(Inner {
             demux: crate::actor::ReplyDemux::new(),
             next_id: AtomicU64::new(1),
+            generation: AtomicU64::new(0),
+            load_epoch: AtomicU64::new(0),
             events_tx,
             bus,
             last_load: Mutex::new(None),
@@ -246,6 +325,8 @@ impl Supervisor {
         let inner = Arc::new(Inner {
             demux: crate::actor::ReplyDemux::new(),
             next_id: AtomicU64::new(1),
+            generation: AtomicU64::new(0),
+            load_epoch: AtomicU64::new(0),
             events_tx,
             bus: Arc::new(LogBus::new()),
             last_load: Mutex::new(None),
@@ -643,6 +724,8 @@ impl Supervisor {
     /// Record the params of a successful `higgs/load` for post-restart replay.
     pub(crate) fn record_last_load(&self, params: Value) {
         *self.inner.last_load.lock() = Some(params);
+        // Bump so a stale crash-replay capturing an OLDER load is skipped.
+        self.inner.load_epoch.fetch_add(1, Ordering::AcqRel);
     }
 
     /// The model id of the last recorded load (`None` if nothing is loaded). Used by the
@@ -660,6 +743,8 @@ impl Supervisor {
     /// user just unloaded.
     pub(crate) fn clear_last_load(&self) {
         *self.inner.last_load.lock() = None;
+        // Bump so a stale crash-replay capturing the now-cleared load is skipped.
+        self.inner.load_epoch.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Emit a lifecycle event on the broadcast channel.
@@ -761,6 +846,17 @@ impl Supervisor {
         // Reset the deliberate-stop flag so the new worker's reader_task
         // will auto-restart on unexpected death (stop→start cycle fix).
         self.inner.stopped.store(false, Ordering::Relaxed);
+        // Bump the worker-lifetime generation NOW — before installing the new `write_tx`
+        // below — so that the instant this new lifetime begins, any reader left over from a
+        // prior (stopped) lifetime is already marked stale. If we bumped only after
+        // installing `write_tx`, an old reader hitting EOF in that window would see its own
+        // generation still current and clobber the freshly installed channel. A bump
+        // followed by a factory failure is harmless (generation only ever moves forward).
+        let gen = self
+            .inner
+            .generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
         let halves = match (self.inner.factory)(self.inner.bus.clone(), model) {
             Ok(h) => h,
             Err(e) => {
@@ -769,10 +865,20 @@ impl Supervisor {
                 return Err(e);
             }
         };
-        // Stash the child handle so stop() can wait on / kill it. No concurrent
-        // holder exists at (re)spawn time — stop() is terminal and never races a
-        // spawn — so a non-blocking lock is sufficient and avoids blocking_lock
-        // inside the async runtime.
+        // Stash the child handle so stop() can wait on / kill it. No concurrent holder
+        // exists at (re)spawn time because `start_for`/`do_spawn` is never concurrent
+        // with `stop()` on the same Supervisor — this is a CALLER-ENFORCED precondition,
+        // required because do_spawn's reset of `stopped=false` (above) would otherwise
+        // defeat a stop()'s `stopped=true`:
+        //   * local `Higgs` (api.rs) holds the `lifecycle` mutex across BOTH load()
+        //     (which calls start_for) and unload()/stop() (which call sup.stop());
+        //   * the node runtime (P1) awaits `start_for` fully inside `do_load` BEFORE the
+        //     Supervisor is committed to the registry, and only a committed Supervisor is
+        //     ever reaped/stopped.
+        // Given that, a non-blocking `try_lock` is sufficient and avoids blocking_lock
+        // inside the async runtime. (The reader's `attempt_restart` DOES race stop() — a
+        // worker can die at any time — which is why it carries its own post-factory
+        // `stopped` Acquire guard; do_spawn needs none under the precondition above.)
         if let Ok(mut guard) = self.inner.proc.try_lock() {
             *guard = halves.proc;
         }
@@ -782,8 +888,10 @@ impl Supervisor {
         // Exits when the sender half is dropped (stop() or do_spawn replacing it).
         tokio::spawn(writer_task(halves.write, write_rx));
         // Reader task: owns the read half, dispatches lines, triggers restart on EOF/error.
+        // Tagged with the generation bumped ABOVE (before write_tx install), so a reader from
+        // a prior lifetime is already stale by the time this worker is published.
         let inner = Arc::clone(&self.inner);
-        tokio::spawn(reader_task(inner, halves.read));
+        tokio::spawn(reader_task(inner, halves.read, gen));
         Ok(())
     }
 }
@@ -949,60 +1057,55 @@ async fn writer_task(mut write: WriteHalf, mut rx: mpsc::UnboundedReceiver<Strin
 /// 3. If not stopped: waits 1 s, re-checks `stopped` after the sleep, then
 ///    attempts one respawn; on factory failure → broadcasts terminal `WorkerDied`
 ///    and exits.
-async fn reader_task(inner: Arc<Inner>, read: ReadHalf) {
+async fn reader_task(inner: Arc<Inner>, read: ReadHalf, gen: u64) {
     let mut reader = BufReader::new(read).lines();
 
     // Every terminal exit `break`s so the single post-loop clear releases the
     // `running` lifetime flag exactly once. A successful restart `continue`s the
-    // loop on the new transport without clearing it (the lifetime persists).
+    // loop on the new transport without clearing it (the lifetime persists). A STALE
+    // reader (a newer lifetime began) `return`s early WITHOUT clearing `running` — that
+    // flag now belongs to the live worker.
     loop {
-        let line_result = reader.next_line().await;
-        match line_result {
-            Ok(Some(line)) => dispatch(&inner, &line),
-            Ok(None) => {
-                // EOF — worker exited.
-                let deliberate = inner.stopped.load(Ordering::Relaxed);
-                // Pass `deliberate` so on_worker_death suppresses the event on clean stop.
-                on_worker_death(&inner, None, deliberate);
-                if deliberate {
-                    break;
-                }
-                // 1 s backoff, then re-check stopped before respawning.
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                if inner.stopped.load(Ordering::Relaxed) {
-                    break;
-                }
-                match attempt_restart(&inner).await {
-                    Some(new_read) => {
-                        reader = BufReader::new(new_read).lines();
-                        // Continue outer loop on the new transport.
-                    }
-                    None => break,
-                }
+        let reason = match reader.next_line().await {
+            Ok(Some(line)) => {
+                dispatch(&inner, &line);
+                continue;
             }
-            Err(e) => {
-                // I/O error on the read half.
-                let deliberate = inner.stopped.load(Ordering::Relaxed);
-                on_worker_death(&inner, Some(e.to_string()), deliberate);
-                if deliberate {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                // Re-check stopped after backoff sleep (F1: stop() may have raced).
-                if inner.stopped.load(Ordering::Relaxed) {
-                    break;
-                }
-                match attempt_restart(&inner).await {
-                    Some(new_read) => {
-                        reader = BufReader::new(new_read).lines();
-                    }
-                    None => break,
-                }
+            Ok(None) => None,              // EOF — worker exited.
+            Err(e) => Some(e.to_string()), // I/O error on the read half.
+        };
+        // Stale-reader guard: if a later `do_spawn` (a `start_for` after this worker's
+        // `stop()`) bumped the generation, this reader belongs to a replaced lifetime. Exit
+        // WITHOUT touching write_tx/pending/sinks/running — they are the live worker's now.
+        if inner.generation.load(Ordering::Acquire) != gen {
+            return;
+        }
+        let deliberate = inner.stopped.load(Ordering::Relaxed);
+        // Pass `deliberate` so on_worker_death suppresses the event on clean stop.
+        on_worker_death(&inner, reason, deliberate);
+        if deliberate {
+            break;
+        }
+        // 1 s backoff, then re-check stopped (F1: stop() may have raced) AND the generation
+        // (a start_for may have begun a new lifetime during the sleep) before respawning.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        if inner.stopped.load(Ordering::Relaxed) {
+            break;
+        }
+        if inner.generation.load(Ordering::Acquire) != gen {
+            return;
+        }
+        match attempt_restart(&inner).await {
+            Some(new_read) => {
+                reader = BufReader::new(new_read).lines();
+                // Continue outer loop on the new transport.
             }
+            None => break,
         }
     }
-    // Lifetime over (clean stop or respawn give-up): release the flag so a
-    // future start() can spawn a fresh worker. Idempotent with stop()'s clear.
+    // Current-lifetime reader exiting (clean stop or respawn give-up): release the flag so a
+    // future start() can spawn a fresh worker. Idempotent with stop()'s clear. (A stale
+    // reader returned above and never reaches here, so it can't clear the live worker's flag.)
     inner.running.store(false, Ordering::Release);
 }
 
@@ -1029,9 +1132,14 @@ async fn attempt_restart(inner: &Arc<Inner>) -> Option<ReadHalf> {
         reap_child(halves.proc).await;
         return None;
     }
-    // Step 3 — reap the OLD (dead) child and stash the new one so stop() can
-    // later wait on / SIGKILL it.
-    install_child(inner, halves.proc).await;
+    // Step 3 — reap the OLD (dead) child and stash the new one so stop() can later wait on /
+    // SIGKILL it. This re-checks `stopped` UNDER the proc lock (atomic with stop()'s reap):
+    // if a stop() raced in after Step 2's check, install_child abandons + reaps the new child
+    // and returns false — give up WITHOUT installing the writer or replaying, so a worker is
+    // never resurrected after stop().
+    if !install_child(inner, halves.proc).await {
+        return None;
+    }
     // Step 4 — install the new write channel + writer task (drops the old sender).
     install_writer(inner, halves.write);
     // Step 5 — announce the restart, then replay the last load (async, bounded).
@@ -1054,16 +1162,32 @@ fn spawn_replacement(inner: &Arc<Inner>) -> Result<WorkerHalves, HiggsError> {
     (inner.factory)(inner.bus.clone(), &model)
 }
 
+/// Wait for `child` to exit, bounded by [`WORKER_EXIT_TIMEOUT`]; SIGKILL + reap on timeout.
+///
+/// Used wherever a child is reaped while a lock is held (restart path): a worker that EOF'd
+/// its stdout but has not exited must NOT be able to wedge that lock indefinitely (which
+/// would block `stop()`). Normally the EOF means the process already exited, so the wait
+/// returns at once; the timeout+kill is the safety bound. Mirrors `stop()`'s reap.
+async fn wait_or_kill(child: &mut tokio::process::Child) {
+    if tokio::time::timeout(WORKER_EXIT_TIMEOUT, child.wait())
+        .await
+        .is_err()
+    {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+    }
+}
+
 /// Reap the OLD child currently stored in `inner.proc` (if any).
 ///
 /// Its EOF is what triggered this restart, so it has already exited — but
-/// `tokio::process::Child` does NOT reap on drop, so dropping it without
-/// `wait()` leaves a zombie. `wait()` returns immediately since the process is
-/// already gone.
+/// `tokio::process::Child` does NOT reap on drop, so dropping it without `wait()` leaves a
+/// zombie. The wait is bounded ([`wait_or_kill`]) so a not-yet-exited old worker can't wedge
+/// the proc lock.
 async fn reap_old_child(inner: &Arc<Inner>) {
     let mut proc_guard = inner.proc.lock().await;
     if let Some(mut old) = proc_guard.take() {
-        let _ = old.wait().await;
+        wait_or_kill(&mut old).await;
     }
 }
 
@@ -1079,16 +1203,34 @@ async fn reap_child(proc: Option<tokio::process::Child>) {
     }
 }
 
-/// Reap the OLD child, then stash the NEW one in `inner.proc`.
+/// Reap the OLD child, then stash the NEW one in `inner.proc`. Returns `false` if a
+/// concurrent `stop()` was observed and the new worker was abandoned instead of installed.
 ///
-/// `do_spawn` does this for the initial spawn; the respawn path must too, or a
-/// worker restarted after a death would be unreapable by `stop()`.
-async fn install_child(inner: &Arc<Inner>, new_proc: Option<tokio::process::Child>) {
+/// `do_spawn` does this for the initial spawn; the respawn path must too, or a worker
+/// restarted after a death would be unreapable by `stop()`.
+///
+/// **stop()-race close:** `attempt_restart`'s pre-factory `stopped` check is a check-then-
+/// act that races `stop()` across the `install_child` await — `stop()` sets `stopped=true`
+/// FIRST and then takes THIS proc lock to reap, so re-checking `stopped` here UNDER the
+/// proc lock makes install atomic with that reap. If `stop()` won the lock first we observe
+/// `stopped` and abandon (reap the new child) rather than resurrect a worker after stop; if
+/// we install first, `stop()`'s later proc-lock acquisition reaps the new child we stored.
+async fn install_child(inner: &Arc<Inner>, new_proc: Option<tokio::process::Child>) -> bool {
     let mut proc_guard = inner.proc.lock().await;
+    if inner.stopped.load(Ordering::Acquire) {
+        // A stop() raced this restart and already ran (or is mid-reap holding nothing yet).
+        // Do NOT resurrect: drop the lock, then reap the just-spawned child.
+        drop(proc_guard);
+        reap_child(new_proc).await;
+        return false;
+    }
     if let Some(mut old) = proc_guard.take() {
-        let _ = old.wait().await;
+        // Bounded reap: a worker that EOF'd but hasn't exited can't wedge this lock (and
+        // thereby block stop(), which contends for the same lock).
+        wait_or_kill(&mut old).await;
     }
     *proc_guard = new_proc;
+    true
 }
 
 /// Install a fresh write channel + writer task for the respawned worker.
@@ -1141,10 +1283,17 @@ fn route_notification(inner: &Arc<Inner>, notif: &RpcNotification) {
 /// shutdown is not a death event). This enforces four-pillar pillar 3: log once
 /// at origin, not at every boundary that observes the same event.
 fn on_worker_death(inner: &Arc<Inner>, reason: Option<String>, deliberate: bool) {
+    // ORDER MATTERS — close the send→register race with a concurrent `send_request`:
+    // clear `write_tx` FIRST, THEN fail pending. A racing send either (a) locks `write_tx`
+    // after this clear → sees `None` → fast-fails and removes its own pending entry, or
+    // (b) locked `write_tx` before the clear (so it registered its pending entry even
+    // earlier, in code order) → that entry is caught by the `fail_all_pending` below. Either
+    // way a request issued during worker death fails fast instead of waiting out its RPC
+    // timeout. (If these ran in the opposite order, a send could register after
+    // fail_all_pending yet still send through a not-yet-cleared `write_tx` and then block.)
+    *inner.write_tx.lock() = None;
     // Fail all pending requests — the rx.await in `request` sees Err.
     inner.demux.fail_all_pending();
-    // Drop the write sender — the writer task exits when channel closes.
-    *inner.write_tx.lock() = None;
     // Drop all chat sinks — closes each receiver, ending all in-flight streams.
     inner.demux.clear_sinks();
 
@@ -1174,6 +1323,9 @@ fn replay_load(inner: &Arc<Inner>) {
     let Some(load_params) = inner.last_load.lock().clone() else {
         return;
     };
+    // Capture the load epoch alongside the params: if an explicit load/unload bumps it
+    // before this async replay fires, the captured model is stale and the replay is skipped.
+    let captured_epoch = inner.load_epoch.load(Ordering::Acquire);
 
     let inner2 = Arc::clone(inner);
     tokio::spawn(async move {
@@ -1186,6 +1338,15 @@ fn replay_load(inner: &Arc<Inner>) {
         // also cleared `last_load` first, the `let Some` above already returned —
         // this covers the path where `stopped` flips without that clear.)
         if inner2.stopped.load(Ordering::Acquire) {
+            return;
+        }
+        // Stale-replay close: if an explicit load/unload superseded the captured model
+        // (epoch changed), do NOT resurrect the old model over the newer intent. (A tight
+        // residual remains: an explicit load whose `record_last_load` has not landed yet
+        // won't be observed — the FIFO ordering of that in-flight M_LOAD then decides; this
+        // narrows the window from "any delayed replay" to that sub-window. Documented in the
+        // Supervisor assessment.)
+        if inner2.load_epoch.load(Ordering::Acquire) != captured_epoch {
             return;
         }
         let id = load_params
@@ -1506,6 +1667,58 @@ mod tests {
         sup.stop().await;
         let err = sup.request("higgs/ping", json!({})).await.unwrap_err();
         assert!(err.to_string().contains("[HG007]"), "display: {err}");
+    }
+
+    // A spawn bumps the worker-lifetime generation (the tag the stale-reader guard compares
+    // against), and a redundant start() while already running does NOT bump it.
+    #[tokio::test]
+    async fn spawn_bumps_generation_redundant_start_does_not() {
+        // make_supervisor already called start_for once, so the spawn bumped gen 0 → 1.
+        let (sup, _tw, _tr) = make_supervisor();
+        assert_eq!(
+            sup.inner.generation.load(Ordering::Acquire),
+            1,
+            "spawn bumped gen to 1"
+        );
+        // Redundant start() while running is an idempotent no-op (running.swap guard) — it
+        // must NOT bump the generation or the live reader would be wrongly marked stale.
+        sup.start_for("org/model").expect("redundant start ok");
+        assert_eq!(
+            sup.inner.generation.load(Ordering::Acquire),
+            1,
+            "redundant start does not bump generation"
+        );
+        sup.stop().await;
+    }
+
+    // A crash-replay must SKIP if an explicit load/unload superseded the captured model
+    // (load_epoch bumped) — otherwise a stale replay would resurrect the old model over the
+    // newer one. Drive replay_load directly, bump the epoch before the spawned task runs
+    // (current-thread runtime: it can't run until we await), and assert NO M_LOAD is sent.
+    #[tokio::test]
+    async fn replay_load_skips_when_epoch_superseded() {
+        let (sup, _tw, test_read) = make_supervisor(); // worker running (gen 1)
+        sup.record_last_load(json!({ "id": "org/a", "path": "/x" }));
+        // replay_load captures the current epoch synchronously, then spawns the replay task.
+        replay_load(&sup.inner);
+        // Supersede before the task runs: a newer explicit load/unload bumped the epoch.
+        sup.inner.load_epoch.fetch_add(1, Ordering::AcqRel);
+        // The replay task now observes a changed epoch and returns without sending M_LOAD.
+        let mut lines = BufReader::new(test_read).lines();
+        let got =
+            tokio::time::timeout(std::time::Duration::from_millis(200), lines.next_line()).await;
+        match got {
+            // Timed out / EOF / error → nothing was sent → replay correctly skipped.
+            Err(_) | Ok(Ok(None)) | Ok(Err(_)) => {}
+            // A line was sent: it must NOT be an M_LOAD (that would be the stale replay).
+            Ok(Ok(Some(line))) => {
+                assert!(
+                    !line.contains("higgs/load"),
+                    "superseded replay sent M_LOAD: {line}"
+                );
+            }
+        }
+        sup.stop().await;
     }
 
     // ─── Test 1-b: redundant start() is an idempotent no-op ──────────────────
@@ -2804,5 +3017,34 @@ mod tests {
             "child reaped by stop"
         );
         assert!(!sup.inner.running.load(Ordering::Relaxed));
+    }
+
+    // install_child's stop()-race close: when `stopped` is set (a stop() won the proc lock
+    // first), install_child must NOT install the new worker — it reaps it and returns false
+    // so attempt_restart gives up instead of resurrecting a worker after stop. When not
+    // stopped, it installs and returns true.
+    #[tokio::test]
+    async fn install_child_aborts_and_reaps_when_stopped() {
+        let (sup, _tw, _tr) = make_supervisor();
+
+        // Not stopped → installs the new child and returns true.
+        let installed = install_child(&sup.inner, Some(dummy_child())).await;
+        assert!(installed, "installs when not stopped");
+        assert!(
+            sup.inner.proc.lock().await.is_some(),
+            "new child stored on install"
+        );
+
+        // Now simulate a concurrent stop() having flipped `stopped` and reaped: clear proc,
+        // set stopped. A subsequent restart's install_child must abandon + reap the child it
+        // just spawned (return false), leaving proc empty — no resurrection.
+        *sup.inner.proc.lock().await = None;
+        sup.inner.stopped.store(true, Ordering::Release);
+        let installed = install_child(&sup.inner, Some(dummy_child())).await;
+        assert!(!installed, "aborts when stopped");
+        assert!(
+            sup.inner.proc.lock().await.is_none(),
+            "aborted restart installs no worker after stop"
+        );
     }
 }
