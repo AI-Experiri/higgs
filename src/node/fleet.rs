@@ -37,7 +37,7 @@
 //! transport handle is compared by `Arc` identity so a stale failure can't drop a freshly
 //! reconnected transport.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use iroh::endpoint::Connection;
@@ -276,40 +276,15 @@ impl FleetActor {
     /// instances (not just connected ones) so a disconnect never renumbers the survivors;
     /// pure, no persistence.
     ///
-    /// Collision-free and deterministic: instances are assigned in sorted `(model, node,
-    /// worker)` order against a global taken-set, and a candidate served id that is already
-    /// taken (e.g. a model literally named `org/model-1` clashing with the suffix of a second
-    /// `org/model` instance) bumps to the next free suffix. So EVERY live instance always gets
-    /// a unique, reachable served id — no instance is ever left unaddressable (un-unloadable).
+    /// Collision-free and deterministic — see [`crate::node::served::served_ids`], the shared
+    /// algorithm reused by the local engine (P4b).
     fn served_ids(&self) -> HashMap<String, (NodeKey, WorkerId)> {
-        // Sort by (model, node, worker) so the mapping is a stable function of the live set.
-        let mut entries: Vec<(&str, &NodeKey, WorkerId)> = self
+        let instances: Vec<(NodeKey, WorkerId, String)> = self
             .routes
             .iter()
-            .map(|((node, worker), model)| (model.as_str(), node, *worker))
+            .map(|((node, worker), model)| (node.clone(), *worker, model.clone()))
             .collect();
-        entries.sort_unstable();
-
-        let mut taken: HashSet<String> = HashSet::new();
-        let mut next_suffix: HashMap<&str, usize> = HashMap::new();
-        let mut out = HashMap::new();
-        for (model, node, worker) in entries {
-            let i = next_suffix.entry(model).or_insert(0);
-            // Find the first free served id at or past this model's running suffix.
-            let served = loop {
-                let candidate = if *i == 0 {
-                    model.to_string()
-                } else {
-                    format!("{model}-{i}")
-                };
-                *i += 1;
-                if taken.insert(candidate.clone()) {
-                    break candidate;
-                }
-            };
-            out.insert(served, (node.clone(), worker));
-        }
-        out
+        crate::node::served::served_ids(&instances)
     }
 
     /// Explicitly retire a node: a FULL removal (operator action). Drops its transport,

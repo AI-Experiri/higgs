@@ -13,6 +13,7 @@ pub mod hub;
 pub mod identity;
 pub mod node_id;
 pub mod runtime;
+pub mod served;
 pub mod transport;
 pub mod worker_id;
 
