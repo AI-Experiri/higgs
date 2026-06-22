@@ -954,7 +954,7 @@ impl Higgs {
         // held across the `.await` (an `if let` scrutinee temporary would make this !Send).
         let fleet = self.fleet.lock().clone();
         if let Some(fleet) = fleet {
-            if fleet.is_remote(&model) {
+            if fleet.is_remote(&model).await {
                 // Bound concurrent REMOTE chats — the node-side relay has no semaphore, so
                 // without this a client could open unbounded hub/node generations + streams.
                 // Separate from `inference_gate` so it never blocks the reaper's

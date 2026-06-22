@@ -2,8 +2,25 @@
 //! the hub uses to send `/v1` chat to a remote-resident worker (DESIGN-remote.md §4.2/§4.3,
 //! P3 hub seam).
 //!
-//! Routing is built from the hub's OWN remote loads. Two correlation domains stay separate:
-//! this fleet's `NodeTransport`s never touch the hub's local `Supervisor`.
+//! **Actor** (P3 of `docs/superpowers/specs/2026-06-22-actor-runtime-design.md`). The fleet
+//! read-model (nodes / routes / node-ids / inventories / per-node generations /
+//! owed-unloads) is **private actor state behind one mailbox — no mutexes**. This dissolves
+//! the old 7-mutex TOCTOU class: every state transition is now a single message handled in
+//! isolation, so two ops can never observe or commit a half-updated table, and the
+//! cross-map snapshot (`nodes_view`) is atomic.
+//!
+//! Per `CLAUDE.md`, a handler does only fast synchronous state work; the slow iroh RPCs
+//! (`M_NODE_SCAN`/`_INVENTORY`/`_LOAD`/`_UNLOAD`/`_KILL`, chat setup) run in the async
+//! wrapper methods — NOT inside a handler — so a slow load can never head-of-line-block a
+//! retire. The wrapper threads each op as: fast state read → slow RPC (off the actor) →
+//! fast atomic commit message. Compound transitions (route insert↦displaced, inventory
+//! generation-CAS, transport replace+bump, route-drop+log-evict+bump, full retire) are each
+//! one message, so they apply all-or-nothing.
+//!
+//! Generation tokens, not locks: each node carries an `epoch` bumped on every
+//! load/unload/kill/route-drop/(re)admission; a `refresh_inventory` commits its (possibly
+//! stale) result only if the epoch is unchanged since it started. The map is private actor
+//! state, so the check+store is a single message — no lock.
 //!
 //! Durable routes, transient transports: the `--node` daemon reuses ONE `NodeRuntime`
 //! across reconnects, so its workers (and ids) persist through a dropped connection. Routes
@@ -13,15 +30,15 @@
 //! transport handle is compared by `Arc` identity so a stale failure can't drop a freshly
 //! reconnected transport.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use iroh::endpoint::Connection;
-use parking_lot::Mutex;
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
+use crate::actor::{spawn_actor, Actor, Handle};
 use crate::diagnostic::HiggsError;
 use crate::log_bus::{LogBus, LogSource};
 use crate::node::node_id::{NodeId, NodeIdAllocator};
@@ -64,56 +81,425 @@ pub struct NodeView {
 }
 }
 
-/// The hub's view of its remote fleet.
-pub struct HubFleet {
+/// The actor's typed mailbox. Reads carry a `reply` the wrapper awaits; writes are atomic
+/// state transitions (some also reply so the wrapper can sequence the next slow RPC).
+enum FleetMsg {
+    // --- fast reads ---
+    NodeId {
+        node: NodeKey,
+        reply: oneshot::Sender<Option<NodeId>>,
+    },
+    NodesView {
+        reply: oneshot::Sender<Vec<NodeView>>,
+    },
+    NodeIds {
+        reply: oneshot::Sender<Vec<NodeKey>>,
+    },
+    Resolve {
+        model: String,
+        reply: oneshot::Sender<Option<(NodeKey, WorkerId)>>,
+    },
+    IsRemote {
+        model: String,
+        reply: oneshot::Sender<bool>,
+    },
+    RoutedModels {
+        reply: oneshot::Sender<Vec<String>>,
+    },
+    Transport {
+        node: NodeKey,
+        reply: oneshot::Sender<Result<Arc<NodeTransport>, HiggsError>>,
+    },
+    Epoch {
+        node: NodeKey,
+        reply: oneshot::Sender<u64>,
+    },
+    PendingOwed {
+        node: NodeKey,
+        reply: oneshot::Sender<Vec<WorkerId>>,
+    },
+    // --- fast atomic writes ---
+    SeedNode {
+        node: NodeKey,
+        reply: oneshot::Sender<()>,
+    },
+    AssignNodeId {
+        node: NodeKey,
+        reply: oneshot::Sender<NodeId>,
+    },
+    /// Insert/replace a node's transport AND bump its epoch (atomic readmission), returning
+    /// any prior transport for the wrapper to close.
+    InsertTransport {
+        node: NodeKey,
+        transport: Arc<NodeTransport>,
+        reply: oneshot::Sender<Option<Arc<NodeTransport>>>,
+    },
+    /// Remove a node's transport only if it's still the current one (Arc identity); closes it.
+    DropTransportIf {
+        node: NodeKey,
+        transport: Arc<NodeTransport>,
+        reply: oneshot::Sender<()>,
+    },
+    Retire {
+        node: NodeKey,
+        reply: oneshot::Sender<()>,
+    },
+    /// Insert a route, returning any displaced `(node, worker)`. Does NOT bump the epoch (the
+    /// wrapper bumps after the displaced worker is reaped, matching the original ordering).
+    InsertRoute {
+        model: String,
+        new: (NodeKey, WorkerId),
+        reply: oneshot::Sender<Option<(NodeKey, WorkerId)>>,
+    },
+    /// CAS route-drop: remove only if it still equals `expected`; on removal also reclaim the
+    /// worker's relayed-log ring and bump the node's epoch — all atomic.
+    RemoveRouteIf {
+        model: String,
+        expected: (NodeKey, WorkerId),
+        reply: oneshot::Sender<()>,
+    },
+    /// Commit a fetched inventory only if the node's epoch is unchanged since the fetch began.
+    /// Boxed — `NodeInventory` is large and would bloat every `FleetMsg` otherwise.
+    CommitInventory {
+        node: NodeKey,
+        epoch_before: u64,
+        inventory: Box<NodeInventory>,
+        reply: oneshot::Sender<()>,
+    },
+    BumpEpoch {
+        node: NodeKey,
+        reply: oneshot::Sender<()>,
+    },
+    EvictRemoteLogs {
+        node: NodeKey,
+        worker: WorkerId,
+        reply: oneshot::Sender<()>,
+    },
+    PendingInsert {
+        route: (NodeKey, WorkerId),
+        reply: oneshot::Sender<()>,
+    },
+    PendingRemove {
+        route: (NodeKey, WorkerId),
+        reply: oneshot::Sender<()>,
+    },
+    #[cfg(test)]
+    PendingHas {
+        route: (NodeKey, WorkerId),
+        reply: oneshot::Sender<bool>,
+    },
+}
+
+/// Private actor state: the hub's whole fleet read-model + routing table, owned by one task.
+struct FleetActor {
     /// Currently-connected nodes → their live transport (absent while disconnected).
-    nodes: Mutex<HashMap<NodeKey, Arc<NodeTransport>>>,
+    nodes: HashMap<NodeKey, Arc<NodeTransport>>,
     /// Durable routes: `model → (node, worker)`, survive reconnect.
-    routes: Mutex<HashMap<String, (NodeKey, WorkerId)>>,
+    routes: HashMap<String, (NodeKey, WorkerId)>,
     /// Stable hub-local [`NodeId`] per `EndpointId`, for `LogSource::RemoteWorker` tagging.
-    node_ids: Mutex<NodeIdAllocator>,
-    /// Last-fetched inventory per node (host + workers + hw/rt), refreshed on connect and
-    /// after every hub-driven lifecycle change. The node's reply is authoritative.
-    inventories: Mutex<HashMap<NodeKey, NodeInventory>>,
+    node_ids: NodeIdAllocator,
+    /// Last-fetched inventory per node (host + workers + hw/rt). The node's reply is
+    /// authoritative; refreshed on connect and after every hub-driven lifecycle change.
+    inventories: HashMap<NodeKey, NodeInventory>,
     /// Per-node lifecycle generation, bumped on every load/unload/kill/route-drop. A
-    /// `refresh_inventory` only commits its (possibly in-flight, now stale) result if this is
-    /// unchanged since it started — so a slow connect-time fetch can't clobber a newer state.
-    epochs: Mutex<HashMap<NodeKey, u64>>,
+    /// `refresh_inventory` only commits its (possibly stale) result if this is unchanged
+    /// since it started — so a slow connect-time fetch can't clobber a newer state.
+    epochs: HashMap<NodeKey, u64>,
+    /// Unloads the hub OWES a node but couldn't deliver because the node was disconnected.
+    /// Drained on the node's next reconnect (`reconcile_pending_unloads`) so a displaced
+    /// worker is reaped instead of leaking RAM/VRAM forever.
+    pending_unloads: HashSet<(NodeKey, WorkerId)>,
     /// The hub's Developer-Log bus: relayed remote worker stderr lands here under
     /// `LogSource::RemoteWorker { node, worker }` so it shares the operator's log console.
     bus: Arc<LogBus>,
-    /// Unloads the hub OWES a node but couldn't deliver because the node was disconnected
-    /// (e.g. a cross-node reload displaced a worker on a node that was offline). Drained on
-    /// the node's next reconnect (`reconcile_pending_unloads`) so the displaced worker is
-    /// reaped instead of leaking RAM/VRAM forever. Distinct from the hub-restart case (no
-    /// pending entries → node-reported workers are preserved, not killed).
-    pending_unloads: Mutex<std::collections::HashSet<(NodeKey, WorkerId)>>,
+}
+
+impl FleetActor {
+    /// This node's current lifecycle generation (0 if never touched).
+    fn epoch(&self, node: &str) -> u64 {
+        self.epochs.get(node).copied().unwrap_or(0)
+    }
+
+    /// Bump a node's lifecycle generation so any in-flight `refresh_inventory` for it is
+    /// invalidated and won't commit a pre-change snapshot.
+    fn bump_epoch(&mut self, node: &str) {
+        *self.epochs.entry(node.to_string()).or_insert(0) += 1;
+    }
+
+    /// Reclaim a remote worker's relayed-log ring, if the node has a known [`NodeId`].
+    fn evict_remote_logs(&self, node: &str, worker: WorkerId) {
+        if let Some(nid) = self.node_ids.get(node) {
+            self.bus.evict_remote(nid, worker);
+        }
+    }
+
+    /// On connection close, remove ONLY the transport — and only if it's still the current
+    /// one (Arc identity), so a reconnect's fresh transport isn't dropped by a stale watcher.
+    fn drop_transport_if(&mut self, node: &str, transport: &Arc<NodeTransport>) {
+        let removed = if self
+            .nodes
+            .get(node)
+            .is_some_and(|cur| Arc::ptr_eq(cur, transport))
+        {
+            self.nodes.remove(node)
+        } else {
+            None
+        };
+        if let Some(t) = removed {
+            tracing::warn!(
+                node,
+                "higgs: node connection dropped; transport removed (routes kept)"
+            );
+            // Close so a wedged-but-open connection's close-watcher wakes and releases its
+            // Arc (otherwise it would wait on `closed()` forever).
+            t.close();
+        }
+    }
+
+    /// CAS route-drop (see [`FleetMsg::RemoveRouteIf`]).
+    fn remove_route_if(&mut self, model: &str, expected: &(NodeKey, WorkerId)) {
+        let removed = if self.routes.get(model) == Some(expected) {
+            self.routes.remove(model).is_some()
+        } else {
+            false
+        };
+        if removed {
+            let (node, worker) = expected;
+            self.evict_remote_logs(node, *worker);
+            // Invalidate any in-flight inventory fetch; the caller refreshes after.
+            self.bump_epoch(node);
+        }
+    }
+
+    /// Explicitly retire a node: a FULL removal (operator action). Drops its transport,
+    /// routes, cached inventory, relayed-log rings, owed unloads, AND its durable `NodeId`
+    /// slot — all atomically, so the node disappears from the fleet view entirely.
+    fn retire(&mut self, node: &str) {
+        if let Some(t) = self.nodes.remove(node) {
+            t.close();
+        }
+        // Reclaim ALL of this node's relayed-log rings — including any worker displaced by a
+        // reload that's no longer on a current route (a per-route walk would miss those).
+        if let Some(nid) = self.node_ids.get(node) {
+            self.bus.evict_node(nid);
+        }
+        self.routes.retain(|_, (n, _)| n != node);
+        // Bump so a refresh already in flight can't reinsert stale inventory after this.
+        self.bump_epoch(node);
+        self.inventories.remove(node);
+        // The node is gone for good — drop any unloads we were owing it.
+        self.pending_unloads.retain(|(n, _)| n != node);
+        // Forget the durable id slot so the node leaves the fleet view (not left disconnected).
+        self.node_ids.remove(node);
+    }
+
+    /// The fleet view, taken as ONE atomic snapshot across node-ids / nodes / inventories.
+    fn nodes_view(&self) -> Vec<NodeView> {
+        self.node_ids
+            .all()
+            .into_iter()
+            .map(|(endpoint_id, node_id)| NodeView {
+                node_id: node_id.0,
+                connected: self.nodes.contains_key(&endpoint_id),
+                inventory: self.inventories.get(&endpoint_id).cloned(),
+                endpoint_id,
+            })
+            .collect()
+    }
+
+    /// Remote-resident model ids whose node is CURRENTLY connected (servable now), sorted.
+    fn routed_models(&self) -> Vec<String> {
+        let mut v: Vec<_> = self
+            .routes
+            .iter()
+            .filter(|(_, (node, _))| self.nodes.contains_key(node))
+            .map(|(model, _)| model.clone())
+            .collect();
+        v.sort();
+        v
+    }
+}
+
+impl Actor for FleetActor {
+    type Msg = FleetMsg;
+
+    async fn handle(&mut self, msg: FleetMsg) {
+        match msg {
+            FleetMsg::NodeId { node, reply } => {
+                let _ = reply.send(self.node_ids.get(&node));
+            }
+            FleetMsg::NodesView { reply } => {
+                let _ = reply.send(self.nodes_view());
+            }
+            FleetMsg::NodeIds { reply } => {
+                let mut v: Vec<_> = self.nodes.keys().cloned().collect();
+                v.sort();
+                let _ = reply.send(v);
+            }
+            FleetMsg::Resolve { model, reply } => {
+                let _ = reply.send(self.routes.get(&model).cloned());
+            }
+            FleetMsg::IsRemote { model, reply } => {
+                let _ = reply.send(self.routes.contains_key(&model));
+            }
+            FleetMsg::RoutedModels { reply } => {
+                let _ = reply.send(self.routed_models());
+            }
+            FleetMsg::Transport { node, reply } => {
+                let _ = reply.send(self.nodes.get(&node).cloned().ok_or_else(|| {
+                    HiggsError::NodeUnreachable {
+                        endpoint_id: node.clone(),
+                        detail: "node not connected".into(),
+                    }
+                }));
+            }
+            FleetMsg::Epoch { node, reply } => {
+                let _ = reply.send(self.epoch(&node));
+            }
+            FleetMsg::PendingOwed { node, reply } => {
+                let owed = self
+                    .pending_unloads
+                    .iter()
+                    .filter(|(n, _)| *n == node)
+                    .map(|(_, w)| *w)
+                    .collect();
+                let _ = reply.send(owed);
+            }
+            FleetMsg::SeedNode { node, reply } => {
+                self.node_ids.assign(&node);
+                let _ = reply.send(());
+            }
+            FleetMsg::AssignNodeId { node, reply } => {
+                let _ = reply.send(self.node_ids.assign(&node));
+            }
+            FleetMsg::InsertTransport {
+                node,
+                transport,
+                reply,
+            } => {
+                let replaced = self.nodes.insert(node.clone(), transport);
+                // Bump on (re)admission so an inventory fetch from a PRIOR connection still in
+                // flight can't commit its now-stale result over this fresh one.
+                self.bump_epoch(&node);
+                let _ = reply.send(replaced);
+            }
+            FleetMsg::DropTransportIf {
+                node,
+                transport,
+                reply,
+            } => {
+                self.drop_transport_if(&node, &transport);
+                let _ = reply.send(());
+            }
+            FleetMsg::Retire { node, reply } => {
+                self.retire(&node);
+                let _ = reply.send(());
+            }
+            FleetMsg::InsertRoute { model, new, reply } => {
+                let _ = reply.send(self.routes.insert(model, new));
+            }
+            FleetMsg::RemoveRouteIf {
+                model,
+                expected,
+                reply,
+            } => {
+                self.remove_route_if(&model, &expected);
+                let _ = reply.send(());
+            }
+            FleetMsg::CommitInventory {
+                node,
+                epoch_before,
+                inventory,
+                reply,
+            } => {
+                if self.epoch(&node) == epoch_before {
+                    self.inventories.insert(node, *inventory);
+                }
+                let _ = reply.send(());
+            }
+            FleetMsg::BumpEpoch { node, reply } => {
+                self.bump_epoch(&node);
+                let _ = reply.send(());
+            }
+            FleetMsg::EvictRemoteLogs {
+                node,
+                worker,
+                reply,
+            } => {
+                self.evict_remote_logs(&node, worker);
+                let _ = reply.send(());
+            }
+            FleetMsg::PendingInsert { route, reply } => {
+                self.pending_unloads.insert(route);
+                let _ = reply.send(());
+            }
+            FleetMsg::PendingRemove { route, reply } => {
+                self.pending_unloads.remove(&route);
+                let _ = reply.send(());
+            }
+            #[cfg(test)]
+            FleetMsg::PendingHas { route, reply } => {
+                let _ = reply.send(self.pending_unloads.contains(&route));
+            }
+        }
+    }
+}
+
+/// The hub's view of its remote fleet: a thin handle over the actor's mailbox. Cloning the
+/// underlying `Handle` keeps the actor alive; dropping the last one ends the loop.
+pub struct HubFleet {
+    handle: Handle<FleetMsg>,
+    /// Immutable, set at construction — kept on the wrapper so `bus()` needs no round-trip.
+    bus: Arc<LogBus>,
 }
 
 impl HubFleet {
     /// Build a fleet that files relayed remote logs into `bus` (the hub's own `LogBus`, the
     /// one its serve layer reads — so remote worker output appears in the same console).
+    /// Spawns the actor task — must be called from within a Tokio runtime.
     pub fn new(bus: Arc<LogBus>) -> Self {
-        Self {
-            nodes: Mutex::new(HashMap::new()),
-            routes: Mutex::new(HashMap::new()),
-            node_ids: Mutex::new(NodeIdAllocator::new()),
-            inventories: Mutex::new(HashMap::new()),
-            epochs: Mutex::new(HashMap::new()),
-            bus,
-            pending_unloads: Mutex::new(std::collections::HashSet::new()),
-        }
+        let bus_for_actor = bus.clone();
+        let handle = spawn_actor(FleetActor {
+            nodes: HashMap::new(),
+            routes: HashMap::new(),
+            node_ids: NodeIdAllocator::new(),
+            inventories: HashMap::new(),
+            epochs: HashMap::new(),
+            pending_unloads: HashSet::new(),
+            bus: bus_for_actor,
+        });
+        Self { handle, bus }
+    }
+
+    /// Send a message carrying a `reply` and await it; `None` if the actor mailbox is gone
+    /// (only possible after every handle drops — never while a caller holds `&self`).
+    async fn ask<T: Send + 'static>(
+        &self,
+        make: impl FnOnce(oneshot::Sender<T>) -> FleetMsg,
+    ) -> Option<T> {
+        let (tx, rx) = oneshot::channel();
+        self.handle.send(make(tx)).ok()?;
+        rx.await.ok()
     }
 
     /// The stable hub-local [`NodeId`] for a node key, if it has ever been admitted.
-    pub fn node_id(&self, node: &str) -> Option<NodeId> {
-        self.node_ids.lock().get(node)
+    pub async fn node_id(&self, node: &str) -> Option<NodeId> {
+        self.ask(|reply| FleetMsg::NodeId {
+            node: node.to_string(),
+            reply,
+        })
+        .await
+        .flatten()
     }
 
     /// Pre-register a known (e.g. persisted-allowlisted) node so it appears in the fleet view
     /// as DISCONNECTED before it reconnects — assigns its stable `NodeId` without a transport.
-    pub fn seed_node(&self, node: &str) {
-        self.node_ids.lock().assign(node);
+    pub async fn seed_node(&self, node: &str) {
+        self.ask(|reply| FleetMsg::SeedNode {
+            node: node.to_string(),
+            reply,
+        })
+        .await;
     }
 
     /// The hub Developer-Log bus this fleet relays remote worker stderr into.
@@ -124,9 +510,15 @@ impl HubFleet {
     /// Register/replace a paired node's transport (after the hub admits its HELLO). Routes
     /// are KEPT across reconnect (the node's workers persist). Closes any prior transport
     /// and spawns a watcher that drops the transport (only) when its connection closes.
-    pub fn add_node(self: &Arc<Self>, node: NodeKey, transport: Arc<NodeTransport>) {
+    pub async fn add_node(self: &Arc<Self>, node: NodeKey, transport: Arc<NodeTransport>) {
         // Mint (or reuse) this node's stable NodeId so relayed logs tag consistently.
-        let node_id = self.node_ids.lock().assign(&node);
+        let node_id = self
+            .ask(|reply| FleetMsg::AssignNodeId {
+                node: node.clone(),
+                reply,
+            })
+            .await
+            .unwrap_or(NodeId(0));
         // Read the node's relayed worker stderr (its uni stream) into the hub bus for THIS
         // connection; ends when the connection closes (accept_uni errors).
         tokio::spawn(read_remote_logs(
@@ -135,13 +527,18 @@ impl HubFleet {
             self.bus.clone(),
         ));
 
-        let replaced = self.nodes.lock().insert(node.clone(), transport.clone());
+        // Insert the transport + bump the epoch atomically; close any prior transport.
+        let replaced = self
+            .ask(|reply| FleetMsg::InsertTransport {
+                node: node.clone(),
+                transport: transport.clone(),
+                reply,
+            })
+            .await
+            .flatten();
         if let Some(old) = replaced {
             old.close(); // free the old connection + wake its close-watcher
         }
-        // Bump the generation on (re)admission so any inventory fetch from a PRIOR connection
-        // still in flight can't commit its now-stale result over this fresh one.
-        self.bump_epoch(&node);
         // On (re)connect: deliver any unloads owed to this node (displaced-while-offline
         // workers), THEN refresh the inventory for the fleet view. Best-effort, off the hot path.
         let inv_weak = Arc::downgrade(self);
@@ -158,195 +555,156 @@ impl HubFleet {
         tokio::spawn(async move {
             watched.closed().await;
             if let Some(fleet) = weak.upgrade() {
-                fleet.drop_transport_if(&node, &watched);
+                fleet.drop_transport_if(&node, &watched).await;
             }
         });
     }
 
     /// Fetch `node`'s on-disk model catalog over its live transport (`M_NODE_SCAN`). The
-    /// node's reply (`{ "models": [HiggsModel, …] }`) is the authoritative scan of its own
-    /// disk and is returned verbatim — read-only, no caching, no routes touched. HG027 when
-    /// the node isn't currently connected. Powers the remote Load picker + the fleet's
-    /// not-loaded model list.
-    pub async fn scan_node(&self, node: &str) -> Result<serde_json::Value, HiggsError> {
-        let transport = self.transport(node)?;
-        transport
-            .request(M_NODE_SCAN, json!({}))
-            .await
-            .map_err(|e| self.handle_op_error(node, &transport, e))
+    /// node's reply is the authoritative scan of its own disk and is returned verbatim —
+    /// read-only, no caching, no routes touched. HG027 when the node isn't connected.
+    pub async fn scan_node(&self, node: &str) -> Result<Value, HiggsError> {
+        let transport = self.transport(node).await?;
+        match transport.request(M_NODE_SCAN, json!({})).await {
+            Ok(v) => Ok(v),
+            Err(e) => Err(self.handle_op_error(node, &transport, e).await),
+        }
     }
 
     /// Fetch `node`'s inventory over its live transport and cache it for the fleet view. The
-    /// node's `M_NODE_INVENTORY` reply is AUTHORITATIVE (its real resident workers) and stored
-    /// verbatim — except a result is dropped if a lifecycle op changed this node's generation
-    /// while the request was in flight (a newer op's own refresh wins), so a slow connect-time
-    /// fetch can never resurrect a stale worker list.
+    /// node's reply is AUTHORITATIVE and stored verbatim — except a result is dropped if a
+    /// lifecycle op changed this node's generation while the request was in flight, so a slow
+    /// connect-time fetch can never resurrect a stale worker list.
     pub async fn refresh_inventory(&self, node: &str) -> Result<NodeInventory, HiggsError> {
-        let epoch_before = self.epoch(node);
-        let transport = self.transport(node)?;
-        let value = transport
-            .request(M_NODE_INVENTORY, json!({}))
-            .await
-            .map_err(|e| self.handle_op_error(node, &transport, e))?;
+        let epoch_before = self.epoch(node).await;
+        let transport = self.transport(node).await?;
+        let value = match transport.request(M_NODE_INVENTORY, json!({})).await {
+            Ok(v) => v,
+            Err(e) => return Err(self.handle_op_error(node, &transport, e).await),
+        };
         let inventory: NodeInventory =
             serde_json::from_value(value).map_err(|e| HiggsError::WorkerDead {
                 context: format!("node inventory decode failed: {e}"),
             })?;
-        // Commit only if no lifecycle op superseded us (epochs locked across the check+store).
-        let mut epochs = self.epochs.lock();
-        if *epochs.entry(node.to_string()).or_insert(0) == epoch_before {
-            self.inventories
-                .lock()
-                .insert(node.to_string(), inventory.clone());
-        }
+        // Commit only if no lifecycle op superseded us (the check+store is one message).
+        self.ask(|reply| FleetMsg::CommitInventory {
+            node: node.to_string(),
+            epoch_before,
+            inventory: Box::new(inventory.clone()),
+            reply,
+        })
+        .await;
         Ok(inventory)
     }
 
     /// This node's current lifecycle generation (0 if never touched).
-    fn epoch(&self, node: &str) -> u64 {
-        self.epochs.lock().get(node).copied().unwrap_or(0)
+    async fn epoch(&self, node: &str) -> u64 {
+        self.ask(|reply| FleetMsg::Epoch {
+            node: node.to_string(),
+            reply,
+        })
+        .await
+        .unwrap_or(0)
     }
 
     /// Bump a node's lifecycle generation — call AFTER mutating its routes so any in-flight
     /// `refresh_inventory` for it is invalidated and won't commit a pre-change snapshot.
-    fn bump_epoch(&self, node: &str) {
-        *self.epochs.lock().entry(node.to_string()).or_insert(0) += 1;
+    async fn bump_epoch(&self, node: &str) {
+        self.ask(|reply| FleetMsg::BumpEpoch {
+            node: node.to_string(),
+            reply,
+        })
+        .await;
     }
 
-    /// The fleet view: one [`NodeView`] per node the hub has ever admitted, with live
-    /// connected state + last-fetched inventory. Sorted by `NodeId` (stable order).
-    pub fn nodes_view(&self) -> Vec<NodeView> {
-        let assigned = self.node_ids.lock().all();
-        let nodes = self.nodes.lock();
-        let inventories = self.inventories.lock();
-        assigned
-            .into_iter()
-            .map(|(endpoint_id, node_id)| NodeView {
-                node_id: node_id.0,
-                connected: nodes.contains_key(&endpoint_id),
-                inventory: inventories.get(&endpoint_id).cloned(),
-                endpoint_id,
-            })
-            .collect()
+    /// The fleet view: one [`NodeView`] per node the hub has ever admitted, taken as one
+    /// atomic snapshot. Sorted by `NodeId` (stable order).
+    pub async fn nodes_view(&self) -> Vec<NodeView> {
+        self.ask(|reply| FleetMsg::NodesView { reply })
+            .await
+            .unwrap_or_default()
     }
 
-    /// On connection close, remove ONLY the transport — and only if it's still the current
-    /// one (Arc identity), so a reconnect's fresh transport isn't dropped by a stale
-    /// watcher. Routes are kept (durable across reconnect); ops return HG027 until the node
-    /// reconnects.
-    fn drop_transport_if(&self, node: &str, transport: &Arc<NodeTransport>) {
-        let removed = {
-            let mut nodes = self.nodes.lock();
-            if nodes
-                .get(node)
-                .is_some_and(|cur| Arc::ptr_eq(cur, transport))
-            {
-                nodes.remove(node)
-            } else {
-                None
-            }
-        };
-        if let Some(t) = removed {
-            tracing::warn!(
-                node,
-                "higgs: node connection dropped; transport removed (routes kept)"
-            );
-            // Close so a wedged-but-open connection's close-watcher wakes and releases its
-            // Arc (otherwise it would wait on `closed()` forever).
-            t.close();
-        }
+    /// On connection close, remove ONLY the transport (Arc-identity guarded). Routes are kept
+    /// (durable across reconnect); ops return HG027 until the node reconnects.
+    async fn drop_transport_if(&self, node: &str, transport: &Arc<NodeTransport>) {
+        self.ask(|reply| FleetMsg::DropTransportIf {
+            node: node.to_string(),
+            transport: transport.clone(),
+            reply,
+        })
+        .await;
     }
 
     /// Explicitly retire a node: a FULL removal (operator action — the machine is being taken
     /// out of the fleet). Drops its transport, routes, cached inventory, relayed-log rings,
-    /// owed unloads, AND its durable `NodeId` slot — so it disappears from the fleet view
-    /// entirely (not left as a disconnected entry). Ids stay monotonic (never reused), so a
-    /// re-added machine gets a fresh id. Pairs with the hub removing it from the allowlist.
-    pub fn retire(&self, node: &str) {
-        if let Some(t) = self.nodes.lock().remove(node) {
-            t.close();
-        }
-        // Reclaim ALL of this node's relayed-log rings — including any worker displaced by a
-        // reload that's no longer on a current route (a per-route walk would miss those).
-        if let Some(nid) = self.node_id(node) {
-            self.bus.evict_node(nid);
-        }
-        self.routes.lock().retain(|_, (n, _)| n != node);
-        // Bump the generation so a refresh already in flight can't reinsert stale inventory
-        // after this removal.
-        self.bump_epoch(node);
-        self.inventories.lock().remove(node);
-        // The node is gone for good — drop any unloads we were owing it.
-        self.pending_unloads.lock().retain(|(n, _)| n != node);
-        // Forget the durable id slot so the node leaves the fleet view (not left disconnected).
-        self.node_ids.lock().remove(node);
+    /// owed unloads, AND its durable `NodeId` slot. Pairs with the hub removing it from the
+    /// allowlist.
+    pub async fn retire(&self, node: &str) {
+        self.ask(|reply| FleetMsg::Retire {
+            node: node.to_string(),
+            reply,
+        })
+        .await;
     }
 
-    pub fn node_ids(&self) -> Vec<NodeKey> {
-        let mut v: Vec<_> = self.nodes.lock().keys().cloned().collect();
-        v.sort();
-        v
+    /// Currently-connected node keys, ascending.
+    pub async fn node_ids(&self) -> Vec<NodeKey> {
+        self.ask(|reply| FleetMsg::NodeIds { reply })
+            .await
+            .unwrap_or_default()
     }
 
     /// The live transport for a node, or HG027 if it isn't currently connected.
-    fn transport(&self, node: &str) -> Result<Arc<NodeTransport>, HiggsError> {
-        self.nodes
-            .lock()
-            .get(node)
-            .cloned()
-            .ok_or_else(|| HiggsError::NodeUnreachable {
-                endpoint_id: node.to_string(),
-                detail: "node not connected".into(),
-            })
+    async fn transport(&self, node: &str) -> Result<Arc<NodeTransport>, HiggsError> {
+        self.ask(|reply| FleetMsg::Transport {
+            node: node.to_string(),
+            reply,
+        })
+        .await
+        .unwrap_or_else(|| Err(Self::actor_gone()))
     }
 
     /// Reclaim a remote worker's relayed-log ring, if the node has a known [`NodeId`].
-    /// Shared by every route-drop / unload path so the hub bus never keeps a gone worker's
-    /// lines.
-    fn evict_remote_logs(&self, node: &str, worker: WorkerId) {
-        if let Some(nid) = self.node_id(node) {
-            self.bus.evict_remote(nid, worker);
-        }
+    async fn evict_remote_logs(&self, node: &str, worker: WorkerId) {
+        self.ask(|reply| FleetMsg::EvictRemoteLogs {
+            node: node.to_string(),
+            worker,
+            reply,
+        })
+        .await;
     }
 
-    /// Resolve `model` to its `(node, worker)` route or fail with HG002 — the precondition
-    /// shared by chat/unload/kill.
-    fn require_route(&self, model: &str) -> Result<(NodeKey, WorkerId), HiggsError> {
+    /// Resolve `model` to its `(node, worker)` route or fail with HG002.
+    async fn require_route(&self, model: &str) -> Result<(NodeKey, WorkerId), HiggsError> {
         self.resolve(model)
+            .await
             .ok_or_else(|| HiggsError::ModelNotFound {
                 id: model.to_string(),
             })
     }
 
-    /// Remove a route only if it STILL equals `expected` — so a route from a concurrent op
-    /// (which awaits a remote RPC) is never clobbered. When the route is actually removed,
-    /// also reclaim the worker's relayed-log ring and drop it from the cached fleet view, so
-    /// EVERY route-drop path (explicit unload/kill AND a chat-time worker-gone) keeps the
-    /// node's logs + `/api/higgs/nodes` consistent.
-    fn remove_route_if(&self, model: &str, expected: &(NodeKey, WorkerId)) {
-        let removed = {
-            let mut routes = self.routes.lock();
-            if routes.get(model) == Some(expected) {
-                routes.remove(model).is_some()
-            } else {
-                false
-            }
-        };
-        if removed {
-            let (node, worker) = expected;
-            self.evict_remote_logs(node, *worker);
-            // Invalidate any in-flight inventory fetch; the caller refreshes after.
-            self.bump_epoch(node);
-        }
+    /// CAS route-drop: remove a route only if it STILL equals `expected`; on removal also
+    /// reclaim the worker's relayed-log ring and bump the node's generation (all atomic).
+    async fn remove_route_if(&self, model: &str, expected: &(NodeKey, WorkerId)) {
+        self.ask(|reply| FleetMsg::RemoveRouteIf {
+            model: model.to_string(),
+            expected: expected.clone(),
+            reply,
+        })
+        .await;
     }
 
-    /// On a transport-level failure (`WorkerDead` = the connection is gone), drop the dead
-    /// transport — but only if `used` is still the current one (Arc identity), so a stale
-    /// failure can't drop a freshly reconnected transport — and remap to HG027. Routes are
-    /// kept (the node may reconnect with its workers intact). Other errors pass through.
-    fn handle_op_error(&self, node: &str, used: &Arc<NodeTransport>, e: HiggsError) -> HiggsError {
+    /// On a transport-level failure (`WorkerDead`), drop the dead transport (Arc-identity
+    /// guarded) and remap to HG027. Routes are kept. Other errors pass through.
+    async fn handle_op_error(
+        &self,
+        node: &str,
+        used: &Arc<NodeTransport>,
+        e: HiggsError,
+    ) -> HiggsError {
         if matches!(e, HiggsError::WorkerDead { .. }) {
-            self.drop_transport_if(node, used);
+            self.drop_transport_if(node, used).await;
             return HiggsError::NodeUnreachable {
                 endpoint_id: node.to_string(),
                 detail: e.to_string(),
@@ -358,59 +716,75 @@ impl HubFleet {
     /// Load `model` on `node` and record the route. A displaced worker (reload, or a
     /// concurrent load that lost the race) is unloaded best-effort so it's never orphaned.
     pub async fn load(&self, node: &str, model: &str) -> Result<WorkerId, HiggsError> {
-        let transport = self.transport(node)?;
-        let result = transport
-            .request(M_NODE_LOAD, json!({ "id": model }))
-            .await
-            .map_err(|e| self.handle_op_error(node, &transport, e))?;
+        let transport = self.transport(node).await?;
+        let result = match transport.request(M_NODE_LOAD, json!({ "id": model })).await {
+            Ok(v) => v,
+            Err(e) => return Err(self.handle_op_error(node, &transport, e).await),
+        };
         let new = (node.to_string(), WorkerId(parse_worker_id(&result)?));
-        let displaced = self.routes.lock().insert(model.to_string(), new.clone());
+        let displaced = self
+            .ask(|reply| FleetMsg::InsertRoute {
+                model: model.to_string(),
+                new: new.clone(),
+                reply,
+            })
+            .await
+            .flatten();
         if let Some(old) = displaced {
             if old != new {
                 // Unload the worker this load displaced. If the OLD node is currently
-                // disconnected (a cross-node reload during a blip) the unload is recorded as
-                // a pending unload and delivered when that node reconnects
-                // (`reconcile_pending_unloads`), so the displaced worker is never leaked.
+                // disconnected the unload is recorded as pending and delivered on reconnect.
                 self.best_effort_unload(&old).await;
             }
         }
         // Refresh the fleet view from the node's authoritative state after the load lands.
-        self.bump_epoch(node);
+        self.bump_epoch(node).await;
         let _ = self.refresh_inventory(node).await;
         Ok(new.1)
     }
 
     /// Best-effort unload of a displaced worker via its node's CURRENT transport, also
-    /// reclaiming its relayed-log ring so a reload doesn't leak the old worker's lines. If the
-    /// node is DISCONNECTED the unload can't be delivered, so it's recorded as pending and
-    /// reaped on the node's next reconnect — never silently leaked.
+    /// reclaiming its relayed-log ring. If the node is DISCONNECTED the unload can't be
+    /// delivered, so it's recorded as pending and reaped on the node's next reconnect.
     async fn best_effort_unload(&self, route: &(NodeKey, WorkerId)) {
-        self.evict_remote_logs(&route.0, route.1);
-        match self.transport(&route.0) {
+        self.evict_remote_logs(&route.0, route.1).await;
+        match self.transport(&route.0).await {
             Ok(t) => {
                 let res = t
                     .request(M_NODE_UNLOAD, json!({ "worker_id": route.1 .0 }))
                     .await;
                 // Clear the obligation ONLY if the unload landed (Ok) or the node reports the
-                // worker already gone (HG006/HG007). A real failure (transport hiccup mid-
-                // request) means the worker may still be running, so KEEP it pending so the
-                // next reconnect retries — otherwise the displaced worker leaks. Mirrors
-                // `reconcile_pending_unloads`.
+                // worker already gone (HG006/HG007). A real failure means the worker may still
+                // be running, so KEEP it pending so the next reconnect retries.
                 if res.is_ok() || res.as_ref().err().is_some_and(route_invalidating) {
-                    self.pending_unloads.lock().remove(route);
+                    self.pending_remove(route).await;
                 } else {
-                    self.pending_unloads.lock().insert(route.clone());
+                    self.pending_insert(route).await;
                 }
             }
             // Node offline — owe it the unload until it reconnects.
-            Err(_) => {
-                self.pending_unloads.lock().insert(route.clone());
-            }
+            Err(_) => self.pending_insert(route).await,
         }
         // Re-sync the DISPLACED node's fleet view (it may differ from the load's target node
         // on a cross-node reload, where the caller only refreshes the new node).
-        self.bump_epoch(&route.0);
+        self.bump_epoch(&route.0).await;
         let _ = self.refresh_inventory(&route.0).await;
+    }
+
+    async fn pending_insert(&self, route: &(NodeKey, WorkerId)) {
+        self.ask(|reply| FleetMsg::PendingInsert {
+            route: route.clone(),
+            reply,
+        })
+        .await;
+    }
+
+    async fn pending_remove(&self, route: &(NodeKey, WorkerId)) {
+        self.ask(|reply| FleetMsg::PendingRemove {
+            route: route.clone(),
+            reply,
+        })
+        .await;
     }
 
     /// Deliver any unloads owed to `node` (recorded while it was offline), now that it's
@@ -418,28 +792,27 @@ impl HubFleet {
     /// Only targets workers the hub explicitly tried to unload (never the node's legitimate
     /// resident workers a fresh hub simply hasn't routed yet).
     async fn reconcile_pending_unloads(&self, node: &str) {
-        let owed: Vec<WorkerId> = self
-            .pending_unloads
-            .lock()
-            .iter()
-            .filter(|(n, _)| n == node)
-            .map(|(_, w)| *w)
-            .collect();
+        let owed = self
+            .ask(|reply| FleetMsg::PendingOwed {
+                node: node.to_string(),
+                reply,
+            })
+            .await
+            .unwrap_or_default();
         if owed.is_empty() {
             return;
         }
-        let Ok(t) = self.transport(node) else { return };
+        let Ok(t) = self.transport(node).await else {
+            return;
+        };
         for w in owed {
             let res = t.request(M_NODE_UNLOAD, json!({ "worker_id": w.0 })).await;
-            // Clear on success OR when the node reports the worker already gone
-            // (HG006/HG007) — the owed unload is satisfied either way. Leaving a worker-gone
-            // entry pending would leak forever AND, after a node restart reuses the id for a
-            // DIFFERENT worker, a later reconcile could unload that legitimate worker. (Mirrors
-            // `unload_or_kill`'s clear-on-worker-gone.) A transport error keeps it for the
+            // Clear on success OR when the node reports the worker already gone (HG006/HG007)
+            // — the owed unload is satisfied either way. A transport error keeps it for the
             // next reconnect.
             if res.is_ok() || res.as_ref().err().is_some_and(route_invalidating) {
-                self.pending_unloads.lock().remove(&(node.to_string(), w));
-                self.evict_remote_logs(node, w);
+                self.pending_remove(&(node.to_string(), w)).await;
+                self.evict_remote_logs(node, w).await;
             }
         }
     }
@@ -457,45 +830,58 @@ impl HubFleet {
     /// Shared unload/kill: clear the route on success OR when the node reports the worker
     /// already gone; node-down → HG027 (transport dropped).
     async fn unload_or_kill(&self, model: &str, method: &str) -> Result<(), HiggsError> {
-        let (node, worker) = self.require_route(model)?;
-        let transport = self.transport(&node)?;
+        let (node, worker) = self.require_route(model).await?;
+        let transport = self.transport(&node).await?;
         let res = transport
             .request(method, json!({ "worker_id": worker.0 }))
             .await;
         if res.is_ok() || res.as_ref().err().is_some_and(route_invalidating) {
             // remove_route_if reclaims the log ring + bumps the node's generation.
-            self.remove_route_if(model, &(node.clone(), worker));
+            self.remove_route_if(model, &(node.clone(), worker)).await;
             // Re-sync the fleet view from the node's authoritative state.
             let _ = self.refresh_inventory(&node).await;
         }
-        res.map(|_| ())
-            .map_err(|e| self.handle_op_error(&node, &transport, e))
+        match res {
+            Ok(_) => Ok(()),
+            Err(e) => Err(self.handle_op_error(&node, &transport, e).await),
+        }
     }
 
     /// Resolve a model to its `(node, worker)`, if routed.
-    pub fn resolve(&self, model: &str) -> Option<(NodeKey, WorkerId)> {
-        self.routes.lock().get(model).cloned()
+    pub async fn resolve(&self, model: &str) -> Option<(NodeKey, WorkerId)> {
+        self.ask(|reply| FleetMsg::Resolve {
+            model: model.to_string(),
+            reply,
+        })
+        .await
+        .flatten()
     }
 
     /// Is this model resident on some remote node?
-    pub fn is_remote(&self, model: &str) -> bool {
-        self.routes.lock().contains_key(model)
+    pub async fn is_remote(&self, model: &str) -> bool {
+        self.ask(|reply| FleetMsg::IsRemote {
+            model: model.to_string(),
+            reply,
+        })
+        .await
+        .unwrap_or(false)
     }
 
     /// Remote-resident model ids whose node is CURRENTLY connected (for `/v1/models`
-    /// discovery = servable now). A route whose node is disconnected is hidden — chat to it
-    /// would fail with HG027 until the node reconnects.
-    pub fn routed_models(&self) -> Vec<String> {
-        let nodes = self.nodes.lock();
-        let mut v: Vec<_> = self
-            .routes
-            .lock()
-            .iter()
-            .filter(|(_, (node, _))| nodes.contains_key(node))
-            .map(|(model, _)| model.clone())
-            .collect();
-        v.sort();
-        v
+    /// discovery = servable now). A route whose node is disconnected is hidden.
+    pub async fn routed_models(&self) -> Vec<String> {
+        self.ask(|reply| FleetMsg::RoutedModels { reply })
+            .await
+            .unwrap_or_default()
+    }
+
+    /// Error returned when the actor mailbox is gone (loop ended — only after all handles
+    /// drop, which can't happen while a caller holds `&self`).
+    fn actor_gone() -> HiggsError {
+        HiggsError::NodeUnreachable {
+            endpoint_id: String::new(),
+            detail: "hub fleet stopped".into(),
+        }
     }
 
     /// Relay a chat to the remote worker hosting `model`. Returns the streamed-delta
@@ -515,9 +901,9 @@ impl HubFleet {
         ),
         HiggsError,
     > {
-        let (node, worker) = self.require_route(model)?;
-        let transport = self.transport(&node)?;
-        let (rx, fut) = transport
+        let (node, worker) = self.require_route(model).await?;
+        let transport = self.transport(&node).await?;
+        let (rx, fut) = match transport
             .chat(
                 worker.0,
                 model.to_string(),
@@ -527,7 +913,10 @@ impl HubFleet {
                 tools_json,
             )
             .await
-            .map_err(|e| self.handle_op_error(&node, &transport, e))?;
+        {
+            Ok(x) => x,
+            Err(e) => return Err(self.handle_op_error(&node, &transport, e).await),
+        };
 
         let fleet = self.clone();
         let model = model.to_string();
@@ -538,17 +927,27 @@ impl HubFleet {
                 Err(e) if route_invalidating(&e) => {
                     // Worker gone (node alive) — drop the route so a retry re-resolves, and
                     // re-sync the fleet view (remove_route_if bumped the node's generation).
-                    fleet.remove_route_if(&model, &(node.clone(), worker));
+                    fleet.remove_route_if(&model, &(node.clone(), worker)).await;
                     let _ = fleet.refresh_inventory(&node).await;
                     Err(e)
                 }
                 // Transport-level / other failure surfacing mid-stream: drop the dead
-                // transport (Arc-identity guarded) and remap to HG027, same as setup-time
-                // failures. The durable route is kept (the node may reconnect).
-                Err(e) => Err(fleet.handle_op_error(&node, &used, e)),
+                // transport (Arc-identity guarded) and remap to HG027. The route is kept.
+                Err(e) => Err(fleet.handle_op_error(&node, &used, e).await),
             }
         };
         Ok((rx, wrapped))
+    }
+
+    /// Test-only: is this `(node, worker)` currently an owed unload?
+    #[cfg(test)]
+    async fn pending_has(&self, route: &(NodeKey, WorkerId)) -> bool {
+        self.ask(|reply| FleetMsg::PendingHas {
+            route: route.clone(),
+            reply,
+        })
+        .await
+        .unwrap_or(false)
     }
 }
 
@@ -626,17 +1025,19 @@ mod tests {
         std::mem::forget(hub);
 
         let fleet = Arc::new(HubFleet::new(Arc::new(crate::log_bus::LogBus::new())));
-        fleet.add_node(node_key.clone(), Arc::new(NodeTransport::new(conn)));
+        fleet
+            .add_node(node_key.clone(), Arc::new(NodeTransport::new(conn)))
+            .await;
         (fleet, node_key, model_id, root)
     }
 
     #[tokio::test]
     async fn load_routes_and_resolves() {
         let (fleet, node_key, model_id, _root) = fleet_with_one_node().await;
-        assert!(!fleet.is_remote(&model_id));
+        assert!(!fleet.is_remote(&model_id).await);
         let worker = fleet.load(&node_key, &model_id).await.unwrap();
-        assert!(fleet.is_remote(&model_id));
-        assert_eq!(fleet.resolve(&model_id), Some((node_key, worker)));
+        assert!(fleet.is_remote(&model_id).await);
+        assert_eq!(fleet.resolve(&model_id).await, Some((node_key, worker)));
     }
 
     #[tokio::test]
@@ -678,7 +1079,7 @@ mod tests {
         let w1 = fleet.load(&node_key, &model_id).await.unwrap();
         let w2 = fleet.load(&node_key, &model_id).await.unwrap();
         assert_ne!(w1, w2, "reload spawns a fresh worker (old one unloaded)");
-        assert_eq!(fleet.resolve(&model_id), Some((node_key, w2)));
+        assert_eq!(fleet.resolve(&model_id).await, Some((node_key, w2)));
     }
 
     #[tokio::test]
@@ -686,11 +1087,11 @@ mod tests {
         let (fleet, node_key, model_id, _root) = fleet_with_one_node().await;
         fleet.load(&node_key, &model_id).await.unwrap();
         fleet.unload(&model_id).await.unwrap();
-        assert!(!fleet.is_remote(&model_id), "unload drops the route");
+        assert!(!fleet.is_remote(&model_id).await, "unload drops the route");
 
         fleet.load(&node_key, &model_id).await.unwrap();
         fleet.kill(&model_id).await.unwrap();
-        assert!(!fleet.is_remote(&model_id), "kill drops the route");
+        assert!(!fleet.is_remote(&model_id).await, "kill drops the route");
     }
 
     #[tokio::test]
@@ -698,7 +1099,7 @@ mod tests {
         let (fleet, _node_key, _model_id, _root) = fleet_with_one_node().await;
         assert!(fleet.unload("nope/none").await.is_err());
         assert!(fleet.kill("nope/none").await.is_err());
-        assert!(fleet.resolve("nope/none").is_none());
+        assert!(fleet.resolve("nope/none").await.is_none());
         assert!(fleet
             .chat("nope/none", "[]".into(), 8, 0.0, None)
             .await
@@ -708,12 +1109,12 @@ mod tests {
     #[tokio::test]
     async fn routed_models_lists_connected_only() {
         let (fleet, node_key, model_id, _root) = fleet_with_one_node().await;
-        assert!(fleet.routed_models().is_empty());
+        assert!(fleet.routed_models().await.is_empty());
         fleet.load(&node_key, &model_id).await.unwrap();
-        assert_eq!(fleet.routed_models(), vec![model_id.clone()]);
+        assert_eq!(fleet.routed_models().await, vec![model_id.clone()]);
         // After retiring the node, the route is gone → not advertised.
-        fleet.retire(&node_key);
-        assert!(fleet.routed_models().is_empty());
+        fleet.retire(&node_key).await;
+        assert!(fleet.routed_models().await.is_empty());
     }
 
     #[tokio::test]
@@ -726,53 +1127,38 @@ mod tests {
             .best_effort_unload(&("offline-node".to_string(), w))
             .await;
         assert!(
-            fleet
-                .pending_unloads
-                .lock()
-                .contains(&("offline-node".to_string(), w)),
+            fleet.pending_has(&("offline-node".to_string(), w)).await,
             "unload to an offline node is recorded as pending"
         );
 
         // When a node with a pending unload reconnects, reconciliation delivers it (the
         // connected fake node answers M_NODE_UNLOAD), clearing the pending entry.
-        fleet.pending_unloads.lock().insert((node_key.clone(), w));
+        fleet.pending_insert(&(node_key.clone(), w)).await;
         fleet.reconcile_pending_unloads(&node_key).await;
         assert!(
-            !fleet
-                .pending_unloads
-                .lock()
-                .contains(&(node_key.clone(), w)),
+            !fleet.pending_has(&(node_key.clone(), w)).await,
             "reconnect drains the owed unload"
         );
 
         // A pending unload for a worker the node NO LONGER has (e.g. it restarted) must also
         // be cleared — the node replies worker-gone (HG007), which counts as reconciled.
-        // Otherwise it would leak forever and could later kill a same-id worker after restart.
         fleet
-            .pending_unloads
-            .lock()
-            .insert((node_key.clone(), WorkerId(9999)));
+            .pending_insert(&(node_key.clone(), WorkerId(9999)))
+            .await;
         fleet.reconcile_pending_unloads(&node_key).await;
         assert!(
-            !fleet
-                .pending_unloads
-                .lock()
-                .contains(&(node_key.clone(), WorkerId(9999))),
+            !fleet.pending_has(&(node_key.clone(), WorkerId(9999))).await,
             "worker-gone reply clears the owed unload (not left pending forever)"
         );
 
         // Retiring a node clears anything still owed to it.
         fleet.best_effort_unload(&("gone".to_string(), w)).await;
-        assert!(fleet
-            .pending_unloads
-            .lock()
-            .contains(&("gone".to_string(), w)));
-        fleet.retire("gone");
-        assert!(fleet
-            .pending_unloads
-            .lock()
-            .iter()
-            .all(|(n, _)| n != "gone"));
+        assert!(fleet.pending_has(&("gone".to_string(), w)).await);
+        fleet.retire("gone").await;
+        assert!(
+            !fleet.pending_has(&("gone".to_string(), w)).await,
+            "retire clears owed unloads for the node"
+        );
     }
 
     #[test]
@@ -793,11 +1179,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn seed_node_lists_a_known_node_as_disconnected() {
+    #[tokio::test]
+    async fn seed_node_lists_a_known_node_as_disconnected() {
         let fleet = Arc::new(HubFleet::new(Arc::new(crate::log_bus::LogBus::new())));
-        fleet.seed_node("endpointA");
-        let views = fleet.nodes_view();
+        fleet.seed_node("endpointA").await;
+        let views = fleet.nodes_view().await;
         assert_eq!(views.len(), 1, "seeded node appears in the view");
         assert_eq!(views[0].endpoint_id, "endpointA");
         assert!(
@@ -808,7 +1194,10 @@ mod tests {
             views[0].inventory.is_none(),
             "no inventory until it connects"
         );
-        assert!(fleet.node_id("endpointA").is_some(), "got a stable NodeId");
+        assert!(
+            fleet.node_id("endpointA").await.is_some(),
+            "got a stable NodeId"
+        );
     }
 
     #[tokio::test]
@@ -830,7 +1219,7 @@ mod tests {
 
         // A hub-driven load refreshes the cached view from the node's authoritative state.
         let w = fleet.load(&node_key, &model_id).await.unwrap();
-        let workers = fleet.nodes_view()[0]
+        let workers = fleet.nodes_view().await[0]
             .inventory
             .as_ref()
             .unwrap()
@@ -844,7 +1233,7 @@ mod tests {
         );
         // Unload refreshes it back out.
         fleet.unload(&model_id).await.unwrap();
-        let workers = fleet.nodes_view()[0]
+        let workers = fleet.nodes_view().await[0]
             .inventory
             .as_ref()
             .unwrap()
@@ -855,7 +1244,7 @@ mod tests {
             "unload removes it from the view"
         );
 
-        let views = fleet.nodes_view();
+        let views = fleet.nodes_view().await;
         assert_eq!(views.len(), 1, "one node in the fleet view");
         let v = &views[0];
         assert_eq!(v.endpoint_id, node_key);
@@ -863,9 +1252,9 @@ mod tests {
         assert!(v.inventory.is_some(), "view carries the fetched inventory");
 
         // Retire is a FULL removal — the node leaves the fleet view entirely.
-        fleet.retire(&node_key);
+        fleet.retire(&node_key).await;
         assert!(
-            fleet.nodes_view().is_empty(),
+            fleet.nodes_view().await.is_empty(),
             "retired node is removed from the view (not left disconnected)"
         );
     }
@@ -874,9 +1263,9 @@ mod tests {
     async fn retire_drops_node_and_routes() {
         let (fleet, node_key, model_id, _root) = fleet_with_one_node().await;
         fleet.load(&node_key, &model_id).await.unwrap();
-        fleet.retire(&node_key);
-        assert!(fleet.node_ids().is_empty());
-        assert!(!fleet.is_remote(&model_id));
+        fleet.retire(&node_key).await;
+        assert!(fleet.node_ids().await.is_empty());
+        assert!(!fleet.is_remote(&model_id).await);
         assert!(fleet
             .chat(&model_id, "[]".into(), 8, 0.0, None)
             .await

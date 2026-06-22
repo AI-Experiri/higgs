@@ -353,7 +353,10 @@ pub(super) async fn control_nodes(
     State(higgs): State<Arc<Higgs>>,
 ) -> Json<Vec<crate::node::fleet::NodeView>> {
     tracing::info!("higgs: GET /api/higgs/nodes");
-    let views = higgs.fleet().map(|f| f.nodes_view()).unwrap_or_default();
+    let views = match higgs.fleet() {
+        Some(f) => f.nodes_view().await,
+        None => Vec::new(),
+    };
     Json(views)
 }
 

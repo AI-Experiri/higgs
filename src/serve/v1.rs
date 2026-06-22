@@ -259,7 +259,7 @@ pub(super) async fn v1_models(State(higgs): State<Arc<Higgs>>) -> Response {
             // Also advertise remote-resident models — they are valid chat targets routed
             // through the fleet (skip any already listed by the local worker).
             if let Some(fleet) = higgs.fleet() {
-                for id in fleet.routed_models() {
+                for id in fleet.routed_models().await {
                     if !data.iter().any(|m| m.id == id) {
                         data.push(Model {
                             id,
@@ -428,7 +428,11 @@ async fn ensure_loaded(higgs: &Arc<Higgs>, model: &str) -> Result<LoadedInfo, Re
     // loaded/scan gate (which would 404 it as HG003/HG002). The remote worker enforces the
     // exact prompt-vs-context check (HG005), so we report a permissive `ctx_len` here and
     // defer prompt-fit to it.
-    if higgs.fleet().is_some_and(|f| f.is_remote(model)) {
+    let is_remote = match higgs.fleet() {
+        Some(f) => f.is_remote(model).await,
+        None => false,
+    };
+    if is_remote {
         return Ok(LoadedInfo {
             id: model.to_owned(),
             ctx_len: u32::MAX,

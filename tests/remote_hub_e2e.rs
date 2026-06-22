@@ -113,12 +113,14 @@ async fn hub_v1_chat_routes_to_remote_node() {
         matches!(outcome, GateOutcome::Admitted { .. }),
         "node admitted: {outcome:?}"
     );
-    fleet.add_node(peer.clone(), Arc::new(NodeTransport::new(conn)));
+    fleet
+        .add_node(peer.clone(), Arc::new(NodeTransport::new(conn)))
+        .await;
 
     // Load a real model on the node via the fleet → records the route.
     fleet.load(&peer, TINY_MODEL_ID).await.expect("remote load");
     assert!(
-        fleet.is_remote(TINY_MODEL_ID),
+        fleet.is_remote(TINY_MODEL_ID).await,
         "model is now remote-routable"
     );
 
@@ -155,8 +157,11 @@ async fn hub_v1_chat_routes_to_remote_node() {
     // ── Remote log relay (P4): the node forwarded its real worker's stderr over iroh, and
     // the hub filed it under LogSource::RemoteWorker keyed by (node, worker). It appears in
     // the hub's own Developer-Logs console (the shared bus), filterable per remote worker.
-    let node_id = fleet.node_id(&peer).expect("node has an assigned NodeId");
-    let worker = fleet.resolve(TINY_MODEL_ID).expect("model routed").1;
+    let node_id = fleet
+        .node_id(&peer)
+        .await
+        .expect("node has an assigned NodeId");
+    let worker = fleet.resolve(TINY_MODEL_ID).await.expect("model routed").1;
     let remote_src = LogSource::RemoteWorker {
         node: node_id,
         worker,
@@ -193,7 +198,7 @@ async fn hub_v1_chat_routes_to_remote_node() {
         "inventory lists the resident worker's model: {:?}",
         inv.workers
     );
-    let views = fleet.nodes_view();
+    let views = fleet.nodes_view().await;
     assert!(
         views
             .iter()
@@ -205,12 +210,15 @@ async fn hub_v1_chat_routes_to_remote_node() {
     // re-loaded + force-killed, then the node is retired — each transition reflected in the
     // hub's routing view, and the remote log ring reclaimed on teardown.
     assert_eq!(
-        fleet.routed_models(),
+        fleet.routed_models().await,
         vec![TINY_MODEL_ID.to_string()],
         "routed_models lists it"
     );
     fleet.unload(TINY_MODEL_ID).await.expect("remote unload");
-    assert!(!fleet.is_remote(TINY_MODEL_ID), "unload drops the route");
+    assert!(
+        !fleet.is_remote(TINY_MODEL_ID).await,
+        "unload drops the route"
+    );
     assert!(
         bus.snapshot(usize::MAX, Some(remote_src)).is_empty(),
         "unload reclaims the log ring"
@@ -231,23 +239,29 @@ async fn hub_v1_chat_routes_to_remote_node() {
         .await
         .expect("remote re-load");
     assert!(
-        fleet.is_remote(TINY_MODEL_ID),
+        fleet.is_remote(TINY_MODEL_ID).await,
         "re-loaded model is routable again"
     );
     fleet.kill(TINY_MODEL_ID).await.expect("remote kill");
-    assert!(!fleet.is_remote(TINY_MODEL_ID), "kill drops the route");
+    assert!(
+        !fleet.is_remote(TINY_MODEL_ID).await,
+        "kill drops the route"
+    );
 
     // Retire the node: its routes + transport are gone, and ops now report unreachable.
     fleet
         .load(&peer, TINY_MODEL_ID)
         .await
         .expect("load before retire");
-    fleet.retire(&peer);
+    fleet.retire(&peer).await;
     assert!(
-        fleet.node_ids().is_empty(),
+        fleet.node_ids().await.is_empty(),
         "retired node removed from the fleet"
     );
-    assert!(fleet.routed_models().is_empty(), "retire clears routes");
+    assert!(
+        fleet.routed_models().await.is_empty(),
+        "retire clears routes"
+    );
 }
 
 /// A node survives a connection blip: when the hub link drops, the `--node` daemon redials
@@ -320,9 +334,11 @@ async fn node_reconnects_and_route_survives() {
 
     // First session: admit, load, route established.
     let (conn1, peer) = admit(&hub, &mut allow, &mut tokens, &hub_id).await;
-    fleet.add_node(peer.clone(), Arc::new(NodeTransport::new(conn1.clone())));
+    fleet
+        .add_node(peer.clone(), Arc::new(NodeTransport::new(conn1.clone())))
+        .await;
     fleet.load(&peer, TINY_MODEL_ID).await.expect("remote load");
-    let worker_before = fleet.resolve(TINY_MODEL_ID).expect("routed").1;
+    let worker_before = fleet.resolve(TINY_MODEL_ID).await.expect("routed").1;
 
     // Blip: drop the hub side. The node's serve loop returns and it redials after backoff.
     conn1.close(0u32.into(), b"blip");
@@ -331,9 +347,11 @@ async fn node_reconnects_and_route_survives() {
     // the fresh transport. The durable route to the still-resident worker is unchanged.
     let (conn2, peer2) = admit(&hub, &mut allow, &mut tokens, &hub_id).await;
     assert_eq!(peer2, peer, "same node reconnects");
-    fleet.add_node(peer2.clone(), Arc::new(NodeTransport::new(conn2)));
+    fleet
+        .add_node(peer2.clone(), Arc::new(NodeTransport::new(conn2)))
+        .await;
     assert_eq!(
-        fleet.resolve(TINY_MODEL_ID).map(|r| r.1),
+        fleet.resolve(TINY_MODEL_ID).await.map(|r| r.1),
         Some(worker_before),
         "route + worker id survive the reconnect (durable routes)"
     );
