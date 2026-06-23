@@ -53,6 +53,169 @@ async fn hub_endpoint() -> iroh::Endpoint {
         .expect("bind hub endpoint")
 }
 
+/// Accept + gate the next inbound node connection, returning `(conn, peer_id)`.
+async fn admit_node(
+    hub: &iroh::Endpoint,
+    allow: &mut Allowlist,
+    tokens: &mut PairingTokens,
+    hub_id: &str,
+) -> (iroh::endpoint::Connection, String) {
+    let incoming = tokio::time::timeout(Duration::from_secs(30), hub.accept())
+        .await
+        .expect("node dialed within 30s")
+        .expect("incoming");
+    let conn = incoming.await.expect("connection");
+    let peer = conn.remote_id().to_string();
+    let outcome = gate_connection(
+        &conn,
+        allow,
+        tokens,
+        now_ms(),
+        hub_id.to_string(),
+        Some("test".into()),
+        HELLO_DEADLINE,
+    )
+    .await;
+    assert!(
+        matches!(outcome, GateOutcome::Admitted { .. }),
+        "admitted: {outcome:?}"
+    );
+    (conn, peer)
+}
+
+/// Drain a chat delta stream + final outcome, returning the chunk count and whether any
+/// tokens were produced (chunks or non-empty content).
+async fn drain_chat(
+    deltas: tokio::sync::mpsc::UnboundedReceiver<String>,
+    handle: tokio::task::JoinHandle<Result<higgs::api::ChatOutcome, higgs::diagnostic::HiggsError>>,
+) -> bool {
+    let collector = tokio::spawn(async move {
+        let mut deltas = deltas;
+        let mut n = 0usize;
+        while deltas.recv().await.is_some() {
+            n += 1;
+        }
+        n
+    });
+    let outcome = handle.await.expect("join").expect("chat outcome");
+    let chunks = collector.await.unwrap();
+    chunks > 0 || !outcome.content.is_empty()
+}
+
+/// P5 (streaming sink handoff) + multi-instance served ids, end-to-end over REAL iroh:
+/// TWO `higgs --node` processes on one machine both load the SAME model, so the fleet
+/// exposes TWO collision-free served ids (`id`, `id-1`); a streamed `/v1` chat to EACH
+/// served id routes to its own node and streams real tokens; retiring one node leaves the
+/// fleet (the survivor renumbers to the lone served id) while it keeps streaming.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_nodes_same_model_two_served_ids_stream_each_then_retire_one() {
+    let Some(gguf) = tiny_gguf_path() else {
+        eprintln!("skipping two_nodes_same_model: no tiny GGUF (set HIGGS_TEST_GGUF)");
+        return;
+    };
+    let scan_root = stage_tiny_model(&gguf);
+    let home_a = tempfile::tempdir().expect("node home a");
+    let home_b = tempfile::tempdir().expect("node home b");
+
+    // Hub: a local Higgs (no local models) with a HubFleet installed.
+    let bus = Arc::new(LogBus::new());
+    let higgs = Arc::new(Higgs::with_log_bus(HiggsConfig::default(), bus.clone()));
+    let fleet = Arc::new(HubFleet::new(bus.clone()));
+    higgs.set_fleet(fleet.clone());
+
+    let hub = hub_endpoint().await;
+    let hub_id = hub.id().to_string();
+    let ticket = EndpointTicket::new(hub.addr()).to_string();
+    let mut allow = Allowlist::load(&home_a.path().join("hub-pairings.json")).unwrap();
+    let mut tokens = PairingTokens::new();
+    let token_a = tokens.mint(now_ms(), 600_000);
+    let token_b = tokens.mint(now_ms(), 600_000);
+
+    // Spawn TWO real node processes (own homes, shared read-only model dir, hermetic iroh).
+    let spawn_node = |home: &std::path::Path, token: &str| {
+        Command::new(env!("CARGO_BIN_EXE_higgs"))
+            .arg("--node")
+            .arg(&ticket)
+            .arg(token)
+            .env("HIGGS_HOME", home)
+            .env("HIGGS_MODEL_DIR", scan_root.path())
+            .env("HIGGS_IROH_LOCAL", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn higgs --node")
+    };
+    let _node_a = NodeProc(spawn_node(home_a.path(), &token_a));
+    let _node_b = NodeProc(spawn_node(home_b.path(), &token_b));
+
+    // Admit both (dial order is nondeterministic).
+    let (conn1, peer1) = admit_node(&hub, &mut allow, &mut tokens, &hub_id).await;
+    fleet
+        .add_node(peer1.clone(), Arc::new(NodeTransport::new(conn1)))
+        .await;
+    let (conn2, peer2) = admit_node(&hub, &mut allow, &mut tokens, &hub_id).await;
+    fleet
+        .add_node(peer2.clone(), Arc::new(NodeTransport::new(conn2)))
+        .await;
+    assert_ne!(peer1, peer2, "two distinct nodes paired");
+
+    // Load the SAME model on BOTH nodes → two instances → two collision-free served ids.
+    fleet.load(&peer1, TINY_MODEL_ID).await.expect("load node1");
+    fleet.load(&peer2, TINY_MODEL_ID).await.expect("load node2");
+
+    let mut served = fleet.routed_models().await;
+    served.sort();
+    let suffixed = format!("{TINY_MODEL_ID}-1");
+    assert_eq!(
+        served,
+        vec![TINY_MODEL_ID.to_string(), suffixed.clone()],
+        "same model on two nodes → two collision-free served ids"
+    );
+
+    // Each served id resolves to a DISTINCT (node, worker) — i.e. targets the right node.
+    let r0 = fleet
+        .resolve(TINY_MODEL_ID)
+        .await
+        .expect("served[0] routed");
+    let r1 = fleet.resolve(&suffixed).await.expect("served[1] routed");
+    assert_ne!(r0, r1, "the two served ids map to two distinct instances");
+
+    // Stream a chat to EACH served id; both must stream real tokens (sink handoff end-to-end).
+    let prompt = "[{\"role\":\"user\",\"content\":\"Once upon a time\"}]";
+    for sid in [TINY_MODEL_ID.to_string(), suffixed.clone()] {
+        let (deltas, handle) = higgs
+            .chat_stream(sid.clone(), prompt.to_string(), 8, 0.0, None)
+            .await
+            .unwrap_or_else(|e| panic!("chat_stream {sid}: {e}"));
+        assert!(
+            drain_chat(deltas, handle).await,
+            "served id {sid} streamed real tokens"
+        );
+    }
+
+    // Retire ONE node → it leaves the fleet; the survivor's instance renumbers to the lone
+    // (unsuffixed) served id and KEEPS streaming.
+    fleet.retire(&peer1).await;
+    assert_eq!(
+        fleet.node_ids().await.len(),
+        1,
+        "one node remains after retiring the other"
+    );
+    assert_eq!(
+        fleet.routed_models().await,
+        vec![TINY_MODEL_ID.to_string()],
+        "the survivor renumbers to the lone served id"
+    );
+    let (deltas, handle) = higgs
+        .chat_stream(TINY_MODEL_ID.to_string(), prompt.to_string(), 8, 0.0, None)
+        .await
+        .expect("survivor chat");
+    assert!(
+        drain_chat(deltas, handle).await,
+        "the survivor keeps streaming after the peer retired"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hub_v1_chat_routes_to_remote_node() {
     let Some(gguf) = tiny_gguf_path() else {
