@@ -215,6 +215,11 @@ enum NodeMsg {
         paths: Vec<String>,
         reply: oneshot::Sender<ProbeVerdicts>,
     },
+    /// Enumerate host GPUs via a transient Supervisor (control-plane). Mirrors
+    /// `Supervisor::sysinfo`.
+    Gpus {
+        reply: oneshot::Sender<Vec<crate::system::GpuDevice>>,
+    },
     ShutdownAll {
         reply: oneshot::Sender<()>,
     },
@@ -544,6 +549,15 @@ impl Actor for NodeActor {
                 tokio::spawn(async move {
                     let sup = (spawner)(bus);
                     let _ = reply.send(sup.probe_paths(paths).await);
+                });
+            }
+            NodeMsg::Gpus { reply } => {
+                // Transient Supervisor enumerates GPUs and self-reaps; off the actor thread.
+                let spawner = self.spawner.clone();
+                let bus = self.config.bus.clone();
+                tokio::spawn(async move {
+                    let sup = (spawner)(bus);
+                    let _ = reply.send(sup.sysinfo().await);
                 });
             }
             NodeMsg::ShutdownAll { reply } => {
@@ -1024,6 +1038,15 @@ impl NodeRuntime {
         rx.await.unwrap_or_default()
     }
 
+    /// Enumerate host GPUs (control-plane; via a transient worker). Empty on failure.
+    pub async fn gpus(&self) -> Vec<crate::system::GpuDevice> {
+        let (tx, rx) = oneshot::channel();
+        if self.handle.send(NodeMsg::Gpus { reply: tx }).is_err() {
+            return Vec::new();
+        }
+        rx.await.unwrap_or_default()
+    }
+
     /// Live worker ids, ascending (empty if the actor has stopped).
     pub async fn worker_ids(&self) -> Vec<WorkerId> {
         let (tx, rx) = oneshot::channel();
@@ -1224,6 +1247,15 @@ mod tests {
             models.iter().any(|m| m["id"] == "org/seen"),
             "scan lists the staged model: {scanned}"
         );
+    }
+
+    // `gpus()` enumerates host GPUs via a transient worker (the engine's `Higgs::sysinfo`
+    // input post-P4b). The fake worker reports an empty GPU list, returned without hanging.
+    #[tokio::test]
+    async fn gpus_enumerates_via_transient_worker() {
+        let (rt, _dir) = fake_runtime_with_models(&[]);
+        let gpus = rt.gpus().await;
+        assert!(gpus.is_empty(), "fake worker reports no GPUs");
     }
 
     #[tokio::test]
