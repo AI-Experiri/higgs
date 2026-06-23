@@ -239,8 +239,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn vram_total_sums_only_gpu_devices() {
+    // `Higgs::new` constructs the co-located node (which spawns its actor task), so
+    // these need a Tokio runtime even though the bodies are otherwise synchronous.
+    #[tokio::test]
+    async fn vram_total_sums_only_gpu_devices() {
         let cfg = crate::api::Higgs::new(crate::HiggsConfig::default()).server_config();
         let gpus = vec![
             cpu_device(),
@@ -276,8 +278,8 @@ mod tests {
         assert_eq!(none.available_bytes, 0);
     }
 
-    #[test]
-    fn gather_reports_plausible_hardware() {
+    #[tokio::test]
+    async fn gather_reports_plausible_hardware() {
         let cfg = crate::api::Higgs::new(crate::HiggsConfig::default()).server_config();
         let info = SystemInfo::gather(cfg, vec![cpu_device()]);
         assert!(!info.hardware.cpu_name.is_empty(), "cpu name present");

@@ -236,51 +236,43 @@ fn chatcmpl_id() -> String {
 /// `GET /v1/models` — LOADED models only: answers "what can serve chat right
 /// now", never the on-disk catalog (that is the control `models` route).
 ///
-/// higgs is spawn-on-load, so the normal idle state has NO worker: nothing
-/// loaded means there is no worker process. An empty list is the correct OpenAI
-/// answer in that case — "no models can serve chat right now" — so this never
-/// gates on `worker_alive`. A crashed worker mid-serve likewise presents here as
-/// an empty list (it can serve nothing); `GET /api/higgs/status` still exposes
-/// `worker_alive` truthfully for diagnostics.
+/// The local node may host several models at once (additive load); each resident
+/// instance is one served id (`org/model`, `org/model-1`, …). Nothing loaded
+/// means an empty list — the correct OpenAI answer for "no models can serve chat
+/// right now" — so this never gates on liveness. `GET /api/higgs/status` still
+/// exposes `worker_alive` truthfully for diagnostics.
 pub(super) async fn v1_models(State(higgs): State<Arc<Higgs>>) -> Response {
     tracing::info!("higgs: GET /v1/models");
-    match higgs.status().await {
-        Ok(status) => {
-            let mut data: Vec<Model> = status
-                .loaded
-                .into_iter()
-                .map(|l| Model {
-                    id: l.id,
+    let mut data: Vec<Model> = higgs
+        .local_served_ids()
+        .await
+        .into_iter()
+        .map(|id| Model {
+            id,
+            object: "model".to_owned(),
+            created: now_secs(),
+            owned_by: "higgs".to_owned(),
+        })
+        .collect();
+    // Also advertise remote-resident models — they are valid chat targets routed
+    // through the fleet (skip any already listed by a local worker).
+    if let Some(fleet) = higgs.fleet() {
+        for id in fleet.routed_models().await {
+            if !data.iter().any(|m| m.id == id) {
+                data.push(Model {
+                    id,
                     object: "model".to_owned(),
                     created: now_secs(),
                     owned_by: "higgs".to_owned(),
-                })
-                .collect();
-            // Also advertise remote-resident models — they are valid chat targets routed
-            // through the fleet (skip any already listed by the local worker).
-            if let Some(fleet) = higgs.fleet() {
-                for id in fleet.routed_models().await {
-                    if !data.iter().any(|m| m.id == id) {
-                        data.push(Model {
-                            id,
-                            object: "model".to_owned(),
-                            created: now_secs(),
-                            owned_by: "higgs".to_owned(),
-                        });
-                    }
-                }
+                });
             }
-            Json(ListModelResponse {
-                object: "list".to_owned(),
-                data,
-            })
-            .into_response()
-        }
-        Err(err) => {
-            tracing::warn!(error = %err, "higgs: /v1/models failed");
-            v1_error(&err).into_response()
         }
     }
+    Json(ListModelResponse {
+        object: "list".to_owned(),
+        data,
+    })
+    .into_response()
 }
 
 /// `POST /v1/chat/completions`. With JIT on (the default), a request for a
@@ -412,20 +404,31 @@ pub(super) async fn v1_chat_completions(
 /// is on. Returns the [`LoadedInfo`] of the now-resident requested model, or an
 /// `Err(response)` carrying the mapped failure.
 ///
-/// - Requested model already loaded → returns its [`LoadedInfo`] (no load).
+/// - Requested model already loaded LOCALLY → returns its [`LoadedInfo`] (no load).
+/// - Else remote-resident → permissive [`LoadedInfo`] (the fleet routes it).
 /// - Not loaded and JIT OFF → 404 `[HG003]` `ModelNotLoaded` (explicit-load).
 /// - Not loaded and JIT ON → JIT path: the id must be a scanned model
 ///   (`[HG002]` `ModelNotFound` → 404 otherwise — never attempt to load an
-///   unknown id), then [`Higgs::load`] loads it with host defaults. higgs serves
-///   one model at a time, so the worker's M_LOAD swaps out any resident model —
-///   a request for B while A is loaded ends with B resident (only-keep-last).
-///   `load()` takes the lifecycle mutex, serializing concurrent JIT loads. A
-///   load failure (insufficient memory `[HG017]` → 503, bad GGUF, worker spawn
-///   failure, …) surfaces as its mapped error — NOT a silent 404. On success the
-///   post-load status carries the now-loaded model.
+///   unknown id), then [`Higgs::load`] loads it with host defaults. The local node
+///   is multi-model, so the load is ADDITIVE (a fresh worker, idempotent per model)
+///   — it does not swap out other models. `load()` takes the lifecycle mutex,
+///   serializing concurrent JIT loads. A load failure (insufficient memory
+///   `[HG017]` → 503, bad GGUF, worker spawn failure, …) surfaces as its mapped
+///   error — NOT a silent 404.
+///
+/// LOCAL-first: a locally-served id wins over a remote one of the same name, so a
+/// model the user explicitly loaded locally is preferred (and stays consistent with
+/// `chat_stream` + `/v1/models`, which are also local-first).
 async fn ensure_loaded(higgs: &Arc<Higgs>, model: &str) -> Result<LoadedInfo, Response> {
+    // Already locally served (by served id) — serve it, no load. The local node is
+    // multi-model: this resolves the SPECIFIC resident instance (`org/model`,
+    // `org/model-1`, …), so a chat for an already-loaded model never re-loads.
+    if let Some(loaded) = higgs.local_loaded_info(model).await {
+        return Ok(loaded);
+    }
+
     // Remote-resident model: the fleet routes the chat to its node, so skip the LOCAL
-    // loaded/scan gate (which would 404 it as HG003/HG002). The remote worker enforces the
+    // scan/JIT gate (which would 404 it as HG003/HG002). The remote worker enforces the
     // exact prompt-vs-context check (HG005), so we report a permissive `ctx_len` here and
     // defer prompt-fit to it.
     let is_remote = match higgs.fleet() {
@@ -447,21 +450,6 @@ async fn ensure_loaded(higgs: &Arc<Higgs>, model: &str) -> Result<LoadedInfo, Re
         });
     }
 
-    let status = match higgs.status().await {
-        Ok(s) => s,
-        Err(err) => {
-            tracing::warn!(error = %err, "higgs: chat status check failed");
-            return Err(v1_error(&err).into_response());
-        }
-    };
-    // Capture the currently-resident model id (for the JIT swap log line) before
-    // the match consumes `status.loaded`.
-    let prev = status.loaded.as_ref().map(|l| l.id.clone());
-    // Already loaded — serve as today, no load.
-    if let Some(loaded) = status.loaded.filter(|l| l.id == model) {
-        return Ok(loaded);
-    }
-
     // Not loaded. With JIT off, keep the explicit-load behavior: 404 [HG003].
     if !higgs.jit_enabled() {
         let err = HiggsError::ModelNotLoaded {
@@ -472,7 +460,9 @@ async fn ensure_loaded(higgs: &Arc<Higgs>, model: &str) -> Result<LoadedInfo, Re
     }
 
     // JIT path. The requested id must be a scanned model — never try to load an
-    // unknown id (that is a [HG002] 404, not a load attempt).
+    // unknown id (that is a [HG002] 404, not a load attempt). A suffixed served id
+    // (`org/model-1`) is never a scanned id, so it can't be JIT-loaded — only an
+    // already-resident extra instance is addressable by its suffix.
     let scanned = match higgs.scan().await {
         Ok(models) => models,
         Err(err) => {
@@ -488,26 +478,17 @@ async fn ensure_loaded(higgs: &Arc<Higgs>, model: &str) -> Result<LoadedInfo, Re
         return Err(v1_error(&err).into_response());
     }
 
-    // Load on demand (host defaults). One always-on INFO line so the swap is
-    // visible in the Developer Logs. `prev` is the model being swapped out, if any.
-    tracing::info!(
-        "higgs: JIT loading {model} (was {})",
-        prev.as_deref().unwrap_or("none")
-    );
+    // Load on demand (host defaults). One always-on INFO line so the load is
+    // visible in the Developer Logs. The local load is ADDITIVE — it spawns a new
+    // worker alongside any others (and is idempotent per model), no swap.
+    tracing::info!("higgs: JIT loading {model}");
     if let Err(err) = higgs.load(model, None).await {
         tracing::warn!(model = %model, error = %err, "higgs: JIT load failed");
         return Err(v1_error(&err).into_response());
     }
 
-    // Re-fetch status: the requested model must now be resident.
-    let status = match higgs.status().await {
-        Ok(s) => s,
-        Err(err) => {
-            tracing::warn!(error = %err, "higgs: post-JIT status check failed");
-            return Err(v1_error(&err).into_response());
-        }
-    };
-    match status.loaded.filter(|l| l.id == model) {
+    // Re-resolve: the requested model must now be served.
+    match higgs.local_loaded_info(model).await {
         Some(loaded) => Ok(loaded),
         None => {
             // Load reported success but the model isn't resident — surface the
@@ -868,34 +849,11 @@ fn messages_to_pairs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rpc::{encode, RpcFrame, RpcNotification};
-    use crate::worker::N_CHAT_CHUNK;
     use async_openai::types::chat::CreateChatCompletionStreamResponse;
     use serde_json::json;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tower::ServiceExt;
 
     use super::super::test_support::*;
-
-    /// Deliver a streaming chat-chunk notification keyed to `request_id`.
-    async fn write_chunk_notification(
-        stream: &mut tokio::io::DuplexStream,
-        request_id: u64,
-        delta: &str,
-    ) {
-        let line = encode(&RpcFrame::Notification(RpcNotification {
-            jsonrpc: "2.0".into(),
-            method: N_CHAT_CHUNK.into(),
-            // request_id matches the M_CHAT RPC id so route_notification
-            // delivers this delta to the correct keyed sink.
-            params: json!({ "request_id": request_id, "delta": delta }),
-        }));
-        stream
-            .write_all(format!("{line}\n").as_bytes())
-            .await
-            .unwrap();
-        stream.flush().await.unwrap();
-    }
 
     fn parse_messages(v: serde_json::Value) -> Vec<ChatCompletionRequestMessage> {
         serde_json::from_value(v).expect("messages deserialize")
@@ -1003,23 +961,9 @@ mod tests {
 
     #[tokio::test]
     async fn v1_models_empty_when_unloaded() {
-        let (sup, mut test_write, test_read, _ring) = make_supervisor();
-        let app = make_app(sup);
-
-        // Read-driven mock: the handler runs a host-side scan (blocking thread)
-        // before its M_STATUS RPC, so respond only AFTER reading the request line
-        // (proving the id is pending). A fixed pre-sleep races the scan under load.
-        let mut lines = BufReader::new(test_read).lines();
-        let (resp, _) = tokio::join!(app.oneshot(get("/v1/models")), async {
-            lines.next_line().await.unwrap().expect("M_STATUS request");
-            write_response(
-                &mut test_write,
-                1,
-                json!({"loaded": null, "models_scanned": 0}),
-            )
-            .await;
-        });
-        let resp = resp.unwrap();
+        // Nothing loaded (no resident worker) → empty served set → empty list.
+        let app = make_app();
+        let resp = app.oneshot(get("/v1/models")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let list: ListModelResponse = serde_json::from_slice(&body_bytes(resp).await).unwrap();
         assert_eq!(list.object, "list");
@@ -1030,15 +974,14 @@ mod tests {
 
     #[tokio::test]
     async fn v1_models_lists_loaded() {
-        let (sup, mut test_write, test_read, _ring) = make_supervisor();
-        let app = make_app(sup);
+        // Load a fixture model so it becomes a served instance, then list it.
+        let dir = tempfile::TempDir::new().unwrap();
+        write_gguf_fixture(dir.path(), "org/model");
+        let higgs = make_higgs_with_lmstudio(dir.path().to_path_buf());
+        higgs.load("org/model", None).await.expect("load");
+        let app = app_for(higgs);
 
-        let mut lines = BufReader::new(test_read).lines();
-        let (resp, _) = tokio::join!(app.oneshot(get("/v1/models")), async {
-            lines.next_line().await.unwrap().expect("M_STATUS request");
-            write_response(&mut test_write, 1, loaded_status_json()).await;
-        });
-        let resp = resp.unwrap();
+        let resp = app.oneshot(get("/v1/models")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let list: ListModelResponse = serde_json::from_slice(&body_bytes(resp).await).unwrap();
         assert_eq!(list.data.len(), 1);
@@ -1051,25 +994,14 @@ mod tests {
 
     #[tokio::test]
     async fn chat_unloaded_404_hg003() {
-        let (sup, mut test_write, test_read, _ring) = make_supervisor();
         // JIT off: an unloaded model is the explicit-load HG003 404 (not a JIT load).
-        let app = make_app_jit_off(sup);
+        let app = make_app_jit_off();
 
         let req = post_json(
             "/v1/chat/completions",
             &json!({"model": "org/missing", "messages": [{"role": "user", "content": "hi"}]}),
         );
-        let mut lines = BufReader::new(test_read).lines();
-        let (resp, _) = tokio::join!(app.oneshot(req), async {
-            lines.next_line().await.unwrap().expect("M_STATUS request");
-            write_response(
-                &mut test_write,
-                1,
-                json!({"loaded": null, "models_scanned": 0}),
-            )
-            .await;
-        });
-        let resp = resp.unwrap();
+        let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
         let body = String::from_utf8(body_bytes(resp).await).unwrap();
@@ -1097,7 +1029,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_serving_disabled_503_hg019() {
-        let app = make_app_serving_off(make_idle_supervisor());
+        let app = make_app_serving_off();
         let req = post_json(
             "/v1/chat/completions",
             &json!({"model": "org/model", "messages": [{"role": "user", "content": "hi"}]}),
@@ -1127,7 +1059,7 @@ mod tests {
 
     #[tokio::test]
     async fn v1_models_idle_no_worker_200_empty() {
-        let app = make_app(make_idle_supervisor());
+        let app = make_app();
         let resp = app.oneshot(get("/v1/models")).await.unwrap();
         assert_eq!(
             resp.status(),
@@ -1142,7 +1074,7 @@ mod tests {
     #[tokio::test]
     async fn v1_chat_idle_no_worker_404_hg003() {
         // JIT off: idle chat is the explicit-load HG003 404, not a JIT attempt.
-        let app = make_app_jit_off(make_idle_supervisor());
+        let app = make_app_jit_off();
         let req = post_json(
             "/v1/chat/completions",
             &json!({"model": "org/model", "messages": [{"role": "user", "content": "hi"}]}),
@@ -1169,7 +1101,7 @@ mod tests {
     async fn v1_chat_jit_on_unknown_model_404_hg002() {
         // Default app → JIT on. Empty temp config so the scan finds nothing.
         let dir = tempfile::TempDir::new().unwrap();
-        let app = make_app_with_lmstudio(make_idle_supervisor(), dir.path().to_path_buf());
+        let app = make_app_with_lmstudio(dir.path().to_path_buf());
         let req = post_json(
             "/v1/chat/completions",
             &json!({"model": "org/unknown", "messages": [{"role": "user", "content": "hi"}]}),
@@ -1198,61 +1130,24 @@ mod tests {
 
     #[tokio::test]
     async fn v1_chat_jit_on_scanned_loads_then_serves() {
-        let (sup, mut test_write, test_read, _ring) = make_supervisor();
-        // Host-side scan must discover `org/model` so the JIT path loads it.
+        // JIT on (default). Host-side scan discovers `org/model` but nothing is
+        // loaded, so the chat triggers a JIT load (the stateful fake worker spawns
+        // and records it), then serves. The model is NOT pre-loaded — reaching 200
+        // with the completion proves the JIT load path ran.
         let dir = tempfile::TempDir::new().unwrap();
         write_gguf_fixture(dir.path(), "org/model");
-        let app = make_app_with_lmstudio(sup, dir.path().to_path_buf());
+        let app = make_app_with_lmstudio(dir.path().to_path_buf());
 
         let req = post_json(
             "/v1/chat/completions",
             &json!({"model": "org/model", "messages": [{"role": "user", "content": "hi"}]}),
         );
-        // Read-driven mock: respond to each RPC only after its request line is
-        // read. RPC 1 = M_STATUS (nothing loaded) → triggers JIT; RPC 2 = M_LOAD
-        // (the swap) → ok; RPC 3 = M_STATUS (now loaded org/model); RPC 4 =
-        // M_CHAT → the completion.
-        let mut lines = BufReader::new(test_read).lines();
-        let (resp, load_line) = tokio::join!(app.oneshot(req), async {
-            lines
-                .next_line()
-                .await
-                .unwrap()
-                .expect("M_STATUS #1 request");
-            write_response(
-                &mut test_write,
-                1,
-                json!({"loaded": null, "models_scanned": 1}),
-            )
-            .await;
-            let load_line = lines.next_line().await.unwrap().expect("M_LOAD request");
-            write_response(&mut test_write, 2, json!({"id": "org/model"})).await; // load ok
-            lines
-                .next_line()
-                .await
-                .unwrap()
-                .expect("M_STATUS #2 request");
-            write_response(&mut test_write, 3, loaded_status_json()).await; // now loaded
-            lines.next_line().await.unwrap().expect("M_CHAT request");
-            write_response(
-                &mut test_write,
-                4,
-                json!({"content": "hello", "finish_reason": "stop", "prompt_tokens": 3, "completion_tokens": 5}),
-            )
-            .await;
-            load_line
-        });
-        let resp = resp.unwrap();
+        let resp = app.oneshot(req).await.unwrap();
         assert_eq!(
             resp.status(),
             StatusCode::OK,
             "JIT load then serve returns 200"
         );
-        // The JIT load issued an M_LOAD for the requested model (the swap target).
-        let v: serde_json::Value = serde_json::from_str(&load_line).unwrap();
-        assert_eq!(v["method"], "higgs/load");
-        assert_eq!(v["params"]["id"], "org/model");
-
         let chat: CreateChatCompletionResponse =
             serde_json::from_slice(&body_bytes(resp).await).unwrap();
         assert_eq!(chat.model, "org/model");
@@ -1263,29 +1158,19 @@ mod tests {
 
     #[tokio::test]
     async fn chat_nonstream_returns_content() {
-        let (sup, mut test_write, test_read, _ring) = make_supervisor();
-        let app = make_app(sup);
+        // Pre-load a fixture model, then chat it. The stateful fake worker returns
+        // `content:"hello", finish:"stop", prompt_tokens:10, completion_tokens:3`.
+        let dir = tempfile::TempDir::new().unwrap();
+        write_gguf_fixture(dir.path(), "org/model");
+        let higgs = make_higgs_with_lmstudio(dir.path().to_path_buf());
+        higgs.load("org/model", None).await.expect("load");
+        let app = app_for(higgs);
 
         let req = post_json(
             "/v1/chat/completions",
             &json!({"model": "org/model", "messages": [{"role": "user", "content": "hi"}]}),
         );
-        // Respond to each RPC only after reading its request line: M_STATUS gate
-        // (id 1) then M_CHAT (id 2). Read-driven so the host-side scan timing
-        // can't drop a response.
-        let mut lines = BufReader::new(test_read).lines();
-        let (resp, _) = tokio::join!(app.oneshot(req), async {
-            lines.next_line().await.unwrap().expect("M_STATUS request");
-            write_response(&mut test_write, 1, loaded_status_json()).await; // status gate
-            lines.next_line().await.unwrap().expect("M_CHAT request");
-            write_response(
-                &mut test_write,
-                2,
-                json!({"content": "hello", "finish_reason": "stop", "prompt_tokens": 12, "completion_tokens": 5}), // higgs/chat
-            )
-            .await;
-        });
-        let resp = resp.unwrap();
+        let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
         let chat: CreateChatCompletionResponse =
@@ -1296,17 +1181,23 @@ mod tests {
         assert_eq!(chat.choices[0].message.content.as_deref(), Some("hello"));
         assert_eq!(chat.choices[0].finish_reason, Some(FinishReason::Stop));
         let usage = chat.usage.expect("usage must be present");
-        assert_eq!(usage.prompt_tokens, 12);
-        assert_eq!(usage.completion_tokens, 5);
-        assert_eq!(usage.total_tokens, 17);
+        assert_eq!(usage.prompt_tokens, 10);
+        assert_eq!(usage.completion_tokens, 3);
+        assert_eq!(usage.total_tokens, 13);
     }
 
     // ── Test 5: streaming chat SSE framing ───────────────────────────────────
 
     #[tokio::test]
     async fn chat_stream_sse_framing() {
-        let (sup, mut test_write, test_read, _ring) = make_supervisor();
-        let app = make_app(sup);
+        // Pre-load a fixture model, then stream a chat. The stateful fake worker
+        // streams two deltas `he`/`llo` then a final `hello`/stop response, so the
+        // SSE assembly emits: role + 2 deltas + finish + [DONE].
+        let dir = tempfile::TempDir::new().unwrap();
+        write_gguf_fixture(dir.path(), "org/model");
+        let higgs = make_higgs_with_lmstudio(dir.path().to_path_buf());
+        higgs.load("org/model", None).await.expect("load");
+        let app = app_for(higgs);
 
         let req = post_json(
             "/v1/chat/completions",
@@ -1316,25 +1207,7 @@ mod tests {
                 "stream": true,
             }),
         );
-        // Read-driven: respond to M_STATUS (id 1), then — only after the M_CHAT
-        // request line is read (its sink for request_id=2 is already registered) —
-        // emit the chunk notifications and the final chat response.
-        let mut lines = BufReader::new(test_read).lines();
-        let (resp, _) = tokio::join!(app.oneshot(req), async {
-            lines.next_line().await.unwrap().expect("M_STATUS request");
-            write_response(&mut test_write, 1, loaded_status_json()).await; // status gate
-            lines.next_line().await.unwrap().expect("M_CHAT request");
-            // Chunks tagged with request_id=2 (the M_CHAT RPC id, allocated after status id=1).
-            write_chunk_notification(&mut test_write, 2, "hel").await;
-            write_chunk_notification(&mut test_write, 2, "lo").await;
-            write_response(
-                &mut test_write,
-                2,
-                json!({"content": "hello", "finish_reason": "stop"}), // higgs/chat
-            )
-            .await;
-        });
-        let resp = resp.unwrap();
+        let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let content_type = resp
             .headers()
@@ -1361,11 +1234,11 @@ mod tests {
         assert_eq!(role.object, "chat.completion.chunk");
         assert_eq!(
             parse(datas[1]).choices[0].delta.content.as_deref(),
-            Some("hel")
+            Some("he")
         );
         assert_eq!(
             parse(datas[2]).choices[0].delta.content.as_deref(),
-            Some("lo")
+            Some("llo")
         );
         let finish = parse(datas[3]);
         assert_eq!(finish.choices[0].finish_reason, Some(FinishReason::Stop));

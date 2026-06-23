@@ -1,11 +1,15 @@
 //! Shared test harness for the serve-layer handler tests.
 //!
-//! Spins up a [`Supervisor`] over duplex pipes with a mock worker, wraps it in a
-//! [`Higgs`] facade, and builds the [`router`] — so the `v1` and `control`
-//! handler tests drive the real router without a real worker process. Shared by
-//! both surfaces' test modules via `super::test_support::*`.
+//! Builds a [`Higgs`] facade over a co-located LOCAL [`NodeRuntime`] whose workers
+//! are STATEFUL fakes ([`fake_worker_factory_stateful`]) — they auto-respond to
+//! load/status/chat without llama.cpp. So the handler tests drive the REAL
+//! load/chat path (load a fixture model, then assert) instead of hand-driving
+//! worker stdio. "Nothing loaded" is the natural idle state (no resident worker),
+//! so there is no separate idle-supervisor seam anymore. Shared by both surfaces'
+//! test modules via `super::test_support::*`.
 
 use std::io::Cursor;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -14,132 +18,87 @@ use axum::response::Response;
 use axum::Router;
 use ggus::{GGufFileHeader, GGufFileWriter, GGufMetaDataValueType};
 use http_body_util::BodyExt;
-use parking_lot::Mutex;
-use serde_json::json;
-use tokio::io::AsyncWriteExt;
 
 use super::router;
 use crate::api::{Higgs, HiggsConfig};
-use crate::diagnostic::HiggsError;
 use crate::log_bus::LogBus;
-use crate::rpc::{encode, RpcFrame, RpcResponse};
-use crate::supervisor::{Supervisor, WorkerHalves};
+use crate::node::runtime::{NodeConfig, NodeRuntime, DEFAULT_IDLE_TTL};
+use crate::node::test_support::fake_worker_factory_stateful;
+use crate::supervisor::Supervisor;
 
-/// Build a `Supervisor` plus duplex test handles and its captured [`LogBus`].
-pub(crate) fn make_supervisor() -> (
-    Supervisor,
-    tokio::io::DuplexStream, // test_write: write responses → supervisor reads
-    tokio::io::DuplexStream, // test_read:  supervisor writes requests → test reads
-    Arc<LogBus>,             // log bus (push lines for logs tests)
-) {
-    let (sup_write, test_read) = tokio::io::duplex(64 * 1024);
-    let (test_write, sup_read) = tokio::io::duplex(64 * 1024);
-
-    let sup_write_cell = Arc::new(Mutex::new(Some(sup_write)));
-    let sup_read_cell = Arc::new(Mutex::new(Some(sup_read)));
-    let bus_cell: Arc<Mutex<Option<Arc<LogBus>>>> = Arc::new(Mutex::new(None));
-    let bus_capture = Arc::clone(&bus_cell);
-
-    let sup = Supervisor::with_factory(Box::new(move |bus, _model| {
-        *bus_capture.lock() = Some(bus);
-        let write = sup_write_cell
-            .lock()
-            .take()
-            .ok_or_else(|| HiggsError::WorkerSpawnFailed {
-                source: std::io::Error::other("mock: no more write halves"),
-            })?;
-        let read = sup_read_cell
-            .lock()
-            .take()
-            .ok_or_else(|| HiggsError::WorkerSpawnFailed {
-                source: std::io::Error::other("mock: no more read halves"),
-            })?;
-        Ok(WorkerHalves {
-            write: Box::new(write),
-            read: Box::new(read),
-            proc: None,
-        })
-    }));
-
-    sup.start_for("test-model").expect("mock start");
-    let bus = bus_cell.lock().take().expect("factory ran on start");
-    (sup, test_write, test_read, bus)
+/// Build a fake-worker-backed LOCAL [`NodeRuntime`] scanning `dirs`, sharing `bus`
+/// so logs tests can seed the same Developer-Log history `higgs.logs()` reads.
+fn make_node(dirs: Vec<PathBuf>, bus: Arc<LogBus>) -> NodeRuntime {
+    NodeRuntime::with_spawner(
+        NodeConfig {
+            bus,
+            lmstudio_dirs: dirs,
+            hf_dirs: vec![],
+            ollama_dirs: vec![],
+            idle_ttl: DEFAULT_IDLE_TTL,
+        },
+        Arc::new(|_bus| Supervisor::with_factory(fake_worker_factory_stateful())),
+    )
 }
 
-/// Build a `Supervisor` that has NEVER spawned a worker — its factory is never
-/// invoked, so `status()` reports `worker_alive:false` with `loaded:None`. This
-/// reproduces higgs's normal idle state (spawn-on-load: nothing loaded ⇒ no
-/// worker) for the `/v1` idle-behavior tests.
-pub(crate) fn make_idle_supervisor() -> Supervisor {
-    Supervisor::with_factory(Box::new(|_ring, _model| {
-        Err(HiggsError::WorkerSpawnFailed {
-            source: std::io::Error::other("mock: idle supervisor never spawns"),
-        })
-    }))
-}
-
-/// Write a JSON-RPC success response to the supervisor's read side.
-pub(crate) async fn write_response(
-    stream: &mut tokio::io::DuplexStream,
-    id: u64,
-    result: serde_json::Value,
-) {
-    let line = encode(&RpcFrame::Response(RpcResponse {
-        jsonrpc: "2.0".into(),
-        id,
-        result: Some(result),
-        error: None,
-    }));
-    stream
-        .write_all(format!("{line}\n").as_bytes())
-        .await
-        .unwrap();
-    stream.flush().await.unwrap();
-}
-
-/// Wrap a mock supervisor in a `Higgs` facade and build the router.
-pub(crate) fn make_app(sup: Supervisor) -> Router {
-    router(Arc::new(Higgs::with_supervisor(
-        Arc::new(sup),
-        HiggsConfig::default(),
-    )))
-}
-
-/// Build an app whose host-side `scan()` reads `lmstudio_dirs`.
-///
-/// Scan runs host-side now, so control tests that need a discoverable model
-/// point the config at a temp LM Studio fixture dir (see [`write_gguf_fixture`])
-/// instead of injecting models through the worker.
-pub(crate) fn make_app_with_lmstudio(sup: Supervisor, dir: std::path::PathBuf) -> Router {
+/// A `Higgs` facade over a stateful-fake-worker node scanning `dirs`, plus the
+/// node's shared [`LogBus`]. Both the node and the facade config see `dirs`.
+fn node_higgs(dirs: Vec<PathBuf>) -> (Arc<Higgs>, Arc<LogBus>) {
+    let bus = Arc::new(LogBus::new());
+    let node = make_node(dirs.clone(), bus.clone());
     let cfg = HiggsConfig {
-        lmstudio_dirs: vec![dir],
+        lmstudio_dirs: dirs,
         hf_dirs: vec![],
         ollama_dirs: vec![],
         default_load: HiggsConfig::default().default_load,
     };
-    router(Arc::new(Higgs::with_supervisor(Arc::new(sup), cfg)))
+    (Arc::new(Higgs::with_local(Arc::new(node), cfg)), bus)
 }
 
-/// Wrap a mock supervisor in a `Higgs` facade with JIT turned OFF, and build
-/// the router. Used by the `/v1` tests that assert the explicit-load HG003 404
-/// path (the behavior when just-in-time loading is disabled).
-pub(crate) fn make_app_jit_off(sup: Supervisor) -> Router {
-    let higgs = Arc::new(Higgs::with_supervisor(
-        Arc::new(sup),
-        HiggsConfig::default(),
-    ));
+/// A `Higgs` facade scanning nothing (the common idle starting point).
+pub(crate) fn make_higgs() -> Arc<Higgs> {
+    node_higgs(vec![]).0
+}
+
+/// A `Higgs` facade whose host-side `scan()` + node both read `dir` (an LM Studio
+/// fixture root). Tests `higgs.load("org/model", None)` against a fixture there.
+pub(crate) fn make_higgs_with_lmstudio(dir: PathBuf) -> Arc<Higgs> {
+    node_higgs(vec![dir]).0
+}
+
+/// A `Higgs` facade plus its node's Developer-Log bus — for the logs tests, which
+/// seed history before hitting the endpoint.
+pub(crate) fn make_higgs_with_bus() -> (Arc<Higgs>, Arc<LogBus>) {
+    node_higgs(vec![])
+}
+
+/// Wrap a `Higgs` (typically after a `load`) in the serve router.
+pub(crate) fn app_for(higgs: Arc<Higgs>) -> Router {
+    router(higgs)
+}
+
+/// The serve router over a fresh idle facade (nothing loaded, JIT on, serving on).
+pub(crate) fn make_app() -> Router {
+    router(make_higgs())
+}
+
+/// The serve router over a facade whose `scan()` reads `dir` (LM Studio fixture).
+pub(crate) fn make_app_with_lmstudio(dir: PathBuf) -> Router {
+    router(make_higgs_with_lmstudio(dir))
+}
+
+/// The serve router with JIT turned OFF — for the `/v1` tests that assert the
+/// explicit-load HG003 404 path (chat against an unloaded model).
+pub(crate) fn make_app_jit_off() -> Router {
+    let higgs = make_higgs();
     higgs.set_jit_enabled(false);
     router(higgs)
 }
 
-/// Wrap a mock supervisor in a `Higgs` facade with serving turned OFF, and
-/// build the router. Used by the `/v1` test that asserts the serving-disabled
-/// HG019 503 path (the `/v1` inference surface refuses while serving is off).
-pub(crate) fn make_app_serving_off(sup: Supervisor) -> Router {
-    let higgs = Arc::new(Higgs::with_supervisor(
-        Arc::new(sup),
-        HiggsConfig::default(),
-    ));
+/// The serve router with serving turned OFF — for the test that asserts the
+/// serving-disabled HG019 503 path (`/v1` refuses while serving is off).
+pub(crate) fn make_app_serving_off() -> Router {
+    let higgs = make_higgs();
     higgs.set_serving_enabled(false);
     router(higgs)
 }
@@ -229,12 +188,4 @@ pub(crate) async fn body_bytes(resp: Response) -> Vec<u8> {
         .unwrap()
         .to_bytes()
         .to_vec()
-}
-
-/// A canonical `higgs/status` response with one loaded model.
-pub(crate) fn loaded_status_json() -> serde_json::Value {
-    json!({
-        "loaded": { "id": "org/model", "ctx_len": 4096, "gpu_layers": 99, "threads": 4 },
-        "models_scanned": 1,
-    })
 }

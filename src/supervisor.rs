@@ -339,13 +339,24 @@ impl Supervisor {
         Self { inner }
     }
 
+    // ── Per-supervisor log/event/verbose accessors ─────────────────────────────
+    //
+    // After the P4b engine swap the `Higgs` facade reads the Developer-Log bus and
+    // lifecycle events from the LOCAL `NodeRuntime` (which owns per-worker buses +
+    // its own event fan-out), not from a single Supervisor. These delegators are
+    // kept — each has its own unit test below and they remain the natural per-worker
+    // API the node will surface for per-worker log routing — so `#[allow(dead_code)]`
+    // silences the unused-in-non-test-build warning without dropping the coverage.
+
     /// Subscribe to worker lifecycle events.
+    #[allow(dead_code)]
     pub fn events(&self) -> broadcast::Receiver<HiggsEvent> {
         self.inner.events_tx.subscribe()
     }
 
     /// Return up to `n` recent Developer-Log lines (oldest first), optionally
     /// restricted to one [`LogSource`] (`None` = worker stderr + serve events).
+    #[allow(dead_code)]
     pub fn logs(&self, n: usize, filter: Option<LogSource>) -> Vec<String> {
         self.inner.bus.snapshot(n, filter)
     }
@@ -353,17 +364,20 @@ impl Supervisor {
     /// Subscribe to live Developer-Log lines pushed after this call. Pair with
     /// [`logs`](Self::logs) for replay-then-live SSE delivery; filter by
     /// [`LogLine::source`].
+    #[allow(dead_code)]
     pub fn subscribe_logs(&self) -> broadcast::Receiver<LogLine> {
         self.inner.bus.subscribe()
     }
 
     /// The "Verbose Logging" toggle (single home on the [`LogBus`]). Read by the
     /// serve layer and the worker stderr drain.
+    #[allow(dead_code)]
     pub fn log_verbose(&self) -> bool {
         self.inner.bus.verbose()
     }
 
     /// Set the "Verbose Logging" toggle.
+    #[allow(dead_code)]
     pub fn set_log_verbose(&self, v: bool) {
         self.inner.bus.set_verbose(v);
     }
@@ -375,6 +389,7 @@ impl Supervisor {
     /// reply (if any) arrives id-less-of-pending and is harmlessly dropped. No
     /// worker → `write_tx` is `None` → nothing sent (the next spawn seeds the
     /// level from `HIGGS_WORKER_VERBOSE`).
+    #[allow(dead_code)]
     pub fn set_worker_verbose(&self, v: bool) {
         let line = rpc::encode(&RpcFrame::Request(RpcRequest {
             jsonrpc: "2.0".into(),
@@ -389,11 +404,13 @@ impl Supervisor {
 
     /// Whether Developer Logs are in un-redacted DEBUG mode (show structured
     /// fields incl. prompt content). Off by default.
+    #[allow(dead_code)]
     pub fn log_show_fields(&self) -> bool {
         self.inner.bus.show_fields()
     }
 
     /// Toggle the un-redacted DEBUG log mode.
+    #[allow(dead_code)]
     pub fn set_log_show_fields(&self, v: bool) {
         self.inner.bus.set_show_fields(v);
     }
@@ -741,6 +758,12 @@ impl Supervisor {
     /// Forget the recorded `higgs/load` replay params — called after an explicit
     /// unload so a later unexpected worker restart does NOT reload the model the
     /// user just unloaded.
+    ///
+    /// Post-P4b the node's `unload`/`shutdown_all` reaps the whole Supervisor (its
+    /// `last_load` dies with it), so nothing calls this anymore; kept (with its test)
+    /// as the per-supervisor primitive a future explicit-unload-without-kill path
+    /// would use.
+    #[allow(dead_code)]
     pub(crate) fn clear_last_load(&self) {
         *self.inner.last_load.lock() = None;
         // Bump so a stale crash-replay capturing the now-cleared load is skipped.
@@ -749,8 +772,10 @@ impl Supervisor {
 
     /// Emit a lifecycle event on the broadcast channel.
     ///
-    /// Used by the [`Higgs`](crate::api::Higgs) facade to publish
-    /// `ModelLoaded` / `ModelUnloaded` after the corresponding RPC succeeds.
+    /// Post-P4b the LOCAL node owns the facade's event fan-out, so the `Higgs`
+    /// facade no longer emits through a Supervisor; kept (with its tests) as the
+    /// per-supervisor emit primitive the restart FSM's siblings use.
+    #[allow(dead_code)]
     pub(crate) fn emit(&self, event: HiggsEvent) {
         let _ = self.inner.events_tx.send(event);
     }

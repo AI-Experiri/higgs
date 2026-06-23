@@ -1,60 +1,20 @@
 use super::*;
-use crate::supervisor::WorkerHalves;
-use parking_lot::Mutex;
-use serde_json::json;
-use tokio::io::AsyncWriteExt;
+use crate::node::test_support::{fake_runtime_spawn_fails, fake_runtime_stateful};
 
-// ── Test seam (mirrored from supervisor::tests::make_supervisor) ──────────
+// ── Test seam ─────────────────────────────────────────────────────────────
 
-/// Build a `Supervisor` plus duplex test handles.
-fn make_supervisor() -> (
-    Supervisor,
-    tokio::io::DuplexStream, // test_write: write responses → supervisor reads
-    tokio::io::DuplexStream, // test_read:  supervisor writes requests → test reads
-) {
-    let (sup_write, test_read) = tokio::io::duplex(64 * 1024);
-    let (test_write, sup_read) = tokio::io::duplex(64 * 1024);
-
-    let sup_write_cell = Arc::new(Mutex::new(Some(sup_write)));
-    let sup_read_cell = Arc::new(Mutex::new(Some(sup_read)));
-
-    let sup = Supervisor::with_factory(Box::new(move |_ring, _model| {
-        let write = sup_write_cell
-            .lock()
-            .take()
-            .ok_or_else(|| HiggsError::WorkerSpawnFailed {
-                source: std::io::Error::other("mock: no more write halves"),
-            })?;
-        let read = sup_read_cell
-            .lock()
-            .take()
-            .ok_or_else(|| HiggsError::WorkerSpawnFailed {
-                source: std::io::Error::other("mock: no more read halves"),
-            })?;
-        Ok(WorkerHalves {
-            write: Box::new(write),
-            read: Box::new(read),
-            proc: None,
-        })
-    }));
-
-    sup.start_for("test-model").expect("mock start");
-    (sup, test_write, test_read)
-}
-
-async fn write_response(stream: &mut tokio::io::DuplexStream, id: u64, result: serde_json::Value) {
-    use crate::rpc::{encode, RpcFrame, RpcResponse};
-    let line = encode(&RpcFrame::Response(RpcResponse {
-        jsonrpc: "2.0".into(),
-        id,
-        result: Some(result),
-        error: None,
-    }));
-    stream
-        .write_all(format!("{line}\n").as_bytes())
-        .await
-        .unwrap();
-    stream.flush().await.unwrap();
+/// A `Higgs` facade over a STATEFUL-fake-worker LOCAL node scanning `dirs` (no
+/// llama.cpp): M_LOAD records the model, M_STATUS reports it, M_CHAT streams
+/// `he`/`llo` + token counts. The node and the facade config both see `dirs`.
+fn fake_higgs(dirs: Vec<PathBuf>) -> Higgs {
+    let node = fake_runtime_stateful(dirs.clone());
+    let cfg = HiggsConfig {
+        lmstudio_dirs: dirs,
+        hf_dirs: vec![],
+        ollama_dirs: vec![],
+        default_load: HiggsConfig::default().default_load,
+    };
+    Higgs::with_local(Arc::new(node), cfg)
 }
 
 // ── Phase A2: repo-id charset + path-traversal guards ────────────────────
@@ -113,12 +73,7 @@ fn path_within_roots_contains_and_escapes() {
 /// any scan or worker RPC.
 #[tokio::test]
 async fn load_rejects_traversal_id() {
-    let higgs = Higgs::new(HiggsConfig {
-        lmstudio_dirs: vec![],
-        hf_dirs: vec![],
-        ollama_dirs: vec![],
-        default_load: HiggsConfig::default().default_load,
-    });
+    let higgs = fake_higgs(vec![]);
     let err = higgs
         .load("org/../../etc/passwd", None)
         .await
@@ -129,14 +84,15 @@ async fn load_rejects_traversal_id() {
 /// `probe_support` returns a cached `(arch, quant)` verdict WITHOUT probing.
 ///
 /// The cache is pre-seeded for the current engine version; the rep's combo is
-/// a hit, so `probe_paths` (which would spawn-fail under the mock factory and
+/// a hit, so `probe_paths` (which would spawn-fail under the spawn-fail node and
 /// yield a `false` verdict) is never consulted — the returned verdict is the
 /// seeded `(true, None)`. A second combo is a miss and goes to the probe path,
 /// proving the partition.
 #[tokio::test]
 async fn probe_support_cache_hit_skips_probe() {
-    let (sup, _tw, _tr) = make_supervisor();
-    let higgs = Higgs::with_supervisor(Arc::new(sup), HiggsConfig::default());
+    // Spawn-fail node: a probe miss spawns a transient worker that fails, so the
+    // miss combo yields a `false` verdict (the hit must never reach this path).
+    let higgs = Higgs::with_local(Arc::new(fake_runtime_spawn_fails()), HiggsConfig::default());
     let ev = crate::worker::engine::llamacpp::engine_version();
     // Seed a HIT for (llama, Q4_K_M, <this engine version>).
     higgs
@@ -147,7 +103,7 @@ async fn probe_support_cache_hit_skips_probe() {
         .probe_support(vec![
             // Hit: returns the seeded verdict, no probe.
             ("llama".into(), "Q4_K_M".into(), "/seeded/path.gguf".into()),
-            // Miss: probe path (mock factory spawn-fails) → false verdict.
+            // Miss: probe path (spawn-fails) → false verdict.
             ("gemma4".into(), "Q8_0".into(), "/miss/path.gguf".into()),
         ])
         .await;
@@ -178,10 +134,14 @@ async fn probe_support_cache_hit_skips_probe() {
 /// taken; releasing a permit re-opens a slot.
 #[tokio::test]
 async fn inference_gate_rejects_when_full() {
-    let (sup, _tw, _tr) = make_supervisor();
-    let mut higgs = Higgs::with_supervisor(Arc::new(sup), HiggsConfig::default());
+    // A loaded model so chat_stream resolves past the served-id lookup and reaches
+    // the admission gate.
+    let dir = tempfile::TempDir::new().unwrap();
+    crate::serve::test_support::write_gguf_fixture(dir.path(), "org/model");
+    let mut higgs = fake_higgs(vec![dir.path().to_path_buf()]);
     // One-slot gate so the test deterministically fills it (override the default capacity).
     higgs.inference_gate = Arc::new(tokio::sync::Semaphore::new(1));
+    higgs.load("org/model", None).await.expect("load");
     // Take the only permit and hold it.
     let held = Arc::clone(&higgs.inference_gate)
         .try_acquire_owned()
@@ -199,14 +159,31 @@ async fn inference_gate_rejects_when_full() {
         .expect_err("gate full → ServerBusy");
     assert!(matches!(err, HiggsError::ServerBusy { .. }), "got {err}");
     drop(held);
-    // With the permit released, a request is admitted again (it then fails
-    // later for lack of a real worker response, but admission succeeds).
+    // With the permit released, a request is admitted again.
     assert!(
         Arc::clone(&higgs.inference_gate)
             .try_acquire_owned()
             .is_ok(),
         "slot re-opens after release"
     );
+}
+
+/// `chat_stream` for a model that is not locally served is [HG002] ModelNotFound,
+/// before any admission permit is taken (no worker, nothing to clean up).
+#[tokio::test]
+async fn chat_stream_unloaded_model_not_found() {
+    let higgs = fake_higgs(vec![]);
+    let err = higgs
+        .chat_stream(
+            "org/missing".to_owned(),
+            r#"[{"role":"user","content":"hi"}]"#.to_owned(),
+            8,
+            0.0,
+            None,
+        )
+        .await
+        .expect_err("unloaded model → ModelNotFound");
+    assert!(matches!(err, HiggsError::ModelNotFound { .. }), "got {err}");
 }
 
 // ── Phase B: RAM headroom guard arithmetic ───────────────────────────────
@@ -231,13 +208,9 @@ fn fits_in_memory_respects_headroom_fraction() {
     assert!(fits_in_memory(0, available));
 }
 
-/// `load` refuses a model whose file size exceeds the RAM headroom with
-/// [HG017], before spawning a worker. Uses a fixture whose declared size is
-/// forced over the limit by checking against a tiny synthetic available
-/// value is not possible through `load` (it reads real RAM), so this asserts
-/// the typed-error path via the pure guard plus the diagnostic wiring; the
-/// end-to-end refusal is covered by `fits_in_memory_respects_headroom_fraction`
-/// and the HG017 status-mapping test in `serve::mod`.
+/// The insufficient-memory diagnostic renders the HG017 code. The end-to-end
+/// refusal is covered by `fits_in_memory_respects_headroom_fraction` and the
+/// HG017 status-mapping test in `serve::mod`.
 #[test]
 fn insufficient_memory_diagnostic_is_503_capacity() {
     let err = HiggsError::InsufficientMemory {
@@ -251,9 +224,9 @@ fn insufficient_memory_diagnostic_is_503_capacity() {
 
 // ── Verbose toggle: default false, set/get round-trip ────────────────────
 
-#[test]
-fn verbose_defaults_false_and_round_trips() {
-    let higgs = Higgs::new(HiggsConfig::default());
+#[tokio::test]
+async fn verbose_defaults_false_and_round_trips() {
+    let higgs = fake_higgs(vec![]);
     assert!(!higgs.verbose(), "verbose defaults to false");
     higgs.set_verbose(true);
     assert!(higgs.verbose(), "set_verbose(true) is observed");
@@ -263,9 +236,9 @@ fn verbose_defaults_false_and_round_trips() {
 
 // ── Log-incoming-tokens toggle: default false, set/get round-trip ─────────
 
-#[test]
-fn log_incoming_tokens_defaults_false_and_round_trips() {
-    let higgs = Higgs::new(HiggsConfig::default());
+#[tokio::test]
+async fn log_incoming_tokens_defaults_false_and_round_trips() {
+    let higgs = fake_higgs(vec![]);
     assert!(
         !higgs.log_incoming_tokens(),
         "log_incoming_tokens defaults to false"
@@ -284,9 +257,9 @@ fn log_incoming_tokens_defaults_false_and_round_trips() {
 
 // ── JIT toggle: default TRUE, set/get round-trip ────────────────────────
 
-#[test]
-fn jit_enabled_defaults_true_and_round_trips() {
-    let higgs = Higgs::new(HiggsConfig::default());
+#[tokio::test]
+async fn jit_enabled_defaults_true_and_round_trips() {
+    let higgs = fake_higgs(vec![]);
     assert!(higgs.jit_enabled(), "JIT defaults to ON (true)");
     higgs.set_jit_enabled(false);
     assert!(!higgs.jit_enabled(), "set_jit_enabled(false) is observed");
@@ -296,19 +269,18 @@ fn jit_enabled_defaults_true_and_round_trips() {
 
 // ── Idle auto-unload toggles: defaults + round-trip ──────────────────────
 
-#[test]
-fn idle_unload_settings_default_and_round_trip() {
-    let higgs = Higgs::new(HiggsConfig::default());
-    // Defaults: auto-unload ON, TTL 5 minutes (seeded from IDLE_UNLOAD_TTL).
+#[tokio::test]
+async fn idle_unload_settings_default_and_round_trip() {
+    let higgs = fake_higgs(vec![]);
+    // Defaults: auto-unload ON, TTL 60 minutes (mirrors the node's DEFAULT_IDLE_TTL).
     assert!(
         higgs.auto_unload_idle(),
         "auto-unload defaults to ON (true)"
     );
-    assert_eq!(higgs.idle_ttl_minutes(), 5, "TTL defaults to 5 minutes");
     assert_eq!(
-        IDLE_UNLOAD_TTL_MINUTES * 60,
-        IDLE_UNLOAD_TTL.as_secs(),
-        "minutes seed must equal the Duration const"
+        higgs.idle_ttl_minutes(),
+        DEFAULT_IDLE_TTL.as_secs() / 60,
+        "TTL defaults to the node's idle TTL (60 minutes)"
     );
 
     higgs.set_auto_unload_idle(false);
@@ -318,13 +290,19 @@ fn idle_unload_settings_default_and_round_trip() {
 
     higgs.set_idle_ttl_minutes(30);
     assert_eq!(higgs.idle_ttl_minutes(), 30, "set_idle_ttl_minutes(30)");
+    // The setter also drives the node's live idle policy.
+    assert_eq!(
+        higgs.local.idle().ttl(),
+        std::time::Duration::from_secs(30 * 60),
+        "set_idle_ttl_minutes propagates to the node reaper"
+    );
 }
 
 // ── Per-load idle-TTL override: default None, set/clear round-trip ────────
 
-#[test]
-fn loaded_idle_ttl_override_defaults_none_and_round_trips() {
-    let higgs = Higgs::new(HiggsConfig::default());
+#[tokio::test]
+async fn loaded_idle_ttl_override_defaults_none_and_round_trips() {
+    let higgs = fake_higgs(vec![]);
     // No override by default (0 in the atomic reads back as None).
     assert_eq!(
         higgs.loaded_idle_ttl_override(),
@@ -347,70 +325,16 @@ fn loaded_idle_ttl_override_defaults_none_and_round_trips() {
     );
 }
 
-/// The reaper's effective-TTL expression prefers the per-load override over
-/// the global `idle_ttl_minutes` — the exact `unwrap_or_else` the reaper runs.
-#[test]
-fn reaper_prefers_loaded_override_over_global_ttl() {
-    let higgs = Higgs::new(HiggsConfig::default());
-    // Global TTL is 5 (the default); with no override the effective value is
-    // the global TTL.
-    let effective = |h: &Higgs| {
-        h.loaded_idle_ttl_override()
-            .unwrap_or_else(|| h.idle_ttl_minutes())
-    };
-    assert_eq!(effective(&higgs), 5, "no override → global TTL (5)");
-    // With an override set, it wins regardless of the global TTL.
-    higgs.set_loaded_idle_ttl_override(Some(42));
-    assert_eq!(effective(&higgs), 42, "override (42) wins over global");
-    // Clearing the override falls back to the global TTL again.
-    higgs.set_loaded_idle_ttl_override(None);
-    assert_eq!(effective(&higgs), 5, "cleared → global TTL (5) again");
-}
-
 // ── Serving on/off gate: default true, set/get round-trip ─────────────────
 
-#[test]
-fn serving_enabled_defaults_true_and_round_trips() {
-    let higgs = Higgs::new(HiggsConfig::default());
+#[tokio::test]
+async fn serving_enabled_defaults_true_and_round_trips() {
+    let higgs = fake_higgs(vec![]);
     assert!(higgs.serving_enabled(), "serving defaults to ON (true)");
     higgs.set_serving_enabled(false);
     assert!(!higgs.serving_enabled(), "set_serving_enabled(false)");
     higgs.set_serving_enabled(true);
     assert!(higgs.serving_enabled(), "set_serving_enabled(true)");
-}
-
-// ── Reaper respects the runtime auto-unload toggle and TTL ────────────────
-//
-// The reaper reads `auto_unload_idle` and `idle_ttl_minutes` from the live
-// atoms each tick. These tests drive the same decision predicate the reaper
-// uses (read flag → skip if off; read TTL → skip if idle_for < ttl) against a
-// facade whose runtime values are set via the public accessors, proving a
-// change takes effect without a restart.
-
-#[test]
-fn reaper_skips_when_auto_unload_disabled() {
-    let higgs = Higgs::new(HiggsConfig::default());
-    higgs.set_auto_unload_idle(false);
-    // With auto-unload off, the reaper's first guard short-circuits: no
-    // unload regardless of how long the model has been idle.
-    assert!(!higgs.auto_unload_idle(), "reaper would skip this tick");
-}
-
-#[test]
-fn reaper_uses_runtime_ttl_not_const() {
-    let higgs = Higgs::new(HiggsConfig::default());
-    // Raise the TTL to 60 minutes at runtime.
-    higgs.set_idle_ttl_minutes(60);
-    let ttl = std::time::Duration::from_secs(higgs.idle_ttl_minutes() * 60);
-    // A model idle for 10 minutes is BELOW the new 60-minute TTL → not reaped,
-    // even though it exceeds the old 5-minute const default.
-    let idle_for = std::time::Duration::from_secs(10 * 60);
-    assert!(idle_for < ttl, "runtime TTL (60m) keeps a 10m-idle model");
-    assert!(
-        idle_for > IDLE_UNLOAD_TTL,
-        "the same 10m idle WOULD reap under the old 5m const — proving the \
-             reaper must read the runtime value, not the const"
-    );
 }
 
 // ── Test 1: default config paths ─────────────────────────────────────────
@@ -451,22 +375,16 @@ fn default_config_paths() {
 // ── Test 2: scan runs host-side with no worker ───────────────────────────
 
 /// `scan()` runs host-side (pure Rust, no worker RPC): with a fresh facade
-/// that never spawned a worker and empty config dirs, it returns `Ok(empty)`.
+/// that never loaded a model and empty config dirs, it returns `Ok(empty)` and
+/// status reports no resident worker.
 #[tokio::test]
 async fn scan_runs_host_side_without_worker() {
-    // Empty config dirs → nothing to scan → Ok(empty). The point is that no
-    // worker is live (start() never called) yet scan succeeds.
-    let higgs = Higgs::new(HiggsConfig {
-        lmstudio_dirs: vec![],
-        hf_dirs: vec![],
-        ollama_dirs: vec![],
-        default_load: HiggsConfig::default().default_load,
-    });
+    let higgs = fake_higgs(vec![]);
 
     let models = higgs.scan().await.expect("host-side scan should succeed");
     assert!(models.is_empty(), "empty dirs yield no models");
 
-    // No worker was ever spawned: status reports worker_alive=false.
+    // No model loaded → no resident worker: status reports worker_alive=false.
     let st = higgs.status().await.expect("status");
     assert!(!st.worker_alive, "scan must not spawn a worker");
 }
@@ -478,20 +396,8 @@ async fn load_then_status_maps() {
     // `load` resolves the GGUF path host-side, so point config at a fixture (ctx_train=4096).
     let dir = tempfile::TempDir::new().unwrap();
     crate::serve::test_support::write_gguf_fixture(dir.path(), "org/model");
-    let cfg = HiggsConfig {
-        lmstudio_dirs: vec![dir.path().to_path_buf()],
-        hf_dirs: vec![],
-        ollama_dirs: vec![],
-        default_load: HiggsConfig::default().default_load,
-    };
-    let expected_gpu_layers = cfg.default_load.gpu_layers;
-    // Self-responding stateful fake worker: M_LOAD records the model; M_STATUS reports it back
-    // — so the load→status round-trip is exercised without driving stdio by hand (and the test
-    // survives the P4b engine swap, which routes through a NodeRuntime).
-    let sup = crate::supervisor::Supervisor::with_factory(
-        crate::node::test_support::fake_worker_factory_stateful(),
-    );
-    let higgs = Higgs::with_supervisor(Arc::new(sup), cfg);
+    let expected_gpu_layers = HiggsConfig::default().default_load.gpu_layers;
+    let higgs = fake_higgs(vec![dir.path().to_path_buf()]);
     let mut events_rx = higgs.events();
 
     higgs
@@ -499,8 +405,8 @@ async fn load_then_status_maps() {
         .await
         .expect("load should succeed");
 
-    // ModelLoaded event must arrive.
-    let ev = tokio::time::timeout(std::time::Duration::from_millis(200), events_rx.recv())
+    // ModelLoaded event must arrive (emitted by the node on commit).
+    let ev = tokio::time::timeout(std::time::Duration::from_millis(500), events_rx.recv())
         .await
         .expect("timeout")
         .expect("recv");
@@ -514,7 +420,7 @@ async fn load_then_status_maps() {
     assert_eq!(li.id, "org/model");
     // ctx_len defaults to the model's trained context (4096) when the caller pins none.
     assert_eq!(li.ctx_len, 4096);
-    // gpu_layers from the load request round-trips through the worker into status.
+    // gpu_layers from the host default round-trips through the worker into status.
     assert_eq!(li.gpu_layers, expected_gpu_layers);
 }
 
@@ -527,18 +433,7 @@ async fn status_loaded_info_includes_model_metadata() {
     // enriches the worker-reported `loaded`.
     let dir = tempfile::TempDir::new().unwrap();
     crate::serve::test_support::write_gguf_fixture(dir.path(), "org/model");
-    let cfg = HiggsConfig {
-        lmstudio_dirs: vec![dir.path().to_path_buf()],
-        hf_dirs: vec![],
-        ollama_dirs: vec![],
-        default_load: HiggsConfig::default().default_load,
-    };
-    // Stateful fake worker reports the loaded model in M_STATUS after a load; the metadata
-    // fields (arch/quant/size/max_ctx/chat_template) are filled host-side from the fixture.
-    let sup = crate::supervisor::Supervisor::with_factory(
-        crate::node::test_support::fake_worker_factory_stateful(),
-    );
-    let higgs = Higgs::with_supervisor(Arc::new(sup), cfg);
+    let higgs = fake_higgs(vec![dir.path().to_path_buf()]);
 
     higgs
         .load("org/model", None)
@@ -555,69 +450,98 @@ async fn status_loaded_info_includes_model_metadata() {
     assert_eq!(li.has_chat_template, Some(true));
 }
 
-// ── Test 3c: host-resolved load carries the GGUF path (no worker scan) ────
-//
-// Regression: after scan moved host-side, the worker's ModelStore is empty,
-// so the worker can only resolve a path if the host puts it in M_LOAD params.
-// This asserts `load(id)` resolves the path host-side and includes it in the
-// M_LOAD request — proving the load works WITHOUT a prior worker scan. If the
-// path-passing were removed (worker fell back to its empty `store.get(id)`),
-// the params would carry no `path` and this test would fail.
+// ── Test 3c: load is idempotent per model ─────────────────────────────────
+
+/// A second `load` of the same id is a no-op success — the facade dedups by raw
+/// model so the additive node never spawns a duplicate worker. After two loads
+/// there is exactly one resident instance.
 #[tokio::test]
-async fn load_carries_host_resolved_path() {
-    use tokio::io::{AsyncBufReadExt, BufReader};
-
-    let (sup, mut test_write, test_read) = make_supervisor();
-
-    // Real GGUF fixture so the host-side scan discovers the id with a path.
+async fn load_is_idempotent_per_model() {
     let dir = tempfile::TempDir::new().unwrap();
     crate::serve::test_support::write_gguf_fixture(dir.path(), "org/model");
-    let cfg = HiggsConfig {
-        lmstudio_dirs: vec![dir.path().to_path_buf()],
-        hf_dirs: vec![],
-        ollama_dirs: vec![],
-        default_load: HiggsConfig::default().default_load,
-    };
-    let higgs = Higgs::with_supervisor(Arc::new(sup), cfg);
+    let higgs = fake_higgs(vec![dir.path().to_path_buf()]);
 
-    // Drive the load. `load` first runs a host-side scan (on a blocking
-    // thread) before sending M_LOAD, so drive the load future concurrently
-    // with a responder that reads the request line (proving id=1 is pending)
-    // before replying. A fixed pre-sleep would race the scan and drop the
-    // response.
-    let mut lines = BufReader::new(test_read).lines();
-    let load_fut = higgs.load("org/model", None);
-    let (load_res, line) = tokio::join!(load_fut, async {
-        let line = lines.next_line().await.unwrap().expect("M_LOAD request");
-        write_response(&mut test_write, 1, json!({"id": "org/model"})).await;
-        line
-    });
-    load_res.expect("host-resolved load should succeed");
+    higgs.load("org/model", None).await.expect("first load");
+    higgs
+        .load("org/model", None)
+        .await
+        .expect("second load (no-op)");
 
-    // The M_LOAD request carries the fixture path resolved host-side.
-    let v: serde_json::Value = serde_json::from_str(&line).unwrap();
-    assert_eq!(v["method"], M_LOAD);
-    let path = v["params"]["path"].as_str().expect("path in M_LOAD params");
-    assert!(path.ends_with(".gguf"), "path was: {path}");
-    assert!(path.contains("org/model"), "path was: {path}");
+    assert_eq!(
+        higgs.local_served_ids().await,
+        vec!["org/model".to_owned()],
+        "exactly one resident instance after a duplicate load"
+    );
+}
+
+// ── Test 3d: multi-model — two distinct models resident + individually served ─
+
+/// The local node is multi-model: loading two distinct models keeps BOTH resident
+/// (additive), each addressable by its own served id, and a chat for each routes to
+/// its own worker. status() reports the PRIMARY (lowest worker id).
+#[tokio::test]
+async fn multi_model_both_served_and_reachable() {
+    let dir = tempfile::TempDir::new().unwrap();
+    crate::serve::test_support::write_gguf_fixture(dir.path(), "org/a");
+    crate::serve::test_support::write_gguf_fixture(dir.path(), "org/b");
+    let higgs = fake_higgs(vec![dir.path().to_path_buf()]);
+
+    higgs.load("org/a", None).await.expect("load a");
+    higgs.load("org/b", None).await.expect("load b");
+
+    // Both are served (sorted), each by its raw id (no suffix — distinct models).
+    assert_eq!(
+        higgs.local_served_ids().await,
+        vec!["org/a".to_owned(), "org/b".to_owned()],
+        "both models are served at once"
+    );
+
+    // Each served id resolves to its own loaded instance.
+    assert_eq!(
+        higgs.local_loaded_info("org/a").await.map(|l| l.id),
+        Some("org/a".to_owned())
+    );
+    assert_eq!(
+        higgs.local_loaded_info("org/b").await.map(|l| l.id),
+        Some("org/b".to_owned())
+    );
+
+    // A chat for each routes to its own worker and completes.
+    for id in ["org/a", "org/b"] {
+        let (_rx, handle) = higgs
+            .chat_stream(
+                id.to_owned(),
+                r#"[{"role":"user","content":"hi"}]"#.to_owned(),
+                32,
+                0.0,
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("chat_stream {id}: {e}"));
+        let out = tokio::time::timeout(std::time::Duration::from_millis(500), handle)
+            .await
+            .expect("join timeout")
+            .expect("join error")
+            .expect("chat outcome");
+        assert_eq!(out.content, "hello", "{id} served");
+    }
+
+    // status() reports the primary (lowest worker id = first loaded = org/a).
+    let st = higgs.status().await.expect("status");
+    assert!(st.worker_alive);
+    assert_eq!(st.loaded.expect("loaded").id, "org/a", "primary is org/a");
 }
 
 // ── Test 4: chat_stream delivers chunks and outcome ────────────────────────
-//
-// Verifies end-to-end: alloc_request_id allocates id=1; chat_stream registers
-// the sink under that id and sends M_CHAT with request_id=1; the test injects
-// N_CHAT_CHUNK notifications tagged request_id=1; route_notification delivers
-// them to rx; the final response for RPC id=1 resolves the outcome handle.
 
 #[tokio::test]
 async fn chat_stream_delivers() {
-    // Stateful fake worker streams `he`/`llo` then a final `hello` on M_CHAT — so the
-    // streaming path is exercised without driving stdio by hand (and survives the P4b swap).
-    let sup = crate::supervisor::Supervisor::with_factory(
-        crate::node::test_support::fake_worker_factory_stateful(),
-    );
-    sup.start_for("org/model").expect("start the fake worker");
-    let higgs = Higgs::with_supervisor(Arc::new(sup), HiggsConfig::default());
+    // Load a fixture model, then stream a chat. The stateful fake worker streams
+    // `he`/`llo` then a final `hello` with token counts.
+    let dir = tempfile::TempDir::new().unwrap();
+    crate::serve::test_support::write_gguf_fixture(dir.path(), "org/model");
+    let higgs = fake_higgs(vec![dir.path().to_path_buf()]);
+    higgs.load("org/model", None).await.expect("load");
 
     let (mut rx, handle) = higgs
         .chat_stream(
@@ -647,47 +571,4 @@ async fn chat_stream_delivers() {
     let chunk2 = rx.recv().await.expect("chunk 2");
     assert_eq!(chunk1, "he");
     assert_eq!(chunk2, "llo");
-}
-
-// ── Test 5: chat_stream against dead worker removes sink ─────────────────
-
-/// When the chat request fails (write_tx is None — worker not running), the
-/// spawned task removes the sink on the error path so the map stays clean.
-#[tokio::test]
-async fn chat_stream_dead_worker_removes_sink() {
-    // Build a Supervisor with no worker halves — factory always fails.
-    let sup = crate::supervisor::Supervisor::with_factory(Box::new(|_ring, _model| {
-        Err(HiggsError::WorkerSpawnFailed {
-            source: std::io::Error::other("mock: no worker"),
-        })
-    }));
-    // Do NOT call start() — write_tx stays None (dead worker).
-
-    let higgs = Higgs::with_supervisor(Arc::new(sup), HiggsConfig::default());
-
-    // chat_stream registers the sink then the spawned task encounters dead worker.
-    let (_rx, handle) = higgs
-        .chat_stream(
-            "org/model".to_owned(),
-            r#"[{"role":"user","content":"hi"}]"#.to_owned(),
-            8,
-            0.0,
-            None,
-        )
-        .await
-        .expect("chat_stream itself should not fail");
-
-    // The spawned task must return an Err (worker dead).
-    let result = tokio::time::timeout(std::time::Duration::from_millis(200), handle)
-        .await
-        .expect("join timeout")
-        .expect("join error");
-    assert!(result.is_err(), "chat against dead worker must fail");
-
-    // After the failed request, the sink map must be empty (remove_chat_sink was called).
-    assert_eq!(
-        higgs.sup.chat_sinks_count(),
-        0,
-        "chat_sinks must be empty after failed request"
-    );
 }

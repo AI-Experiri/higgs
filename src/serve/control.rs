@@ -58,17 +58,22 @@ fn control_error(err: &HiggsError) -> (StatusCode, Json<HiggsErrorResponse>) {
     )
 }
 
-/// Host-side scan of all configured directories plus the currently loaded model
-/// id. The scan is pure Rust (no worker); only the `status()` call is a worker
-/// RPC. `Err(response)` carries the mapped control error on either failure.
+/// Host-side scan of all configured directories plus the set of currently-resident
+/// model ids and the PRIMARY one. The local node is multi-model, so the per-model
+/// "loaded" flag must reflect EVERY resident model (`loaded_set`), not just the
+/// primary; the singular legacy `loaded_id` (primary, lowest worker) is kept for the
+/// `HiggsModelsResponse.loaded_id` field. At the facade served ids == raw repo ids
+/// (one worker per model), so `local_served_ids` IS the set of loaded raw ids. The
+/// scan is pure Rust (no worker); `Err(response)` carries the mapped control error.
 async fn scan_with_loaded(
     higgs: &Arc<Higgs>,
-) -> Result<(Vec<HiggsModel>, Option<String>), Response> {
+) -> Result<(Vec<HiggsModel>, Vec<String>, Option<String>), Response> {
     let models = higgs.scan().await.map_err(|err| {
         tracing::warn!(error = %err, "higgs: scan failed");
         control_error(&err).into_response()
     })?;
-    let loaded_id = higgs
+    let loaded_set = higgs.local_served_ids().await;
+    let primary = higgs
         .status()
         .await
         .map(|s| s.loaded.map(|l| l.id))
@@ -76,7 +81,7 @@ async fn scan_with_loaded(
             tracing::warn!(error = %err, "higgs: status failed");
             control_error(&err).into_response()
         })?;
-    Ok((models, loaded_id))
+    Ok((models, loaded_set, primary))
 }
 
 /// The `(arch, quant)` support-cache key for a model. A missing arch/quant is
@@ -110,11 +115,13 @@ fn tool_calls_supported(model: &HiggsModel) -> bool {
 /// but no parser matches its template, else `None`.
 fn model_entry(
     mut model: HiggsModel,
-    loaded_id: Option<&str>,
+    loaded_ids: &[String],
     loadable: bool,
     load_reason: Option<String>,
 ) -> HiggsModelEntry {
-    let is_loaded = loaded_id == Some(model.id.as_str());
+    // Multi-model: this model is "loaded" if it is among the resident ids, not only
+    // when it is the primary.
+    let is_loaded = loaded_ids.iter().any(|id| id == &model.id);
     let tool_calls = tool_calls_supported(&model);
     let support_reason = if !loadable {
         // Gate 1 failed: surface the engine's verbatim load error.
@@ -147,8 +154,8 @@ fn model_entry(
 /// the currently loaded model id and the Gate-1/Gate-2 support verdict per model.
 pub(super) async fn control_models(State(higgs): State<Arc<Higgs>>) -> Response {
     tracing::info!("higgs: GET /api/higgs/models");
-    let (models, loaded_id) = match scan_with_loaded(&higgs).await {
-        Ok(pair) => pair,
+    let (models, loaded_set, primary) = match scan_with_loaded(&higgs).await {
+        Ok(triple) => triple,
         Err(resp) => return resp,
     };
     // Gate 1 sweep: one representative path per distinct (arch, quant), probed
@@ -175,12 +182,12 @@ pub(super) async fn control_models(State(higgs): State<Arc<Higgs>>) -> Response 
                 .get(&support_key(&m))
                 .cloned()
                 .unwrap_or((false, Some("probe verdict missing".to_owned())));
-            model_entry(m, loaded_id.as_deref(), loadable, reason)
+            model_entry(m, &loaded_set, loadable, reason)
         })
         .collect();
     Json(HiggsModelsResponse {
         models: entries,
-        loaded_id,
+        loaded_id: primary,
     })
     .into_response()
 }
@@ -196,8 +203,8 @@ pub(super) async fn control_model_by_id(
     Path(id): Path<String>,
 ) -> Response {
     tracing::info!(id = %id, "higgs: GET /api/higgs/models/{{*id}}");
-    let (models, loaded_id) = match scan_with_loaded(&higgs).await {
-        Ok(pair) => pair,
+    let (models, loaded_set, _primary) = match scan_with_loaded(&higgs).await {
+        Ok(triple) => triple,
         Err(resp) => return resp,
     };
     match models.into_iter().find(|m| m.id == id) {
@@ -211,7 +218,7 @@ pub(super) async fn control_model_by_id(
                 .get(&(arch, quant))
                 .cloned()
                 .unwrap_or((false, Some("probe verdict missing".to_owned())));
-            Json(model_entry(model, loaded_id.as_deref(), loadable, reason)).into_response()
+            Json(model_entry(model, &loaded_set, loadable, reason)).into_response()
         }
         None => {
             let err = HiggsError::ModelNotFound { id };
@@ -652,7 +659,6 @@ mod tests {
     use crate::log_bus::LogSource;
     use axum::http::StatusCode;
     use serde_json::json;
-    use std::time::Duration;
     use tower::ServiceExt;
 
     // ── Gate 2: host-side tool-call-parser sniff ─────────────────────────────
@@ -704,20 +710,12 @@ mod tests {
 
     #[tokio::test]
     async fn control_load_unload_roundtrip() {
-        let (sup, mut test_write, _test_read, _ring) = make_supervisor();
         // `load` resolves the GGUF path host-side, so the id must be discoverable.
+        // The stateful fake worker auto-responds to M_LOAD/M_STATUS/M_UNLOAD, so
+        // the load → unload round-trip runs through the real node path.
         let dir = tempfile::TempDir::new().unwrap();
         write_gguf_fixture(dir.path(), "org/model");
-        let app = make_app_with_lmstudio(sup, dir.path().to_path_buf());
-
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            write_response(&mut test_write, 1, json!({"id": "org/model"})).await; // higgs/load
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            write_response(&mut test_write, 2, loaded_status_json()).await; // status (unload id capture)
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            write_response(&mut test_write, 3, serde_json::Value::Null).await; // higgs/unload
-        });
+        let app = make_app_with_lmstudio(dir.path().to_path_buf());
 
         let resp = app
             .clone()
@@ -753,25 +751,15 @@ mod tests {
 
     #[tokio::test]
     async fn control_model_by_id_found_slashed() {
-        let (sup, mut test_write, _test_read, _ring) = make_supervisor();
         // Scan runs host-side: discover the slashed id from a real GGUF fixture.
+        // Nothing is loaded (no worker), so the status enrichment reports
+        // `not-loaded` — the fake worker need not be driven.
         let dir = tempfile::TempDir::new().unwrap();
         write_gguf_fixture(
             dir.path(),
             "lmstudio-community/NVIDIA-Nemotron-3-Nano-4B-GGUF",
         );
-        let app = make_app_with_lmstudio(sup, dir.path().to_path_buf());
-
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            // Only the worker RPC remains: status (nothing loaded).
-            write_response(
-                &mut test_write,
-                1,
-                serde_json::json!({"loaded": null, "models_scanned": 1}),
-            )
-            .await;
-        });
+        let app = make_app_with_lmstudio(dir.path().to_path_buf());
 
         // Literal slash in the URL — this is what real curl sends and what
         // the old `{id}` route could never match.
@@ -793,21 +781,9 @@ mod tests {
 
     #[tokio::test]
     async fn control_model_by_id_not_found() {
-        let (sup, mut test_write, _test_read, _ring) = make_supervisor();
         // Empty temp dir → host-side scan finds nothing → the id is absent.
         let dir = tempfile::TempDir::new().unwrap();
-        let app = make_app_with_lmstudio(sup, dir.path().to_path_buf());
-
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            // Only the worker RPC remains: status (nothing loaded).
-            write_response(
-                &mut test_write,
-                1,
-                serde_json::json!({"loaded": null, "models_scanned": 0}),
-            )
-            .await;
-        });
+        let app = make_app_with_lmstudio(dir.path().to_path_buf());
 
         // Slashed id that does not exist in the catalog → 404 HG002.
         let resp = app
@@ -821,8 +797,7 @@ mod tests {
 
     #[tokio::test]
     async fn pair_without_hub_mode_is_conflict() {
-        let (sup, _test_write, _test_read, _ring) = make_supervisor();
-        let app = make_app(sup);
+        let app = make_app();
         // No hub installed → pairing is a 409 with an explanatory error.
         let resp = app
             .oneshot(post_json("/api/higgs/pair", &json!({})))
@@ -838,8 +813,7 @@ mod tests {
 
     #[tokio::test]
     async fn nodes_load_unload_without_fleet_is_conflict() {
-        let (sup, _w, _r, _ring) = make_supervisor();
-        let load = make_app(sup)
+        let load = make_app()
             .oneshot(post_json(
                 "/api/higgs/nodes/load",
                 &json!({ "node": "n", "model": "m" }),
@@ -847,8 +821,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(load.status(), StatusCode::CONFLICT, "no fleet → 409");
-        let (sup2, _w2, _r2, _ring2) = make_supervisor();
-        let unload = make_app(sup2)
+        let unload = make_app()
             .oneshot(post_json(
                 "/api/higgs/nodes/unload",
                 &json!({ "model": "m" }),
@@ -862,8 +835,7 @@ mod tests {
 
     #[tokio::test]
     async fn version_endpoint() {
-        let (sup, _test_write, _test_read, _ring) = make_supervisor();
-        let app = make_app(sup);
+        let app = make_app();
 
         let resp = app.oneshot(get("/api/higgs/version")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -882,11 +854,11 @@ mod tests {
 
     #[tokio::test]
     async fn logs_endpoint_shapes() {
-        let (sup, _test_write, _test_read, bus) = make_supervisor();
+        let (higgs, bus) = make_higgs_with_bus();
         bus.push(LogSource::Serve, "line one".to_owned());
         bus.push(LogSource::Serve, "line two".to_owned());
         bus.push(LogSource::Serve, "line three".to_owned());
-        let app = make_app(sup);
+        let app = app_for(higgs);
 
         let resp = app.oneshot(get("/api/higgs/logs?n=2")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -902,11 +874,11 @@ mod tests {
     /// end-to-end through the HTTP snapshot handler.
     #[tokio::test]
     async fn logs_endpoint_filters_by_source() {
-        let (sup, _test_write, _test_read, bus) = make_supervisor();
+        let (higgs, bus) = make_higgs_with_bus();
         bus.push(LogSource::Serve, "higgs: GET /v1/models".to_owned());
         bus.push(LogSource::Worker, "ggml_metal_init: loaded".to_owned());
         bus.push(LogSource::Serve, "higgs: loading model".to_owned());
-        let app = make_app(sup);
+        let app = app_for(higgs);
 
         // ?source=worker → only the worker stderr line.
         let resp = app
@@ -949,22 +921,16 @@ mod tests {
     #[tokio::test]
     async fn logs_stream_replays_then_streams_live() {
         use super::{control_logs_stream, LogsQuery};
-        use crate::api::{Higgs, HiggsConfig};
         use axum::extract::{Query, State};
         use axum::response::IntoResponse;
         use futures::StreamExt;
-        use std::sync::Arc;
         use std::time::Duration;
 
-        let (sup, _test_write, _test_read, bus) = make_supervisor();
+        let (higgs, bus) = make_higgs_with_bus();
         // Seed history BEFORE the request — this is the replay prefix.
         bus.push(LogSource::Serve, "hist-1".to_owned());
         bus.push(LogSource::Serve, "hist-2".to_owned());
 
-        let higgs = Arc::new(Higgs::with_supervisor(
-            Arc::new(sup),
-            HiggsConfig::default(),
-        ));
         let resp = control_logs_stream(
             State(higgs.clone()),
             Query(LogsQuery {
@@ -1029,39 +995,44 @@ mod tests {
 
     #[tokio::test]
     async fn control_models_lists_with_loaded_flag() {
-        let (sup, mut test_write, _test_read, _ring) = make_supervisor();
-        // Host-side scan discovers `org/model`; the worker reports it loaded.
+        // Multi-model: load TWO distinct models — the models list must flag BOTH as
+        // `loaded` (not just the primary), and `loaded_id` reports the primary.
         let dir = tempfile::TempDir::new().unwrap();
         write_gguf_fixture(dir.path(), "org/model");
-        let app = make_app_with_lmstudio(sup, dir.path().to_path_buf());
-
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            write_response(&mut test_write, 1, loaded_status_json()).await; // status
-        });
+        write_gguf_fixture(dir.path(), "org/other");
+        let higgs = make_higgs_with_lmstudio(dir.path().to_path_buf());
+        higgs.load("org/model", None).await.expect("load model");
+        higgs.load("org/other", None).await.expect("load other");
+        let app = app_for(higgs);
 
         let resp = app.oneshot(get("/api/higgs/models")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        // Primary (lowest worker = first loaded) is org/model.
         assert_eq!(v["loaded_id"], "org/model");
         let models = v["models"].as_array().expect("models array");
-        assert_eq!(models.len(), 1);
-        assert_eq!(models[0]["state"], "loaded", "loaded id is flagged");
-        assert_eq!(models[0]["format"], "gguf");
-        assert_eq!(models[0]["id"], "org/model");
+        assert_eq!(models.len(), 2, "both models listed");
+        // BOTH resident models are flagged loaded — the multi-model fix.
+        for m in models {
+            assert_eq!(
+                m["state"], "loaded",
+                "every resident model is flagged loaded: {m}"
+            );
+            assert_eq!(m["format"], "gguf");
+        }
     }
 
     // ── control_status passthrough ───────────────────────────────────────────
 
     #[tokio::test]
     async fn control_status_returns_snapshot() {
-        let (sup, mut test_write, _test_read, _ring) = make_supervisor();
-        let app = make_app(sup);
-
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            write_response(&mut test_write, 1, loaded_status_json()).await;
-        });
+        // Load a fixture model so the status snapshot reports it resident (the
+        // stateful fake worker echoes the loaded model in M_STATUS).
+        let dir = tempfile::TempDir::new().unwrap();
+        write_gguf_fixture(dir.path(), "org/model");
+        let higgs = make_higgs_with_lmstudio(dir.path().to_path_buf());
+        higgs.load("org/model", None).await.expect("load");
+        let app = app_for(higgs);
 
         let resp = app.oneshot(get("/api/higgs/status")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1073,17 +1044,10 @@ mod tests {
 
     #[tokio::test]
     async fn control_load_with_explicit_params() {
-        let (sup, mut test_write, _test_read, _ring) = make_supervisor();
         // `load` resolves the GGUF path host-side, so the id must be discoverable.
         let dir = tempfile::TempDir::new().unwrap();
         write_gguf_fixture(dir.path(), "org/model");
-        let app = make_app_with_lmstudio(sup, dir.path().to_path_buf());
-
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            write_response(&mut test_write, 1, json!({"id": "org/model"})).await;
-            // higgs/load
-        });
+        let app = make_app_with_lmstudio(dir.path().to_path_buf());
 
         // Providing ctx_len takes the param-merge branch (Some(LoadParams)).
         let resp = app
@@ -1103,8 +1067,7 @@ mod tests {
 
     #[tokio::test]
     async fn control_system_returns_host_info() {
-        let (sup, _test_write, _test_read, _ring) = make_supervisor();
-        let app = make_app(sup);
+        let app = make_app();
 
         let resp = app.oneshot(get("/api/higgs/system")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1120,8 +1083,7 @@ mod tests {
 
     #[tokio::test]
     async fn logs_settings_get_default_and_put_toggles() {
-        let (sup, _test_write, _test_read, _ring) = make_supervisor();
-        let app = make_app(sup);
+        let app = make_app();
 
         // GET defaults to verbose:false.
         let resp = app
@@ -1169,10 +1131,9 @@ mod tests {
 
     #[tokio::test]
     async fn settings_get_default_and_put_toggles_jit() {
-        let (sup, _test_write, _test_read, _ring) = make_supervisor();
-        let app = make_app(sup);
+        let app = make_app();
 
-        // GET defaults: JIT on, auto-unload on, TTL 5 minutes.
+        // GET defaults: JIT on, auto-unload on, TTL 60 minutes (the node default).
         let resp = app
             .clone()
             .oneshot(get("/api/higgs/settings"))
@@ -1182,7 +1143,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
         assert_eq!(v["jit_enabled"], true, "JIT defaults to on");
         assert_eq!(v["auto_unload_idle"], true, "auto-unload defaults to on");
-        assert_eq!(v["idle_ttl_minutes"], 5, "TTL defaults to 5 minutes");
+        assert_eq!(v["idle_ttl_minutes"], 60, "TTL defaults to 60 minutes");
         assert_eq!(v["serving_enabled"], true, "serving defaults to on");
 
         // PUT all four (JIT off, auto-unload off, TTL 30, serving off) returns ok.
@@ -1217,15 +1178,9 @@ mod tests {
     #[tokio::test]
     async fn settings_handlers_round_trip() {
         use super::{control_set_settings, control_settings};
-        use crate::api::Higgs;
         use axum::extract::State;
-        use std::sync::Arc;
 
-        let (sup, _test_write, _test_read, _ring) = make_supervisor();
-        let higgs = Arc::new(Higgs::with_supervisor(
-            Arc::new(sup),
-            crate::api::HiggsConfig::default(),
-        ));
+        let higgs = make_higgs();
 
         // GET handler reflects the default-on state.
         assert!(
@@ -1262,15 +1217,9 @@ mod tests {
     #[tokio::test]
     async fn verbose_gate_round_trips_through_handlers() {
         use super::{control_logs_settings, control_set_logs_settings};
-        use crate::api::Higgs;
         use axum::extract::State;
-        use std::sync::Arc;
 
-        let (sup, _test_write, _test_read, _ring) = make_supervisor();
-        let higgs = Arc::new(Higgs::with_supervisor(
-            Arc::new(sup),
-            crate::api::HiggsConfig::default(),
-        ));
+        let higgs = make_higgs();
 
         // GET handler reflects the default-off state.
         assert!(
@@ -1308,8 +1257,7 @@ mod tests {
 
     #[tokio::test]
     async fn control_worker_stop_ok() {
-        let (sup, _test_write, _test_read, _ring) = make_supervisor();
-        let app = make_app(sup);
+        let app = make_app();
 
         let resp = app
             .oneshot(post_json("/api/higgs/worker/stop", &json!({})))
@@ -1327,8 +1275,7 @@ mod tests {
     /// wiring + route registration without a live iroh hub.
     #[tokio::test]
     async fn node_models_and_retire_require_hub_mode() {
-        let (sup, _w, _r, _ring) = make_supervisor();
-        let app = make_app(sup);
+        let app = make_app();
 
         let resp = app
             .clone()

@@ -519,13 +519,12 @@ mod tests {
     /// body → 413, and a loopback `Host` with a small body passes the guard.
     #[tokio::test]
     async fn router_host_guard_and_body_limit() {
-        use super::test_support::{make_app, make_supervisor};
+        use super::test_support::make_app;
         use axum::body::Body;
         use axum::http::Request;
         use tower::ServiceExt;
 
-        let (sup, _w, _r, _ring) = make_supervisor();
-        let app = make_app(sup);
+        let app = make_app();
 
         // Foreign Host → 403 (HG012), before any handler runs.
         let resp = app
@@ -561,13 +560,12 @@ mod tests {
     /// `/health` returns 200 without a worker RPC.
     #[tokio::test]
     async fn health_is_cheap_200() {
-        use super::test_support::{make_app, make_supervisor};
+        use super::test_support::make_app;
         use axum::body::Body;
         use axum::http::Request;
         use tower::ServiceExt;
 
-        let (sup, _w, _r, _ring) = make_supervisor();
-        let app = make_app(sup);
+        let app = make_app();
         for uri in ["/health", "/api/higgs/health"] {
             let resp = app
                 .clone()

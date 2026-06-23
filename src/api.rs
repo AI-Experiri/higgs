@@ -1,53 +1,55 @@
 //! `Higgs` public facade and `HiggsConfig` — the host-facing API.
 //!
-//! One `Higgs` instance per host app. Typed facade over
-//! [`Supervisor`](crate::supervisor::Supervisor): `Higgs` owns the facade-level
-//! state (config, the load/unload lifecycle mutex, the inference admission gate,
-//! the idle `last_activity` stamp) and delegates worker process management, RPC
-//! correlation, and load-replay state to the supervisor. The host maps its own
-//! config table onto [`HiggsConfig`].
+//! One `Higgs` instance per host app. Typed facade over a co-located LOCAL
+//! [`NodeRuntime`](crate::node::runtime::NodeRuntime) — the same multi-worker
+//! engine remote nodes run (P4b). `Higgs` owns the facade-level state (config,
+//! the load lifecycle mutex, the inference admission gate, the serve-layer
+//! toggles) and delegates worker spawn/load/unload/status/chat, idle
+//! auto-unload, and the Developer-Log bus to the node. A remote-resident model
+//! routes through the `fleet` instead. The host maps its own config table onto
+//! [`HiggsConfig`].
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use serde_json::json;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::diagnostic::HiggsError;
 use crate::log_bus::{LogBus, LogLine, LogSource};
-use crate::supervisor::{HiggsEvent, Supervisor};
+use crate::node::runtime::{NodeConfig, NodeRuntime, DEFAULT_IDLE_TTL};
+use crate::node::worker_id::WorkerId;
+use crate::remote::NodeLoadParams;
+use crate::supervisor::HiggsEvent;
 use crate::worker::engine::LoadParams;
 use crate::worker::models::HiggsModel;
-use crate::worker::{M_LOAD, M_STATUS, M_UNLOAD};
 
 // Submodules split out of this file (see api/README.md, api/DESIGN.md). `pub use`
 // keeps every existing `crate::api::*` path resolving unchanged.
 mod guards;
-mod reaper;
 mod types;
 
 #[cfg(test)]
 use guards::fits_in_memory;
 use guards::validate_repo_id;
 pub(crate) use guards::{guard_memory_headroom, path_within_roots};
-use reaper::idle_reaper;
 pub use types::*;
 
 /// The in-process handle to the higgs runtime. One instance per host app.
 ///
-/// The host-facing facade over the [`Supervisor`]. `Higgs` owns the facade-level
-/// state — the live [`HiggsConfig`], the `lifecycle` mutex that serializes
-/// load/unload/stop, the `inference_gate` admission semaphore, and the
-/// `last_activity` stamp the idle reaper reads — while the [`Supervisor`] owns
-/// the worker process, RPC correlation, and the load-replay state. Constructing
-/// `Higgs` does not start the worker; call [`start`](Self::start) when the host
-/// is ready to serve requests (a worker is spawned lazily on the first
-/// [`load`](Self::load)).
+/// The host-facing facade over the co-located LOCAL [`NodeRuntime`]. `Higgs` owns
+/// the facade-level state — the live [`HiggsConfig`], the `lifecycle` mutex that
+/// serializes concurrent loads, the `inference_gate` admission semaphore, and the
+/// serve-layer toggles — while the node owns the worker processes, RPC
+/// correlation, idle auto-unload, and the load-replay state. Constructing `Higgs`
+/// does not start a worker; workers are spawned lazily, one per [`load`](Self::load).
 pub struct Higgs {
-    sup: Arc<Supervisor>,
+    /// The co-located LOCAL node (P4b): an in-process multi-worker `NodeRuntime`, the same
+    /// engine remote nodes run. Local inference/load/unload/status route through it; a remote
+    /// model routes through the `fleet`. (Replaces the old single direct `Supervisor`.)
+    local: Arc<NodeRuntime>,
     config: parking_lot::Mutex<HiggsConfig>,
-    /// Serializes load/unload so spawn-on-load and kill-on-unload never
-    /// interleave (protects last_load and the supervisor proc handle).
+    /// Serializes concurrent loads so two racing JIT loads of the same id can't
+    /// each spawn a worker (the node load is additive — it never dedups).
     lifecycle: tokio::sync::Mutex<()>,
     /// Inference admission gate — at most [`MAX_CONCURRENT_INFERENCE`] chat
     /// requests in flight. A `try_acquire_owned` failure on the chat path is a
@@ -61,12 +63,6 @@ pub struct Higgs {
     /// a local model resident — see `chat_stream`). `None` until a fleet is installed is not
     /// needed: the gate exists always; it's only used on the remote branch.
     remote_gate: Arc<tokio::sync::Semaphore>,
-    /// Instant of the most recent chat request, stamped at the top of
-    /// [`chat_stream`](Self::chat_stream). The idle reaper reads it to decide
-    /// when the loaded model has been idle past [`IDLE_UNLOAD_TTL`]. A plain
-    /// `parking_lot::Mutex` — read/written for a single `Instant` copy only,
-    /// never held across `.await`.
-    last_activity: parking_lot::Mutex<std::time::Instant>,
     /// Runtime "Log Incoming Tokens" toggle for the serve layer. When `true`, the
     /// chat path emits an extra INFO `higgs:`-target line per request carrying the
     /// (capped) flattened incoming prompt CONTENT so the Developer Logs show the
@@ -77,31 +73,34 @@ pub struct Higgs {
     log_incoming_tokens: std::sync::atomic::AtomicBool,
     /// Runtime "Just-in-Time loading" toggle for the serve layer. When `true`
     /// (the default), a chat request for a scanned-but-unloaded model triggers an
-    /// on-demand [`load`](Self::load) — swapping out any currently-resident model
-    /// (higgs serves one model at a time) — instead of the `[HG003]` 404. When
+    /// on-demand additive [`load`](Self::load) (a fresh worker alongside any
+    /// others — the local node is multi-model) instead of the `[HG003]` 404. When
     /// `false`, the chat path keeps the explicit-load behavior: an unloaded model
     /// is a 404. A plain atomic — set/read in isolation, no critical section,
     /// never across `.await`. Defaults to `true` (JIT on).
     jit_enabled: std::sync::atomic::AtomicBool,
-    /// Runtime "Auto-unload idle models" toggle. When `true` (the default), the
-    /// idle reaper unloads the loaded model after [`idle_ttl_minutes`](Self::idle_ttl_minutes)
-    /// of no inference. When `false`, the reaper never unloads — a model stays
-    /// resident until an explicit unload. Read by the reaper each tick, so a
-    /// change takes effect without restart. A plain atomic — set/read in
-    /// isolation, never across `.await`.
-    auto_unload_idle: std::sync::atomic::AtomicBool,
-    /// Runtime idle auto-unload TTL, in minutes. The idle reaper unloads the
-    /// loaded model once the time since the last chat exceeds this. Seeded from
-    /// [`IDLE_UNLOAD_TTL`] (5 minutes) and read by the reaper each tick, so a
-    /// change takes effect without restart. A plain atomic — set/read in
-    /// isolation, never across `.await`.
-    idle_ttl_minutes: std::sync::atomic::AtomicU64,
-    /// Per-load idle-TTL override, in minutes (HOST-SIDE only — never sent to the
-    /// worker). `0` means "no override"; any non-zero value takes precedence over
-    /// [`idle_ttl_minutes`](Self::idle_ttl_minutes) in the idle reaper for the
-    /// CURRENTLY-loaded model. Set at load time from the load request and cleared
-    /// on unload so a stale override never outlives its model. A plain atomic —
+    /// Runtime "Auto-unload idle models" toggle, mirrored to the node's live
+    /// [`IdleConfig`](crate::node::runtime::IdleConfig) by
+    /// [`set_auto_unload_idle`](Self::set_auto_unload_idle). When `true` (the
+    /// default), the node's per-worker idle reaper unloads a worker after the idle
+    /// TTL of no inference; when `false` it never auto-unloads. This atomic is the
+    /// facade-side mirror the Server-Settings getter reads. A plain atomic —
     /// set/read in isolation, never across `.await`.
+    auto_unload_idle: std::sync::atomic::AtomicBool,
+    /// Runtime idle auto-unload TTL, in minutes, mirrored to the node's live
+    /// [`IdleConfig`](crate::node::runtime::IdleConfig) by
+    /// [`set_idle_ttl_minutes`](Self::set_idle_ttl_minutes). Seeded from the node's
+    /// [`DEFAULT_IDLE_TTL`] (60 minutes). This atomic is the facade-side mirror the
+    /// Server-Settings getter reads. A plain atomic — set/read in isolation, never
+    /// across `.await`.
+    idle_ttl_minutes: std::sync::atomic::AtomicU64,
+    /// Per-load idle-TTL override, in minutes (HOST-SIDE display only). `0` means
+    /// "no override". Set by the control settings endpoint at load time and cleared
+    /// on unload, and surfaced in [`status`](Self::status)'s `LoadedInfo`. NOTE: the
+    /// node's reaper enforces a single per-node TTL ([`IdleConfig`](crate::node::runtime::IdleConfig));
+    /// per-load override ENFORCEMENT is a documented follow-up, so today this value
+    /// is reported but not independently enforced. A plain atomic — set/read in
+    /// isolation, never across `.await`.
     loaded_idle_ttl_override: std::sync::atomic::AtomicU64,
     /// Runtime "serving on/off" gate for the `/v1` inference surface. When `false`,
     /// the `/v1` inference endpoints return `[HG019]` → 503 while the
@@ -116,9 +115,9 @@ pub struct Higgs {
     /// deferred). A plain `parking_lot::Mutex` over a `HashMap` — held only for the
     /// map read/insert, never across `.await`.
     probe_cache: parking_lot::Mutex<std::collections::HashMap<SupportKey, SupportVerdict>>,
-    /// Cached host device list gathered once via a transient sysinfo worker (see
-    /// [`Supervisor::sysinfo`](crate::supervisor::Supervisor::sysinfo)). Hardware
-    /// is static-ish, so it is gathered on first request and reused; `None` until
+    /// Cached host device list gathered once via the node's transient sysinfo
+    /// worker ([`NodeRuntime::gpus`](crate::node::runtime::NodeRuntime::gpus)).
+    /// Hardware is static-ish, so it is gathered on first request and reused; `None` until
     /// the first successful gather. A failed gather leaves it `None` so a later
     /// request retries. A plain `parking_lot::Mutex` — held only for the
     /// read/insert, never across `.await`.
@@ -156,25 +155,34 @@ impl Higgs {
     /// same Developer-Log history+stream. The caller is responsible for
     /// installing `HiggsLogLayer::new(bus.clone())` on its tracing subscriber.
     pub fn with_log_bus(config: HiggsConfig, bus: Arc<LogBus>) -> Self {
-        Self::with_supervisor(Arc::new(Supervisor::spawn(bus)), config)
+        // Build the co-located LOCAL node from the same config + bus. The node owns the
+        // workers; it shares `bus` so local worker stderr lands in the Developer Logs.
+        let node_config = NodeConfig {
+            bus,
+            lmstudio_dirs: config.lmstudio_dirs.clone(),
+            hf_dirs: config.hf_dirs.clone(),
+            ollama_dirs: config.ollama_dirs.clone(),
+            idle_ttl: DEFAULT_IDLE_TTL,
+        };
+        Self::with_local(Arc::new(NodeRuntime::new(node_config)), config)
     }
 
-    /// Construct the facade around an already-built [`Supervisor`] — the single home for the
-    /// facade's default field initialization. Production goes through [`with_log_bus`]; tests
-    /// inject a fake-worker-backed `Supervisor` here instead of spelling out the struct
-    /// literal, which keeps them stable across struct changes (and the P4b engine swap).
-    pub(crate) fn with_supervisor(sup: Arc<Supervisor>, config: HiggsConfig) -> Self {
+    /// Construct the facade around an already-built local [`NodeRuntime`] — the single home for
+    /// the facade's default field initialization. Production goes through [`with_log_bus`];
+    /// tests inject a fake-worker-backed `NodeRuntime` here.
+    pub(crate) fn with_local(local: Arc<NodeRuntime>, config: HiggsConfig) -> Self {
         Self {
-            sup,
+            local,
             config: parking_lot::Mutex::new(config),
             lifecycle: tokio::sync::Mutex::new(()),
             inference_gate: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_INFERENCE)),
             remote_gate: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_INFERENCE)),
-            last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
             log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
             jit_enabled: std::sync::atomic::AtomicBool::new(true),
+            // Mirror the node's idle defaults (auto-unload on, 60-min TTL) so the
+            // Server-Settings getters read the same values the node reaper enforces.
             auto_unload_idle: std::sync::atomic::AtomicBool::new(true),
-            idle_ttl_minutes: std::sync::atomic::AtomicU64::new(IDLE_UNLOAD_TTL_MINUTES),
+            idle_ttl_minutes: std::sync::atomic::AtomicU64::new(DEFAULT_IDLE_TTL.as_secs() / 60),
             loaded_idle_ttl_override: std::sync::atomic::AtomicU64::new(0),
             serving_enabled: std::sync::atomic::AtomicBool::new(true),
             probe_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
@@ -221,16 +229,15 @@ impl Higgs {
     /// Whether "Verbose Logging" is on. Single home is the [`LogBus`] (read by
     /// the serve completion line AND the worker drain); delegated via the supervisor.
     pub fn verbose(&self) -> bool {
-        self.sup.log_verbose()
+        self.local.bus().verbose()
     }
 
-    /// Turn "Verbose Logging" on or off at runtime. Sets the one-home flag (the
-    /// serve layer + log layer pick it up instantly) AND fire-and-forget pushes
-    /// the level to the running worker so its llama.cpp engine-log filter flips
-    /// (INFO+ ↔ DEBUG+) live, without a reload or blocking the caller.
+    /// Turn "Verbose Logging" on or off at runtime on the local node bus (the serve layer +
+    /// log layer pick it up instantly; newly-spawned local workers inherit it at load time).
+    /// NOTE: with multiple local workers the level is no longer pushed live into
+    /// already-running workers' llama.cpp filters — it takes effect on the next load.
     pub fn set_verbose(&self, v: bool) {
-        self.sup.set_log_verbose(v);
-        self.sup.set_worker_verbose(v);
+        self.local.bus().set_verbose(v);
     }
 
     /// Whether serve-layer "Log Incoming Tokens" is on (the incoming-prompt line).
@@ -250,13 +257,13 @@ impl Higgs {
     /// then emits non-message structured fields (incl. prompt content). Off by
     /// default. Lives on the [`LogBus`] (the layer's only handle); delegated here.
     pub fn log_show_fields(&self) -> bool {
-        self.sup.log_show_fields()
+        self.local.bus().show_fields()
     }
 
     /// Toggle the un-redacted DEBUG log mode at runtime. Enabling it surfaces ALL
     /// structured log fields — including prompt CONTENT — for debugging.
     pub fn set_log_show_fields(&self, v: bool) {
-        self.sup.set_log_show_fields(v);
+        self.local.bus().set_show_fields(v);
     }
 
     /// Whether serve-layer "Just-in-Time loading" is on (default `true`). When
@@ -285,6 +292,7 @@ impl Higgs {
     pub fn set_auto_unload_idle(&self, v: bool) {
         self.auto_unload_idle
             .store(v, std::sync::atomic::Ordering::Relaxed);
+        self.local.idle().set_enabled(v); // drive the local node reaper live
     }
 
     /// Idle minutes after which the loaded model is auto-unloaded (default seeded
@@ -299,6 +307,9 @@ impl Higgs {
     pub fn set_idle_ttl_minutes(&self, minutes: u64) {
         self.idle_ttl_minutes
             .store(minutes, std::sync::atomic::Ordering::Relaxed);
+        self.local
+            .idle()
+            .set_ttl(std::time::Duration::from_secs(minutes * 60));
     }
 
     /// Active per-load idle-TTL override in minutes, or `None` when no override
@@ -345,28 +356,36 @@ impl Higgs {
     /// LM-Studio model). `scan` runs host-side and needs no worker. The serve
     /// layer holds `Arc<Higgs>` for control regardless of worker liveness.
     ///
-    /// Spawns the idle reaper background task, which auto-unloads the loaded
-    /// model after [`IDLE_UNLOAD_TTL`] with no inference. The task holds a
-    /// `Weak<Higgs>` so it self-terminates when the host drops its `Arc<Higgs>`.
+    /// Idle auto-unload now lives IN the local `NodeRuntime` (per-worker), so the engine no
+    /// longer runs its own reaper. This spawns a relay draining the local node's per-worker
+    /// stderr into the shared Developer-Log bus (the node tags lines on per-worker buses,
+    /// otherwise separate from the engine bus).
     pub async fn start(self: &Arc<Self>) -> Result<(), HiggsError> {
-        let weak = Arc::downgrade(self);
-        tokio::spawn(idle_reaper(weak));
+        let mut logs = self.local.subscribe_logs();
+        let bus = self.local.bus().clone();
+        tokio::spawn(async move {
+            loop {
+                match logs.recv().await {
+                    Ok((_worker, line)) => bus.push(LogSource::Worker, line),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
         Ok(())
     }
 
-    /// Gracefully shut down the worker (2 s timeout).
+    /// Gracefully shut down EVERY local worker (the node's `shutdown_all` drain).
     ///
     /// Holds the `lifecycle` mutex for the whole body so a deliberate stop never
-    /// interleaves with a concurrent `load`/`unload` (which would let a load
-    /// spawn + M_LOAD + emit `ModelLoaded` race this kill). Also clears the
-    /// load-replay state: a deliberate worker stop must not leave `last_load`
-    /// behind for `attempt_restart` to resurrect the model.
+    /// interleaves with a concurrent `load` (which would let a fresh worker slip
+    /// past the drain). The node's drain reaps each worker's process and clears its
+    /// load-replay state, so no worker survives to be auto-restarted.
     pub async fn stop(&self) {
         let _lifecycle = self.lifecycle.lock().await;
-        self.sup.clear_last_load();
-        self.sup.stop().await;
-        // A deliberate worker stop unloads the model — drop any per-load idle-TTL
-        // override so it never applies to a model loaded after a restart.
+        // Drain every local worker (graceful shutdown of the local node's registry).
+        self.local.shutdown_all().await;
+        // No model is loaded after a full drain — drop any per-load idle-TTL override.
         self.set_loaded_idle_ttl_override(None);
     }
 
@@ -444,7 +463,7 @@ impl Higgs {
             return result;
         }
         // Probe the misses in a transient, crash-isolated worker.
-        let verdicts = self.sup.probe_paths(to_probe).await;
+        let verdicts = self.local.probe_paths(to_probe).await;
         let mut cache = self.probe_cache.lock();
         for (path, (loadable, reason, probe_version)) in verdicts {
             let Some((arch, quant)) = path_combo.remove(&path) else {
@@ -465,141 +484,165 @@ impl Higgs {
     /// `params` overrides `default_load` when supplied. On success, records the
     /// load params for post-restart replay and emits [`HiggsEvent::ModelLoaded`].
     pub async fn load(&self, id: &str, params: Option<LoadParams>) -> Result<(), HiggsError> {
-        // Serialize the whole load/unload lifecycle: spawn-on-load and
-        // kill-on-unload must never interleave (protects last_load and the
-        // supervisor proc handle). Held for the entire method body.
+        // Serialize concurrent loads at the facade so two racing JIT loads of the
+        // same id can't each spawn a worker (the node load is additive — it never
+        // dedups). Held for the whole method body.
         let _lifecycle = self.lifecycle.lock().await;
-        // load() reads as a sequence of named guard/resolve steps; each helper
-        // keeps the exact same order and diagnostic codes as before.
-        let explicit_params = params.is_some();
-        let mut p = params.unwrap_or_else(|| self.config.lock().default_load.clone());
-        // 1. Charset guard ([HG015]) — reject traversal/escape ids before any FS use.
+        // 1. Charset guard ([HG015]) — reject traversal/escape ids before any FS
+        //    use. The node does resolve ([HG002]), the path-traversal guard
+        //    ([HG015]), and the RAM headroom guard ([HG017]); this charset check
+        //    is the one guard that stays host-side (it precedes any FS access).
         validate_repo_id(id)?;
-        // 2. Scan host-side and resolve the GGUF path ([HG002] if not found).
-        let model = self.resolve_model(id).await?;
-        // 3. Path-traversal guard ([HG015]) — resolved path must stay inside the roots.
-        self.guard_path_within_roots(id, &model.path)?;
-        // 4. Pre-load RAM headroom guard ([HG017]) — refuse before spawning a worker.
-        guard_memory_headroom(id, model.size_bytes)?;
-        // When the caller didn't pin ctx_len, default it to the model's trained
-        // context (capped at DEFAULT_CTX_CAP) rather than the hardcoded 4096 —
-        // otherwise an agent asking for a large max_tokens overflows n_ctx
-        // ([HG005]). The UI can still request the full trained window explicitly.
-        if !explicit_params {
-            if let Some(train) = model.ctx_train {
-                p.ctx_len = (train as u32).min(DEFAULT_CTX_CAP);
+        // Idempotent per model: if a worker for this raw id is already resident,
+        // this is a no-op success. The node load is ADDITIVE (it never dedups), so
+        // without this a second explicit load — or two racing JIT loads of the same
+        // unloaded model — would spawn a duplicate worker. The `lifecycle` mutex
+        // serializes concurrent loads, so the common check-then-load is race-free.
+        // (To run N instances of one model, the node API is additive; the facade
+        // deliberately presents one-worker-per-model.)
+        //
+        // RESIDUAL (cancellation): the mutex is released if a load future is
+        // CANCELLED mid-flight (after its `NodeMsg::Load` is sent but before the
+        // reply). A second same-id load can then acquire the mutex, observe no
+        // COMMITTED worker (the first's commit is still pending), and spawn a
+        // duplicate. This self-heals: the cancelled load's `LoadCommit` reaps its
+        // worker (the caller is gone, so the keep-insert is skipped), and the RAM
+        // headroom guard bounds the transient overlap — end state is one worker. A
+        // fully cancellation-safe dedup would require the node actor to track and
+        // dedup IN-FLIGHT loads, changing its additive contract (used by the remote
+        // path); deferred as not worth that for a self-healing, memory-bounded race.
+        if self.local.instances().await.iter().any(|(_, m)| m == id) {
+            return Ok(());
+        }
+        // Map the host `LoadParams` onto the node's lean `NodeLoadParams`. Only
+        // id/ctx_len/gpu_layers/threads cross to the node today; the rich engine
+        // overrides (use_mmap/use_mlock/n_batch/…) are NOT carried — matching the
+        // remote path (DESIGN-remote.md), a documented gap. When the caller pins
+        // no params, ctx_len is left `None` so the node defaults it to the model's
+        // trained context (capped at DEFAULT_CTX_CAP), exactly as the old facade did.
+        let np = match params {
+            Some(p) => NodeLoadParams {
+                id: id.to_owned(),
+                ctx_len: Some(p.ctx_len),
+                gpu_layers: Some(p.gpu_layers),
+                threads: Some(p.threads),
+            },
+            None => {
+                let d = self.config.lock().default_load.clone();
+                NodeLoadParams {
+                    id: id.to_owned(),
+                    ctx_len: None,
+                    gpu_layers: Some(d.gpu_layers),
+                    threads: Some(d.threads),
+                }
             }
-        }
-        // Serialize the full LoadParams (base + every optional override) and
-        // merge `id`/`path` in. Absent optionals (`skip_serializing_if`) simply
-        // don't appear, so a quick-load carries exactly the three base fields —
-        // the worker then sees no overrides and reproduces current behavior.
-        let mut req_params =
-            serde_json::to_value(&p).expect("LoadParams serializes to a JSON object");
-        if let Some(obj) = req_params.as_object_mut() {
-            obj.insert("id".into(), json!(id));
-            obj.insert("path".into(), json!(model.path));
-        }
-        // Spawn-on-load: if no worker is live, bring one up named `higgs(<id>)`
-        // before sending M_LOAD. A redundant call while a worker is running is a
-        // no-op (single-reader invariant in the supervisor).
-        self.sup.start_for(id)?;
-        // If M_LOAD fails (bad GGUF, OOM, …) the worker is alive but holds no
-        // model — that contradicts kill-on-unload. Tear it down before
-        // returning. Call `self.sup.stop()` DIRECTLY (not `self.stop()`): we
-        // already hold the `lifecycle` mutex, and `Higgs::stop()` would re-take
-        // it → deadlock. `record_last_load`/`ModelLoaded` stay on success only.
-        if let Err(e) = self.sup.request(M_LOAD, req_params.clone()).await {
-            self.sup.clear_last_load();
-            self.sup.stop().await;
-            return Err(e);
-        }
-        self.sup.record_last_load(req_params);
-        // Stamp activity on a successful load: the idle reaper measures the TTL
-        // from the last chat OR load. Without this, a model loaded while the
-        // process has been idle past IDLE_UNLOAD_TTL would be eligible for
-        // auto-unload on the reaper's very next tick — before the user gets to
-        // send a single chat. A fresh load IS recent activity.
-        *self.last_activity.lock() = std::time::Instant::now();
-        self.sup.emit(HiggsEvent::ModelLoaded { id: id.to_owned() });
-        Ok(())
+        };
+        // Additive load on the local node: spawns a fresh worker for `id` (the
+        // node emits `ModelLoaded` on commit). resolve / headroom / path-traversal
+        // failures surface as their mapped HiggsError.
+        self.local.load(np).await.map(|_| ())
     }
 
-    /// Unload the current model.
+    /// Unload ALL locally-resident models.
     ///
-    /// Emits [`HiggsEvent::ModelUnloaded`] with an empty id when no model id
-    /// is available at the facade layer (v1 limitation; worker tracks it).
+    /// The control surface is single-button ("unload"), so this drains every local
+    /// worker. Each [`NodeRuntime::unload`](crate::node::runtime::NodeRuntime::unload)
+    /// removes the worker from the registry synchronously, then AWAITS its
+    /// `Supervisor::stop()` (the node fires the reply only after the process is
+    /// reaped) and emits one [`HiggsEvent::ModelUnloaded`].
+    ///
+    /// `shutdown_all` is NOT used here: it is terminal (it permanently rejects
+    /// future loads), whereas unload must leave the node ready to load again.
+    ///
+    /// CONCURRENCY: the `lifecycle` mutex serializes this against `load` (no fresh
+    /// worker can slip past the drain — `load` is the only thing that ADDS a worker).
+    /// The one other concurrent mutator is the node's idle reaper, which only
+    /// REMOVES workers. If it grabs a snapshotted worker between this loop's
+    /// `instances()` snapshot and that worker's `unload`, our `unload` returns
+    /// `no_worker` (ignored): that worker was already removed AND its stop is reaped
+    /// by the node on a tracked teardown task (no leak/orphan — the actor holds
+    /// itself alive until every in-flight stop completes). So the post-condition
+    /// "no worker resident" always holds on return; the only residual is that a
+    /// reaper-grabbed worker's process exit may finish microseconds after this
+    /// returns, which is harmless (a following additive `load` is gated by the RAM
+    /// headroom guard, and multi-model workers coexist by design anyway).
     pub async fn unload(&self) -> Result<(), HiggsError> {
-        // Serialize the whole load/unload lifecycle (see `load`): held for the
-        // entire method body so a concurrent load cannot re-set last_load after
-        // the clear or race start_for against this stop.
         let _lifecycle = self.lifecycle.lock().await;
-        // TODO(v2): single RPC — status+unload is TOCTOU if worker state changes between calls (v1: worker serializes, benign)
-        // Capture id from status before unloading so the event carries it.
-        let id = self.loaded_id().await.unwrap_or_default();
-        // Drop the load-replay state BEFORE the unload/stop awaits: if a respawn
-        // races the stop, there must be nothing left for it to replay. Clearing
-        // after the awaits leaves a window where attempt_restart could reload the
-        // model the user just unloaded.
-        self.sup.clear_last_load();
-        // Best-effort graceful in-worker unload, then KILL the worker process
-        // (spawn-on-load / kill-on-unload). `stop()` sets the deliberate-stop flag
-        // so the death triggers no respawn, drains stdin, and reaps the process.
-        let _ = self.sup.request(M_UNLOAD, serde_json::Value::Null).await;
-        self.sup.stop().await;
-        // Clear the per-load idle-TTL override so it never outlives its model: a
-        // stale override must not apply to the next loaded model.
+        for (worker, _model) in self.local.instances().await {
+            // Ignore `no_worker`: a concurrent idle-reap already removed+reaped it
+            // (see the CONCURRENCY note above). The reaper never ADDS, so after this
+            // single pass the registry is empty.
+            let _ = self.local.unload(worker).await;
+        }
+        // Clear the per-load idle-TTL override so it never outlives its model.
         self.set_loaded_idle_ttl_override(None);
-        self.sup.emit(HiggsEvent::ModelUnloaded { id });
         Ok(())
     }
 
-    /// Return a live status snapshot.
+    /// Return a live status snapshot of the PRIMARY local instance.
     ///
-    /// `worker_alive` is `true` iff the RPC round-trip succeeded. `loaded` is
-    /// independently best-effort: an RPC failure yields `worker_alive:false` with
-    /// `loaded:None`; a malformed `loaded` shape in an otherwise-OK response yields
-    /// `worker_alive:true` with `loaded:None`.
+    /// The local node may host several models (additive load); the single-model
+    /// control surface reports the PRIMARY — the lowest worker id. `worker_alive`
+    /// is `true` iff a worker is resident and its `M_STATUS` round-trip succeeded.
+    /// `loaded` is independently best-effort: no resident worker yields
+    /// `worker_alive:false`/`loaded:None`; a malformed `loaded` shape yields
+    /// `worker_alive:true`/`loaded:None`. `/v1/models` lists ALL served instances
+    /// via [`local_served_ids`](Self::local_served_ids), not just this primary.
     pub async fn status(&self) -> Result<HiggsStatus, HiggsError> {
-        let result = self.sup.request(M_STATUS, serde_json::Value::Null).await;
-        let worker_alive = result.is_ok();
-        let v = result.unwrap_or(serde_json::Value::Null);
-
-        // Scan moved host-side: the worker no longer scans (its `ModelStore` is
-        // empty), so model metadata and the on-disk count both come from ONE
-        // host-side FS walk (pure Rust, no worker RPC), reused below.
+        // Scan host-side (pure Rust, no worker RPC): model metadata + on-disk
+        // count both come from ONE FS walk, reused for enrichment below.
         let scan = self.scan().await.unwrap_or_default();
         let models_on_disk = scan.len() as u32;
 
-        // The worker's M_STATUS reports `id`/`ctx_len`/`gpu_layers`/`threads`
-        // from the live model, but `arch`/`quant`/`size_bytes`/
-        // `max_context_length`/`has_chat_template` come back null (its store is
-        // empty). Enrich those from the matching host-scanned `HiggsModel` while
-        // keeping the worker-reported id/ctx_len verbatim.
-        let loaded = v.get("loaded").and_then(|l| {
-            if l.is_null() {
-                return None;
-            }
-            let id = l.get("id")?.as_str()?.to_owned();
-            let scanned = scan.iter().find(|m| m.id == id);
-            Some(LoadedInfo {
-                ctx_len: l.get("ctx_len")?.as_u64()? as u32,
-                gpu_layers: l.get("gpu_layers")?.as_u64()? as u32,
-                threads: l.get("threads")?.as_u64()? as u32,
-                arch: scanned.and_then(|m| m.arch.clone()),
-                quant: scanned.and_then(|m| m.quant.clone()),
-                max_context_length: scanned.and_then(|m| m.ctx_train),
-                size_bytes: scanned.map(|m| m.size_bytes),
-                has_chat_template: scanned.map(|m| m.has_chat_template),
-                idle_ttl_minutes: self.loaded_idle_ttl_override(),
-                id,
-            })
-        });
+        // Primary = lowest worker id. No resident worker → idle state.
+        let mut instances = self.local.instances().await;
+        instances.sort_by_key(|(w, _)| *w);
+        let Some(primary) = instances.first().map(|(w, _)| *w) else {
+            return Ok(HiggsStatus {
+                worker_alive: false,
+                loaded: None,
+                models_on_disk,
+            });
+        };
+
+        let result = self.local.status(primary).await;
+        let worker_alive = result.is_ok();
+        // `loaded` is best-effort: an OK status whose `loaded` shape is malformed
+        // still reports `worker_alive:true` with `loaded:None`.
+        let loaded = result.ok().and_then(|v| self.loaded_info_from(&v, &scan));
 
         Ok(HiggsStatus {
             worker_alive,
             loaded,
             models_on_disk,
+        })
+    }
+
+    /// Enrich a worker's raw `M_STATUS` value into a [`LoadedInfo`] using the
+    /// host-side `scan`. The worker reports `id`/`ctx_len`/`gpu_layers`/`threads`
+    /// from the live model, but `arch`/`quant`/`size_bytes`/`max_context_length`/
+    /// `has_chat_template` come back null (its store is empty) — those are filled
+    /// from the matching scanned [`HiggsModel`]. `None` when nothing is loaded or
+    /// the shape is malformed. Shared by [`status`](Self::status) (primary) and
+    /// [`local_loaded_info`](Self::local_loaded_info) (a specific served id).
+    fn loaded_info_from(&self, v: &serde_json::Value, scan: &[HiggsModel]) -> Option<LoadedInfo> {
+        let l = v.get("loaded")?;
+        if l.is_null() {
+            return None;
+        }
+        let id = l.get("id")?.as_str()?.to_owned();
+        let scanned = scan.iter().find(|m| m.id == id);
+        Some(LoadedInfo {
+            ctx_len: l.get("ctx_len")?.as_u64()? as u32,
+            gpu_layers: l.get("gpu_layers")?.as_u64()? as u32,
+            threads: l.get("threads")?.as_u64()? as u32,
+            arch: scanned.and_then(|m| m.arch.clone()),
+            quant: scanned.and_then(|m| m.quant.clone()),
+            max_context_length: scanned.and_then(|m| m.ctx_train),
+            size_bytes: scanned.map(|m| m.size_bytes),
+            has_chat_template: scanned.map(|m| m.has_chat_template),
+            idle_ttl_minutes: self.loaded_idle_ttl_override(),
+            id,
         })
     }
 
@@ -638,19 +681,71 @@ impl Higgs {
         ),
         HiggsError,
     > {
-        // Remote routing FIRST: if a fleet is installed and this model lives on a remote node,
-        // relay the chat over that node's transport. A remote model uses NEITHER the local
-        // worker NOR the local idle timer, so this path does NOT stamp `last_activity` (else
-        // remote traffic would keep an idle LOCAL model resident) and uses a SEPARATE
-        // admission gate. Bind the clone to a `let` so the parking_lot guard drops HERE, not
-        // held across the `.await` (an `if let` scrutinee temporary would make this !Send).
+        // LOCAL routing FIRST: a locally-resident served id wins — it is faster and
+        // keeps routing CONSISTENT with `/v1/models` (which lists local served ids
+        // first) and `ensure_loaded` (local-first), so a listed local instance is
+        // always reachable even if a remote node happens to expose the same served
+        // string. `model` is a SERVED id (`org/model`, `org/model-1`); the worker
+        // matches on the RAW model, so the raw id rides the wire.
+        //
+        // Served suffix ids are EPHEMERAL (a pure function of the live instance set —
+        // see `node::served`), so in the narrow window between the serve-layer gate's
+        // resolution and this one, an unload/idle-reap can renumber suffixes. This
+        // resolves at DISPATCH time (the authoritative current meaning) and the worker
+        // runs the exact tokenizer [HG005] check, so a stale gate estimate degrades to
+        // the worker's own backstop rather than a wrong answer — never a panic.
+        if let Some((worker, raw_model)) = self.local_served().await.remove(&model) {
+            // Admission gate: bound concurrent in-flight inference so the no-auth
+            // server can't be flooded. A full gate is a capacity signal (HTTP 503),
+            // not a failure — the client may retry. The owned permit is moved into
+            // the spawned generation task below so it is held for the WHOLE request
+            // (queue wait + generation) and released on any outcome.
+            let permit = Arc::clone(&self.inference_gate)
+                .try_acquire_owned()
+                .map_err(|_| HiggsError::ServerBusy {
+                    in_flight: MAX_CONCURRENT_INFERENCE,
+                    max: MAX_CONCURRENT_INFERENCE,
+                })?;
+            // Lease the worker's Supervisor for the whole generation. The lease stamps
+            // the worker's last-activity on acquire and (on drop) re-stamps + drops the
+            // in-flight reference, so the node's idle reaper never unloads a worker
+            // mid-chat. A dead/unloaded worker here is a mapped error.
+            let lease = self.local.chat_handle(worker).await?;
+            // Mint the request, register its keyed sink, and obtain a future that
+            // drives the M_CHAT RPC to completion and removes the sink on any outcome —
+            // all of it lives in `Supervisor::chat` (reached via the lease's `Deref`).
+            // `rx` is returned to the caller now; `call` (and the lease that keeps the
+            // worker alive) ride the spawned generation task with the admission permit.
+            let (rx, call) = lease.chat(
+                raw_model,
+                messages_json,
+                max_tokens,
+                temperature,
+                tools_json,
+            );
+            let handle = tokio::spawn(async move {
+                // Hold the admission permit AND the lease for the whole generation;
+                // dropping them here (on any return path) releases the gate slot and
+                // ends the worker's in-flight hold. Bound to names so neither drops early.
+                let _permit = permit;
+                let _lease = lease;
+                let result = call.await;
+
+                Ok(chat_outcome_from_value(&result?))
+            });
+            return Ok((rx, handle));
+        }
+
+        // REMOTE next: not local, so if a fleet is installed and this model lives on a
+        // remote node, relay the chat over that node's transport. A remote model uses
+        // NEITHER a local worker NOR the local node's idle timer, and uses a SEPARATE
+        // admission gate (so a flood of remote traffic can't grow hub/node tasks
+        // unbounded, and never blocks the local idle reaper). Bind the clone to a `let`
+        // so the parking_lot guard drops HERE, not held across the `.await` (an `if let`
+        // scrutinee temporary would make this !Send).
         let fleet = self.fleet.lock().clone();
         if let Some(fleet) = fleet {
             if fleet.is_remote(&model).await {
-                // Bound concurrent REMOTE chats — the node-side relay has no semaphore, so
-                // without this a client could open unbounded hub/node generations + streams.
-                // Separate from `inference_gate` so it never blocks the reaper's
-                // acquire-all-LOCAL-permits unload of an idle local model.
                 let permit = Arc::clone(&self.remote_gate)
                     .try_acquire_owned()
                     .map_err(|_| HiggsError::ServerBusy {
@@ -668,61 +763,74 @@ impl Higgs {
             }
         }
 
-        // Local path. Stamp last-activity so the idle reaper never unloads a model that is
-        // actively serving. Done before the admission gate so even a request that ends up
-        // rejected (ServerBusy) still counts as recent activity — a busy server is by
-        // definition not idle. Lock held for one `Instant` write only, never across `.await`.
-        *self.last_activity.lock() = std::time::Instant::now();
-
-        // Admission gate: bound concurrent in-flight inference so the no-auth
-        // server can't be flooded. A full gate is a capacity signal (HTTP 503),
-        // not a failure — the client may retry. The owned permit is moved into
-        // the spawned generation task below so it is held for the WHOLE request
-        // (queue wait + generation) and released on any outcome.
-        let permit = Arc::clone(&self.inference_gate)
-            .try_acquire_owned()
-            .map_err(|_| HiggsError::ServerBusy {
-                in_flight: MAX_CONCURRENT_INFERENCE,
-                max: MAX_CONCURRENT_INFERENCE,
-            })?;
-        // Mint the request, register its keyed sink, and obtain a future that
-        // drives the M_CHAT RPC to completion and removes the sink on any
-        // outcome — all of it lives in `Supervisor::chat` so this facade does not
-        // touch request-id minting, the sink map, or `request_with_id` directly.
-        // `rx` is returned to the caller now; `call` is awaited inside the spawned
-        // generation task (so the admission permit, kept here, rides it).
-        let (rx, call) = self
-            .sup
-            .chat(model, messages_json, max_tokens, temperature, tools_json);
-        let handle = tokio::spawn(async move {
-            // Hold the admission permit for the whole generation; dropping it
-            // here (on any return path) releases the gate slot. Bound to a name
-            // so it is not dropped early.
-            let _permit = permit;
-            let result = call.await;
-
-            Ok(chat_outcome_from_value(&result?))
-        });
-
-        Ok((rx, handle))
+        // Neither local nor remote serves this id (the serve layer JIT-loads a
+        // scanned-but-unloaded model BEFORE calling this, so reaching here means the
+        // model was unloaded out from under the request).
+        Err(HiggsError::ModelNotFound { id: model })
     }
 
-    /// Subscribe to worker lifecycle events.
+    /// Resolve the live LOCAL served-id → `(worker, raw model)` map (P4b). N local
+    /// workers serving the same raw model coexist as N served ids
+    /// (`org/model`, `org/model-1`, …) via the shared
+    /// [`served_ids`](crate::node::served::served_ids) algorithm; a chat for a
+    /// served id leases its worker and sends the RAW model on the wire.
+    async fn local_served(&self) -> std::collections::HashMap<String, (WorkerId, String)> {
+        let instances = self.local.instances().await;
+        // All local instances share one location marker `()` — collisions are
+        // resolved across workers exactly as the remote fleet resolves across nodes.
+        let located: Vec<((), WorkerId, String)> =
+            instances.iter().map(|(w, m)| ((), *w, m.clone())).collect();
+        let by_worker: std::collections::HashMap<WorkerId, String> =
+            instances.into_iter().collect();
+        crate::node::served::served_ids(&located)
+            .into_iter()
+            .filter_map(|(served, ((), worker))| {
+                by_worker
+                    .get(&worker)
+                    .map(|raw| (served, (worker, raw.clone())))
+            })
+            .collect()
+    }
+
+    /// Every LOCAL served model id, sorted — the input to `/v1/models` (joined with
+    /// the fleet's remote ids by the serve layer).
+    pub async fn local_served_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.local_served().await.into_keys().collect();
+        ids.sort();
+        ids
+    }
+
+    /// [`LoadedInfo`] for a LOCAL served id — resolves served → worker, reads that
+    /// worker's status, and enriches it from the host scan. The reported `id` is the
+    /// SERVED id (not the raw model) so a follow-up [`chat_stream`](Self::chat_stream)
+    /// resolves the SAME worker. `None` when the id is not locally served. Used by
+    /// the serve layer's loaded-model gate ([`ensure_loaded`](crate::serve)).
+    pub async fn local_loaded_info(&self, served: &str) -> Option<LoadedInfo> {
+        let (worker, _raw) = self.local_served().await.remove(served)?;
+        let v = self.local.status(worker).await.ok()?;
+        let scan = self.scan().await.unwrap_or_default();
+        let mut info = self.loaded_info_from(&v, &scan)?;
+        info.id = served.to_owned();
+        Some(info)
+    }
+
+    /// Subscribe to worker lifecycle events (ModelLoaded/ModelUnloaded) from the
+    /// local node's event fan-out.
     pub fn events(&self) -> broadcast::Receiver<HiggsEvent> {
-        self.sup.events()
+        self.local.events()
     }
 
     /// Return up to `n` recent Developer-Log lines (oldest first), optionally
     /// restricted to one [`LogSource`] (`None` = worker stderr + serve events).
     pub fn logs(&self, n: usize, filter: Option<LogSource>) -> Vec<String> {
-        self.sup.logs(n, filter)
+        self.local.bus().snapshot(n, filter)
     }
 
     /// Subscribe to live Developer-Log lines pushed after this call. The SSE
     /// log-stream handler pairs this with [`logs`](Self::logs) for
     /// replay-then-live delivery; filter each by [`LogLine::source`].
     pub fn subscribe_logs(&self) -> tokio::sync::broadcast::Receiver<LogLine> {
-        self.sup.subscribe_logs()
+        self.local.bus().subscribe()
     }
 
     /// Snapshot of the configured default load parameters.
@@ -773,66 +881,13 @@ impl Higgs {
         if let Some(cached) = self.device_cache.lock().clone() {
             return cached;
         }
-        let gpus = self.sup.sysinfo().await;
+        let gpus = self.local.gpus().await;
         // Cache only a non-empty result: an empty list usually means the gather
         // failed (spawn/EOF/timeout), so leave the cache empty to retry later.
         if !gpus.is_empty() {
             *self.device_cache.lock() = Some(gpus.clone());
         }
         gpus
-    }
-
-    // ── private ───────────────────────────────────────────────────────────────
-
-    /// Resolve a model id to its scanned [`HiggsModel`] (with the GGUF path).
-    ///
-    /// Scan moved host-side, so the worker's `ModelStore` is empty on a fresh
-    /// spawn-on-load worker: the model is resolved HERE and its GGUF path carried
-    /// in the M_LOAD params. Without this the worker's `store.get(id)` returns
-    /// HG002 for every normal load. Takes the first matching model; returns
-    /// `Err` [HG002] `ModelNotFound` when no scanned model has this id.
-    async fn resolve_model(&self, id: &str) -> Result<HiggsModel, HiggsError> {
-        self.scan()
-            .await?
-            .into_iter()
-            .find(|m| m.id == id)
-            .ok_or_else(|| HiggsError::ModelNotFound { id: id.to_owned() })
-    }
-
-    /// Reject a resolved GGUF `path` that escapes every configured scan root.
-    ///
-    /// The path comes from a host-side scan of those roots, so this holds for
-    /// every legitimate load; the check rejects any path that escapes the roots
-    /// (symlink/`..` escape) before it is sent to the worker for FFI loading.
-    /// `Err` [HG015] `InvalidModelId` on an escape.
-    fn guard_path_within_roots(&self, id: &str, path: &str) -> Result<(), HiggsError> {
-        let scan_roots: Vec<PathBuf> = {
-            let cfg = self.config.lock();
-            cfg.lmstudio_dirs
-                .iter()
-                .chain(cfg.hf_dirs.iter())
-                .chain(cfg.ollama_dirs.iter())
-                .cloned()
-                .collect()
-        };
-        if path_within_roots(path, &scan_roots) {
-            Ok(())
-        } else {
-            Err(HiggsError::InvalidModelId {
-                id: id.to_owned(),
-                reason: format!("resolved path {path} is outside every configured scan directory"),
-            })
-        }
-    }
-
-    /// Best-effort: ask the worker for the currently loaded model id.
-    async fn loaded_id(&self) -> Option<String> {
-        let v = self
-            .sup
-            .request(M_STATUS, serde_json::Value::Null)
-            .await
-            .ok()?;
-        v.get("loaded")?.get("id")?.as_str().map(ToOwned::to_owned)
     }
 }
 
