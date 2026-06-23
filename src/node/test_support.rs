@@ -85,6 +85,94 @@ pub(crate) fn fake_worker_factory() -> HalvesFactory {
     })
 }
 
+/// Like [`fake_worker_factory`] but STATEFUL: it remembers the model from the last `M_LOAD`
+/// (with its `ctx_len`/`gpu_layers`/`threads`) and reports it back in `M_STATUS` under
+/// `loaded`, so facade tests that assert the status-mapping path work without llama.cpp.
+/// `M_UNLOAD` clears it; `M_CHAT` streams `he`/`llo` then a final response.
+pub(crate) fn fake_worker_factory_stateful() -> HalvesFactory {
+    Box::new(|_bus, _model| {
+        let (sup_end, worker_end) = tokio::io::duplex(64 * 1024);
+        let (sup_r, sup_w) = tokio::io::split(sup_end);
+        let (wr, mut ww) = tokio::io::split(worker_end);
+        let loaded: std::sync::Arc<parking_lot::Mutex<Value>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(Value::Null));
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(wr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let Ok(RpcFrame::Request(r)) = rpc::decode(&line) else {
+                    continue;
+                };
+                if r.method == crate::worker::M_CHAT {
+                    let request_id = r.params.get("request_id").cloned().unwrap_or(Value::Null);
+                    for delta in ["he", "llo"] {
+                        let note = crate::rpc::RpcNotification {
+                            jsonrpc: "2.0".into(),
+                            method: crate::worker::N_CHAT_CHUNK.into(),
+                            params: json!({ "request_id": request_id, "delta": delta }),
+                        };
+                        let line = format!("{}\n", rpc::encode(&RpcFrame::Notification(note)));
+                        if ww.write_all(line.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                    // Include token counts so callers can verify usage propagation.
+                    let resp = RpcResponse {
+                        jsonrpc: "2.0".into(),
+                        id: r.id,
+                        result: Some(json!({
+                            "content": "hello",
+                            "finish_reason": "stop",
+                            "prompt_tokens": 10,
+                            "completion_tokens": 3,
+                        })),
+                        error: None,
+                    };
+                    let line = format!("{}\n", rpc::encode(&RpcFrame::Response(resp)));
+                    if ww.write_all(line.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                let result = match r.method.as_str() {
+                    crate::worker::M_LOAD => {
+                        // Record the loaded model so M_STATUS can report it.
+                        *loaded.lock() = json!({
+                            "id": r.params.get("id").cloned().unwrap_or(Value::Null),
+                            "ctx_len": r.params.get("ctx_len").cloned().unwrap_or(Value::Null),
+                            "gpu_layers": r.params.get("gpu_layers").cloned().unwrap_or(Value::Null),
+                            "threads": r.params.get("threads").cloned().unwrap_or(Value::Null),
+                        });
+                        json!({ "id": r.params.get("id").cloned().unwrap_or(Value::Null) })
+                    }
+                    crate::worker::M_STATUS => json!({ "loaded": loaded.lock().clone() }),
+                    crate::worker::M_UNLOAD => {
+                        *loaded.lock() = Value::Null;
+                        json!({})
+                    }
+                    crate::worker::M_SYSINFO => json!({ "gpus": [] }),
+                    crate::worker::M_SHUTDOWN => break,
+                    _ => json!({}),
+                };
+                let resp = RpcResponse {
+                    jsonrpc: "2.0".into(),
+                    id: r.id,
+                    result: Some(result),
+                    error: None,
+                };
+                let line = format!("{}\n", rpc::encode(&RpcFrame::Response(resp)));
+                if ww.write_all(line.as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(WorkerHalves {
+            write: Box::new(sup_w),
+            read: Box::new(sup_r),
+            proc: None,
+        })
+    })
+}
+
 /// A `NodeRuntime` whose workers are fakes (no llama.cpp), scanning `dirs` for models. Uses
 /// the default (60-min) idle TTL so fast tests never trip the reaper.
 pub(crate) fn fake_runtime(lmstudio_dirs: Vec<PathBuf>) -> NodeRuntime {

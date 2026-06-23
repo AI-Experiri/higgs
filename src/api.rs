@@ -156,8 +156,16 @@ impl Higgs {
     /// same Developer-Log history+stream. The caller is responsible for
     /// installing `HiggsLogLayer::new(bus.clone())` on its tracing subscriber.
     pub fn with_log_bus(config: HiggsConfig, bus: Arc<LogBus>) -> Self {
+        Self::with_supervisor(Arc::new(Supervisor::spawn(bus)), config)
+    }
+
+    /// Construct the facade around an already-built [`Supervisor`] — the single home for the
+    /// facade's default field initialization. Production goes through [`with_log_bus`]; tests
+    /// inject a fake-worker-backed `Supervisor` here instead of spelling out the struct
+    /// literal, which keeps them stable across struct changes (and the P4b engine swap).
+    pub(crate) fn with_supervisor(sup: Arc<Supervisor>, config: HiggsConfig) -> Self {
         Self {
-            sup: Arc::new(Supervisor::spawn(bus)),
+            sup,
             config: parking_lot::Mutex::new(config),
             lifecycle: tokio::sync::Mutex::new(()),
             inference_gate: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_INFERENCE)),
@@ -772,33 +780,6 @@ impl Higgs {
             *self.device_cache.lock() = Some(gpus.clone());
         }
         gpus
-    }
-
-    /// Test-only: build a `Higgs` over a pre-built (mock) supervisor.
-    ///
-    /// Lets sibling modules (`serve`) reuse the duplex mock seam without
-    /// access to this module's private fields.
-    #[cfg(test)]
-    pub(crate) fn with_supervisor(sup: Arc<Supervisor>, config: HiggsConfig) -> Self {
-        Self {
-            sup,
-            config: parking_lot::Mutex::new(config),
-            lifecycle: tokio::sync::Mutex::new(()),
-            inference_gate: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_INFERENCE)),
-            remote_gate: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_INFERENCE)),
-            last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
-            log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
-            jit_enabled: std::sync::atomic::AtomicBool::new(true),
-            auto_unload_idle: std::sync::atomic::AtomicBool::new(true),
-            idle_ttl_minutes: std::sync::atomic::AtomicU64::new(IDLE_UNLOAD_TTL_MINUTES),
-            loaded_idle_ttl_override: std::sync::atomic::AtomicU64::new(0),
-            serving_enabled: std::sync::atomic::AtomicBool::new(true),
-            probe_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            device_cache: parking_lot::Mutex::new(None),
-            fleet: parking_lot::Mutex::new(None),
-            api_keys: parking_lot::Mutex::new(std::sync::Arc::new(crate::keys::ApiKeys::default())),
-            hub: parking_lot::Mutex::new(None),
-        }
     }
 
     // ── private ───────────────────────────────────────────────────────────────

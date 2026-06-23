@@ -1,6 +1,5 @@
 use super::*;
 use crate::supervisor::WorkerHalves;
-use crate::worker::N_CHAT_CHUNK;
 use parking_lot::Mutex;
 use serde_json::json;
 use tokio::io::AsyncWriteExt;
@@ -137,25 +136,7 @@ async fn load_rejects_traversal_id() {
 #[tokio::test]
 async fn probe_support_cache_hit_skips_probe() {
     let (sup, _tw, _tr) = make_supervisor();
-    let higgs = Higgs {
-        sup: Arc::new(sup),
-        config: parking_lot::Mutex::new(HiggsConfig::default()),
-        lifecycle: tokio::sync::Mutex::new(()),
-        inference_gate: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_INFERENCE)),
-        remote_gate: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_INFERENCE)),
-        last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
-        log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
-        jit_enabled: std::sync::atomic::AtomicBool::new(true),
-        auto_unload_idle: std::sync::atomic::AtomicBool::new(true),
-        idle_ttl_minutes: std::sync::atomic::AtomicU64::new(IDLE_UNLOAD_TTL_MINUTES),
-        loaded_idle_ttl_override: std::sync::atomic::AtomicU64::new(0),
-        serving_enabled: std::sync::atomic::AtomicBool::new(true),
-        probe_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
-        device_cache: parking_lot::Mutex::new(None),
-        fleet: parking_lot::Mutex::new(None),
-        api_keys: parking_lot::Mutex::new(std::sync::Arc::new(crate::keys::ApiKeys::default())),
-        hub: parking_lot::Mutex::new(None),
-    };
+    let higgs = Higgs::with_supervisor(Arc::new(sup), HiggsConfig::default());
     let ev = crate::worker::engine::llamacpp::engine_version();
     // Seed a HIT for (llama, Q4_K_M, <this engine version>).
     higgs
@@ -198,26 +179,9 @@ async fn probe_support_cache_hit_skips_probe() {
 #[tokio::test]
 async fn inference_gate_rejects_when_full() {
     let (sup, _tw, _tr) = make_supervisor();
-    let higgs = Higgs {
-        sup: Arc::new(sup),
-        config: parking_lot::Mutex::new(HiggsConfig::default()),
-        lifecycle: tokio::sync::Mutex::new(()),
-        // One-slot gate so the test deterministically fills it.
-        inference_gate: Arc::new(tokio::sync::Semaphore::new(1)),
-        remote_gate: Arc::new(tokio::sync::Semaphore::new(1)),
-        last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
-        log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
-        jit_enabled: std::sync::atomic::AtomicBool::new(true),
-        auto_unload_idle: std::sync::atomic::AtomicBool::new(true),
-        idle_ttl_minutes: std::sync::atomic::AtomicU64::new(IDLE_UNLOAD_TTL_MINUTES),
-        loaded_idle_ttl_override: std::sync::atomic::AtomicU64::new(0),
-        serving_enabled: std::sync::atomic::AtomicBool::new(true),
-        probe_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
-        device_cache: parking_lot::Mutex::new(None),
-        fleet: parking_lot::Mutex::new(None),
-        api_keys: parking_lot::Mutex::new(std::sync::Arc::new(crate::keys::ApiKeys::default())),
-        hub: parking_lot::Mutex::new(None),
-    };
+    let mut higgs = Higgs::with_supervisor(Arc::new(sup), HiggsConfig::default());
+    // One-slot gate so the test deterministically fills it (override the default capacity).
+    higgs.inference_gate = Arc::new(tokio::sync::Semaphore::new(1));
     // Take the only permit and hold it.
     let held = Arc::clone(&higgs.inference_gate)
         .try_acquire_owned()
@@ -511,10 +475,7 @@ async fn scan_runs_host_side_without_worker() {
 
 #[tokio::test]
 async fn load_then_status_maps() {
-    use tokio::io::{AsyncBufReadExt, BufReader};
-
-    let (sup, mut test_write, test_read) = make_supervisor();
-    // `load` resolves the GGUF path host-side, so point config at a fixture.
+    // `load` resolves the GGUF path host-side, so point config at a fixture (ctx_train=4096).
     let dir = tempfile::TempDir::new().unwrap();
     crate::serve::test_support::write_gguf_fixture(dir.path(), "org/model");
     let cfg = HiggsConfig {
@@ -523,87 +484,47 @@ async fn load_then_status_maps() {
         ollama_dirs: vec![],
         default_load: HiggsConfig::default().default_load,
     };
-    let higgs = Higgs {
-        sup: Arc::new(sup),
-        config: parking_lot::Mutex::new(cfg),
-        lifecycle: tokio::sync::Mutex::new(()),
-        inference_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(
-            crate::api::MAX_CONCURRENT_INFERENCE,
-        )),
-        remote_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(
-            crate::api::MAX_CONCURRENT_INFERENCE,
-        )),
-        last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
-        log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
-        jit_enabled: std::sync::atomic::AtomicBool::new(true),
-        auto_unload_idle: std::sync::atomic::AtomicBool::new(true),
-        idle_ttl_minutes: std::sync::atomic::AtomicU64::new(IDLE_UNLOAD_TTL_MINUTES),
-        loaded_idle_ttl_override: std::sync::atomic::AtomicU64::new(0),
-        serving_enabled: std::sync::atomic::AtomicBool::new(true),
-        probe_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
-        device_cache: parking_lot::Mutex::new(None),
-        fleet: parking_lot::Mutex::new(None),
-        api_keys: parking_lot::Mutex::new(std::sync::Arc::new(crate::keys::ApiKeys::default())),
-        hub: parking_lot::Mutex::new(None),
-    };
+    let expected_gpu_layers = cfg.default_load.gpu_layers;
+    // Self-responding stateful fake worker: M_LOAD records the model; M_STATUS reports it back
+    // — so the load→status round-trip is exercised without driving stdio by hand (and the test
+    // survives the P4b engine swap, which routes through a NodeRuntime).
+    let sup = crate::supervisor::Supervisor::with_factory(
+        crate::node::test_support::fake_worker_factory_stateful(),
+    );
+    let higgs = Higgs::with_supervisor(Arc::new(sup), cfg);
     let mut events_rx = higgs.events();
-    // `load`/`status` run a host-side scan (on a blocking thread) before each
-    // RPC, so drive the operation future concurrently with the responder: the
-    // responder reads the request line (proving the id is pending) and only
-    // then writes the reply. A fixed pre-sleep + sequential write would race
-    // the scan and drop the response.
-    let mut lines = BufReader::new(test_read).lines();
 
-    // Issue load — mock responds with ok.
-    let load_fut = higgs.load("org/model", None);
-    let (load_res, _) = tokio::join!(load_fut, async {
-        lines.next_line().await.unwrap().expect("M_LOAD request");
-        write_response(&mut test_write, 1, json!({"id": "org/model"})).await;
-    });
-    load_res.expect("load should succeed");
+    higgs
+        .load("org/model", None)
+        .await
+        .expect("load should succeed");
 
     // ModelLoaded event must arrive.
-    let ev = tokio::time::timeout(std::time::Duration::from_millis(100), events_rx.recv())
+    let ev = tokio::time::timeout(std::time::Duration::from_millis(200), events_rx.recv())
         .await
         .expect("timeout")
         .expect("recv");
     assert!(matches!(ev, HiggsEvent::ModelLoaded { id } if id == "org/model"));
 
-    // Issue status — mock responds with loaded info.
-    let status_fut = higgs.status();
-    let (st, _) = tokio::join!(status_fut, async {
-        lines.next_line().await.unwrap().expect("M_STATUS request");
-        write_response(
-                &mut test_write,
-                2,
-                json!({
-                    "loaded": { "id": "org/model", "ctx_len": 4096, "gpu_layers": 4294967295u64, "threads": 4 },
-                    "models_scanned": 3,
-                }),
-            )
-            .await;
-    });
-    let st = st.expect("status should succeed");
+    let st = higgs.status().await.expect("status should succeed");
     assert!(st.worker_alive);
-    // models_on_disk now comes from a host-side scan of the config dirs
-    // (one GGUF fixture), not the worker's `models_scanned`.
+    // models_on_disk comes from a host-side scan of the config dirs (one GGUF fixture).
     assert_eq!(st.models_on_disk, 1);
     let li = st.loaded.expect("loaded should be Some");
     assert_eq!(li.id, "org/model");
+    // ctx_len defaults to the model's trained context (4096) when the caller pins none.
     assert_eq!(li.ctx_len, 4096);
-    assert_eq!(li.gpu_layers, u32::MAX);
+    // gpu_layers from the load request round-trips through the worker into status.
+    assert_eq!(li.gpu_layers, expected_gpu_layers);
 }
 
 // ── Test 3b: status loaded info includes model metadata ──────────────────
 
 #[tokio::test]
 async fn status_loaded_info_includes_model_metadata() {
-    use tokio::io::{AsyncBufReadExt, BufReader};
-
-    let (sup, mut test_write, test_read) = make_supervisor();
-    // Metadata now comes from the HOST scan, not the worker response: point
-    // config at a GGUF fixture (arch=llama, ctx_train=4096, chat template)
-    // so the host-scanned `HiggsModel` enriches the worker-reported `loaded`.
+    // Metadata comes from the HOST scan, not the worker response: point config at a GGUF
+    // fixture (arch=llama, ctx_train=4096, chat template) so the host-scanned `HiggsModel`
+    // enriches the worker-reported `loaded`.
     let dir = tempfile::TempDir::new().unwrap();
     crate::serve::test_support::write_gguf_fixture(dir.path(), "org/model");
     let cfg = HiggsConfig {
@@ -612,55 +533,19 @@ async fn status_loaded_info_includes_model_metadata() {
         ollama_dirs: vec![],
         default_load: HiggsConfig::default().default_load,
     };
-    let higgs = Higgs {
-        sup: Arc::new(sup),
-        config: parking_lot::Mutex::new(cfg),
-        lifecycle: tokio::sync::Mutex::new(()),
-        inference_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(
-            crate::api::MAX_CONCURRENT_INFERENCE,
-        )),
-        remote_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(
-            crate::api::MAX_CONCURRENT_INFERENCE,
-        )),
-        last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
-        log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
-        jit_enabled: std::sync::atomic::AtomicBool::new(true),
-        auto_unload_idle: std::sync::atomic::AtomicBool::new(true),
-        idle_ttl_minutes: std::sync::atomic::AtomicU64::new(IDLE_UNLOAD_TTL_MINUTES),
-        loaded_idle_ttl_override: std::sync::atomic::AtomicU64::new(0),
-        serving_enabled: std::sync::atomic::AtomicBool::new(true),
-        probe_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
-        device_cache: parking_lot::Mutex::new(None),
-        fleet: parking_lot::Mutex::new(None),
-        api_keys: parking_lot::Mutex::new(std::sync::Arc::new(crate::keys::ApiKeys::default())),
-        hub: parking_lot::Mutex::new(None),
-    };
+    // Stateful fake worker reports the loaded model in M_STATUS after a load; the metadata
+    // fields (arch/quant/size/max_ctx/chat_template) are filled host-side from the fixture.
+    let sup = crate::supervisor::Supervisor::with_factory(
+        crate::node::test_support::fake_worker_factory_stateful(),
+    );
+    let higgs = Higgs::with_supervisor(Arc::new(sup), cfg);
 
-    // `status` runs a host-side scan (on a blocking thread) before M_STATUS,
-    // so drive the future concurrently with a responder that reads the
-    // request line before replying — a fixed sleep would race the scan. The
-    // worker reports only id/ctx_len/gpu_layers/threads; the metadata fields
-    // are filled host-side from the fixture.
-    let mut lines = BufReader::new(test_read).lines();
-    let status_fut = higgs.status();
-    let (st, _) = tokio::join!(status_fut, async {
-        lines.next_line().await.unwrap().expect("M_STATUS request");
-        write_response(
-            &mut test_write,
-            1,
-            json!({
-                "loaded": {
-                    "id": "org/model",
-                    "ctx_len": 4096,
-                    "gpu_layers": 99,
-                    "threads": 4,
-                },
-                "models_scanned": 1,
-            }),
-        )
-        .await;
-    });
-    let st = st.expect("status should succeed");
+    higgs
+        .load("org/model", None)
+        .await
+        .expect("load should succeed");
+
+    let st = higgs.status().await.expect("status should succeed");
     let li = st.loaded.expect("loaded should be Some");
     assert_eq!(li.id, "org/model");
     assert_eq!(li.arch.as_deref(), Some("llama"));
@@ -693,29 +578,7 @@ async fn load_carries_host_resolved_path() {
         ollama_dirs: vec![],
         default_load: HiggsConfig::default().default_load,
     };
-    let higgs = Higgs {
-        sup: Arc::new(sup),
-        config: parking_lot::Mutex::new(cfg),
-        lifecycle: tokio::sync::Mutex::new(()),
-        inference_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(
-            crate::api::MAX_CONCURRENT_INFERENCE,
-        )),
-        remote_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(
-            crate::api::MAX_CONCURRENT_INFERENCE,
-        )),
-        last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
-        log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
-        jit_enabled: std::sync::atomic::AtomicBool::new(true),
-        auto_unload_idle: std::sync::atomic::AtomicBool::new(true),
-        idle_ttl_minutes: std::sync::atomic::AtomicU64::new(IDLE_UNLOAD_TTL_MINUTES),
-        loaded_idle_ttl_override: std::sync::atomic::AtomicU64::new(0),
-        serving_enabled: std::sync::atomic::AtomicBool::new(true),
-        probe_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
-        device_cache: parking_lot::Mutex::new(None),
-        fleet: parking_lot::Mutex::new(None),
-        api_keys: parking_lot::Mutex::new(std::sync::Arc::new(crate::keys::ApiKeys::default())),
-        hub: parking_lot::Mutex::new(None),
-    };
+    let higgs = Higgs::with_supervisor(Arc::new(sup), cfg);
 
     // Drive the load. `load` first runs a host-side scan (on a blocking
     // thread) before sending M_LOAD, so drive the load future concurrently
@@ -748,30 +611,13 @@ async fn load_carries_host_resolved_path() {
 
 #[tokio::test]
 async fn chat_stream_delivers() {
-    let (sup, mut test_write, _test_read) = make_supervisor();
-    let higgs = Higgs {
-        sup: Arc::new(sup),
-        config: parking_lot::Mutex::new(HiggsConfig::default()),
-        lifecycle: tokio::sync::Mutex::new(()),
-        inference_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(
-            crate::api::MAX_CONCURRENT_INFERENCE,
-        )),
-        remote_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(
-            crate::api::MAX_CONCURRENT_INFERENCE,
-        )),
-        last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
-        log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
-        jit_enabled: std::sync::atomic::AtomicBool::new(true),
-        auto_unload_idle: std::sync::atomic::AtomicBool::new(true),
-        idle_ttl_minutes: std::sync::atomic::AtomicU64::new(IDLE_UNLOAD_TTL_MINUTES),
-        loaded_idle_ttl_override: std::sync::atomic::AtomicU64::new(0),
-        serving_enabled: std::sync::atomic::AtomicBool::new(true),
-        probe_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
-        device_cache: parking_lot::Mutex::new(None),
-        fleet: parking_lot::Mutex::new(None),
-        api_keys: parking_lot::Mutex::new(std::sync::Arc::new(crate::keys::ApiKeys::default())),
-        hub: parking_lot::Mutex::new(None),
-    };
+    // Stateful fake worker streams `he`/`llo` then a final `hello` on M_CHAT — so the
+    // streaming path is exercised without driving stdio by hand (and survives the P4b swap).
+    let sup = crate::supervisor::Supervisor::with_factory(
+        crate::node::test_support::fake_worker_factory_stateful(),
+    );
+    sup.start_for("org/model").expect("start the fake worker");
+    let higgs = Higgs::with_supervisor(Arc::new(sup), HiggsConfig::default());
 
     let (mut rx, handle) = higgs
         .chat_stream(
@@ -784,31 +630,6 @@ async fn chat_stream_delivers() {
         .await
         .expect("chat_stream should succeed");
 
-    // Inject chunk notifications tagged with request_id=1 (the first allocated id).
-    use crate::rpc::{encode, RpcFrame, RpcNotification};
-    for delta in &["hel", "lo"] {
-        let notif = encode(&RpcFrame::Notification(RpcNotification {
-            jsonrpc: "2.0".into(),
-            method: N_CHAT_CHUNK.into(),
-            params: json!({ "request_id": 1u64, "delta": delta }),
-        }));
-        test_write
-            .write_all(format!("{notif}\n").as_bytes())
-            .await
-            .unwrap();
-    }
-    test_write.flush().await.unwrap();
-
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-
-    // Final response for M_CHAT (RPC id=1) — includes token counts.
-    write_response(
-            &mut test_write,
-            1,
-            json!({"content": "hello", "finish_reason": "stop", "prompt_tokens": 10, "completion_tokens": 3}),
-        )
-        .await;
-
     let outcome = tokio::time::timeout(std::time::Duration::from_millis(500), handle)
         .await
         .expect("join timeout")
@@ -817,14 +638,15 @@ async fn chat_stream_delivers() {
 
     assert_eq!(outcome.content, "hello");
     assert_eq!(outcome.finish_reason, "stop");
+    // Token usage from the worker's final response must propagate to the outcome.
     assert_eq!(outcome.prompt_tokens, 10);
     assert_eq!(outcome.completion_tokens, 3);
 
-    // Chunks must have arrived.
-    let chunk1 = rx.try_recv().expect("chunk 1");
-    let chunk2 = rx.try_recv().expect("chunk 2");
-    assert_eq!(chunk1, "hel");
-    assert_eq!(chunk2, "lo");
+    // The streamed deltas must have arrived in order.
+    let chunk1 = rx.recv().await.expect("chunk 1");
+    let chunk2 = rx.recv().await.expect("chunk 2");
+    assert_eq!(chunk1, "he");
+    assert_eq!(chunk2, "llo");
 }
 
 // ── Test 5: chat_stream against dead worker removes sink ─────────────────
@@ -841,29 +663,7 @@ async fn chat_stream_dead_worker_removes_sink() {
     }));
     // Do NOT call start() — write_tx stays None (dead worker).
 
-    let higgs = Higgs {
-        sup: Arc::new(sup),
-        config: parking_lot::Mutex::new(HiggsConfig::default()),
-        lifecycle: tokio::sync::Mutex::new(()),
-        inference_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(
-            crate::api::MAX_CONCURRENT_INFERENCE,
-        )),
-        remote_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(
-            crate::api::MAX_CONCURRENT_INFERENCE,
-        )),
-        last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
-        log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
-        jit_enabled: std::sync::atomic::AtomicBool::new(true),
-        auto_unload_idle: std::sync::atomic::AtomicBool::new(true),
-        idle_ttl_minutes: std::sync::atomic::AtomicU64::new(IDLE_UNLOAD_TTL_MINUTES),
-        loaded_idle_ttl_override: std::sync::atomic::AtomicU64::new(0),
-        serving_enabled: std::sync::atomic::AtomicBool::new(true),
-        probe_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
-        device_cache: parking_lot::Mutex::new(None),
-        fleet: parking_lot::Mutex::new(None),
-        api_keys: parking_lot::Mutex::new(std::sync::Arc::new(crate::keys::ApiKeys::default())),
-        hub: parking_lot::Mutex::new(None),
-    };
+    let higgs = Higgs::with_supervisor(Arc::new(sup), HiggsConfig::default());
 
     // chat_stream registers the sink then the spawned task encounters dead worker.
     let (_rx, handle) = higgs
