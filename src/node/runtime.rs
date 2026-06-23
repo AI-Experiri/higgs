@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -44,6 +45,49 @@ pub const DEFAULT_IDLE_TTL: Duration = Duration::from_secs(60 * 60);
 /// `[50ms, 60s]`. So a 60-min TTL polls once a minute (cheap); a tiny test TTL polls fast.
 fn reap_interval(ttl: Duration) -> Duration {
     (ttl / 4).clamp(Duration::from_millis(50), Duration::from_secs(60))
+}
+
+/// Runtime-mutable idle auto-unload policy, shared (via `Arc`) between the wrapper's setters
+/// and the actor's reaper, which reads it on EVERY tick — so the engine's Server-Settings
+/// toggles (auto-unload on/off, TTL) take effect live without a restart, exactly as the old
+/// engine-level reaper did. Plain atomics, set/read in isolation.
+pub struct IdleConfig {
+    /// TTL in MILLISECONDS (not seconds — sub-second TTLs are used in tests and truncating to
+    /// seconds would make a 120ms TTL read back as 0 and reap instantly).
+    ttl_millis: AtomicU64,
+    enabled: AtomicBool,
+    /// Notified on any change so the reaper can interrupt an in-progress sleep and re-evaluate
+    /// at the new cadence immediately — a lowered TTL takes effect now, not after the old sleep.
+    changed: tokio::sync::Notify,
+}
+
+impl IdleConfig {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            ttl_millis: AtomicU64::new(ttl.as_millis() as u64),
+            enabled: AtomicBool::new(true),
+            changed: tokio::sync::Notify::new(),
+        }
+    }
+    /// Current idle TTL.
+    pub fn ttl(&self) -> Duration {
+        Duration::from_millis(self.ttl_millis.load(Ordering::Relaxed))
+    }
+    /// Set the idle TTL (live; the reaper re-evaluates immediately).
+    pub fn set_ttl(&self, ttl: Duration) {
+        self.ttl_millis
+            .store(ttl.as_millis() as u64, Ordering::Relaxed);
+        self.changed.notify_one();
+    }
+    /// Whether auto-unload is on.
+    pub fn enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+    /// Turn auto-unload on/off (live; the reaper re-evaluates immediately).
+    pub fn set_enabled(&self, on: bool) {
+        self.enabled.store(on, Ordering::Relaxed);
+        self.changed.notify_one();
+    }
 }
 
 /// Node configuration: the model roots the node scans (it owns its own disk), the shared log
@@ -251,8 +295,8 @@ struct NodeActor {
     /// Per-worker count of in-flight chats (held via [`ChatLease`]). A worker with a non-zero
     /// count is never idle-reaped, so a generation longer than the TTL is not killed mid-chat.
     in_flight: HashMap<WorkerId, u32>,
-    /// Idle auto-unload TTL (from [`NodeConfig::idle_ttl`]).
-    idle_ttl: Duration,
+    /// Runtime-mutable idle auto-unload policy (TTL + on/off), read by the reaper each tick.
+    idle: Arc<IdleConfig>,
     /// Set once the drain has fully completed. A `ShutdownAll` arriving afterwards answers
     /// immediately (no in-flight work remains to release a fresh waiter).
     shutdown_done: bool,
@@ -453,9 +497,10 @@ impl Actor for NodeActor {
                 }
             }
             NodeMsg::ReapIdle => {
-                // Skip while draining (shutdown reaps everything anyway).
-                if !self.shutting_down {
-                    let ttl = self.idle_ttl;
+                // Skip while draining (shutdown reaps everything anyway) or when auto-unload
+                // is turned off at runtime.
+                if !self.shutting_down && self.idle.enabled() {
+                    let ttl = self.idle.ttl();
                     let idle: Vec<WorkerId> = self
                         .registry
                         .ids()
@@ -845,6 +890,8 @@ pub struct NodeRuntime {
     events_tx: broadcast::Sender<HiggsEvent>,
     /// The node's shared Developer-Log bus (P4b: the local engine reads/configures it here).
     bus: Arc<LogBus>,
+    /// Runtime-mutable idle policy, shared with the reaper.
+    idle: Arc<IdleConfig>,
 }
 
 impl NodeRuntime {
@@ -862,7 +909,9 @@ impl NodeRuntime {
         let bus = config.bus.clone();
         let relay = log_tx.clone();
         let events_for_actor = events_tx.clone();
-        let idle_ttl = config.idle_ttl;
+        let idle = Arc::new(IdleConfig::new(config.idle_ttl));
+        let idle_for_actor = idle.clone();
+        let idle_for_reaper = idle.clone();
         let handle = spawn_actor_with(move |h| NodeActor {
             registry: WorkerRegistry::new(),
             spawner,
@@ -877,18 +926,23 @@ impl NodeRuntime {
             shutdown_done: false,
             last_activity: HashMap::new(),
             in_flight: HashMap::new(),
-            idle_ttl,
+            idle: idle_for_actor,
             events_tx: events_for_actor,
         });
         // Idle reaper: a WeakHandle so it never keeps the actor alive — it exits the tick the
-        // last real handle drops (upgrade fails).
+        // last real handle drops (upgrade fails). The cadence is ADAPTIVE — each iteration
+        // sleeps `reap_interval(idle.ttl())`, re-reading the live TTL — so a runtime TTL change
+        // (Server-Settings) is honored at the new cadence within one period, not frozen to the
+        // startup TTL.
         let reaper = handle.downgrade();
-        let interval = reap_interval(idle_ttl);
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(interval);
-            tick.tick().await; // the first tick fires immediately — skip it
             loop {
-                tick.tick().await;
+                // Wake on the cadence OR immediately when settings change, so a lowered TTL /
+                // re-enable takes effect without waiting out the prior sleep.
+                tokio::select! {
+                    _ = tokio::time::sleep(reap_interval(idle_for_reaper.ttl())) => {}
+                    _ = idle_for_reaper.changed.notified() => {}
+                }
                 match reaper.upgrade() {
                     Some(h) => {
                         if h.send(NodeMsg::ReapIdle).is_err() {
@@ -904,7 +958,14 @@ impl NodeRuntime {
             log_tx,
             events_tx,
             bus,
+            idle,
         }
+    }
+
+    /// The runtime-mutable idle auto-unload policy (TTL + on/off). The engine wires its
+    /// Server-Settings toggles to this; the reaper reads it live.
+    pub fn idle(&self) -> &Arc<IdleConfig> {
+        &self.idle
     }
 
     /// Error returned when the actor mailbox is gone (shutting down / loop ended).
@@ -1253,6 +1314,18 @@ mod tests {
         );
     }
 
+    /// Poll until the runtime has no resident workers (idle reaper did its job), up to ~5s.
+    /// Robust against scheduling jitter under full-suite parallel load (vs a fixed sleep).
+    async fn wait_reaped(rt: &NodeRuntime) -> bool {
+        for _ in 0..100 {
+            if rt.worker_ids().await.is_empty() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        false
+    }
+
     // `instances()` lists resident (worker, raw model) pairs, and lifecycle events fire on
     // load/unload — the surface the local engine consumes in P4b.
     #[tokio::test]
@@ -1288,11 +1361,40 @@ mod tests {
         );
         load(&rt, "org/m").await;
         assert_eq!(rt.worker_ids().await.len(), 1);
-        // Wait past the TTL + a couple reap ticks (interval = ttl/4, clamped ≥ 50ms).
-        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        // Poll past the TTL + reap ticks (robust to scheduling jitter under load).
         assert!(
-            rt.worker_ids().await.is_empty(),
+            wait_reaped(&rt).await,
             "idle worker auto-unloaded after the TTL"
+        );
+    }
+
+    // Turning auto-unload OFF at runtime stops the reaper; turning it back on (with a tiny TTL)
+    // lets it reap again — the live Server-Settings behavior.
+    #[tokio::test]
+    async fn runtime_idle_config_toggles_take_effect_live() {
+        use crate::node::test_support::fake_runtime_with_idle_ttl;
+        let dir = TempDir::new().expect("staging dir");
+        let model_dir = dir.path().join("org/m");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(model_dir.join("m.gguf"), b"GGUF\x00 dummy").unwrap();
+        // Start with a tiny TTL but auto-unload DISABLED — the worker must survive.
+        let rt = fake_runtime_with_idle_ttl(
+            vec![dir.path().to_path_buf()],
+            std::time::Duration::from_millis(120),
+        );
+        rt.idle().set_enabled(false);
+        load(&rt, "org/m").await;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(
+            rt.worker_ids().await.len(),
+            1,
+            "auto-unload disabled keeps the worker resident"
+        );
+        // Re-enable: now the idle worker is reaped.
+        rt.idle().set_enabled(true);
+        assert!(
+            wait_reaped(&rt).await,
+            "re-enabling auto-unload reaps the idle worker"
         );
     }
 
@@ -1320,9 +1422,8 @@ mod tests {
         );
         // End the chat; now the idle clock runs and the worker is reaped.
         drop(lease);
-        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
         assert!(
-            rt.worker_ids().await.is_empty(),
+            wait_reaped(&rt).await,
             "worker reaped once the chat ended and it went idle"
         );
     }
