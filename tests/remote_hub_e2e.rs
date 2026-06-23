@@ -180,6 +180,21 @@ async fn two_nodes_same_model_two_served_ids_stream_each_then_retire_one() {
     let r1 = fleet.resolve(&suffixed).await.expect("served[1] routed");
     assert_ne!(r0, r1, "the two served ids map to two distinct instances");
 
+    // The fleet view (what `/api/higgs/nodes` serves the UI) tags each resident worker
+    // with its hub-assigned served id, so the UI shows exactly what clients must call.
+    let view = fleet.nodes_view().await;
+    let mut view_served: Vec<String> = view
+        .iter()
+        .filter_map(|n| n.inventory.as_ref())
+        .flat_map(|inv| inv.workers.iter().map(|w| w.served_id.clone()))
+        .collect();
+    view_served.sort();
+    assert_eq!(
+        view_served,
+        vec![TINY_MODEL_ID.to_string(), suffixed.clone()],
+        "fleet view tags each resident worker with its served id"
+    );
+
     // Stream a chat to EACH served id; both must stream real tokens (sink handoff end-to-end).
     let prompt = "[{\"role\":\"user\",\"content\":\"Once upon a time\"}]";
     for sid in [TINY_MODEL_ID.to_string(), suffixed.clone()] {

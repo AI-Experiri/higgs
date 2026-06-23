@@ -308,15 +308,34 @@ impl FleetActor {
     }
 
     /// The fleet view, taken as ONE atomic snapshot across node-ids / nodes / inventories.
+    /// Each resident worker is tagged with its hub-assigned served id (`org/model`,
+    /// `org/model-1`, …) so the UI can show exactly what clients call to reach it.
     fn nodes_view(&self) -> Vec<NodeView> {
+        // Invert served → (node, worker) into (node, worker) → served, so we can tag each
+        // worker in each node's inventory with the id clients address it by. Computed once
+        // per snapshot over ALL instances (connected or not) — same set `served_ids` uses.
+        let rev: HashMap<(NodeKey, WorkerId), String> = self
+            .served_ids()
+            .into_iter()
+            .map(|(served, key)| (key, served))
+            .collect();
         self.node_ids
             .all()
             .into_iter()
-            .map(|(endpoint_id, node_id)| NodeView {
-                node_id: node_id.0,
-                connected: self.nodes.contains_key(&endpoint_id),
-                inventory: self.inventories.get(&endpoint_id).cloned(),
-                endpoint_id,
+            .map(|(endpoint_id, node_id)| {
+                let inventory = self.inventories.get(&endpoint_id).cloned().map(|mut inv| {
+                    for w in &mut inv.workers {
+                        let key = (endpoint_id.clone(), WorkerId(w.worker_id));
+                        w.served_id = served_id_for_worker(&key, &w.model, &self.routes, &rev);
+                    }
+                    inv
+                });
+                NodeView {
+                    node_id: node_id.0,
+                    connected: self.nodes.contains_key(&endpoint_id),
+                    inventory,
+                    endpoint_id,
+                }
             })
             .collect()
     }
@@ -868,6 +887,29 @@ fn parse_worker_id(reply: &serde_json::Value) -> Result<u32, HiggsError> {
     })
 }
 
+/// The served id to display for a resident worker in the fleet view: the route's served id,
+/// but ONLY when the route's model still matches the worker's currently-reported model.
+///
+/// A node-process restart can leave a STALE route whose reused worker id now serves a DIFFERENT
+/// model (the documented HG018 case, healed on the next hub-driven op). Tagging by `(node,
+/// worker)` alone would then mislabel that worker — claiming a served id clients can't actually
+/// reach on it. So when the route's model and the worker's model disagree (or there is no route),
+/// the worker has no current served id and this returns `""`. `served_rev` is the inverse of
+/// [`FleetActor::served_ids`] (`(node, worker) → served`), so its keys match `routes`.
+fn served_id_for_worker(
+    key: &(NodeKey, WorkerId),
+    worker_model: &str,
+    routes: &HashMap<(NodeKey, WorkerId), String>,
+    served_rev: &HashMap<(NodeKey, WorkerId), String>,
+) -> String {
+    routes
+        .get(key)
+        .filter(|route_model| route_model.as_str() == worker_model)
+        .and_then(|_| served_rev.get(key))
+        .cloned()
+        .unwrap_or_default()
+}
+
 /// Accept the node's uni stream(s) of `N_LOG_LINE` notifications and file each line into the
 /// hub bus under `LogSource::RemoteWorker { node, worker }`. Returns when the connection
 /// closes. Best-effort: a malformed frame is skipped, not fatal.
@@ -1007,6 +1049,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn nodes_view_fills_served_id_per_worker() {
+        // Two instances of the same model on one node → the fleet view must tag each
+        // resident worker with its hub-assigned served id (`model`, `model-1`), NOT the
+        // empty string the node reports.
+        let (fleet, node_key, model_id, _root) = fleet_with_one_node().await;
+        fleet.load(&node_key, &model_id).await.unwrap();
+        fleet.load(&node_key, &model_id).await.unwrap();
+        let view = fleet.nodes_view().await;
+        let node = view
+            .iter()
+            .find(|n| n.endpoint_id == node_key)
+            .expect("node present in fleet view");
+        let inv = node.inventory.as_ref().expect("node inventory present");
+        assert_eq!(
+            inv.workers.len(),
+            2,
+            "two resident workers: {:?}",
+            inv.workers
+        );
+        let mut served: Vec<String> = inv.workers.iter().map(|w| w.served_id.clone()).collect();
+        served.sort();
+        assert_eq!(
+            served,
+            vec![model_id.clone(), format!("{model_id}-1")],
+            "each worker carries its hub-assigned served id: {:?}",
+            inv.workers
+        );
+    }
+
+    #[tokio::test]
     async fn unload_then_kill_drop_routes() {
         let (fleet, node_key, model_id, _root) = fleet_with_one_node().await;
         fleet.load(&node_key, &model_id).await.unwrap();
@@ -1066,6 +1138,28 @@ mod tests {
         assert_eq!(workers.len(), 3, "no two served ids share a worker");
         // Deterministic: re-deriving yields the same mapping.
         assert_eq!(actor.served_ids(), served);
+    }
+
+    #[test]
+    fn served_id_for_worker_guards_stale_route_model_mismatch() {
+        let key = |w| ("nodeA".to_string(), WorkerId(w));
+        let mut routes = HashMap::new();
+        routes.insert(key(1), "org/a".to_string());
+        routes.insert(key(2), "org/b".to_string());
+        // The reverse map as nodes_view builds it from served_ids() (same keys as routes).
+        let mut rev = HashMap::new();
+        rev.insert(key(1), "org/a".to_string());
+        rev.insert(key(2), "org/b".to_string());
+
+        // Matching model → the worker is tagged with its served id.
+        assert_eq!(
+            served_id_for_worker(&key(1), "org/a", &routes, &rev),
+            "org/a"
+        );
+        // Stale route: a restart reused worker 2 for a DIFFERENT model → no current served id.
+        assert_eq!(served_id_for_worker(&key(2), "org/c", &routes, &rev), "");
+        // No route at all for this worker → empty.
+        assert_eq!(served_id_for_worker(&key(9), "org/x", &routes, &rev), "");
     }
 
     #[tokio::test]

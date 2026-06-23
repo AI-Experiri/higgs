@@ -328,6 +328,9 @@ impl NodeActor {
                     .map(|sup| crate::remote::InventoryWorker {
                         worker_id: id.0,
                         model: sup.loaded_model_id().unwrap_or_default(),
+                        // The node does not know its hub-assigned served id; the hub
+                        // fills this in when it folds the inventory into the fleet view.
+                        served_id: String::new(),
                     })
             })
             .collect()

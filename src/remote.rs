@@ -158,11 +158,18 @@ pub struct NodeLoadResult {
 
 higgs_ts! {
 /// One resident worker in a node's [`NodeInventory`]: its node-local id and the model it
-/// currently serves.
+/// currently serves, plus the hub-assigned `/v1` served id.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InventoryWorker {
     pub worker_id: u32,
     pub model: String,
+    /// The collision-free `/v1` served instance id clients call to reach THIS worker
+    /// (`org/model`, `org/model-1`, …). This is a HUB concept derived from the routing
+    /// table — the node does not know it, so `M_NODE_INVENTORY` payloads omit it
+    /// (`serde(default)` → empty) and the hub fills it in [`crate::node::fleet`]'s
+    /// `nodes_view`. Empty for a resident worker the hub holds no route for.
+    #[serde(default)]
+    pub served_id: String,
 }
 }
 
