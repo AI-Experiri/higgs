@@ -268,3 +268,211 @@ async fn hub_server_pairs_a_node_and_lists_it() {
         "retired node no longer counted: {hub_after}"
     );
 }
+
+/// The hub kill switch: `POST /api/higgs/hub/disable` stops ALL node network activity (closes
+/// the endpoint → no inbound dials, no relay; closes node transports → nodes disconnected) while
+/// KEEPING the fleet's node list/routes; `POST /api/higgs/hub/enable` turns it back on. Asserts
+/// the deterministic, hermetic behavior: enabled→disabled→enabled status, pairing gated (200 vs
+/// 409) by the switch, and a paired node going disconnected-but-still-listed on disable. (Live
+/// reconnect-with-route-survival is covered by the fleet-level
+/// `remote_hub_e2e::node_reconnects_and_route_survives` + the `disconnect_all` unit test, since a
+/// LAN-only rebind can land on a new UDP port the node's cached ticket can't redial.)
+#[tokio::test]
+async fn hub_kill_switch_disables_then_reenables_the_network() {
+    let hub_home = tempfile::tempdir().unwrap();
+    let node_home = tempfile::tempdir().unwrap();
+    let port = free_port();
+
+    let hub = Command::new(env!("CARGO_BIN_EXE_higgs"))
+        .env("HIGGS_BIND", "127.0.0.1")
+        .env("HIGGS_PORT", port.to_string())
+        .env("HIGGS_HOME", hub_home.path())
+        .env("HIGGS_HUB", "1")
+        .env("HIGGS_IROH_LOCAL", "1")
+        .env("RUST_LOG", "warn")
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn hub");
+    let _hub = Proc(hub);
+    let base = format!("http://127.0.0.1:{port}");
+    let c = reqwest::Client::new();
+
+    // Wait for the server.
+    let mut ready = false;
+    for _ in 0..150 {
+        if let Ok(r) = c.get(format!("{base}/health")).send().await {
+            if r.status().is_success() {
+                ready = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(ready, "hub server ready");
+
+    // Boots enabled (HIGGS_HUB=1).
+    let st: serde_json::Value = c
+        .get(format!("{base}/api/higgs/hub"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(st["enabled"], true, "boots enabled: {st}");
+
+    // Pair + dial a node; wait until it shows connected.
+    let pair: serde_json::Value = c
+        .post(format!("{base}/api/higgs/pair"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ticket = pair["ticket"].as_str().expect("ticket").to_string();
+    let token = pair["token"].as_str().expect("token").to_string();
+    let _node = Proc(
+        Command::new(env!("CARGO_BIN_EXE_higgs"))
+            .arg("--node")
+            .arg(&ticket)
+            .arg(&token)
+            .env("HIGGS_HOME", node_home.path())
+            .env("HIGGS_IROH_LOCAL", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn node"),
+    );
+    let mut node_id = String::new();
+    for _ in 0..150 {
+        let nodes: serde_json::Value = c
+            .get(format!("{base}/api/higgs/nodes"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if let Some(n) = nodes
+            .as_array()
+            .and_then(|a| a.iter().find(|n| n["connected"] == true))
+        {
+            node_id = n["endpoint_id"].as_str().unwrap().to_string();
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(!node_id.is_empty(), "node connected before disable");
+
+    // ── DISABLE — network off. ──
+    let dis: serde_json::Value = c
+        .post(format!("{base}/api/higgs/hub/disable"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(dis["enabled"], false, "disabled status: {dis}");
+
+    // Pairing is gated off while disabled.
+    let pair_status = c
+        .post(format!("{base}/api/higgs/pair"))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(pair_status.as_u16(), 409, "pair 409 while disabled");
+
+    // The node's transport is closed: it goes disconnected, but STAYS listed (route/seed kept,
+    // not retired) — the hub isn't accepting, so it can't reconnect during the disabled window.
+    let mut disconnected_listed = false;
+    for _ in 0..50 {
+        let nodes: serde_json::Value = c
+            .get(format!("{base}/api/higgs/nodes"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if nodes.as_array().is_some_and(|a| {
+            a.iter()
+                .any(|n| n["endpoint_id"] == node_id.as_str() && n["connected"] == false)
+        }) {
+            disconnected_listed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        disconnected_listed,
+        "node disconnected but still listed (route kept) while disabled"
+    );
+
+    // ── ENABLE — network back on. ──
+    let en: serde_json::Value = c
+        .post(format!("{base}/api/higgs/hub/enable"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(en["enabled"], true, "re-enabled status: {en}");
+    assert!(
+        en["hub_id"].as_str().is_some_and(|s| !s.is_empty()),
+        "hub id present after re-enable: {en}"
+    );
+
+    // Pairing works again, and the re-armed fleet ADMITS a freshly-paired node — proving enable
+    // re-armed admission (disable disarms it via disconnect_all) and the new endpoint accepts.
+    let pair2: serde_json::Value = c
+        .post(format!("{base}/api/higgs/pair"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ticket2 = pair2["ticket"].as_str().expect("ticket2").to_string();
+    let token2 = pair2["token"].as_str().expect("token2").to_string();
+    let node2_home = tempfile::tempdir().unwrap();
+    let _node2 = Proc(
+        Command::new(env!("CARGO_BIN_EXE_higgs"))
+            .arg("--node")
+            .arg(&ticket2)
+            .arg(&token2)
+            .env("HIGGS_HOME", node2_home.path())
+            .env("HIGGS_IROH_LOCAL", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn node2"),
+    );
+    let mut node2_connected = false;
+    for _ in 0..150 {
+        let nodes: serde_json::Value = c
+            .get(format!("{base}/api/higgs/nodes"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if nodes.as_array().is_some_and(|a| {
+            a.iter()
+                .any(|n| n["connected"] == true && n["endpoint_id"] != node_id.as_str())
+        }) {
+            node2_connected = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(
+        node2_connected,
+        "re-enabled hub admits a freshly-paired node (fleet re-armed)"
+    );
+}

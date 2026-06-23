@@ -128,16 +128,20 @@ enum FleetMsg {
         node: NodeKey,
         reply: oneshot::Sender<()>,
     },
-    AssignNodeId {
-        node: NodeKey,
-        reply: oneshot::Sender<NodeId>,
-    },
-    /// Insert/replace a node's transport AND bump its epoch (atomic readmission), returning
-    /// any prior transport for the wrapper to close.
-    InsertTransport {
+    /// Atomically admit a node: if `gen` is current (or `None` = unconditional, for direct/test
+    /// callers), assign its stable `NodeId`, insert the transport, and bump the epoch — replying
+    /// with `Some((node_id, replaced))` (the prior transport, if any, for the caller to close).
+    /// If `gen` is stale (the kill switch bumped the generation: a disable raced this admission),
+    /// reply `None` — nothing is assigned or inserted, so the caller closes the refused transport
+    /// and skips all per-connection bookkeeping. One message → no TOCTOU between the generation
+    /// check, the node-id assign, and the transport insert.
+    AdmitNode {
         node: NodeKey,
         transport: Arc<NodeTransport>,
-        reply: oneshot::Sender<Option<Arc<NodeTransport>>>,
+        /// The accept loop's admission generation; `None` = admit unconditionally.
+        gen: Option<u64>,
+        #[allow(clippy::type_complexity)]
+        reply: oneshot::Sender<Option<(NodeId, Option<Arc<NodeTransport>>)>>,
     },
     /// Remove a node's transport only if it's still the current one (Arc identity); closes it.
     DropTransportIf {
@@ -148,6 +152,18 @@ enum FleetMsg {
     Retire {
         node: NodeKey,
         reply: oneshot::Sender<()>,
+    },
+    /// Close + forget EVERY node's transport (mark all disconnected) AND disarm new-node
+    /// admission, WITHOUT touching routes, inventories, or node-ids — so a hub re-enable /
+    /// reconnect restores the fleet with its previously-loaded routes intact. Used by the hub
+    /// kill switch.
+    DisconnectAll {
+        reply: oneshot::Sender<()>,
+    },
+    /// Bump the admission generation and return the NEW value — a fresh generation for an accept
+    /// loop about to be spawned (`start_hub`). Invalidates any prior loop's in-flight admissions.
+    BumpAdmitGen {
+        reply: oneshot::Sender<u64>,
     },
     /// Add an instance `(node, worker) → model`. Loads are ADDITIVE — N workers serving the
     /// same model coexist as N instances (distinct served ids). Worker ids are unique per
@@ -211,6 +227,14 @@ struct FleetActor {
     /// The hub's Developer-Log bus: relayed remote worker stderr lands here under
     /// `LogSource::RemoteWorker { node, worker }` so it shares the operator's log console.
     bus: Arc<LogBus>,
+    /// Monotonic ADMISSION GENERATION. Each hub accept loop is spawned bound to the generation
+    /// current when it started (`bump_admit_gen`); every `AdmitNode` it issues carries that gen
+    /// and is admitted only while it still equals this. The kill switch's `disconnect_all` bumps
+    /// the generation (atomically with draining transports), so an admission task spawned by the
+    /// now-closing accept loop that races past disable is REFUSED — and stays refused even after a
+    /// quick re-enable spawns a fresh loop at a newer gen (the stale task's gen can never match
+    /// again). Direct callers (tests) pass `None` to admit unconditionally.
+    admit_gen: u64,
 }
 
 impl FleetActor {
@@ -399,19 +423,31 @@ impl Actor for FleetActor {
                 self.node_ids.assign(&node);
                 let _ = reply.send(());
             }
-            FleetMsg::AssignNodeId { node, reply } => {
-                let _ = reply.send(self.node_ids.assign(&node));
-            }
-            FleetMsg::InsertTransport {
+            FleetMsg::AdmitNode {
                 node,
                 transport,
+                gen,
                 reply,
             } => {
-                let replaced = self.nodes.insert(node.clone(), transport);
-                // Bump on (re)admission so an inventory fetch from a PRIOR connection still in
-                // flight can't commit its now-stale result over this fresh one.
-                self.bump_epoch(&node);
-                let _ = reply.send(replaced);
+                if matches!(gen, Some(g) if g != self.admit_gen) {
+                    // Stale generation: this admission task belongs to an accept loop the kill
+                    // switch already invalidated (a disable raced it; even a later re-enable
+                    // spawns a NEWER gen). REFUSE atomically — assign nothing, insert nothing;
+                    // the caller closes the refused transport. Keeps the kill switch airtight:
+                    // a disabled hub neither connects nor seeds the node.
+                    let _ = reply.send(None);
+                } else {
+                    let node_id = self.node_ids.assign(&node);
+                    let replaced = self.nodes.insert(node.clone(), transport);
+                    // Bump on (re)admission so an inventory fetch from a PRIOR connection still in
+                    // flight can't commit its now-stale result over this fresh one.
+                    self.bump_epoch(&node);
+                    let _ = reply.send(Some((node_id, replaced)));
+                }
+            }
+            FleetMsg::BumpAdmitGen { reply } => {
+                self.admit_gen = self.admit_gen.wrapping_add(1);
+                let _ = reply.send(self.admit_gen);
             }
             FleetMsg::DropTransportIf {
                 node,
@@ -423,6 +459,25 @@ impl Actor for FleetActor {
             }
             FleetMsg::Retire { node, reply } => {
                 self.retire(&node);
+                let _ = reply.send(());
+            }
+            FleetMsg::DisconnectAll { reply } => {
+                // Bump the admission generation FIRST (same message, so it's atomic with the
+                // drain): any in-flight admission task from the now-closing accept loop that
+                // calls `AdmitNode` after this carries the OLD gen and is refused, not
+                // resurrected — and a later re-enable spawns an even newer gen, so it can never
+                // match again.
+                self.admit_gen = self.admit_gen.wrapping_add(1);
+                // Drain transports (closing each so a wedged-open connection's close-watcher
+                // wakes) but KEEP routes/inventories/node-ids — same "routes survive a dropped
+                // connection" contract as `drop_transport_if`, applied to every node at once.
+                for (node, t) in self.nodes.drain() {
+                    tracing::info!(
+                        node,
+                        "higgs hub: disabling — node transport closed (route kept)"
+                    );
+                    t.close();
+                }
                 let _ = reply.send(());
             }
             FleetMsg::AddInstance {
@@ -483,6 +538,7 @@ impl HubFleet {
             inventories: HashMap::new(),
             epochs: HashMap::new(),
             bus: bus_for_actor,
+            admit_gen: 0,
         });
         Self { handle, bus }
     }
@@ -526,15 +582,34 @@ impl HubFleet {
     /// Register/replace a paired node's transport (after the hub admits its HELLO). Routes
     /// are KEPT across reconnect (the node's workers persist). Closes any prior transport
     /// and spawns a watcher that drops the transport (only) when its connection closes.
-    pub async fn add_node(self: &Arc<Self>, node: NodeKey, transport: Arc<NodeTransport>) {
-        // Mint (or reuse) this node's stable NodeId so relayed logs tag consistently.
-        let node_id = self
-            .ask(|reply| FleetMsg::AssignNodeId {
+    pub async fn add_node(
+        self: &Arc<Self>,
+        node: NodeKey,
+        transport: Arc<NodeTransport>,
+        admit_gen: Option<u64>,
+    ) {
+        // Atomically admit: assign the stable NodeId, insert the transport, and bump the epoch in
+        // ONE actor message, gated by the admission generation. If the kill switch bumped the
+        // generation (a disable raced this admission), the admit is REFUSED — close the transport
+        // and skip ALL per-connection bookkeeping, so a disabled hub neither connects nor seeds
+        // the node into the fleet view. `admit_gen = None` admits unconditionally (direct/test
+        // callers that aren't the kill-switch-gated accept loop).
+        let admitted = self
+            .ask(|reply| FleetMsg::AdmitNode {
                 node: node.clone(),
+                transport: transport.clone(),
+                gen: admit_gen,
                 reply,
             })
             .await
-            .unwrap_or(NodeId(0));
+            .flatten();
+        let Some((node_id, replaced)) = admitted else {
+            transport.close(); // refused (hub disabled mid-admission)
+            return;
+        };
+        if let Some(old) = replaced {
+            old.close(); // free the old connection + wake its close-watcher
+        }
         // Read the node's relayed worker stderr (its uni stream) into the hub bus for THIS
         // connection; ends when the connection closes (accept_uni errors).
         tokio::spawn(read_remote_logs(
@@ -543,18 +618,6 @@ impl HubFleet {
             self.bus.clone(),
         ));
 
-        // Insert the transport + bump the epoch atomically; close any prior transport.
-        let replaced = self
-            .ask(|reply| FleetMsg::InsertTransport {
-                node: node.clone(),
-                transport: transport.clone(),
-                reply,
-            })
-            .await
-            .flatten();
-        if let Some(old) = replaced {
-            old.close(); // free the old connection + wake its close-watcher
-        }
         // On (re)connect: refresh the inventory for the fleet view. Best-effort, off the hot
         // path. (Loads are additive — no displaced workers are ever owed to an offline node —
         // so there are no pending unloads to reconcile.)
@@ -661,6 +724,25 @@ impl HubFleet {
             reply,
         })
         .await;
+    }
+
+    /// Close every node's transport and mark all nodes disconnected, WITHOUT dropping routes,
+    /// inventories, or node-ids. Used by the hub kill switch: disabling stops all node network
+    /// activity but keeps the route table, so re-enabling is a pure reconnect (previously-loaded
+    /// remote routes survive — see `tests/remote_hub_e2e.rs::node_reconnects_and_route_survives`).
+    pub async fn disconnect_all(&self) {
+        self.ask(|reply| FleetMsg::DisconnectAll { reply }).await;
+    }
+
+    /// Bump the admission generation and return the fresh value, for an accept loop about to be
+    /// spawned (`start_hub`). The loop binds to this gen and passes it to every `add_node`; a
+    /// prior loop's in-flight admissions (older gen) are thereby invalidated. The kill switch's
+    /// `disconnect_all` also bumps the gen, so a disabled fleet refuses stale admissions until
+    /// the next enable spawns a loop at a newer gen.
+    pub async fn bump_admit_gen(&self) -> u64 {
+        self.ask(|reply| FleetMsg::BumpAdmitGen { reply })
+            .await
+            .unwrap_or(0)
     }
 
     /// Currently-connected node keys, ascending.
@@ -971,7 +1053,7 @@ mod tests {
 
         let fleet = Arc::new(HubFleet::new(Arc::new(crate::log_bus::LogBus::new())));
         fleet
-            .add_node(node_key.clone(), Arc::new(NodeTransport::new(conn)))
+            .add_node(node_key.clone(), Arc::new(NodeTransport::new(conn)), None)
             .await;
         (fleet, node_key, model_id, root)
     }
@@ -983,6 +1065,38 @@ mod tests {
         let worker = fleet.load(&node_key, &model_id).await.unwrap();
         assert!(fleet.is_remote(&model_id).await);
         assert_eq!(fleet.resolve(&model_id).await, Some((node_key, worker)));
+    }
+
+    #[tokio::test]
+    async fn disconnect_all_closes_transports_but_keeps_routes() {
+        // The hub kill switch: disconnect_all severs every transport (nodes go offline) but the
+        // route table SURVIVES, so re-enabling the hub is a pure reconnect, not a re-pair.
+        let (fleet, node_key, model_id, _root) = fleet_with_one_node().await;
+        fleet.load(&node_key, &model_id).await.unwrap();
+        assert!(fleet.is_remote(&model_id).await, "route present after load");
+        assert!(
+            fleet.node_ids().await.contains(&node_key),
+            "node connected before disconnect_all"
+        );
+
+        fleet.disconnect_all().await;
+
+        assert!(
+            !fleet.node_ids().await.contains(&node_key),
+            "no connected nodes after disconnect_all"
+        );
+        // Route kept (durable across reconnect) and the node still appears — as DISCONNECTED,
+        // not retired (retire removes the node-id slot; disconnect keeps it).
+        assert!(
+            fleet.is_remote(&model_id).await,
+            "route survives disconnect_all"
+        );
+        let view = fleet.nodes_view().await;
+        let n = view
+            .iter()
+            .find(|n| n.endpoint_id == node_key)
+            .expect("node still listed after disconnect_all");
+        assert!(!n.connected, "node shown disconnected, not removed");
     }
 
     #[tokio::test]
@@ -1130,6 +1244,7 @@ mod tests {
             inventories: HashMap::new(),
             epochs: HashMap::new(),
             bus: Arc::new(crate::log_bus::LogBus::new()),
+            admit_gen: 0,
         };
         let served = actor.served_ids();
         // Three instances → three distinct served ids, each mapping to a distinct worker.

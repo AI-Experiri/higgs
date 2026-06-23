@@ -334,6 +334,11 @@ pub(super) async fn control_status(State(higgs): State<Arc<Higgs>>) -> Response 
 /// (hub mode only). Admin-scoped. The operator runs `higgs --node <ticket> <token>` on the
 /// node; the hub's accept loop admits it. `409` when the server isn't a hub.
 pub(super) async fn control_pair(State(higgs): State<Arc<Higgs>>) -> Response {
+    // Serialize against the kill switch (enable/disable): without this, a /pair concurrent with a
+    // disable could clone the still-published hub and mint a ticket/token from a closing endpoint,
+    // returning a 200 with an unusable command. Holding the lock means /pair runs either fully
+    // before a disable (valid at mint time) or fully after (sees hub() None → 409).
+    let _lifecycle = higgs.hub_lifecycle().lock().await;
     tracing::warn!("higgs: POST /api/higgs/pair (minting node pairing token)");
     match higgs.hub() {
         Some(hub) => {
@@ -354,28 +359,87 @@ pub(super) async fn control_pair(State(higgs): State<Arc<Higgs>>) -> Response {
     }
 }
 
+/// Build the current hub-mode status. `enabled` = the hub network is up (accepting dials);
+/// `node_count` is the fleet size, which persists across a disable (nodes then show disconnected
+/// until the hub is re-enabled and they reconnect).
+async fn hub_status(higgs: &Higgs) -> HiggsHubStatus {
+    let node_count = match higgs.fleet() {
+        Some(fleet) => u32::try_from(fleet.nodes_view().await.len()).unwrap_or(u32::MAX),
+        None => 0,
+    };
+    match higgs.hub() {
+        Some(hub) => HiggsHubStatus {
+            enabled: true,
+            hub_id: Some(hub.hub_id().to_string()),
+            node_count,
+        },
+        None => HiggsHubStatus {
+            enabled: false,
+            hub_id: None,
+            node_count,
+        },
+    }
+}
+
 /// `GET /api/higgs/hub` — hub-mode status: whether this server is a fleet hub, and if so its
 /// stable id and how many nodes it has admitted. Lets the Fleet tab show an explicit
 /// "hub mode off" state instead of inferring it from a `/pair` 409.
 pub(super) async fn control_hub(State(higgs): State<Arc<Higgs>>) -> Json<HiggsHubStatus> {
-    let status = if let Some(hub) = higgs.hub() {
-        let node_count = match higgs.fleet() {
-            Some(fleet) => u32::try_from(fleet.nodes_view().await.len()).unwrap_or(u32::MAX),
-            None => 0,
-        };
-        HiggsHubStatus {
-            enabled: true,
-            hub_id: Some(hub.hub_id().to_string()),
-            node_count,
+    Json(hub_status(&higgs).await)
+}
+
+/// `POST /api/higgs/hub/enable` — turn the hub network ON (the kill switch). Binds the iroh
+/// endpoint + spawns the accept loop against the EXISTING fleet (routes preserved), so a node
+/// that was disconnected by a prior disable reconnects with its routes intact. Idempotent —
+/// a no-op returning the current status when already enabled.
+pub(super) async fn control_hub_enable(State(higgs): State<Arc<Higgs>>) -> Response {
+    // Serialize the whole check→start→publish against any concurrent enable/disable: without
+    // this, two enables could both pass the `is_none` check, bind two endpoints + accept loops,
+    // and orphan the loser (which would keep accepting after a later disable).
+    let _lifecycle = higgs.hub_lifecycle().lock().await;
+    if higgs.hub().is_some() {
+        return Json(hub_status(&higgs).await).into_response();
+    }
+    // start_hub bumps the fleet's admission generation for its fresh accept loop, so a fleet that
+    // a prior disable invalidated admits reconnecting nodes again under the new generation.
+    match crate::node::hub::start_hub(higgs.log_bus(), higgs.fleet()).await {
+        Ok(hub) => {
+            let hub = Arc::new(hub);
+            higgs.set_fleet(hub.fleet.clone());
+            higgs.set_hub(hub);
+            tracing::warn!("higgs: hub ENABLED via /api/higgs/hub/enable");
+            Json(hub_status(&higgs).await).into_response()
         }
-    } else {
-        HiggsHubStatus {
-            enabled: false,
-            hub_id: None,
-            node_count: 0,
+        Err(e) => {
+            tracing::error!(error = %e, "higgs: hub enable failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("hub enable failed: {e}") })),
+            )
+                .into_response()
         }
-    };
-    Json(status)
+    }
+}
+
+/// `POST /api/higgs/hub/disable` — turn the hub network OFF (the kill switch). Closes the iroh
+/// endpoint (ends the accept loop + drops all relay connections) and every node transport, but
+/// KEEPS the fleet route table so re-enabling is a pure reconnect (no re-pair). Idempotent.
+pub(super) async fn control_hub_disable(State(higgs): State<Arc<Higgs>>) -> Json<HiggsHubStatus> {
+    // Serialized against enable (and other disables) so the close→disconnect→clear sequence is
+    // atomic w.r.t. a concurrent (re-)enable — see `control_hub_enable`.
+    let _lifecycle = higgs.hub_lifecycle().lock().await;
+    if let Some(hub) = higgs.hub() {
+        // Publish "disabled" FIRST (synchronous, before any await): a /pair that is also waiting
+        // on the lifecycle lock will, once it runs, see hub() None → 409 (never mints from the
+        // closing endpoint). Then tear down the network.
+        higgs.clear_hub();
+        hub.shutdown().await;
+        if let Some(fleet) = higgs.fleet() {
+            fleet.disconnect_all().await;
+        }
+        tracing::warn!("higgs: hub DISABLED via /api/higgs/hub/disable (network off; routes kept)");
+    }
+    Json(hub_status(&higgs).await)
 }
 
 /// `GET /api/higgs/nodes` — the remote fleet: one entry per paired node with its stable id,
@@ -868,6 +932,18 @@ mod tests {
             v.get("hub_id").is_none(),
             "hub_id omitted when disabled: {v}"
         );
+    }
+
+    #[tokio::test]
+    async fn hub_disable_without_hub_is_a_noop() {
+        // The kill switch is idempotent: disabling when no hub is installed just reports disabled.
+        let resp = make_app()
+            .oneshot(post_json("/api/higgs/hub/disable", &json!({})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(v["enabled"], false, "still disabled: {v}");
     }
 
     // ── Test 9: version endpoint ──────────────────────────────────────────────

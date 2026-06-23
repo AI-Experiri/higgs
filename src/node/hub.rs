@@ -56,6 +56,15 @@ impl Hub {
         (ticket, token)
     }
 
+    /// Disable the hub network: close the iroh endpoint, which ends the accept loop and drops
+    /// all relay connections (no more inbound dials, no relay phoning). Node transports are
+    /// closed separately by the caller via `HubFleet::disconnect_all`; the fleet's route table
+    /// is deliberately NOT touched, so a later `start_hub(bus, Some(fleet))` re-enables the hub
+    /// with previously-loaded routes intact (the kill switch is network-only).
+    pub async fn shutdown(&self) {
+        self.endpoint.close().await;
+    }
+
     /// Retire a node for good: remove its `EndpointId` from the persistent allowlist FIRST
     /// (so a reconnect can't silently re-admit without a fresh pairing token), then drop it
     /// from the fleet (transport, routes, cached inventory, relayed logs). Idempotent —
@@ -77,28 +86,45 @@ impl Hub {
 /// Build the hub from the persistent identity + allowlist under the higgs home dir, bind the
 /// endpoint, spawn the accept loop, and return the live [`Hub`]. `bus` is the hub's log bus
 /// (relayed remote worker stderr lands there). Call once at server startup in hub mode.
-pub async fn start_hub(bus: Arc<LogBus>) -> std::io::Result<Hub> {
+pub async fn start_hub(
+    bus: Arc<LogBus>,
+    existing_fleet: Option<Arc<HubFleet>>,
+) -> std::io::Result<Hub> {
     let home = crate::home::ensure_home()?;
     let sk = load_or_create_secret(&home.join("endpoint.key"))?;
     let endpoint = bind_endpoint(sk).await.map_err(std::io::Error::other)?;
     // Wait (bounded) for a home relay so tickets minted by the pairing API carry a relay URL
     // and are dialable from outside the hub's LAN (mirrors `link pair`). On a relay-less /
     // local setup this times out and we proceed with whatever direct addresses we have.
-    if tokio::time::timeout(std::time::Duration::from_secs(10), endpoint.online())
-        .await
-        .is_err()
+    // SKIP the wait entirely in LAN-only mode (HIGGS_IROH_LOCAL): relay is disabled, so
+    // `online()` can never resolve and we'd burn the full 10s on every (re-)enable for nothing.
+    if std::env::var_os("HIGGS_IROH_LOCAL").is_none()
+        && tokio::time::timeout(std::time::Duration::from_secs(10), endpoint.online())
+            .await
+            .is_err()
     {
         tracing::warn!(
             "higgs hub: no relay connected yet — pairing tickets may only be dialable on the LAN"
         );
     }
     let allow = Allowlist::load(&home.join("pairings.json"))?;
-    let fleet = Arc::new(HubFleet::new(bus));
-    // Seed the fleet with persisted pairings so a just-restarted hub lists every paired node
-    // (as disconnected) in /api/higgs/nodes before any of them reconnect.
-    for id in allow.ids() {
-        fleet.seed_node(&id).await;
-    }
+    // Re-enabling the hub (kill switch) reuses the EXISTING fleet so previously-loaded routes
+    // survive the disable→enable cycle — the disable is network-only. A cold start builds a
+    // fresh fleet and seeds it with the persisted allowlist so every paired node shows (as
+    // disconnected) in /api/higgs/nodes before any of them reconnect.
+    let fleet = match existing_fleet {
+        Some(fleet) => fleet,
+        None => {
+            let fleet = Arc::new(HubFleet::new(bus));
+            for id in allow.ids() {
+                fleet.seed_node(&id).await;
+            }
+            fleet
+        }
+    };
+    // A fresh admission generation for THIS accept loop. Bumping invalidates any prior loop's
+    // in-flight admissions (so a disable→enable can't let an old loop's task resurrect a node).
+    let admit_gen = fleet.bump_admit_gen().await;
     let hub = Hub {
         hub_id: endpoint.id().to_string(),
         allow: Arc::new(Mutex::new(allow)),
@@ -112,6 +138,7 @@ pub async fn start_hub(bus: Arc<LogBus>) -> std::io::Result<Hub> {
         hub.allow.clone(),
         hub.tokens.clone(),
         hub.hub_id.clone(),
+        admit_gen,
     );
     Ok(hub)
 }
@@ -124,6 +151,7 @@ pub fn spawn_accept_loop(
     allow: Arc<Mutex<Allowlist>>,
     tokens: Arc<Mutex<PairingTokens>>,
     hub_id: String,
+    admit_gen: u64,
 ) {
     tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
@@ -172,8 +200,10 @@ pub fn spawn_accept_loop(
                 match outcome {
                     GateOutcome::Admitted { .. } => {
                         tracing::info!(node = %peer, "higgs hub: node admitted");
+                        // Gated on THIS loop's admission generation: if the kill switch disabled
+                        // (bumped the gen) since this loop started, the admit is refused.
                         fleet
-                            .add_node(peer, Arc::new(NodeTransport::new(conn)))
+                            .add_node(peer, Arc::new(NodeTransport::new(conn)), Some(admit_gen))
                             .await;
                     }
                     GateOutcome::Rejected { code } => {
@@ -208,7 +238,9 @@ mod tests {
         let tokens = Arc::new(Mutex::new(PairingTokens::new()));
         let token = tokens.lock().await.mint(now_ms(), TOKEN_TTL_MS);
 
-        spawn_accept_loop(hub_ep, fleet.clone(), allow, tokens, hub_id);
+        // Bind the loop to a fresh admission generation (mirrors `start_hub`).
+        let admit_gen = fleet.bump_admit_gen().await;
+        spawn_accept_loop(hub_ep, fleet.clone(), allow, tokens, hub_id, admit_gen);
 
         // Node dials with the one-time token + completes HELLO (admitted + allowlisted).
         let self_id = node_ep.id().to_string();

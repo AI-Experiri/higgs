@@ -91,24 +91,23 @@ pub async fn run_standalone(
     higgs.set_api_keys(Arc::new(keys));
 
     // Hub mode (HIGGS_HUB=1, P3): bind the iroh endpoint, install the fleet, and accept node
-    // dials. `_hub` is kept in scope for the server's lifetime so the endpoint stays bound.
-    let _hub = if std::env::var("HIGGS_HUB").is_ok_and(|v| v == "1" || v == "true") {
-        match crate::node::hub::start_hub(log_bus.clone()).await {
+    // dials. The facade owns the hub Arc (`set_hub`) for the server's lifetime, so the endpoint
+    // stays bound; the kill switch (`POST /api/higgs/hub/{disable,enable}`) can later tear it
+    // down + rebind it against the same fleet (routes survive).
+    if std::env::var("HIGGS_HUB").is_ok_and(|v| v == "1" || v == "true") {
+        match crate::node::hub::start_hub(log_bus.clone(), None).await {
             Ok(hub) => {
                 let hub = Arc::new(hub);
-                higgs.set_fleet(hub.fleet.clone());
-                higgs.set_hub(hub.clone());
                 tracing::info!(
                     hub_id = hub.hub_id(),
                     "higgs: HUB mode — accepting node dials"
                 );
-                Some(hub)
+                higgs.set_fleet(hub.fleet.clone());
+                higgs.set_hub(hub);
             }
             Err(e) => return Err(Box::new(e)),
         }
-    } else {
-        None
-    };
+    }
 
     higgs.start().await?;
 

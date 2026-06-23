@@ -134,6 +134,13 @@ pub struct Higgs {
     /// The running hub (P3), when the server is in hub mode — used by the pairing API to mint
     /// node-join tokens. `None` for a pure-local / non-hub server.
     hub: parking_lot::Mutex<Option<Arc<crate::node::hub::Hub>>>,
+    /// Serializes the hub kill-switch lifecycle ops (`enable`/`disable`). Held across the WHOLE
+    /// check→start→publish (enable) / shutdown→disconnect→clear (disable) sequence so two
+    /// concurrent enables can't both pass the `hub().is_none()` check, bind two endpoints + accept
+    /// loops, and orphan the loser (whose accept loop would keep admitting nodes after a later
+    /// disable, defeating the kill switch). SEPARATE from `lifecycle` (local model load/unload) so
+    /// the two never cross-couple. An async `Mutex` because the guard is held across `.await`.
+    hub_lifecycle: tokio::sync::Mutex<()>,
 }
 
 impl Higgs {
@@ -190,6 +197,7 @@ impl Higgs {
             fleet: parking_lot::Mutex::new(None),
             api_keys: parking_lot::Mutex::new(std::sync::Arc::new(crate::keys::ApiKeys::default())),
             hub: parking_lot::Mutex::new(None),
+            hub_lifecycle: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -224,6 +232,28 @@ impl Higgs {
     /// The running hub, if the server is in hub mode.
     pub fn hub(&self) -> Option<Arc<crate::node::hub::Hub>> {
         self.hub.lock().clone()
+    }
+
+    /// Tear down the running-hub handle (the kill switch's network-off step). The caller first
+    /// closes the endpoint (`Hub::shutdown`) and the node transports
+    /// (`HubFleet::disconnect_all`); this then drops the hub so `hub()` is `None` (pairing 409s,
+    /// status reports disabled). The `fleet` is deliberately KEPT installed so the route table
+    /// survives and re-enabling is a pure reconnect.
+    pub fn clear_hub(&self) {
+        *self.hub.lock() = None;
+    }
+
+    /// The process [`LogBus`] this facade was built with (the one its serve layer reads). The
+    /// hub kill switch hands it to `start_hub` when (re-)enabling so relayed remote-worker logs
+    /// land in the same Developer-Log console.
+    pub fn log_bus(&self) -> Arc<LogBus> {
+        self.local.bus().clone()
+    }
+
+    /// The lock serializing hub enable/disable (the kill switch). Callers hold it across the
+    /// whole lifecycle op (see the `hub_lifecycle` field doc) so concurrent toggles can't race.
+    pub fn hub_lifecycle(&self) -> &tokio::sync::Mutex<()> {
+        &self.hub_lifecycle
     }
 
     /// Whether "Verbose Logging" is on. Single home is the [`LogBus`] (read by
