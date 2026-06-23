@@ -22,11 +22,12 @@ The split groups code by **responsibility**, not by layer:
   files about logic.
 - **`guards.rs`** — pure, testable validation/containment/headroom functions with no `Higgs`
   state. They are `pub(crate)` because `node::runtime` reuses `guard_memory_headroom` and
-  `path_within_roots` for the remote load path (one guard implementation, two callers).
-- **`reaper.rs`** — the one long-running background loop. It only needs `Weak<Higgs>` +
-  three constants, so it carries no facade internals and reads as a self-contained policy.
+  `path_within_roots` for the node's load path (one guard implementation, two callers).
 - **`tests.rs`** — moved verbatim; it is the largest single block and belongs beside, not
   inside, the code.
+
+(An earlier `reaper.rs` held the engine-level idle auto-unload loop; P4b moved idle
+auto-unload INTO the node — per-worker, uniform local+remote — so that file was removed.)
 
 `api.rs` keeps the `Higgs` struct and its core lifecycle `impl`, because those are tightly
 coupled to the struct's private fields and to each other.
@@ -37,22 +38,33 @@ coupled to the struct's private fields and to each other.
    used by `serve/`, `node/`, and `bin/` are unchanged. The split is behavior-preserving and
    was verified by codex convergence + both coverage gates.
 2. **Privacy is intentional.** Wire types/constants are `pub` (some cross the bindings
-   boundary); guards/reaper helpers are `pub(crate)`; `fits_in_memory` is re-exported only
-   under `#[cfg(test)]` (it has no non-test caller).
+   boundary); the guard helpers (`guard_memory_headroom`, `path_within_roots`) are
+   `pub(crate)` (the node reuses them); `fits_in_memory` is re-exported only under
+   `#[cfg(test)]` (it has no non-test caller).
 3. **Child-module test access.** `tests.rs` uses `use super::*`; a child module can see its
    parent's private items, so the tests still exercise facade internals without widening
    visibility.
+
+## How the facade routes (post-P4b)
+
+`Higgs` holds `local: Arc<NodeRuntime>` (the co-located multi-worker node) and an optional
+`fleet: HubFleet` (remote nodes). The facade is **local-first** everywhere — listing,
+loaded-model gating, and chat routing all prefer a locally-resident model over a remote one
+of the same served id, so a model the user loaded locally is always reachable:
+
+- **`load`** is additive on the node (one worker per model) and deduped by raw id at the
+  facade; **`unload`** drains every local worker; **`status`** reports the PRIMARY (lowest
+  worker id) instance.
+- **`chat_stream`** resolves a SERVED id → `(worker, raw model)` via
+  [`local_served`], leases that worker, and sends the RAW model on the wire; if not local it
+  falls through to the fleet.
+- **`local_served_ids`** feeds `/v1/models` (∪ the fleet's routed models).
+
+Idle auto-unload, worker spawn/RPC correlation, and the Developer-Log bus live in the node,
+not the facade.
 
 ## Boundaries / what does NOT belong here
 
 - Worker-process lifecycle, RPC correlation, restart FSM → `supervisor.rs`.
 - Multi-worker orchestration + the node idle reaper → `node/runtime.rs`.
 - Remote fleet routing + served-instance ids → `node/fleet.rs`, `node/served.rs`.
-
-## Forward note (P4b)
-
-The actor-runtime migration's P4b replaces `Higgs`'s direct `Supervisor` with an in-process
-`NodeRuntime` behind a `NodeHandle (Local | Remote)` seam (unified local+remote routing,
-multi-model local). That change lands in `api.rs` (the struct + lifecycle); this split is a
-prerequisite that makes it tractable. See
-`docs/superpowers/plans/2026-06-22-p4b-local-as-noderuntime.md`.
