@@ -54,6 +54,26 @@ mod tests {
 }
 
 higgs_ts! {
+    /// Response for `GET /api/higgs/hub`: whether this server is a fleet hub right now.
+    ///
+    /// `enabled` is false when hub mode is off (no hub installed) — the Fleet tab shows a
+    /// "hub mode off" panel instead of inferring it from a `/pair` 409. When enabled, `hub_id`
+    /// is the hub's stable iroh endpoint id and `node_count` is how many nodes it has admitted
+    /// (connected or not).
+    #[derive(Debug, Clone, serde::Serialize)]
+    pub struct HiggsHubStatus {
+        /// True when this server runs as a fleet hub (accepting node dials).
+        pub enabled: bool,
+        /// The hub's stable id (iroh endpoint id); `None` when hub mode is off.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub hub_id: Option<String>,
+        /// Nodes admitted to the fleet (connected or not); 0 when hub mode is off.
+        pub node_count: u32,
+    }
+}
+
+higgs_ts! {
     /// One load-relevant GGUF header key/value, curated for the UI so a support
     /// mismatch can be pinned to a specific field (e.g. `general.architecture =
     /// gemma4`). Only keys that bear on loadability are surfaced — giant arrays

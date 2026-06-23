@@ -133,6 +133,25 @@ async fn hub_server_pairs_a_node_and_lists_it() {
         .expect("endpoint_id")
         .to_string();
 
+    // ── GET /api/higgs/hub — hub-mode status reflects the live hub + the admitted node. ──
+    let hub_status: serde_json::Value = c
+        .get(format!("{base}/api/higgs/hub"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(hub_status["enabled"], true, "hub mode on: {hub_status}");
+    assert!(
+        hub_status["hub_id"].as_str().is_some_and(|s| !s.is_empty()),
+        "hub status carries the stable hub id: {hub_status}"
+    );
+    assert!(
+        hub_status["node_count"].as_u64().is_some_and(|n| n >= 1),
+        "hub status counts the admitted node: {hub_status}"
+    );
+
     // ── GET /api/higgs/nodes/{node}/models — the node's on-disk catalog (M_NODE_SCAN over
     // iroh). Always answers 200 with a `models` array; with a staged GGUF it lists the model.
     let cat = c
@@ -233,4 +252,19 @@ async fn hub_server_pairs_a_node_and_lists_it() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(gone, "retired node is removed from /api/higgs/nodes");
+
+    // The hub is still enabled after the retire, but no longer counts the node.
+    let hub_after: serde_json::Value = c
+        .get(format!("{base}/api/higgs/hub"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(hub_after["enabled"], true, "hub still enabled: {hub_after}");
+    assert_eq!(
+        hub_after["node_count"], 0,
+        "retired node no longer counted: {hub_after}"
+    );
 }

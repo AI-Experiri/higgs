@@ -16,8 +16,9 @@ use tokio::sync::{broadcast, mpsc};
 
 use super::http_status;
 use super::wire::{
-    HiggsErrorResponse, HiggsLoadRequest, HiggsLoadResponse, HiggsLogsResponse, HiggsModelEntry,
-    HiggsModelsResponse, HiggsOk, HiggsRuntimeSettings, HiggsVersionResponse, LogSettings,
+    HiggsErrorResponse, HiggsHubStatus, HiggsLoadRequest, HiggsLoadResponse, HiggsLogsResponse,
+    HiggsModelEntry, HiggsModelsResponse, HiggsOk, HiggsRuntimeSettings, HiggsVersionResponse,
+    LogSettings,
 };
 use crate::api::Higgs;
 use crate::diagnostic::HiggsError;
@@ -351,6 +352,30 @@ pub(super) async fn control_pair(State(higgs): State<Arc<Higgs>>) -> Response {
         )
             .into_response(),
     }
+}
+
+/// `GET /api/higgs/hub` — hub-mode status: whether this server is a fleet hub, and if so its
+/// stable id and how many nodes it has admitted. Lets the Fleet tab show an explicit
+/// "hub mode off" state instead of inferring it from a `/pair` 409.
+pub(super) async fn control_hub(State(higgs): State<Arc<Higgs>>) -> Json<HiggsHubStatus> {
+    let status = if let Some(hub) = higgs.hub() {
+        let node_count = match higgs.fleet() {
+            Some(fleet) => u32::try_from(fleet.nodes_view().await.len()).unwrap_or(u32::MAX),
+            None => 0,
+        };
+        HiggsHubStatus {
+            enabled: true,
+            hub_id: Some(hub.hub_id().to_string()),
+            node_count,
+        }
+    } else {
+        HiggsHubStatus {
+            enabled: false,
+            hub_id: None,
+            node_count: 0,
+        }
+    };
+    Json(status)
 }
 
 /// `GET /api/higgs/nodes` — the remote fleet: one entry per paired node with its stable id,
@@ -829,6 +854,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(unload.status(), StatusCode::CONFLICT, "no fleet → 409");
+    }
+
+    #[tokio::test]
+    async fn hub_status_without_hub_reports_disabled() {
+        // No hub installed → GET /api/higgs/hub answers 200 with enabled:false, no id, 0 nodes.
+        let resp = make_app().oneshot(get("/api/higgs/hub")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(v["enabled"], false, "no hub installed → disabled: {v}");
+        assert_eq!(v["node_count"], 0, "no nodes when disabled: {v}");
+        assert!(
+            v.get("hub_id").is_none(),
+            "hub_id omitted when disabled: {v}"
+        );
     }
 
     // ── Test 9: version endpoint ──────────────────────────────────────────────
