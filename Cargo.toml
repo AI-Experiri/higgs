@@ -5,10 +5,12 @@ edition = "2021"
 description = "In-app local model runtime: OpenAI-compatible serving over llama.cpp with crash-isolated worker"
 license = "MIT"
 
-# higgs is its own single-crate workspace (extracted from jigglebot). This makes
+# higgs is its own workspace (extracted from jigglebot). This makes
 # `[lints] workspace = true` resolve standalone and lets the crate build/release
 # on its own; embedders (jigglebot) depend on it via a path/git dependency.
+# `higgs-macros` is a proc-macro member (TsConstEnum: const-object TS enum emitter).
 [workspace]
+members = ["higgs-macros"]
 
 [profile.dev]
 incremental = false
@@ -30,6 +32,8 @@ implicit_clone = "warn"
 unnecessary_to_owned = "warn"
 
 [dependencies]
+# higgs's own proc-macros (TsConstEnum — const-object TS enums, consistent with jigglebot).
+higgs-macros = { path = "higgs-macros" }
 # full: supervisor needs rt+sync+time+io, worker needs rt+process+io — Tasks 2-12 use all of it
 tokio = { version = "1", features = ["full"] }
 # Default OS-specific directories (home, config, cache, data). 246M downloads.

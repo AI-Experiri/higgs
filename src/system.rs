@@ -11,7 +11,7 @@ use sysinfo::System;
 use crate::api::HiggsServerConfig;
 use crate::LLAMA_CPP_2_VERSION;
 
-higgs_ts! {
+higgs_const_enum! {
     /// Kind of compute device, mirroring ggml's `ggml_backend_dev_type`
     /// (`GGML_BACKEND_DEVICE_TYPE_{CPU,GPU,ACCEL}`). The worker maps the raw
     /// FFI enum to this engine-agnostic shape; the mapping lives only in

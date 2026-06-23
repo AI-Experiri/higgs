@@ -299,8 +299,14 @@ The fast pre-commit gate. Runs, in order:
 2. `cargo clippy --all-targets -D warnings`.
 3. `cargo test` — the full suite, which also **regenerates** the ts-rs bindings under
    `bindings/higgs/` (emitted by the `higgs_ts!` macro's `#[ts(export)]` derive tests).
-4. **Bindings sync** — fails if `bindings/` drifted after the test pass, so a Rust wire-type
-   change can't land without the regenerated TypeScript committed alongside it.
+4. `cargo test macro_run -- --ignored` — a SECOND pass that regenerates the **const-object**
+   enum bindings (`higgs_const_enum!` → `TsConstEnum`, e.g. `FlashAttn`/`HiggsModelSource`).
+   It must run AFTER step 3: ts-rs's transitive export writes a union for each enum as a side
+   effect of exporting a dependent struct, so this pass runs last to win. To regenerate bindings
+   by hand, run `scripts/quality.sh` (or `cargo test && cargo test macro_run -- --ignored`) —
+   plain `cargo test` alone leaves the const enums in ts-rs union form.
+5. **Bindings sync** — fails if `bindings/` drifted after the two regen passes, so a Rust
+   wire-type change can't land without the regenerated TypeScript committed alongside it.
 
 ### Coverage gates (`scripts/coverage.sh`)
 

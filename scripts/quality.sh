@@ -73,17 +73,27 @@ run_check "clippy" cargo clippy --all-targets -- -D warnings
 step "cargo test"
 run_check "tests" cargo test
 
+# ── Const-enum bindings (TsConstEnum) ────────────────────
+
+# Unit-variant enums emit a const-OBJECT (`higgs_const_enum!` → TsConstEnum) instead
+# of a ts-rs `"a"|"b"` union, so the frontend can use them as VALUES (consistent with
+# jigglebot). Their writers are #[ignore]d `macro_run_*` tests run in a SEPARATE pass
+# AFTER `cargo test` — ts-rs's transitive export (above) writes a union for each as a
+# side effect of exporting a dependent struct, so this pass must run LAST to win.
+step "cargo test macro_run (regenerate const-object enum bindings)"
+run_check "ts-const-enum bindings" cargo test macro_run -- --ignored
+
 # ── Bindings sync ────────────────────────────────────────
 
 # After the test pass regenerated them, the committed ts-rs bindings must be
 # unchanged — a drift means a Rust wire type changed without committing the
 # regenerated TypeScript. Scope strictly to bindings/ so unrelated working-tree
 # changes don't trip this.
-step "ts-rs bindings sync (bindings/ unchanged after cargo test)"
+step "ts-rs bindings sync (bindings/ unchanged after cargo test + macro_run)"
 if git diff --quiet -- bindings/; then
     log "✓ bindings in sync with Rust types"
 else
-    err "✗ bindings/ drifted — cargo test regenerated different .ts than committed"
+    err "✗ bindings/ drifted — the regen produced different .ts than committed"
     git --no-pager diff --stat -- bindings/
     echo "  Commit the regenerated bindings: git add bindings/ && commit."
     FAILED=1

@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::diagnostic::HiggsError;
 use crate::serve::wire::GgufComponent;
 
-higgs_ts! {
+higgs_const_enum! {
     /// Where a scanned model file came from.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
     pub enum HiggsModelSource {

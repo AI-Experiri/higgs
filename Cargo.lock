@@ -1409,6 +1409,7 @@ dependencies = [
  "encoding_rs",
  "futures",
  "ggus",
+ "higgs-macros",
  "http-body-util",
  "iroh",
  "iroh-base",
@@ -1435,6 +1436,15 @@ dependencies = [
  "tracing-subscriber",
  "ts-rs",
  "uuid",
+]
+
+[[package]]
+name = "higgs-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

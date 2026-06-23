@@ -119,7 +119,7 @@ higgs_ts! {
     }
 }
 
-higgs_ts! {
+higgs_const_enum! {
     /// Flash-attention policy, mirroring llama.cpp's `llama_flash_attn_type`
     /// (AUTO = -1, DISABLED = 0, ENABLED = 1). Engine-agnostic at this layer;
     /// mapped to the raw `llama_cpp_sys_2` value only inside `llamacpp.rs`.
@@ -135,7 +135,7 @@ higgs_ts! {
     }
 }
 
-higgs_ts! {
+higgs_const_enum! {
     /// KV-cache element type (the LM Studio subset of GGML types usable for the
     /// K/V cache). Engine-agnostic here; mapped to `llama_cpp_2`'s `KvCacheType`
     /// only inside `llamacpp.rs`.
