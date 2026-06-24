@@ -10,7 +10,9 @@ use serde_json::json;
 
 use crate::auth::{Allowlist, PairingTokens};
 use crate::node::test_support::{fake_runtime, local_endpoint, node_rpc, stage_dummy_model};
-use crate::node::{connect_node, gate_connection, serve_node, GateOutcome, HELLO_DEADLINE};
+use crate::node::{
+    connect_node, gate_connection, serve_node, GateOutcome, HubIdentity, HELLO_DEADLINE,
+};
 use crate::remote::{M_NODE_LOAD, M_NODE_STATUS, M_NODE_SYSINFO};
 
 #[tokio::test]
@@ -35,7 +37,7 @@ async fn node_hosts_two_workers_sysinfo_status_over_iroh() {
     let rt = Arc::new(fake_runtime(vec![model_root.path().to_path_buf()]));
     let rt_node = rt.clone();
     let node_task = tokio::spawn(async move {
-        let (node_conn, _hello) = connect_node(&node, hub_addr, node_id, None)
+        let (node_conn, _hello) = connect_node(&node, hub_addr, node_id, String::new(), None)
             .await
             .expect("connect");
         serve_node(node_conn, rt_node).await; // runs until the connection closes
@@ -51,7 +53,7 @@ async fn node_hosts_two_workers_sysinfo_status_over_iroh() {
         &mut allow,
         &mut tokens,
         1,
-        hub_id,
+        &HubIdentity::new(hub_id),
         None,
         HELLO_DEADLINE,
     )

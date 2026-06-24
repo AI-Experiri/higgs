@@ -11,12 +11,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use iroh_tickets::endpoint::EndpointTicket;
 
 use crate::auth::{Allowlist, PairingTokens};
+use crate::config::{name_or_init, Role};
 use crate::home::ensure_home;
 use crate::node::identity::{bind_endpoint, load_or_create_secret};
 use crate::node::runtime::{NodeConfig, NodeRuntime};
-use crate::node::{dial_and_hello, gate_connection, GateOutcome, HELLO_DEADLINE};
+use crate::node::{dial_and_hello, gate_connection, GateOutcome, HubIdentity, HELLO_DEADLINE};
 
-/// Pairing-token lifetime: 10 minutes (DESIGN-remote.md §7).
 const TOKEN_TTL_MS: u64 = 10 * 60 * 1000;
 
 fn now_ms() -> u64 {
@@ -59,6 +59,11 @@ fn run_link_pair() -> Result<()> {
         let sk = load_or_create_secret(&key_path()?)?;
         let endpoint = bind_endpoint(sk).await.map_err(Error::other)?;
         let hub_id = endpoint.id().to_string();
+        // The hub's persistent friendly name, sent to each node in its HELLO result.
+        let identity = HubIdentity {
+            id: hub_id.clone(),
+            name: name_or_init(Role::Hub, &hub_id, &crate::system::hostname())?,
+        };
         let mut allow = Allowlist::load(&pairings_path()?)?;
         let mut tokens = PairingTokens::new();
         let token = tokens.mint(now_ms(), TOKEN_TTL_MS);
@@ -74,7 +79,7 @@ fn run_link_pair() -> Result<()> {
         }
         let ticket = EndpointTicket::new(endpoint.addr());
 
-        println!("higgs hub id : {hub_id}");
+        println!("higgs hub    : {} ({hub_id})", identity.name);
         println!("pairing token: {token}   (valid 10m, single-use)");
         println!("ticket       : {ticket}");
         println!("on the node:  higgs node connect {ticket} {token}");
@@ -99,7 +104,7 @@ fn run_link_pair() -> Result<()> {
             };
             let peer = conn.remote_id().to_string();
             let outcome = gate_connection(
-                &conn, &mut allow, &mut tokens, now_ms(), hub_id.clone(), Some("paired-node".into()),
+                &conn, &mut allow, &mut tokens, now_ms(), &identity, Some("paired-node".into()),
                 HELLO_DEADLINE,
             )
             .await;
@@ -152,11 +157,12 @@ fn run_node_connect(args: &[String]) -> Result<()> {
         let sk = load_or_create_secret(&key_path()?)?;
         let endpoint = bind_endpoint(sk).await.map_err(Error::other)?;
         let self_id = endpoint.id().to_string();
-        println!("higgs node id: {self_id}");
-        let res = dial_and_hello(&endpoint, target, self_id, token).await?;
+        let name = name_or_init(Role::Node, &self_id, &crate::system::hostname())?;
+        println!("higgs node   : {name} ({self_id})");
+        let res = dial_and_hello(&endpoint, target, self_id, name, token).await?;
         println!(
-            "paired with hub {} (protocol v{}, label {:?})",
-            res.node_id, res.agreed_version, res.assigned_label
+            "paired with hub {} ({}) (protocol v{}, label {:?})",
+            res.hub_name, res.node_id, res.agreed_version, res.assigned_label
         );
         Ok(())
     })
@@ -182,6 +188,9 @@ pub fn run_node_daemon(args: &[String]) -> Result<()> {
         let sk = load_or_create_secret(&key_path()?)?;
         let endpoint = bind_endpoint(sk).await.map_err(Error::other)?;
         let self_id = endpoint.id().to_string();
+        // This node's persistent friendly name (`node-<eid8>(<host>)`), sent in every HELLO so
+        // the hub labels it in the fleet view. Generated + persisted on first run, reused after.
+        let name = name_or_init(Role::Node, &self_id, &crate::system::hostname())?;
         // Model roots: the same defaults the standalone runtime uses (standard LM Studio /
         // HF / Ollama dirs) plus the HIGGS_MODEL_DIR override, so a node can actually
         // scan/load real models — not an empty set.
@@ -209,7 +218,7 @@ pub fn run_node_daemon(args: &[String]) -> Result<()> {
             ollama_dirs: hc.ollama_dirs,
             idle_ttl: crate::node::runtime::DEFAULT_IDLE_TTL,
         }));
-        println!("higgs node id: {self_id}; connecting to hub…");
+        println!("higgs node   : {name} ({self_id}); connecting to hub…");
 
         // The one-time token is sent until a connect SUCCEEDS (HELLO admitted); a failed
         // attempt (hub offline, relay flake, HELLO timeout) must keep it for retry, or an
@@ -223,11 +232,11 @@ pub fn run_node_daemon(args: &[String]) -> Result<()> {
         loop {
             tokio::select! {
                 _ = &mut shutdown => break,
-                res = crate::node::connect_node(&endpoint, target.clone(), self_id.clone(), token.clone()) => {
+                res = crate::node::connect_node(&endpoint, target.clone(), self_id.clone(), name.clone(), token.clone()) => {
                     match res {
                         Ok((conn, hello)) => {
                             token = None; // admitted — token burned hub-side; don't resend it
-                            println!("paired with hub {} (protocol v{})", hello.node_id, hello.agreed_version);
+                            println!("paired with hub {} ({}) (protocol v{})", hello.hub_name, hello.node_id, hello.agreed_version);
                             tokio::select! {
                                 _ = &mut shutdown => break,
                                 _ = crate::node::serve_node(conn, node.clone()) => {

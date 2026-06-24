@@ -63,6 +63,11 @@ pub struct HelloParams {
     pub role: String,
     /// Self EndpointId (canonical string); MUST equal the QUIC peer id.
     pub node_id: String,
+    /// The node's friendly name (`node-<eid8>(<host>)`), shown in the hub fleet view and
+    /// stored as its allowlist label on first join. `#[serde(default)]` so an older node that
+    /// omits it still parses (the hub then falls back to its own `label_for_new`).
+    #[serde(default)]
+    pub name: String,
     /// Only on first join; omitted once paired.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pairing_token: Option<String>,
@@ -107,6 +112,11 @@ pub fn hub_capabilities() -> Capabilities {
 pub struct HelloResult {
     pub role: String,
     pub node_id: String,
+    /// The hub's friendly name (`hub-<eid8>(<host>)`). The node saves this as the `label` of
+    /// the hub in its `config.json` (Unit B) so `higgs --node --list` shows a human name, not a
+    /// raw EndpointId. `#[serde(default)]` so an older hub that omits it still parses (empty).
+    #[serde(default)]
+    pub hub_name: String,
     /// The single major both sides pin for this session.
     pub agreed_version: u32,
     pub software_version: String,
@@ -292,6 +302,7 @@ mod tests {
         HelloParams {
             role: "node".into(),
             node_id: "z32id".into(),
+            name: "node-z32id000(box)".into(),
             pairing_token: Some("htk_abc".into()),
             protocol_versions: vec![1],
             min_supported: 1,
@@ -310,6 +321,38 @@ mod tests {
         assert_eq!(
             back.capabilities.get("chat"),
             Some(&serde_json::Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn hello_carries_friendly_names() {
+        // The node's name rides HelloParams; an older node omitting it still parses (empty).
+        let p = sample_params();
+        let back: HelloParams = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        assert_eq!(back.name, "node-z32id000(box)");
+        let older = r#"{"role":"node","node_id":"z","protocol_versions":[1],
+            "min_supported":1,"software_version":"0.1.0"}"#;
+        assert_eq!(serde_json::from_str::<HelloParams>(older).unwrap().name, "");
+
+        // The hub's name rides HelloResult; an older hub omitting it still parses (empty).
+        let r = HelloResult {
+            role: "hub".into(),
+            node_id: "hubid".into(),
+            hub_name: "hub-3f9a2b1c(srv)".into(),
+            agreed_version: 1,
+            software_version: "0.4.2".into(),
+            assigned_label: Some("node-z32id000(box)".into()),
+            capabilities: hub_capabilities(),
+        };
+        let back: HelloResult = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(back.hub_name, "hub-3f9a2b1c(srv)");
+        let older_hub =
+            r#"{"role":"hub","node_id":"h","agreed_version":1,"software_version":"0.1.0"}"#;
+        assert_eq!(
+            serde_json::from_str::<HelloResult>(older_hub)
+                .unwrap()
+                .hub_name,
+            ""
         );
     }
 

@@ -20,7 +20,7 @@ use iroh_tickets::endpoint::EndpointTicket;
 use serde_json::{json, Value};
 
 use higgs::auth::{Allowlist, PairingTokens};
-use higgs::node::{gate_connection, GateOutcome, HELLO_DEADLINE};
+use higgs::node::{gate_connection, GateOutcome, HubIdentity, HELLO_DEADLINE};
 use higgs::remote::{
     ALPN, M_NODE_KILL, M_NODE_LOAD, M_NODE_SCAN, M_NODE_STATUS, M_NODE_SYSINFO, M_NODE_UNLOAD,
 };
@@ -172,7 +172,7 @@ async fn remote_node_full_workflow_over_iroh() {
         &mut allow,
         &mut tokens,
         now_ms(),
-        hub_id,
+        &HubIdentity::new(hub_id),
         Some("test".into()),
         HELLO_DEADLINE,
     )

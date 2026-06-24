@@ -15,13 +15,13 @@ use iroh::Endpoint;
 use tokio::sync::Mutex;
 
 use crate::auth::{Allowlist, PairingTokens};
+use crate::config::{name_or_init, Role};
 use crate::log_bus::LogBus;
 use crate::node::fleet::HubFleet;
 use crate::node::identity::{bind_endpoint, load_or_create_secret};
 use crate::node::transport::NodeTransport;
-use crate::node::{gate_admit, gate_read_hello, GateOutcome, HELLO_DEADLINE};
+use crate::node::{gate_admit, gate_read_hello, GateOutcome, HubIdentity, HELLO_DEADLINE};
 
-/// Pairing-token lifetime: 10 minutes (matches the `link pair` CLI / §7).
 const TOKEN_TTL_MS: u64 = 10 * 60 * 1000;
 
 fn now_ms() -> u64 {
@@ -93,6 +93,17 @@ pub async fn start_hub(
     let home = crate::home::ensure_home()?;
     let sk = load_or_create_secret(&home.join("endpoint.key"))?;
     let endpoint = bind_endpoint(sk).await.map_err(std::io::Error::other)?;
+    // The hub's stable friendly name (`hub-<eid8>(<host>)`), generated + persisted on first run
+    // and reused thereafter; sent to every node in its HELLO result so the node can label this
+    // hub in its saved-hubs list (Unit B).
+    let identity = HubIdentity {
+        id: endpoint.id().to_string(),
+        name: name_or_init(
+            Role::Hub,
+            &endpoint.id().to_string(),
+            &crate::system::hostname(),
+        )?,
+    };
     // Wait (bounded) for a home relay so tickets minted by the pairing API carry a relay URL
     // and are dialable from outside the hub's LAN (mirrors `link pair`). On a relay-less /
     // local setup this times out and we proceed with whatever direct addresses we have.
@@ -126,7 +137,7 @@ pub async fn start_hub(
     // in-flight admissions (so a disable→enable can't let an old loop's task resurrect a node).
     let admit_gen = fleet.bump_admit_gen().await;
     let hub = Hub {
-        hub_id: endpoint.id().to_string(),
+        hub_id: identity.id.clone(),
         allow: Arc::new(Mutex::new(allow)),
         tokens: Arc::new(Mutex::new(PairingTokens::new())),
         endpoint: endpoint.clone(),
@@ -137,7 +148,7 @@ pub async fn start_hub(
         fleet,
         hub.allow.clone(),
         hub.tokens.clone(),
-        hub.hub_id.clone(),
+        identity,
         admit_gen,
     );
     Ok(hub)
@@ -150,13 +161,17 @@ pub fn spawn_accept_loop(
     fleet: Arc<HubFleet>,
     allow: Arc<Mutex<Allowlist>>,
     tokens: Arc<Mutex<PairingTokens>>,
-    hub_id: String,
+    identity: HubIdentity,
     admit_gen: u64,
 ) {
     tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
-            let (fleet, allow, tokens, hub_id) =
-                (fleet.clone(), allow.clone(), tokens.clone(), hub_id.clone());
+            let (fleet, allow, tokens, identity) = (
+                fleet.clone(),
+                allow.clone(),
+                tokens.clone(),
+                identity.clone(),
+            );
             tokio::spawn(async move {
                 let conn = match incoming.await {
                     Ok(c) => c,
@@ -193,7 +208,7 @@ pub fn spawn_accept_loop(
                     &mut allow,
                     &mut tokens,
                     now_ms(),
-                    hub_id,
+                    &identity,
                     Some("paired-node".into()),
                 )
                 .await;
@@ -240,14 +255,26 @@ mod tests {
 
         // Bind the loop to a fresh admission generation (mirrors `start_hub`).
         let admit_gen = fleet.bump_admit_gen().await;
-        spawn_accept_loop(hub_ep, fleet.clone(), allow, tokens, hub_id, admit_gen);
+        let identity = HubIdentity {
+            id: hub_id,
+            name: "hub-testname(srv)".into(),
+        };
+        spawn_accept_loop(hub_ep, fleet.clone(), allow, tokens, identity, admit_gen);
 
         // Node dials with the one-time token + completes HELLO (admitted + allowlisted).
         let self_id = node_ep.id().to_string();
-        let (_conn, result) = connect_node(&node_ep, hub_addr, self_id.clone(), Some(token))
-            .await
-            .unwrap();
+        let (_conn, result) = connect_node(
+            &node_ep,
+            hub_addr,
+            self_id.clone(),
+            "node-x(box)".into(),
+            Some(token),
+        )
+        .await
+        .unwrap();
         assert_eq!(result.role, "hub");
+        // The hub's friendly name rides the HELLO result.
+        assert_eq!(result.hub_name, "hub-testname(srv)");
 
         // The accept loop registers the node in the fleet (poll briefly for the async add).
         let mut admitted = false;

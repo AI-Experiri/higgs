@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use higgs::auth::{Allowlist, PairingTokens};
-use higgs::node::{dial_and_hello, gate_connection, GateOutcome, HELLO_DEADLINE};
+use higgs::node::{dial_and_hello, gate_connection, GateOutcome, HubIdentity, HELLO_DEADLINE};
 use higgs::remote::ALPN;
 
 /// Bind a local-only endpoint (relay disabled) for in-process testing.
@@ -45,7 +45,7 @@ async fn valid_token_pairs() {
             &mut allow,
             &mut tokens,
             2_000,
-            hub_id,
+            &HubIdentity::new(hub_id),
             Some("studio".into()),
             HELLO_DEADLINE,
         )
@@ -56,7 +56,7 @@ async fn valid_token_pairs() {
     });
 
     let node_id = node.id().to_string();
-    let res = dial_and_hello(&node, hub_addr, node_id, Some(tok)).await;
+    let res = dial_and_hello(&node, hub_addr, node_id, String::new(), Some(tok)).await;
     assert!(res.is_ok(), "valid token should pair: {res:?}");
     assert_eq!(res.unwrap().agreed_version, 1);
 
@@ -83,7 +83,7 @@ async fn stranger_without_token_is_rejected_hg024() {
             &mut allow,
             &mut tokens,
             2_000,
-            hub_id,
+            &HubIdentity::new(hub_id),
             None,
             HELLO_DEADLINE,
         )
@@ -92,7 +92,7 @@ async fn stranger_without_token_is_rejected_hg024() {
 
     let node_id = node.id().to_string();
     // No token, empty allowlist → hub rejects; the node's read sees the closed stream.
-    let res = dial_and_hello(&node, hub_addr, node_id, None).await;
+    let res = dial_and_hello(&node, hub_addr, node_id, String::new(), None).await;
     assert!(res.is_err(), "stranger must be rejected");
 
     let outcome = hub_task.await.unwrap();
@@ -113,7 +113,16 @@ async fn silent_peer_is_dropped_hg028() {
     let hub_task = tokio::spawn(async move {
         let incoming = hub.accept().await.expect("incoming");
         let conn = incoming.await.expect("conn");
-        gate_connection(&conn, &mut allow, &mut tokens, 2_000, hub_id, None, short).await
+        gate_connection(
+            &conn,
+            &mut allow,
+            &mut tokens,
+            2_000,
+            &HubIdentity::new(hub_id),
+            None,
+            short,
+        )
+        .await
     });
 
     // Node connects and opens the control stream but NEVER writes HELLO.
@@ -147,7 +156,7 @@ async fn spoofed_node_id_is_rejected() {
             &mut allow,
             &mut tokens,
             2_000,
-            hub_id,
+            &HubIdentity::new(hub_id),
             None,
             HELLO_DEADLINE,
         )
@@ -155,11 +164,84 @@ async fn spoofed_node_id_is_rejected() {
     });
 
     // Lie about our identity: pass a bogus self_id that won't match remote_id().
-    let res = dial_and_hello(&node, hub_addr, "deadbeef-not-my-id".into(), Some(tok)).await;
+    let res = dial_and_hello(
+        &node,
+        hub_addr,
+        "deadbeef-not-my-id".into(),
+        String::new(),
+        Some(tok),
+    )
+    .await;
     assert!(res.is_err(), "spoofed node_id must be rejected");
     assert_eq!(
         hub_task.await.unwrap(),
         GateOutcome::Rejected { code: "HG024" }
+    );
+}
+
+#[tokio::test]
+async fn hello_exchanges_friendly_names() {
+    // A node sends its friendly name in HELLO; the hub (a) stores it as the new pairing's
+    // allowlist label and returns it as `assigned_label`, and (b) sends its OWN name back as
+    // `hub_name` so the node can save the hub under a human label (Unit B).
+    let hub = local_endpoint().await;
+    let node = local_endpoint().await;
+    let hub_addr = hub.addr();
+    let hub_id = hub.id().to_string();
+
+    let mut allow = temp_allowlist("names");
+    let mut tokens = PairingTokens::new();
+    let tok = tokens.mint(1_000, 600_000);
+
+    let hub_task = tokio::spawn(async move {
+        let incoming = hub.accept().await.expect("incoming");
+        let conn = incoming.await.expect("conn");
+        let identity = HubIdentity {
+            id: hub_id,
+            name: "hub-friendly(srv)".into(),
+        };
+        let out = gate_connection(
+            &conn,
+            &mut allow,
+            &mut tokens,
+            2_000,
+            &identity,
+            Some("fallback".into()),
+            HELLO_DEADLINE,
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The node's HELLO name became its allowlist label (NOT the "fallback").
+        let label = allow.label(&conn.remote_id().to_string());
+        (out, label)
+    });
+
+    let node_id = node.id().to_string();
+    let res = dial_and_hello(
+        &node,
+        hub_addr,
+        node_id,
+        "node-friendly(box)".into(),
+        Some(tok),
+    )
+    .await
+    .expect("admitted");
+    assert_eq!(
+        res.hub_name, "hub-friendly(srv)",
+        "hub name returned to node"
+    );
+    assert_eq!(
+        res.assigned_label.as_deref(),
+        Some("node-friendly(box)"),
+        "node's own name is its assigned label"
+    );
+
+    let (outcome, label) = hub_task.await.unwrap();
+    assert_eq!(outcome, GateOutcome::Admitted { agreed_version: 1 });
+    assert_eq!(
+        label.as_deref(),
+        Some("node-friendly(box)"),
+        "hub persisted the node's friendly name as its allowlist label"
     );
 }
 
@@ -189,7 +271,7 @@ async fn allowlisted_node_reconnects_without_token() {
             &mut allow,
             &mut tokens,
             2_000,
-            hub_id,
+            &HubIdentity::new(hub_id),
             None,
             HELLO_DEADLINE,
         )
@@ -199,7 +281,7 @@ async fn allowlisted_node_reconnects_without_token() {
     });
 
     // Pre-allowlisted node reconnects with NO token — pure allowlist membership.
-    let res = dial_and_hello(&node, hub_addr, node_id, None)
+    let res = dial_and_hello(&node, hub_addr, node_id, String::new(), None)
         .await
         .expect("admitted");
     assert_eq!(res.agreed_version, 1);

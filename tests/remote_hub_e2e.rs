@@ -20,7 +20,7 @@ use higgs::auth::{Allowlist, PairingTokens};
 use higgs::log_bus::{LogBus, LogSource};
 use higgs::node::fleet::HubFleet;
 use higgs::node::transport::NodeTransport;
-use higgs::node::{gate_connection, GateOutcome, HELLO_DEADLINE};
+use higgs::node::{gate_connection, GateOutcome, HubIdentity, HELLO_DEADLINE};
 use higgs::remote::ALPN;
 use higgs::{Higgs, HiggsConfig};
 
@@ -71,7 +71,7 @@ async fn admit_node(
         allow,
         tokens,
         now_ms(),
-        hub_id.to_string(),
+        &HubIdentity::new(hub_id),
         Some("test".into()),
         HELLO_DEADLINE,
     )
@@ -282,7 +282,7 @@ async fn hub_v1_chat_routes_to_remote_node() {
         &mut allow,
         &mut tokens,
         now_ms(),
-        hub_id,
+        &HubIdentity::new(hub_id),
         Some("test".into()),
         HELLO_DEADLINE,
     )
@@ -498,7 +498,7 @@ async fn node_reconnects_and_route_survives() {
             allow,
             tokens,
             now_ms(),
-            hub_id.to_string(),
+            &HubIdentity::new(hub_id),
             Some("test".into()),
             HELLO_DEADLINE,
         )

@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use iroh_tickets::endpoint::EndpointTicket;
 
 use higgs::auth::{Allowlist, PairingTokens};
-use higgs::node::{dial_and_hello, gate_connection, GateOutcome, HELLO_DEADLINE};
+use higgs::node::{dial_and_hello, gate_connection, GateOutcome, HubIdentity, HELLO_DEADLINE};
 use higgs::remote::ALPN;
 
 fn now_ms() -> u64 {
@@ -130,7 +130,7 @@ async fn node_connect_dials_and_pairs_with_a_hub() {
             &mut allow,
             &mut tokens,
             now_ms(),
-            hub_id,
+            &HubIdentity::new(hub_id),
             Some("cli".into()),
             HELLO_DEADLINE,
         )
@@ -192,7 +192,7 @@ async fn node_connect_with_bad_token_is_rejected() {
             &mut allow,
             &mut tokens,
             now_ms(),
-            hub_id,
+            &HubIdentity::new(hub_id),
             Some("cli".into()),
             HELLO_DEADLINE,
         )
@@ -265,9 +265,15 @@ async fn link_pair_accepts_an_in_process_node_dial() {
         .await
         .expect("bind node");
     let self_id = node.id().to_string();
-    let result = dial_and_hello(&node, ticket.endpoint_addr().clone(), self_id, Some(token))
-        .await
-        .expect("node pairs with the link-pair hub");
+    let result = dial_and_hello(
+        &node,
+        ticket.endpoint_addr().clone(),
+        self_id,
+        String::new(),
+        Some(token),
+    )
+    .await
+    .expect("node pairs with the link-pair hub");
     assert_eq!(result.role, "hub", "hub answered the HELLO");
 
     // SIGTERM (not SIGKILL): the pair listener exits its accept loop cleanly, which also

@@ -886,7 +886,7 @@ async fn do_inventory(
 ) -> Result<Value, HiggsError> {
     let (hardware, runtime) = hardware_runtime(spawner, bus, "inventory").await?;
     let inventory = crate::remote::NodeInventory {
-        hostname: sysinfo::System::host_name().unwrap_or_default(),
+        hostname: crate::system::hostname(),
         os: std::env::consts::OS.to_string(),
         workers,
         hardware,

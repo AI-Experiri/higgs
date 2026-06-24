@@ -110,6 +110,12 @@ higgs_ts! {
     }
 }
 
+/// Best-effort host name (empty string when unavailable). Single source for both the friendly
+/// instance name ([`crate::config::name_or_init`]) and a node's `M_NODE_INVENTORY` hostname.
+pub fn hostname() -> String {
+    System::host_name().unwrap_or_default()
+}
+
 impl SystemInfo {
     /// Gather a fresh snapshot. Blocking (samples CPU usage over a short
     /// interval) — call from a blocking context, not directly in an async task.

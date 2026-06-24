@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use higgs::auth::{Allowlist, PairingTokens};
-use higgs::node::{gate_connection, GateOutcome, HELLO_DEADLINE};
+use higgs::node::{gate_connection, GateOutcome, HubIdentity, HELLO_DEADLINE};
 use higgs::remote::{ALPN, M_NODE_PULL, M_NODE_SCAN, N_PROGRESS};
 use higgs::rpc::{self, RpcFrame, RpcRequest, RpcResponse};
 
@@ -114,7 +114,7 @@ async fn node_pulls_a_model_over_http_and_scan_sees_it() {
         &mut allow,
         &mut tokens,
         now_ms(),
-        hub_id,
+        &HubIdentity::new(hub_id),
         Some("test".into()),
         HELLO_DEADLINE,
     )

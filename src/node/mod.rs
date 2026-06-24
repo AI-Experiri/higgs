@@ -44,6 +44,27 @@ pub const HELLO_DEADLINE: Duration = Duration::from_secs(5);
 /// this; an over-long frame is treated as a malformed handshake (HG028).
 const MAX_HELLO_BYTES: u64 = 64 * 1024;
 
+/// The hub's self-identity sent back to a node in the HELLO result: its canonical `EndpointId`
+/// (which the node dials) and its friendly name (`hub-<eid8>(<host>)`, from `config.json`). One
+/// struct so the two strings can't be swapped at a call site, and so adding a future field
+/// (e.g. a hub display version) doesn't churn every gate signature.
+#[derive(Debug, Clone)]
+pub struct HubIdentity {
+    pub id: String,
+    pub name: String,
+}
+
+impl HubIdentity {
+    /// A hub identity with no friendly name (the back-compat default used by tests and the
+    /// pre-naming `link pair` path — the node then sees an empty `hub_name`).
+    pub fn new(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            name: String::new(),
+        }
+    }
+}
+
 /// Outcome of gating one inbound connection.
 #[derive(Debug, PartialEq, Eq)]
 pub enum GateOutcome {
@@ -209,7 +230,7 @@ pub(crate) async fn gate_admit(
     allow: &mut Allowlist,
     tokens: &mut PairingTokens,
     now_ms: u64,
-    hub_id: String,
+    hub: &HubIdentity,
     label_for_new: Option<String>,
 ) -> GateOutcome {
     let Handshake {
@@ -219,6 +240,15 @@ pub(crate) async fn gate_admit(
         agreed_version,
     } = handshake;
     let peer = conn.remote_id().to_string();
+
+    // The label for a FIRST-time pairing is the node's own friendly name (so the fleet view
+    // shows a human name immediately), falling back to the caller's `label_for_new` when an
+    // older node sends no name.
+    let new_label = if hello.name.is_empty() {
+        label_for_new
+    } else {
+        Some(hello.name.clone())
+    };
 
     // 3. allowlist OR a valid one-time pairing token (the only path that admits a
     //    not-yet-allowlisted id). `assigned_label` is the persisted label for an existing
@@ -230,13 +260,13 @@ pub(crate) async fn gate_admit(
             Some(tok) => match tokens.validate(tok, now_ms) {
                 Ok(()) => {
                     // Persist FIRST, then burn — a failed save must leave the token usable.
-                    if let Err(e) = allow.add(peer.clone(), label_for_new.clone()) {
+                    if let Err(e) = allow.add(peer.clone(), new_label.clone()) {
                         tracing::error!(error = %e, "higgs: failed to persist new pairing");
                         conn.close(0u32.into(), b"HG024");
                         return GateOutcome::Rejected { code: "HG024" };
                     }
                     tokens.burn(tok);
-                    label_for_new
+                    new_label
                 }
                 Err(TokenError::Expired) | Err(TokenError::UnknownOrUsed) => {
                     let e = HiggsError::PairingTokenInvalid {
@@ -258,10 +288,11 @@ pub(crate) async fn gate_admit(
         }
     };
 
-    // 4. admitted — reply HelloResult.
+    // 4. admitted — reply HelloResult (carrying the hub's friendly name so the node can save it).
     let result = HelloResult {
         role: "hub".into(),
-        node_id: hub_id,
+        node_id: hub.id.clone(),
+        hub_name: hub.name.clone(),
         agreed_version,
         software_version: env!("CARGO_PKG_VERSION").into(),
         assigned_label,
@@ -291,22 +322,13 @@ pub async fn gate_connection(
     allow: &mut Allowlist,
     tokens: &mut PairingTokens,
     now_ms: u64,
-    hub_id: String,
+    hub: &HubIdentity,
     label_for_new: Option<String>,
     hello_deadline: Duration,
 ) -> GateOutcome {
     match gate_read_hello(conn, hello_deadline).await {
         Ok(handshake) => {
-            gate_admit(
-                conn,
-                handshake,
-                allow,
-                tokens,
-                now_ms,
-                hub_id,
-                label_for_new,
-            )
-            .await
+            gate_admit(conn, handshake, allow, tokens, now_ms, hub, label_for_new).await
         }
         Err(rejected) => rejected,
     }
@@ -318,9 +340,10 @@ pub async fn dial_and_hello(
     endpoint: &Endpoint,
     target: impl Into<EndpointAddr>,
     self_id: String,
+    name: String,
     pairing_token: Option<String>,
 ) -> std::io::Result<HelloResult> {
-    let (_conn, result) = connect_node(endpoint, target, self_id, pairing_token).await?;
+    let (_conn, result) = connect_node(endpoint, target, self_id, name, pairing_token).await?;
     Ok(result)
 }
 
@@ -331,6 +354,7 @@ pub async fn connect_node(
     endpoint: &Endpoint,
     target: impl Into<EndpointAddr>,
     self_id: String,
+    name: String,
     pairing_token: Option<String>,
 ) -> std::io::Result<(Connection, HelloResult)> {
     use std::io::Error;
@@ -340,6 +364,7 @@ pub async fn connect_node(
     let params = HelloParams {
         role: "node".into(),
         node_id: self_id,
+        name,
         pairing_token,
         protocol_versions: PROTOCOL_VERSIONS.to_vec(),
         min_supported: MIN_SUPPORTED,
