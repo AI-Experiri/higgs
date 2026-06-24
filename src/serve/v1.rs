@@ -438,6 +438,7 @@ async fn ensure_loaded(higgs: &Arc<Higgs>, model: &str) -> Result<LoadedInfo, Re
     if is_remote {
         return Ok(LoadedInfo {
             id: model.to_owned(),
+            worker_id: 0, // remote-resident placeholder — the fleet routes it, no local worker
             ctx_len: u32::MAX,
             gpu_layers: 0,
             threads: 0,

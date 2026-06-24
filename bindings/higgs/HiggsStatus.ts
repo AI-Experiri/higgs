@@ -10,9 +10,18 @@ export type HiggsStatus = {
  */
 worker_alive: boolean, 
 /**
- * Info about the loaded model, if any.
+ * Info about the PRIMARY loaded model (lowest worker id), if any. Kept for the status
+ * bar + provider seeding; `loaded_all` carries every resident model.
  */
 loaded?: LoadedInfo, 
+/**
+ * EVERY resident local model — one entry per worker (the local node is multi-model:
+ * additive loads, one worker per model), sorted by worker id, `loaded` first. Always an
+ * array (empty when nothing is loaded). The UI's "Loaded Models" section renders one card
+ * per entry. `#[serde(default)]` keeps deserialization tolerant; clients still default it
+ * defensively (`status.loaded_all ?? []`) as cheap insurance.
+ */
+loaded_all: Array<LoadedInfo>, 
 /**
  * Number of models discovered in the last scan.
  */

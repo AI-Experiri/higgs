@@ -8,7 +8,7 @@
 
 mod common;
 
-use common::{spawn_with_tiny_model, tiny_gguf_path, TINY_MODEL_ID};
+use common::{spawn_with_models, spawn_with_tiny_model, tiny_gguf_path, TINY_MODEL_ID};
 
 #[tokio::test]
 async fn control_api_lifecycle() {
@@ -257,6 +257,59 @@ async fn control_api_lifecycle() {
     assert_eq!(
         status["worker_alive"], false,
         "worker_alive is false after stop"
+    );
+}
+
+/// Multi-model: the local node is multi-worker (one worker per loaded model), so `/api/higgs/status`
+/// must report EVERY resident model in `loaded_all` (each tagged with its `worker_id`) — not just
+/// the primary `loaded`. This is what the UI's "Loaded Models" section renders one card per.
+#[tokio::test]
+async fn status_loaded_all_lists_every_worker() {
+    let Some(gguf) = tiny_gguf_path() else {
+        eprintln!("SKIP status_loaded_all_lists_every_worker: tiny gguf not found");
+        return;
+    };
+    let srv = spawn_with_models(11512, &gguf, &["org-a/m", "org-b/m"]).await;
+    let c = reqwest::Client::new();
+
+    for id in ["org-a/m", "org-b/m"] {
+        let load = c
+            .post(format!("{}/api/higgs/models/load", srv.base))
+            .json(&serde_json::json!({ "id": id }))
+            .send()
+            .await
+            .unwrap();
+        assert!(load.status().is_success(), "load {id} ok");
+    }
+
+    let status: serde_json::Value = c
+        .get(format!("{}/api/higgs/status", srv.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let all = status["loaded_all"]
+        .as_array()
+        .expect("loaded_all is an array");
+    assert_eq!(all.len(), 2, "every loaded worker reported: {status}");
+    let mut ids: Vec<&str> = all.iter().map(|e| e["id"].as_str().unwrap()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, ["org-a/m", "org-b/m"], "both models present: {status}");
+    let workers: std::collections::HashSet<u64> = all
+        .iter()
+        .map(|e| e["worker_id"].as_u64().unwrap())
+        .collect();
+    assert_eq!(
+        workers.len(),
+        2,
+        "each entry has a distinct worker_id: {status}"
+    );
+    // `loaded` (back-compat primary) is one of the resident models.
+    assert!(
+        ["org-a/m", "org-b/m"].contains(&status["loaded"]["id"].as_str().unwrap()),
+        "primary loaded is one of the resident models: {status}"
     );
 }
 

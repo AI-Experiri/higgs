@@ -77,10 +77,20 @@ impl ServerGuard {
 /// copied (not symlinked) so it stays inside the scan root and passes higgs's
 /// path-within-roots guard.
 pub fn stage_tiny_model(gguf: &Path) -> TempDir {
+    stage_models(gguf, &[TINY_MODEL_ID])
+}
+
+/// Stage `gguf` into a temp LM-Studio layout under EACH `id` (`<tmp>/{org}/{model}/`), so the
+/// scanner discovers one model per id. Copies (not symlinks) so each stays inside the scan root
+/// and passes higgs's path-within-roots guard. Use for multi-model tests (each distinct id →
+/// its own worker on load).
+pub fn stage_models(gguf: &Path, ids: &[&str]) -> TempDir {
     let dir = TempDir::new().expect("create staging dir");
-    let model_dir = dir.path().join("higgs-test").join("stories260k");
-    std::fs::create_dir_all(&model_dir).expect("create model dir");
-    std::fs::copy(gguf, model_dir.join("stories260K.gguf")).expect("copy tiny gguf");
+    for id in ids {
+        let model_dir = dir.path().join(id); // `org/model` nests via the path separator
+        std::fs::create_dir_all(&model_dir).expect("create model dir");
+        std::fs::copy(gguf, model_dir.join("stories260K.gguf")).expect("copy tiny gguf");
+    }
     dir
 }
 
@@ -94,7 +104,14 @@ pub fn stage_tiny_model(gguf: &Path) -> TempDir {
 // zombie-process lint is a false positive — clippy can't see the Drop impl.
 #[allow(clippy::zombie_processes)]
 pub async fn spawn_with_tiny_model(port: u16, gguf: &Path) -> ServerGuard {
-    let staged = stage_tiny_model(gguf);
+    spawn_with_models(port, gguf, &[TINY_MODEL_ID]).await
+}
+
+/// Like [`spawn_with_tiny_model`] but stages one model per id in `ids` (each loadable under that
+/// id), for multi-model / multi-worker tests.
+#[allow(clippy::zombie_processes)]
+pub async fn spawn_with_models(port: u16, gguf: &Path, ids: &[&str]) -> ServerGuard {
+    let staged = stage_models(gguf, ids);
     // Isolated home so the server never reads the machine's real ~/.higgs (a present
     // api_keys.json there would turn auth ON and 401 these no-token tests).
     let home = TempDir::new().expect("create temp HIGGS_HOME");

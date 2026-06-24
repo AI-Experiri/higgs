@@ -631,21 +631,96 @@ impl Higgs {
             return Ok(HiggsStatus {
                 worker_alive: false,
                 loaded: None,
+                loaded_all: Vec::new(),
                 models_on_disk,
             });
         };
 
-        let result = self.local.status(primary).await;
-        let worker_alive = result.is_ok();
-        // `loaded` is best-effort: an OK status whose `loaded` shape is malformed
-        // still reports `worker_alive:true` with `loaded:None`.
-        let loaded = result.ok().and_then(|v| self.loaded_info_from(&v, &scan));
+        // The local node is multi-model (one worker per resident model). Report EVERY worker —
+        // each tagged with its `worker_id` and its `/v1` served id — so the UI can show a card
+        // (and a per-worker log pane) per worker, not just the primary. `served` maps the served
+        // id back per worker (local is deduped one-worker-per-model, so served == raw id).
+        let served = self.local_served().await;
+        let worker_to_served: std::collections::HashMap<WorkerId, String> =
+            served.into_iter().map(|(s, (w, _raw))| (w, s)).collect();
+        // Live load params come from ONE probe of the PRIMARY — EXACTLY as before this
+        // multi-model change (a busy primary's `M_STATUS` already queued once per poll; we add NO
+        // new per-worker RPCs). SECONDARY workers are listed from CACHED state (the instance set +
+        // the host-side scan), so a busy/wedged secondary never adds an RPC, never stalls the
+        // snapshot, and never queues an orphaned status request behind a long generation. (Their
+        // live ctx/gpu/threads come as a stub for now; per-worker live stats are the T9 follow-up.)
+        let primary_status = self.local.status(primary).await;
+        let worker_alive = primary_status.is_ok();
+        let primary_info = primary_status
+            .ok()
+            .and_then(|v| self.loaded_info_from(&v, &scan));
+
+        // `loaded` (back-compat) = the primary's SUCCESSFUL probe ONLY — `None` when it failed or
+        // was malformed, preserving the legacy `/api/higgs/status.loaded` contract (a stub must
+        // never masquerade as a real loaded model for provider seeding). The `loaded_all` list MAY
+        // carry a stub for the primary so it still appears, but `loaded` does not.
+        let loaded = primary_info.clone().map(|mut i| {
+            if let Some(served_id) = worker_to_served.get(&primary) {
+                i.id = served_id.clone();
+            }
+            i.worker_id = primary.0;
+            i
+        });
+
+        let mut loaded_all = Vec::with_capacity(instances.len());
+        for (worker, raw) in &instances {
+            let served_id = worker_to_served.get(worker).cloned().unwrap_or(raw.clone());
+            let info = if *worker == primary {
+                // Primary in the LIST: full live params from the probe, or a stub if it failed —
+                // so a busy/wedged primary still shows a card (its live params just default).
+                primary_info
+                    .clone()
+                    .map(|mut i| {
+                        i.id = served_id.clone();
+                        i.worker_id = worker.0;
+                        i
+                    })
+                    .unwrap_or_else(|| self.loaded_info_stub(served_id, worker.0, raw, &scan))
+            } else {
+                self.loaded_info_stub(served_id, worker.0, raw, &scan)
+            };
+            loaded_all.push(info);
+        }
 
         Ok(HiggsStatus {
             worker_alive,
             loaded,
+            loaded_all,
             models_on_disk,
         })
+    }
+
+    /// A [`LoadedInfo`] built WITHOUT a worker RPC: `id`/`worker_id` + host-side scan metadata
+    /// (`arch`/`quant`/`size_bytes`/`max_context_length`). The live load params
+    /// (`ctx_len`/`gpu_layers`/`threads`) default to `0` — [`status`](Self::status) enriches them
+    /// from a bounded probe when the worker answers in time. Lets EVERY resident worker appear in
+    /// `loaded_all` even while its worker is busy generating (and so can't answer `M_STATUS`).
+    fn loaded_info_stub(
+        &self,
+        served_id: String,
+        worker_id: u32,
+        raw_model: &str,
+        scan: &[HiggsModel],
+    ) -> LoadedInfo {
+        let scanned = scan.iter().find(|m| m.id == raw_model);
+        LoadedInfo {
+            id: served_id,
+            worker_id,
+            ctx_len: 0,
+            gpu_layers: 0,
+            threads: 0,
+            arch: scanned.and_then(|m| m.arch.clone()),
+            quant: scanned.and_then(|m| m.quant.clone()),
+            max_context_length: scanned.and_then(|m| m.ctx_train),
+            size_bytes: scanned.map(|m| m.size_bytes),
+            has_chat_template: scanned.map(|m| m.has_chat_template),
+            idle_ttl_minutes: None,
+        }
     }
 
     /// Enrich a worker's raw `M_STATUS` value into a [`LoadedInfo`] using the
@@ -663,6 +738,8 @@ impl Higgs {
         let id = l.get("id")?.as_str()?.to_owned();
         let scanned = scan.iter().find(|m| m.id == id);
         Some(LoadedInfo {
+            // None by default; the caller (status/local_loaded_info) sets the real worker id.
+            worker_id: 0,
             ctx_len: l.get("ctx_len")?.as_u64()? as u32,
             gpu_layers: l.get("gpu_layers")?.as_u64()? as u32,
             threads: l.get("threads")?.as_u64()? as u32,
@@ -893,6 +970,7 @@ impl Higgs {
         let scan = self.scan().await.unwrap_or_default();
         let mut info = self.loaded_info_from(&v, &scan)?;
         info.id = served.to_owned();
+        info.worker_id = worker.0;
         Some(info)
     }
 

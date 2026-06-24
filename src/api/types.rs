@@ -156,6 +156,11 @@ higgs_ts! {
     pub struct LoadedInfo {
         /// HuggingFace repo id of the resident model.
         pub id: String,
+        /// The node-local worker id serving this model. Distinguishes the entries of
+        /// [`HiggsStatus::loaded_all`] (one worker per resident model) so the UI can key a
+        /// per-worker card + its per-worker log pane. Always present.
+        #[ts(type = "number")]
+        pub worker_id: u32,
         /// Context window size in tokens.
         #[ts(type = "number")]
         pub ctx_len: u32,
@@ -204,10 +209,18 @@ higgs_ts! {
     pub struct HiggsStatus {
         /// Whether the worker process is currently alive.
         pub worker_alive: bool,
-        /// Info about the loaded model, if any.
+        /// Info about the PRIMARY loaded model (lowest worker id), if any. Kept for the status
+        /// bar + provider seeding; `loaded_all` carries every resident model.
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         pub loaded: Option<LoadedInfo>,
+        /// EVERY resident local model — one entry per worker (the local node is multi-model:
+        /// additive loads, one worker per model), sorted by worker id, `loaded` first. Always an
+        /// array (empty when nothing is loaded). The UI's "Loaded Models" section renders one card
+        /// per entry. `#[serde(default)]` keeps deserialization tolerant; clients still default it
+        /// defensively (`status.loaded_all ?? []`) as cheap insurance.
+        #[serde(default)]
+        pub loaded_all: Vec<LoadedInfo>,
         /// Number of models discovered in the last scan.
         #[ts(type = "number")]
         pub models_on_disk: u32,

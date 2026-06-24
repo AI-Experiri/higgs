@@ -9,6 +9,12 @@ export type LoadedInfo = {
  */
 id: string, 
 /**
+ * The node-local worker id serving this model. Distinguishes the entries of
+ * [`HiggsStatus::loaded_all`] (one worker per resident model) so the UI can key a
+ * per-worker card + its per-worker log pane. Always present.
+ */
+worker_id: number, 
+/**
  * Context window size in tokens.
  */
 ctx_len: number, 
