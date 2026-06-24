@@ -47,10 +47,11 @@ async fn control_api_lifecycle() {
         .iter()
         .find(|m| m["id"] == serde_json::json!(id))
         .expect("scan lists the staged tiny model");
-    // Gate-1 probe must judge this real llama-arch GGUF loadable.
-    assert_eq!(
-        scanned["loadable"], true,
-        "tiny model is loadable: {scanned}"
+    // The scan no longer probes (no load-to-test at open): there is NO `loadable`
+    // field — loadability is learned only at actual load time, below.
+    assert!(
+        scanned.get("loadable").is_none(),
+        "scan must not probe-judge loadability: {scanned}"
     );
 
     // load the model.

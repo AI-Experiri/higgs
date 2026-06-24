@@ -1,5 +1,5 @@
 use super::*;
-use crate::node::test_support::{fake_runtime_spawn_fails, fake_runtime_stateful};
+use crate::node::test_support::fake_runtime_stateful;
 
 // ── Test seam ─────────────────────────────────────────────────────────────
 
@@ -79,55 +79,6 @@ async fn load_rejects_traversal_id() {
         .await
         .expect_err("traversal id must be rejected");
     assert!(matches!(err, HiggsError::InvalidModelId { .. }));
-}
-
-/// `probe_support` returns a cached `(arch, quant)` verdict WITHOUT probing.
-///
-/// The cache is pre-seeded for the current engine version; the rep's combo is
-/// a hit, so `probe_paths` (which would spawn-fail under the spawn-fail node and
-/// yield a `false` verdict) is never consulted — the returned verdict is the
-/// seeded `(true, None)`. A second combo is a miss and goes to the probe path,
-/// proving the partition.
-#[tokio::test]
-async fn probe_support_cache_hit_skips_probe() {
-    // Spawn-fail node: a probe miss spawns a transient worker that fails, so the
-    // miss combo yields a `false` verdict (the hit must never reach this path).
-    let higgs = Higgs::with_local(Arc::new(fake_runtime_spawn_fails()), HiggsConfig::default());
-    let ev = crate::worker::engine::llamacpp::engine_version();
-    // Seed a HIT for (llama, Q4_K_M, <this engine version>).
-    higgs
-        .probe_cache
-        .lock()
-        .insert(("llama".into(), "Q4_K_M".into(), ev.clone()), (true, None));
-    let out = higgs
-        .probe_support(vec![
-            // Hit: returns the seeded verdict, no probe.
-            ("llama".into(), "Q4_K_M".into(), "/seeded/path.gguf".into()),
-            // Miss: probe path (spawn-fails) → false verdict.
-            ("gemma4".into(), "Q8_0".into(), "/miss/path.gguf".into()),
-        ])
-        .await;
-    assert_eq!(
-        out.get(&("llama".into(), "Q4_K_M".into())),
-        Some(&(true, None))
-    );
-    let (miss_loadable, miss_reason) = out
-        .get(&("gemma4".into(), "Q8_0".into()))
-        .cloned()
-        .expect("miss combo present");
-    assert!(
-        !miss_loadable,
-        "miss combo is not loadable under spawn-fail"
-    );
-    assert!(miss_reason.is_some(), "miss carries a reason");
-    // The miss verdict was stored (the probe path inserts under the version
-    // the worker reported — empty here because spawn failed before any reply).
-    let _ = ev;
-    assert!(higgs
-        .probe_cache
-        .lock()
-        .keys()
-        .any(|(a, q, _)| a == "gemma4" && q == "Q8_0"));
 }
 
 /// The inference admission gate returns `ServerBusy` once all permits are

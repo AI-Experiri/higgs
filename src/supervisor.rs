@@ -44,7 +44,7 @@ use crate::diagnostic::HiggsError;
 use crate::log_bus::{LogBus, LogLine, LogSource};
 use crate::rpc::{self, RpcFrame, RpcNotification, RpcRequest};
 use crate::system::GpuDevice;
-use crate::worker::{M_LOAD, M_LOG_LEVEL, M_PROBE, M_SHUTDOWN, M_SYSINFO, N_CHAT_CHUNK};
+use crate::worker::{M_LOAD, M_LOG_LEVEL, M_SHUTDOWN, M_SYSINFO, N_CHAT_CHUNK};
 
 /// How long `stop()` waits for the worker to exit on its own (after stdin
 /// closes) before SIGKILL-ing it. Generous enough for the child to free a
@@ -79,13 +79,6 @@ const CONTROL_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// higgs value, grouped with the other serve-layer limits for a later config
 /// lift.
 pub(crate) const CHAT_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
-
-/// Per-path bound on a single M_PROBE round-trip in [`Supervisor::probe_paths`].
-/// A probe is a header-only `with_no_alloc` load — fast — but it runs FFI inside
-/// the transient worker, so a pathological/corrupt GGUF that wedges the loader
-/// must not hang the support sweep. On expiry the path's verdict is
-/// `(false, Some("probe timed out loading <path>"))` and the sweep moves on.
-const PROBE_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Bound on the single M_SYSINFO round-trip in [`Supervisor::sysinfo`]. Device
 /// enumeration is a cheap FFI registry read with no model load, so it completes
@@ -568,91 +561,8 @@ impl Supervisor {
         (rx, fut)
     }
 
-    /// Probe each GGUF path for engine loadability (Gate 1) in a SEPARATE,
-    /// transient worker — fully isolated from the serving worker (`self.inner`).
-    ///
-    /// Spawns one fresh worker via the same factory (`production_factory(bus,
-    /// "probe")`), runs an M_PROBE round-trip per path on its raw stdio (no
-    /// persistent reader/writer tasks, no `pending`/`chat_sinks` involvement),
-    /// then reaps the child. The serving worker is never touched, so a probe can
-    /// never evict a resident model or interfere with in-flight generation; and a
-    /// probe-worker crash is contained here.
-    ///
-    /// Returns, per input path, `(path, (loadable, reason, engine_version))`:
-    /// - On success the worker's reply supplies all three; `engine_version` keys
-    ///   the support cache (the probing binary is the correct version source).
-    /// - On spawn failure / EOF / per-path timeout the verdict is
-    ///   `(false, Some("<context>"), "")` — never a panic or hang ([HG020]).
-    pub(crate) async fn probe_paths(
-        &self,
-        paths: Vec<String>,
-    ) -> Vec<(String, (bool, Option<String>, String))> {
-        // Fresh worker, independent of the serving lifetime. Stamp argv0 "probe".
-        let halves = match (self.inner.factory)(self.inner.bus.clone(), "probe") {
-            Ok(h) => h,
-            Err(e) => {
-                warn!(error = %e, "higgs: probe worker spawn failed");
-                // Every path inherits the spawn failure as a non-fatal verdict.
-                return paths
-                    .into_iter()
-                    .map(|p| {
-                        (
-                            p,
-                            (
-                                false,
-                                Some(format!("probe worker spawn failed: {e}")),
-                                String::new(),
-                            ),
-                        )
-                    })
-                    .collect();
-            }
-        };
-        let mut write = halves.write;
-        let mut lines = BufReader::new(halves.read).lines();
-        let mut id: u64 = 0;
-
-        let mut out = Vec::with_capacity(paths.len());
-        for path in paths {
-            id += 1;
-            let verdict = match tokio::time::timeout(
-                PROBE_RPC_TIMEOUT,
-                probe_one(&mut write, &mut lines, id, &path),
-            )
-            .await
-            {
-                Ok(v) => v,
-                Err(_) => {
-                    warn!(path = %path, "higgs: probe timed out");
-                    (
-                        false,
-                        Some(format!("probe timed out loading {path}")),
-                        String::new(),
-                    )
-                }
-            };
-            out.push((path, verdict));
-        }
-
-        // Reap the transient worker: close stdin (EOF → worker exits its loop),
-        // then wait/kill so it never lingers as a zombie. `drop(write)` closes
-        // the child's stdin; `proc` is the OS handle (None under the test factory).
-        drop(write);
-        if let Some(mut child) = halves.proc {
-            match tokio::time::timeout(WORKER_EXIT_TIMEOUT, child.wait()).await {
-                Ok(_) => {}
-                Err(_) => {
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
-                }
-            }
-        }
-        out
-    }
-
     /// Enumerate the host's compute devices in a SEPARATE, transient worker —
-    /// fully isolated from the serving worker (`self.inner`), exactly like
-    /// [`probe_paths`](Self::probe_paths).
+    /// fully isolated from the serving worker (`self.inner`).
     ///
     /// Spawns one fresh worker via the same factory (`production_factory(bus,
     /// "sysinfo")`), runs a single M_SYSINFO round-trip on its raw stdio (no
@@ -683,8 +593,8 @@ impl Supervisor {
                 }
             };
 
-        // Reap the transient worker (same shape as `probe_paths`): close stdin so
-        // the worker exits its loop, then wait/kill so it never lingers.
+        // Reap the transient worker: close stdin so the worker exits its loop,
+        // then wait/kill so it never lingers.
         drop(write);
         if let Some(mut child) = halves.proc {
             match tokio::time::timeout(WORKER_EXIT_TIMEOUT, child.wait()).await {
@@ -921,88 +831,11 @@ impl Supervisor {
     }
 }
 
-/// One synchronous M_PROBE round-trip on the transient probe worker's raw stdio.
-///
-/// Encodes the request with the SAME `rpc` codec the persistent path uses,
-/// writes it to the worker's stdin, then reads lines until the matching response
-/// (by `id`) arrives — skipping any stray notifications the worker might emit.
-/// Returns `(loadable, reason, engine_version)`; a write/EOF/decode failure
-/// yields a non-fatal `(false, Some("<context>"), "")` verdict so the sweep
-/// continues rather than hanging ([HG020] semantics).
-async fn probe_one(
-    write: &mut WriteHalf,
-    lines: &mut tokio::io::Lines<BufReader<ReadHalf>>,
-    id: u64,
-    path: &str,
-) -> (bool, Option<String>, String) {
-    let line = rpc::encode(&RpcFrame::Request(RpcRequest {
-        jsonrpc: "2.0".into(),
-        id,
-        method: M_PROBE.to_string(),
-        params: serde_json::json!({ "path": path }),
-    }));
-    if write.write_all(line.as_bytes()).await.is_err()
-        || write.write_all(b"\n").await.is_err()
-        || write.flush().await.is_err()
-    {
-        return (
-            false,
-            Some(format!("probe worker pipe broken loading {path}")),
-            String::new(),
-        );
-    }
-    loop {
-        match lines.next_line().await {
-            Ok(Some(l)) if l.trim().is_empty() => continue,
-            Ok(Some(l)) => match rpc::decode(&l) {
-                // The probe worker only ever replies with a Response to M_PROBE.
-                Ok(RpcFrame::Response(resp)) if resp.id == id => {
-                    if let Some(err) = resp.error {
-                        return (false, Some(err.message), String::new());
-                    }
-                    let result = resp.result.unwrap_or(Value::Null);
-                    let loadable = result
-                        .get("loadable")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false);
-                    let reason = result
-                        .get("reason")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned);
-                    let engine_version = result
-                        .get("engine_version")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned();
-                    return (loadable, reason, engine_version);
-                }
-                // Stray frame (notification or other id) — keep reading.
-                Ok(_) => continue,
-                Err(_) => continue,
-            },
-            Ok(None) => {
-                return (
-                    false,
-                    Some(format!("probe worker exited before replying for {path}")),
-                    String::new(),
-                );
-            }
-            Err(e) => {
-                return (
-                    false,
-                    Some(format!("probe worker read error loading {path}: {e}")),
-                    String::new(),
-                );
-            }
-        }
-    }
-}
-
 /// One synchronous M_SYSINFO round-trip on the transient sysinfo worker's raw
-/// stdio. Mirrors [`probe_one`]: encodes the request with the same codec, writes
-/// it, then reads lines until the matching response (id 1), skipping strays.
-/// Returns the worker's `gpus` list, or an empty `Vec` on any write/EOF/decode
-/// failure ([HG021] semantics — never hangs the sweep).
+/// stdio. Encodes the request with the `rpc` codec the persistent path uses,
+/// writes it, then reads lines until the matching response (id 1), skipping
+/// strays. Returns the worker's `gpus` list, or an empty `Vec` on any
+/// write/EOF/decode failure ([HG021] semantics — never hangs the sweep).
 async fn sysinfo_one(
     write: &mut WriteHalf,
     lines: &mut tokio::io::Lines<BufReader<ReadHalf>>,
@@ -2234,14 +2067,14 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap(), "hi");
     }
 
-    // ─── Transient-worker factory helper (probe / sysinfo) ───────────────────
+    // ─── Transient-worker factory helper (sysinfo) ───────────────────────────
     //
-    // `probe_paths` / `sysinfo` call the factory directly for a SEPARATE,
-    // transient worker (no `start_for`, no persistent reader/writer). This
-    // builds a supervisor whose factory hands out exactly one duplex pair and
-    // returns the test control handles for that transient worker.
+    // `sysinfo` calls the factory directly for a SEPARATE, transient worker (no
+    // `start_for`, no persistent reader/writer). This builds a supervisor whose
+    // factory hands out exactly one duplex pair and returns the test control
+    // handles for that transient worker.
     //
-    //   sup_write ↔ test_read  : supervisor writes the M_PROBE/M_SYSINFO request
+    //   sup_write ↔ test_read  : supervisor writes the M_SYSINFO request
     //   test_write ↔ sup_read  : test writes the worker's response back
     fn transient_supervisor() -> (
         Supervisor,
@@ -2271,8 +2104,7 @@ mod tests {
     }
 
     /// Build a supervisor whose factory always fails — used to drive the
-    /// spawn-failure verdict paths in `probe_paths`, `sysinfo`, and
-    /// `start_for`/`do_spawn`.
+    /// spawn-failure verdict paths in `sysinfo` and `start_for`/`do_spawn`.
     fn failing_supervisor() -> Supervisor {
         Supervisor::with_factory(Box::new(|_ring, _model| {
             Err(HiggsError::WorkerSpawnFailed {
@@ -2293,151 +2125,6 @@ mod tests {
             .expect("request line present");
         let v: Value = serde_json::from_str(&line).expect("valid json frame");
         v["id"].as_u64().expect("request carries an id")
-    }
-
-    // ─── probe_paths: success verdict per path ───────────────────────────────
-    //
-    // Drives `probe_paths` + `probe_one`: supervisor writes one M_PROBE per
-    // path; the test replies with a loadable/reason/engine_version triple. With
-    // `proc: None` the post-loop reap is a no-op (test factory has no OS child).
-
-    #[tokio::test]
-    async fn probe_paths_returns_per_path_verdicts() {
-        let (sup, mut test_write, mut test_read) = transient_supervisor();
-
-        let probe = tokio::spawn(async move {
-            sup.probe_paths(vec!["/a.gguf".into(), "/b.gguf".into()])
-                .await
-        });
-
-        // Path 1 → id 1: loadable, with an engine_version that keys the cache.
-        let id1 = read_request_id(&mut test_read).await;
-        write_line(
-            &mut test_write,
-            &ok_response(
-                id1,
-                json!({"loadable": true, "reason": null, "engine_version": "b1234"}),
-            ),
-        )
-        .await;
-        // Path 2 → id 2: not loadable, with a reason and no engine_version.
-        let id2 = read_request_id(&mut test_read).await;
-        write_line(
-            &mut test_write,
-            &ok_response(
-                id2,
-                json!({"loadable": false, "reason": "arch unsupported"}),
-            ),
-        )
-        .await;
-
-        let out = probe.await.expect("probe task");
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[0].0, "/a.gguf");
-        assert_eq!(out[0].1, (true, None, "b1234".to_string()));
-        assert_eq!(out[1].0, "/b.gguf");
-        assert_eq!(
-            out[1].1,
-            (false, Some("arch unsupported".to_string()), String::new())
-        );
-    }
-
-    // ─── probe_one: worker replies with a JSON-RPC error → (false, msg, "") ───
-
-    #[tokio::test]
-    async fn probe_one_maps_rpc_error_to_verdict() {
-        let (sup, mut test_write, mut test_read) = transient_supervisor();
-        let probe = tokio::spawn(async move { sup.probe_paths(vec!["/bad.gguf".into()]).await });
-
-        let id = read_request_id(&mut test_read).await;
-        write_line(&mut test_write, &err_response(id, -32000, "corrupt header")).await;
-
-        let out = probe.await.expect("probe task");
-        assert_eq!(
-            out[0].1,
-            (false, Some("corrupt header".to_string()), String::new())
-        );
-    }
-
-    // ─── probe_one: a stray notification is skipped before the real response ──
-
-    #[tokio::test]
-    async fn probe_one_skips_stray_frames() {
-        let (sup, mut test_write, mut test_read) = transient_supervisor();
-        let probe = tokio::spawn(async move { sup.probe_paths(vec!["/x.gguf".into()]).await });
-
-        let id = read_request_id(&mut test_read).await;
-        // An empty line and a stray notification must be skipped, not decoded as
-        // the response — probe_one keeps reading until the matching id arrives.
-        write_line(&mut test_write, "").await;
-        write_line(&mut test_write, &chunk_notif(999, "noise")).await;
-        // A response for a DIFFERENT id is also skipped (Ok(_) arm).
-        write_line(
-            &mut test_write,
-            &ok_response(id + 7, json!({"loadable": true})),
-        )
-        .await;
-        write_line(
-            &mut test_write,
-            &ok_response(id, json!({"loadable": true, "engine_version": "vX"})),
-        )
-        .await;
-
-        let out = probe.await.expect("probe task");
-        assert_eq!(out[0].1, (true, None, "vX".to_string()));
-    }
-
-    // ─── probe_one: worker EOF before replying → exited-before-replying verdict ─
-
-    #[tokio::test]
-    async fn probe_one_eof_before_reply() {
-        let (sup, test_write, mut test_read) = transient_supervisor();
-        let probe = tokio::spawn(async move { sup.probe_paths(vec!["/eof.gguf".into()]).await });
-
-        // Consume the request, then drop the worker's write end → EOF on read.
-        let _ = read_request_id(&mut test_read).await;
-        drop(test_write);
-
-        let out = probe.await.expect("probe task");
-        let (loadable, reason, ev) = &out[0].1;
-        assert!(!loadable);
-        assert!(reason
-            .as_deref()
-            .unwrap()
-            .contains("exited before replying"));
-        assert!(ev.is_empty());
-    }
-
-    // ─── probe_paths: factory spawn failure → every path inherits the failure ─
-
-    #[tokio::test]
-    async fn probe_paths_spawn_failure_marks_all_paths() {
-        let sup = failing_supervisor();
-        let out = sup
-            .probe_paths(vec!["/a.gguf".into(), "/b.gguf".into()])
-            .await;
-        assert_eq!(out.len(), 2);
-        for (path, (loadable, reason, ev)) in &out {
-            assert!(
-                !loadable,
-                "path {path} must be non-loadable on spawn failure"
-            );
-            assert!(reason.as_deref().unwrap().contains("spawn failed"));
-            assert!(ev.is_empty());
-        }
-    }
-
-    // ─── probe_one: pipe broken (worker read end gone) → pipe-broken verdict ──
-
-    #[tokio::test]
-    async fn probe_one_pipe_broken_on_write() {
-        let (sup, _test_write, test_read) = transient_supervisor();
-        // Drop the worker's read end so the supervisor's first write_all fails.
-        drop(test_read);
-        let out = sup.probe_paths(vec!["/pipe.gguf".into()]).await;
-        let (loadable, reason, _ev) = &out[0].1;
-        assert!(!loadable);
-        assert!(reason.as_deref().unwrap().contains("pipe broken"));
     }
 
     // ─── sysinfo: success → typed GpuDevice list deserialized from worker ─────
@@ -2987,7 +2674,7 @@ mod tests {
 
     // ─── proc-reap helpers with a real (trivial) Child ───────────────────────
     //
-    // The proc-reap branches in `stop()` / `probe_paths` / `sysinfo` and the
+    // The proc-reap branches in `stop()` / `sysinfo` and the
     // `reap_child` / `reap_old_child` / `install_child` helpers all need an
     // actual `tokio::process::Child` to `wait()`/`start_kill()`. We use a
     // SHORT-LIVED system command (`true` — exits immediately) purely as a Child

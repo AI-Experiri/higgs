@@ -108,13 +108,6 @@ pub struct Higgs {
     /// Defaults to `true` (serving on). A plain atomic — set/read in isolation,
     /// never across `.await`.
     serving_enabled: std::sync::atomic::AtomicBool,
-    /// Model-support verdict cache, keyed by `(architecture, quant, engine_version)`
-    /// — NOT per file. A probe runs once per distinct `(arch, quant)` for a given
-    /// engine version; every model sharing that key inherits the cached verdict
-    /// `(loadable, reason)`. In-memory only (higgs writes no files; persistence is
-    /// deferred). A plain `parking_lot::Mutex` over a `HashMap` — held only for the
-    /// map read/insert, never across `.await`.
-    probe_cache: parking_lot::Mutex<std::collections::HashMap<SupportKey, SupportVerdict>>,
     /// Cached host device list gathered once via the node's transient sysinfo
     /// worker ([`NodeRuntime::gpus`](crate::node::runtime::NodeRuntime::gpus)).
     /// Hardware is static-ish, so it is gathered on first request and reused; `None` until
@@ -192,7 +185,6 @@ impl Higgs {
             idle_ttl_minutes: std::sync::atomic::AtomicU64::new(DEFAULT_IDLE_TTL.as_secs() / 60),
             loaded_idle_ttl_override: std::sync::atomic::AtomicU64::new(0),
             serving_enabled: std::sync::atomic::AtomicBool::new(true),
-            probe_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             device_cache: parking_lot::Mutex::new(None),
             fleet: parking_lot::Mutex::new(None),
             api_keys: parking_lot::Mutex::new(std::sync::Arc::new(crate::keys::ApiKeys::default())),
@@ -444,69 +436,6 @@ impl Higgs {
         })
         .await
         .expect("higgs model scan task panicked")
-    }
-
-    /// Resolve the Gate-1 (engine-loadability) verdict for each distinct model
-    /// `(architecture, quant)` combination, probing only the ones not already
-    /// cached for the current engine version.
-    ///
-    /// `reps` is one representative `(arch, quant, path)` per distinct
-    /// `(arch, quant)` — the caller (control layer) dedups by `(arch, quant)` and
-    /// picks any one file's path. Probing ONE file per combo and caching the
-    /// verdict means every model sharing that `(arch, quant)` inherits it, so a
-    /// directory of N quants of the same repo costs at most one probe per quant.
-    ///
-    /// The cache key is `(arch, quant, engine_version)`: the lookup uses this
-    /// binary's engine version, and a stored verdict carries the version the probe
-    /// worker reported — the same binary, so the strings match and a re-probe
-    /// after an engine upgrade is forced (the key changes). Returns a map
-    /// `(arch, quant) -> (loadable, reason)`. A probe-infrastructure failure for a
-    /// path yields `(false, Some("<context>"))` for that combo (never a panic).
-    pub async fn probe_support(
-        &self,
-        reps: Vec<(String, String, String)>,
-    ) -> std::collections::HashMap<(String, String), (bool, Option<String>)> {
-        // This binary's engine version — used to form lookup keys. A stored
-        // verdict carries the probe worker's reported version, which is the same
-        // value (same binary), so hits match and an engine upgrade invalidates.
-        let engine_version = crate::worker::engine::llamacpp::engine_version();
-        let mut result: std::collections::HashMap<(String, String), (bool, Option<String>)> =
-            std::collections::HashMap::new();
-        // Partition into cache hits and the paths that still need a probe.
-        let mut to_probe: Vec<String> = Vec::new();
-        // Map a probe path back to its (arch, quant) so we can key the verdict.
-        let mut path_combo: std::collections::HashMap<String, (String, String)> =
-            std::collections::HashMap::new();
-        {
-            let cache = self.probe_cache.lock();
-            for (arch, quant, path) in reps {
-                let key = (arch.clone(), quant.clone(), engine_version.clone());
-                if let Some(verdict) = cache.get(&key) {
-                    result.insert((arch, quant), verdict.clone());
-                } else {
-                    path_combo.insert(path.clone(), (arch, quant));
-                    to_probe.push(path);
-                }
-            }
-        }
-        if to_probe.is_empty() {
-            return result;
-        }
-        // Probe the misses in a transient, crash-isolated worker.
-        let verdicts = self.local.probe_paths(to_probe).await;
-        let mut cache = self.probe_cache.lock();
-        for (path, (loadable, reason, probe_version)) in verdicts {
-            let Some((arch, quant)) = path_combo.remove(&path) else {
-                continue;
-            };
-            // Key the stored verdict on the version the worker reported.
-            cache.insert(
-                (arch.clone(), quant.clone(), probe_version),
-                (loadable, reason.clone()),
-            );
-            result.insert((arch, quant), (loadable, reason));
-        }
-        result
     }
 
     /// Load a model by HuggingFace repo id.

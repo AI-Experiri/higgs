@@ -338,11 +338,3 @@ pub const IDLE_UNLOAD_TTL_MINUTES: u64 = 5;
 /// negligible wakeup that bounds the post-TTL unload latency to at most this
 /// interval. Grouped with the other Phase B knobs for a later config lift.
 pub const IDLE_REAP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// A Gate-1 support verdict: `(loadable, reason)` where `reason` is the engine's
-/// verbatim load error when `!loadable`, else `None`.
-pub(crate) type SupportVerdict = (bool, Option<String>);
-
-/// Support-cache key: `(architecture, quant, engine_version)`. One verdict per
-/// distinct `(arch, quant)` for a given engine version (NOT per file).
-pub(crate) type SupportKey = (String, String, String);

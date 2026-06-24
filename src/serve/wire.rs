@@ -113,19 +113,15 @@ higgs_ts! {
         pub state: String,
         /// File format — always `"gguf"` for higgs-discovered models.
         pub format: String,
-        /// Gate 1: whether our llama.cpp engine can LOAD this model, as proved by
-        /// a real probe of a representative GGUF for this `(arch, quant)`. `false`
-        /// means a load attempt failed; `support_reason` carries the verbatim
-        /// engine reason.
-        pub loadable: bool,
         /// Gate 2: whether higgs has a tool-call parser that matches this model's
-        /// chat template. `false` means the model loads but tool calls can't be
-        /// parsed; `support_reason` explains.
+        /// chat template. `false` means the model can be served but tool calls
+        /// can't be parsed; `support_reason` explains. (There is no scan-time
+        /// load probe — engine loadability is learned only at actual load.)
         pub tool_calls: bool,
-        /// The exact reason this model isn't fully supported, or `None` when it is.
-        /// When `!loadable`, this is the engine's VERBATIM load error (e.g.
-        /// `"unknown model architecture: 'gemma4'"`). When `loadable && !tool_calls`,
-        /// it is `"no tool-call parser matches this model's template"`.
+        /// The fixed Gate-2 message when `!tool_calls`
+        /// (`"no tool-call parser matches this model's template"`), else `None`.
+        /// There is no scan-time load probe, so this never carries an engine load
+        /// error — a failed load is reported by the load endpoint itself.
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         ///

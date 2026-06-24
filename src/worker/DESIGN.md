@@ -44,8 +44,6 @@ resolution every load would `[HG002]`. (`models.rs` lives under `worker/` becaus
   authoritative cross-process check.)
 - **`ctx_len = 0` coercion.** `M_LOAD` coerces a 0 context to the default, so a model can't load
   into an unusable 0-sized window that fails every fit-check.
-- **`M_PROBE` is non-destructive.** It loads vocab-only into a throwaway handle and drops it; the
-  resident model is never disturbed.
 - **Error codes cross the boundary.** Engine errors carrying an `HG*` code are encoded in the
   JSON-RPC error's `data.code` so the host's `http_status` table maps them correctly.
 

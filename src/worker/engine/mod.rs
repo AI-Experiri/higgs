@@ -209,28 +209,11 @@ pub trait HiggsEngine: Send {
         sink: &mut dyn FnMut(&str),
     ) -> Result<ChatResult, HiggsError>;
 
-    /// Attempt to load the GGUF at `path` into a throwaway model handle to learn
-    /// whether THIS engine can load it (Gate 1 — "can our llama.cpp load it").
-    ///
-    /// Probe-only: the loaded handle is dropped immediately and never stored as
-    /// the resident model, so a probe never disturbs a model already being
-    /// served (`&self`, no resident-slot mutation). Returns `(true, None)` when
-    /// the load succeeds, or `(false, Some(reason))` carrying the engine's
-    /// verbatim error string (e.g. `"unknown model architecture: 'gemma4'"`)
-    /// when it fails — that exact reason is what the UI shows as the mismatch.
-    fn probe(&self, path: &str) -> (bool, Option<String>);
-
     /// Enumerate the host's compute devices (CPU/GPU/accel) as this engine sees
     /// them. Cheap and read-only — no model load, no resident-state mutation —
     /// so it is safe to call at any time, including on a fresh worker. Returns an
     /// empty vec when the engine exposes no devices.
     fn devices(&self) -> Vec<crate::system::GpuDevice>;
-
-    /// This engine's version string (e.g. the vendored llama.cpp/ggml version). Reported in
-    /// `M_PROBE` replies and used as part of the host's support-cache key, so each backend
-    /// reports ITS OWN version — a pluggable non-llamacpp engine must not be cached under the
-    /// llama.cpp version (which would reuse stale verdicts across backends/upgrades).
-    fn version(&self) -> String;
 }
 
 /// One compiled-in engine: a stable selector name + a zero-arg constructor. The build

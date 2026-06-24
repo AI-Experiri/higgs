@@ -146,10 +146,6 @@ const LOG_RELAY_CAP: usize = 1024;
 /// discrete and consumers (UI/SSE) keep up; a lagging consumer drops the gap.
 const EVENT_CAP: usize = 256;
 
-/// Per-path model-support probe verdicts: `(path, (loadable, reason, engine_version))`.
-/// Mirrors `Supervisor::probe_paths`' return shape.
-pub type ProbeVerdicts = Vec<(String, (bool, Option<String>, String))>;
-
 /// The actor's typed mailbox. Each variant carries a oneshot `reply` the wrapper awaits.
 enum NodeMsg {
     /// Spawn a new worker + load the model. Reserves an id synchronously, runs the slow
@@ -208,12 +204,6 @@ enum NodeMsg {
     /// global served-id derivation (P4b).
     Instances {
         reply: oneshot::Sender<Vec<(WorkerId, String)>>,
-    },
-    /// Probe GGUF support for `paths` via a transient Supervisor (control-plane; independent of
-    /// resident workers). Mirrors `Supervisor::probe_paths`.
-    Probe {
-        paths: Vec<String>,
-        reply: oneshot::Sender<ProbeVerdicts>,
     },
     /// Enumerate host GPUs via a transient Supervisor (control-plane). Mirrors
     /// `Supervisor::sysinfo`.
@@ -543,16 +533,6 @@ impl Actor for NodeActor {
                         })
                         .collect(),
                 );
-            }
-            NodeMsg::Probe { paths, reply } => {
-                // Control-plane probe on a transient Supervisor — independent of resident
-                // workers, so run it off the actor thread.
-                let spawner = self.spawner.clone();
-                let bus = self.config.bus.clone();
-                tokio::spawn(async move {
-                    let sup = (spawner)(bus);
-                    let _ = reply.send(sup.probe_paths(paths).await);
-                });
             }
             NodeMsg::Gpus { reply } => {
                 // Transient Supervisor enumerates GPUs and self-reaps; off the actor thread.
@@ -1023,19 +1003,6 @@ impl NodeRuntime {
     pub async fn instances(&self) -> Vec<(WorkerId, String)> {
         let (tx, rx) = oneshot::channel();
         if self.handle.send(NodeMsg::Instances { reply: tx }).is_err() {
-            return Vec::new();
-        }
-        rx.await.unwrap_or_default()
-    }
-
-    /// Probe GGUF support for `paths` (control-plane; via a transient worker).
-    pub async fn probe_paths(&self, paths: Vec<String>) -> ProbeVerdicts {
-        let (tx, rx) = oneshot::channel();
-        if self
-            .handle
-            .send(NodeMsg::Probe { paths, reply: tx })
-            .is_err()
-        {
             return Vec::new();
         }
         rx.await.unwrap_or_default()

@@ -46,7 +46,7 @@ The same status table applies to both surfaces:
 | HG018 ResidentModelMismatch | 503 |
 | HG019 ServingDisabled | 503 |
 | HG027 NodeUnreachable | 503 |
-| HG020/HG021/HG025/HG026 (probe/sysinfo/download/update) | 500 |
+| HG021/HG025/HG026 (sysinfo/download/update) | 500 |
 | anything else | 500 |
 | missing / insufficient API key | 401 |
 
@@ -363,7 +363,6 @@ Live scan of all configured model directories plus the currently loaded model id
       ],
       "state": "loaded",
       "format": "gguf",
-      "loadable": true,
       "tool_calls": true
     }
   ],
@@ -376,18 +375,21 @@ to the top level) **plus** the control-computed `state` (`"loaded"` /
 `"not-loaded"`), `format` (always `"gguf"`), and the support verdict below.
 `source` is one of `"LmStudio"`, `"HfCache"`, `"Ollama"`.
 `quant`, `arch`, `ctx_train` are omitted when unreadable from the GGUF header;
-`support_reason` is present only when the model isn't fully supported.
+`support_reason` is present only when higgs can't parse the model's tool calls.
 
 #### Model support detection fields
 
-Each `HiggsModelEntry` carries a two-gate support verdict plus the curated GGUF
-header fields the verdict is computed from:
+Each `HiggsModelEntry` carries a host-side tool-call support verdict plus the
+curated GGUF header fields the verdict is computed from. The scan is **pure
+host-side and fast** — it never loads a GGUF to test it. Engine loadability is
+learned at **actual load time** (`POST /api/higgs/models/load` returns the
+engine's verbatim error if the model fails to load); there is no scan-time
+pre-flight verdict.
 
 | Field | Type | Meaning |
 |-------|------|---------|
-| `loadable` | boolean | **Gate 1** — whether higgs's llama.cpp engine accepts this model's header + architecture, checked by a `vocab_only` probe of a representative GGUF for the model's `(architecture, quant)` combo. (A header/arch check — it won't catch a tensor/quant-level mismatch.) |
-| `tool_calls` | boolean | **Gate 2** — whether higgs has a tool-call parser matching the model's chat template (host-side, zero FFI). |
-| `support_reason` | string (optional) | The EXACT reason a model isn't fully supported. When `!loadable`: the engine's **verbatim** load error (e.g. `"unknown model architecture: 'gemma4'"`). When `loadable && !tool_calls`: the fixed string `"no tool-call parser matches this model's template"`. **Omitted** when the model is fully supported. |
+| `tool_calls` | boolean | Whether higgs has a tool-call parser matching the model's chat template (host-side chat-template sniff, zero FFI, no worker). |
+| `support_reason` | string (optional) | When `!tool_calls`: the fixed string `"no tool-call parser matches this model's template"`. **Omitted** when `tool_calls` is true. It never carries an engine load error. |
 | `gguf_components` | `GgufComponent[]` | Curated load-relevant GGUF header fields (this field lives on the flattened `HiggsModel` — its single home). Each `GgufComponent = { key: string, value: string }`. |
 
 The curated `gguf_components` keys are: `gguf.version`, `general.architecture`,
@@ -397,22 +399,22 @@ The curated `gguf_components` keys are: `gguf.version`, `general.architecture`,
 lists/merges) are deliberately skipped so the UI can pin a support mismatch to a
 specific component.
 
-**Example — an UNSUPPORTED model** (`gemma4` architecture the engine can't load):
+**Example — a model whose tool calls higgs can't parse** (no matching
+tool-call parser for its chat template):
 
 ```json
 {
-  "id": "org/gemma4-experimental",
-  "path": "/home/user/.cache/lm-studio/models/org/gemma4-experimental/model-Q4_K_M.gguf",
+  "id": "org/some-model",
+  "path": "/home/user/.cache/lm-studio/models/org/some-model/model-Q4_K_M.gguf",
   "size_bytes": 4200000000,
   "quant": "Q4_K_M",
   "source": "LmStudio",
-  "arch": "gemma4",
+  "arch": "llama",
   "has_chat_template": true,
-  "loadable": false,
   "tool_calls": false,
-  "support_reason": "unknown model architecture: 'gemma4'",
+  "support_reason": "no tool-call parser matches this model's template",
   "gguf_components": [
-    { "key": "general.architecture", "value": "gemma4" },
+    { "key": "general.architecture", "value": "llama" },
     { "key": "general.file_type", "value": "Q4_K_M" }
   ]
 }

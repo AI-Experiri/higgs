@@ -29,7 +29,6 @@ catalog** — the host scans and passes a resolved GGUF path in `M_LOAD`.
 | `M_UNLOAD` | `higgs/unload` | Drop the resident model. |
 | `M_STATUS` | `higgs/status` | Report `{loaded: {id, ctx_len, gpu_layers, threads}}` or `{loaded: null}`. |
 | `M_CHAT` | `higgs/chat` | Run inference (`model` bind, `messages_json`, `max_tokens`, `temperature`, optional `tools`, `request_id`). Streams `N_CHAT_CHUNK`, then replies `{content, finish_reason, tool_calls, prompt_tokens, completion_tokens}`. |
-| `M_PROBE` | `higgs/probe` | Non-destructive GGUF loadability check (Gate 1) on a throwaway vocab-only handle; never touches the resident model. |
 | `M_SYSINFO` | `higgs/sysinfo` | Enumerate compute devices `{gpus: [...]}` (cheap, no model load). |
 | `M_LOG_LEVEL` | `higgs/log_level` | Toggle engine log verbosity live (`{verbose}`). |
 | `M_SHUTDOWN` | `higgs/shutdown` | Reply, then exit the loop. |

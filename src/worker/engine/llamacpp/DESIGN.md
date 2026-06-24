@@ -61,10 +61,6 @@ The handful of `unsafe` blocks are narrow and documented at their call sites:
 - Position/index conversions to `i32` use `try_from` → `[HG011]` on overflow rather than a
   panic (unreachable in practice — positions never exceed `n_ctx`).
 
-`probe` uses `with_vocab_only(true)` to keep Gate-1 cheap; the pinned binding exposes no
-"no-alloc" path, so a full tensor/quant-mismatch catch awaits a newer `llama-cpp-2` (documented
-at the call site).
-
 ## Logging (`logging.rs`)
 
 Only THIS engine's logging lives here (a future engine ships its own). It routes the binding's

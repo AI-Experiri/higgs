@@ -85,16 +85,6 @@ async fn scan_with_loaded(
     Ok((models, loaded_set, primary))
 }
 
-/// The `(arch, quant)` support-cache key for a model. A missing arch/quant is
-/// keyed as the empty string, so all "unknown arch/quant" files share one verdict
-/// (and one probe) rather than each probing redundantly.
-fn support_key(model: &HiggsModel) -> (String, String) {
-    (
-        model.arch.clone().unwrap_or_default(),
-        model.quant.clone().unwrap_or_default(),
-    )
-}
-
 /// Gate 2 (host-side, zero FFI): does any registered tool-call parser recognize
 /// this model's chat template? `false` when there is no template or none matches.
 /// The `tool_parser` registry is pure Rust, so this runs in-process — no worker.
@@ -108,31 +98,20 @@ fn tool_calls_supported(model: &HiggsModel) -> bool {
 }
 
 /// Build the per-model control entry: the canonical [`HiggsModel`] enriched with
-/// its load `state`, `format`, and the two support gates.
+/// its load `state`, `format`, and the Gate-2 tool-call support verdict.
 ///
-/// `loadable`/`load_reason` are the Gate-1 verdict for this model's
-/// `(arch, quant)` (from the probe sweep). `support_reason` is the verbatim
-/// engine reason when `!loadable`, the fixed Gate-2 message when the model loads
-/// but no parser matches its template, else `None`.
-fn model_entry(
-    mut model: HiggsModel,
-    loaded_ids: &[String],
-    loadable: bool,
-    load_reason: Option<String>,
-) -> HiggsModelEntry {
+/// There is NO load-to-test probe at scan time — engine loadability is learned
+/// only when the model is actually loaded (the load error is surfaced then).
+/// `support_reason` carries the fixed Gate-2 message when no tool-call parser
+/// matches the model's template, else `None`.
+fn model_entry(mut model: HiggsModel, loaded_ids: &[String]) -> HiggsModelEntry {
     // Multi-model: this model is "loaded" if it is among the resident ids, not only
     // when it is the primary.
     let is_loaded = loaded_ids.iter().any(|id| id == &model.id);
     let tool_calls = tool_calls_supported(&model);
-    let support_reason = if !loadable {
-        // Gate 1 failed: surface the engine's verbatim load error.
-        load_reason
-    } else if !tool_calls {
-        // Gate 1 passed, Gate 2 failed: no parser matches the template.
-        Some("no tool-call parser matches this model's template".to_owned())
-    } else {
-        None
-    };
+    // Gate 2 (pure host-side template sniff): no parser matches the template.
+    let support_reason =
+        (!tool_calls).then(|| "no tool-call parser matches this model's template".to_owned());
     // The transient chat_template never leaves the host; drop it explicitly
     // (it is `serde(skip)` anyway). `gguf_components` stays on the model — its
     // single home — and rides the flattened payload.
@@ -144,47 +123,25 @@ fn model_entry(
             "not-loaded".to_owned()
         },
         format: "gguf".to_owned(),
-        loadable,
         tool_calls,
         support_reason,
         model,
     }
 }
 
-/// `GET /api/higgs/models` — live scan of all configured directories, plus
-/// the currently loaded model id and the Gate-1/Gate-2 support verdict per model.
+/// `GET /api/higgs/models` — live scan of all configured directories, plus the
+/// currently loaded model id and the Gate-2 tool-call support verdict per model.
+/// Pure host-side: the scan never loads a model (no probe), so it is fast even
+/// across a large catalog — loadability is learned only at actual load time.
 pub(super) async fn control_models(State(higgs): State<Arc<Higgs>>) -> Response {
     tracing::info!("higgs: GET /api/higgs/models");
     let (models, loaded_set, primary) = match scan_with_loaded(&higgs).await {
         Ok(triple) => triple,
         Err(resp) => return resp,
     };
-    // Gate 1 sweep: one representative path per distinct (arch, quant), probed
-    // once (cached thereafter). Every model sharing the combo inherits the verdict.
-    let mut reps: std::collections::HashMap<(String, String), String> =
-        std::collections::HashMap::new();
-    for m in &models {
-        reps.entry(support_key(m)).or_insert_with(|| m.path.clone());
-    }
-    let combos = reps.len();
-    let support = higgs
-        .probe_support(
-            reps.into_iter()
-                .map(|((arch, quant), path)| (arch, quant, path))
-                .collect(),
-        )
-        .await;
-    let unsupported = support.values().filter(|(loadable, _)| !*loadable).count();
-    tracing::info!("higgs: support sweep — probed {combos} combos, {unsupported} unsupported");
     let entries: Vec<HiggsModelEntry> = models
         .into_iter()
-        .map(|m| {
-            let (loadable, reason) = support
-                .get(&support_key(&m))
-                .cloned()
-                .unwrap_or((false, Some("probe verdict missing".to_owned())));
-            model_entry(m, &loaded_set, loadable, reason)
-        })
+        .map(|m| model_entry(m, &loaded_set))
         .collect();
     Json(HiggsModelsResponse {
         models: entries,
@@ -209,18 +166,7 @@ pub(super) async fn control_model_by_id(
         Err(resp) => return resp,
     };
     match models.into_iter().find(|m| m.id == id) {
-        Some(model) => {
-            // Gate 1 for this one model's (arch, quant) — cached after the first probe.
-            let (arch, quant) = support_key(&model);
-            let support = higgs
-                .probe_support(vec![(arch.clone(), quant.clone(), model.path.clone())])
-                .await;
-            let (loadable, reason) = support
-                .get(&(arch, quant))
-                .cloned()
-                .unwrap_or((false, Some("probe verdict missing".to_owned())));
-            Json(model_entry(model, &loaded_set, loadable, reason)).into_response()
-        }
+        Some(model) => Json(model_entry(model, &loaded_set)).into_response(),
         None => {
             let err = HiggsError::ModelNotFound { id };
             tracing::warn!(error = %err, "higgs: model not found");

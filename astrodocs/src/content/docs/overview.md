@@ -100,10 +100,10 @@ flowchart TB
 - Pre-load **RAM headroom guard** — a model that can't fit is rejected before it
   thrashes the host. (Total/free VRAM is also reported and a `fits_vram` helper is
   provided, though the enforced pre-load check is RAM-based.)
-- **Model-support detection**: a transient probe worker validates a GGUF's header
-  and architecture (a `vocab_only` load — it won't catch a tensor/quant mismatch),
-  and host-side parsing confirms its tool dialect — cached per
-  `(arch, quant, engine_version)`.
+- **Model-support detection**: host-side only — a chat-template sniff confirms the
+  model's tool dialect (`tool_calls`), with no FFI and no worker. Engine
+  loadability isn't pre-probed; it's learned at **actual load time** (a failed
+  load returns the engine's verbatim error).
 - Rich load tuning: `ctx_len`, `gpu_layers`, `threads`, mmap / mlock, batch sizes,
   KV-cache type, flash-attention.
 

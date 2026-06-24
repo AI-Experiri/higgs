@@ -13,7 +13,7 @@ only the worker.
 
 | File | Responsibility |
 |------|----------------|
-| `mod.rs` | The engine: trait methods (`load`/`unload`/`is_loaded`/`chat`/`probe`/`devices`/`version`), the chat pipeline (template apply → tokenize + fit-check → streaming decode → final parse), the streaming decode loop + sampler, tool-call parsing (crate parser + registry fallback), GPU/device enumeration, and the FFI enum mappings (FlashAttn, KV-cache kind, device kind). Holds `LlamaCppEngine` (`Option<LoadedModel>` + a `ToolParserRegistry`). |
+| `mod.rs` | The engine: trait methods (`load`/`unload`/`is_loaded`/`chat`/`devices`), the chat pipeline (template apply → tokenize + fit-check → streaming decode → final parse), the streaming decode loop + sampler, tool-call parsing (crate parser + registry fallback), GPU/device enumeration, and the FFI enum mappings (FlashAttn, KV-cache kind, device kind). Holds `LlamaCppEngine` (`Option<LoadedModel>` + a `ToolParserRegistry`). |
 | `logging.rs` | Worker log control: installs the `tracing` subscriber (stderr, no ANSI — the host drains raw text), routes llama.cpp/ggml's C log callback into `tracing` (target `llama-cpp-2`), and filters verbosity live (INFO+ normal / DEBUG+ verbose, with load-time KV/hyperparameter noise suppressed unless verbose; WARN/ERROR always surfaced). Toggled by `M_LOG_LEVEL` via an atomic. |
 
 ## `HiggsEngine` methods (what the FFI does)
@@ -23,9 +23,7 @@ only the worker.
 | `load` | `LlamaBackend::init()` + `LlamaModel::load_from_file()` with `use_mmap`/`use_mlock`/`gpu_layers`. One model at a time; replaces any resident. |
 | `unload` / `is_loaded` | Drop the handle (`Drop` frees FFI resources) / presence check. |
 | `chat` | The pipeline: load+apply the GGUF chat template → tokenize + context-fit (`[HG005]` on overflow) → streaming decode (sample → detokenize → `sink(delta)` → re-batch) → final `parse_output` (content, finish_reason, tool_calls, token counts). |
-| `probe` | `load_from_file(with_vocab_only(true))` — cheap Gate-1 loadability check on a throwaway handle; returns `(loadable, reason)` with the engine's verbatim error. |
 | `devices` | Enumerate ggml backend devices (Metal on macOS, CPU otherwise) → `Vec<GpuDevice>` with VRAM stats. |
-| `version` | `ggml_version()` — the real runtime ggml version (NOT the crate version); part of the support-cache key so an engine upgrade invalidates verdicts. |
 
 ## Key types
 

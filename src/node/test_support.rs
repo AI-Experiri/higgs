@@ -196,27 +196,6 @@ pub(crate) fn fake_runtime_stateful(lmstudio_dirs: Vec<PathBuf>) -> NodeRuntime 
     )
 }
 
-/// A `NodeRuntime` whose worker factory ALWAYS fails to spawn — for the probe spawn-failure
-/// path (`probe_paths` → `false` verdict) and the idle/no-worker (`worker_alive=false`) state.
-pub(crate) fn fake_runtime_spawn_fails() -> NodeRuntime {
-    NodeRuntime::with_spawner(
-        NodeConfig {
-            bus: Arc::new(LogBus::new()),
-            lmstudio_dirs: vec![],
-            hf_dirs: vec![],
-            ollama_dirs: vec![],
-            idle_ttl: crate::node::runtime::DEFAULT_IDLE_TTL,
-        },
-        Arc::new(|_bus| {
-            Supervisor::with_factory(Box::new(|_ring, _model| {
-                Err(crate::diagnostic::HiggsError::WorkerSpawnFailed {
-                    source: std::io::Error::other("mock: no worker"),
-                })
-            }))
-        }),
-    )
-}
-
 /// Like [`fake_runtime`] but with an explicit idle TTL — lets a test drive the node's idle
 /// reaper deterministically with a tiny TTL.
 pub(crate) fn fake_runtime_with_idle_ttl(

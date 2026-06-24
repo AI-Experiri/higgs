@@ -16,23 +16,17 @@ state: string,
  */
 format: string, 
 /**
- * Gate 1: whether our llama.cpp engine can LOAD this model, as proved by
- * a real probe of a representative GGUF for this `(arch, quant)`. `false`
- * means a load attempt failed; `support_reason` carries the verbatim
- * engine reason.
- */
-loadable: boolean, 
-/**
  * Gate 2: whether higgs has a tool-call parser that matches this model's
- * chat template. `false` means the model loads but tool calls can't be
- * parsed; `support_reason` explains.
+ * chat template. `false` means the model can be served but tool calls
+ * can't be parsed; `support_reason` explains. (There is no scan-time
+ * load probe — engine loadability is learned only at actual load.)
  */
 tool_calls: boolean, 
 /**
- * The exact reason this model isn't fully supported, or `None` when it is.
- * When `!loadable`, this is the engine's VERBATIM load error (e.g.
- * `"unknown model architecture: 'gemma4'"`). When `loadable && !tool_calls`,
- * it is `"no tool-call parser matches this model's template"`.
+ * The fixed Gate-2 message when `!tool_calls`
+ * (`"no tool-call parser matches this model's template"`), else `None`.
+ * There is no scan-time load probe, so this never carries an engine load
+ * error — a failed load is reported by the load endpoint itself.
  *
  * The curated `gguf_components` list — used by the UI to pin a support
  * mismatch to a specific header field — rides the flattened

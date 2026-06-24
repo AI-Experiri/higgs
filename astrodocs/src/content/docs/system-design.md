@@ -158,9 +158,7 @@ trait HiggsEngine: Send {
         params: &GenParams,
         sink: &mut dyn FnMut(&str),   // token callback
     ) -> Result<ChatResult, HiggsError>;  // { content, finish_reason, prompt/completion tokens }
-    fn probe(&self, path: &str) -> (bool, Option<String>);  // Gate-1 loadability
     fn devices(&self) -> Vec<GpuDevice>;  // ggml backend-device enumeration
-    fn version(&self) -> String;          // backend version (support-cache key)
 }
 ```
 
@@ -182,7 +180,7 @@ workers. The **M_SYSINFO** RPC (`higgs/sysinfo`) replies `{ gpus: [GpuDevice, �
 it is cheap, read-only, and never mutates the resident-model slot.
 
 The host runs M_SYSINFO in a **separate, transient, crash-isolated worker**
-(`Supervisor::sysinfo`, same pattern as `probe_paths`), never the serving worker,
+(`Supervisor::sysinfo`), never the serving worker,
 and `Higgs::sysinfo()` caches the result (hardware is static-ish). On
 spawn/EOF/timeout the device list is empty (HG021) — `GET /api/higgs/system` still
 returns hardware/runtime. The host-side `fits_vram(model_size, vram_total,
@@ -264,93 +262,30 @@ ModelStore::scan(lmstudio_roots, hf_roots, ollama_roots)   (host process)
 
 ## Model Support Detection
 
-Each scanned model carries a **two-gate support verdict** so the UI can show
-exactly whether higgs can serve it — and, if not, the precise reason. The two
-gates are independent: Gate 1 proves the engine can LOAD the model, Gate 2 proves
-higgs can PARSE its tool calls.
+Each scanned model carries a **host-side support verdict** so the UI can show
+whether higgs can parse its tool calls — and, if not, why. The scan is **pure
+host-side and fast**: it never loads a GGUF to test it.
 
 ```
 HiggsModelEntry
   │
-  ├─ loadable  ── Gate 1 ── engine CAN load (probe of (arch,quant))
-  ├─ tool_calls ─ Gate 2 ── a tool-call parser matches the template
+  ├─ tool_calls ─ a tool-call parser matches the template (host-side sniff)
   └─ support_reason (optional)
-        │  !loadable            → engine's VERBATIM load error
-        │  loadable && !tool_calls → "no tool-call parser matches this model's template"
-        └─ fully supported      → omitted
+        │  !tool_calls → "no tool-call parser matches this model's template"
+        └─ otherwise   → omitted
 ```
 
-### Gate 1 — engine loadability (transient probe worker)
+### Engine loadability — learned at load time, not pre-probed
 
-Loadability is checked by asking the engine to load the GGUF's header + vocab
-(`with_vocab_only(true)` — it validates architecture/header but does not page in
-tensors, so a tensor/quant-level mismatch isn't caught here; see the caveat
-below) — but never in the serving worker. A **separate transient probe worker** is spawned (re-exec
-of the same binary, `production_factory(bus, "probe")`), crash-isolated exactly
-like the serving worker. The probe loads the GGUF into a throwaway handle and
-drops it immediately.
+higgs does **not** pre-probe engine loadability at scan time. There is no
+scan-time/at-open load-to-test, no probe worker, and no support-verdict cache.
+Whether the llama.cpp engine can actually load a model is learned at **actual
+load time**: `POST /api/higgs/models/load` returns the engine's **verbatim**
+error if the load fails. `support_reason` never carries an engine load error.
 
-```
-Higgs                              probe worker (re-exec, "probe")
-  │  M_PROBE { path }                       │
-  ├────────────────────────────────────────▶ LlamaModel::load_from_file(
-  │                                          │     path, with_vocab_only(true))
-  │                                          │  handle DROPPED immediately —
-  │                                          │  NEVER stored as resident
-  │  { loadable, reason, engine_version }    │
-  ◀────────────────────────────────────────┤
-  │
-  └─ crash / timeout / spawn-fail ⇒ (false, Some("<context>"))   [HG020]
-```
+### Tool-call parsing (host-side, zero FFI)
 
-- The handle is **dropped immediately** and **never stored as resident**, so a
-  probe never disturbs a model being served.
-- The verbatim engine error string becomes `support_reason` when `loadable` is
-  false.
-- **Vocab-only caveat:** the pinned llama-cpp-2 0.1.139 lacks `no_alloc`. A
-  `with_vocab_only(true)` probe validates the architecture/header but **cannot**
-  catch a quant/tensor mismatch — that needs a later llama-cpp-2. So Gate 1 today
-  proves "the engine recognizes this arch and header," not "every tensor loads."
-
-### Verdict caching — per `(arch, quant, engine_version)`, not per file
-
-A probe is expensive (a process spawn + a model load), so verdicts are cached by
-the **combo**, not the file. One probe per distinct `(architecture, quant)`; every
-model sharing that combo inherits the verdict.
-
-```
-key = (architecture, quant, engine_version)
-        │
-        ├─ hit  → reuse verdict, no probe
-        └─ miss → spawn probe worker → cache (loadable, reason)
-
-store: Mutex<HashMap<key, verdict>> on Higgs   (in-memory; no persistence yet)
-engine_version: lookups key on THIS binary's engine_version();
-                a stored verdict carries the probe reply's version
-                (same binary, so they match)
-```
-
-The `engine_version` component of the key is the **current binary's**
-`engine_version()` on lookup; a verdict is stored under the version reported in the
-probe worker's `M_PROBE` reply. Because the probe worker is a re-exec of the same
-binary, the two agree — so the cache can't serve a verdict computed by a different
-engine version.
-
-### The M_PROBE RPC
-
-```
-request:  { path }
-reply:    { loadable, reason, engine_version }
-
-per-path timeout
-crash / timeout / spawn-fail  ⇒  (false, Some("<context>"))
-                                  never a panic, never a hang
-                                  diagnostic HG020 ProbeWorkerFailed
-```
-
-### Gate 2 — tool-call parsing (host-side, zero FFI)
-
-Gate 2 is pure Rust on the host — no worker, no FFI:
+The tool-call verdict is pure Rust on the host — no worker, no FFI:
 
 ```
 ToolParserRegistry::with_defaults()
@@ -360,7 +295,9 @@ ToolParserRegistry::with_defaults()
 
 It selects a parser from the model's chat template against the same
 `ToolParserRegistry` the worker's fallback path uses (see **Tool calling**). A
-match means higgs can turn that model's emitted calls into OpenAI `tool_calls`.
+match means higgs can turn that model's emitted calls into OpenAI `tool_calls`;
+no match sets `tool_calls = false` and `support_reason` to the fixed string
+`"no tool-call parser matches this model's template"`.
 
 ---
 

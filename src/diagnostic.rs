@@ -166,13 +166,12 @@ pub enum HiggsError {
     #[diagnostic(code(HG019))]
     ServingDisabled,
 
-    /// A model-support probe could not run: the transient probe worker failed to
-    /// spawn, its stdio closed before replying, or the probe RPC timed out. This
-    /// is a probe-infrastructure failure, distinct from a model that loaded and
-    /// returned a verbatim engine reason — those are reported as a verdict, not
-    /// an error. Surfaced as the probe verdict `(false, Some("<context>"))` so a
-    /// failed probe never hangs or panics the support sweep; `context` names the
-    /// path or stage that failed.
+    /// RETIRED (reserved). Formerly raised when the Gate-1 loadability probe
+    /// worker failed to spawn/reply. The scan-time probe was removed — loadability
+    /// is now learned only at actual load — so this is never emitted. The variant
+    /// and its `HG020` code are KEPT (not deleted/renumbered) to honor the
+    /// append-only code policy: downstream consumers that matched on `HG020` keep
+    /// a stable, documented meaning rather than seeing the code silently reused.
     #[snafu(display("[HG020] probe worker failed: {context}"))]
     #[diagnostic(code(HG020))]
     ProbeWorkerFailed { context: String },
@@ -293,6 +292,8 @@ mod tests {
         assert!(HiggsError::ServingDisabled
             .to_string()
             .starts_with("[HG019]"));
+        // HG020 is RETIRED but RESERVED (append-only policy) — the code still
+        // formats even though nothing emits it anymore.
         assert!(HiggsError::ProbeWorkerFailed {
             context: "/models/x.gguf".into(),
         }
