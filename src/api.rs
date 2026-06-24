@@ -134,6 +134,48 @@ pub struct Higgs {
     /// disable, defeating the kill switch). SEPARATE from `lifecycle` (local model load/unload) so
     /// the two never cross-couple. An async `Mutex` because the guard is held across `.await`.
     hub_lifecycle: tokio::sync::Mutex<()>,
+    /// Serializes read-modify-write of `config.json` (load records, instance rename, autoload
+    /// toggles). The save is atomic (temp+rename) so the LAST writer wins — but two concurrent
+    /// RMWs would each load the file, mutate a DIFFERENT field, and the second save would clobber
+    /// the first's change. Holding this for the whole load→mutate→save makes each RMW atomic w.r.t.
+    /// the others. A plain `parking_lot::Mutex` — held only across synchronous file I/O, never an
+    /// `.await`. Pure reads of `config.json` (e.g. the node view's label) need no lock: the atomic
+    /// rename means a reader always sees a complete prior-or-next version.
+    config_io: parking_lot::Mutex<()>,
+    /// Override for the `config.json` path. `None` in production → the real
+    /// [`crate::config::config_path`] (`~/.higgs` or `$HIGGS_HOME`). Set to a unique temp
+    /// path for in-crate unit tests (see [`default_config_path_override`]) so `load`'s
+    /// per-model-record PERSISTENCE never writes the developer/CI `~/.higgs/config.json`
+    /// and parallel tests don't share state. A `Mutex` only to satisfy `Sync` cheaply; it is
+    /// set once at construction and read thereafter.
+    config_path: parking_lot::Mutex<Option<std::path::PathBuf>>,
+}
+
+/// Wall-clock milliseconds since the Unix epoch (`0` if the clock is before it). Used to stamp
+/// per-model load records in `config.json`.
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// The default `config.json` path override for a freshly-built [`Higgs`].
+///
+/// Production (and integration tests, which run the real binary under an isolated `HIGGS_HOME`)
+/// get `None` → the real [`crate::config::config_path`]. In-crate unit tests (`cfg(test)`) get a
+/// UNIQUE temp path per instance, so `Higgs::load`'s config persistence is hermetic (never
+/// touches the real `~/.higgs/config.json`) and parallel-safe (no two instances share a file).
+#[cfg(not(test))]
+fn default_config_path_override() -> Option<std::path::PathBuf> {
+    None
+}
+#[cfg(test)]
+fn default_config_path_override() -> Option<std::path::PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    Some(std::env::temp_dir().join(format!("higgs-unit-config-{}-{n}.json", std::process::id())))
 }
 
 impl Higgs {
@@ -190,7 +232,47 @@ impl Higgs {
             api_keys: parking_lot::Mutex::new(std::sync::Arc::new(crate::keys::ApiKeys::default())),
             hub: parking_lot::Mutex::new(None),
             hub_lifecycle: tokio::sync::Mutex::new(()),
+            config_io: parking_lot::Mutex::new(()),
+            config_path: parking_lot::Mutex::new(default_config_path_override()),
         }
+    }
+
+    /// The `config.json` path this instance reads/writes: the per-instance override when set
+    /// (unit tests), else the real [`crate::config::config_path`].
+    fn config_file_path(&self) -> std::io::Result<std::path::PathBuf> {
+        match self.config_path.lock().clone() {
+            Some(p) => Ok(p),
+            None => crate::config::config_path(),
+        }
+    }
+
+    /// Serialize a read-modify-write of `config.json` under [`Self::config_io`]: load the current
+    /// config, apply `f`, then persist atomically — so concurrent load-record / rename / autoload
+    /// writes can't clobber each other. The closure runs while the lock is held; it must not block
+    /// or `.await` (it's a quick field mutation). A missing file loads as the default config.
+    pub(crate) fn with_config_mut<R>(
+        &self,
+        f: impl FnOnce(&mut crate::config::InstanceConfig) -> R,
+    ) -> std::io::Result<R> {
+        let _guard = self.config_io.lock();
+        let path = self.config_file_path()?;
+        let mut cfg = crate::config::InstanceConfig::load(&path)?;
+        let r = f(&mut cfg);
+        cfg.save(&path)?;
+        Ok(r)
+    }
+
+    /// The per-model load records persisted in this instance's `config.json` (read-only — no lock
+    /// needed; the atomic save means a reader always sees a complete version). Empty on any error
+    /// or absent file. Honors the per-instance config-path override so reads match writes.
+    pub(crate) fn model_records(
+        &self,
+    ) -> std::collections::BTreeMap<String, crate::config::ModelRecord> {
+        self.config_file_path()
+            .ok()
+            .and_then(|p| crate::config::InstanceConfig::load(&p).ok())
+            .map(|c| c.models)
+            .unwrap_or_default()
     }
 
     /// Install the remote fleet (hub mode) — `/v1` chat for a remote-resident model then
@@ -441,7 +523,11 @@ impl Higgs {
     /// Load a model by HuggingFace repo id.
     ///
     /// `params` overrides `default_load` when supplied. On success, records the
-    /// load params for post-restart replay and emits [`HiggsEvent::ModelLoaded`].
+    /// load params for post-restart replay and emits [`HiggsEvent::ModelLoaded`],
+    /// and PERSISTS the effective requested params to `config.json` (per-model
+    /// record) so the UI can display what the model was loaded with and a future
+    /// autoload can reload it the same way. Persistence is best-effort: a config
+    /// write failure is logged, never failing an otherwise-successful load.
     pub async fn load(&self, id: &str, params: Option<LoadParams>) -> Result<(), HiggsError> {
         // Serialize concurrent loads at the facade so two racing JIT loads of the
         // same id can't each spawn a worker (the node load is additive — it never
@@ -482,7 +568,13 @@ impl Higgs {
         let np = match params {
             Some(p) => NodeLoadParams {
                 id: id.to_owned(),
-                ctx_len: Some(p.ctx_len),
+                // `ctx_len == 0` means AUTO → leave it `None` so the node picks the
+                // model's trained context (capped), exactly like a no-params load.
+                // This makes a replayed `last_load` (which records auto as `0`)
+                // reproduce the SAME auto load instead of pinning a literal 0 (which
+                // the worker would coerce to its 4096 fallback). A pinned 0 context is
+                // nonsensical anyway, so nothing meaningful is lost.
+                ctx_len: (p.ctx_len > 0).then_some(p.ctx_len),
                 gpu_layers: Some(p.gpu_layers),
                 threads: Some(p.threads),
             },
@@ -496,10 +588,28 @@ impl Higgs {
                 }
             }
         };
+        // The params we PERSIST on success — derived from `np` so the record reflects
+        // EXACTLY what crossed to the node (and a future autoload reproduces it). We
+        // record ONLY the forwarded fields; the rich engine overrides are NOT carried
+        // to the node today (documented gap), so persisting them would claim options
+        // the engine never received — they stay at default here until the gap closes.
+        // A `ctx_len` of 0 means AUTO (node called with `ctx_len: None` → trained
+        // context, capped) — never `default_load().ctx_len`, which the node ignores.
+        let effective = LoadParams {
+            ctx_len: np.ctx_len.unwrap_or(0),
+            gpu_layers: np.gpu_layers.unwrap_or_default(),
+            threads: np.threads.unwrap_or_default(),
+            ..Default::default()
+        };
         // Additive load on the local node: spawns a fresh worker for `id` (the
         // node emits `ModelLoaded` on commit). resolve / headroom / path-traversal
         // failures surface as their mapped HiggsError.
-        self.local.load(np).await.map(|_| ())
+        self.local.load(np).await?;
+        // Persist the per-model load record (best-effort — never fail a good load).
+        if let Err(e) = self.with_config_mut(|c| c.record_load(id, effective, now_unix_ms())) {
+            tracing::warn!(id, error = %e, "higgs: failed to persist load record to config.json");
+        }
+        Ok(())
     }
 
     /// Unload ALL locally-resident models.

@@ -4,7 +4,7 @@
 //! re-exported from `frontend/src/lib/types.ts`. The `/v1` surface uses
 //! `async-openai` wire types verbatim, so only the control shapes live here.
 
-use crate::worker::engine::{FlashAttn, KvCacheKind};
+use crate::worker::engine::{FlashAttn, KvCacheKind, LoadParams};
 use crate::worker::models::HiggsModel;
 
 higgs_ts! {
@@ -129,6 +129,15 @@ higgs_ts! {
         /// mismatch to a specific header field — rides the flattened
         /// [`HiggsModel`] (its single home); it is not re-declared here.
         pub support_reason: Option<String>,
+        /// The params this model was last successfully loaded with on THIS instance,
+        /// persisted in `config.json` (`None` if it has never been loaded here).
+        /// Lets the UI show "last loaded with ctx=…, gpu_layers=…" for any scanned
+        /// model — replacing the removed scan-time load probe with real load history.
+        /// A `ctx_len` of `0` means AUTO (the engine picks the model's trained
+        /// context, capped) — the UI should render that as "auto", not "0".
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub last_load: Option<LoadParams>,
     }
 }
 

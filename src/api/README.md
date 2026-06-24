@@ -15,8 +15,8 @@ keeps resolving unchanged.
 
 | File | Responsibility |
 |------|----------------|
-| `api.rs` | The `Higgs` struct + its core `impl` (construct, `load`/`unload`/`status`/`chat_stream`/`scan`/`events`/`logs`/`sysinfo`/`stop`/`start`, the served-id helpers `local_served`/`local_served_ids`/`local_loaded_info`), plus submodule declarations and re-exports. Delegates to the `local: Arc<NodeRuntime>` field. |
-| `api/types.rs` | Wire/response types (`HiggsConfig`, `HiggsStatus`, `LoadedInfo`, `ChatOutcome`, server config, …, all via `higgs_ts!`), the runtime constants (`DEFAULT_CTX_CAP`, `MAX_CONCURRENT_INFERENCE`, idle-TTL constants, …), the `Support*` type aliases, and `chat_outcome_from_value`. |
+| `api.rs` | The `Higgs` struct + its core `impl` (construct, `load`/`unload`/`status`/`chat_stream`/`scan`/`events`/`logs`/`sysinfo`/`stop`/`start`, the served-id helpers `local_served`/`local_served_ids`/`local_loaded_info`, and `with_config_mut` — the lock-serialized read-modify-write of `config.json` for per-model load records + instance rename), plus submodule declarations and re-exports. Delegates to the `local: Arc<NodeRuntime>` field. On a successful `load`, persists the effective load params to `config.json` (per-model `ModelRecord`) so the UI can show what a model was loaded with — best-effort, never failing a good load. |
+| `api/types.rs` | Wire/response types (`HiggsConfig`, `HiggsStatus`, `LoadedInfo`, `ChatOutcome`, server config, …, all via `higgs_ts!`), the runtime constants (`DEFAULT_CTX_CAP`, `MAX_CONCURRENT_INFERENCE`, idle-TTL constants, …), and `chat_outcome_from_value`. |
 | `api/guards.rs` | Host-side load guards: `validate_repo_id` (charset/traversal), `path_within_roots` (containment), and `guard_memory_headroom` (pre-load RAM check) + its helpers. |
 | `api/tests.rs` | The crate's `#[cfg(test)] mod tests` for the facade. Reaches facade internals via `use super::*` (child modules can see parent-private items). |
 

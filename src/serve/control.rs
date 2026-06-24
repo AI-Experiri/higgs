@@ -98,13 +98,18 @@ fn tool_calls_supported(model: &HiggsModel) -> bool {
 }
 
 /// Build the per-model control entry: the canonical [`HiggsModel`] enriched with
-/// its load `state`, `format`, and the Gate-2 tool-call support verdict.
+/// its load `state`, `format`, the Gate-2 tool-call support verdict, and the
+/// `last_load` params persisted on the last successful load (if any).
 ///
 /// There is NO load-to-test probe at scan time — engine loadability is learned
 /// only when the model is actually loaded (the load error is surfaced then).
 /// `support_reason` carries the fixed Gate-2 message when no tool-call parser
 /// matches the model's template, else `None`.
-fn model_entry(mut model: HiggsModel, loaded_ids: &[String]) -> HiggsModelEntry {
+fn model_entry(
+    mut model: HiggsModel,
+    loaded_ids: &[String],
+    last_load: Option<LoadParams>,
+) -> HiggsModelEntry {
     // Multi-model: this model is "loaded" if it is among the resident ids, not only
     // when it is the primary.
     let is_loaded = loaded_ids.iter().any(|id| id == &model.id);
@@ -125,6 +130,7 @@ fn model_entry(mut model: HiggsModel, loaded_ids: &[String]) -> HiggsModelEntry 
         format: "gguf".to_owned(),
         tool_calls,
         support_reason,
+        last_load,
         model,
     }
 }
@@ -139,9 +145,16 @@ pub(super) async fn control_models(State(higgs): State<Arc<Higgs>>) -> Response 
         Ok(triple) => triple,
         Err(resp) => return resp,
     };
+    // One read of the per-model load records; each entry attaches its own (if any).
+    // Non-consuming lookup — the scan can list multiple rows for one id (e.g. several
+    // HF cache revisions), and they should all carry the same persisted `last_load`.
+    let records = higgs.model_records();
     let entries: Vec<HiggsModelEntry> = models
         .into_iter()
-        .map(|m| model_entry(m, &loaded_set))
+        .map(|m| {
+            let last_load = records.get(&m.id).and_then(|r| r.load.clone());
+            model_entry(m, &loaded_set, last_load)
+        })
         .collect();
     Json(HiggsModelsResponse {
         models: entries,
@@ -166,7 +179,10 @@ pub(super) async fn control_model_by_id(
         Err(resp) => return resp,
     };
     match models.into_iter().find(|m| m.id == id) {
-        Some(model) => Json(model_entry(model, &loaded_set)).into_response(),
+        Some(model) => {
+            let last_load = higgs.model_records().remove(&model.id).and_then(|r| r.load);
+            Json(model_entry(model, &loaded_set, last_load)).into_response()
+        }
         None => {
             let err = HiggsError::ModelNotFound { id };
             tracing::warn!(error = %err, "higgs: model not found");
@@ -557,7 +573,10 @@ pub(super) async fn control_nodes_label(
 ) -> Response {
     tracing::warn!(node = %req.node, label = %req.label, "higgs: POST /api/higgs/nodes/label");
     if req.node == "local" {
-        return match rename_local(&req.label) {
+        // Rename the LOCAL instance under the shared config-io lock (so it can't clobber a
+        // concurrent load-record write). The next `GET /api/higgs/nodes` shows the new name, and
+        // the hub accept loop re-reads it per admission so paired nodes learn the new `hub_name`.
+        return match higgs.with_config_mut(|c| c.name = req.label.clone()) {
             Ok(()) => Json(serde_json::json!({ "status": "ok" })).into_response(),
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -596,15 +615,6 @@ pub(super) async fn control_nodes_label(
         )
             .into_response(),
     }
-}
-
-/// Rename the LOCAL instance: set `config.json`'s `name`. The next `GET /api/higgs/nodes` shows
-/// it, and the hub accept loop re-reads it per admission so paired nodes learn the new `hub_name`.
-fn rename_local(label: &str) -> std::io::Result<()> {
-    let path = crate::config::config_path()?;
-    let mut cfg = crate::config::InstanceConfig::load(&path)?;
-    cfg.name = label.to_string();
-    cfg.save(&path)
 }
 
 /// The `409` returned by hub-only routes when no fleet is installed.

@@ -105,6 +105,18 @@ async fn control_api_lifecycle() {
         entry["supports_reasoning"], false,
         "no embedded template → no reasoning"
     );
+    // P2: the load persisted a per-model record — the entry now carries `last_load`
+    // (the params the model was loaded with), surviving in config.json for display
+    // + future autoload. Loaded with no pinned params → the effective default_load
+    // is recorded (ctx_len 0 = "auto", capped to the trained context at load).
+    assert!(
+        entry["last_load"].is_object(),
+        "loaded model carries a persisted last_load record: {entry}"
+    );
+    assert!(
+        entry["last_load"]["ctx_len"].is_number() && entry["last_load"]["gpu_layers"].is_number(),
+        "persisted last_load carries the load params: {entry}"
+    );
 
     // model-by-id (the wildcard route handles the slashed HF repo id).
     let by_id: serde_json::Value = get(format!("/api/higgs/models/{id}"))

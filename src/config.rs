@@ -10,9 +10,12 @@
 //! still PUBLIC info; the reconnect is authenticated by the node's keypair against the hub
 //! allowlist, not by anything stored here.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+use crate::worker::engine::LoadParams;
 
 /// The role an instance runs as. Fixes the friendly-name prefix (`hub-…` vs `node-…`) so a
 /// machine is identifiable at a glance. A hub that was first a node keeps its original prefix
@@ -46,9 +49,26 @@ pub struct SavedHub {
     pub last_used_ms: u64,
 }
 
+/// A per-model record persisted in `config.json`, keyed by HuggingFace repo id. Records the
+/// parameters a model was last successfully loaded with — so the UI can DISPLAY "loaded with
+/// ctx=…, gpu_layers=…" and a future autoload can reload it with the same params — replacing the
+/// old scan-time load-probe (loadability is now learned only at actual load; see the
+/// probe-removal change). Still PUBLIC info (just load knobs + a timestamp).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ModelRecord {
+    /// The load params of the last successful load, or `None` if this model has only ever carried
+    /// flags (never been loaded on this instance).
+    #[serde(default)]
+    pub load: Option<LoadParams>,
+    /// Unix-ms timestamp of the last successful load (`0` = unknown / never loaded).
+    #[serde(default)]
+    pub last_loaded_ms: u64,
+}
+
 /// On-disk shape of `config.json`. `name` is always present; `hubs`/`default_hub` are node-side
-/// only (default-empty for a pure hub, whose file is just `{"name":"hub-…"}`). Every field is
-/// `#[serde(default)]`, so a name-only file written by an older build still loads.
+/// only (default-empty for a pure hub, whose file is just `{"name":"hub-…"}`); `models` records
+/// per-model load info on any instance. Every field is `#[serde(default)]`, so a name-only file
+/// written by an older build still loads.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InstanceConfig {
     /// The friendly instance name, e.g. `node-a1b2c3d4(studio-mac)`. Empty only on a config
@@ -61,6 +81,10 @@ pub struct InstanceConfig {
     /// The `hub_id` a bare `higgs --node` dials. Empty/none for a hub or an unpaired node.
     #[serde(default)]
     pub default_hub: Option<String>,
+    /// Per-model load records, keyed by HuggingFace repo id. `BTreeMap` for stable,
+    /// diff-friendly JSON ordering. Empty by default; populated on the first successful load.
+    #[serde(default)]
+    pub models: BTreeMap<String, ModelRecord>,
 }
 
 impl InstanceConfig {
@@ -104,6 +128,21 @@ impl InstanceConfig {
                 .map(|h| h.hub_id.clone());
         }
         removed
+    }
+
+    /// Record a successful load of model `id` with `params` at `now_ms`, replacing any prior
+    /// record's load info. Called after a load succeeds so the UI can show what the model was
+    /// loaded with and a future autoload can reload it the same way. `now_ms` is passed in (this
+    /// module stays clock-free) — the caller stamps it.
+    pub fn record_load(&mut self, id: &str, params: LoadParams, now_ms: u64) {
+        let rec = self.models.entry(id.to_string()).or_default();
+        rec.load = Some(params);
+        rec.last_loaded_ms = now_ms;
+    }
+
+    /// The persisted per-model record for `id`, if one exists.
+    pub fn model_record(&self, id: &str) -> Option<&ModelRecord> {
+        self.models.get(id)
     }
 }
 
@@ -296,6 +335,7 @@ mod tests {
             name: "node-x(box)".into(),
             hubs: vec![],
             default_hub: Some("ghost".into()),
+            ..Default::default()
         };
         assert!(cfg.default_saved_hub().is_none());
     }
@@ -318,6 +358,71 @@ mod tests {
         assert_eq!(back.name, "node-aa(box)");
         assert_eq!(back.hubs, cfg.hubs);
         assert_eq!(back.default_hub.as_deref(), Some("h1"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn record_load_stores_and_replaces_per_model() {
+        let mut cfg = InstanceConfig::default();
+        assert!(cfg.model_record("org/m").is_none());
+
+        let p1 = LoadParams {
+            ctx_len: 4096,
+            gpu_layers: 99,
+            ..Default::default()
+        };
+        cfg.record_load("org/m", p1.clone(), 1000);
+        let rec = cfg.model_record("org/m").expect("record present");
+        assert_eq!(rec.load.as_ref().unwrap().ctx_len, 4096);
+        assert_eq!(rec.last_loaded_ms, 1000);
+
+        // A second load of the SAME id replaces the load info (latest wins), no duplicate key.
+        let p2 = LoadParams {
+            ctx_len: 8192,
+            gpu_layers: 0,
+            ..Default::default()
+        };
+        cfg.record_load("org/m", p2, 2000);
+        assert_eq!(cfg.models.len(), 1, "keyed by id, no duplicate");
+        let rec = cfg.model_record("org/m").unwrap();
+        assert_eq!(rec.load.as_ref().unwrap().ctx_len, 8192);
+        assert_eq!(rec.last_loaded_ms, 2000);
+    }
+
+    #[test]
+    fn config_roundtrips_model_records() {
+        let dir = std::env::temp_dir().join("higgs-config-models-roundtrip-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let _ = std::fs::remove_file(&path);
+
+        let mut cfg = InstanceConfig {
+            name: "node-aa(box)".into(),
+            ..Default::default()
+        };
+        cfg.record_load(
+            "org/m",
+            LoadParams {
+                ctx_len: 2048,
+                gpu_layers: 12,
+                ..Default::default()
+            },
+            42,
+        );
+        cfg.save(&path).unwrap();
+
+        let back = InstanceConfig::load(&path).unwrap();
+        assert_eq!(back.models, cfg.models);
+        assert_eq!(back.model_record("org/m").unwrap().last_loaded_ms, 42);
+        assert_eq!(
+            back.model_record("org/m")
+                .unwrap()
+                .load
+                .as_ref()
+                .unwrap()
+                .ctx_len,
+            2048
+        );
         let _ = std::fs::remove_file(&path);
     }
 

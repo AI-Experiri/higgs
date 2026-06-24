@@ -44,7 +44,7 @@ higgs_ts! {
     /// reproduces the pre-expansion behavior exactly. Each optional maps to a
     /// real `llama-cpp-2` 0.1.139 builder call, applied only inside `llamacpp.rs`
     /// (the sole file allowed to name `llama_cpp_2`).
-    #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+    #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
     #[serde(default)]
     pub struct LoadParams {
         #[ts(type = "number")]

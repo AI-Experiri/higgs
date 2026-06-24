@@ -81,6 +81,27 @@ async fn load_rejects_traversal_id() {
     assert!(matches!(err, HiggsError::InvalidModelId { .. }));
 }
 
+/// A successful load PERSISTS a per-model record (P2): after `load`, the instance's
+/// `config.json` (a hermetic per-test temp path) carries a `ModelRecord` for that id with
+/// the effective load params. A no-params load records `ctx_len: 0` (= AUTO).
+#[tokio::test]
+async fn load_persists_model_record() {
+    let dir = tempfile::TempDir::new().unwrap();
+    crate::serve::test_support::write_gguf_fixture(dir.path(), "org/model");
+    let higgs = fake_higgs(vec![dir.path().to_path_buf()]);
+    assert!(
+        higgs.model_records().is_empty(),
+        "no records before any load"
+    );
+
+    higgs.load("org/model", None).await.expect("load");
+    let records = higgs.model_records();
+    let rec = records.get("org/model").expect("record persisted on load");
+    let load = rec.load.as_ref().expect("load params persisted");
+    assert_eq!(load.ctx_len, 0, "no-params load records ctx_len 0 = auto");
+    assert!(rec.last_loaded_ms > 0, "load stamps a timestamp");
+}
+
 /// The inference admission gate returns `ServerBusy` once all permits are
 /// taken; releasing a permit re-opens a slot.
 #[tokio::test]

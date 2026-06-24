@@ -363,7 +363,8 @@ Live scan of all configured model directories plus the currently loaded model id
       ],
       "state": "loaded",
       "format": "gguf",
-      "tool_calls": true
+      "tool_calls": true,
+      "last_load": { "ctx_len": 8192, "gpu_layers": 999, "threads": 0 }
     }
   ],
   "loaded_id": "org/model-name"
@@ -372,10 +373,12 @@ Live scan of all configured model directories plus the currently loaded model id
 
 Each entry is a `HiggsModelEntry`: all `HiggsModel` fields (`#[serde(flatten)]`d
 to the top level) **plus** the control-computed `state` (`"loaded"` /
-`"not-loaded"`), `format` (always `"gguf"`), and the support verdict below.
+`"not-loaded"`), `format` (always `"gguf"`), the support verdict below, and
+`last_load` (the params of the last successful load, persisted in `config.json`).
 `source` is one of `"LmStudio"`, `"HfCache"`, `"Ollama"`.
 `quant`, `arch`, `ctx_train` are omitted when unreadable from the GGUF header;
-`support_reason` is present only when higgs can't parse the model's tool calls.
+`support_reason` is present only when higgs can't parse the model's tool calls;
+`last_load` is omitted until the model has been loaded at least once on this instance.
 
 #### Model support detection fields
 
@@ -390,6 +393,7 @@ pre-flight verdict.
 |-------|------|---------|
 | `tool_calls` | boolean | Whether higgs has a tool-call parser matching the model's chat template (host-side chat-template sniff, zero FFI, no worker). |
 | `support_reason` | string (optional) | When `!tool_calls`: the fixed string `"no tool-call parser matches this model's template"`. **Omitted** when `tool_calls` is true. It never carries an engine load error. |
+| `last_load` | `LoadParams` (optional) | The params the model was last successfully loaded with on this instance, persisted in `config.json`. **Omitted** until the model has been loaded at least once. A `ctx_len` of `0` means **auto** (the engine picks the model's trained context, capped) — render it as "auto", not "0". |
 | `gguf_components` | `GgufComponent[]` | Curated load-relevant GGUF header fields (this field lives on the flattened `HiggsModel` — its single home). Each `GgufComponent = { key: string, value: string }`. |
 
 The curated `gguf_components` keys are: `gguf.version`, `general.architecture`,
