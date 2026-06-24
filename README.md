@@ -239,6 +239,10 @@ higgs --node           # connect to the default saved hub
 higgs --node --list    # list saved hubs (★ = default)
 higgs --node --hub <label|id>   # connect to a specific saved hub (and make it default)
 
+# Self-retire: ask the hub to remove this node, then forget the hub locally.
+higgs node leave                 # leave the default saved hub
+higgs node leave --hub <label|id>  # leave a specific saved hub
+
 # Pull a model onto a node from HuggingFace (lands in the node's ~/.higgs/models/):
 #   issued by the hub over M_NODE_PULL; progress streams as N_PROGRESS.
 ```

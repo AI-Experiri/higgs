@@ -13,8 +13,8 @@ fits together and `../../DESIGN-remote.md` for the full spec.
 | `runtime.rs` | `NodeRuntime` — the multi-worker orchestrator: `HashMap<WorkerId, Arc<Supervisor>>`, lifecycle (`load`/`unload`/`kill`/`status`/`sysinfo`/`scan`), cancellation-safe via `StopOnDrop`, graceful `shutdown_all`. |
 | `control.rs` | `dispatch_node_control` — routes `higgs/node/*` control RPCs to `NodeRuntime`. |
 | `data.rs` | `relay_chat` — bridges a hub chat stream to `Supervisor::chat()`, streaming `N_CHAT_CHUNK` + final back. |
-| `mod.rs` | Endpoint bind/dial (`connect_node`), the post-HELLO gate (`gate_connection`), the persistent node serve loop (`serve_node` + per-stream dispatch). |
-| `cli.rs` | `higgs link pair/status`, `higgs node connect`, `higgs --node` (persistent daemon). |
+| `mod.rs` | Endpoint bind/dial (`connect_node`), the post-HELLO gate (`gate_connection`), the persistent node serve loop (`serve_node` + per-stream dispatch), node self-`leave` (`send_leave`). |
+| `cli.rs` | `higgs link pair/status`, `higgs node connect/leave`, `higgs --node` (persistent daemon: bare/`--list`/`--hub`). |
 | `test_support.rs` | `#[cfg(test)]` fakes shared by the unit tests (fake worker, fake runtime). |
 
 ## Two roles, one binary

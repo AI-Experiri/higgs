@@ -32,7 +32,7 @@ use crate::auth::{Allowlist, PairingTokens, TokenError};
 use crate::diagnostic::HiggsError;
 use crate::remote::{
     hub_capabilities, negotiate_version, node_capabilities, HelloParams, HelloResult, ALPN,
-    MIN_SUPPORTED, M_HELLO, PROTOCOL_VERSIONS,
+    MIN_SUPPORTED, M_HELLO, M_NODE_LEAVE, PROTOCOL_VERSIONS,
 };
 use crate::rpc::{self, RpcError, RpcFrame, RpcRequest, RpcResponse};
 
@@ -413,6 +413,50 @@ pub async fn connect_node(
         }
     };
     Ok((conn, result))
+}
+
+/// Node side: ask the hub (on an established post-HELLO connection) to retire THIS node. Opens a
+/// bi stream, sends `M_NODE_LEAVE`, and awaits the hub's ack. The hub authenticates by the
+/// connection's TLS id, so no node id is sent. `Ok(())` once the hub confirms the retire; an
+/// error reply, a closed stream, or a timeout is an `Err`. The caller then forgets the saved hub.
+pub async fn send_leave(conn: &Connection) -> std::io::Result<()> {
+    use std::io::Error;
+    let (mut send, recv) = conn.open_bi().await.map_err(Error::other)?;
+    let req = RpcRequest {
+        jsonrpc: "2.0".into(),
+        id: 1,
+        method: M_NODE_LEAVE.into(),
+        params: serde_json::json!({}),
+    };
+    write_frame(&mut send, &RpcFrame::Request(req)).await?;
+    let _ = send.finish();
+
+    let mut lines = BufReader::new(recv).lines();
+    let line = match tokio::time::timeout(HELLO_DEADLINE, lines.next_line()).await {
+        Ok(Ok(Some(line))) => line,
+        Ok(Ok(None)) => {
+            return Err(Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "hub closed the stream before acking leave",
+            ))
+        }
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            return Err(Error::new(
+                std::io::ErrorKind::TimedOut,
+                "hub did not ack leave within the deadline",
+            ))
+        }
+    };
+    match rpc::decode(&line).map_err(Error::other)? {
+        RpcFrame::Response(resp) => match resp.error {
+            Some(err) => Err(Error::other(format!("hub rejected leave: {}", err.message))),
+            None => Ok(()),
+        },
+        other => Err(Error::other(format!(
+            "unexpected reply to leave: {other:?}"
+        ))),
+    }
 }
 
 /// Node side (persistent): serve the hub's control RPCs. After HELLO the hub opens a bi

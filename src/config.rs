@@ -88,6 +88,23 @@ impl InstanceConfig {
             .find(|h| h.label == needle)
             .or_else(|| self.hubs.iter().find(|h| h.hub_id.starts_with(needle)))
     }
+
+    /// Drop a saved hub by `hub_id` (after `higgs node leave` retires it hub-side). If it was
+    /// the default, promote the most-recently-used remaining hub to default (else clear it), so
+    /// a bare `higgs --node` still has a sensible target. Returns whether a hub was removed.
+    pub fn remove_hub(&mut self, hub_id: &str) -> bool {
+        let before = self.hubs.len();
+        self.hubs.retain(|h| h.hub_id != hub_id);
+        let removed = self.hubs.len() != before;
+        if self.default_hub.as_deref() == Some(hub_id) {
+            self.default_hub = self
+                .hubs
+                .iter()
+                .max_by_key(|h| h.last_used_ms)
+                .map(|h| h.hub_id.clone());
+        }
+        removed
+    }
 }
 
 impl InstanceConfig {
@@ -247,6 +264,28 @@ mod tests {
         );
         // No match.
         assert!(cfg.find_hub("nope").is_none());
+    }
+
+    #[test]
+    fn remove_hub_drops_and_repoints_default() {
+        let mut cfg = InstanceConfig::default();
+        cfg.remember_hub(hub("aaa", "tkt-a", "hub-a", 1));
+        cfg.remember_hub(hub("bbb", "tkt-b", "hub-b", 9)); // default = bbb (last remembered)
+        assert_eq!(cfg.default_hub.as_deref(), Some("bbb"));
+
+        // Removing the default promotes the most-recently-used remaining hub (aaa).
+        assert!(cfg.remove_hub("bbb"));
+        assert_eq!(cfg.hubs.len(), 1);
+        assert_eq!(cfg.default_hub.as_deref(), Some("aaa"), "default repointed");
+
+        // Removing the last hub clears the default; removing an unknown id is a no-op.
+        assert!(!cfg.remove_hub("ghost"));
+        assert!(cfg.remove_hub("aaa"));
+        assert!(cfg.hubs.is_empty());
+        assert!(
+            cfg.default_hub.is_none(),
+            "default cleared with no hubs left"
+        );
     }
 
     #[test]

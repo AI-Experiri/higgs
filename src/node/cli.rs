@@ -114,9 +114,11 @@ fn run_link_pair() -> Result<()> {
             match outcome {
                 GateOutcome::Admitted { agreed_version } => {
                     println!("paired {peer} (protocol v{agreed_version})");
-                    // Hold the connection until the node has read the HELLO result
-                    // (it closes after reading); dropping it now can truncate the reply.
-                    let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
+                    // Hold the connection until the node has read the HELLO result (it closes
+                    // after reading) — and, if the node immediately asks to LEAVE (self-retire),
+                    // handle it here too, so `higgs node leave` works against this CLI loop as
+                    // well as the production hub server.
+                    link_pair_post_admit(&conn, &mut allow, &peer).await;
                 }
                 GateOutcome::Rejected { code } => {
                     println!("rejected {peer} [{code}]");
@@ -125,6 +127,67 @@ fn run_link_pair() -> Result<()> {
         }
         Ok(())
     })
+}
+
+/// After `link pair` admits a node, hold the connection (bounded) so the node reads its HELLO
+/// reply — and if the node immediately opens a `M_NODE_LEAVE` stream (self-retire), do the
+/// DURABLE allowlist removal + ack so `higgs node leave` works against this CLI loop too. The
+/// loop owns no fleet, so the removal IS the retire — the hub server seeds nodes from this same
+/// `pairings.json`, so a removed node stays gone. A normal daemon opens no such stream (it opens
+/// a uni log stream), so this just waits out the bounded window exactly as before.
+async fn link_pair_post_admit(
+    conn: &iroh::endpoint::Connection,
+    allow: &mut Allowlist,
+    peer: &str,
+) {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    use crate::node::write_frame;
+    use crate::rpc::{self, RpcError, RpcFrame, RpcResponse};
+
+    let accepted = tokio::select! {
+        _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()) => return,
+        a = conn.accept_bi() => a,
+    };
+    let Ok((mut send, recv)) = accepted else {
+        return;
+    };
+    let Ok(Some(line)) = BufReader::new(recv).lines().next_line().await else {
+        return;
+    };
+    let req = match rpc::decode(&line) {
+        Ok(RpcFrame::Request(r)) => r,
+        _ => return,
+    };
+    if req.method != crate::remote::M_NODE_LEAVE {
+        return;
+    }
+    let resp = match allow.remove(peer) {
+        Ok(()) => {
+            println!("node {peer} left (self-retired)");
+            RpcResponse {
+                jsonrpc: "2.0".into(),
+                id: req.id,
+                result: Some(serde_json::json!({ "status": "left" })),
+                error: None,
+            }
+        }
+        Err(e) => RpcResponse {
+            jsonrpc: "2.0".into(),
+            id: req.id,
+            result: None,
+            error: Some(RpcError {
+                code: -32000,
+                message: format!("leave failed: {e}"),
+                data: None,
+            }),
+        },
+    };
+    let _ = write_frame(&mut send, &RpcFrame::Response(resp)).await;
+    let _ = send.finish();
+    // Wait for the node to read the ack + close before returning — the caller drops `conn` on the
+    // next loop iteration, which would otherwise truncate the reply mid-flight.
+    let _ = tokio::time::timeout(Duration::from_secs(2), conn.closed()).await;
 }
 
 /// Print this hub's identity and the count of paired nodes.
@@ -136,15 +199,70 @@ fn run_link_status() -> Result<()> {
     Ok(())
 }
 
-/// `higgs node connect <ticket> [token]` — dial a hub and complete HELLO.
+/// `higgs node <connect|leave>` — one-shot node-side ops against a hub.
 pub fn run_node(args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("connect") => run_node_connect(&args[1..]),
+        Some("leave") => run_node_leave(&args[1..]),
         other => {
-            eprintln!("usage: higgs node connect <ticket> [token] (got {other:?})");
+            eprintln!("usage: higgs node <connect <ticket> [token] | leave [--hub <label|id>]> (got {other:?})");
             Err(Error::other("unknown node subcommand"))
         }
     }
+}
+
+/// `higgs node leave [--hub <label|id>]` — self-retire: dial the saved hub (default, or the one
+/// selected by `--hub`), ask it to retire this node, and on success forget that hub locally so a
+/// bare `higgs --node` no longer dials it. Nodes persist by default; this is the explicit opt-out
+/// (the node-side counterpart of the operator's hub-side Retire).
+fn run_node_leave(args: &[String]) -> Result<()> {
+    let cfg_path = config_path()?;
+    let cfg = InstanceConfig::load(&cfg_path)?;
+    let hub = match args.first().map(String::as_str) {
+        Some("--hub") => {
+            let sel = args
+                .get(1)
+                .ok_or_else(|| Error::other("usage: higgs node leave --hub <label|id>"))?;
+            cfg.find_hub(sel).ok_or_else(|| {
+                Error::other(format!(
+                    "no saved hub matching {sel:?} — see `higgs --node --list`"
+                ))
+            })?
+        }
+        Some(other) => {
+            return Err(Error::other(format!(
+                "unknown flag {other:?} — usage: higgs node leave [--hub <label|id>]"
+            )))
+        }
+        None => cfg
+            .default_saved_hub()
+            .ok_or_else(|| Error::other("no saved hub to leave — nothing to do"))?,
+    };
+    let hub_id = hub.hub_id.clone();
+    let ticket_str = hub.ticket.clone();
+    let ticket: EndpointTicket = ticket_str.parse().map_err(Error::other)?;
+    let target = ticket.endpoint_addr().clone();
+
+    let rt = runtime()?;
+    rt.block_on(async {
+        let sk = load_or_create_secret(&key_path()?)?;
+        let endpoint = bind_endpoint(sk).await.map_err(Error::other)?;
+        let self_id = endpoint.id().to_string();
+        let name = name_or_init(Role::Node, &self_id, &crate::system::hostname())?;
+        let (conn, hello) =
+            crate::node::connect_node(&endpoint, target, self_id, name, None).await?;
+        println!("connected to hub {} ({})", hello.hub_name, hello.node_id);
+        crate::node::send_leave(&conn).await?;
+        println!("left hub {} — retired from its fleet", hello.hub_name);
+        Ok::<(), Error>(())
+    })?;
+
+    // Retired hub-side; forget it locally (re-load so a concurrent name write isn't clobbered).
+    let mut cfg = InstanceConfig::load(&cfg_path)?;
+    cfg.remove_hub(&hub_id);
+    cfg.save(&cfg_path)?;
+    println!("removed {hub_id} from saved hubs");
+    Ok(())
 }
 
 fn run_node_connect(args: &[String]) -> Result<()> {

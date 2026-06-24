@@ -71,17 +71,15 @@ impl Hub {
         self.allow.lock().await.labels()
     }
 
-    /// Retire a node for good: remove its `EndpointId` from the persistent allowlist FIRST
-    /// (so a reconnect can't silently re-admit without a fresh pairing token), then drop it
-    /// from the fleet (transport, routes, cached inventory, relayed logs). Idempotent —
-    /// retiring an unknown id no-ops on both. The allowlist write is persisted, so the
-    /// retirement survives a hub restart.
+    /// Retire a node for good (operator action): remove its `EndpointId` from the persistent
+    /// allowlist FIRST (so a reconnect can't silently re-admit without a fresh pairing token),
+    /// then drop it from the fleet (transport, routes, cached inventory, relayed logs).
+    /// Idempotent; the allowlist write is persisted, so it survives a hub restart.
     pub async fn retire(&self, node: &str) -> std::io::Result<()> {
-        // Hold the allowlist lock across BOTH removals so retire is mutually exclusive with
-        // the accept loop's admit+register critical section (which takes this same lock).
-        // Otherwise a concurrent admit could re-add the node between the allowlist removal and
-        // `fleet.retire`. `fleet.retire` awaits the fleet actor mailbox (NOT this allow lock),
-        // so there is no await-under-lock deadlock.
+        // Hold the allowlist lock across BOTH removals so retire is mutually exclusive with the
+        // accept loop's admit+register critical section (which takes this same lock); otherwise a
+        // concurrent admit could re-add the node between the allowlist removal and `fleet.retire`.
+        // `fleet.retire` awaits the fleet actor mailbox (NOT this allow lock), so no deadlock.
         let mut allow = self.allow.lock().await;
         allow.remove(node)?;
         self.fleet.retire(node).await;
@@ -206,13 +204,13 @@ pub fn spawn_accept_loop(
                 // re-introduce a just-retired node into the fleet view. `add_node` awaits the
                 // fleet actor mailbox (which never takes this allow lock), so holding the lock
                 // across it preserves that mutual exclusion and can't deadlock.
-                let mut allow = allow.lock().await;
-                let mut tokens = tokens.lock().await;
+                let mut allow_g = allow.lock().await;
+                let mut tokens_g = tokens.lock().await;
                 let outcome = gate_admit(
                     &conn,
                     handshake,
-                    &mut allow,
-                    &mut tokens,
+                    &mut allow_g,
+                    &mut tokens_g,
                     now_ms(),
                     &identity,
                     Some("paired-node".into()),
@@ -221,21 +219,121 @@ pub fn spawn_accept_loop(
                 match outcome {
                     GateOutcome::Admitted { .. } => {
                         tracing::info!(node = %peer, "higgs hub: node admitted");
+                        // add_node runs UNDER the allowlist lock (held here) so it's mutually
+                        // exclusive with a concurrent retire — the register can't race a removal.
                         // Gated on THIS loop's admission generation: if the kill switch disabled
                         // (bumped the gen) since this loop started, the admit is refused.
+                        let conn_for_requests = conn.clone();
                         fleet
-                            .add_node(peer, Arc::new(NodeTransport::new(conn)), Some(admit_gen))
+                            .add_node(
+                                peer.clone(),
+                                Arc::new(NodeTransport::new(conn)),
+                                Some(admit_gen),
+                            )
                             .await;
+                        // Accept node→hub requests (self-`leave`) on this connection. Holds the
+                        // Arc, not the guard, and only locks it later (on leave) — so spawning it
+                        // here, under the guard, can't deadlock.
+                        tokio::spawn(serve_node_requests(
+                            conn_for_requests,
+                            peer,
+                            allow.clone(),
+                            fleet.clone(),
+                        ));
                     }
                     GateOutcome::Rejected { code } => {
                         tracing::warn!(node = %peer, code, "higgs hub: node rejected");
                     }
                 }
-                drop(allow);
-                drop(tokens);
+                drop(allow_g);
+                drop(tokens_g);
             });
         }
     });
+}
+
+/// Hub side: accept NODE-opened bi streams on an admitted connection and handle node→hub
+/// requests — currently only `M_NODE_LEAVE` (the node retiring itself). The node is identified by
+/// `peer` (the connection's TLS `remote_id`, captured at admit), and any request payload is
+/// IGNORED, so a node can only ever remove ITSELF. Runs until the connection closes (a daemon
+/// node never opens such a stream, so this just idles for it). Separate stream set from the
+/// hub→node control RPCs (which the hub OPENS) — QUIC multiplexes both directions.
+async fn serve_node_requests(
+    conn: iroh::endpoint::Connection,
+    peer: String,
+    allow: Arc<Mutex<Allowlist>>,
+    fleet: Arc<HubFleet>,
+) {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    use crate::node::write_frame;
+    use crate::rpc::{self, RpcError, RpcFrame, RpcResponse};
+
+    while let Ok((mut send, recv)) = conn.accept_bi().await {
+        let mut lines = BufReader::new(recv).lines();
+        let Ok(Some(line)) = lines.next_line().await else {
+            continue;
+        };
+        let req = match rpc::decode(&line) {
+            Ok(RpcFrame::Request(r)) => r,
+            _ => continue,
+        };
+        if req.method != crate::remote::M_NODE_LEAVE {
+            let resp = RpcResponse {
+                jsonrpc: "2.0".into(),
+                id: req.id,
+                result: None,
+                error: Some(RpcError {
+                    code: -32601,
+                    message: format!("unknown node request {}", req.method),
+                    data: None,
+                }),
+            };
+            let _ = write_frame(&mut send, &RpcFrame::Response(resp)).await;
+            let _ = send.finish();
+            continue;
+        }
+        // LEAVE. Tie success to the DURABLE allowlist removal: do it FIRST and reply `left` only
+        // if it persisted — a failed persist replies an error so `higgs node leave` keeps the
+        // node's saved hub (no false "left"). The in-memory `fleet.retire` (full removal:
+        // node-id, routes, inventory) follows, and CLOSES this very connection, so it must run
+        // AFTER the ack is delivered — hence the reply-then-wait-then-fleet-drop ordering.
+        //
+        // Splitting the allowlist removal from the fleet drop (vs `Hub::retire`'s atomic lock) is
+        // safe here: the allowlist removal gates re-admission, so a concurrent dial can't re-pair
+        // the leaving node token-free in the gap. And it is crash-safe — the durable removal is
+        // persisted before the ack, so a hub crash before `fleet.retire` still leaves the node
+        // gone (it is no longer seeded from the allowlist on restart).
+        let durable = { allow.lock().await.remove(&peer) };
+        let resp = match &durable {
+            Ok(()) => RpcResponse {
+                jsonrpc: "2.0".into(),
+                id: req.id,
+                result: Some(serde_json::json!({ "status": "left" })),
+                error: None,
+            },
+            Err(e) => RpcResponse {
+                jsonrpc: "2.0".into(),
+                id: req.id,
+                result: None,
+                error: Some(RpcError {
+                    code: -32000,
+                    message: format!("leave failed: {e}"),
+                    data: None,
+                }),
+            },
+        };
+        let _ = write_frame(&mut send, &RpcFrame::Response(resp)).await;
+        let _ = send.finish();
+        if durable.is_ok() {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), conn.closed()).await;
+            fleet.retire(&peer).await;
+            tracing::info!(node = %peer, "higgs hub: node left (self-retired)");
+        } else {
+            tracing::error!(node = %peer, "higgs hub: node-leave allowlist removal failed");
+        }
+        return; // node is gone (or the error was reported); nothing more to serve here
+    }
 }
 
 #[cfg(test)]

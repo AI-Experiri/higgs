@@ -15,7 +15,10 @@ use tokio::sync::Mutex;
 
 use higgs::auth::{Allowlist, PairingTokens};
 use higgs::config::InstanceConfig;
-use higgs::node::{dial_and_hello, gate_connection, GateOutcome, HubIdentity, HELLO_DEADLINE};
+use higgs::node::{
+    connect_node, dial_and_hello, gate_connection, send_leave, GateOutcome, HubIdentity,
+    HELLO_DEADLINE,
+};
 use higgs::remote::ALPN;
 
 fn now_ms() -> u64 {
@@ -429,6 +432,85 @@ async fn link_pair_accepts_an_in_process_node_dial() {
 
     // SIGTERM (not SIGKILL): the pair listener exits its accept loop cleanly, which also
     // flushes its coverage profile under llvm-cov instrumentation.
+    unsafe {
+        libc::kill(child.id().expect("child pid") as libc::pid_t, libc::SIGTERM);
+    }
+    let _ = child.wait().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn link_pair_handles_node_leave() {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let home = tempfile::tempdir().unwrap();
+    // Spawn the real `higgs link pair` accept loop; read its ticket + token from stdout.
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_higgs"))
+        .args(["link", "pair"])
+        .env("HIGGS_HOME", home.path())
+        .env("HIGGS_IROH_LOCAL", "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn higgs link pair");
+
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let (mut ticket, mut token) = (None, None);
+    let read = tokio::time::timeout(Duration::from_secs(30), async {
+        while let Ok(Some(line)) = lines.next_line().await {
+            if let Some(rest) = line.strip_prefix("pairing token: ") {
+                token = rest.split_whitespace().next().map(str::to_string);
+            } else if let Some(rest) = line.strip_prefix("ticket       : ") {
+                ticket = Some(rest.trim().to_string());
+            }
+            if ticket.is_some() && token.is_some() {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(
+        read.is_ok(),
+        "link pair printed its ticket+token within 30s"
+    );
+    let ticket: EndpointTicket = ticket.expect("ticket line").parse().expect("valid ticket");
+    let token = token.expect("token line");
+
+    // In-process node: pair (HELLO), then ask to LEAVE on the same connection.
+    let node = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .alpns(vec![ALPN.to_vec()])
+        .relay_mode(iroh::RelayMode::Disabled)
+        .bind()
+        .await
+        .expect("bind node");
+    let self_id = node.id().to_string();
+    let (conn, _hello) = connect_node(
+        &node,
+        ticket.endpoint_addr().clone(),
+        self_id.clone(),
+        String::new(),
+        Some(token),
+    )
+    .await
+    .expect("node pairs with the link-pair hub");
+    // The node was added to the allowlist on admit.
+    let pairings = home.path().join("pairings.json");
+    assert!(
+        Allowlist::load(&pairings).unwrap().contains(&self_id),
+        "node is allowlisted after pairing"
+    );
+
+    // Now LEAVE — the link-pair loop handles it and removes the node from the allowlist.
+    send_leave(&conn).await.expect("hub acks the leave");
+    let mut gone = false;
+    for _ in 0..50 {
+        if !Allowlist::load(&pairings).unwrap().contains(&self_id) {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(gone, "node removed from the allowlist after `node leave`");
+
     unsafe {
         libc::kill(child.id().expect("child pid") as libc::pid_t, libc::SIGTERM);
     }

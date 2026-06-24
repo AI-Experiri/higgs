@@ -51,6 +51,12 @@ pub const M_NODE_PULL: &str = "higgs/node/pull";
 /// `{ request_id, downloaded, total? }` (`total` omitted when the server sends no length).
 pub const N_PROGRESS: &str = "higgs/node/progress";
 
+/// `higgs/node/leave` — the one NODE→hub control op: the node asks the hub to retire IT
+/// (`higgs node leave`). The hub authenticates by the connection's TLS `remote_id` and IGNORES
+/// any payload, so a node can only ever remove ITSELF. The hub removes it from the allowlist +
+/// fleet and replies `{ "status": "left" }`. Takes `{}`.
+pub const M_NODE_LEAVE: &str = "higgs/node/leave";
+
 /// The wire-protocol majors this build speaks.
 pub const PROTOCOL_VERSIONS: &[u32] = &[1];
 /// The lowest major this build still accepts.

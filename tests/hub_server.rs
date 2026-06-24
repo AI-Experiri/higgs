@@ -272,6 +272,136 @@ async fn hub_server_pairs_a_node_and_lists_it() {
     );
 }
 
+/// Node self-retire: a paired node runs `higgs node leave`, which dials the saved hub and asks it
+/// to retire ITSELF. The node then disappears from `/api/higgs/nodes` and forgets the hub locally.
+/// No GGUF needed (pairing + leave path only).
+#[tokio::test]
+async fn hub_server_node_self_leave() {
+    let hub_home = tempfile::tempdir().unwrap();
+    let node_home = tempfile::tempdir().unwrap();
+    let port = free_port();
+
+    let _hub = Proc(
+        Command::new(env!("CARGO_BIN_EXE_higgs"))
+            .env("HIGGS_BIND", "127.0.0.1")
+            .env("HIGGS_PORT", port.to_string())
+            .env("HIGGS_HOME", hub_home.path())
+            .env("HIGGS_HUB", "1")
+            .env("HIGGS_IROH_LOCAL", "1")
+            .env("RUST_LOG", "warn")
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn hub"),
+    );
+    let base = format!("http://127.0.0.1:{port}");
+    let c = reqwest::Client::new();
+
+    let mut ready = false;
+    for _ in 0..150 {
+        if let Ok(r) = c.get(format!("{base}/health")).send().await {
+            if r.status().is_success() {
+                ready = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(ready, "hub server ready");
+
+    // Pair a node daemon with a freshly-minted token.
+    let pair: serde_json::Value = c
+        .post(format!("{base}/api/higgs/pair"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ticket = pair["ticket"].as_str().expect("ticket").to_string();
+    let token = pair["token"].as_str().expect("token").to_string();
+    let node = Proc(
+        Command::new(env!("CARGO_BIN_EXE_higgs"))
+            .arg("--node")
+            .arg(&ticket)
+            .arg(&token)
+            .env("HIGGS_HOME", node_home.path())
+            .env("HIGGS_IROH_LOCAL", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn node"),
+    );
+
+    // Wait for the REMOTE node to connect, and capture its EndpointId.
+    let mut node_id = String::new();
+    for _ in 0..150 {
+        let nodes: serde_json::Value = c
+            .get(format!("{base}/api/higgs/nodes"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if let Some(n) = nodes.as_array().and_then(|a| {
+            a.iter()
+                .find(|n| n["connected"] == true && n["is_local"] != true)
+        }) {
+            node_id = n["endpoint_id"].as_str().unwrap().to_string();
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(!node_id.is_empty(), "node paired before leave");
+
+    // Stop the daemon so it can't reconnect after it leaves, then run `higgs node leave` (which
+    // makes its OWN connection, same HIGGS_HOME → same EndpointId, and asks the hub to retire it).
+    drop(node);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let leave = tokio::process::Command::new(env!("CARGO_BIN_EXE_higgs"))
+        .args(["node", "leave"])
+        .env("HIGGS_HOME", node_home.path())
+        .env("HIGGS_IROH_LOCAL", "1")
+        .output()
+        .await
+        .expect("run node leave");
+    assert!(
+        leave.status.success(),
+        "node leave exits 0: {}",
+        String::from_utf8_lossy(&leave.stderr)
+    );
+
+    // The node retired ITSELF — gone from /api/higgs/nodes entirely (not lingering disconnected).
+    let mut gone = false;
+    for _ in 0..50 {
+        let nodes: serde_json::Value = c
+            .get(format!("{base}/api/higgs/nodes"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if nodes
+            .as_array()
+            .is_some_and(|a| !a.iter().any(|n| n["endpoint_id"] == node_id))
+        {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(gone, "node removed itself from the fleet via `node leave`");
+
+    // And it forgot the hub locally, so a bare `higgs --node` no longer dials it.
+    let cfg = higgs::config::InstanceConfig::load(&node_home.path().join("config.json")).unwrap();
+    assert!(
+        cfg.default_saved_hub().is_none(),
+        "node forgot its saved hub after leaving"
+    );
+}
+
 /// The hub kill switch: `POST /api/higgs/hub/disable` stops ALL node network activity (closes
 /// the endpoint → no inbound dials, no relay; closes node transports → nodes disconnected) while
 /// KEEPING the fleet's node list/routes; `POST /api/higgs/hub/enable` turns it back on. Asserts
