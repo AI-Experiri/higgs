@@ -2,7 +2,21 @@
 import type { NodeInventory } from "./NodeInventory";
 
 /**
- * The hub's UI/API view of one paired node: its stable id, endpoint, whether it's currently
- * connected, and its last-fetched inventory (host + resident workers + hardware/runtime).
+ * The hub's UI/API view of one node: its stable id, endpoint, whether it's currently
+ * connected, its operator label, whether it is the LOCAL machine, and its last-fetched
+ * inventory (host + resident workers + hardware/runtime). The Fleet UI renders local and
+ * remote nodes with this one shape.
  */
-export type NodeView = { node_id: number, endpoint_id: string, connected: boolean, inventory?: NodeInventory, };
+export type NodeView = { node_id: number, endpoint_id: string, connected: boolean, 
+/**
+ * The local machine the server runs on (`true`) vs a paired remote node (`false`). The UI
+ * hides Retire/Leave for the local node — there is nothing to un-pair.
+ */
+is_local: boolean, 
+/**
+ * Human label for the node. For a remote node this is the hub's allowlist label (the
+ * node's friendly name, operator-renamable) — the fleet leaves it empty and the serve layer
+ * fills it from the allowlist (the editable source of truth). For the local node it is the
+ * instance's `config.json` name.
+ */
+label: string, inventory?: NodeInventory, };

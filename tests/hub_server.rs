@@ -105,10 +105,11 @@ async fn hub_server_pairs_a_node_and_lists_it() {
             .json()
             .await
             .unwrap();
-        if nodes
-            .as_array()
-            .is_some_and(|a| a.iter().any(|n| n["connected"] == true))
-        {
+        // The local node is always present + connected; wait for the REMOTE node specifically.
+        if nodes.as_array().is_some_and(|a| {
+            a.iter()
+                .any(|n| n["connected"] == true && n["is_local"] != true)
+        }) {
             connected = true;
             break;
         }
@@ -128,9 +129,11 @@ async fn hub_server_pairs_a_node_and_lists_it() {
         .json()
         .await
         .unwrap();
-    let node_id = nodes[0]["endpoint_id"]
-        .as_str()
-        .expect("endpoint_id")
+    let node_id = nodes
+        .as_array()
+        .and_then(|a| a.iter().find(|n| n["is_local"] != true))
+        .and_then(|n| n["endpoint_id"].as_str())
+        .expect("a remote node in /api/higgs/nodes")
         .to_string();
 
     // ── GET /api/higgs/hub — hub-mode status reflects the live hub + the admitted node. ──
@@ -355,10 +358,10 @@ async fn hub_kill_switch_disables_then_reenables_the_network() {
             .json()
             .await
             .unwrap();
-        if let Some(n) = nodes
-            .as_array()
-            .and_then(|a| a.iter().find(|n| n["connected"] == true))
-        {
+        if let Some(n) = nodes.as_array().and_then(|a| {
+            a.iter()
+                .find(|n| n["connected"] == true && n["is_local"] != true)
+        }) {
             node_id = n["endpoint_id"].as_str().unwrap().to_string();
             break;
         }
@@ -463,8 +466,11 @@ async fn hub_kill_switch_disables_then_reenables_the_network() {
             .await
             .unwrap();
         if nodes.as_array().is_some_and(|a| {
-            a.iter()
-                .any(|n| n["connected"] == true && n["endpoint_id"] != node_id.as_str())
+            a.iter().any(|n| {
+                n["connected"] == true
+                    && n["is_local"] != true
+                    && n["endpoint_id"] != node_id.as_str()
+            })
         }) {
             node2_connected = true;
             break;

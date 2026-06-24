@@ -18,7 +18,7 @@ use crate::diagnostic::HiggsError;
 use crate::log_bus::{LogBus, LogLine, LogSource};
 use crate::node::runtime::{NodeConfig, NodeRuntime, DEFAULT_IDLE_TTL};
 use crate::node::worker_id::WorkerId;
-use crate::remote::NodeLoadParams;
+use crate::remote::{InventoryWorker, NodeInventory, NodeLoadParams};
 use crate::supervisor::HiggsEvent;
 use crate::worker::engine::LoadParams;
 use crate::worker::models::HiggsModel;
@@ -828,6 +828,58 @@ impl Higgs {
         let mut ids: Vec<String> = self.local_served().await.into_keys().collect();
         ids.sort();
         ids
+    }
+
+    /// The LOCAL machine as a first-class [`NodeView`] (`endpoint_id = "local"`, `is_local`,
+    /// always connected), so the serve layer can list it alongside the remote fleet in one
+    /// shape. Each resident worker is tagged with its `/v1` served id, exactly as the fleet tags
+    /// remote workers. `label` is the instance's `config.json` name, passed in by the caller.
+    ///
+    /// Hardware is sampled fresh (CPU/RAM, ~one update interval) but GPUs are deliberately NOT
+    /// enumerated here — that would spawn a transient worker on every poll of this endpoint. The
+    /// local machine's full hardware (incl. GPUs) is already served by `GET /api/higgs/system`.
+    pub async fn local_node_view(&self, label: String) -> crate::node::fleet::NodeView {
+        // ONE instance snapshot drives BOTH the served-id map and the worker list, so a
+        // concurrent local load/unload can't make `/api/higgs/nodes` disagree with `/v1/models`
+        // (a worker shown with a stale/empty served id). Same `served_ids` algorithm as
+        // `local_served`/`local_served_ids`, applied to this single snapshot — no worker spawn.
+        let instances = self.local.instances().await;
+        let located: Vec<((), WorkerId, String)> =
+            instances.iter().map(|(w, m)| ((), *w, m.clone())).collect();
+        let by_worker: std::collections::HashMap<u32, String> =
+            crate::node::served::served_ids(&located)
+                .into_iter()
+                .map(|(served, ((), worker))| (worker.0, served))
+                .collect();
+        let workers: Vec<InventoryWorker> = instances
+            .into_iter()
+            .map(|(worker, model)| InventoryWorker {
+                worker_id: worker.0,
+                model,
+                served_id: by_worker.get(&worker.0).cloned().unwrap_or_default(),
+            })
+            .collect();
+        // CPU/RAM/engine snapshot with NO GPU enumeration (empty `gpus` → no transient worker).
+        let (hardware, runtime) = tokio::task::spawn_blocking(|| {
+            crate::system::SystemInfo::gather_hardware_runtime(vec![])
+        })
+        .await
+        .expect("hardware sample task");
+        let inventory = NodeInventory {
+            hostname: crate::system::hostname(),
+            os: std::env::consts::OS.to_string(),
+            workers,
+            hardware,
+            runtime,
+        };
+        crate::node::fleet::NodeView {
+            node_id: 0, // remote NodeIds start at 1; 0 is the local sentinel
+            endpoint_id: "local".to_string(),
+            connected: true,
+            is_local: true,
+            label,
+            inventory: Some(inventory),
+        }
     }
 
     /// [`LoadedInfo`] for a LOCAL served id — resolves served → worker, reads that

@@ -47,6 +47,17 @@ impl Allowlist {
         self.file.nodes.get(id).cloned().flatten()
     }
 
+    /// Every paired id → its label, for the fleet view. Read from the live allowlist by the hub,
+    /// or loaded straight from `pairings.json` by the serve layer when the hub is disabled (so
+    /// labels survive the kill switch dropping the `Hub` while the fleet persists).
+    pub fn labels(&self) -> HashMap<String, Option<String>> {
+        self.file
+            .nodes
+            .iter()
+            .map(|(id, label)| (id.clone(), label.clone()))
+            .collect()
+    }
+
     /// Every paired EndpointId (ascending) — used to seed the hub's fleet view with known
     /// nodes at startup so they appear (disconnected) before they reconnect.
     pub fn ids(&self) -> Vec<String> {
@@ -227,6 +238,29 @@ mod tests {
         assert!(!allow.contains(&id_str()));
         assert!(allow.is_empty());
         assert!(allow.ids().is_empty(), "ids empty after removal");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn labels_maps_ids_to_their_labels() {
+        let dir = std::env::temp_dir().join("higgs-allow-labels-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pairings.json");
+        let _ = std::fs::remove_file(&path);
+
+        let mut allow = Allowlist::load(&path).unwrap();
+        allow
+            .add("aa".repeat(32), Some("node-a(box)".into()))
+            .unwrap();
+        allow.add("bb".repeat(32), None).unwrap();
+
+        // The serve layer reads labels straight off disk when the hub is disabled.
+        let labels = Allowlist::load(&path).unwrap().labels();
+        assert_eq!(
+            labels.get(&"aa".repeat(32)),
+            Some(&Some("node-a(box)".into()))
+        );
+        assert_eq!(labels.get(&"bb".repeat(32)), Some(&None));
         let _ = std::fs::remove_file(&path);
     }
 

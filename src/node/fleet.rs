@@ -75,13 +75,23 @@ fn route_invalidating(e: &HiggsError) -> bool {
 }
 
 higgs_ts! {
-/// The hub's UI/API view of one paired node: its stable id, endpoint, whether it's currently
-/// connected, and its last-fetched inventory (host + resident workers + hardware/runtime).
+/// The hub's UI/API view of one node: its stable id, endpoint, whether it's currently
+/// connected, its operator label, whether it is the LOCAL machine, and its last-fetched
+/// inventory (host + resident workers + hardware/runtime). The Fleet UI renders local and
+/// remote nodes with this one shape.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct NodeView {
     pub node_id: u32,
     pub endpoint_id: String,
     pub connected: bool,
+    /// The local machine the server runs on (`true`) vs a paired remote node (`false`). The UI
+    /// hides Retire/Leave for the local node — there is nothing to un-pair.
+    pub is_local: bool,
+    /// Human label for the node. For a remote node this is the hub's allowlist label (the
+    /// node's friendly name, operator-renamable) — the fleet leaves it empty and the serve layer
+    /// fills it from the allowlist (the editable source of truth). For the local node it is the
+    /// instance's `config.json` name.
+    pub label: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub inventory: Option<NodeInventory>,
@@ -357,6 +367,10 @@ impl FleetActor {
                 NodeView {
                     node_id: node_id.0,
                     connected: self.nodes.contains_key(&endpoint_id),
+                    // The fleet only tracks remote nodes; the local node is prepended by the serve
+                    // layer. `label` is filled there from the allowlist (live, rename-aware).
+                    is_local: false,
+                    label: String::new(),
                     inventory,
                     endpoint_id,
                 }

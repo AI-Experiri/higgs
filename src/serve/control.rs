@@ -442,18 +442,63 @@ pub(super) async fn control_hub_disable(State(higgs): State<Arc<Higgs>>) -> Json
     Json(hub_status(&higgs).await)
 }
 
-/// `GET /api/higgs/nodes` — the remote fleet: one entry per paired node with its stable id,
-/// endpoint, connected state, and last-fetched inventory (host + resident workers + hw/rt).
-/// Empty when no `HubFleet` is installed (the hub role is off).
+/// Node labels keyed by `EndpointId`, from the live hub allowlist when the hub is enabled, else
+/// read straight from the persisted `pairings.json`. The kill switch (`clear_hub`) drops the
+/// `Hub` but KEEPS the fleet, so without this disk fallback every remote node would lose its
+/// operator label for the whole disabled window — the disk read keeps labels stable across
+/// enable/disable. A missing/unreadable file yields no labels (callers fall back to hostname).
+async fn node_labels(higgs: &Higgs) -> std::collections::HashMap<String, Option<String>> {
+    if let Some(hub) = higgs.hub() {
+        return hub.labels().await;
+    }
+    let path = crate::home::higgs_home().join("pairings.json");
+    crate::auth::Allowlist::load(&path)
+        .map(|allow| allow.labels())
+        .unwrap_or_default()
+}
+
+/// `GET /api/higgs/nodes` — every node in one shape: the LOCAL machine FIRST (`is_local`,
+/// always present, even when the hub role is off), then each paired remote node with its stable
+/// id, endpoint, connected state, label, and last-fetched inventory. Remote labels are merged
+/// from the hub allowlist (the operator-editable source of truth) so the view reflects renames.
 pub(super) async fn control_nodes(
     State(higgs): State<Arc<Higgs>>,
 ) -> Json<Vec<crate::node::fleet::NodeView>> {
     tracing::info!("higgs: GET /api/higgs/nodes");
-    let views = match higgs.fleet() {
-        Some(f) => f.nodes_view().await,
-        None => Vec::new(),
-    };
-    Json(views)
+
+    // The local node always appears first, labelled with this instance's config.json name.
+    let local_label = crate::config::config_path()
+        .ok()
+        .and_then(|p| crate::config::InstanceConfig::load(&p).ok())
+        .map(|c| c.name)
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "this machine".to_string());
+    let mut out = vec![higgs.local_node_view(local_label).await];
+
+    // Then the remote fleet, with each node's label filled from the allowlist (falling back to
+    // its reported hostname, else a short endpoint id) so the UI shows a human name. Each node
+    // keeps the served ids IT reports — the Fleet view shows EVERY resident model on EVERY node,
+    // so the same raw model loaded both locally and on a remote node legitimately appears on
+    // both (chat resolves local-first, but the view's job is full visibility, not routing).
+    if let Some(fleet) = higgs.fleet() {
+        let labels = node_labels(&higgs).await;
+        let mut remotes = fleet.nodes_view().await;
+        for v in &mut remotes {
+            v.label = labels
+                .get(&v.endpoint_id)
+                .cloned()
+                .flatten()
+                .or_else(|| {
+                    v.inventory
+                        .as_ref()
+                        .map(|i| i.hostname.clone())
+                        .filter(|h| !h.is_empty())
+                })
+                .unwrap_or_else(|| v.endpoint_id.chars().take(8).collect());
+        }
+        out.extend(remotes);
+    }
+    Json(out)
 }
 
 /// `POST /api/higgs/nodes/load` — load a model on a paired node and record the route, so
@@ -918,6 +963,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(unload.status(), StatusCode::CONFLICT, "no fleet → 409");
+    }
+
+    #[tokio::test]
+    async fn nodes_lists_the_local_node_first_even_without_a_fleet() {
+        // Even with the hub role off (no fleet), GET /api/higgs/nodes returns the LOCAL machine
+        // as a first-class node, so the Fleet view always shows "this machine".
+        let resp = make_app().oneshot(get("/api/higgs/nodes")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: Vec<serde_json::Value> = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(v.len(), 1, "only the local node when no fleet: {v:?}");
+        assert_eq!(v[0]["endpoint_id"], "local", "local sentinel id");
+        assert_eq!(v[0]["is_local"], true, "flagged local");
+        assert_eq!(v[0]["connected"], true, "local node is always connected");
+        assert!(
+            v[0]["label"].as_str().is_some_and(|s| !s.is_empty()),
+            "local node has a label: {v:?}"
+        );
+        assert!(
+            v[0]["inventory"].is_object(),
+            "local inventory present: {v:?}"
+        );
     }
 
     #[tokio::test]

@@ -64,6 +64,13 @@ impl Hub {
         self.endpoint.close().await;
     }
 
+    /// Every paired node's `EndpointId` → its allowlist label (the node's friendly name, which
+    /// an operator can rename). The serve layer merges these into the fleet view so each node
+    /// shows its human name. Read-only snapshot under the allowlist lock.
+    pub async fn labels(&self) -> std::collections::HashMap<String, Option<String>> {
+        self.allow.lock().await.labels()
+    }
+
     /// Retire a node for good: remove its `EndpointId` from the persistent allowlist FIRST
     /// (so a reconnect can't silently re-admit without a fresh pairing token), then drop it
     /// from the fleet (transport, routes, cached inventory, relayed logs). Idempotent —
