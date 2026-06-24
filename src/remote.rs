@@ -56,6 +56,16 @@ pub const PROTOCOL_VERSIONS: &[u32] = &[1];
 /// The lowest major this build still accepts.
 pub const MIN_SUPPORTED: u32 = 1;
 
+/// Pairing-token lifetime. The token is a **single-use** bootstrap that only ever gates the
+/// FIRST enrollment — once admitted, a node reconnects via its keypair + the hub allowlist (no
+/// token), and the pairing persists until an explicit retire (hub-side or node self-`leave`),
+/// NOT a clock. So the token is **effectively non-expiring** (≈100 years): single-use is the
+/// real control, and retire is the revocation. This is what lets a node that was paired but
+/// killed BEFORE it could store its hub still pair on the next run with the same token. Single
+/// home for the TTL used by every mint site (the production hub `mint_pairing` + `higgs link
+/// pair`). `validate` uses a saturating deadline so this never overflows.
+pub const PAIRING_TOKEN_TTL_MS: u64 = 100 * 365 * 24 * 60 * 60 * 1000;
+
 /// node → hub HELLO request params.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HelloParams {

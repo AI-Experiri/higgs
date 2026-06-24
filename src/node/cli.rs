@@ -10,14 +10,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use iroh_tickets::endpoint::EndpointTicket;
 
+use std::path::Path;
+
 use crate::auth::{Allowlist, PairingTokens};
-use crate::config::{name_or_init, Role};
+use crate::config::{config_path, name_or_init, InstanceConfig, Role, SavedHub};
 use crate::home::ensure_home;
 use crate::node::identity::{bind_endpoint, load_or_create_secret};
 use crate::node::runtime::{NodeConfig, NodeRuntime};
 use crate::node::{dial_and_hello, gate_connection, GateOutcome, HubIdentity, HELLO_DEADLINE};
-
-const TOKEN_TTL_MS: u64 = 10 * 60 * 1000;
+use crate::remote::{HelloResult, PAIRING_TOKEN_TTL_MS as TOKEN_TTL_MS};
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -80,9 +81,11 @@ fn run_link_pair() -> Result<()> {
         let ticket = EndpointTicket::new(endpoint.addr());
 
         println!("higgs hub    : {} ({hub_id})", identity.name);
-        println!("pairing token: {token}   (valid 10m, single-use)");
+        println!("pairing token: {token}   (single-use)");
         println!("ticket       : {ticket}");
-        println!("on the node:  higgs node connect {ticket} {token}");
+        // The persistent daemon (`--node`), NOT the one-shot `node connect`: the daemon saves
+        // the hub so a later bare `higgs --node` reconnects on its own (no token, no ticket).
+        println!("on the node:  higgs --node {ticket} {token}");
         println!("listening for dials (Ctrl-C to stop)…");
 
         // SIGINT/SIGTERM ends the accept loop and returns cleanly so the process runs its
@@ -168,18 +171,106 @@ fn run_node_connect(args: &[String]) -> Result<()> {
     })
 }
 
-/// `higgs --node [<ticket> [token]]` — run the persistent node daemon: dial the hub,
-/// complete HELLO, then serve its `higgs/node/*` control RPCs, reconnecting with backoff
-/// if the link drops (the EndpointId is stable, so re-pairing isn't needed). With no
-/// ticket, just print this node's identity.
-pub fn run_node_daemon(args: &[String]) -> Result<()> {
-    let id = load_or_create_secret(&key_path()?)?.public();
-    let Some(ticket_str) = args.first() else {
-        println!("higgs node id: {id}");
-        println!("usage: higgs --node <ticket> [token]   (run as a persistent node)");
-        return Ok(());
+/// Re-load `config.json`, record this hub as the default, and persist — best-effort, called
+/// once after the FIRST successful admission so a later bare `higgs --node` reconnects to it.
+/// Re-loading (rather than mutating a stale in-memory copy) preserves whatever `name_or_init`
+/// wrote concurrently. The hub's id/label come from its HELLO result (authoritative); the
+/// `ticket` is the exact string we dialed. A persistence failure is logged, never fatal — the
+/// node stays connected regardless.
+fn persist_hub(cfg_path: &Path, hello: &HelloResult, ticket: &str) {
+    let mut cfg = match InstanceConfig::load(cfg_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("higgs node: could not load config to save hub: {e}");
+            return;
+        }
     };
-    let token = args.get(1).cloned();
+    cfg.remember_hub(SavedHub {
+        hub_id: hello.node_id.clone(),
+        ticket: ticket.to_string(),
+        label: hello.hub_name.clone(),
+        last_used_ms: now_ms(),
+    });
+    if let Err(e) = cfg.save(cfg_path) {
+        eprintln!("higgs node: failed to save hub to config: {e}");
+    }
+}
+
+/// Print the node's saved hubs (`higgs --node --list`); `★` marks the default a bare
+/// `higgs --node` dials. No network.
+fn list_saved_hubs(cfg: &InstanceConfig, node_id: &str) -> Result<()> {
+    if cfg.hubs.is_empty() {
+        println!("higgs node {node_id}: no saved hubs — pair with: higgs --node <ticket> <token>");
+        return Ok(());
+    }
+    println!("higgs node {node_id} — saved hubs:");
+    for h in &cfg.hubs {
+        let default = if cfg.default_hub.as_deref() == Some(h.hub_id.as_str()) {
+            " ★default"
+        } else {
+            ""
+        };
+        let short: String = h.hub_id.chars().take(8).collect();
+        println!(
+            "  {} ({})  last-used {}ms{}",
+            h.label, short, h.last_used_ms, default
+        );
+    }
+    Ok(())
+}
+
+/// `higgs --node [<ticket> [token]] | --list | --hub <label|id>` — the persistent node daemon.
+///
+/// Resolves WHICH hub to dial, then loops: dial, complete HELLO, serve the hub's
+/// `higgs/node/*` control RPCs, and reconnect with backoff if the link drops (the EndpointId is
+/// stable, so re-pairing is never needed). On the FIRST admission it saves the hub to
+/// `config.json`, so afterwards a bare `higgs --node` reconnects on its own — no token, no
+/// ticket. Modes:
+/// - `<ticket> [token]` — pair/connect to a hub explicitly (token only on first enrollment).
+/// - bare — connect to the default saved hub (none saved → print how to pair, exit 0).
+/// - `--list` — print saved hubs and exit.
+/// - `--hub <label|id>` — connect to a specific saved hub and make it the default.
+pub fn run_node_daemon(args: &[String]) -> Result<()> {
+    let id = load_or_create_secret(&key_path()?)?.public().to_string();
+    let cfg_path = config_path()?;
+    let cfg = InstanceConfig::load(&cfg_path)?;
+
+    // `--list` short-circuits (no bind, no network).
+    if args.first().map(String::as_str) == Some("--list") {
+        return list_saved_hubs(&cfg, &id);
+    }
+
+    // Resolve the hub to dial + whether to present a one-time token.
+    let (ticket_str, token): (String, Option<String>) = match args.first().map(String::as_str) {
+        Some("--hub") => {
+            let sel = args
+                .get(1)
+                .ok_or_else(|| Error::other("usage: higgs --node --hub <label|id>"))?;
+            let hub = cfg.find_hub(sel).ok_or_else(|| {
+                Error::other(format!(
+                    "no saved hub matching {sel:?} — see `higgs --node --list`"
+                ))
+            })?;
+            (hub.ticket.clone(), None)
+        }
+        Some(flag) if flag.starts_with("--") => {
+            return Err(Error::other(format!(
+                "unknown flag {flag:?} — usage: higgs --node [<ticket> [token]] | --list | --hub <label|id>"
+            )));
+        }
+        // An explicit ticket (first-time pairing, or an explicit re-dial); token optional.
+        Some(ticket) => (ticket.to_string(), args.get(1).cloned()),
+        // Bare: connect to the default saved hub, or explain how to pair if there is none.
+        None => match cfg.default_saved_hub() {
+            Some(hub) => (hub.ticket.clone(), None),
+            None => {
+                let name = name_or_init(Role::Node, &id, &crate::system::hostname())?;
+                println!("higgs node   : {name} ({id})");
+                println!("no saved hub yet — pair with: higgs --node <ticket> <token>");
+                return Ok(());
+            }
+        },
+    };
     let ticket: EndpointTicket = ticket_str.parse().map_err(Error::other)?;
     let target = ticket.endpoint_addr().clone();
 
@@ -225,6 +316,9 @@ pub fn run_node_daemon(args: &[String]) -> Result<()> {
         // unallowlisted node could never pair. Reconnects after success rely on allowlist
         // membership, so the token is cleared only then.
         let mut token = token;
+        // Persist the hub into config.json once, after the FIRST admission, so a later bare
+        // `higgs --node` reconnects to it without a ticket or token.
+        let mut saved = false;
         // SIGINT/SIGTERM ends the loop so we can drain resident workers — a dropped
         // Supervisor does not reap its child, so an undrained exit would orphan models.
         let shutdown = crate::shutdown_signal();
@@ -236,6 +330,10 @@ pub fn run_node_daemon(args: &[String]) -> Result<()> {
                     match res {
                         Ok((conn, hello)) => {
                             token = None; // admitted — token burned hub-side; don't resend it
+                            if !saved {
+                                saved = true;
+                                persist_hub(&cfg_path, &hello, &ticket_str);
+                            }
                             println!("paired with hub {} ({}) (protocol v{})", hello.hub_name, hello.node_id, hello.agreed_version);
                             tokio::select! {
                                 _ = &mut shutdown => break,

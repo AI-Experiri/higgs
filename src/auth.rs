@@ -134,9 +134,11 @@ pub enum TokenError {
     Expired,
 }
 
-/// In-memory mint/burn store for one-time pairing tokens. Not persisted: tokens are
-/// short-lived (default 10 min) and a hub restart simply invalidates pending ones —
-/// the operator re-mints. Single home for token state on the hub.
+/// In-memory mint/burn store for one-time pairing tokens. Not persisted: a token is a
+/// **single-use** bootstrap credential (effectively non-expiring — see
+/// [`crate::remote::PAIRING_TOKEN_TTL_MS`]); a hub restart simply invalidates pending ones, so
+/// the operator re-mints. Once a node is admitted the token is burned and the pairing persists
+/// via the keypair + allowlist until retire — no token thereafter. Single home for token state.
 #[derive(Default)]
 pub struct PairingTokens {
     /// token string → expiry epoch-ms.

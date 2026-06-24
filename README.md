@@ -228,11 +228,16 @@ HIGGS_HUB=1 higgs                                  # server in hub mode
 curl -X POST localhost:11434/api/higgs/pair        # → { ticket, token, node_command }
 
 # Option B — hand-pair from the CLI (separate accept loop):
-higgs link pair        # prints hub id + a single-use token (10m) + ticket
+higgs link pair        # prints hub id + a single-use token + ticket
 higgs link status      # list pairings
 
 # On the NODE: run the persistent daemon, dialing the hub. Pulled/scanned models load here.
+# First time, pair with the ticket + single-use token; the hub is then saved.
 HIGGS_MODEL_DIR=/path/to/models higgs --node <ticket> <token>
+# After that, the node reconnects to its saved hub by itself — no token, no re-pair:
+higgs --node           # connect to the default saved hub
+higgs --node --list    # list saved hubs (★ = default)
+higgs --node --hub <label|id>   # connect to a specific saved hub (and make it default)
 
 # Pull a model onto a node from HuggingFace (lands in the node's ~/.higgs/models/):
 #   issued by the hub over M_NODE_PULL; progress streams as N_PROGRESS.

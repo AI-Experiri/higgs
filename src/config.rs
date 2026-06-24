@@ -5,8 +5,10 @@
 //!
 //! Single home for the naming state, mirroring `auth.rs` (the allowlist) so the home directory
 //! has one obvious file per concern: `endpoint.key`, `pairings.json`, `api_keys.json`,
-//! `models/`, and this `config.json`. A node's saved hubs (for restart reconnect) extend this
-//! same struct in a later unit — `#[serde(default)]` keeps a name-only file forward-compatible.
+//! `models/`, and this `config.json`. A node also records here the hubs it has paired with, so a
+//! restarted node reconnects to its hub by itself (no re-pair) — see [`SavedHub`]. All of it is
+//! still PUBLIC info; the reconnect is authenticated by the node's keypair against the hub
+//! allowlist, not by anything stored here.
 
 use std::path::{Path, PathBuf};
 
@@ -31,15 +33,61 @@ impl Role {
     }
 }
 
-/// On-disk shape of `config.json`. Today just the friendly `name`; a node's saved hubs extend
-/// this struct in a later unit (each new field `#[serde(default)]`, so a name-only file written
-/// now still loads then).
+/// A hub a node has paired with, saved so a restarted node reconnects without re-pairing.
+/// `hub_id` is the hub's `EndpointId` (the dedup key + what `default_hub` points at, learned
+/// authoritatively from the hub's HELLO result); `ticket` is the dialable
+/// [`EndpointTicket`](iroh_tickets::endpoint) string; `label` is the hub's friendly name;
+/// `last_used_ms` records the last successful connect (newest = the natural default).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SavedHub {
+    pub hub_id: String,
+    pub ticket: String,
+    pub label: String,
+    pub last_used_ms: u64,
+}
+
+/// On-disk shape of `config.json`. `name` is always present; `hubs`/`default_hub` are node-side
+/// only (default-empty for a pure hub, whose file is just `{"name":"hub-…"}`). Every field is
+/// `#[serde(default)]`, so a name-only file written by an older build still loads.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InstanceConfig {
     /// The friendly instance name, e.g. `node-a1b2c3d4(studio-mac)`. Empty only on a config
     /// that predates naming; [`name_or_init`] fills it in on first run.
     #[serde(default)]
     pub name: String,
+    /// Hubs this node has paired with (most-recent connects toward the end). Empty for a hub.
+    #[serde(default)]
+    pub hubs: Vec<SavedHub>,
+    /// The `hub_id` a bare `higgs --node` dials. Empty/none for a hub or an unpaired node.
+    #[serde(default)]
+    pub default_hub: Option<String>,
+}
+
+impl InstanceConfig {
+    /// Insert or replace a hub (keyed by `hub_id`) and make it the default. Called after a
+    /// successful HELLO, so the latest ticket/label/`last_used_ms` always win and a bare
+    /// `higgs --node` thereafter reconnects to it. Idempotent on the id (never duplicates).
+    pub fn remember_hub(&mut self, hub: SavedHub) {
+        let id = hub.hub_id.clone();
+        self.hubs.retain(|h| h.hub_id != id);
+        self.hubs.push(hub);
+        self.default_hub = Some(id);
+    }
+
+    /// The default hub's saved entry, if the `default_hub` id still resolves to one.
+    pub fn default_saved_hub(&self) -> Option<&SavedHub> {
+        let id = self.default_hub.as_ref()?;
+        self.hubs.iter().find(|h| &h.hub_id == id)
+    }
+
+    /// Find a saved hub by exact `label`, else by `hub_id` prefix (a short 8-char id works) —
+    /// for `higgs --node --hub <label|id>`. Label is tried first so a human name is unambiguous.
+    pub fn find_hub(&self, needle: &str) -> Option<&SavedHub> {
+        self.hubs
+            .iter()
+            .find(|h| h.label == needle)
+            .or_else(|| self.hubs.iter().find(|h| h.hub_id.starts_with(needle)))
+    }
 }
 
 impl InstanceConfig {
@@ -87,7 +135,7 @@ impl InstanceConfig {
 }
 
 /// `~/.higgs/config.json` (creating the home dir if absent). Honors `HIGGS_HOME`.
-fn config_path() -> std::io::Result<PathBuf> {
+pub fn config_path() -> std::io::Result<PathBuf> {
     Ok(crate::home::ensure_home()?.join("config.json"))
 }
 
@@ -147,23 +195,6 @@ mod tests {
     }
 
     #[test]
-    fn config_save_load_roundtrip() {
-        let dir = std::env::temp_dir().join("higgs-config-roundtrip-test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("config.json");
-        let _ = std::fs::remove_file(&path);
-
-        let cfg = InstanceConfig {
-            name: "node-aa(box)".into(),
-        };
-        cfg.save(&path).unwrap();
-
-        let back = InstanceConfig::load(&path).unwrap();
-        assert_eq!(back.name, "node-aa(box)");
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
     fn load_missing_file_is_default() {
         let path = std::env::temp_dir().join("higgs-config-absent-xyz.json");
         let _ = std::fs::remove_file(&path);
@@ -171,20 +202,103 @@ mod tests {
         assert!(cfg.name.is_empty());
     }
 
+    fn hub(id: &str, ticket: &str, label: &str, ts: u64) -> SavedHub {
+        SavedHub {
+            hub_id: id.into(),
+            ticket: ticket.into(),
+            label: label.into(),
+            last_used_ms: ts,
+        }
+    }
+
+    #[test]
+    fn remember_hub_dedups_by_id_and_sets_default() {
+        let mut cfg = InstanceConfig::default();
+        cfg.remember_hub(hub("aaa111", "tkt-old", "hub-a(srv)", 1));
+        assert_eq!(cfg.default_hub.as_deref(), Some("aaa111"));
+        assert_eq!(cfg.hubs.len(), 1);
+
+        // Re-remembering the SAME hub_id replaces (newer ticket/label/ts win), no duplicate.
+        cfg.remember_hub(hub("aaa111", "tkt-new", "hub-a2(srv)", 5));
+        assert_eq!(cfg.hubs.len(), 1, "deduped by hub_id");
+        assert_eq!(cfg.hubs[0].ticket, "tkt-new");
+        assert_eq!(cfg.hubs[0].label, "hub-a2(srv)");
+
+        // A different hub is added and becomes the new default.
+        cfg.remember_hub(hub("bbb222", "tkt-b", "hub-b(box)", 9));
+        assert_eq!(cfg.hubs.len(), 2);
+        assert_eq!(cfg.default_hub.as_deref(), Some("bbb222"));
+        assert_eq!(cfg.default_saved_hub().unwrap().ticket, "tkt-b");
+    }
+
+    #[test]
+    fn find_hub_by_label_then_id_prefix() {
+        let mut cfg = InstanceConfig::default();
+        cfg.remember_hub(hub("a1b2c3d4ffff", "tkt", "hub-a1b2c3d4(srv)", 1));
+        // Exact label.
+        assert_eq!(
+            cfg.find_hub("hub-a1b2c3d4(srv)").map(|h| h.hub_id.as_str()),
+            Some("a1b2c3d4ffff")
+        );
+        // Short id prefix.
+        assert_eq!(
+            cfg.find_hub("a1b2c3d4").map(|h| h.hub_id.as_str()),
+            Some("a1b2c3d4ffff")
+        );
+        // No match.
+        assert!(cfg.find_hub("nope").is_none());
+    }
+
+    #[test]
+    fn default_saved_hub_none_when_id_dangles() {
+        // A default_hub id with no matching entry resolves to None (defensive against a hand-
+        // edited config), rather than panicking.
+        let cfg = InstanceConfig {
+            name: "node-x(box)".into(),
+            hubs: vec![],
+            default_hub: Some("ghost".into()),
+        };
+        assert!(cfg.default_saved_hub().is_none());
+    }
+
+    #[test]
+    fn config_roundtrips_hubs_and_default() {
+        let dir = std::env::temp_dir().join("higgs-config-hubs-roundtrip-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let _ = std::fs::remove_file(&path);
+
+        let mut cfg = InstanceConfig {
+            name: "node-aa(box)".into(),
+            ..Default::default()
+        };
+        cfg.remember_hub(hub("h1", "tkt1", "hub-1(srv)", 7));
+        cfg.save(&path).unwrap();
+
+        let back = InstanceConfig::load(&path).unwrap();
+        assert_eq!(back.name, "node-aa(box)");
+        assert_eq!(back.hubs, cfg.hubs);
+        assert_eq!(back.default_hub.as_deref(), Some("h1"));
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn load_tolerates_unknown_future_fields() {
-        // A config.json written by a NEWER build (with saved-hub fields) must still load on
-        // this build — unknown keys are ignored, so an upgrade/downgrade never wipes the name.
+        // A config.json written by a NEWER build (with extra keys) must still load on this
+        // build — unknown keys are ignored, so an upgrade/downgrade never wipes the name. A pure
+        // hub's minimal `{"name":…}` (no hubs/default_hub) also defaults in cleanly.
         let dir = std::env::temp_dir().join("higgs-config-future-test");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.json");
         std::fs::write(
             &path,
-            br#"{"name":"hub-3f9a2b1c(srv)","hubs":[{"ticket":"t"}],"default_hub":"x"}"#,
+            br#"{"name":"hub-3f9a2b1c(srv)","some_future_field":true}"#,
         )
         .unwrap();
         let cfg = InstanceConfig::load(&path).unwrap();
         assert_eq!(cfg.name, "hub-3f9a2b1c(srv)");
+        assert!(cfg.hubs.is_empty());
+        assert!(cfg.default_hub.is_none());
         let _ = std::fs::remove_file(&path);
     }
 

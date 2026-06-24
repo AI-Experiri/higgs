@@ -5,12 +5,16 @@
 //! a one-shot node→hub dial (`node connect`) against an in-process test hub, and the
 //! argument/parse error branches. No GGUF needed, so they always run.
 
+use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use iroh_tickets::endpoint::EndpointTicket;
+use tokio::sync::Mutex;
 
 use higgs::auth::{Allowlist, PairingTokens};
+use higgs::config::InstanceConfig;
 use higgs::node::{dial_and_hello, gate_connection, GateOutcome, HubIdentity, HELLO_DEADLINE};
 use higgs::remote::ALPN;
 
@@ -45,13 +49,36 @@ fn link_status_prints_identity_and_zero_paired() {
 }
 
 #[test]
-fn node_daemon_without_ticket_prints_identity_and_usage() {
+fn node_daemon_bare_without_saved_hubs_prints_pair_hint() {
     let home = tempfile::tempdir().unwrap();
+    // Bare `--node` with no saved hub explains how to pair and exits 0 (no network).
     let out = run_higgs(home.path(), &["--node"]);
-    assert!(out.status.success(), "--node with no ticket exits 0");
+    assert!(out.status.success(), "bare --node (no hubs) exits 0");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("higgs node id"), "prints node id: {stdout}");
-    assert!(stdout.contains("usage:"), "prints usage hint: {stdout}");
+    assert!(
+        stdout.contains("higgs node"),
+        "prints node identity: {stdout}"
+    );
+    assert!(
+        stdout.contains("higgs --node <ticket>"),
+        "prints the pairing hint: {stdout}"
+    );
+}
+
+#[test]
+fn node_list_empty_and_hub_miss() {
+    let home = tempfile::tempdir().unwrap();
+    // `--node --list` with no saved hubs exits 0 with a "no saved hubs" line.
+    let list = run_higgs(home.path(), &["--node", "--list"]);
+    assert!(list.status.success(), "--node --list exits 0");
+    assert!(
+        String::from_utf8_lossy(&list.stdout).contains("no saved hubs"),
+        "empty list message: {}",
+        String::from_utf8_lossy(&list.stdout)
+    );
+    // `--node --hub <unknown>` with nothing saved is an error (non-zero, no panic).
+    let miss = run_higgs(home.path(), &["--node", "--hub", "ghost"]);
+    assert!(!miss.status.success(), "--hub with no match exits non-zero");
 }
 
 #[test]
@@ -215,6 +242,130 @@ async fn node_connect_with_bad_token_is_rejected() {
         !out.status.success(),
         "node connect with a bad token exits non-zero"
     );
+}
+
+/// Spawn `higgs --node <args>` against `home`, wait (≤30s) until it prints the pairing line,
+/// and return the live child. Stdout is consumed by the reader; the caller SIGTERMs the child.
+async fn run_node_until_paired(home: &Path, args: &[&str]) -> tokio::process::Child {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let mut full = vec!["--node"];
+    full.extend_from_slice(args);
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_higgs"))
+        .args(&full)
+        .env("HIGGS_HOME", home)
+        .env("HIGGS_IROH_LOCAL", "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn higgs --node");
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let paired = tokio::time::timeout(Duration::from_secs(30), async {
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line.contains("paired with hub") {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+    assert!(
+        matches!(paired, Ok(true)),
+        "node should pair within 30s (args {args:?})"
+    );
+    child
+}
+
+fn sigterm(child: &tokio::process::Child) {
+    if let Some(pid) = child.id() {
+        // SIGTERM (not SIGKILL): the node drains its workers + flushes coverage cleanly.
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGTERM);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn node_pairs_then_bare_reconnects_via_saved_hub_without_token() {
+    // The Unit B core: pair once with a ticket+token, the node SAVES the hub to config.json,
+    // and a later bare `higgs --node` (same HIGGS_HOME) reconnects via the allowlist — no token.
+    let node_home = tempfile::tempdir().unwrap();
+    let allow_dir = tempfile::tempdir().unwrap();
+
+    // In-process hub that accepts repeatedly (pairing dial, then the bare-reconnect dial),
+    // sharing ONE allowlist so the token-paired node is admitted token-free on reconnect.
+    let hub = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .alpns(vec![ALPN.to_vec()])
+        .relay_mode(iroh::RelayMode::Disabled)
+        .bind()
+        .await
+        .expect("bind hub");
+    let hub_id = hub.id().to_string();
+    let ticket = EndpointTicket::new(hub.addr()).to_string();
+    let allow = Arc::new(Mutex::new(
+        Allowlist::load(&allow_dir.path().join("pairings.json")).unwrap(),
+    ));
+    let tokens = Arc::new(Mutex::new(PairingTokens::new()));
+    let token = tokens.lock().await.mint(now_ms(), 600_000);
+
+    let hub_task = tokio::spawn(async move {
+        loop {
+            let Some(incoming) = hub.accept().await else {
+                break;
+            };
+            let conn = match incoming.await {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let mut a = allow.lock().await;
+            let mut t = tokens.lock().await;
+            let _ = gate_connection(
+                &conn,
+                &mut a,
+                &mut t,
+                now_ms(),
+                &HubIdentity {
+                    id: hub_id.clone(),
+                    name: "hub-e2e(srv)".into(),
+                },
+                Some("paired-node".into()),
+                HELLO_DEADLINE,
+            )
+            .await;
+            drop(a);
+            drop(t);
+            // Hold the connection open briefly so the node reads its HELLO reply; keep accepting.
+            tokio::spawn(async move {
+                let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
+            });
+        }
+    });
+
+    // Step 1 — pair with ticket + token. The node saves the hub + sets it default.
+    let mut node1 = run_node_until_paired(node_home.path(), &[&ticket, &token]).await;
+    sigterm(&node1);
+    let _ = node1.wait().await;
+
+    // The hub was persisted to config.json with the hub's friendly name as its label + default.
+    let cfg = InstanceConfig::load(&node_home.path().join("config.json")).unwrap();
+    let saved = cfg.default_saved_hub().expect("a default hub was saved");
+    assert_eq!(saved.label, "hub-e2e(srv)", "saved the hub's friendly name");
+    assert_eq!(saved.ticket, ticket, "saved the dialed ticket");
+
+    // `--node --list` now shows the saved hub.
+    let list = run_higgs(node_home.path(), &["--node", "--list"]);
+    assert!(list.status.success());
+    assert!(
+        String::from_utf8_lossy(&list.stdout).contains("hub-e2e(srv)"),
+        "list shows the saved hub: {}",
+        String::from_utf8_lossy(&list.stdout)
+    );
+
+    // Step 2 — BARE `higgs --node`, same HIGGS_HOME, NO token: reconnects via the allowlist.
+    let mut node2 = run_node_until_paired(node_home.path(), &[]).await;
+    sigterm(&node2);
+    let _ = node2.wait().await;
+
+    hub_task.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

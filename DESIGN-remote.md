@@ -991,7 +991,9 @@ Two **different trust questions**, never conflated — no shared token, store, o
 | CLI noun | `link …` | `keys …` |
 | Reject diag | `HG024 NotAllowlisted` / `HG022 PairingTokenInvalid` / `HG028 HandshakeStalled` | `401 { "error": { "code":"invalid_api_key" } }` |
 
-**Surface A flow:** hub mints `htk_<random>` (TTL default 10 min, single-use), encodes hub
+**Surface A flow:** hub mints `htk_<random>` (single-use, effectively non-expiring — the token
+only gates first enrollment; persistence comes from the keypair + allowlist, not a clock, so a
+node killed before it could save its hub can still pair on the next run), encodes hub
 `EndpointId` + token + relay URL into a QR/pairing string. The dial coordinates are an
 `EndpointTicket` built from `EndpointAddr::new(hub_id).with_relay_url(relay)` (and/or
 `.with_addrs(..)` / `.with_ip_addr(..)` for known direct addrs — **`with_direct_addresses` does

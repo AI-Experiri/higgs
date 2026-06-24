@@ -21,8 +21,7 @@ use crate::node::fleet::HubFleet;
 use crate::node::identity::{bind_endpoint, load_or_create_secret};
 use crate::node::transport::NodeTransport;
 use crate::node::{gate_admit, gate_read_hello, GateOutcome, HubIdentity, HELLO_DEADLINE};
-
-const TOKEN_TTL_MS: u64 = 10 * 60 * 1000;
+use crate::remote::PAIRING_TOKEN_TTL_MS as TOKEN_TTL_MS;
 
 fn now_ms() -> u64 {
     SystemTime::now()
