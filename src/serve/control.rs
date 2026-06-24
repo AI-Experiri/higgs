@@ -593,6 +593,74 @@ pub(super) async fn control_nodes_retire(
     }
 }
 
+/// `POST /api/higgs/nodes/label` — rename a node. `node:"local"` edits this instance's
+/// `config.json` name; any other id renames that paired node's allowlist label (operator
+/// rename — surfaced in `GET /api/higgs/nodes`). An empty label clears a remote node's label
+/// (it then falls back to hostname/short id in the view). Admin-scoped.
+#[derive(Deserialize)]
+pub(super) struct NodeLabelHttp {
+    /// `"local"` for this machine, else the node's `EndpointId`.
+    node: String,
+    /// The new label (empty clears a remote node's label).
+    label: String,
+}
+
+pub(super) async fn control_nodes_label(
+    State(higgs): State<Arc<Higgs>>,
+    Json(req): Json<NodeLabelHttp>,
+) -> Response {
+    tracing::warn!(node = %req.node, label = %req.label, "higgs: POST /api/higgs/nodes/label");
+    if req.node == "local" {
+        return match rename_local(&req.label) {
+            Ok(()) => Json(serde_json::json!({ "status": "ok" })).into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("rename failed: {e}") })),
+            )
+                .into_response(),
+        };
+    }
+    // Renaming a REMOTE node mutates the hub-owned allowlist, so it requires the hub enabled
+    // (409 otherwise, like the other node-mutation routes). Deliberately NO disabled-hub
+    // disk-write fallback: `clear_hub` publishes `hub() == None` before the old accept tasks are
+    // necessarily drained, so a direct `pairings.json` rewrite from a stale snapshot could clobber
+    // a concurrent admit/retire. Labels stay VIEWABLE while disabled (`node_labels` reads the file
+    // read-only) — just not editable until re-enabled.
+    //
+    // Serialize against the kill switch (enable/disable) with the SAME lock as `/pair`: otherwise
+    // a relabel concurrent with a disable→enable could clone the still-published OLD hub and write
+    // `pairings.json` after the NEW hub loaded its allowlist — making the relabel invisible or
+    // later clobbered. Holding the lock means this runs fully before a disable (writes the live
+    // allowlist) or fully after (sees `hub()` None → 409).
+    let _lifecycle = higgs.hub_lifecycle().lock().await;
+    let Some(hub) = higgs.hub() else {
+        return not_a_hub();
+    };
+    let label = (!req.label.is_empty()).then(|| req.label.clone());
+    match hub.set_label(&req.node, label).await {
+        Ok(true) => Json(serde_json::json!({ "status": "ok" })).into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("unknown node {}", req.node) })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("rename failed: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
+/// Rename the LOCAL instance: set `config.json`'s `name`. The next `GET /api/higgs/nodes` shows
+/// it, and the hub accept loop re-reads it per admission so paired nodes learn the new `hub_name`.
+fn rename_local(label: &str) -> std::io::Result<()> {
+    let path = crate::config::config_path()?;
+    let mut cfg = crate::config::InstanceConfig::load(&path)?;
+    cfg.name = label.to_string();
+    cfg.save(&path)
+}
+
 /// The `409` returned by hub-only routes when no fleet is installed.
 fn not_a_hub() -> Response {
     (
@@ -963,6 +1031,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(unload.status(), StatusCode::CONFLICT, "no fleet → 409");
+    }
+
+    #[tokio::test]
+    async fn relabel_remote_without_hub_is_conflict() {
+        // Renaming a REMOTE node requires the hub enabled (it owns the allowlist) → 409 when off,
+        // like the other node-mutation routes. (The local rename + remote-success + unknown-id 404
+        // paths run in the hub_server e2e under a temp HIGGS_HOME, so this doesn't touch ~/.higgs.)
+        let resp = make_app()
+            .oneshot(post_json(
+                "/api/higgs/nodes/label",
+                &json!({ "node": "some-remote-endpoint-id", "label": "x" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CONFLICT,
+            "remote relabel needs a hub → 409"
+        );
     }
 
     #[tokio::test]

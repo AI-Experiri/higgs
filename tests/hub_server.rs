@@ -272,6 +272,135 @@ async fn hub_server_pairs_a_node_and_lists_it() {
     );
 }
 
+/// Editable labels: `POST /api/higgs/nodes/label` renames the local instance (config.json name)
+/// and a paired remote node (allowlist label); both surface in `GET /api/higgs/nodes`. No GGUF.
+#[tokio::test]
+async fn hub_server_relabel_local_and_remote() {
+    let hub_home = tempfile::tempdir().unwrap();
+    let node_home = tempfile::tempdir().unwrap();
+    let port = free_port();
+
+    let _hub = Proc(
+        Command::new(env!("CARGO_BIN_EXE_higgs"))
+            .env("HIGGS_BIND", "127.0.0.1")
+            .env("HIGGS_PORT", port.to_string())
+            .env("HIGGS_HOME", hub_home.path())
+            .env("HIGGS_HUB", "1")
+            .env("HIGGS_IROH_LOCAL", "1")
+            .env("RUST_LOG", "warn")
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn hub"),
+    );
+    let base = format!("http://127.0.0.1:{port}");
+    let c = reqwest::Client::new();
+
+    let mut ready = false;
+    for _ in 0..150 {
+        if let Ok(r) = c.get(format!("{base}/health")).send().await {
+            if r.status().is_success() {
+                ready = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(ready, "hub server ready");
+
+    // Pair a node so there's a remote node to rename.
+    let pair: serde_json::Value = c
+        .post(format!("{base}/api/higgs/pair"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ticket = pair["ticket"].as_str().unwrap().to_string();
+    let token = pair["token"].as_str().unwrap().to_string();
+    let _node = Proc(
+        Command::new(env!("CARGO_BIN_EXE_higgs"))
+            .arg("--node")
+            .arg(&ticket)
+            .arg(&token)
+            .env("HIGGS_HOME", node_home.path())
+            .env("HIGGS_IROH_LOCAL", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn node"),
+    );
+    let mut node_id = String::new();
+    for _ in 0..150 {
+        let nodes: serde_json::Value = c
+            .get(format!("{base}/api/higgs/nodes"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if let Some(n) = nodes.as_array().and_then(|a| {
+            a.iter()
+                .find(|n| n["connected"] == true && n["is_local"] != true)
+        }) {
+            node_id = n["endpoint_id"].as_str().unwrap().to_string();
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(!node_id.is_empty(), "node paired before relabel");
+
+    // Rename the LOCAL instance and the REMOTE node.
+    for (node, label) in [
+        ("local", "studio-hub"),
+        (node_id.as_str(), "renamed-remote"),
+    ] {
+        let resp = c
+            .post(format!("{base}/api/higgs/nodes/label"))
+            .json(&serde_json::json!({ "node": node, "label": label }))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success(),
+            "relabel {node} ok: {}",
+            resp.status()
+        );
+    }
+
+    // Both new labels surface in the unified node view.
+    let nodes: serde_json::Value = c
+        .get(format!("{base}/api/higgs/nodes"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let arr = nodes.as_array().expect("nodes array");
+    let local = arr
+        .iter()
+        .find(|n| n["is_local"] == true)
+        .expect("local node");
+    assert_eq!(local["label"], "studio-hub", "local renamed: {nodes}");
+    let remote = arr
+        .iter()
+        .find(|n| n["endpoint_id"] == node_id.as_str())
+        .expect("remote node");
+    assert_eq!(remote["label"], "renamed-remote", "remote renamed: {nodes}");
+
+    // An unknown remote id is a 404 (never a silent insert).
+    let miss = c
+        .post(format!("{base}/api/higgs/nodes/label"))
+        .json(&serde_json::json!({ "node": "not-a-node", "label": "x" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(miss.status().as_u16(), 404, "unknown node → 404");
+}
+
 /// Node self-retire: a paired node runs `higgs node leave`, which dials the saved hub and asks it
 /// to retire ITSELF. The node then disappears from `/api/higgs/nodes` and forgets the hub locally.
 /// No GGUF needed (pairing + leave path only).

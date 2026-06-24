@@ -182,6 +182,7 @@ pub fn router(higgs: Arc<Higgs>) -> Router {
             "/api/higgs/nodes/retire",
             post(control::control_nodes_retire),
         )
+        .route("/api/higgs/nodes/label", post(control::control_nodes_label))
         .route(
             "/api/higgs/nodes/{node}/models",
             get(control::control_node_models),

@@ -71,6 +71,13 @@ impl Hub {
         self.allow.lock().await.labels()
     }
 
+    /// Rename a paired node (operator action): update its allowlist label; persists. Returns
+    /// whether the node was found (`false` = unknown id, no change). Errors only on a persistence
+    /// failure. The next `GET /api/higgs/nodes` reflects the new label.
+    pub async fn set_label(&self, node: &str, label: Option<String>) -> std::io::Result<bool> {
+        self.allow.lock().await.relabel(node, label)
+    }
+
     /// Retire a node for good (operator action): remove its `EndpointId` from the persistent
     /// allowlist FIRST (so a reconnect can't silently re-admit without a fresh pairing token),
     /// then drop it from the fleet (transport, routes, cached inventory, relayed logs).
@@ -204,6 +211,20 @@ pub fn spawn_accept_loop(
                 // re-introduce a just-retired node into the fleet view. `add_node` awaits the
                 // fleet actor mailbox (which never takes this allow lock), so holding the lock
                 // across it preserves that mutual exclusion and can't deadlock.
+                // Build the hub identity LIVE from config.json so a `POST /api/higgs/nodes/label`
+                // rename of the local instance is reflected in the `hub_name` sent to nodes that
+                // pair/reconnect afterwards — without a hub restart. Falls back to the name
+                // captured at `start_hub` if the config can't be read. (A dial is infrequent, so
+                // the small read is negligible; the EndpointId never changes.)
+                let live_identity = HubIdentity {
+                    id: identity.id.clone(),
+                    name: crate::config::config_path()
+                        .ok()
+                        .and_then(|p| crate::config::InstanceConfig::load(&p).ok())
+                        .map(|c| c.name)
+                        .filter(|n| !n.is_empty())
+                        .unwrap_or_else(|| identity.name.clone()),
+                };
                 let mut allow_g = allow.lock().await;
                 let mut tokens_g = tokens.lock().await;
                 let outcome = gate_admit(
@@ -212,7 +233,7 @@ pub fn spawn_accept_loop(
                     &mut allow_g,
                     &mut tokens_g,
                     now_ms(),
-                    &identity,
+                    &live_identity,
                     Some("paired-node".into()),
                 )
                 .await;

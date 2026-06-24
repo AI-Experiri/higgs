@@ -78,6 +78,19 @@ impl Allowlist {
         })
     }
 
+    /// Update the label of an ALREADY-paired id (operator rename); persists. Returns whether the
+    /// id was present — a relabel of an unknown id is a no-op `false`, NOT an insert (only pairing
+    /// adds a node), so a typo'd id can't smuggle an entry into the allowlist.
+    pub fn relabel(&mut self, id: &str, label: Option<String>) -> std::io::Result<bool> {
+        if !self.file.nodes.contains_key(id) {
+            return Ok(false);
+        }
+        self.mutate(|nodes| {
+            nodes.insert(id.to_string(), label);
+        })?;
+        Ok(true)
+    }
+
     /// Apply `f`, persist, and only keep the change if the save succeeded. On a
     /// persistence error (disk full, permissions) the in-memory map is rolled back
     /// to the persisted state, so authorization decisions never diverge from disk.
@@ -238,6 +251,33 @@ mod tests {
         assert!(!allow.contains(&id_str()));
         assert!(allow.is_empty());
         assert!(allow.ids().is_empty(), "ids empty after removal");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn relabel_updates_only_existing_ids() {
+        let dir = std::env::temp_dir().join("higgs-allow-relabel-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pairings.json");
+        let _ = std::fs::remove_file(&path);
+
+        let mut allow = Allowlist::load(&path).unwrap();
+        allow.add(id_str(), Some("old".into())).unwrap();
+
+        // Rename an existing node → true, persisted.
+        assert!(allow.relabel(&id_str(), Some("new".into())).unwrap());
+        assert_eq!(
+            Allowlist::load(&path).unwrap().label(&id_str()).as_deref(),
+            Some("new")
+        );
+        // Clearing the label (None) is allowed.
+        assert!(allow.relabel(&id_str(), None).unwrap());
+        assert_eq!(allow.label(&id_str()), None);
+        // Relabeling an UNKNOWN id is a no-op false — never an insert.
+        assert!(!allow
+            .relabel("bb".repeat(32).as_str(), Some("x".into()))
+            .unwrap());
+        assert!(!allow.contains(&"bb".repeat(32)));
         let _ = std::fs::remove_file(&path);
     }
 
