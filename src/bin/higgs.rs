@@ -46,6 +46,14 @@ fn main() {
     // Remote-worker roles/subcommands (iroh). Each runs to completion and exits,
     // before the default server path below.
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // `higgs --version` / `-V`: report the crate version. The single source of
+    // truth is Cargo.toml `[package] version`, surfaced here via CARGO_PKG_VERSION
+    // so the CLI and the release tag/artifacts always agree. First-arg only, so a
+    // `--version` buried in a subcommand's own args is left for that subcommand.
+    if matches!(args.first().map(String::as_str), Some("--version" | "-V")) {
+        println!("higgs {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     let remote = match args.first().map(String::as_str) {
         Some("--node") => Some(higgs::node::cli::run_node_daemon(&args[1..])),
         Some("link") => Some(higgs::node::cli::run_link(&args[1..])),

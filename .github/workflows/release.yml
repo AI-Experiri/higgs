@@ -1,0 +1,228 @@
+# higgs release pipeline.
+#
+# Trigger: a version-bump PR merged to `main` (push: main), or a manual re-run
+# (workflow_dispatch — the "Run workflow" button on the repo's Actions tab).
+#
+# Versioning: the single source of truth is `Cargo.toml` `[package] version`
+# (semver). The CLI (`higgs --version`), the git tag (`v<version>`), and the
+# release artifacts all derive from it. The `gate` job is the version gate: it
+# releases ONLY when `v<version>` does not already exist, so ordinary pushes to
+# `main` are no-ops and only a version bump cuts a release. `workflow_dispatch`
+# is therefore a safe retry.
+#
+# Targets: macOS arm64 (Metal) + Linux x86_64 CPU (runs anywhere) + Linux x86_64
+# CUDA (GPU boxes; needs the CUDA runtime). A CUDA-linked binary won't load
+# without the CUDA runtime, and the Rust llama.cpp wrapper has no dynamic-backend
+# loading, so CPU and CUDA ship as separate artifacts — CPU is the universal one.
+#
+# NOTE: the repo `.cargo/config.toml` carries a macOS-dev `[env]` (a hardcoded
+# Xcode SDK + an `arm64-apple-darwin` bindgen target) and a dev-only lld linker.
+# Those are correct on a dev Mac but WRONG on CI runners, so each build job
+# overrides them (cargo `[env]` without `force` yields to an env var already set).
+
+name: release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Serialize release runs (do NOT cancel an in-flight one): a queued run re-reads
+# the version gate, so once a release is cut, the next run is a clean no-op.
+concurrency:
+  group: higgs-release
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      should_release: ${{ steps.v.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - id: v
+        shell: bash
+        run: |
+          set -euo pipefail
+          # First `^version = "…"` is the [package] version ([package] is the
+          # first table in Cargo.toml; the [workspace] table has no version key).
+          version="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/^version = "(.*)"/\1/')"
+          if [ -z "$version" ]; then
+            echo "::error::could not read [package] version from Cargo.toml"; exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if git rev-parse "refs/tags/v$version" >/dev/null 2>&1; then
+            echo "tag v$version already exists — nothing to release"
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "v$version is new — a release will be cut"
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: gate
+    if: needs.gate.outputs.should_release == 'true'
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS arm64 — Metal (system, no runtime dep).
+          - os: macos-14
+            target: aarch64-apple-darwin
+            features: ""
+            suffix: aarch64-apple-darwin
+          # Linux x86_64 CPU — the UNIVERSAL build; runs on any x86_64 Linux.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            features: ""
+            suffix: x86_64-unknown-linux-gnu
+          # Linux x86_64 CUDA — GPU acceleration; requires the CUDA runtime at run time.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            features: cuda
+            suffix: x86_64-unknown-linux-gnu-cuda
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.suffix }}
+
+      # --- macOS: Metal (system) + OpenMP (the llama-cpp-2 default feature) ---
+      - name: Install macOS build deps
+        if: matrix.os == 'macos-14'
+        run: brew install libomp
+
+      # --- Linux: CUDA toolkit (CUDA build only) + bindgen/cmake deps (both Linux) ---
+      - name: Install CUDA toolkit (Linux CUDA build)
+        if: matrix.features == 'cuda'
+        uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          cuda: "12.5.0"
+          method: network
+      - name: Install Linux build deps
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake clang libclang-dev
+
+      # Override the dev-only bits of .cargo/config.toml per platform.
+      - name: Configure build env
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.os }}" = "macos-14" ]; then
+            # Use the runner's real SDK (the repo config hardcodes a dev Xcode path)
+            # and drop the dev-only lld linker (its /opt/homebrew path is absent here)
+            # via an empty RUSTFLAGS, which overrides config target.rustflags.
+            sdk="$(xcrun --sdk macosx --show-sdk-path)"
+            {
+              echo "SDKROOT=$sdk"
+              echo "BINDGEN_EXTRA_CLANG_ARGS=--target=arm64-apple-darwin -isysroot $sdk"
+              echo "RUSTFLAGS="
+              echo "OpenMP_ROOT=$(brew --prefix libomp)"
+            } >> "$GITHUB_ENV"
+          else
+            # Neutralize the macOS-only [env] from .cargo/config.toml on Linux:
+            # cargo [env] only sets a var when it is ABSENT, so presence (even empty)
+            # here wins, keeping the macOS SDK/bindgen target off the Linux build.
+            {
+              echo "SDKROOT="
+              echo "BINDGEN_EXTRA_CLANG_ARGS="
+            } >> "$GITHUB_ENV"
+            # Bound the CUDA build to a sane set of GPU archs (Turing→Hopper). The
+            # default builds kernels for a much wider arch list, which balloons the
+            # binary to ~1 GB and the build time; CUDAARCHS seeds CMAKE_CUDA_ARCHITECTURES.
+            if [ "${{ matrix.features }}" = "cuda" ]; then
+              echo "CUDAARCHS=75;80;86;89;90" >> "$GITHUB_ENV"
+            fi
+          fi
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${{ matrix.features }}" ]; then
+            cargo build --release --locked --target "${{ matrix.target }}" --features "${{ matrix.features }}"
+          else
+            cargo build --release --locked --target "${{ matrix.target }}"
+          fi
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver="${{ needs.gate.outputs.version }}"
+          name="higgs-v${ver}-${{ matrix.suffix }}"
+          mkdir -p dist
+          tar -C "target/${{ matrix.target }}/release" -czf "dist/${name}.tar.gz" higgs
+          ( cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: higgs-${{ matrix.suffix }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: [gate, build]
+    if: needs.gate.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Extract release notes from CHANGELOG
+        id: notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver="${{ needs.gate.outputs.version }}"
+          # Grab the body of the `## [<ver>] …` section (up to the next `## [`).
+          notes="$(awk -v v="$ver" '
+            $0 ~ ("^## \\[" v "\\]") {grab=1; next}
+            grab && /^## \[/ {exit}
+            grab {print}
+          ' CHANGELOG.md)"
+          if [ -n "$(printf '%s' "$notes" | tr -d '[:space:]')" ]; then
+            printf '%s\n' "$notes" > release_notes.md
+            echo "have_notes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "no CHANGELOG section for $ver — auto-generating notes"
+            echo "have_notes=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.gate.outputs.version }}
+          # Tag the exact merged commit, not whatever main points at when this runs.
+          target_commitish: ${{ github.sha }}
+          name: higgs v${{ needs.gate.outputs.version }}
+          body_path: ${{ steps.notes.outputs.have_notes == 'true' && 'release_notes.md' || '' }}
+          generate_release_notes: ${{ steps.notes.outputs.have_notes != 'true' }}
+          # Any semver pre-release (a version with a '-', e.g. 0.1.0-beta.1) is
+          # published as a GitHub pre-release.
+          prerelease: ${{ contains(needs.gate.outputs.version, '-') }}
+          files: dist/*
+          fail_on_unmatched_files: true

@@ -131,6 +131,24 @@ fn cli_arg_errors_are_nonzero() {
     }
 }
 
+#[test]
+fn version_flag_prints_crate_version() {
+    let home = tempfile::tempdir().unwrap();
+    // `higgs --version` (and `-V`) print `higgs <crate version>` and exit 0. The
+    // version MUST equal CARGO_PKG_VERSION so the CLI, Cargo.toml, and the release
+    // tag/artifacts can never drift (the release workflow derives the tag from the
+    // same Cargo.toml version).
+    for flag in ["--version", "-V"] {
+        let out = run_higgs(home.path(), &[flag]);
+        assert!(out.status.success(), "`higgs {flag}` exits 0");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            format!("higgs {}", env!("CARGO_PKG_VERSION")),
+            "`higgs {flag}` prints the crate version"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn node_connect_dials_and_pairs_with_a_hub() {
     let home = tempfile::tempdir().unwrap();

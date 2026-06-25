@@ -1,0 +1,98 @@
+# higgs CI — runs on every PR and on pushes to main.
+#
+# Mirrors the local gate (`scripts/quality.sh`): rustfmt + clippy (-D warnings) +
+# the test suite, on the two release platforms (macOS arm64, Linux x86_64 CPU).
+# CUDA is NOT exercised here (toolkit + GPU only matter for release artifacts);
+# coverage is left to the local `scripts/coverage.sh` gate (integration tests need
+# a GGUF that CI does not provide, so they skip — coverage would collapse here).
+#
+# Like release.yml, each build job overrides the macOS-dev `.cargo/config.toml`
+# `[env]` (hardcoded Xcode SDK + arm64 bindgen target) and dev-only lld linker,
+# which are correct on a dev Mac but wrong on CI runners.
+#
+# Security: no step interpolates untrusted event input (PR title/body/branch,
+# commit messages, etc.) into a `run:` script — only the trusted `matrix.os`
+# literal — so this workflow is not exposed to GitHub Actions script injection.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  test:
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-${{ matrix.target }}
+
+      - name: Install macOS build deps
+        if: matrix.os == 'macos-14'
+        run: brew install libomp
+
+      - name: Install Linux build deps
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake clang libclang-dev
+
+      # Override the dev-only bits of .cargo/config.toml per platform (see header).
+      - name: Configure build env
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.os }}" = "macos-14" ]; then
+            sdk="$(xcrun --sdk macosx --show-sdk-path)"
+            {
+              echo "SDKROOT=$sdk"
+              echo "BINDGEN_EXTRA_CLANG_ARGS=--target=arm64-apple-darwin -isysroot $sdk"
+              echo "RUSTFLAGS="
+              echo "OpenMP_ROOT=$(brew --prefix libomp)"
+            } >> "$GITHUB_ENV"
+          else
+            {
+              echo "SDKROOT="
+              echo "BINDGEN_EXTRA_CLANG_ARGS="
+            } >> "$GITHUB_ENV"
+          fi
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked

@@ -1,6 +1,6 @@
 [package]
 name = "higgs"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 edition = "2021"
 description = "In-app local model runtime: OpenAI-compatible serving over llama.cpp with crash-isolated worker"
 license = "MIT"
@@ -30,6 +30,13 @@ manual_string_new = "warn"
 implicit_clone = "warn"
 # Perf
 unnecessary_to_owned = "warn"
+
+[features]
+# CUDA GPU acceleration for the llama.cpp engine. Used by the Linux release build
+# (`cargo build --release --features cuda`); requires the CUDA toolkit at build
+# time and a CUDA runtime at run time. macOS gets Metal automatically from the
+# llama.cpp build (Apple default), so no feature is needed there.
+cuda = ["llama-cpp-2/cuda"]
 
 [dependencies]
 # higgs's own proc-macros (TsConstEnum — const-object TS enums, consistent with jigglebot).
