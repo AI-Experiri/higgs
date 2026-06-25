@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Quality gate for higgs (Rust-only — this crate has no frontend). Runs the fast
-# checks every change should pass before commit:
+# Quality gate for higgs. Runs the fast checks every change should pass before commit:
 #
 #   * cargo fmt   (apply, then verify clean)
 #   * cargo clippy --all-targets -D warnings
 #   * cargo test  (full suite; also REGENERATES the ts-rs bindings)
 #   * bindings sync (the committed bindings/higgs/*.ts match the Rust types)
+#   * vendor bindings → jigglebot frontend (the ONLY sanctioned way the ts-rs .ts
+#     move into jigglebot — it consumes higgs as a path/git DEPENDENCY, not a
+#     workspace member, so its own build never regenerates them; never hand-copy)
 #
 # The ts-rs TypeScript files in bindings/higgs/ are emitted by ts-rs's own
 # derive-generated test functions during `cargo test` (the `higgs_ts!` macro in
@@ -97,6 +99,41 @@ else
     git --no-pager diff --stat -- bindings/
     echo "  Commit the regenerated bindings: git add bindings/ && commit."
     FAILED=1
+fi
+
+# ── Vendor bindings → jigglebot frontend ─────────────────
+
+# higgs is consumed by jigglebot as a path/git DEPENDENCY (not a workspace member),
+# so jigglebot's own `cargo test` never runs higgs's ts-rs export tests and never
+# regenerates these .ts. Its frontend therefore VENDORS a copy under
+# frontend/src/lib/generated/higgs/. THIS STEP IS THE ONE SANCTIONED WAY those files
+# move — it mirrors the just-regenerated, in-sync bindings into that copy. Never
+# hand-copy; run this gate instead.
+#
+# Gated on a clean run (don't push drifted/uncommitted bindings) and CONDITIONAL on
+# the sibling jigglebot repo being present, so higgs still builds/gates standalone.
+# Override the location with JIGGLEBOT_DIR.
+step "vendor bindings → jigglebot frontend"
+JIGGLEBOT_DIR="${JIGGLEBOT_DIR:-$PROJECT_DIR/../jigglebot}"
+JIGGLE_HIGGS="$JIGGLEBOT_DIR/frontend/src/lib/generated/higgs"
+if [ "$FAILED" -ne 0 ]; then
+    warn "skipped frontend vendor — resolve the failures above first"
+elif [ -d "$JIGGLE_HIGGS" ]; then
+    # Mirror: copy every binding (add/update), then drop any stale vendored file
+    # higgs no longer emits, so the copy is a faithful 1:1 of bindings/higgs/.
+    cp "$PROJECT_DIR/bindings/higgs/"*.ts "$JIGGLE_HIGGS/"
+    for f in "$JIGGLE_HIGGS"/*.ts; do
+        [ -f "$PROJECT_DIR/bindings/higgs/$(basename "$f")" ] || rm -f "$f"
+    done
+    # Match jigglebot's committed format: its generated/ is .prettierignore'd, so it
+    # strips ts-rs's trailing whitespace itself — do the same here (perl -i is portable
+    # on macOS + Linux; sed -i is not), so a later jigglebot gate sees no churn.
+    find "$JIGGLE_HIGGS" -name '*.ts' -print0 \
+        | xargs -0 perl -i -pe 's/[ \t]+$//' 2>/dev/null || true
+    count=$(find "$PROJECT_DIR/bindings/higgs" -name '*.ts' | wc -l | tr -d ' ')
+    log "✓ vendored $count bindings → $JIGGLE_HIGGS"
+else
+    warn "jigglebot not at $JIGGLEBOT_DIR — frontend vendor skipped (set JIGGLEBOT_DIR to override)"
 fi
 
 # ── Summary ──────────────────────────────────────────────
