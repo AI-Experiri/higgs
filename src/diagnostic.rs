@@ -31,9 +31,12 @@ pub enum HiggsError {
     #[diagnostic(code(HG004), severity(Error))]
     EngineLoadFailed { id: String, reason: String },
 
-    /// Prompt + max generation tokens exceed the context window.
+    /// Prompt + max generation tokens exceed the loaded context window. The lever is
+    /// `ctx_len` (the window the model was loaded with); raising it helps up to the
+    /// model's TRAINED context, beyond which the prompt itself must shrink. When
+    /// `autotune` is on, a re-tune derives the largest fitting context automatically.
     #[snafu(display(
-        "[HG005] context overflow: prompt {prompt_tokens} + max_gen {max_gen} > n_ctx {n_ctx}"
+        "[HG005] context overflow: prompt {prompt_tokens} + max_gen {max_gen} tokens exceed the loaded context window n_ctx={n_ctx} — reload the model with a larger ctx_len (up to its trained context), or lower max_tokens / shorten the prompt; if autotune is enabled, re-tune to derive the largest fitting context"
     ))]
     #[diagnostic(code(HG005))]
     ContextOverflow {
@@ -52,8 +55,13 @@ pub enum HiggsError {
     #[diagnostic(code(HG007))]
     WorkerDead { context: String },
 
-    /// A JSON-RPC frame failed to encode/decode.
-    #[snafu(display("[HG008] rpc decode failed: {detail}"))]
+    /// A line could not be decoded as a JSON-RPC 2.0 frame. `rpc::decode` is shared
+    /// by BOTH the supervisor↔worker pipe and the hub↔node control plane, so this
+    /// stays transport-NEUTRAL: it means the peer (a worker, or a remote node/hub)
+    /// sent a malformed/partial line — a crash mid-write or a version-mismatched
+    /// peer. Retry (the supervisor auto-restarts a dead worker); a persistent
+    /// failure means a faulty/mismatched peer — upgrade both higgs peers.
+    #[snafu(display("[HG008] rpc decode failed: {detail} — the peer sent a malformed JSON-RPC frame (a crash mid-write or a version-mismatched peer); retry, and if it persists upgrade both higgs peers to the same version"))]
     #[diagnostic(code(HG008))]
     RpcDecode { detail: String },
 
@@ -73,8 +81,11 @@ pub enum HiggsError {
     #[diagnostic(code(HG010))]
     OllamaManifestInvalid { path: String, detail: String },
 
-    /// A generation-time failure: context creation, prompt decode, sampling, detokenize, or loop decode.
-    #[snafu(display("[HG011] generation failed at {stage}: {reason}"))]
+    /// A generation-time failure inside the engine: context creation, prompt decode,
+    /// sampling, detokenize, or the decode loop. Usually transient (resource pressure)
+    /// or a too-aggressive load — a reload with a smaller `ctx_len`/`gpu_layers` (less
+    /// VRAM/RAM pressure) is the lever; a persistent failure points at a corrupt GGUF.
+    #[snafu(display("[HG011] generation failed at {stage}: {reason} — retry; if it recurs, reload the model with a smaller ctx_len/gpu_layers (relieves VRAM/RAM pressure), or re-verify the GGUF is not corrupt"))]
     #[diagnostic(code(HG011))]
     GenerationFailed { stage: String, reason: String },
 
@@ -320,6 +331,96 @@ pub enum HiggsError {
         primary: String,
         fallback: String,
     },
+
+    // ── Control-plane RPC + peer-protocol faults (supervisor↔worker, hub↔node) ──
+    /// A peer sent an RPC method this endpoint does not implement. On the
+    /// internal wire this means a PROTOCOL SKEW — the two higgs binaries are
+    /// different versions (a method one side speaks, the other doesn't).
+    /// `endpoint` is who received it (`worker`/`node`/`hub`).
+    #[snafu(display(
+        "[HG037] {endpoint} received unknown RPC method '{method}' — protocol skew; rebuild/upgrade so both higgs peers run the same version"
+    ))]
+    #[diagnostic(code(HG037))]
+    RpcMethodNotFound { endpoint: String, method: String },
+
+    /// A control-plane peer sent a structurally-invalid or undecodable message —
+    /// a malformed frame, a reply that won't deserialize, or an out-of-range id.
+    /// The peer is version-mismatched or faulty; this is NOT a local fault, so the
+    /// action is to update the peer and inspect ITS logs. `peer_role` is the
+    /// misbehaving side (`hub`/`node`/`worker`).
+    #[snafu(display(
+        "[HG038] {peer_role} sent a malformed control message: {detail} — the peer is version-mismatched or faulty; upgrade both higgs peers to the same version and check the {peer_role}'s logs"
+    ))]
+    #[diagnostic(code(HG038))]
+    ProtocolViolation { peer_role: String, detail: String },
+
+    /// The hub refused a node's request (HELLO admission, `M_NODE_LEAVE`, or a
+    /// self-retire). The usual cause is the hub no longer recognizing this node or
+    /// a spent/expired pairing token. `stage` names the rejected request.
+    #[snafu(display(
+        "[HG039] hub rejected this node's {stage} request: {detail} — re-pair with a fresh token (`higgs node --hub <ticket> <token>`) if the hub no longer recognizes this node"
+    ))]
+    #[diagnostic(code(HG039))]
+    HubRequestRejected { stage: String, detail: String },
+
+    // ── Local on-disk store faults (config / pairings / keystore / models.json) ──
+    /// A read/write/rename against a higgs on-disk store failed (an OS I/O error).
+    /// `store` names which store (`config`/`pairings`/`keystore`/`models`); `path`
+    /// is the file. The lever is the filesystem — free space and the file/directory
+    /// permissions. Covers both reads and writes (the message stays neutral).
+    #[snafu(display(
+        "[HG040] I/O error on the {store} store at {path}: {source} — check free disk space and the file/directory permissions"
+    ))]
+    #[diagnostic(code(HG040))]
+    PersistenceFailed {
+        store: String,
+        path: String,
+        source: std::io::Error,
+    },
+
+    /// A higgs store file exists but its JSON will not deserialize — it is
+    /// corrupted (hand-edited, truncated, or written by an incompatible version).
+    /// Distinct from [HG040] (an I/O error) so the fix is unambiguous: reset the
+    /// file. higgs recreates a valid default on next start.
+    #[snafu(display(
+        "[HG041] the {store} store at {path} is corrupted: {detail} — back up and delete the file to reset it to defaults, or repair its JSON by hand"
+    ))]
+    #[diagnostic(code(HG041))]
+    StoreCorrupted {
+        store: String,
+        path: String,
+        detail: String,
+    },
+
+    /// An internal invariant failed on a path that COULD recover — e.g. a
+    /// `spawn_blocking` task that panicked (a `JoinError`). Converted to a typed
+    /// error so the boundary returns a clean 500 instead of the process aborting.
+    /// There is no user lever: this is a higgs bug. `context` names the operation.
+    #[snafu(display(
+        "[HG042] internal fault in {context}: {detail} — this is a higgs bug, not a configuration problem; capture this message and the surrounding logs and report it"
+    ))]
+    #[diagnostic(code(HG042), severity(Error))]
+    InternalFault { context: String, detail: String },
+
+    // ── Fleet/hub admin (HTTP) + background chat task ───────────────────────────
+    /// A `/api/higgs/hub/*` or `/api/higgs/nodes/*` admin mutation failed (enable
+    /// the hub, retire/relabel a node). `op` names the operation; `detail` carries
+    /// the cause. Usually the hub is disabled or the target node id is wrong/gone.
+    #[snafu(display(
+        "[HG043] fleet admin operation '{op}' failed: {detail} — verify the hub is enabled and the target node id is current (`GET /api/higgs/nodes`)"
+    ))]
+    #[diagnostic(code(HG043))]
+    HubControlFailed { op: String, detail: String },
+
+    /// The background chat generation task aborted — it panicked or was cancelled
+    /// (a tokio `JoinError`), as opposed to returning a typed engine error. The
+    /// request produced no result; a retry usually succeeds. A recurring abort is
+    /// a bug worth reporting with the worker logs.
+    #[snafu(display(
+        "[HG044] the chat generation task aborted unexpectedly: {detail} — retry the request; if it recurs, capture this message and the worker logs and report it"
+    ))]
+    #[diagnostic(code(HG044), severity(Error))]
+    ChatTaskFailed { detail: String },
 }
 
 #[cfg(test)]
@@ -473,6 +574,93 @@ mod tests {
         let s = exhausted.to_string();
         assert!(s.starts_with("[HG036]"));
         assert!(s.contains("[HG029]") && s.contains("connection refused"));
+    }
+
+    #[test]
+    fn subsystem_fault_codes_render_with_remediation() {
+        // Each new code renders its [HGxxx] tag AND carries a remediation clause
+        // (the "—" separator introduces the "what to do"), per the diagnostics bar.
+        let cases: Vec<(HiggsError, &str)> = vec![
+            (
+                HiggsError::RpcMethodNotFound {
+                    endpoint: "node".into(),
+                    method: "higgs/bogus".into(),
+                },
+                "[HG037]",
+            ),
+            (
+                HiggsError::ProtocolViolation {
+                    peer_role: "node".into(),
+                    detail: "inventory decode failed".into(),
+                },
+                "[HG038]",
+            ),
+            (
+                HiggsError::HubRequestRejected {
+                    stage: "hello".into(),
+                    detail: "not allowlisted".into(),
+                },
+                "[HG039]",
+            ),
+            (
+                HiggsError::PersistenceFailed {
+                    store: "config".into(),
+                    path: "/x/config.json".into(),
+                    source: std::io::Error::other("disk full"),
+                },
+                "[HG040]",
+            ),
+            (
+                HiggsError::StoreCorrupted {
+                    store: "pairings".into(),
+                    path: "/x/pairings.json".into(),
+                    detail: "expected value".into(),
+                },
+                "[HG041]",
+            ),
+            (
+                HiggsError::InternalFault {
+                    context: "system info gather".into(),
+                    detail: "join error".into(),
+                },
+                "[HG042]",
+            ),
+            (
+                HiggsError::HubControlFailed {
+                    op: "retire".into(),
+                    detail: "node gone".into(),
+                },
+                "[HG043]",
+            ),
+            (
+                HiggsError::ChatTaskFailed {
+                    detail: "panicked".into(),
+                },
+                "[HG044]",
+            ),
+        ];
+        for (err, code) in cases {
+            let s = err.to_string();
+            assert!(s.starts_with(code), "code prefix: {s}");
+            assert!(
+                s.contains(" — "),
+                "every diagnostic must carry a remediation clause (em-dash): {s}"
+            );
+        }
+        // The two high-severity faults are fatal-severity.
+        use miette::Diagnostic;
+        assert_eq!(
+            HiggsError::InternalFault {
+                context: "x".into(),
+                detail: "y".into()
+            }
+            .severity(),
+            Some(miette::Severity::Error)
+        );
+        assert_eq!(
+            HiggsError::ChatTaskFailed { detail: "y".into() }.severity(),
+            Some(miette::Severity::Error)
+        );
     }
 
     #[test]

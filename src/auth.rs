@@ -25,16 +25,43 @@ impl Allowlist {
     /// Load from `path`; a missing file is an empty allowlist. Other read errors
     /// (permissions, corruption) fail loudly rather than silently emptying it.
     pub fn load(path: &Path) -> std::io::Result<Self> {
+        // Return type stays io::Result (callers use `?`/`.ok()`); the HG code rides
+        // INSIDE the io::Error so its Display surfaces at the CLI/startup boundary.
         let file = match std::fs::read(path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
+            // Present but unparseable = corruption (HG041); distinct from I/O (HG040).
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    crate::diagnostic::HiggsError::StoreCorrupted {
+                        store: "pairings".into(),
+                        path: path.display().to_string(),
+                        detail: e.to_string(),
+                    },
+                )
+            })?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => PairingsFile::default(),
-            Err(e) => return Err(e),
+            Err(e) => {
+                let kind = e.kind();
+                return Err(std::io::Error::new(
+                    kind,
+                    crate::diagnostic::HiggsError::PersistenceFailed {
+                        store: "pairings".into(),
+                        path: path.display().to_string(),
+                        source: e,
+                    },
+                ));
+            }
         };
         Ok(Self {
             path: path.to_path_buf(),
             file,
         })
+    }
+
+    /// The on-disk path this allowlist persists to — for accurate diagnostics
+    /// (so an `HG040` persistence failure names the real `pairings.json`).
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Is this EndpointId (canonical string) paired?
@@ -251,6 +278,28 @@ mod tests {
         assert!(!allow.contains(&id_str()));
         assert!(allow.is_empty());
         assert!(allow.ids().is_empty(), "ids empty after removal");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_corrupt_pairings_is_hg041_with_remediation() {
+        // A present-but-unparseable pairings.json is corruption (HG041) — fail loudly
+        // with the code + "delete to reset" rather than silently emptying the allowlist.
+        let dir = std::env::temp_dir().join("higgs-allow-corrupt-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pairings.json");
+        std::fs::write(&path, b"not json at all").unwrap();
+        // `Allowlist` isn't `Debug`, so destructure rather than `unwrap_err()`.
+        let Err(err) = Allowlist::load(&path) else {
+            panic!("corrupt pairings must fail to load");
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let msg = err.to_string();
+        assert!(msg.contains("[HG041]"), "corruption carries HG041: {msg}");
+        assert!(
+            msg.contains("delete the file to reset"),
+            "carries the remediation: {msg}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

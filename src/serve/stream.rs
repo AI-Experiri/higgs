@@ -123,11 +123,15 @@ async fn assemble(
             ));
         }
         // JoinError: the chat task panicked or was aborted — not a HiggsError.
+        // Surface it as a coded HG044 so the SSE error envelope says what to do.
         Err(join_err) => {
-            tracing::warn!(error = %join_err, "higgs: chat task failed");
+            let e = crate::diagnostic::HiggsError::ChatTaskFailed {
+                detail: join_err.to_string(),
+            };
+            tracing::warn!(error = %e, "higgs: chat task failed");
             send(super::v1::v1_envelope_json(
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("chat task failed: {join_err}"),
+                super::http_status(&e),
+                &e.to_string(),
             ));
         }
     }

@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::diagnostic::HiggsError;
 use crate::worker::engine::LoadParams;
 
 /// The role an instance runs as. Fixes the friendly-name prefix (`hub-…` vs `node-…`) so a
@@ -174,11 +175,34 @@ impl InstanceConfig {
     /// Load from `path`; a missing file is the default (empty) config. Other read errors
     /// (permissions, corruption) fail loudly rather than silently resetting the instance name.
     pub fn load(path: &Path) -> std::io::Result<Self> {
+        // The return type stays io::Result (many `?`/`.ok()` callers); the HG code
+        // rides INSIDE the io::Error so its Display surfaces it at the CLI/startup.
         match std::fs::read(path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+            // Present but unparseable JSON = corruption (HG041) — distinct from an
+            // I/O error so the fix ("delete to reset") is unambiguous.
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    HiggsError::StoreCorrupted {
+                        store: "config".into(),
+                        path: path.display().to_string(),
+                        detail: e.to_string(),
+                    },
+                )
+            }),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(e),
+            // A real read I/O error (permissions, …) = HG040.
+            Err(e) => {
+                let kind = e.kind();
+                Err(std::io::Error::new(
+                    kind,
+                    HiggsError::PersistenceFailed {
+                        store: "config".into(),
+                        path: path.display().to_string(),
+                        source: e,
+                    },
+                ))
+            }
         }
     }
 
@@ -284,6 +308,23 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let cfg = InstanceConfig::load(&path).unwrap();
         assert!(cfg.name.is_empty());
+    }
+
+    #[test]
+    fn load_corrupt_config_is_hg041_with_remediation() {
+        // A present-but-unparseable config.json is corruption (HG041), NOT a missing
+        // file — so it fails loudly with the code + the "delete to reset" remediation.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, b"{ this is not json").unwrap();
+        let err = InstanceConfig::load(&path).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let msg = err.to_string();
+        assert!(msg.contains("[HG041]"), "corruption carries HG041: {msg}");
+        assert!(
+            msg.contains("delete the file to reset"),
+            "carries the remediation: {msg}"
+        );
     }
 
     fn hub(id: &str, ticket: &str, label: &str, ts: u64) -> SavedHub {

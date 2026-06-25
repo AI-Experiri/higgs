@@ -399,10 +399,14 @@ pub(super) async fn control_hub_enable(State(higgs): State<Arc<Higgs>>) -> Respo
             Json(hub_status(&higgs).await).into_response()
         }
         Err(e) => {
-            tracing::error!(error = %e, "higgs: hub enable failed");
+            let err = HiggsError::HubControlFailed {
+                op: "hub enable".into(),
+                detail: e.to_string(),
+            };
+            tracing::error!(error = %err, "higgs: hub enable failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("hub enable failed: {e}") })),
+                Json(serde_json::json!({ "error": err.to_string() })),
             )
                 .into_response()
         }
@@ -573,11 +577,17 @@ pub(super) async fn control_nodes_retire(
     };
     match hub.retire(&req.node).await {
         Ok(()) => Json(serde_json::json!({ "status": "ok" })).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": format!("retire failed: {e}") })),
-        )
-            .into_response(),
+        Err(e) => {
+            let err = HiggsError::HubControlFailed {
+                op: "retire".into(),
+                detail: e.to_string(),
+            };
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": err.to_string() })),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -604,11 +614,20 @@ pub(super) async fn control_nodes_label(
         // the hub accept loop re-reads it per admission so paired nodes learn the new `hub_name`.
         return match higgs.with_config_mut(|c| c.name = req.label.clone()) {
             Ok(()) => Json(serde_json::json!({ "status": "ok" })).into_response(),
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("rename failed: {e}") })),
-            )
-                .into_response(),
+            // The rename PERSISTS to config.json; a write failure is HG040 (the
+            // remediation — check disk/permissions — is the local operator's).
+            Err(e) => {
+                let err = HiggsError::PersistenceFailed {
+                    store: "config".into(),
+                    path: "config.json".into(),
+                    source: e,
+                };
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": err.to_string() })),
+                )
+                    .into_response()
+            }
         };
     }
     // Renaming a REMOTE node mutates the hub-owned allowlist, so it requires the hub enabled
@@ -630,14 +649,22 @@ pub(super) async fn control_nodes_label(
     let label = (!req.label.is_empty()).then(|| req.label.clone());
     match hub.set_label(&req.node, label).await {
         Ok(true) => Json(serde_json::json!({ "status": "ok" })).into_response(),
+        // Unknown node KEEPS its 404 (the one HG043 site that isn't a 500), but now
+        // carries the code so the body is classifiable like the rest.
         Ok(false) => (
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": format!("unknown node {}", req.node) })),
+            Json(serde_json::json!({ "error": HiggsError::HubControlFailed {
+                op: "label".into(),
+                detail: format!("unknown node {}", req.node),
+            }.to_string() })),
         )
             .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": format!("rename failed: {e}") })),
+            Json(serde_json::json!({ "error": HiggsError::HubControlFailed {
+                op: "label".into(),
+                detail: e.to_string(),
+            }.to_string() })),
         )
             .into_response(),
     }
@@ -822,7 +849,7 @@ pub(super) async fn control_version() -> Json<HiggsVersionResponse> {
 ///
 /// Gathering samples CPU load over a short interval, so it runs on a blocking
 /// thread to avoid stalling the async executor.
-pub(super) async fn control_system(State(higgs): State<Arc<Higgs>>) -> Json<SystemInfo> {
+pub(super) async fn control_system(State(higgs): State<Arc<Higgs>>) -> Response {
     tracing::info!("higgs: GET /api/higgs/system");
     // Snapshot the read-only server config (cheap lock, no I/O) on the async
     // thread, then move it into the blocking gather (which samples CPU load).
@@ -831,10 +858,17 @@ pub(super) async fn control_system(State(higgs): State<Arc<Higgs>>) -> Json<Syst
     // then fold them into the blocking hardware/runtime snapshot. An empty list
     // (no worker reachable) still yields a complete hardware/runtime response.
     let gpus = higgs.sysinfo().await;
-    let info = tokio::task::spawn_blocking(move || SystemInfo::gather(config, gpus))
-        .await
-        .expect("system info gather task");
-    Json(info)
+    // A panic INSIDE the blocking gather surfaces here as a JoinError. Rather than
+    // re-panic (`.expect`, aborting the request task), return a typed HG042 500 —
+    // a recoverable internal fault the caller can see and report.
+    match tokio::task::spawn_blocking(move || SystemInfo::gather(config, gpus)).await {
+        Ok(info) => Json(info).into_response(),
+        Err(e) => control_error(&HiggsError::InternalFault {
+            context: "system info gather".into(),
+            detail: e.to_string(),
+        })
+        .into_response(),
+    }
 }
 
 #[cfg(test)]

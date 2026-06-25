@@ -93,7 +93,9 @@ pub use wire::*;
 
 /// Map a `HiggsError` to its HTTP status — the single status table shared by
 /// both surfaces and the SSE path: HG002/HG003 → 404, HG005/HG013/HG015 → 400,
-/// HG006/HG007/HG014/HG017/HG018/HG019 → 503, HG016 → 504, else 500.
+/// HG006/HG007/HG014/HG017/HG018/HG019 → 503, HG016 → 504, HG037 → 501,
+/// HG038/HG039 → 502, and the internal/persistence/admin/chat-task faults
+/// (HG040–HG044) → 500 (the default).
 pub(crate) fn http_status(err: &HiggsError) -> StatusCode {
     match err {
         HiggsError::ModelNotFound { .. } | HiggsError::ModelNotLoaded { .. } => {
@@ -113,6 +115,13 @@ pub(crate) fn http_status(err: &HiggsError) -> StatusCode {
         | HiggsError::ServingDisabled => StatusCode::SERVICE_UNAVAILABLE,
         // A wedged-but-alive worker that didn't finish generation in time.
         HiggsError::ChatTimeout { .. } => StatusCode::GATEWAY_TIMEOUT,
+        // An unimplemented RPC method = a protocol this server doesn't speak → 501.
+        HiggsError::RpcMethodNotFound { .. } => StatusCode::NOT_IMPLEMENTED,
+        // An upstream PEER (a node/worker we relay to) misbehaved or rejected us —
+        // we are a faulty gateway to it, not the origin of the fault → 502.
+        HiggsError::ProtocolViolation { .. } | HiggsError::HubRequestRejected { .. } => {
+            StatusCode::BAD_GATEWAY
+        }
         // A worker-reported error carries the worker's origin diagnostic code;
         // map by it so a worker-side code (local OR propagated from a remote node)
         // reaches the client as its true status instead of a generic 500.
@@ -127,8 +136,14 @@ pub(crate) fn http_status(err: &HiggsError) -> StatusCode {
             }
             // HG016: a remote chat that timed out, propagated as a worker code.
             Some("HG016") => StatusCode::GATEWAY_TIMEOUT,
+            // Worker/node→hub→HTTP propagated codes keep their direct-arm status
+            // (explicit, not the 500 default, for parity).
+            Some("HG037") => StatusCode::NOT_IMPLEMENTED,
+            Some("HG038") => StatusCode::BAD_GATEWAY,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         },
+        // Internal faults (HG042), local persistence (HG040/HG041), fleet-admin
+        // (HG043), and an aborted chat task (HG044) are all server-side 500s.
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -690,6 +705,52 @@ mod tests {
             http_status(&HiggsError::ServingDisabled),
             StatusCode::SERVICE_UNAVAILABLE
         );
+        // Subsystem faults: unimplemented method → 501; a misbehaving/rejecting
+        // upstream peer → 502; internal/persistence/admin/chat-task → 500.
+        assert_eq!(
+            http_status(&HiggsError::RpcMethodNotFound {
+                endpoint: "node".into(),
+                method: "higgs/bogus".into()
+            }),
+            StatusCode::NOT_IMPLEMENTED
+        );
+        assert_eq!(
+            http_status(&HiggsError::ProtocolViolation {
+                peer_role: "node".into(),
+                detail: "x".into()
+            }),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            http_status(&HiggsError::HubRequestRejected {
+                stage: "hello".into(),
+                detail: "x".into()
+            }),
+            StatusCode::BAD_GATEWAY
+        );
+        for e in [
+            HiggsError::PersistenceFailed {
+                store: "config".into(),
+                path: "/x".into(),
+                source: std::io::Error::other("x"),
+            },
+            HiggsError::StoreCorrupted {
+                store: "config".into(),
+                path: "/x".into(),
+                detail: "x".into(),
+            },
+            HiggsError::InternalFault {
+                context: "x".into(),
+                detail: "y".into(),
+            },
+            HiggsError::HubControlFailed {
+                op: "retire".into(),
+                detail: "x".into(),
+            },
+            HiggsError::ChatTaskFailed { detail: "x".into() },
+        ] {
+            assert_eq!(http_status(&e), StatusCode::INTERNAL_SERVER_ERROR, "{e}");
+        }
     }
 
     #[test]
@@ -712,6 +773,12 @@ mod tests {
             http_status(&rpc(Some("HG018"))),
             StatusCode::SERVICE_UNAVAILABLE
         );
+        // Propagated subsystem codes keep their status through the worker_code hop.
+        assert_eq!(
+            http_status(&rpc(Some("HG037"))),
+            StatusCode::NOT_IMPLEMENTED
+        );
+        assert_eq!(http_status(&rpc(Some("HG038"))), StatusCode::BAD_GATEWAY);
         // Unknown / absent code falls back to 500.
         assert_eq!(
             http_status(&rpc(Some("HG011"))),

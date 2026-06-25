@@ -712,7 +712,14 @@ impl Higgs {
         if let Ok(store) = self.models_store() {
             store.set_profile(id, profile.clone(), now_unix_ms());
             if let Err(e) = store.flush() {
-                tracing::warn!(id, error = %e, "higgs: failed to persist accepted load profile to models.json");
+                // Best-effort (a load already succeeded), but log the coded HG040 so a
+                // recurring persistence problem is diagnosable from the warning.
+                let pe = HiggsError::PersistenceFailed {
+                    store: "models".into(),
+                    path: "models.json".into(),
+                    source: e,
+                };
+                tracing::warn!(id, error = %pe, "higgs: failed to persist accepted load profile");
             }
         }
     }
@@ -1294,7 +1301,12 @@ impl Higgs {
                     },
                 );
                 if let Err(e) = store.flush() {
-                    tracing::warn!(id, error = %e, "higgs: failed to persist tuning to models.json");
+                    let pe = HiggsError::PersistenceFailed {
+                        store: "models".into(),
+                        path: "models.json".into(),
+                        source: e,
+                    };
+                    tracing::warn!(id, error = %pe, "higgs: failed to persist tuning");
                 }
             }
         }

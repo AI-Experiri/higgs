@@ -66,13 +66,16 @@ fn serve_state(mut state: WorkerState, reader: impl BufRead, mut writer: impl Wr
             Ok(_) => {} // worker never receives responses/notifications
             Err(e) => {
                 // Decode failure has no id: JSON-RPC null-id convention, we use 0.
+                // Keep the -32700 "parse error" numeric code, but ride the
+                // HiggsError's origin code (HG008) in `data.code` so the supervisor
+                // surfaces a classifiable reason instead of a bare string.
                 respond(
                     &mut writer,
                     0,
                     Err(RpcError {
                         code: -32700,
                         message: e.to_string(),
-                        data: None,
+                        data: e.code().map(|c| json!({ "code": c.to_string() })),
                     }),
                 );
             }
@@ -156,11 +159,9 @@ impl WorkerState {
                 engine::llamacpp::logging::set_engine_verbose(verbose);
                 Ok(json!({}))
             }
-            other => Err(RpcError {
-                code: -32601,
-                message: format!("unknown method {other}"),
-                data: None,
-            }),
+            // An unknown method = a protocol skew (HG037, → 501): the shared helper
+            // keeps the JSON-RPC -32601 code and rides HG037 in data.code.
+            other => Err(crate::rpc::method_not_found("worker", other)),
         }
     }
 
@@ -533,11 +534,18 @@ mod tests {
         };
         assert_eq!(resp.id, 2);
         let err = resp.error.as_ref().expect("expected error");
-        assert_eq!(err.code, -32601);
+        assert_eq!(err.code, -32601, "keeps the JSON-RPC method-not-found code");
         assert!(
-            err.message.contains("unknown method"),
+            err.message.contains("unknown RPC method"),
             "message was: {}",
             err.message
+        );
+        // The HG037 origin code now rides in data so the boundary can classify it (501).
+        assert_eq!(
+            err.data.as_ref().and_then(|d| d.get("code")),
+            Some(&json!("HG037")),
+            "method-not-found carries the HG037 code: {:?}",
+            err.data
         );
     }
 

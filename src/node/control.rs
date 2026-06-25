@@ -15,6 +15,10 @@ use crate::remote::{
 use crate::rpc::{RpcError, RpcRequest, RpcResponse};
 
 /// JSON-RPC error codes used by the control plane (mirrors the worker wire).
+/// `-32601` (method-not-found) is now produced by the shared `rpc::method_not_found`
+/// helper (which also rides the HG037 code); the named constant remains only for the
+/// test that asserts the wire code.
+#[cfg(test)]
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 const INTERNAL_ERROR: i64 = -32000;
@@ -77,12 +81,12 @@ pub async fn dispatch_node_control(rt: &NodeRuntime, req: RpcRequest) -> RpcResp
                 detail: "this build ships no updater".into(),
             },
         ),
-        other => err(
-            id,
-            METHOD_NOT_FOUND,
-            format!("unknown control method {other}"),
-            None,
-        ),
+        // Unknown method = a protocol skew (HG037, → 501); reuse the shared helper's
+        // message + data.code, keeping the -32601 numeric code.
+        other => {
+            let mnf = crate::rpc::method_not_found("node", other);
+            err(id, mnf.code, mnf.message, mnf.data)
+        }
     }
 }
 

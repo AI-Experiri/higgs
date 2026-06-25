@@ -347,6 +347,23 @@ pub async fn dial_and_hello(
     Ok(result)
 }
 
+/// Surface a hub's error reply to a node request (HELLO / leave) as an `io::Error`.
+/// The hub almost always classified its OWN rejection (`[HG023]` version → "update",
+/// `[HG024]` not-allowlisted, `[HG022]` token invalid, `[HG040]` persistence →
+/// "check disk", …) — that code+remediation is MORE specific than a generic "hub
+/// rejected", so it is preserved verbatim. Only a bare/uncoded rejection falls back
+/// to `HG039 HubRequestRejected` for `stage`, so the node always shows SOME code.
+fn hub_rejection(stage: &str, err: crate::rpc::RpcError) -> std::io::Error {
+    if err.message.contains("[HG") {
+        std::io::Error::other(err.message)
+    } else {
+        std::io::Error::other(HiggsError::HubRequestRejected {
+            stage: stage.to_owned(),
+            detail: err.message,
+        })
+    }
+}
+
 /// Node side: dial `target`, open the control bi-stream, send HELLO first (satisfying
 /// iroh's "opener writes first" rule), await the hub's HELLO result, and return the LIVE
 /// connection so a persistent node can then [`serve_node`] the hub's control RPCs.
@@ -401,15 +418,19 @@ pub async fn connect_node(
     let result = match rpc::decode(&line).map_err(Error::other)? {
         RpcFrame::Response(resp) => {
             if let Some(err) = resp.error {
-                return Err(Error::other(format!("hub rejected HELLO: {}", err.message)));
+                // Preserve the hub's specific code (version/allowlist/persistence);
+                // only an uncoded rejection becomes the generic HG039.
+                return Err(hub_rejection("hello", err));
             }
             serde_json::from_value::<HelloResult>(resp.result.unwrap_or_default())
                 .map_err(Error::other)?
         }
+        // The hub sent something other than a response to our HELLO (HG038).
         other => {
-            return Err(Error::other(format!(
-                "unexpected reply frame to HELLO: {other:?}"
-            )))
+            return Err(Error::other(HiggsError::ProtocolViolation {
+                peer_role: "hub".into(),
+                detail: format!("unexpected reply frame to HELLO: {other:?}"),
+            }))
         }
     };
     Ok((conn, result))
@@ -450,12 +471,16 @@ pub async fn send_leave(conn: &Connection) -> std::io::Result<()> {
     };
     match rpc::decode(&line).map_err(Error::other)? {
         RpcFrame::Response(resp) => match resp.error {
-            Some(err) => Err(Error::other(format!("hub rejected leave: {}", err.message))),
+            // Preserve the hub's specific code (e.g. HG040 persistence → "check disk");
+            // only an uncoded rejection becomes the generic HG039.
+            Some(err) => Err(hub_rejection("leave", err)),
             None => Ok(()),
         },
-        other => Err(Error::other(format!(
-            "unexpected reply to leave: {other:?}"
-        ))),
+        // The hub sent something other than a response to our leave (HG038).
+        other => Err(Error::other(HiggsError::ProtocolViolation {
+            peer_role: "hub".into(),
+            detail: format!("unexpected reply to leave: {other:?}"),
+        })),
     }
 }
 
@@ -544,15 +569,13 @@ async fn handle_node_stream(
                 _ = send.stopped() => return,
             }
         } else {
+            // Unknown method = a protocol skew (HG037, → 501): the shared helper keeps
+            // -32601 and rides HG037 in data.code.
             RpcResponse {
                 jsonrpc: "2.0".into(),
                 id: req.id,
                 result: None,
-                error: Some(RpcError {
-                    code: -32601,
-                    message: format!("unknown method {}", req.method),
-                    data: None,
-                }),
+                error: Some(crate::rpc::method_not_found("node", &req.method)),
             }
         };
         if write_frame(&mut send, &RpcFrame::Response(resp))

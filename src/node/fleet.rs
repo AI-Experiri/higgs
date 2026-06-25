@@ -676,8 +676,9 @@ impl HubFleet {
             Err(e) => return Err(self.handle_op_error(node, &transport, e).await),
         };
         let inventory: NodeInventory =
-            serde_json::from_value(value).map_err(|e| HiggsError::WorkerDead {
-                context: format!("node inventory decode failed: {e}"),
+            serde_json::from_value(value).map_err(|e| HiggsError::ProtocolViolation {
+                peer_role: "node".into(),
+                detail: format!("M_NODE_INVENTORY reply did not decode: {e}"),
             })?;
         // Commit only if no lifecycle op superseded us (the check+store is one message).
         self.ask(|reply| FleetMsg::CommitInventory {
@@ -975,11 +976,13 @@ fn parse_worker_id(reply: &serde_json::Value) -> Result<u32, HiggsError> {
     let raw = reply
         .get("worker_id")
         .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| HiggsError::WorkerDead {
-            context: "node load reply missing worker_id".into(),
+        .ok_or_else(|| HiggsError::ProtocolViolation {
+            peer_role: "node".into(),
+            detail: "M_NODE_LOAD reply missing worker_id".into(),
         })?;
-    u32::try_from(raw).map_err(|_| HiggsError::WorkerDead {
-        context: format!("node load reply worker_id {raw} out of u32 range"),
+    u32::try_from(raw).map_err(|_| HiggsError::ProtocolViolation {
+        peer_role: "node".into(),
+        detail: format!("M_NODE_LOAD reply worker_id {raw} out of u32 range"),
     })
 }
 

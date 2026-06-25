@@ -300,15 +300,13 @@ async fn serve_node_requests(
             _ => continue,
         };
         if req.method != crate::remote::M_NODE_LEAVE {
+            // Unknown request = a protocol skew (HG037, → 501): the shared helper
+            // keeps -32601 and rides HG037 in data.code.
             let resp = RpcResponse {
                 jsonrpc: "2.0".into(),
                 id: req.id,
                 result: None,
-                error: Some(RpcError {
-                    code: -32601,
-                    message: format!("unknown node request {}", req.method),
-                    data: None,
-                }),
+                error: Some(crate::rpc::method_not_found("hub", &req.method)),
             };
             let _ = write_frame(&mut send, &RpcFrame::Response(resp)).await;
             let _ = send.finish();
@@ -325,7 +323,13 @@ async fn serve_node_requests(
         // the leaving node token-free in the gap. And it is crash-safe — the durable removal is
         // persisted before the ack, so a hub crash before `fleet.retire` still leaves the node
         // gone (it is no longer seeded from the allowlist on restart).
-        let durable = { allow.lock().await.remove(&peer) };
+        // Capture the allowlist's REAL on-disk path alongside the removal, so an
+        // HG040 persistence failure below names the actual `pairings.json` (not a guess).
+        let (durable, pairings_path) = {
+            let mut g = allow.lock().await;
+            let path = g.path().display().to_string();
+            (g.remove(&peer), path)
+        };
         let resp = match &durable {
             Ok(()) => RpcResponse {
                 jsonrpc: "2.0".into(),
@@ -333,16 +337,26 @@ async fn serve_node_requests(
                 result: Some(serde_json::json!({ "status": "left" })),
                 error: None,
             },
-            Err(e) => RpcResponse {
-                jsonrpc: "2.0".into(),
-                id: req.id,
-                result: None,
-                error: Some(RpcError {
-                    code: -32000,
-                    message: format!("leave failed: {e}"),
-                    data: None,
-                }),
-            },
+            // The removal PERSISTS to the pairings store; a failure there (HG040) is
+            // why the node's leave can't be confirmed — the node keeps its saved hub.
+            // The remediation (check disk/permissions) is the hub operator's.
+            Err(e) => {
+                let pe = crate::diagnostic::HiggsError::PersistenceFailed {
+                    store: "pairings".into(),
+                    path: pairings_path,
+                    source: std::io::Error::new(e.kind(), e.to_string()),
+                };
+                RpcResponse {
+                    jsonrpc: "2.0".into(),
+                    id: req.id,
+                    result: None,
+                    error: Some(RpcError {
+                        code: -32000,
+                        message: pe.to_string(),
+                        data: crate::node::worker_origin_code_data(&pe),
+                    }),
+                }
+            }
         };
         let _ = write_frame(&mut send, &RpcFrame::Response(resp)).await;
         let _ = send.finish();

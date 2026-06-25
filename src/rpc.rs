@@ -70,6 +70,26 @@ pub enum RpcFrame {
     Notification(RpcNotification),
 }
 
+/// Build a JSON-RPC "method not found" (`-32601`) error that carries the `HG037`
+/// origin code in `data.code`, so the receiving supervisor/hub/HTTP boundary can
+/// classify it (→ 501) instead of treating it as a transport fault. Shared by the
+/// worker, node-control, and hub dispatchers — `endpoint` names which side rejected
+/// the call (`worker`/`node`/`hub`).
+pub fn method_not_found(endpoint: &str, method: &str) -> RpcError {
+    use miette::Diagnostic;
+    let e = HiggsError::RpcMethodNotFound {
+        endpoint: endpoint.to_owned(),
+        method: method.to_owned(),
+    };
+    RpcError {
+        code: -32601,
+        message: e.to_string(),
+        data: e
+            .code()
+            .map(|c| serde_json::json!({ "code": c.to_string() })),
+    }
+}
+
 /// Encode one frame as a single NDJSON line (no trailing newline included).
 pub fn encode(frame: &RpcFrame) -> String {
     match frame {
