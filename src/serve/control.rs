@@ -24,6 +24,7 @@ use crate::api::Higgs;
 use crate::diagnostic::HiggsError;
 use crate::log_bus::LogSource;
 use crate::system::SystemInfo;
+use crate::worker::engine::llamacpp::params::LlamaCppParams;
 use crate::worker::engine::LoadParams;
 use crate::worker::models::HiggsModel;
 use crate::LLAMA_CPP_2_VERSION;
@@ -217,11 +218,16 @@ pub(super) async fn control_load(
         || req.type_k.is_some()
         || req.type_v.is_some()
         || req.seed.is_some();
-    let params = if !any_pinned {
+    let params = if let Some(full) = req.params.clone() {
+        // The full engine-tagged params (an accepted [Tune params] suggestion, or
+        // a complete manual edit) supersede the flat fields and are used as-is.
+        Some(full)
+    } else if !any_pinned {
         None
     } else {
         let base = higgs.default_load();
-        Some(LoadParams {
+        let base = base.as_llamacpp();
+        Some(LoadParams::llamacpp(LlamaCppParams {
             ctx_len: req.ctx_len.unwrap_or(base.ctx_len),
             gpu_layers: req.gpu_layers.unwrap_or(base.gpu_layers),
             threads: req.threads.unwrap_or(base.threads),
@@ -236,7 +242,8 @@ pub(super) async fn control_load(
             type_k: req.type_k,
             type_v: req.type_v,
             seed: req.seed,
-        })
+            ..Default::default()
+        }))
     };
     let started = std::time::Instant::now();
     match higgs.load(&req.id, params).await {
@@ -263,6 +270,25 @@ pub(super) async fn control_load(
             // `error = %err` carries the full typed reason (worker RPC → HG004
             // engine-load failure → llama.cpp detail); the log layer appends it.
             tracing::warn!(id = %req.id, error = %err, "higgs: load failed");
+            control_error(&err).into_response()
+        }
+    }
+}
+
+/// `POST /api/higgs/models/tune` — compute suggested load + sampling params for a
+/// model (the model id is in the BODY, matching `/models/load`; higgs ids are
+/// slashed/colon'd so a path id is infeasible). FILLS the editable fields; it
+/// never loads. Persists the suggestion as the saved profile so the next plain
+/// load reuses it.
+pub(super) async fn control_tune(
+    State(higgs): State<Arc<Higgs>>,
+    Json(req): Json<crate::tune::TuneRequest>,
+) -> Response {
+    tracing::info!(id = %req.id, "higgs: POST /api/higgs/models/tune");
+    match higgs.tune(req).await {
+        Ok(suggestion) => Json(suggestion).into_response(),
+        Err(err) => {
+            tracing::warn!(error = %err, "higgs: tune failed");
             control_error(&err).into_response()
         }
     }
@@ -832,6 +858,11 @@ mod tests {
             source: crate::worker::models::HiggsModelSource::LmStudio,
             arch: None,
             ctx_train: None,
+            block_count: None,
+            head_count: None,
+            head_count_kv: None,
+            embedding_length: None,
+            expert_count: None,
             has_chat_template: template.is_some(),
             supports_tools: false,
             supports_reasoning: false,

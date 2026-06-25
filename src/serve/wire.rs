@@ -217,6 +217,16 @@ higgs_ts! {
         #[ts(type = "number")]
         #[ts(optional)]
         pub idle_ttl_minutes: Option<u64>,
+        /// The FULL engine load params, as the engine-tagged [`LoadParams`] umbrella
+        /// (`{"engine":"LlamaCpp", …}`) — an accepted autotune suggestion or a manual
+        /// edit of the complete §4/§5 surface. When present it SUPERSEDES the flat
+        /// fields above (kept for back-compat); its base fields are used as-is. This
+        /// is what the frontend sends after `[Tune params]` fills the pane — and the
+        /// engine tag means a future MLX engine sends `{"engine":"Mlx", …}` here
+        /// without a new wire field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub params: Option<LoadParams>,
     }
 }
 

@@ -52,6 +52,38 @@ higgs_ts! {
     #[ts(type = "number")]
     #[ts(optional)]
     pub ctx_train: Option<u64>,
+    /// Transformer block count (`{arch}.block_count`) from the GGUF header — the
+    /// number of layers, used by the autotune KV-cache VRAM estimate. `None` when
+    /// the header could not be read or the field is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number")]
+    #[ts(optional)]
+    pub block_count: Option<u32>,
+    /// Attention query-head count (`{arch}.attention.head_count`). Used with
+    /// `embedding_length` to derive `head_dim` for the KV estimate. `None` when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number")]
+    #[ts(optional)]
+    pub head_count: Option<u32>,
+    /// Attention KV/GQA head count (`{arch}.attention.head_count_kv`) — the
+    /// grouped-query KV head count, which is what sizes the KV cache (NOT the query
+    /// `head_count`, which over-estimates KV by the GQA factor). `None` when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number")]
+    #[ts(optional)]
+    pub head_count_kv: Option<u32>,
+    /// Embedding/hidden size (`{arch}.embedding_length`). With `head_count` gives
+    /// `head_dim = embedding_length / head_count`. `None` when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number")]
+    #[ts(optional)]
+    pub embedding_length: Option<u32>,
+    /// Number of MoE experts (`{arch}.expert_count`); `0`/absent for dense models.
+    /// Drives the autotune `cpu_moe` back-off decision. `None` when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number")]
+    #[ts(optional)]
+    pub expert_count: Option<u32>,
     /// Whether `tokenizer.chat_template` is present in the GGUF header.
     /// `false` when the header could not be read.
     pub has_chat_template: bool,
@@ -101,6 +133,11 @@ impl HiggsModel {
             source,
             arch: None,
             ctx_train: None,
+            block_count: None,
+            head_count: None,
+            head_count_kv: None,
+            embedding_length: None,
+            expert_count: None,
             has_chat_template: false,
             supports_tools: false,
             supports_reasoning: false,
@@ -185,6 +222,21 @@ fn enrich_gguf_metadata(model: &mut HiggsModel) {
     let arch = gguf.general_architecture().ok().map(ToString::to_string);
     model.arch = arch.clone();
     model.ctx_train = gguf.llm_context_length().ok().map(|n| n as u64);
+    // Typed tuning fields (arch-scoped). Read the GQA KV head count
+    // (`attention.head_count_kv`) — the KV-cache size driver — NOT the query
+    // `head_count`, which over-estimates KV by the GQA factor.
+    if let Some(a) = arch.as_deref() {
+        let read_u32 = |suffix: &str| {
+            gguf.get_usize(&format!("{a}.{suffix}"))
+                .ok()
+                .map(|n| n as u32)
+        };
+        model.block_count = read_u32("block_count");
+        model.head_count = read_u32("attention.head_count");
+        model.head_count_kv = read_u32("attention.head_count_kv");
+        model.embedding_length = read_u32("embedding_length");
+        model.expert_count = read_u32("expert_count");
+    }
     // Read the embedded chat template once and derive capabilities from it
     // (the template is the GGUF's own declaration of how it talks).
     let template = gguf.tokenizer_chat_template().ok();
@@ -1085,6 +1137,43 @@ mod tests {
         out.extend_from_slice(&(b.len() as u64).to_le_bytes());
         out.extend_from_slice(b);
         out
+    }
+
+    /// The typed tuning fields (block_count, head_count, head_count_kv,
+    /// embedding_length, expert_count) are parsed from the arch-scoped GGUF keys.
+    /// Critically `head_count_kv` is the GQA KV head count (8 here), NOT the query
+    /// `head_count` (32) — the autotune KV-cache estimate rests on this distinction.
+    #[test]
+    fn enrich_extracts_typed_tuning_fields() {
+        use ggus::GGufMetaDataValueType::{String as GS, U32};
+        let model = scan_single_gguf(
+            &[
+                ("general.architecture", GS, gguf_str("llama")),
+                ("llama.block_count", U32, 32u32.to_le_bytes().to_vec()),
+                (
+                    "llama.attention.head_count",
+                    U32,
+                    32u32.to_le_bytes().to_vec(),
+                ),
+                (
+                    "llama.attention.head_count_kv",
+                    U32,
+                    8u32.to_le_bytes().to_vec(),
+                ),
+                (
+                    "llama.embedding_length",
+                    U32,
+                    4096u32.to_le_bytes().to_vec(),
+                ),
+                ("llama.expert_count", U32, 0u32.to_le_bytes().to_vec()),
+            ],
+            "org/m/model-Q4_K_M.gguf",
+        );
+        assert_eq!(model.block_count, Some(32));
+        assert_eq!(model.head_count, Some(32));
+        assert_eq!(model.head_count_kv, Some(8), "GQA KV head count, not 32");
+        assert_eq!(model.embedding_length, Some(4096));
+        assert_eq!(model.expert_count, Some(0));
     }
 
     /// A chat template referencing `tool_call`/`tools` and `<think>` must set

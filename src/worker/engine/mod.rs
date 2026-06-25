@@ -26,7 +26,10 @@ use crate::diagnostic::HiggsError;
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GenParams {
     pub max_tokens: usize,
-    pub temperature: f32,
+    /// The full sampler set for this request (engine umbrella; the `LlamaCpp`
+    /// variant carries temperature/top_k/top_p/min_p/penalties/…). The decode loop
+    /// builds the ordered `LlamaSampler` chain from it. `temperature <= 0` ⇒ greedy.
+    pub sampling: SamplingParams,
     /// OpenAI-compatible `tools` array serialized to a JSON string, or `None`
     /// when the request carries no tools. Fed verbatim to the GGUF chat
     /// template alongside the messages; the crate's vendored `common_chat`
@@ -36,86 +39,94 @@ pub struct GenParams {
 }
 
 higgs_ts! {
-    /// Parameters fixed at load time.
+    /// Engine-tagged **load-parameter umbrella**. `LoadParams::LlamaCpp(LlamaCppParams)`
+    /// today; a future `Mlx(MlxParams)` slots beside it. "All are `LoadParams`."
     ///
-    /// The three base fields (`ctx_len`/`gpu_layers`/`threads`) are always
-    /// present — the quick-load / `default_load` path fills them. Every other
-    /// field is `Option`: absent (`None`) means "use the engine default", which
-    /// reproduces the pre-expansion behavior exactly. Each optional maps to a
-    /// real `llama-cpp-2` 0.1.139 builder call, applied only inside `llamacpp.rs`
-    /// (the sole file allowed to name `llama_cpp_2`).
-    #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
-    #[serde(default)]
-    pub struct LoadParams {
-        #[ts(type = "number")]
-        pub ctx_len: u32,
-        /// Layers offloaded to GPU; u32::MAX = all (LM Studio "max" semantics).
-        #[ts(type = "number")]
-        pub gpu_layers: u32,
-        #[ts(type = "number")]
-        pub threads: u32,
-        /// Memory-map the GGUF instead of reading it into RAM. `None` = engine
-        /// default. Applied via `LlamaModelParams::with_use_mmap`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[ts(optional)]
-        pub use_mmap: Option<bool>,
-        /// Lock model pages in RAM (prevent swap). `None` = engine default.
-        /// Applied via `LlamaModelParams::with_use_mlock`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[ts(optional)]
-        pub use_mlock: Option<bool>,
-        /// Logical batch size for prompt decode. `None` keeps the current
-        /// default (`ctx_len.max(1)` — one-shot prefill). Applied via
-        /// `LlamaContextParams::with_n_batch`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[ts(type = "number")]
-        #[ts(optional)]
-        pub n_batch: Option<u32>,
-        /// Physical (micro) batch size. `None` = engine default. Applied via
-        /// `LlamaContextParams::with_n_ubatch`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[ts(type = "number")]
-        #[ts(optional)]
-        pub n_ubatch: Option<u32>,
-        /// Offload the KV cache & KQV ops to the GPU. `None` = engine default.
-        /// Applied via `LlamaContextParams::with_offload_kqv`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[ts(optional)]
-        pub offload_kqv: Option<bool>,
-        /// RoPE base frequency override. `None` = use the GGUF's trained value.
-        /// Applied via `LlamaContextParams::with_rope_freq_base`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[ts(type = "number")]
-        #[ts(optional)]
-        pub rope_freq_base: Option<f32>,
-        /// RoPE frequency scale (context extension). `None` = trained value.
-        /// Applied via `LlamaContextParams::with_rope_freq_scale`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[ts(type = "number")]
-        #[ts(optional)]
-        pub rope_freq_scale: Option<f32>,
-        /// Flash-attention policy. `None` = engine default. Applied via
-        /// `LlamaContextParams::with_flash_attention_policy`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[ts(optional)]
-        pub flash_attn: Option<FlashAttn>,
-        /// KV cache key data type. `None` = engine default (F16). Applied via
-        /// `LlamaContextParams::with_type_k`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[ts(optional)]
-        pub type_k: Option<KvCacheKind>,
-        /// KV cache value data type. `None` = engine default (F16). Applied via
-        /// `LlamaContextParams::with_type_v`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[ts(optional)]
-        pub type_v: Option<KvCacheKind>,
-        /// Sampler RNG seed. `None` keeps the current behavior: a fresh random
-        /// seed per request (`LlamaSampler::dist(rand::random())`). When set,
-        /// generation is reproducible. Greedy decoding (temperature 0) ignores it.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[ts(type = "number")]
-        #[ts(optional)]
-        pub seed: Option<u32>,
+    /// Serialized **internally tagged** on the `engine` field, so the JSON is the
+    /// flattened llama.cpp payload plus `"engine":"LlamaCpp"`. The worker dispatches
+    /// on the variant; the suggester (`src/tune/`) derives the concrete payload.
+    /// The concrete fields live in [`llamacpp::params::LlamaCppParams`] (full
+    /// `llama-cpp-2` 0.1.139 coverage) — applied only inside `llamacpp/mod.rs`.
+    #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+    #[serde(tag = "engine")]
+    pub enum LoadParams {
+        /// The llama.cpp engine's load parameters.
+        LlamaCpp(llamacpp::params::LlamaCppParams),
+    }
+}
+
+impl Default for LoadParams {
+    fn default() -> Self {
+        LoadParams::LlamaCpp(llamacpp::params::LlamaCppParams::default())
+    }
+}
+
+impl LoadParams {
+    /// Wrap llama.cpp params in the umbrella.
+    pub fn llamacpp(p: llamacpp::params::LlamaCppParams) -> Self {
+        LoadParams::LlamaCpp(p)
+    }
+
+    /// Build the umbrella from just the three base llama.cpp fields (the
+    /// quick-load shape; every optional left at its engine default).
+    pub fn base(ctx_len: u32, gpu_layers: u32, threads: u32) -> Self {
+        LoadParams::LlamaCpp(llamacpp::params::LlamaCppParams::base(
+            ctx_len, gpu_layers, threads,
+        ))
+    }
+
+    /// The llama.cpp payload (the only engine variant today).
+    pub fn as_llamacpp(&self) -> &llamacpp::params::LlamaCppParams {
+        match self {
+            LoadParams::LlamaCpp(p) => p,
+        }
+    }
+
+    /// Base-field accessor: context window in tokens.
+    pub fn ctx_len(&self) -> u32 {
+        self.as_llamacpp().ctx_len
+    }
+
+    /// Base-field accessor: GPU layers (`u32::MAX` = all).
+    pub fn gpu_layers(&self) -> u32 {
+        self.as_llamacpp().gpu_layers
+    }
+
+    /// Base-field accessor: generation threads.
+    pub fn threads(&self) -> u32 {
+        self.as_llamacpp().threads
+    }
+}
+
+higgs_ts! {
+    /// Engine-tagged **sampling-parameter umbrella**, mirroring [`LoadParams`].
+    /// `SamplingParams::LlamaCpp(LlamaCppSamplingParams)` today. Carried by
+    /// [`GenParams`] and persisted alongside a tuning profile.
+    #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+    #[serde(tag = "engine")]
+    pub enum SamplingParams {
+        /// The llama.cpp engine's sampler parameters.
+        LlamaCpp(llamacpp::params::LlamaCppSamplingParams),
+    }
+}
+
+impl Default for SamplingParams {
+    fn default() -> Self {
+        SamplingParams::LlamaCpp(llamacpp::params::LlamaCppSamplingParams::default())
+    }
+}
+
+impl SamplingParams {
+    /// Wrap llama.cpp sampling params in the umbrella.
+    pub fn llamacpp(p: llamacpp::params::LlamaCppSamplingParams) -> Self {
+        SamplingParams::LlamaCpp(p)
+    }
+
+    /// The llama.cpp payload (the only engine variant today).
+    pub fn as_llamacpp(&self) -> &llamacpp::params::LlamaCppSamplingParams {
+        match self {
+            SamplingParams::LlamaCpp(p) => p,
+        }
     }
 }
 

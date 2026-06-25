@@ -42,16 +42,19 @@ pub fn hf_url(repo: &str, revision: &str, file: &str) -> String {
     format!("{base}/{repo}/resolve/{revision}/{file}")
 }
 
-/// A byte source for [`download`]. Streams `url`, handing each chunk to `on_chunk` and
-/// reporting `(downloaded, total_opt)` to `progress`. Returns the engine/network error
-/// string on failure (mapped to `HG025` by the caller).
+/// A byte source for [`download`]. Streams the bytes of `target`, handing each chunk to
+/// `on_chunk` and reporting `(downloaded, total_opt)` to `progress`. Returns a CLASSIFIED
+/// [`HiggsError`] on failure (the specific `HG029`–`HG035` code), which [`download`]
+/// propagates verbatim — so a 404 vs an auth refusal vs a network blip stays distinguishable
+/// all the way up. Implementors resolve their own endpoint from `target` (the hub client from
+/// the repo handle; [`HttpFetcher`] from the `resolve` URL).
 pub trait Fetcher {
     fn fetch(
         &self,
-        url: &str,
+        target: &PullTarget,
         on_chunk: &mut (dyn FnMut(&[u8]) + Send),
         progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
-    ) -> impl std::future::Future<Output = Result<(), String>> + Send;
+    ) -> impl std::future::Future<Output = Result<(), HiggsError>> + Send;
 }
 
 /// Resolve the on-disk destination under `models_root`, enforcing the layout the model
@@ -107,33 +110,88 @@ fn is_safe_segment(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
-/// Download `target` into `models_root` via `fetcher`, streaming progress to `progress`.
-/// Returns the final on-disk path. Atomic: writes a `.part` temp and renames on success.
+/// Where a [`download`] attempt failed, by SOURCE — so [`download_dual`] can decide whether a
+/// fallback retry could possibly help. The DISTINCTION IS THE SOURCE, NOT THE ERROR VARIANT:
+/// the `HG034` (`HubFileWrite`) code is overloaded — `download`'s OWN write into
+/// `~/.higgs/models` is `Local` (deterministic; a retry fails identically), but the hub
+/// client's cache I/O surfaces the SAME code through the fetcher and is `Fetcher` (the direct
+/// `reqwest` fallback bypasses that cache and may still succeed). A variant-only heuristic
+/// can't tell those apart; this enum carries the source down from where it's known.
+enum AttemptError {
+    /// `download`'s own pre/around-fetch failure (wire-validation `HG025`, or a local
+    /// filesystem `HG034`). Deterministic — `download_dual` returns it verbatim, no retry.
+    Local(HiggsError),
+    /// The fetcher failed (classified `HG029`–`HG035`, incl. the hub client's own I/O).
+    /// Eligible for the dual-path fallback.
+    Fetcher(HiggsError),
+}
+
+impl AttemptError {
+    /// The underlying error, discarding the source tag (for the single-fetcher `download`).
+    fn into_inner(self) -> HiggsError {
+        match self {
+            AttemptError::Local(e) | AttemptError::Fetcher(e) => e,
+        }
+    }
+}
+
+/// Download `target` into `models_root` via a SINGLE `fetcher`, streaming progress to
+/// `progress`. Returns the final on-disk path. Atomic + self-contained: writes its OWN
+/// unique `.part` temp and renames on success, removing the temp on ANY failure — so it is
+/// safe to call repeatedly (the dual-path retry in [`download_dual`] just calls it twice).
+///
+/// Error mapping: wire-validation (bad repo/file/revision) stays `HG025`; the fetcher's
+/// CLASSIFIED error (`HG029`–`HG035`) is propagated verbatim; a local filesystem error
+/// (temp create / write / fsync / rename) is `HG034` (`HubFileWrite`).
 pub async fn download<F: Fetcher>(
     target: &PullTarget,
     models_root: &Path,
     fetcher: &F,
     progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
 ) -> Result<PathBuf, HiggsError> {
-    let fail = |detail: String| HiggsError::DownloadFailed {
-        repo: target.repo.clone(),
-        file: target.file.clone(),
-        detail,
+    download_attempt(target, models_root, fetcher, progress)
+        .await
+        .map_err(AttemptError::into_inner)
+}
+
+/// [`download`] but tagging each failure with its [`AttemptError`] source, for [`download_dual`].
+async fn download_attempt<F: Fetcher>(
+    target: &PullTarget,
+    models_root: &Path,
+    fetcher: &F,
+    progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
+) -> Result<PathBuf, AttemptError> {
+    // Wire-validation failures (bad repo/file/revision shape) — HG025, always LOCAL.
+    let bad_request = |detail: String| {
+        AttemptError::Local(HiggsError::DownloadFailed {
+            repo: target.repo.clone(),
+            file: target.file.clone(),
+            detail,
+        })
+    };
+    // OUR OWN filesystem failures (temp / write / fsync / rename into ~/.higgs/models) — HG034,
+    // always LOCAL (a fallback's write to the same dir fails identically).
+    let fs_fail = |detail: String| {
+        AttemptError::Local(HiggsError::HubFileWrite {
+            repo: target.repo.clone(),
+            file: target.file.clone(),
+            detail,
+        })
     };
 
-    let dest = dest_path(models_root, &target.repo, &target.file)?;
+    let dest = dest_path(models_root, &target.repo, &target.file).map_err(AttemptError::Local)?;
     // The revision rides the URL path too but isn't part of the local dest, so validate it
     // here: each `/`-separated segment must be safe (allows branch paths like `refs/pr/1`),
     // keeping reserved chars out of the resolve URL.
     if !target.revision.split('/').all(is_safe_segment) {
-        return Err(fail(format!(
+        return Err(bad_request(format!(
             "invalid revision {:?} (segments must be [A-Za-z0-9._-])",
             target.revision
         )));
     }
 
     if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| fail(e.to_string()))?;
+        std::fs::create_dir_all(parent).map_err(|e| fs_fail(e.to_string()))?;
     }
     // A UNIQUE temp per download (pid + process-global counter), so two concurrent pulls to
     // the same destination never share a `.part` and corrupt each other; the last atomic
@@ -141,9 +199,8 @@ pub async fn download<F: Fetcher>(
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = dest.with_extension(format!("part.{}.{n}", std::process::id()));
-    let url = hf_url(&target.repo, &target.revision, &target.file);
 
-    let mut file = std::fs::File::create(&tmp).map_err(|e| fail(e.to_string()))?;
+    let mut file = std::fs::File::create(&tmp).map_err(|e| fs_fail(e.to_string()))?;
     let mut write_err: Option<std::io::Error> = None;
     let fetch_res = {
         use std::io::Write;
@@ -154,22 +211,25 @@ pub async fn download<F: Fetcher>(
                 }
             }
         };
-        fetcher.fetch(&url, &mut on_chunk, progress).await
+        fetcher.fetch(target, &mut on_chunk, progress).await
     };
-    // Any failure (fetch error OR a write error) removes the temp and surfaces HG025 — never
-    // leaving a partial/empty `.part` behind.
-    let failure = fetch_res
-        .err()
-        .or_else(|| write_err.map(|e| format!("write failed: {e}")));
-    if let Some(detail) = failure {
+    // A fetch failure (a classified HiggsError) is a FETCHER error — propagated verbatim and
+    // eligible for the fallback. A local write failure is HG034 LOCAL. Either removes the temp
+    // — never leaving a partial/empty `.part` behind.
+    if let Err(e) = fetch_res {
         drop(file);
         let _ = std::fs::remove_file(&tmp);
-        return Err(fail(detail));
+        return Err(AttemptError::Fetcher(e));
+    }
+    if let Some(e) = write_err {
+        drop(file);
+        let _ = std::fs::remove_file(&tmp);
+        return Err(fs_fail(format!("write failed: {e}")));
     }
     if let Err(e) = file.sync_all() {
         drop(file);
         let _ = std::fs::remove_file(&tmp);
-        return Err(fail(e.to_string()));
+        return Err(fs_fail(e.to_string()));
     }
     drop(file);
     // Atomic replace: `rename(2)` replaces the destination in place, so an existing model
@@ -179,9 +239,53 @@ pub async fn download<F: Fetcher>(
     // out of scope.)
     if let Err(e) = std::fs::rename(&tmp, &dest) {
         let _ = std::fs::remove_file(&tmp);
-        return Err(fail(e.to_string()));
+        return Err(fs_fail(e.to_string()));
     }
     Ok(dest)
+}
+
+/// Download `target` trying `primary` first and `fallback` only if the primary fails with a
+/// FETCHER error — the hub-client-primary / `reqwest`-fallback strategy. Each attempt is a
+/// self-contained [`download_attempt`] (its own temp + atomic rename), so a failed primary
+/// leaves NO partial file for the fallback to trip over.
+///
+/// A primary failure in `download`'s OWN code ([`AttemptError::Local`] — wire-validation
+/// `HG025`, or a local filesystem `HG034` writing to `~/.higgs/models`) is deterministic: the
+/// fallback would fail identically, so it is returned VERBATIM (preserving the actionable
+/// `HG025`/`HG034` rather than a misleading `HG036`) and the fallback is NOT attempted — no
+/// pointless re-download of a multi-GB model. A FETCHER failure ([`AttemptError::Fetcher`] —
+/// network/auth/404/http, or the hub client's own cache I/O) DOES trigger the fallback; if
+/// that also fails, returns [`HiggsError::HubFetchExhausted`] (`HG036`) carrying both diagnoses.
+pub async fn download_dual<P: Fetcher, F: Fetcher>(
+    target: &PullTarget,
+    models_root: &Path,
+    primary: &P,
+    fallback: &F,
+    progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
+) -> Result<PathBuf, HiggsError> {
+    match download_attempt(target, models_root, primary, progress).await {
+        Ok(path) => Ok(path),
+        // Deterministic local failure (bad input / our own fs write) — surface it verbatim.
+        Err(AttemptError::Local(e)) => Err(e),
+        // A fetcher failure could be transport-specific; the other transport may succeed.
+        Err(AttemptError::Fetcher(primary_err)) => {
+            tracing::warn!(
+                repo = %target.repo,
+                file = %target.file,
+                error = %primary_err,
+                "higgs: hub download failed; trying reqwest fallback"
+            );
+            match download_attempt(target, models_root, fallback, progress).await {
+                Ok(path) => Ok(path),
+                Err(fallback_err) => Err(HiggsError::HubFetchExhausted {
+                    repo: target.repo.clone(),
+                    file: target.file.clone(),
+                    primary: primary_err.to_string(),
+                    fallback: fallback_err.into_inner().to_string(),
+                }),
+            }
+        }
+    }
 }
 
 /// The higgs-owned models directory (`~/.higgs/models/`) — the ONLY place downloads land.
@@ -191,26 +295,43 @@ pub fn models_dir() -> std::io::Result<PathBuf> {
     Ok(dir)
 }
 
-/// Production [`Fetcher`]: streams the URL over HTTPS with `reqwest`.
+/// The FALLBACK [`Fetcher`]: streams the `resolve` URL over HTTPS with `reqwest` (the
+/// hand-rolled path, used when the hub client primary fails). Classifies its failures into
+/// the same distinct codes the hub path uses — a non-success status routes through
+/// [`crate::hub::http_status_to_error`] (404→`HG030`, 401/403→`HG029`, 429→`HG031`, else
+/// `HG032`); a transport error is `HG033` (`HubTransport`).
 pub struct HttpFetcher;
 
 impl Fetcher for HttpFetcher {
     async fn fetch(
         &self,
-        url: &str,
+        target: &PullTarget,
         on_chunk: &mut (dyn FnMut(&[u8]) + Send),
         progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
-    ) -> Result<(), String> {
+    ) -> Result<(), HiggsError> {
         use futures::StreamExt;
-        let resp = reqwest::get(url).await.map_err(|e| e.to_string())?;
+        let transport = |detail: String| HiggsError::HubTransport {
+            repo: target.repo.clone(),
+            detail,
+        };
+        let url = hf_url(&target.repo, &target.revision, &target.file);
+        let resp = reqwest::get(&url)
+            .await
+            .map_err(|e| transport(e.to_string()))?;
         if !resp.status().is_success() {
-            return Err(format!("HTTP {}", resp.status()));
+            let status = resp.status();
+            return Err(crate::hub::http_status_to_error(
+                &target.repo,
+                &target.file,
+                status.as_u16(),
+                format!("HTTP {status}"),
+            ));
         }
         let total = resp.content_length();
         let mut downloaded = 0u64;
         let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| e.to_string())?;
+            let chunk = chunk.map_err(|e| transport(e.to_string()))?;
             on_chunk(&chunk);
             downloaded += chunk.len() as u64;
             progress(downloaded, total);
@@ -225,9 +346,11 @@ mod tests {
 
     /// A no-network fetcher that emits canned chunks + progress. `report_total` toggles
     /// whether it advertises a content length (`Some` vs `None`) so both progress arms run.
+    /// `fail_with` injects a CLASSIFIED failure (via a constructor closure, since
+    /// `HiggsError` isn't `Clone`), exercising the propagate-verbatim path.
     struct FakeFetcher {
         chunks: Vec<Vec<u8>>,
-        fail_with: Option<String>,
+        fail_with: Option<Box<dyn Fn() -> HiggsError + Send + Sync>>,
         report_total: bool,
     }
 
@@ -239,17 +362,26 @@ mod tests {
                 report_total: true,
             }
         }
+
+        /// A fetcher that always fails with the error produced by `mk`.
+        fn failing(mk: impl Fn() -> HiggsError + Send + Sync + 'static) -> Self {
+            Self {
+                chunks: vec![],
+                fail_with: Some(Box::new(mk)),
+                report_total: true,
+            }
+        }
     }
 
     impl Fetcher for FakeFetcher {
         async fn fetch(
             &self,
-            _url: &str,
+            _target: &PullTarget,
             on_chunk: &mut (dyn FnMut(&[u8]) + Send),
             progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
-        ) -> Result<(), String> {
-            if let Some(e) = &self.fail_with {
-                return Err(e.clone());
+        ) -> Result<(), HiggsError> {
+            if let Some(mk) = &self.fail_with {
+                return Err(mk());
             }
             let total: u64 = self.chunks.iter().map(|c| c.len() as u64).sum();
             let mut done = 0u64;
@@ -399,20 +531,126 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn download_maps_fetch_error_to_hg025_and_leaves_no_file() {
+    async fn download_propagates_classified_fetch_error_and_leaves_no_file() {
         let dir = tempfile::tempdir().unwrap();
-        let fetcher = FakeFetcher {
-            chunks: vec![],
-            fail_with: Some("network down".into()),
-            report_total: true,
-        };
+        // The fetcher's CLASSIFIED error is propagated VERBATIM (not re-wrapped in HG025).
+        let fetcher = FakeFetcher::failing(|| HiggsError::HubTransport {
+            repo: "org/m".into(),
+            detail: "network down".into(),
+        });
         let target = PullTarget::new("org/m", "m.gguf");
         let err = download(&target, dir.path(), &fetcher, &mut |_, _| {})
             .await
             .unwrap_err();
-        assert!(err.to_string().starts_with("[HG025]"), "got {err}");
+        assert!(
+            err.to_string().starts_with("[HG033]"),
+            "classified transport error propagates: {err}"
+        );
         let dest = dest_path(dir.path(), "org/m", "m.gguf").unwrap();
         assert!(!dest.exists(), "no file on failure");
         assert!(!dest.with_extension("part").exists(), "no temp left behind");
+    }
+
+    #[tokio::test]
+    async fn download_dual_falls_back_to_second_fetcher() {
+        let dir = tempfile::tempdir().unwrap();
+        // Primary fails (auth) → fallback succeeds → bytes land, no error.
+        let primary = FakeFetcher::failing(|| HiggsError::HubAuthFailed {
+            repo: "org/m".into(),
+            detail: "401".into(),
+        });
+        let fallback = FakeFetcher::new(vec![b"ok".to_vec()]);
+        let target = PullTarget::new("org/m", "x.gguf");
+        let path = download_dual(&target, dir.path(), &primary, &fallback, &mut |_, _| {})
+            .await
+            .expect("fallback succeeds");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"ok",
+            "fallback bytes written"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_dual_does_not_retry_local_validation_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        // A bad revision fails wire-validation INSIDE download() (HG025), before any fetcher.
+        // download_dual must surface that HG025 verbatim — NOT retry the fallback and wrap it
+        // as HG036. The fallback here WOULD succeed if reached, so a non-HG025 result fails.
+        let mut target = PullTarget::new("org/m", "x.gguf");
+        target.revision = "main#frag".into();
+        let primary = FakeFetcher::new(vec![b"a".to_vec()]);
+        let fallback = FakeFetcher::new(vec![b"b".to_vec()]);
+        let err = download_dual(&target, dir.path(), &primary, &fallback, &mut |_, _| {})
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().starts_with("[HG025]"),
+            "local validation error surfaced verbatim (not HG036): {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_dual_retries_fallback_on_fetcher_sourced_hubfilewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        // HG034 RETURNED BY THE FETCHER is the hub client's own cache I/O (HFError::Io) — a
+        // fetcher-side failure the direct fallback (streaming to ~/.higgs/models) can recover
+        // from. Source = Fetcher ⇒ the fallback runs and succeeds.
+        let primary = FakeFetcher::failing(|| HiggsError::HubFileWrite {
+            repo: "org/m".into(),
+            file: "x.gguf".into(),
+            detail: "crate cache write failed".into(),
+        });
+        let fallback = FakeFetcher::new(vec![b"recovered".to_vec()]);
+        let target = PullTarget::new("org/m", "x.gguf");
+        let path = download_dual(&target, dir.path(), &primary, &fallback, &mut |_, _| {})
+            .await
+            .expect("fallback recovers a fetcher-sourced HG034");
+        assert_eq!(std::fs::read(&path).unwrap(), b"recovered");
+    }
+
+    #[tokio::test]
+    async fn download_dual_does_not_retry_downloads_own_fs_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // Put a FILE where the `org` dir must be, so `download`'s OWN create_dir_all (for the
+        // dest parent `org/m`) fails — a LOCAL HG034. The fallback would hit the same
+        // un-creatable path, so it must NOT retry: surface HG034 verbatim, not HG036. The
+        // fakes WOULD succeed if reached, so a non-HG034 result fails the test.
+        std::fs::write(dir.path().join("org"), b"x").unwrap();
+        let primary = FakeFetcher::new(vec![b"a".to_vec()]);
+        let fallback = FakeFetcher::new(vec![b"b".to_vec()]);
+        let target = PullTarget::new("org/m", "x.gguf");
+        let err = download_dual(&target, dir.path(), &primary, &fallback, &mut |_, _| {})
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().starts_with("[HG034]"),
+            "download's own fs error surfaced verbatim (not HG036): {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_dual_exhausted_is_hg036_with_both_diagnoses() {
+        let dir = tempfile::tempdir().unwrap();
+        // BOTH fail → HG036 carrying the primary's code AND the fallback's detail.
+        let primary = FakeFetcher::failing(|| HiggsError::HubResourceNotFound {
+            repo: "org/m".into(),
+            resource: "file x.gguf".into(),
+            detail: "404".into(),
+        });
+        let fallback = FakeFetcher::failing(|| HiggsError::HubTransport {
+            repo: "org/m".into(),
+            detail: "dns failure".into(),
+        });
+        let target = PullTarget::new("org/m", "x.gguf");
+        let err = download_dual(&target, dir.path(), &primary, &fallback, &mut |_, _| {})
+            .await
+            .unwrap_err();
+        let s = err.to_string();
+        assert!(s.starts_with("[HG036]"), "both failed → exhausted: {s}");
+        assert!(s.contains("[HG030]"), "primary code preserved: {s}");
+        assert!(s.contains("dns failure"), "fallback detail preserved: {s}");
+        let dest = dest_path(dir.path(), "org/m", "x.gguf").unwrap();
+        assert!(!dest.exists(), "no file when both paths fail");
     }
 }

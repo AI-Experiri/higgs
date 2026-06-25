@@ -745,6 +745,49 @@ impl From<HiggsError> for LoadFailure {
 ///
 /// NOTE: the cross-worker VRAM fit-check (§4.2b) is pending; the RAM headroom guard here
 /// is the existing local capacity check, reused.
+/// Build the worker `M_LOAD` params json from the node-resolved base fields + the
+/// optional rich override payload. ABSENT base fields are OMITTED (not serialized
+/// as `null`): the worker deserializes this whole object into `LlamaCppParams`,
+/// where the base fields are required `u32`, so a `null` would FAIL that deser and
+/// silently drop every merged rich override (flash_attn/type_k/cpu_moe/…). On an
+/// absent base field the worker re-derives it from its own `u32_param` defaults.
+fn worker_load_params(
+    id: &str,
+    path: &str,
+    ctx_len: Option<u32>,
+    gpu_layers: Option<u32>,
+    threads: Option<u32>,
+    extra: &Option<crate::worker::engine::llamacpp::params::LlamaCppParams>,
+) -> Value {
+    let mut load = json!({ "id": id, "path": path });
+    let obj = load
+        .as_object_mut()
+        .expect("json! object is always an object");
+    if let Some(c) = ctx_len {
+        obj.insert("ctx_len".into(), c.into());
+    }
+    if let Some(g) = gpu_layers {
+        obj.insert("gpu_layers".into(), g.into());
+    }
+    if let Some(t) = threads {
+        obj.insert("threads".into(), t.into());
+    }
+    // Merge the rich engine overrides (type_k, flash_attn, cpu_moe, n_seq_max, …) the
+    // worker applies. The base fields stay authoritative (the node owns ctx-cap /
+    // gpu_layers / threads resolution), so they (and any null) are skipped here.
+    if let Some(p) = extra {
+        if let Ok(Value::Object(map)) = serde_json::to_value(p) {
+            for (k, v) in map {
+                if matches!(k.as_str(), "ctx_len" | "gpu_layers" | "threads") || v.is_null() {
+                    continue;
+                }
+                obj.insert(k, v);
+            }
+        }
+    }
+    load
+}
+
 async fn do_load(
     id: WorkerId,
     params: NodeLoadParams,
@@ -799,13 +842,14 @@ async fn do_load(
     let ctx_len = params
         .ctx_len
         .or_else(|| ctx_train.map(|t| (t as u32).min(crate::api::DEFAULT_CTX_CAP)));
-    let load_params = json!({
-        "id": params.id,
-        "path": path,
-        "ctx_len": ctx_len,
-        "gpu_layers": params.gpu_layers,
-        "threads": params.threads,
-    });
+    let load_params = worker_load_params(
+        &params.id,
+        &path,
+        ctx_len,
+        params.gpu_layers,
+        params.threads,
+        &params.params,
+    );
     let loaded = match sup.request(M_LOAD, load_params.clone()).await {
         Ok(v) => v,
         Err(e) => {
@@ -1120,7 +1164,45 @@ mod tests {
             ctx_len: None,
             gpu_layers: None,
             threads: None,
+            params: None,
         }
+    }
+
+    /// An absent base field (e.g. auto `ctx_len`) is OMITTED — not `null` — so the
+    /// worker's `LlamaCppParams` deserialize doesn't fail and drop the merged rich
+    /// overrides. The whole object must deserialize cleanly into `LlamaCppParams`.
+    #[test]
+    fn worker_load_params_omits_null_base_and_keeps_overrides() {
+        use crate::worker::engine::llamacpp::params::LlamaCppParams;
+        use crate::worker::engine::{FlashAttn, KvCacheKind};
+        let mut rich = LlamaCppParams::base(0, u32::MAX, 4);
+        rich.flash_attn = Some(FlashAttn::On);
+        rich.type_k = Some(KvCacheKind::Q8_0);
+        rich.cpu_moe = Some(true);
+        // ctx_len None (auto) with rich overrides present.
+        let v = worker_load_params(
+            "org/m",
+            "/x.gguf",
+            None,
+            Some(u32::MAX),
+            Some(4),
+            &Some(rich),
+        );
+        let obj = v.as_object().unwrap();
+        assert!(
+            !obj.contains_key("ctx_len"),
+            "absent base field omitted, not null"
+        );
+        assert_eq!(obj["gpu_layers"], u32::MAX);
+        assert_eq!(obj["flash_attn"], "on", "rich override survives");
+        assert_eq!(obj["type_k"], "Q8_0");
+        assert_eq!(obj["cpu_moe"], true);
+        // The whole object deserializes into LlamaCppParams (no null → no failure →
+        // overrides not dropped). id/path are unknown fields, ignored by serde.
+        let back: LlamaCppParams = serde_json::from_value(v).unwrap();
+        assert_eq!(back.flash_attn, Some(FlashAttn::On));
+        assert_eq!(back.type_k, Some(KvCacheKind::Q8_0));
+        assert_eq!(back.cpu_moe, Some(true));
     }
 
     async fn load(rt: &NodeRuntime, id: &str) -> (WorkerId, Value) {

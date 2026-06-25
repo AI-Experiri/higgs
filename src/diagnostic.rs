@@ -233,13 +233,92 @@ pub enum HiggsError {
 
     /// A model download (`M_PULL`) failed — network error, bad repo/file, HTTP status, or a
     /// filesystem error writing into `~/.higgs/models/` (§4 P4b). Never partially exposes a
-    /// file: the download writes a temp and renames only on success.
+    /// file: the download writes a temp and renames only on success. This is the GENERIC
+    /// download umbrella; the HuggingFace-hub client path (`src/hub.rs`) classifies failures
+    /// into the specific `HG029`–`HG035` codes below — `HG025` remains the fallback umbrella.
     #[snafu(display("[HG025] model download failed for {repo}/{file}: {detail}"))]
     #[diagnostic(code(HG025))]
     DownloadFailed {
         repo: String,
         file: String,
         detail: String,
+    },
+
+    // ── HuggingFace hub-client failure taxonomy (src/hub.rs) ─────────────────
+    // The hub client is the PRIMARY fetch path (model GGUFs + card/config); the
+    // hand-rolled `reqwest` path is the fail-open FALLBACK. Each distinct failure
+    // mode gets its own code so an operator can tell auth from not-found from a
+    // network blip — and so a terminal error names which path(s) were exhausted.
+    /// Auth/permission was refused for a repo — it is gated or private and no
+    /// valid `HF_TOKEN` was presented (HTTP 401/403). Actionable: set `HF_TOKEN`
+    /// (or `~/.cache/huggingface/token`) and accept the model's license.
+    #[snafu(display("[HG029] HuggingFace auth failed for {repo}: {detail}"))]
+    #[diagnostic(code(HG029))]
+    HubAuthFailed { repo: String, detail: String },
+
+    /// A repo, revision, or file does not exist on the hub (HTTP 404). `resource`
+    /// names what was missing (the repo id, a revision, or a file path).
+    #[snafu(display("[HG030] HuggingFace resource not found ({resource}) in {repo}: {detail}"))]
+    #[diagnostic(code(HG030))]
+    HubResourceNotFound {
+        repo: String,
+        resource: String,
+        detail: String,
+    },
+
+    /// The hub rate-limited the request (HTTP 429). Transient and retryable —
+    /// back off and retry; not a permanent failure.
+    #[snafu(display("[HG031] HuggingFace rate-limited for {repo}: {detail}"))]
+    #[diagnostic(code(HG031))]
+    HubRateLimited { repo: String, detail: String },
+
+    /// The hub returned an unexpected HTTP status (e.g. 5xx) that is neither
+    /// auth, not-found, nor rate-limit. `status` is the numeric code.
+    #[snafu(display("[HG032] HuggingFace HTTP {status} for {repo}: {detail}"))]
+    #[diagnostic(code(HG032))]
+    HubHttpStatus {
+        repo: String,
+        status: u16,
+        detail: String,
+    },
+
+    /// A network/transport error reaching huggingface.co — DNS, connection
+    /// refused, TLS, or a timeout. Transient and retryable.
+    #[snafu(display("[HG033] HuggingFace transport error for {repo}: {detail}"))]
+    #[diagnostic(code(HG033))]
+    HubTransport { repo: String, detail: String },
+
+    /// A filesystem error writing a downloaded file (temp create, write, fsync,
+    /// or rename) into the hub cache / target dir. Actionable: check disk space
+    /// and permissions on `~/.cache/huggingface` / `~/.higgs/models`.
+    #[snafu(display("[HG034] HuggingFace file write failed for {repo}/{file}: {detail}"))]
+    #[diagnostic(code(HG034))]
+    HubFileWrite {
+        repo: String,
+        file: String,
+        detail: String,
+    },
+
+    /// Any other hub-client failure not covered above — a JSON/diff parse error,
+    /// a malformed URL/parameter, a cache-config error, or an internal client
+    /// error. Carries the underlying detail verbatim.
+    #[snafu(display("[HG035] HuggingFace client error for {repo}: {detail}"))]
+    #[diagnostic(code(HG035))]
+    HubClient { repo: String, detail: String },
+
+    /// BOTH the hub client (primary) AND the `reqwest` fallback failed for a
+    /// fetch — the terminal, non-retryable outcome of the dual-path strategy.
+    /// `primary` carries the hub failure's own `[HGxxx]` code+message;
+    /// `fallback` carries the fallback's detail, so neither path's diagnosis is lost.
+    #[snafu(display(
+        "[HG036] HuggingFace fetch exhausted for {repo}/{file} — primary: {primary}; fallback: {fallback}"
+    ))]
+    #[diagnostic(code(HG036))]
+    HubFetchExhausted {
+        repo: String,
+        file: String,
+        primary: String,
+        fallback: String,
     },
 }
 
@@ -334,6 +413,66 @@ mod tests {
         }
         .to_string()
         .starts_with("[HG027]"));
+    }
+
+    #[test]
+    fn hub_failure_codes_render() {
+        let r = || "bartowski/Q-GGUF".to_string();
+        assert!(HiggsError::HubAuthFailed {
+            repo: r(),
+            detail: "401".into()
+        }
+        .to_string()
+        .starts_with("[HG029]"));
+        assert!(HiggsError::HubResourceNotFound {
+            repo: r(),
+            resource: "file".into(),
+            detail: "404".into()
+        }
+        .to_string()
+        .starts_with("[HG030]"));
+        assert!(HiggsError::HubRateLimited {
+            repo: r(),
+            detail: "429".into()
+        }
+        .to_string()
+        .starts_with("[HG031]"));
+        assert!(HiggsError::HubHttpStatus {
+            repo: r(),
+            status: 503,
+            detail: "x".into()
+        }
+        .to_string()
+        .starts_with("[HG032]"));
+        assert!(HiggsError::HubTransport {
+            repo: r(),
+            detail: "timeout".into()
+        }
+        .to_string()
+        .starts_with("[HG033]"));
+        assert!(HiggsError::HubFileWrite {
+            repo: r(),
+            file: "m.gguf".into(),
+            detail: "ENOSPC".into()
+        }
+        .to_string()
+        .starts_with("[HG034]"));
+        assert!(HiggsError::HubClient {
+            repo: r(),
+            detail: "bad json".into()
+        }
+        .to_string()
+        .starts_with("[HG035]"));
+        // The terminal both-paths-failed error preserves BOTH diagnoses.
+        let exhausted = HiggsError::HubFetchExhausted {
+            repo: r(),
+            file: "m.gguf".into(),
+            primary: "[HG029] auth".into(),
+            fallback: "connection refused".into(),
+        };
+        let s = exhausted.to_string();
+        assert!(s.starts_with("[HG036]"));
+        assert!(s.contains("[HG029]") && s.contains("connection refused"));
     }
 
     #[test]

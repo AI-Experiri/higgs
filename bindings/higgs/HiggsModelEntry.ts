@@ -76,6 +76,33 @@ arch?: string,
  */
 ctx_train?: number, 
 /**
+ * Transformer block count (`{arch}.block_count`) from the GGUF header — the
+ * number of layers, used by the autotune KV-cache VRAM estimate. `None` when
+ * the header could not be read or the field is absent.
+ */
+block_count?: number, 
+/**
+ * Attention query-head count (`{arch}.attention.head_count`). Used with
+ * `embedding_length` to derive `head_dim` for the KV estimate. `None` when absent.
+ */
+head_count?: number, 
+/**
+ * Attention KV/GQA head count (`{arch}.attention.head_count_kv`) — the
+ * grouped-query KV head count, which is what sizes the KV cache (NOT the query
+ * `head_count`, which over-estimates KV by the GQA factor). `None` when absent.
+ */
+head_count_kv?: number, 
+/**
+ * Embedding/hidden size (`{arch}.embedding_length`). With `head_count` gives
+ * `head_dim = embedding_length / head_count`. `None` when absent.
+ */
+embedding_length?: number, 
+/**
+ * Number of MoE experts (`{arch}.expert_count`); `0`/absent for dense models.
+ * Drives the autotune `cpu_moe` back-off decision. `None` when absent.
+ */
+expert_count?: number, 
+/**
  * Whether `tokenizer.chat_template` is present in the GGUF header.
  * `false` when the header could not be read.
  */

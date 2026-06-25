@@ -171,9 +171,9 @@ impl WorkerState {
         let loaded = self.loaded.as_ref().map(|(id, p)| {
             json!({
                 "id": id,
-                "ctx_len": p.ctx_len,
-                "gpu_layers": p.gpu_layers,
-                "threads": p.threads,
+                "ctx_len": p.ctx_len(),
+                "gpu_layers": p.gpu_layers(),
+                "threads": p.threads(),
             })
         });
         json!({ "loaded": loaded })
@@ -197,33 +197,23 @@ impl WorkerState {
             tracing::warn!("higgs: ctx_len=0 requested; using default 4096");
             ctx_len = 4096;
         }
-        // The three base fields keep their specific defaults (gpu_layers=all,
-        // threads=4) via `u32_param`; the optional overrides deserialize from
-        // the same params object (each is `#[serde(default)]` → `None` when
-        // absent, so a quick-load carries no overrides — current behavior).
-        let opts: engine::LoadParams = match serde_json::from_value(req.params.clone()) {
-            Ok(opts) => opts,
-            Err(e) => {
-                tracing::warn!(error = %e, "ignoring malformed higgs load overrides");
-                engine::LoadParams::default()
-            }
-        };
-        let params = engine::LoadParams {
-            ctx_len,
-            gpu_layers: u32_param(&req.params, "gpu_layers", u32::MAX),
-            threads: u32_param(&req.params, "threads", 4),
-            use_mmap: opts.use_mmap,
-            use_mlock: opts.use_mlock,
-            n_batch: opts.n_batch,
-            n_ubatch: opts.n_ubatch,
-            offload_kqv: opts.offload_kqv,
-            rope_freq_base: opts.rope_freq_base,
-            rope_freq_scale: opts.rope_freq_scale,
-            flash_attn: opts.flash_attn,
-            type_k: opts.type_k,
-            type_v: opts.type_v,
-            seed: opts.seed,
-        };
+        // The worker wire is FLAT (no engine tag): deserialize the engine-specific
+        // `LlamaCppParams` directly from the params object (each optional is
+        // `#[serde(default)]` → `None`/empty when absent), then wrap it in the
+        // umbrella for the engine. The three base fields keep their specific
+        // defaults (gpu_layers=all, threads=4) and the ctx_len==0 coercion above.
+        let mut opts: engine::llamacpp::params::LlamaCppParams =
+            match serde_json::from_value(req.params.clone()) {
+                Ok(opts) => opts,
+                Err(e) => {
+                    tracing::warn!(error = %e, "ignoring malformed higgs load overrides");
+                    engine::llamacpp::params::LlamaCppParams::default()
+                }
+            };
+        opts.ctx_len = ctx_len;
+        opts.gpu_layers = u32_param(&req.params, "gpu_layers", u32::MAX);
+        opts.threads = u32_param(&req.params, "threads", 4);
+        let params = engine::LoadParams::llamacpp(opts);
         // Scan moved host-side: the host resolves the GGUF path and passes it in
         // `params.path`. The worker holds no catalog of its own.
         let path = req
@@ -309,17 +299,35 @@ impl WorkerState {
                 data: None,
                 message: "missing messages_json".to_string(),
             })?;
+        // The full sampler set rides the params as a `sampling` sub-object — the
+        // serialized `SamplingParams` umbrella (`{"engine":"LlamaCpp", …}`). When it
+        // is absent or malformed, fall back to the legacy top-level `temperature`
+        // field (the pre-`sampling` M_CHAT shape the worker README documents) so a
+        // direct/older caller that pins only `temperature` still controls sampling
+        // instead of silently snapping to the 0.7 default. Neither present ⇒ an
+        // all-default set (the engine applies its own 0.7).
+        let sampling = req
+            .params
+            .get("sampling")
+            .and_then(|v| serde_json::from_value::<engine::SamplingParams>(v.clone()).ok())
+            .unwrap_or_else(|| {
+                let temperature = req
+                    .params
+                    .get("temperature")
+                    .and_then(Value::as_f64)
+                    .map(|t| t as f32);
+                engine::SamplingParams::llamacpp(engine::llamacpp::params::LlamaCppSamplingParams {
+                    temperature,
+                    ..Default::default()
+                })
+            });
         let gen = engine::GenParams {
             max_tokens: req
                 .params
                 .get("max_tokens")
                 .and_then(Value::as_u64)
                 .map_or(1024, |v| usize::try_from(v).unwrap_or(usize::MAX)),
-            temperature: req
-                .params
-                .get("temperature")
-                .and_then(Value::as_f64)
-                .map_or(0.7, |v| v as f32),
+            sampling,
             // OpenAI `tools` array, already serialized to a JSON string by
             // the serve layer; passed verbatim to the chat template.
             tools_json: req
@@ -445,10 +453,13 @@ mod tests {
         fn chat(
             &mut self,
             _messages_json: &str,
-            _params: &engine::GenParams,
+            params: &engine::GenParams,
             sink: &mut dyn FnMut(&str),
         ) -> Result<engine::ChatResult, HiggsError> {
-            self.calls.lock().push("chat".into());
+            // Record the temperature the worker threaded out of the M_CHAT
+            // `sampling` sub-object, so a test can assert the deserialization.
+            let temp = params.sampling.as_llamacpp().temperature.unwrap_or(0.7);
+            self.calls.lock().push(format!("chat temp={temp}"));
             sink("he");
             sink("llo");
             Ok(engine::ChatResult {
@@ -576,7 +587,83 @@ mod tests {
         let calls = calls.lock();
         assert_eq!(calls.len(), 2, "calls: {calls:?}");
         assert_eq!(calls[0], format!("load {path}"), "calls: {calls:?}");
-        assert_eq!(calls[1], "chat");
+        // No `sampling` in the request → the engine sees the default temperature.
+        assert_eq!(calls[1], "chat temp=0.7", "calls: {calls:?}");
+    }
+
+    #[test]
+    fn chat_threads_sampling_sub_object_to_engine() {
+        // A chat whose params carry a `sampling` sub-object (the serialized
+        // SamplingParams umbrella) must reach the engine with that temperature —
+        // proving the worker deserializes `sampling` into GenParams.
+        let path = "/models/google/gemma-4-12b/gemma-4-12b-Q4_K_M.gguf";
+        let mut input = load_line(2, "google/gemma-4-12b", path, json!({}));
+        input.push_str(&req_line(
+            3,
+            M_CHAT,
+            json!({
+                "request_id": 7,
+                "model": "google/gemma-4-12b",
+                "messages_json": "[{\"role\":\"user\",\"content\":\"hi\"}]",
+                "sampling": { "engine": "LlamaCpp", "temperature": 0.2 },
+            }),
+        ));
+        let (_frames, calls) = serve_with_fake(&input);
+        let calls = calls.lock();
+        assert_eq!(
+            calls[1], "chat temp=0.2",
+            "the request sampling temperature reaches the engine: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn chat_legacy_top_level_temperature_is_honored() {
+        // Back-compat: an M_CHAT with NO `sampling` object but a legacy top-level
+        // `temperature` must still reach the engine with that temperature (not the
+        // 0.7 default) — preserving the pre-`sampling` worker protocol shape.
+        let path = "/models/google/gemma-4-12b/gemma-4-12b-Q4_K_M.gguf";
+        let mut input = load_line(2, "google/gemma-4-12b", path, json!({}));
+        input.push_str(&req_line(
+            3,
+            M_CHAT,
+            json!({
+                "request_id": 7,
+                "model": "google/gemma-4-12b",
+                "messages_json": "[{\"role\":\"user\",\"content\":\"hi\"}]",
+                "temperature": 0.0,
+            }),
+        ));
+        let (_frames, calls) = serve_with_fake(&input);
+        let calls = calls.lock();
+        assert_eq!(
+            calls[1], "chat temp=0",
+            "legacy top-level temperature reaches the engine: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn chat_with_malformed_sampling_degrades_to_default() {
+        // A `sampling` value that fails to deserialize must NOT fail the request —
+        // it degrades to the engine default (0.7), so an older/garbled relay still
+        // generates rather than 500ing.
+        let path = "/models/google/gemma-4-12b/gemma-4-12b-Q4_K_M.gguf";
+        let mut input = load_line(2, "google/gemma-4-12b", path, json!({}));
+        input.push_str(&req_line(
+            3,
+            M_CHAT,
+            json!({
+                "request_id": 7,
+                "model": "google/gemma-4-12b",
+                "messages_json": "[{\"role\":\"user\",\"content\":\"hi\"}]",
+                "sampling": "not-an-object",
+            }),
+        ));
+        let (_frames, calls) = serve_with_fake(&input);
+        let calls = calls.lock();
+        assert_eq!(
+            calls[1], "chat temp=0.7",
+            "malformed sampling falls back to the default: {calls:?}"
+        );
     }
 
     #[test]

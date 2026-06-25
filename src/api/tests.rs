@@ -17,6 +17,16 @@ fn fake_higgs(dirs: Vec<PathBuf>) -> Higgs {
     Higgs::with_local(Arc::new(node), cfg)
 }
 
+/// A deterministic (greedy) sampling umbrella for `chat_stream` test calls.
+fn greedy_sampling() -> crate::worker::engine::SamplingParams {
+    crate::worker::engine::SamplingParams::llamacpp(
+        crate::worker::engine::llamacpp::params::LlamaCppSamplingParams {
+            temperature: Some(0.0),
+            ..Default::default()
+        },
+    )
+}
+
 // ── Phase A2: repo-id charset + path-traversal guards ────────────────────
 
 #[test]
@@ -98,7 +108,7 @@ async fn load_persists_model_record() {
     let records = higgs.model_records();
     let rec = records.get("org/model").expect("record persisted on load");
     let load = rec.load.as_ref().expect("load params persisted");
-    assert_eq!(load.ctx_len, 0, "no-params load records ctx_len 0 = auto");
+    assert_eq!(load.ctx_len(), 0, "no-params load records ctx_len 0 = auto");
     assert!(rec.last_loaded_ms > 0, "load stamps a timestamp");
 }
 
@@ -124,7 +134,7 @@ async fn inference_gate_rejects_when_full() {
             "org/model".to_owned(),
             r#"[{"role":"user","content":"hi"}]"#.to_owned(),
             8,
-            0.0,
+            greedy_sampling(),
             None,
         )
         .await
@@ -150,12 +160,43 @@ async fn chat_stream_unloaded_model_not_found() {
             "org/missing".to_owned(),
             r#"[{"role":"user","content":"hi"}]"#.to_owned(),
             8,
-            0.0,
+            greedy_sampling(),
             None,
         )
         .await
         .expect_err("unloaded model → ModelNotFound");
     assert!(matches!(err, HiggsError::ModelNotFound { .. }), "got {err}");
+}
+
+/// `overlay_sampling` is the chat-time merge: with NO stored profile the request
+/// stands alone; with a stored card/tuned base, the request's set fields win while
+/// the base's other samplers survive (so a plain-temperature chat still inherits
+/// the recommended top_k/min_p/…).
+#[test]
+fn overlay_sampling_merges_stored_base_with_request() {
+    use crate::worker::engine::llamacpp::params::LlamaCppSamplingParams;
+    use crate::worker::engine::SamplingParams;
+
+    // No stored profile → the request is returned verbatim.
+    let req = SamplingParams::llamacpp(LlamaCppSamplingParams {
+        temperature: Some(1.1),
+        ..Default::default()
+    });
+    let out = overlay_sampling(None, req.clone());
+    assert_eq!(out, req, "no base → request unchanged");
+
+    // A stored card base (top_k/min_p) overlaid by a temperature-only request.
+    let base = SamplingParams::llamacpp(LlamaCppSamplingParams {
+        temperature: Some(0.6),
+        top_k: Some(40),
+        min_p: Some(0.05),
+        ..Default::default()
+    });
+    let merged = overlay_sampling(Some(base), req);
+    let s = merged.as_llamacpp();
+    assert_eq!(s.temperature, Some(1.1), "request temp wins");
+    assert_eq!(s.top_k, Some(40), "base top_k survives");
+    assert_eq!(s.min_p, Some(0.05), "base min_p survives");
 }
 
 // ── Phase B: RAM headroom guard arithmetic ───────────────────────────────
@@ -368,7 +409,7 @@ async fn load_then_status_maps() {
     // `load` resolves the GGUF path host-side, so point config at a fixture (ctx_train=4096).
     let dir = tempfile::TempDir::new().unwrap();
     crate::serve::test_support::write_gguf_fixture(dir.path(), "org/model");
-    let expected_gpu_layers = HiggsConfig::default().default_load.gpu_layers;
+    let expected_gpu_layers = HiggsConfig::default().default_load.gpu_layers();
     let higgs = fake_higgs(vec![dir.path().to_path_buf()]);
     let mut events_rx = higgs.events();
 
@@ -485,7 +526,7 @@ async fn multi_model_both_served_and_reachable() {
                 id.to_owned(),
                 r#"[{"role":"user","content":"hi"}]"#.to_owned(),
                 32,
-                0.0,
+                greedy_sampling(),
                 None,
             )
             .await
@@ -520,7 +561,7 @@ async fn chat_stream_delivers() {
             "org/model".to_owned(),
             r#"[{"role":"user","content":"hi"}]"#.to_owned(),
             256,
-            0.7,
+            greedy_sampling(),
             None,
         )
         .await

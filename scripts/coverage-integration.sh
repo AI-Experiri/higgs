@@ -22,16 +22,19 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-# EXCLUSION: the tool_parser/* subtree is pure string-parsing logic for many
-# model-specific tool-call dialects. It is exhaustively covered by the UNIT gate;
-# integration can only reach a given dialect if a real model emits it, which the
-# tiny test GGUF never does. Excluded here so the 75% reflects integration-owned
-# code (wiring, serving, process, remote) rather than parser branches.
+# EXCLUSION: the tool_parser/* AND tune/* subtrees are pure logic — tool-call
+# dialect parsing and the autotune suggester (derive/vram/card/store/merge). Both
+# are exhaustively covered by the UNIT gate; integration can only reach them
+# indirectly (a real model emitting a dialect; the spawned process's suggester),
+# which the tiny test GGUF never fully exercises. Excluded here so the 75%
+# reflects integration-owned code (wiring, serving, process, remote, the tune
+# ROUTE + apply path) rather than pure-module branches.
 #
 # Enumerate every integration target explicitly (NOT --tests, which would also
 # pull in the lib unit tests and inflate the number). Keep in sync with tests/.
 exec cargo llvm-cov \
   --test auth \
+  --test autotune \
   --test control_api \
   --test hub_server \
   --test inference \
@@ -41,5 +44,5 @@ exec cargo llvm-cov \
   --test remote_node_e2e \
   --test remote_pairing \
   --test worker_roundtrip \
-  --ignore-filename-regex 'tool_parser' \
+  --ignore-filename-regex 'tool_parser|/tune/' \
   --fail-under-lines 75 "$@"

@@ -26,6 +26,17 @@ use higgs::{Higgs, HiggsConfig};
 
 use common::{stage_tiny_model, tiny_gguf_path, TINY_MODEL_ID};
 
+/// Deterministic (greedy) sampling umbrella for `chat_stream` — `temperature: 0`
+/// makes the worker pick `argmax`, so these end-to-end streams are reproducible.
+fn greedy() -> higgs::worker::engine::SamplingParams {
+    higgs::worker::engine::SamplingParams::llamacpp(
+        higgs::worker::engine::llamacpp::params::LlamaCppSamplingParams {
+            temperature: Some(0.0),
+            ..Default::default()
+        },
+    )
+}
+
 struct NodeProc(Child);
 impl Drop for NodeProc {
     fn drop(&mut self) {
@@ -199,7 +210,7 @@ async fn two_nodes_same_model_two_served_ids_stream_each_then_retire_one() {
     let prompt = "[{\"role\":\"user\",\"content\":\"Once upon a time\"}]";
     for sid in [TINY_MODEL_ID.to_string(), suffixed.clone()] {
         let (deltas, handle) = higgs
-            .chat_stream(sid.clone(), prompt.to_string(), 8, 0.0, None)
+            .chat_stream(sid.clone(), prompt.to_string(), 8, greedy(), None)
             .await
             .unwrap_or_else(|e| panic!("chat_stream {sid}: {e}"));
         assert!(
@@ -222,7 +233,13 @@ async fn two_nodes_same_model_two_served_ids_stream_each_then_retire_one() {
         "the survivor renumbers to the lone served id"
     );
     let (deltas, handle) = higgs
-        .chat_stream(TINY_MODEL_ID.to_string(), prompt.to_string(), 8, 0.0, None)
+        .chat_stream(
+            TINY_MODEL_ID.to_string(),
+            prompt.to_string(),
+            8,
+            greedy(),
+            None,
+        )
         .await
         .expect("survivor chat");
     assert!(
@@ -309,7 +326,7 @@ async fn hub_v1_chat_routes_to_remote_node() {
             TINY_MODEL_ID.to_string(),
             "[{\"role\":\"user\",\"content\":\"Once upon a time\"}]".to_string(),
             8,
-            0.0,
+            greedy(),
             None,
         )
         .await
@@ -547,7 +564,7 @@ async fn node_reconnects_and_route_survives() {
             TINY_MODEL_ID.to_string(),
             "[{\"role\":\"user\",\"content\":\"Hello again\"}]".to_string(),
             8,
-            0.0,
+            greedy(),
             Some(tools.to_string()),
         )
         .await

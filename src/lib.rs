@@ -18,6 +18,7 @@ pub mod config;
 pub mod diagnostic;
 pub mod download;
 pub mod home;
+pub mod hub;
 pub mod keys;
 pub mod log_bus;
 pub mod node;
@@ -27,6 +28,7 @@ pub mod serve;
 pub mod standalone;
 pub mod supervisor;
 pub mod system;
+pub mod tune;
 pub mod worker;
 
 pub use api::{Higgs, HiggsConfig};

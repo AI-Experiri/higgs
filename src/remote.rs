@@ -160,6 +160,20 @@ pub struct NodeLoadParams {
     pub gpu_layers: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threads: Option<u32>,
+    /// The FULL engine load params (the rich llama.cpp override set — `use_mmap`,
+    /// `type_k`, `flash_attn`, `cpu_moe`, `n_seq_max`, …) the worker applies. The
+    /// base fields above stay authoritative for the node's ctx-cap / resolve logic;
+    /// `do_load` merges the OPTIONAL fields of this into the worker's `M_LOAD` json.
+    /// `None` (omitted on the wire) ⇒ a bare load with only the base fields.
+    ///
+    /// Set only when there's something to apply (`LlamaCppParams::has_overrides`), so
+    /// a plain/default load carries no payload. Today this is exercised ONLY on the
+    /// in-process LOCAL path (`Higgs::load` → `NodeRuntime::load`); the hub's REMOTE
+    /// `M_NODE_LOAD` (`HubFleet::load`) still sends a bare `{ "id" }`. Forwarding this
+    /// to a remote node is DEFERRED and must bump the negotiated protocol version
+    /// first (an older `deny_unknown_fields` node would reject an unknown field).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<crate::worker::engine::llamacpp::params::LlamaCppParams>,
     // NOTE: no `idle_ttl_minutes` yet. A per-load idle TTL requires a node-side idle
     // reaper (the local TTL lives in the host `Higgs` reaper, not the worker). The wire
     // field and its enforcement land together in a later phase, so the node never accepts
@@ -400,6 +414,7 @@ mod tests {
             ctx_len: Some(4096),
             gpu_layers: None,
             threads: None,
+            params: None,
         };
         let s = serde_json::to_string(&p).unwrap();
         let back: NodeLoadParams = serde_json::from_str(&s).unwrap();

@@ -331,14 +331,18 @@ pub(super) async fn v1_chat_completions(
 
     // Effective generation budget (validated above to be in [1, MAX_OUTPUT_TOKENS]).
     let max_tokens = effective_max_tokens(&req) as usize;
-    let temperature = req.temperature.unwrap_or(0.7);
+    // Per-request sampler set from the OpenAI body (only the fields the client
+    // actually sent become `Some`). `chat_stream` overlays this onto the model's
+    // tuned/card-recommended base, so a tuned model serves with its recommendation
+    // by default while these per-request fields still override.
+    let sampling = build_sampling(&req);
 
     let (deltas, outcome) = match higgs
         .chat_stream(
             resolved_model,
             messages_json,
             max_tokens,
-            temperature,
+            sampling,
             tools_json,
         )
         .await
@@ -724,6 +728,25 @@ fn validate_sampling(req: &CreateChatCompletionRequest) -> Result<(), HiggsError
         ));
     }
     Ok(())
+}
+
+/// Map the OpenAI request's sampling fields onto the engine sampling umbrella —
+/// only the fields the client actually sent become `Some`, so `chat_stream` can
+/// overlay this onto a model's tuned/card base without clobbering recommended
+/// samplers the client didn't mention. OpenAI exposes a narrow subset:
+/// `temperature` (→ `temperature`), `top_p` (→ `top_p`), `presence_penalty`
+/// (→ `penalty_present`), `frequency_penalty` (→ `penalty_freq`). The ranges were
+/// already validated by [`validate_sampling`]. A request that sets none yields an
+/// all-`None` set, so the model's base (or the engine's 0.7 default) stands.
+fn build_sampling(req: &CreateChatCompletionRequest) -> crate::worker::engine::SamplingParams {
+    use crate::worker::engine::llamacpp::params::LlamaCppSamplingParams;
+    crate::worker::engine::SamplingParams::llamacpp(LlamaCppSamplingParams {
+        temperature: req.temperature,
+        top_p: req.top_p,
+        penalty_present: req.presence_penalty,
+        penalty_freq: req.frequency_penalty,
+        ..Default::default()
+    })
 }
 
 /// Cheap early reject when the prompt's conservative token estimate plus the
@@ -1349,6 +1372,35 @@ mod tests {
 
     fn req(v: serde_json::Value) -> CreateChatCompletionRequest {
         serde_json::from_value(v).expect("request deserialize")
+    }
+
+    #[test]
+    fn build_sampling_maps_openai_subset_and_omits_absent() {
+        // Absent sampling → an all-None set (the model base / engine default stands).
+        let bare = build_sampling(&req(json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}]
+        })));
+        let s = bare.as_llamacpp();
+        assert!(
+            s.temperature.is_none()
+                && s.top_p.is_none()
+                && s.penalty_present.is_none()
+                && s.penalty_freq.is_none(),
+            "absent OpenAI fields → None: {s:?}"
+        );
+        // Present fields map across (presence→present, frequency→freq).
+        let full = build_sampling(&req(json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "temperature": 0.3, "top_p": 0.9,
+            "presence_penalty": 1.0, "frequency_penalty": -0.5,
+        })));
+        let s = full.as_llamacpp();
+        assert_eq!(s.temperature, Some(0.3));
+        assert_eq!(s.top_p, Some(0.9));
+        assert_eq!(s.penalty_present, Some(1.0), "presence_penalty → present");
+        assert_eq!(s.penalty_freq, Some(-0.5), "frequency_penalty → freq");
+        // Fields outside the OpenAI subset are never invented.
+        assert!(s.top_k.is_none() && s.min_p.is_none());
     }
 
     #[test]

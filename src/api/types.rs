@@ -73,12 +73,7 @@ impl Default for HiggsConfig {
             lmstudio_dirs,
             hf_dirs,
             ollama_dirs,
-            default_load: LoadParams {
-                ctx_len: 4096,
-                gpu_layers: u32::MAX,
-                threads,
-                ..Default::default()
-            },
+            default_load: LoadParams::base(4096, u32::MAX, threads),
         }
     }
 }

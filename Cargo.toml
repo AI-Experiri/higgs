@@ -90,9 +90,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 # compare so a stored key digest never leaks via timing.
 sha2 = "0.10"
 subtle = "2"
-# Streaming HTTP client for the model downloader (P4b, M_PULL): pulls a GGUF from the
+# Streaming HTTP client for the model downloader (P4b, M_PULL) and the FALLBACK
+# path of the HF client (`src/hub.rs`): pulls a GGUF / card file from the
 # HuggingFace resolve URL with progress. rustls to avoid a system OpenSSL dependency.
 reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
+# Official HuggingFace Hub client — PRIMARY path for model downloads + card/config
+# fetch (`src/hub.rs`), with the hand-rolled `reqwest` path above as a fail-open
+# FALLBACK. Pinned to a commit (the crate is pre-1.0, not on crates.io, "APIs may
+# change without notice"); `default-features = false` keeps `xet`/`hf-xet`/`sha2`
+# out. Note: it pulls reqwest 0.13 (a second client+TLS stack alongside our 0.12).
+huggingface-hub = { git = "https://github.com/huggingface/huggingface_hub_rust.git", rev = "c9749ef76a294d5e97acae6b644071e39854aeb8", default-features = false }
 
 [dev-dependencies]
 # test-util: paused-clock control (tokio::time::advance) so the 600 s chat-RPC

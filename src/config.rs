@@ -57,12 +57,36 @@ pub struct SavedHub {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ModelRecord {
     /// The load params of the last successful load, or `None` if this model has only ever carried
-    /// flags (never been loaded on this instance).
-    #[serde(default)]
+    /// flags (never been loaded on this instance). Read tolerantly via [`lenient_load`] so both the
+    /// current engine-tagged `LoadParams` shape AND a pre-umbrella tag-less flat record load.
+    #[serde(default, deserialize_with = "lenient_load")]
     pub load: Option<LoadParams>,
     /// Unix-ms timestamp of the last successful load (`0` = unknown / never loaded).
     #[serde(default)]
     pub last_loaded_ms: u64,
+}
+
+/// Deserialize `ModelRecord.load` tolerantly. Accepts the current engine-tagged
+/// `LoadParams` shape (`{"engine":"LlamaCpp", …}`) AND an older **tag-less flat**
+/// object (records written before the `LoadParams` became an engine umbrella),
+/// and degrades any unrecognizable value to `None` rather than failing the whole
+/// `config.json` load (which would lose the instance name + saved hubs).
+fn lenient_load<'de, D>(d: D) -> Result<Option<LoadParams>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = Option::<serde_json::Value>::deserialize(d)?;
+    Ok(v.and_then(|val| {
+        serde_json::from_value::<LoadParams>(val.clone())
+            .ok()
+            .or_else(|| {
+                serde_json::from_value::<crate::worker::engine::llamacpp::params::LlamaCppParams>(
+                    val,
+                )
+                .ok()
+                .map(LoadParams::llamacpp)
+            })
+    }))
 }
 
 /// On-disk shape of `config.json`. `name` is always present; `hubs`/`default_hub` are node-side
@@ -170,6 +194,10 @@ impl InstanceConfig {
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
+        // Ensure the target directory exists (a no-op for the real `~/.higgs`, which
+        // `ensure_home` creates; needed when the path points at a fresh dir, e.g. a
+        // per-instance test home). Mirrors the `models.json` store's flush.
+        std::fs::create_dir_all(dir)?;
         let tmp = dir.join(format!(
             ".config.json.tmp.{}.{:x}",
             std::process::id(),
@@ -366,27 +394,38 @@ mod tests {
         let mut cfg = InstanceConfig::default();
         assert!(cfg.model_record("org/m").is_none());
 
-        let p1 = LoadParams {
-            ctx_len: 4096,
-            gpu_layers: 99,
-            ..Default::default()
-        };
+        let p1 = LoadParams::base(4096, 99, 0);
         cfg.record_load("org/m", p1.clone(), 1000);
         let rec = cfg.model_record("org/m").expect("record present");
-        assert_eq!(rec.load.as_ref().unwrap().ctx_len, 4096);
+        assert_eq!(rec.load.as_ref().unwrap().ctx_len(), 4096);
         assert_eq!(rec.last_loaded_ms, 1000);
 
         // A second load of the SAME id replaces the load info (latest wins), no duplicate key.
-        let p2 = LoadParams {
-            ctx_len: 8192,
-            gpu_layers: 0,
-            ..Default::default()
-        };
+        let p2 = LoadParams::base(8192, 0, 0);
         cfg.record_load("org/m", p2, 2000);
         assert_eq!(cfg.models.len(), 1, "keyed by id, no duplicate");
         let rec = cfg.model_record("org/m").unwrap();
-        assert_eq!(rec.load.as_ref().unwrap().ctx_len, 8192);
+        assert_eq!(rec.load.as_ref().unwrap().ctx_len(), 8192);
         assert_eq!(rec.last_loaded_ms, 2000);
+    }
+
+    /// Back-compat: a `config.json` written before `LoadParams` became an engine
+    /// umbrella stored a tag-less flat `load` object. It must still deserialize
+    /// (mapped to the `LlamaCpp` variant), and a corrupt `load` value must degrade
+    /// to `None` rather than failing the whole config load.
+    #[test]
+    fn model_record_load_accepts_legacy_flat_and_degrades_garbage() {
+        let legacy = r#"{"name":"node-x","models":{"org/m":{"load":{"ctx_len":2048,"gpu_layers":12,"threads":4},"last_loaded_ms":7}}}"#;
+        let cfg: InstanceConfig = serde_json::from_str(legacy).unwrap();
+        let rec = cfg.model_record("org/m").expect("legacy record present");
+        assert_eq!(rec.load.as_ref().unwrap().ctx_len(), 2048);
+        assert_eq!(rec.load.as_ref().unwrap().gpu_layers(), 12);
+        assert_eq!(rec.last_loaded_ms, 7);
+
+        // A non-object `load` value degrades to None (whole config still loads).
+        let garbage = r#"{"name":"n","models":{"org/m":{"load":42,"last_loaded_ms":1}}}"#;
+        let cfg2: InstanceConfig = serde_json::from_str(garbage).unwrap();
+        assert!(cfg2.model_record("org/m").unwrap().load.is_none());
     }
 
     #[test]
@@ -400,15 +439,7 @@ mod tests {
             name: "node-aa(box)".into(),
             ..Default::default()
         };
-        cfg.record_load(
-            "org/m",
-            LoadParams {
-                ctx_len: 2048,
-                gpu_layers: 12,
-                ..Default::default()
-            },
-            42,
-        );
+        cfg.record_load("org/m", LoadParams::base(2048, 12, 0), 42);
         cfg.save(&path).unwrap();
 
         let back = InstanceConfig::load(&path).unwrap();
@@ -420,7 +451,7 @@ mod tests {
                 .load
                 .as_ref()
                 .unwrap()
-                .ctx_len,
+                .ctx_len(),
             2048
         );
         let _ = std::fs::remove_file(&path);

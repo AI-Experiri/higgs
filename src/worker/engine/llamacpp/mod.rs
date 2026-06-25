@@ -7,15 +7,19 @@
 use std::num::NonZeroU32;
 use std::sync::OnceLock;
 
-use llama_cpp_2::context::params::{KvCacheType, LlamaContextParams};
+use llama_cpp_2::context::params::{
+    KvCacheType, LlamaContextParams, RopeScalingType as LlamaRopeScalingType,
+};
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
-use llama_cpp_2::model::params::LlamaModelParams;
+use llama_cpp_2::model::params::kv_overrides::ParamOverrideValue;
+use llama_cpp_2::model::params::{LlamaModelParams, LlamaSplitMode};
 use llama_cpp_2::model::{AddBos, ChatTemplateResult, LlamaChatTemplate, LlamaModel};
 use llama_cpp_2::openai::OpenAIChatTemplateParams;
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
 
+use self::params::{LlamaCppParams, RopeScalingType, SplitMode};
 use super::{FlashAttn, GenParams, HiggsEngine, KvCacheKind, LoadParams};
 use crate::diagnostic::HiggsError;
 use crate::system::{DeviceKind, GpuDevice};
@@ -25,6 +29,11 @@ use crate::worker::tool_parser::{ToolCallParser, ToolCallStreamFilter, ToolParse
 /// llama.cpp/ggml level + module filters, and the live verbose toggle. All
 /// llama.cpp log filtering lives here — a different engine ships its own.
 pub mod logging;
+
+/// Engine-specific load + sampling parameter types (`LlamaCppParams`,
+/// `LlamaCppSamplingParams`, and the llama.cpp enums) — the payloads of the
+/// `engine::LoadParams` / `engine::SamplingParams` umbrellas.
+pub mod params;
 
 /// Process-wide llama.cpp backend handle — the FFI global init must run
 /// exactly once per process.
@@ -124,8 +133,10 @@ pub fn device_info() -> Vec<GpuDevice> {
 /// A resident model plus the load-time state `chat()` needs to serve it.
 struct LoadedModel {
     model: LlamaModel,
-    /// Load-time knobs; `ctx_len`/`threads` shape the per-request context.
-    params: LoadParams,
+    /// Load-time knobs; `ctx_len`/`threads` shape the per-request context. The
+    /// concrete llama.cpp payload (the worker selected this engine, so it only
+    /// ever holds the `LlamaCpp` variant's params).
+    params: LlamaCppParams,
 }
 
 /// llama.cpp-backed [`HiggsEngine`]. Hosts one loaded model at a time (v1);
@@ -143,23 +154,92 @@ impl HiggsEngine for LlamaCppEngine {
     fn load(&mut self, path: &str, params: &LoadParams) -> Result<(), HiggsError> {
         // Drop any resident model first — one loaded model at a time (v1).
         self.loaded = None;
-        let mut model_params = LlamaModelParams::default().with_n_gpu_layers(params.gpu_layers);
-        // Optional model-params overrides — absent (None) leaves the engine default.
-        if let Some(b) = params.use_mmap {
+        // The worker selected the llamacpp engine, so the umbrella always carries
+        // the LlamaCpp variant here; destructure it for the concrete payload. (When
+        // a second engine variant lands this `let` stops being irrefutable, forcing
+        // the dispatch to be made explicit — the desired compile-time reminder.)
+        let LoadParams::LlamaCpp(p) = params;
+        let load_err = |e: &dyn std::fmt::Display| HiggsError::EngineLoadFailed {
+            id: path.to_string(),
+            reason: e.to_string(),
+        };
+
+        // Safe move-based builder for the params that have plain `with_*` setters.
+        let mut model_params = LlamaModelParams::default().with_n_gpu_layers(p.gpu_layers);
+        if let Some(b) = p.use_mmap {
             model_params = model_params.with_use_mmap(b);
         }
-        if let Some(b) = params.use_mlock {
+        if let Some(b) = p.use_mlock {
             model_params = model_params.with_use_mlock(b);
         }
-        let model = LlamaModel::load_from_file(backend(), path, &model_params).map_err(|e| {
-            HiggsError::EngineLoadFailed {
-                id: path.to_string(),
-                reason: e.to_string(),
+        // Multi-GPU knobs are carried for completeness (single-GPU/Metal target);
+        // applied when explicitly set, never derived.
+        if let Some(sm) = p.split_mode {
+            model_params = model_params.with_split_mode(split_mode_to_llama(sm));
+        }
+        if let Some(g) = p.main_gpu {
+            model_params = model_params.with_main_gpu(g);
+        }
+        if let Some(devs) = &p.devices {
+            let usize_devs: Vec<usize> = devs.iter().map(|d| *d as usize).collect();
+            model_params = model_params
+                .with_devices(&usize_devs)
+                .map_err(|e| load_err(&e))?;
+        }
+        // `add_cpu_moe_override` / `add_cpu_buft_override` / `append_kv_override` take
+        // `Pin<&mut Self>` and build a SELF-REFERENTIAL struct (the params hold raw
+        // pointers into the override Vecs / pattern CStrings). The move-based chain
+        // above can't host them, so when any is requested we pin the params, mutate
+        // through the pin, and keep that allocation — and the buft pattern CStrings —
+        // alive across `load_from_file`. The common case keeps the simple move chain.
+        let needs_pin = p.cpu_moe == Some(true)
+            || !p.cpu_buft_overrides.is_empty()
+            || !p.kv_overrides.is_empty();
+        let model = if needs_pin {
+            // The buft pattern is stored as a raw POINTER into these CStrings, so they
+            // must outlive the load below. (`append_kv_override` instead COPIES the key
+            // + value into the struct, so kv key strings need no keep-alive.)
+            let patterns: Vec<std::ffi::CString> = p
+                .cpu_buft_overrides
+                .iter()
+                .filter_map(|s| std::ffi::CString::new(s.as_str()).ok())
+                .collect();
+            let mut pinned = Box::pin(model_params);
+            if p.cpu_moe == Some(true) {
+                pinned.as_mut().add_cpu_moe_override();
             }
-        })?;
+            for cstr in &patterns {
+                pinned.as_mut().add_cpu_buft_override(cstr);
+            }
+            for ov in &p.kv_overrides {
+                match std::ffi::CString::new(ov.key.as_str()) {
+                    // llama.cpp COPIES the key into a fixed 128-byte buffer with no
+                    // bounds check and would panic on overflow, so skip a key whose
+                    // NUL-terminated form won't fit (a degenerate input — real GGUF
+                    // metadata keys are short) rather than crash the worker.
+                    Ok(key) if key.as_bytes_with_nul().len() <= 128 => pinned
+                        .as_mut()
+                        .append_kv_override(&key, parse_kv_override_value(&ov.value)),
+                    Ok(_) => tracing::warn!(
+                        key = %ov.key,
+                        "higgs: skipping kv_override key longer than 128 bytes"
+                    ),
+                    Err(_) => {
+                        tracing::warn!(key = %ov.key, "higgs: skipping kv_override with NUL in key")
+                    }
+                }
+            }
+            let model =
+                LlamaModel::load_from_file(backend(), path, &pinned).map_err(|e| load_err(&e));
+            // Keep `patterns` alive until the load has consumed the params.
+            drop(patterns);
+            model?
+        } else {
+            LlamaModel::load_from_file(backend(), path, &model_params).map_err(|e| load_err(&e))?
+        };
         self.loaded = Some(LoadedModel {
             model,
-            params: params.clone(),
+            params: p.clone(),
         });
         Ok(())
     }
@@ -294,6 +374,48 @@ fn kv_cache_to_llama(k: KvCacheKind) -> KvCacheType {
     }
 }
 
+/// Parse a string-valued GGUF metadata override into the typed
+/// [`ParamOverrideValue`] llama.cpp expects, guessing the kind bool → int → float
+/// → string (a typical numeric/bool override parses to its kind; anything else is
+/// kept as a string, truncated to the 127-byte C field). Confined to this file.
+fn parse_kv_override_value(s: &str) -> ParamOverrideValue {
+    if let Ok(b) = s.parse::<bool>() {
+        return ParamOverrideValue::Bool(b);
+    }
+    if let Ok(i) = s.parse::<i64>() {
+        return ParamOverrideValue::Int(i);
+    }
+    if let Ok(f) = s.parse::<f64>() {
+        return ParamOverrideValue::Float(f);
+    }
+    let mut arr = [0 as std::os::raw::c_char; 128];
+    for (i, &byte) in s.as_bytes().iter().take(127).enumerate() {
+        arr[i] = byte as std::os::raw::c_char;
+    }
+    ParamOverrideValue::Str(arr)
+}
+
+/// Map higgs's [`SplitMode`] to `llama-cpp-2`'s [`LlamaSplitMode`]. Confined to
+/// this file per the engine boundary.
+fn split_mode_to_llama(sm: SplitMode) -> LlamaSplitMode {
+    match sm {
+        SplitMode::None => LlamaSplitMode::None,
+        SplitMode::Layer => LlamaSplitMode::Layer,
+        SplitMode::Row => LlamaSplitMode::Row,
+    }
+}
+
+/// Map higgs's [`RopeScalingType`] to `llama-cpp-2`'s [`LlamaRopeScalingType`].
+/// Confined to this file per the engine boundary.
+fn rope_scaling_to_llama(r: RopeScalingType) -> LlamaRopeScalingType {
+    match r {
+        RopeScalingType::Unspecified => LlamaRopeScalingType::Unspecified,
+        RopeScalingType::None => LlamaRopeScalingType::None,
+        RopeScalingType::Linear => LlamaRopeScalingType::Linear,
+        RopeScalingType::Yarn => LlamaRopeScalingType::Yarn,
+    }
+}
+
 /// Construct a `GenerationFailed` diagnostic for a named decode stage.
 fn gen_fail(stage: &'static str, reason: &impl ToString) -> HiggsError {
     HiggsError::GenerationFailed {
@@ -362,7 +484,7 @@ fn apply_template(
 fn fit_check(
     model: &LlamaModel,
     prompt: &str,
-    load: &LoadParams,
+    load: &LlamaCppParams,
     gen: &GenParams,
 ) -> Result<Vec<LlamaToken>, HiggsError> {
     let tokens = model
@@ -407,23 +529,37 @@ fn run_decode(
     // n_batch: use the pinned value when present, else the current default
     // (ctx_len.max(1) — one-shot prefill of any fit-checked prompt).
     let n_batch = lp.n_batch.unwrap_or_else(|| lp.ctx_len.max(1));
+    // `n_threads_batch` splits from `n_threads` when set, else reuses `threads`.
+    let threads_batch = lp
+        .n_threads_batch
+        .map(|n| i32::try_from(n).unwrap_or(i32::MAX))
+        .unwrap_or(threads);
     let mut ctx_params = LlamaContextParams::default()
         .with_n_ctx(NonZeroU32::new(lp.ctx_len))
         .with_n_batch(n_batch)
         .with_n_threads(threads)
-        .with_n_threads_batch(threads);
+        .with_n_threads_batch(threads_batch);
     // Optional context-params overrides — absent (None) leaves the engine default.
     if let Some(n) = lp.n_ubatch {
         ctx_params = ctx_params.with_n_ubatch(n);
     }
+    if let Some(n) = lp.n_seq_max {
+        ctx_params = ctx_params.with_n_seq_max(n);
+    }
     if let Some(b) = lp.offload_kqv {
         ctx_params = ctx_params.with_offload_kqv(b);
+    }
+    if let Some(b) = lp.swa_full {
+        ctx_params = ctx_params.with_swa_full(b);
     }
     if let Some(f) = lp.rope_freq_base {
         ctx_params = ctx_params.with_rope_freq_base(f);
     }
     if let Some(f) = lp.rope_freq_scale {
         ctx_params = ctx_params.with_rope_freq_scale(f);
+    }
+    if let Some(r) = lp.rope_scaling_type {
+        ctx_params = ctx_params.with_rope_scaling_type(rope_scaling_to_llama(r));
     }
     if let Some(fa) = lp.flash_attn {
         ctx_params = ctx_params.with_flash_attention_policy(flash_attn_to_sys(fa));
@@ -450,19 +586,57 @@ fn run_decode(
     ctx.decode(&mut batch)
         .map_err(|e| gen_fail("prompt decode", &e))?;
 
-    // Greedy when temperature is zero, else temp + dist. The dist seed is the
-    // load-pinned `seed` when set (reproducible generation), else a fresh random
-    // seed per request (F5: was hardcoded 1234 — fully deterministic; None here
-    // preserves that per-request-entropy behavior).
-    let seed = lp.seed.unwrap_or_else(rand::random::<u32>);
-    let mut sampler = if params.temperature <= 0.0 {
-        LlamaSampler::chain_simple([LlamaSampler::greedy()])
+    // Build the sampler chain from the request's sampling params (the engine
+    // umbrella's LlamaCpp variant). `temperature <= 0` ⇒ greedy (deterministic,
+    // ignoring the other samplers, matching llama.cpp). Otherwise the standard order:
+    // penalties → top_k → typical → top_p → min_p → top_n_sigma → xtc → temp(/dynatemp)
+    // → dist. The seed is the per-request `sampling.seed`, else the load-pinned seed,
+    // else fresh entropy. (Advanced samplers needing the model/vocab handle — dry,
+    // mirostat, grammar, logit_bias — are carried in the type but not built here yet.)
+    let s = params.sampling.as_llamacpp();
+    let temp = s.temperature.unwrap_or(0.7);
+    let seed = s.seed.or(lp.seed).unwrap_or_else(rand::random::<u32>);
+    let mut chain: Vec<LlamaSampler> = Vec::new();
+    if temp <= 0.0 {
+        chain.push(LlamaSampler::greedy());
     } else {
-        LlamaSampler::chain_simple([
-            LlamaSampler::temp(params.temperature),
-            LlamaSampler::dist(seed),
-        ])
-    };
+        if s.penalty_repeat.is_some() || s.penalty_freq.is_some() || s.penalty_present.is_some() {
+            chain.push(LlamaSampler::penalties(
+                s.penalty_last_n.unwrap_or(64),
+                s.penalty_repeat.unwrap_or(1.0),
+                s.penalty_freq.unwrap_or(0.0),
+                s.penalty_present.unwrap_or(0.0),
+            ));
+        }
+        if let Some(k) = s.top_k {
+            chain.push(LlamaSampler::top_k(k));
+        }
+        if let Some(p) = s.typical_p {
+            chain.push(LlamaSampler::typical(p, 1));
+        }
+        if let Some(p) = s.top_p {
+            chain.push(LlamaSampler::top_p(p, 1));
+        }
+        if let Some(p) = s.min_p {
+            chain.push(LlamaSampler::min_p(p, 1));
+        }
+        if let Some(n) = s.top_n_sigma {
+            chain.push(LlamaSampler::top_n_sigma(n));
+        }
+        if let (Some(prob), Some(thr)) = (s.xtc_probability, s.xtc_threshold) {
+            chain.push(LlamaSampler::xtc(prob, thr, 1, seed));
+        }
+        match s.dynatemp_range {
+            Some(range) => chain.push(LlamaSampler::temp_ext(
+                temp,
+                range,
+                s.dynatemp_exponent.unwrap_or(1.0),
+            )),
+            None => chain.push(LlamaSampler::temp(temp)),
+        }
+        chain.push(LlamaSampler::dist(seed));
+    }
+    let mut sampler = LlamaSampler::chain_simple(chain);
 
     let mut stream_filter = parser.map(|p| ToolCallStreamFilter::new(p.open_markers()));
     let mut decoder = encoding_rs::UTF_8.new_decoder();
@@ -590,6 +764,15 @@ fn parse_output(
 mod tests {
     use super::*;
 
+    /// A deterministic (greedy) sampling umbrella for tests — `temperature: 0`
+    /// makes the decode loop pick `argmax`, so generation is reproducible.
+    fn greedy_sampling() -> crate::worker::engine::SamplingParams {
+        crate::worker::engine::SamplingParams::llamacpp(super::params::LlamaCppSamplingParams {
+            temperature: Some(0.0),
+            ..Default::default()
+        })
+    }
+
     /// Phase-1 milestone: first real token from a local GGUF through the
     /// full template → tokenize → decode → detokenize path.
     #[test]
@@ -599,12 +782,12 @@ mod tests {
         let mut e = LlamaCppEngine::default();
         e.load(
             &path,
-            &LoadParams {
+            &LoadParams::llamacpp(LlamaCppParams {
                 ctx_len: 2048,
                 gpu_layers: u32::MAX,
                 threads: 4,
                 ..Default::default()
-            },
+            }),
         )
         .unwrap();
         assert!(e.is_loaded());
@@ -614,7 +797,7 @@ mod tests {
                 r#"[{"role":"user","content":"Say hi in one word."}]"#,
                 &GenParams {
                     max_tokens: 8,
-                    temperature: 0.0,
+                    sampling: greedy_sampling(),
                     tools_json: None,
                 },
                 &mut |d| out.push_str(d),
@@ -634,6 +817,28 @@ mod tests {
         );
         e.unload();
         assert!(!e.is_loaded());
+    }
+
+    /// A string-valued GGUF override parses to the matching `ParamOverrideValue`
+    /// kind: bool → int → float → string (in that precedence).
+    #[test]
+    fn kv_override_value_parses_by_type() {
+        assert!(matches!(
+            parse_kv_override_value("true"),
+            ParamOverrideValue::Bool(true)
+        ));
+        assert!(matches!(
+            parse_kv_override_value("8192"),
+            ParamOverrideValue::Int(8192)
+        ));
+        assert!(matches!(
+            parse_kv_override_value("1.5"),
+            ParamOverrideValue::Float(_)
+        ));
+        assert!(matches!(
+            parse_kv_override_value("llama"),
+            ParamOverrideValue::Str(_)
+        ));
     }
 
     /// `FlashAttn` maps to the exact llama.cpp raw values (AUTO=-1, OFF=0, ON=1).
@@ -682,72 +887,24 @@ mod tests {
         }
     }
 
-    /// An all-default `LoadParams` leaves every optional as `None`, so the
-    /// pre-expansion (quick-load) code path is reproduced exactly.
+    /// The umbrella serializes internally-tagged on `engine`, flattening the
+    /// llama.cpp payload (so the wire stays close to the old flat shape, plus an
+    /// `engine` discriminator). Field-level serde coverage lives in `params.rs`.
     #[test]
-    fn default_load_params_leave_optionals_none() {
-        let p = LoadParams {
-            ctx_len: 4096,
-            gpu_layers: u32::MAX,
-            threads: 4,
-            ..Default::default()
-        };
-        assert!(p.use_mmap.is_none());
-        assert!(p.use_mlock.is_none());
-        assert!(p.n_batch.is_none());
-        assert!(p.n_ubatch.is_none());
-        assert!(p.offload_kqv.is_none());
-        assert!(p.rope_freq_base.is_none());
-        assert!(p.rope_freq_scale.is_none());
-        assert!(p.flash_attn.is_none());
-        assert!(p.type_k.is_none());
-        assert!(p.type_v.is_none());
-        assert!(p.seed.is_none());
-    }
-
-    /// Full serde round-trip of an expanded `LoadParams` (all fields set), and
-    /// the absent-optionals shape (only base fields serialize).
-    #[test]
-    fn load_params_serde_round_trip() {
-        let full = LoadParams {
+    fn umbrella_tags_engine_and_flattens_payload() {
+        let lp = LoadParams::llamacpp(LlamaCppParams {
             ctx_len: 8192,
             gpu_layers: 32,
             threads: 6,
-            use_mmap: Some(false),
-            use_mlock: Some(true),
-            n_batch: Some(1024),
-            n_ubatch: Some(256),
-            offload_kqv: Some(false),
-            rope_freq_base: Some(10000.0),
-            rope_freq_scale: Some(0.5),
-            flash_attn: Some(FlashAttn::On),
             type_k: Some(KvCacheKind::Q8_0),
-            type_v: Some(KvCacheKind::F16),
-            seed: Some(42),
-        };
-        let json = serde_json::to_string(&full).unwrap();
-        let back: LoadParams = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.flash_attn, Some(FlashAttn::On));
-        assert_eq!(back.type_k, Some(KvCacheKind::Q8_0));
-        assert_eq!(back.seed, Some(42));
-        assert_eq!(back.n_batch, Some(1024));
-        assert_eq!(back.use_mmap, Some(false));
-
-        // FlashAttn serializes lowercase ("on"/"off"/"auto").
-        assert_eq!(serde_json::to_string(&FlashAttn::Auto).unwrap(), "\"auto\"");
-
-        // Absent optionals: only the three base fields appear on the wire.
-        let bare = LoadParams {
-            ctx_len: 4096,
-            gpu_layers: u32::MAX,
-            threads: 4,
+            flash_attn: Some(FlashAttn::On),
             ..Default::default()
-        };
-        let bare_json: serde_json::Value = serde_json::to_value(&bare).unwrap();
-        let obj = bare_json.as_object().unwrap();
-        assert_eq!(obj.len(), 3, "absent optionals must not serialize: {obj:?}");
-        // A bare object deserializes back with all optionals None (quick-load).
-        let bare_back: LoadParams = serde_json::from_value(bare_json).unwrap();
-        assert!(bare_back.seed.is_none() && bare_back.flash_attn.is_none());
+        });
+        let v = serde_json::to_value(&lp).unwrap();
+        assert_eq!(v["engine"], "LlamaCpp");
+        assert_eq!(v["ctx_len"], 8192);
+        assert_eq!(v["type_k"], "Q8_0");
+        let back: LoadParams = serde_json::from_value(v).unwrap();
+        assert_eq!(back, lp);
     }
 }

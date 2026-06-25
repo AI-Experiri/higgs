@@ -18,6 +18,12 @@
 #   * node/{hub,fleet,transport,data}.rs — the hub accept loop, fleet routing + background
 #                              watchers, per-node transport, and chat/pull relays — all driven
 #                              by spawned tasks over real iroh streams.
+#   * hub.rs                 — the HuggingFace hub-client glue (download_file_to_bytes /
+#                              download_file_stream over LIVE huggingface.co) + the reqwest
+#                              fallback; only a real network fetch runs it. Its PURE logic
+#                              (error classification, HTTP-status routing, repo-id split) IS
+#                              unit-tested; the network path is the integration gate's job
+#                              (the tune card-fetch + a bogus-repo pull exercise it).
 # Everything else (pure logic + sync wiring) must hit 90% from unit tests alone.
 #
 # Requires cargo-llvm-cov (`cargo install cargo-llvm-cov`). The FFI build env
@@ -29,5 +35,5 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 exec cargo llvm-cov --lib \
-  --ignore-filename-regex 'node/cli\.rs|engine/llamacpp/mod\.rs|node/mod\.rs|node/hub\.rs|node/fleet\.rs|node/transport\.rs|node/data\.rs' \
+  --ignore-filename-regex 'node/cli\.rs|engine/llamacpp/mod\.rs|node/mod\.rs|node/hub\.rs|node/fleet\.rs|node/transport\.rs|node/data\.rs|src/hub\.rs' \
   --fail-under-lines 90 "$@"

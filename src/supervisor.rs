@@ -517,7 +517,7 @@ impl Supervisor {
         model: String,
         messages_json: String,
         max_tokens: usize,
-        temperature: f32,
+        sampling: crate::worker::engine::SamplingParams,
         tools_json: Option<String>,
     ) -> (
         mpsc::UnboundedReceiver<String>,
@@ -547,7 +547,9 @@ impl Supervisor {
                         "model": model,
                         "messages_json": messages_json,
                         "max_tokens": max_tokens,
-                        "temperature": temperature,
+                        // Full sampler set (engine umbrella) as a sub-object — the
+                        // worker rebuilds the ordered sampler chain from it.
+                        "sampling": sampling,
                         "tools": tools_json,
                     }),
                 )

@@ -20,6 +20,9 @@ use crate::node::runtime::{NodeConfig, NodeRuntime, DEFAULT_IDLE_TTL};
 use crate::node::worker_id::WorkerId;
 use crate::remote::{InventoryWorker, NodeInventory, NodeLoadParams};
 use crate::supervisor::HiggsEvent;
+use crate::system::HardwareInfo;
+use crate::tune::store::{JsonModelStore, TuneRecord};
+use crate::tune::{ModelMeta, Suggester, TuneMode, TuneRequest, TuneSuggestion};
 use crate::worker::engine::LoadParams;
 use crate::worker::models::HiggsModel;
 
@@ -142,6 +145,14 @@ pub struct Higgs {
     /// `.await`. Pure reads of `config.json` (e.g. the node view's label) need no lock: the atomic
     /// rename means a reader always sees a complete prior-or-next version.
     config_io: parking_lot::Mutex<()>,
+    /// Serializes read-modify-write of the per-node `models.json` (tuning records).
+    /// `models.json` is rewritten WHOLESALE on flush, so two concurrent `tune`
+    /// calls that each opened their own snapshot would have the last flush clobber
+    /// the other's new `TuneRecord`. Holding this across a fresh re-open → mutate →
+    /// atomic-save makes each write re-read the latest file first. A plain
+    /// `parking_lot::Mutex` — held only across synchronous file I/O, never an
+    /// `.await`. Mirrors [`Self::config_io`].
+    models_io: parking_lot::Mutex<()>,
     /// Override for the `config.json` path. `None` in production → the real
     /// [`crate::config::config_path`] (`~/.higgs` or `$HIGGS_HOME`). Set to a unique temp
     /// path for in-crate unit tests (see [`default_config_path_override`]) so `load`'s
@@ -149,6 +160,28 @@ pub struct Higgs {
     /// and parallel tests don't share state. A `Mutex` only to satisfy `Sync` cheaply; it is
     /// set once at construction and read thereafter.
     config_path: parking_lot::Mutex<Option<std::path::PathBuf>>,
+}
+
+/// Resolve the effective per-request sampling for a local chat: overlay the
+/// `request` sampler set onto the model's `stored` tuned/card-recommended base.
+///
+/// This is the "HF-card recommended sampling actually applies" seam. A `tune`
+/// persists the recommendation (temp/top_k/top_p/min_p/penalties) under the raw
+/// model id; a plain OpenAI chat usually pins only `temperature`, so the rest of
+/// the recommendation flows through ([`LlamaCppSamplingParams::overlaid_with`]:
+/// request fields win, the base's other samplers survive). With no stored profile
+/// the request stands alone (the worker still applies its 0.7 temperature default
+/// for an unset field). Engine-tagged throughout — the umbrella variant matches.
+fn overlay_sampling(
+    stored: Option<crate::worker::engine::SamplingParams>,
+    request: crate::worker::engine::SamplingParams,
+) -> crate::worker::engine::SamplingParams {
+    match stored {
+        Some(base) => crate::worker::engine::SamplingParams::llamacpp(
+            base.as_llamacpp().overlaid_with(request.as_llamacpp()),
+        ),
+        None => request,
+    }
 }
 
 /// Wall-clock milliseconds since the Unix epoch (`0` if the clock is before it). Used to stamp
@@ -175,7 +208,15 @@ fn default_config_path_override() -> Option<std::path::PathBuf> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
-    Some(std::env::temp_dir().join(format!("higgs-unit-config-{}-{n}.json", std::process::id())))
+    // A unique per-instance SUBDIR (not just a unique file in the shared temp dir):
+    // `models_store()` derives its home from this path's PARENT, so `config.json`
+    // AND `models.json` must each live in an isolated dir or parallel unit tests
+    // would clobber each other's per-node model store.
+    Some(
+        std::env::temp_dir()
+            .join(format!("higgs-unit-{}-{n}", std::process::id()))
+            .join("config.json"),
+    )
 }
 
 impl Higgs {
@@ -233,6 +274,7 @@ impl Higgs {
             hub: parking_lot::Mutex::new(None),
             hub_lifecycle: tokio::sync::Mutex::new(()),
             config_io: parking_lot::Mutex::new(()),
+            models_io: parking_lot::Mutex::new(()),
             config_path: parking_lot::Mutex::new(default_config_path_override()),
         }
     }
@@ -557,14 +599,38 @@ impl Higgs {
         // dedup IN-FLIGHT loads, changing its additive contract (used by the remote
         // path); deferred as not worth that for a self-healing, memory-bounded race.
         if self.local.instances().await.iter().any(|(_, m)| m == id) {
+            // Idempotent no-op: the model stays loaded with its CURRENT params — the
+            // request params are NOT applied to the resident worker here. So we also do
+            // NOT sync them to the saved profile: persisting params that were never
+            // validated by a real load would let a later plain reload reuse a profile
+            // that fails (the success-before-persist invariant the full path keeps —
+            // it syncs only AFTER `self.local.load` succeeds). To change a resident
+            // model's saved profile, unload then load.
             return Ok(());
         }
-        // Map the host `LoadParams` onto the node's lean `NodeLoadParams`. Only
-        // id/ctx_len/gpu_layers/threads cross to the node today; the rich engine
-        // overrides (use_mmap/use_mlock/n_batch/…) are NOT carried — matching the
-        // remote path (DESIGN-remote.md), a documented gap. When the caller pins
-        // no params, ctx_len is left `None` so the node defaults it to the model's
-        // trained context (capped at DEFAULT_CTX_CAP), exactly as the old facade did.
+        // Load-seam precedence (DESIGN-autotune §3.1): explicit request params win;
+        // else a saved per-model tuning profile (a prior `tune` the user kept, in
+        // `models.json`) is reused — "tune once, loads that way every time"; else
+        // (`None`) the node's default_load / ctx-cap path. (The `autotune_on_load`
+        // suggester branch slots between saved-profile and default_load — P1.5.)
+        // Track explicit-vs-reused: an EXPLICIT load (request carried params — a fresh
+        // suggestion or an accepted edit) updates the saved profile below; a load that
+        // REUSED the saved profile leaves it unchanged.
+        let from_request = params.is_some();
+        let params = match params {
+            Some(p) => Some(p),
+            None => self
+                .models_store()
+                .ok()
+                .and_then(|s| s.tuning(id))
+                .map(|t| t.profile),
+        };
+        // Map the host `LoadParams` onto the node's `NodeLoadParams`. The base
+        // fields (id/ctx_len/gpu_layers/threads) drive the node's resolve/ctx-cap;
+        // the FULL engine override set rides `params` and is applied by the worker
+        // (the prior drop-at-the-node gap is now closed). When the caller pins no
+        // params, ctx_len is left `None` so the node defaults it to the model's
+        // trained context (capped at DEFAULT_CTX_CAP).
         let np = match params {
             Some(p) => NodeLoadParams {
                 id: id.to_owned(),
@@ -574,42 +640,81 @@ impl Higgs {
                 // reproduce the SAME auto load instead of pinning a literal 0 (which
                 // the worker would coerce to its 4096 fallback). A pinned 0 context is
                 // nonsensical anyway, so nothing meaningful is lost.
-                ctx_len: (p.ctx_len > 0).then_some(p.ctx_len),
-                gpu_layers: Some(p.gpu_layers),
-                threads: Some(p.threads),
+                ctx_len: (p.ctx_len() > 0).then_some(p.ctx_len()),
+                gpu_layers: Some(p.gpu_layers()),
+                threads: Some(p.threads()),
+                // Forward the rich engine override set (type_k/flash_attn/cpu_moe/…)
+                // so the worker applies it — but ONLY when there's something beyond the
+                // base 3 to apply, so a base-only load carries no payload.
+                params: {
+                    let lc = p.as_llamacpp();
+                    lc.has_overrides().then(|| lc.clone())
+                },
             },
             None => {
                 let d = self.config.lock().default_load.clone();
                 NodeLoadParams {
                     id: id.to_owned(),
                     ctx_len: None,
-                    gpu_layers: Some(d.gpu_layers),
-                    threads: Some(d.threads),
+                    gpu_layers: Some(d.gpu_layers()),
+                    threads: Some(d.threads()),
+                    params: {
+                        let lc = d.as_llamacpp();
+                        lc.has_overrides().then(|| lc.clone())
+                    },
                 }
             }
         };
         // The params we PERSIST on success — derived from `np` so the record reflects
-        // EXACTLY what crossed to the node (and a future autoload reproduces it). We
-        // record ONLY the forwarded fields; the rich engine overrides are NOT carried
-        // to the node today (documented gap), so persisting them would claim options
-        // the engine never received — they stay at default here until the gap closes.
-        // A `ctx_len` of 0 means AUTO (node called with `ctx_len: None` → trained
-        // context, capped) — never `default_load().ctx_len`, which the node ignores.
-        let effective = LoadParams {
-            ctx_len: np.ctx_len.unwrap_or(0),
-            gpu_layers: np.gpu_layers.unwrap_or_default(),
-            threads: np.threads.unwrap_or_default(),
-            ..Default::default()
+        // EXACTLY what crossed to the node (and a future autoload reproduces it). Now
+        // that the rich overrides DO cross (the `params` field), persist the full set
+        // with the node-resolved base fields stamped in. A `ctx_len` of 0 means AUTO
+        // (node called with `ctx_len: None` → trained context, capped).
+        let effective = match &np.params {
+            Some(lc) => {
+                let mut lc = lc.clone();
+                lc.ctx_len = np.ctx_len.unwrap_or(0);
+                lc.gpu_layers = np.gpu_layers.unwrap_or_default();
+                lc.threads = np.threads.unwrap_or_default();
+                LoadParams::llamacpp(lc)
+            }
+            None => LoadParams::base(
+                np.ctx_len.unwrap_or(0),
+                np.gpu_layers.unwrap_or_default(),
+                np.threads.unwrap_or_default(),
+            ),
         };
         // Additive load on the local node: spawns a fresh worker for `id` (the
         // node emits `ModelLoaded` on commit). resolve / headroom / path-traversal
         // failures surface as their mapped HiggsError.
         self.local.load(np).await?;
         // Persist the per-model load record (best-effort — never fail a good load).
-        if let Err(e) = self.with_config_mut(|c| c.record_load(id, effective, now_unix_ms())) {
+        let now = now_unix_ms();
+        if let Err(e) = self.with_config_mut(|c| c.record_load(id, effective.clone(), now)) {
             tracing::warn!(id, error = %e, "higgs: failed to persist load record to config.json");
         }
+        // Keep the saved tuning profile in sync with an ACCEPTED explicit load, so a
+        // plain reload reuses the accepted/edited params — not a stale tune suggestion.
+        // A load that merely REUSED the saved profile (no request params) leaves it
+        // unchanged. (The resident-model early return above does the same sync.)
+        if from_request {
+            self.sync_saved_profile(id, &effective);
+        }
         Ok(())
+    }
+
+    /// Persist `profile` as the saved per-model tuning profile for `id` — the LAST
+    /// accepted explicit load — so a later plain reload reuses it. Serialized through
+    /// `models_io` with a fresh re-read (the whole `models.json` is rewritten on
+    /// flush). Best-effort: a write failure is logged, never fails the load.
+    fn sync_saved_profile(&self, id: &str, profile: &LoadParams) {
+        let _guard = self.models_io.lock();
+        if let Ok(store) = self.models_store() {
+            store.set_profile(id, profile.clone(), now_unix_ms());
+            if let Err(e) = store.flush() {
+                tracing::warn!(id, error = %e, "higgs: failed to persist accepted load profile to models.json");
+            }
+        }
     }
 
     /// Unload ALL locally-resident models.
@@ -818,7 +923,7 @@ impl Higgs {
         model: String,
         messages_json: String,
         max_tokens: usize,
-        temperature: f32,
+        sampling: crate::worker::engine::SamplingParams,
         tools_json: Option<String>,
     ) -> Result<
         (
@@ -857,18 +962,25 @@ impl Higgs {
             // in-flight reference, so the node's idle reaper never unloads a worker
             // mid-chat. A dead/unloaded worker here is a mapped error.
             let lease = self.local.chat_handle(worker).await?;
+            // Apply the model's tuned/card-recommended sampling as the BASE, then
+            // overlay the per-request fields the client sent. This is where "HF-card
+            // recommended sampling actually applies": a `tune` persisted the
+            // recommendation under the RAW model id in `models.json`, and a plain
+            // OpenAI chat (usually only `temperature`) inherits the rest (top_k/min_p/
+            // penalties/…). No stored profile ⇒ the request stands alone. Keyed by the
+            // RAW model (the store's key), not the ephemeral served suffix id.
+            let stored = self
+                .models_store()
+                .ok()
+                .and_then(|s| s.tuning(&raw_model))
+                .map(|t| t.sampling);
+            let merged = overlay_sampling(stored, sampling);
             // Mint the request, register its keyed sink, and obtain a future that
             // drives the M_CHAT RPC to completion and removes the sink on any outcome —
             // all of it lives in `Supervisor::chat` (reached via the lease's `Deref`).
             // `rx` is returned to the caller now; `call` (and the lease that keeps the
             // worker alive) ride the spawned generation task with the admission permit.
-            let (rx, call) = lease.chat(
-                raw_model,
-                messages_json,
-                max_tokens,
-                temperature,
-                tools_json,
-            );
+            let (rx, call) = lease.chat(raw_model, messages_json, max_tokens, merged, tools_json);
             let handle = tokio::spawn(async move {
                 // Hold the admission permit AND the lease for the whole generation;
                 // dropping them here (on any return path) releases the gate slot and
@@ -898,6 +1010,10 @@ impl Higgs {
                         in_flight: MAX_CONCURRENT_INFERENCE,
                         max: MAX_CONCURRENT_INFERENCE,
                     })?;
+                // Remote sampling forwarding is DEFERRED (like remote load-param
+                // forwarding): the node relay carries only temperature today. Extract
+                // it from the umbrella; the rest of the sampler set applies locally.
+                let temperature = sampling.as_llamacpp().temperature.unwrap_or(0.7);
                 let (rx, fut) = fleet
                     .chat(&model, messages_json, max_tokens, temperature, tools_json)
                     .await?;
@@ -1087,6 +1203,124 @@ impl Higgs {
             *self.device_cache.lock() = Some(gpus.clone());
         }
         gpus
+    }
+
+    /// Full host hardware snapshot (CPU cores/RAM + the cached GPU list) for the
+    /// autotune suggester. The GPU list rides [`Self::sysinfo`] (cached worker
+    /// round-trip); the CPU/RAM facts come from the `sysinfo` crate locally.
+    /// Blocking (a short CPU-usage sample) — offloaded to a blocking thread.
+    pub async fn hardware(&self) -> HardwareInfo {
+        let gpus = self.sysinfo().await;
+        tokio::task::spawn_blocking(move || {
+            crate::system::SystemInfo::gather_hardware_runtime(gpus).0
+        })
+        .await
+        .expect("higgs hardware gather task panicked")
+    }
+
+    /// Open this instance's per-node `models.json` store (tuning + perf + meta
+    /// cache). Lives in the same home as `config.json` — so the per-instance
+    /// config-path override (unit tests) isolates the store too; else `~/.higgs`.
+    pub(crate) fn models_store(&self) -> std::io::Result<JsonModelStore> {
+        let home = match self.config_path.lock().clone() {
+            Some(p) => p
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(crate::home::higgs_home),
+            None => crate::home::higgs_home(),
+        };
+        JsonModelStore::open(&home)
+    }
+
+    /// Run the autotune suggester for a model: look up its GGUF metadata + the host
+    /// hardware, derive a nominal load + sampling parameter set within the budget,
+    /// and persist it as the saved profile (so the next plain load reuses it — "tune
+    /// once"). It NEVER loads the model — the caller fills the editable fields with
+    /// the result and loads separately. `Suggest` mode is pure + a best-effort HF
+    /// card fetch; `Benchmark` (P2) falls back to `Suggest` for now.
+    pub async fn tune(&self, req: TuneRequest) -> Result<TuneSuggestion, HiggsError> {
+        let id = req.id.clone();
+        // 1. Typed GGUF metadata from the scan.
+        let model = self
+            .scan()
+            .await?
+            .into_iter()
+            .find(|m| m.id == id)
+            .ok_or_else(|| HiggsError::ModelNotFound { id: id.clone() })?;
+        let meta = ModelMeta::from_model(&model);
+
+        // 2. Host hardware + budget.
+        let hw = self.hardware().await;
+        let budget = req.budget.clone().unwrap_or_default();
+
+        // 3. Best-effort HF-card sampling (bounded; fail-open). Skipped for ollama ids.
+        let card = fetch_card_bounded(&id).await;
+
+        // 4. Suggest — always a FRESH derive within the budget (a prior saved profile
+        //    is reused at the LOAD seam, not here, so a re-tune honors a new budget).
+        //    (Benchmark is P2 — treated as Suggest here.)
+        let suggestion = match card {
+            Some(sampling) => Suggester {
+                derive: crate::tune::derive::HeuristicStrategy,
+                vram: crate::tune::vram::StaticVramEstimator,
+                ram: crate::tune::vram::StaticRamEstimator,
+                sampling: crate::tune::card_sampling::StaticSamplingSource(sampling),
+            }
+            .suggest(&meta, &hw, &budget),
+            None => Suggester::static_default().suggest(&meta, &hw, &budget),
+        };
+        if req.mode.unwrap_or_default() == TuneMode::Benchmark {
+            tracing::info!(
+                id,
+                "higgs: tune benchmark mode not yet available (P2); used suggest"
+            );
+        }
+
+        // 6. Persist as the saved profile so the next plain load reuses it. Serialize
+        //    through `models_io` with a FRESH re-read so two concurrent tunes of
+        //    different models don't clobber each other's record (whole-file rewrite).
+        {
+            let _guard = self.models_io.lock();
+            if let Ok(store) = self.models_store() {
+                store.put_tuning(
+                    &id,
+                    TuneRecord {
+                        profile: suggestion.load.clone(),
+                        sampling: suggestion.sampling.clone(),
+                        budget: suggestion.budget.clone(),
+                        provenance: suggestion.provenance,
+                        bench_tps: None,
+                        tuned_at_ms: now_unix_ms(),
+                    },
+                );
+                if let Err(e) = store.flush() {
+                    tracing::warn!(id, error = %e, "higgs: failed to persist tuning to models.json");
+                }
+            }
+        }
+        Ok(suggestion)
+    }
+}
+
+/// Best-effort, time-bounded HF-card sampling fetch (fail-open → `None`). The
+/// fetch goes through the hub client (`src/hub.rs`) which prefers the structured
+/// `generation_config.json` and falls back to README prose (and to a direct
+/// `reqwest` GET if the hub client itself fails). The whole thing — up to two
+/// files across two transports — is bounded here so a slow huggingface.co can
+/// never stall a tune; on timeout we proceed with no recommendation.
+async fn fetch_card_bounded(
+    id: &str,
+) -> Option<crate::worker::engine::llamacpp::params::LlamaCppSamplingParams> {
+    let fetch = crate::tune::card_sampling::fetch_card_sampling(id);
+    match tokio::time::timeout(std::time::Duration::from_secs(10), fetch).await {
+        Ok(res) => res,
+        Err(_) => {
+            tracing::warn!(
+                id,
+                "higgs: HF-card sampling fetch timed out; proceeding without it"
+            );
+            None
+        }
     }
 }
 

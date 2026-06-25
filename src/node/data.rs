@@ -52,11 +52,22 @@ pub(crate) async fn relay_chat(
 
     // Apply the worker's own defaults for omitted optional params (1024 / 0.7), so a
     // remote chat with no max_tokens generates normally instead of zero tokens.
+    // Remote sampling forwarding is DEFERRED: the hub→node wire carries only
+    // `temperature` (the rest of the sampler set, and any local card-recommended
+    // base, are not applied on the relay path — see DESIGN-autotune §9). Wrap the
+    // forwarded temperature in the engine umbrella; `None` lets the worker default
+    // (0.7) stand.
+    let sampling = crate::worker::engine::SamplingParams::llamacpp(
+        crate::worker::engine::llamacpp::params::LlamaCppSamplingParams {
+            temperature: params.temperature,
+            ..Default::default()
+        },
+    );
     let (mut chunks, fut) = lease.chat(
         params.model,
         params.messages_json,
         params.max_tokens.unwrap_or(1024),
-        params.temperature.unwrap_or(0.7),
+        sampling,
         params.tools_json,
     );
     // `Supervisor::chat`'s future is `'static` (owns its own Arc) and removes the chat
@@ -120,19 +131,35 @@ pub(crate) async fn relay_pull(conn: &Connection, send: &mut SendStream, req: Rp
             return;
         }
     };
-    pull_stream(conn, send, req, crate::download::HttpFetcher, models_root).await;
+    // Hub client is the PRIMARY download path; the hand-rolled `reqwest` `HttpFetcher` is the
+    // fail-open FALLBACK. `download_dual` tries them in order and reports `HG036` only if both
+    // exhaust (each carrying its own classified diagnosis).
+    pull_stream(
+        conn,
+        send,
+        req,
+        crate::hub::HubFetcher,
+        crate::download::HttpFetcher,
+        models_root,
+    )
+    .await;
 }
 
-/// Generic core of [`relay_pull`]: download via `fetcher` into `models_root`, streaming
-/// `N_PROGRESS` then the final `{ path }`. Parameterized over the fetcher so it's unit-tested
-/// offline with a fake (production passes the real `HttpFetcher`).
-async fn pull_stream<F: crate::download::Fetcher + Send + Sync + 'static>(
+/// Generic core of [`relay_pull`]: download via `primary` (falling back to `fallback`) into
+/// `models_root`, streaming `N_PROGRESS` then the final `{ path }`. Parameterized over both
+/// fetchers so it's unit-tested offline with fakes (production passes the hub-client primary +
+/// the `HttpFetcher` fallback).
+async fn pull_stream<P, F>(
     conn: &Connection,
     send: &mut SendStream,
     req: RpcRequest,
-    fetcher: F,
+    primary: P,
+    fallback: F,
     models_root: std::path::PathBuf,
-) {
+) where
+    P: crate::download::Fetcher + Send + Sync + 'static,
+    F: crate::download::Fetcher + Send + Sync + 'static,
+{
     let params: crate::remote::NodePullParams = match serde_json::from_value(req.params) {
         Ok(p) => p,
         Err(e) => {
@@ -164,7 +191,9 @@ async fn pull_stream<F: crate::download::Fetcher + Send + Sync + 'static>(
         let mut cb = move |downloaded: u64, total: Option<u64>| {
             let _ = prog_tx.try_send((downloaded, total));
         };
-        let res = crate::download::download(&target, &models_root, &fetcher, &mut cb).await;
+        let res =
+            crate::download::download_dual(&target, &models_root, &primary, &fallback, &mut cb)
+                .await;
         let _ = final_tx.send(res);
     });
     tokio::pin!(final_rx);
@@ -290,13 +319,29 @@ mod tests {
     impl crate::download::Fetcher for FakeFetcher {
         async fn fetch(
             &self,
-            _url: &str,
+            _target: &crate::download::PullTarget,
             on_chunk: &mut (dyn FnMut(&[u8]) + Send),
             progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
-        ) -> Result<(), String> {
+        ) -> Result<(), HiggsError> {
             on_chunk(b"hello");
             progress(5, Some(5));
             Ok(())
+        }
+    }
+
+    /// A fetcher that always fails (transport) — for exercising the dual-path fallback.
+    struct FailFetcher;
+    impl crate::download::Fetcher for FailFetcher {
+        async fn fetch(
+            &self,
+            target: &crate::download::PullTarget,
+            _on_chunk: &mut (dyn FnMut(&[u8]) + Send),
+            _progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
+        ) -> Result<(), HiggsError> {
+            Err(HiggsError::HubTransport {
+                repo: target.repo.clone(),
+                detail: "fake primary down".into(),
+            })
         }
     }
 
@@ -317,7 +362,9 @@ mod tests {
             let RpcFrame::Request(req) = rpc::decode(&line).unwrap() else {
                 panic!("want request")
             };
-            pull_stream(&conn, &mut send, req, FakeFetcher, root).await;
+            // Primary FAILS, fallback succeeds — exercises the dual-path fallback end-to-end:
+            // the streamed bytes + final path must still come from the fallback.
+            pull_stream(&conn, &mut send, req, FailFetcher, FakeFetcher, root).await;
             let _ = send.finish();
             // keep conn alive until the hub reads
             let _ = conn.closed().await;
@@ -374,7 +421,7 @@ mod tests {
             let RpcFrame::Request(req) = rpc::decode(&line).unwrap() else {
                 panic!()
             };
-            pull_stream(&conn, &mut send, req, FakeFetcher, root).await;
+            pull_stream(&conn, &mut send, req, FakeFetcher, FakeFetcher, root).await;
             let _ = send.finish();
             let _ = conn.closed().await;
         });
