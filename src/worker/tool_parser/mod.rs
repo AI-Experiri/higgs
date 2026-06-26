@@ -55,6 +55,15 @@ pub(crate) fn strip_leading_reasoning<'a>(s: &'a str, close_tag: &str) -> &'a st
 /// preamble, gaps between calls, and the trailing remainder — concatenated in order,
 /// so non-call text after/between calls is preserved (the `content` contract). An
 /// unterminated `open` drops the rest (incomplete call markup, not content).
+///
+/// Span detection is the FIRST `close` after each `open` — IDENTICAL to every parser's
+/// `parse()` (e.g. `qwen_json`/`glm_xml`), so `content` removes exactly the spans `parse`
+/// extracts. The shared limitation: a call whose ARGUMENTS literally contain the `close`
+/// sentinel (e.g. a JSON string `"…</tool_call>…"`) cuts the span early — `parse` then drops
+/// that call (its body is truncated/invalid) and a tail can survive here. Accepted: real chat
+/// templates never emit the close sentinel inside an argument, and these parsers are
+/// deliberately complete-text only (no streaming/partial-tag heuristics — see module docs);
+/// handling it correctly needs structured, JSON-aware span detection across every parser.
 pub(crate) fn content_outside_calls(text: &str, open: &str, close: &str) -> String {
     let mut out = String::new();
     let mut rest = text;
