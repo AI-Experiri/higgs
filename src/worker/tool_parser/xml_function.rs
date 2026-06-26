@@ -152,6 +152,15 @@ mod tests {
     }
 
     #[test]
+    fn content_preserves_text_around_and_between_calls() {
+        // The content contract: text BEFORE ("A"), BETWEEN ("B"), and AFTER ("C") complete
+        // `<tool_call>` spans all survive — content() removes only the call markup, it does
+        // not stop at the first call (the regression that bit mistral_bracket).
+        let text = "A<tool_call><function=a></function></tool_call>B<tool_call><function=b></function></tool_call>C";
+        assert_eq!(p().content(text), "ABC");
+    }
+
+    #[test]
     fn parses_multiple_params_and_json_values() {
         let text = "<tool_call>\n<function=search>\n<parameter=query>\nrust\n</parameter>\n<parameter=limit>\n5\n</parameter>\n<parameter=filters>\n{\"lang\":\"en\"}\n</parameter>\n</function>\n</tool_call>";
         let calls = p().parse(text, "z").unwrap();

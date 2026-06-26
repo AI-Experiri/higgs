@@ -345,6 +345,15 @@ mod tests {
         assert_eq!(p().content(forced), "Here we go.");
     }
 
+    #[test]
+    fn content_preserves_text_around_and_between_calls() {
+        // The content contract: text BEFORE ("A"), BETWEEN ("B"), and AFTER ("C") complete
+        // `<|tool_call>`..`<tool_call|>` spans all survive — content() removes only the call
+        // markup, it does not stop at the first call (the regression that bit mistral_bracket).
+        let text = "A<|tool_call>call:a{}<tool_call|>B<|tool_call>call:b{}<tool_call|>C";
+        assert_eq!(p().content(text), "ABC");
+    }
+
     // --- Regression tests for the three ported-parser bugs ---------------
 
     #[test]

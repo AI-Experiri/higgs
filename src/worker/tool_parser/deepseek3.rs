@@ -194,4 +194,14 @@ mod tests {
         let forced = "Reasoning about the weather request.\n</think>\nDone.";
         assert_eq!(p().content(forced), "Done.");
     }
+
+    #[test]
+    fn content_preserves_text_around_and_between_calls() {
+        // The content contract: text BEFORE ("A"), BETWEEN ("B"), and AFTER ("C") complete
+        // call envelopes all survive — content() removes only the markup, it does not stop
+        // at the first envelope (the regression that bit mistral_bracket).
+        let env = "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>f<｜tool▁sep｜>{}<｜tool▁call▁end｜><｜tool▁calls▁end｜>";
+        let text = format!("A{env}B{env}C");
+        assert_eq!(p().content(&text), "ABC");
+    }
 }
