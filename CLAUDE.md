@@ -48,6 +48,32 @@ narrows a race window from "across an `.await`" to "a couple of instructions" an
 degrades safely is acceptable when a full lock refactor isn't warranted —
 document the residual.
 
+## Test layout (where tests live)
+
+- **Unit tests live in a SEPARATE sibling file**, never inline in the production
+  file. For `src/<path>/<name>.rs`, the tests go in `src/<path>/<name>_tests.rs`,
+  wired from the production file as a child module so private-item access is kept:
+
+  ```rust
+  // bottom of src/<path>/<name>.rs — the ONLY test line in a prod file:
+  #[cfg(test)]
+  #[path = "<name>_tests.rs"]
+  mod tests;
+  ```
+
+  The `_tests.rs` file starts with `use super::*;`. The `#[path]` is REQUIRED —
+  without it `mod tests;` would look for a `<name>/tests.rs` subdir. Keeping it a
+  child `mod tests` (not a top-level module) is what preserves access to the
+  module's private items. Do NOT write inline `#[cfg(test)] mod tests { … }`.
+- **Integration tests live in `tests/` only** — one file per end-to-end area
+  (spawn the real `higgs` over HTTP / the in-process iroh gate).
+- **`mod.rs` files carry no logic or tests** — they are export barrels
+  (`pub mod …;` / `pub use …;` + module docs); a module's own code lives in a
+  named sibling file (e.g. `node/gate.rs`), whose tests are `node/gate_tests.rs`.
+- `cargo llvm-cov` does NOT count `_tests.rs` files, so the unit gate below
+  measures PRODUCTION lines only (moving tests out of the prod file is why the
+  prod-only number is the true coverage, not an inline-test-inflated one).
+
 ## Coverage requirements (both gates must stay green)
 
 Two independent line-coverage gates, run by `scripts/coverage.sh`
