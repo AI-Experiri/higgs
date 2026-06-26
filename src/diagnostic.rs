@@ -230,10 +230,15 @@ pub enum HiggsError {
     #[diagnostic(code(HG028))]
     HandshakeStalled { endpoint_id: String, window: u64 },
 
-    /// A paired node became unreachable (connection closed, dial failed, or a wedged
-    /// worker escalation exhausted) and was retired from the fleet. Non-fatal,
-    /// best-effort (§3.4, §3.4.1).
-    #[snafu(display("[HG027] node {endpoint_id} unreachable; retired from fleet: {detail}"))]
+    /// A node is not currently reachable: a paired node whose connection closed / dial
+    /// failed / wedged-worker transport was dropped (routes kept, recovers on reconnect),
+    /// OR an unknown/never-connected endpoint id (no routes — e.g. a `scan_node` for a ghost
+    /// id). Either way it is NOT "retired from the fleet" — retire is a separate, explicit
+    /// removal that drops the node slot. The remediation is therefore phrased conditionally,
+    /// so it doesn't promise reconnect-recovery for an id the fleet never knew (§3.4, §3.4.1).
+    #[snafu(display(
+        "[HG027] node {endpoint_id} unreachable: {detail} — if it is a paired node, it recovers once it reconnects"
+    ))]
     #[diagnostic(code(HG027))]
     NodeUnreachable { endpoint_id: String, detail: String },
 
@@ -534,12 +539,24 @@ mod tests {
         }
         .to_string()
         .starts_with("[HG028]"));
-        assert!(HiggsError::NodeUnreachable {
+        let unreachable = HiggsError::NodeUnreachable {
             endpoint_id: "z32".into(),
-            detail: "closed".into()
+            detail: "closed".into(),
         }
-        .to_string()
-        .starts_with("[HG027]"));
+        .to_string();
+        assert!(unreachable.starts_with("[HG027]"));
+        // HG027 must NOT claim the node was "retired" (retire is a separate, explicit
+        // removal). It also must not UNCONDITIONALLY promise reconnect-recovery / "routes
+        // kept" — the same code fires for an unknown/never-connected id (no routes), so the
+        // remediation is conditional on it being a paired node.
+        assert!(
+            !unreachable.contains("retired"),
+            "HG027 must not over-claim retirement: {unreachable}"
+        );
+        assert!(
+            unreachable.contains("if it is a paired node") && unreachable.contains("reconnect"),
+            "HG027 reconnect remediation must be conditional on being a paired node: {unreachable}"
+        );
     }
 
     #[test]
