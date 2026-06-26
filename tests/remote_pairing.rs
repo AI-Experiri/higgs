@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use higgs::auth::{Allowlist, PairingTokens};
 use higgs::node::{dial_and_hello, gate_connection, GateOutcome, HubIdentity, HELLO_DEADLINE};
-use higgs::remote::ALPN;
+use higgs::remote::{HelloResult, ALPN};
+use higgs::rpc::{self, RpcFrame, RpcResponse};
 
 /// Bind a local-only endpoint (relay disabled) for in-process testing.
 async fn local_endpoint() -> iroh::Endpoint {
@@ -295,4 +296,128 @@ async fn allowlisted_node_reconnects_without_token() {
         GateOutcome::Admitted { agreed_version: 1 }
     );
     let _ = std::fs::remove_file(&path);
+}
+
+/// A node MUST reject a hub whose HELLO reply speaks an unsupported protocol — otherwise
+/// `cli.rs` would persist that reply's `node_id` as the saved hub id and re-dial it under a
+/// version we don't speak. Here the test plays a MISBEHAVING hub: it accepts the node's
+/// dial, drains the node's HELLO request, then hand-writes a HelloResult with a VALID
+/// identity (role=hub, node_id == our TLS id) but an UNSUPPORTED `agreed_version`. The real
+/// node-side `validate_hub_hello` (via `dial_and_hello` → `connect_node`) must turn that into
+/// an `Err`. On revert of the validation call this becomes `Ok` and the test fails.
+#[tokio::test]
+async fn node_rejects_incompatible_hub_hello() {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let hub = local_endpoint().await;
+    let node = local_endpoint().await;
+    let hub_addr = hub.addr();
+    let hub_id = hub.id().to_string();
+
+    let hub_task = tokio::spawn(async move {
+        let incoming = hub.accept().await.expect("incoming");
+        let conn = incoming.await.expect("conn");
+        // The node (opener) writes its HELLO first; accept that control stream.
+        let (mut send, recv) = conn.accept_bi().await.expect("accept control stream");
+        let mut lines = BufReader::new(recv).lines();
+        let _hello_req = lines.next_line().await.expect("read node HELLO req");
+
+        // Reply with an otherwise-valid HELLO carrying an UNSUPPORTED protocol version,
+        // so ONLY the version branch of validate_hub_hello can reject it.
+        let bad = HelloResult {
+            role: "hub".into(),
+            node_id: hub_id, // matches the TLS peer → the identity check passes
+            hub_name: "evil-hub".into(),
+            agreed_version: 999, // NOT in PROTOCOL_VERSIONS → must be rejected
+            software_version: "9.9.9".into(),
+            assigned_label: None,
+            capabilities: Default::default(),
+        };
+        let resp = RpcResponse {
+            jsonrpc: "2.0".into(),
+            id: 1,
+            result: Some(serde_json::to_value(bad).unwrap()),
+            error: None,
+        };
+        // `write_all`/`finish` are inherent iroh SendStream methods (no AsyncWriteExt).
+        send.write_all(format!("{}\n", rpc::encode(&RpcFrame::Response(resp))).as_bytes())
+            .await
+            .expect("write bad hello");
+        send.finish().expect("finish");
+        // Hold the conn open briefly so the node reads its reply before we drop.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    });
+
+    let node_id = node.id().to_string();
+    let res = dial_and_hello(&node, hub_addr, node_id, String::new(), None).await;
+    assert!(
+        res.is_err(),
+        "node must reject a hub HELLO with an unsupported agreed_version: {res:?}"
+    );
+    // It's the version-mismatch diagnostic (HG023), not a transport error.
+    let msg = res.unwrap_err().to_string();
+    assert!(
+        msg.contains("[HG023]"),
+        "expected version-mismatch reject, got: {msg}"
+    );
+
+    let _ = hub_task.await;
+}
+
+/// A VALID pairing token whose pairing CANNOT be persisted (the backing dir is missing) is
+/// rejected with HG040 (storage), NOT the misleading HG024 (not-allowlisted). The allowlist is
+/// backed by a path inside a directory that does not exist: `load()` sees NotFound (empty, ok),
+/// but the post-pairing `save()` fails → `allow.add()` errs → the gate takes the HG040 branch.
+/// Reverting the fix (HG040 → HG024) makes this `assert_eq` fail.
+#[tokio::test]
+async fn valid_token_but_unwritable_store_is_hg040() {
+    let hub = local_endpoint().await;
+    let node = local_endpoint().await;
+    let hub_addr = hub.addr();
+    let hub_id = hub.id().to_string();
+
+    // A path inside a directory that does NOT exist (so File::create in save() fails).
+    let missing_dir = std::env::temp_dir().join(format!("higgs-p1-hg040-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&missing_dir);
+    let path = missing_dir.join("pairings.json");
+    let mut allow = Allowlist::load(&path).expect("empty allowlist loads when file absent");
+
+    let mut tokens = PairingTokens::new();
+    let tok = tokens.mint(1_000, 600_000);
+
+    let hub_task = tokio::spawn(async move {
+        let incoming = hub.accept().await.expect("incoming");
+        let conn = incoming.await.expect("conn");
+        let out = gate_connection(
+            &conn,
+            &mut allow,
+            &mut tokens,
+            2_000,
+            &HubIdentity::new(hub_id),
+            Some("studio".into()),
+            HELLO_DEADLINE,
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The persist failed, so the node must NOT be in the (rolled-back) allowlist.
+        let paired = allow.contains(&conn.remote_id().to_string());
+        (out, paired)
+    });
+
+    let node_id = node.id().to_string();
+    let res = dial_and_hello(&node, hub_addr, node_id, String::new(), Some(tok)).await;
+    assert!(
+        res.is_err(),
+        "unwritable store must reject pairing: {res:?}"
+    );
+
+    let (outcome, paired) = hub_task.await.unwrap();
+    assert_eq!(
+        outcome,
+        GateOutcome::Rejected { code: "HG040" },
+        "persist failure surfaces HG040 (storage), not HG024 (not-allowlisted)"
+    );
+    assert!(!paired, "failed persist rolls back the in-memory allowlist");
+
+    let _ = std::fs::remove_dir_all(&missing_dir);
 }

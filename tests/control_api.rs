@@ -226,10 +226,14 @@ async fn control_api_lifecycle() {
 
     // Re-load with EXPLICIT load params (ctx_len/gpu_layers/threads) — exercises
     // the non-default LoadParams branch in control_load. ctx_len is echoed back.
+    // ALSO send a per-load `idle_ttl_minutes`: it is accepted on the wire for
+    // forward-compat, but the reaper applies ONE per-node TTL, so the host must NOT
+    // record/surface it — status must never advertise an override it ignores.
     let load2: serde_json::Value = c
         .post(format!("{}/api/higgs/models/load", srv.base))
         .json(&serde_json::json!({
-            "id": id, "ctx_len": 2048, "gpu_layers": 0, "threads": 2
+            "id": id, "ctx_len": 2048, "gpu_layers": 0, "threads": 2,
+            "idle_ttl_minutes": 30
         }))
         .send()
         .await
@@ -249,8 +253,19 @@ async fn control_api_lifecycle() {
         2048,
         "explicit ctx_len honored"
     );
+    // Per-load idle_ttl_minutes is a no-op today: it must be ABSENT from the surfaced
+    // LoadedInfo (`skip_serializing_if = Option::is_none` → a missing key reads as JSON
+    // null). On revert (the handler records the override and `loaded_info_from` surfaces
+    // it), this would report `30` — lying about an enforced per-load TTL.
+    assert!(
+        status["loaded"]["idle_ttl_minutes"].is_null(),
+        "per-load idle_ttl_minutes must NOT be surfaced (reaper ignores it): {status}"
+    );
 
-    // ── Worker stop (done LAST: stop kills the worker) ───────────────────────
+    // ── Worker stop is NON-TERMINAL: the server stays loadable after it ───────
+    // worker/stop must be a bulk UNLOAD, not the node's terminal `shutdown_all` drain.
+    // A reverted fix (calling `Higgs::stop`) marks the runtime shutting-down, so the
+    // RELOAD below would be rejected and brick the node until process restart.
     let stop: serde_json::Value = c
         .post(format!("{}/api/higgs/worker/stop", srv.base))
         .json(&serde_json::json!({}))
@@ -271,6 +286,41 @@ async fn control_api_lifecycle() {
         status["worker_alive"], false,
         "worker_alive is false after stop"
     );
+
+    // REGRESSION: a load AFTER worker/stop must still succeed — the node must NOT be
+    // terminally shut down. With the bug (Higgs::stop → shutdown_all), this reload is
+    // rejected and the server is bricked until process restart.
+    let reload: serde_json::Value = c
+        .post(format!("{}/api/higgs/models/load", srv.base))
+        .json(&serde_json::json!({ "id": id }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        reload["status"], "ok",
+        "load after worker/stop must still work — worker/stop is non-terminal"
+    );
+    let status: serde_json::Value = get("/api/higgs/status".into())
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        status["loaded"]["id"], id,
+        "reloaded model is resident again after the non-terminal worker/stop"
+    );
+
+    // Final cleanup so graceful shutdown is clean (no SSE stream is open here).
+    let _ = c
+        .post(format!("{}/api/higgs/worker/stop", srv.base))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
 }
 
 /// Multi-model: the local node is multi-worker (one worker per loaded model), so `/api/higgs/status`
@@ -561,4 +611,119 @@ fn worker_child_pids(server_pid: u32) -> Vec<u32> {
         .lines()
         .filter_map(|l| l.trim().parse::<u32>().ok())
         .collect()
+}
+
+/// `/api/higgs/system` reports the EFFECTIVE (live, runtime-mutable) idle TTL, and a huge
+/// `idle_ttl_minutes` on `PUT /api/higgs/settings` is clamped before the ×60 (no overflow).
+/// Reverting either fix breaks this: a stale fixed 300s would disagree with the 60-min default,
+/// and `u64::MAX * 60` would overflow (debug panic / release wrap) instead of clamping.
+#[tokio::test]
+async fn idle_ttl_effective_report_and_overflow_clamp() {
+    let Some(gguf) = tiny_gguf_path() else {
+        eprintln!("SKIP idle_ttl_effective_report_and_overflow_clamp: tiny gguf not found");
+        return;
+    };
+    let srv = spawn_with_tiny_model(11508, &gguf).await;
+    let c = reqwest::Client::new();
+
+    // Helper closures over the two endpoints we cross-check.
+    let get_settings_ttl = || async {
+        let s: serde_json::Value = c
+            .get(format!("{}/api/higgs/settings", srv.base))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        s["idle_ttl_minutes"]
+            .as_u64()
+            .expect("idle_ttl_minutes present")
+    };
+    let get_system_ttl_secs = || async {
+        let sys: serde_json::Value = c
+            .get(format!("{}/api/higgs/system", srv.base))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        sys["config"]["limits"]["idle_unload_ttl_secs"]
+            .as_u64()
+            .expect("config.limits.idle_unload_ttl_secs present")
+    };
+
+    // ── Default: /system reports the LIVE 60-min default (3600s), not a stale 300s ──
+    let default_min = get_settings_ttl().await;
+    assert_eq!(default_min, 60, "settings default idle TTL is 60 minutes");
+    let default_secs = get_system_ttl_secs().await;
+    assert_eq!(
+        default_secs, 3600,
+        "/system idle_unload_ttl_secs is the live 60min×60 (NOT a stale fixed 300s)"
+    );
+    assert_eq!(
+        default_secs,
+        default_min * 60,
+        "/system and /settings agree at the default"
+    );
+
+    // ── Change it: PUT a new TTL, /system tracks it without a restart ──
+    let mut settings: serde_json::Value = c
+        .get(format!("{}/api/higgs/settings", srv.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    settings["idle_ttl_minutes"] = serde_json::json!(45);
+    let put = c
+        .put(format!("{}/api/higgs/settings", srv.base))
+        .json(&settings)
+        .send()
+        .await
+        .unwrap();
+    assert!(put.status().is_success(), "PUT idle_ttl_minutes=45 ok");
+    assert_eq!(
+        get_settings_ttl().await,
+        45,
+        "settings reflects the new TTL"
+    );
+    assert_eq!(
+        get_system_ttl_secs().await,
+        45 * 60,
+        "/system idle_unload_ttl_secs tracks the runtime change (45×60=2700)"
+    );
+
+    // ── Overflow clamp: a huge minutes count must NOT overflow ×60 ──
+    // u64::MAX * 60 would panic (debug) / wrap (release) without the clamp.
+    settings["idle_ttl_minutes"] = serde_json::json!(u64::MAX);
+    let put = c
+        .put(format!("{}/api/higgs/settings", srv.base))
+        .json(&settings)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        put.status().is_success(),
+        "PUT idle_ttl_minutes=u64::MAX is accepted + clamped (not a 500)"
+    );
+    let clamped_min = get_settings_ttl().await;
+    assert!(
+        clamped_min < u64::MAX,
+        "huge idle_ttl_minutes is clamped at the setter, got {clamped_min}"
+    );
+    // The reported seconds must be the clamped minutes ×60 — finite and consistent,
+    // and crucially NOT a wrapped/overflowed value.
+    let clamped_secs = get_system_ttl_secs().await;
+    assert_eq!(
+        clamped_secs,
+        clamped_min.saturating_mul(60),
+        "/system seconds == clamped minutes ×60 (overflow-free, settings ↔ system agree)"
+    );
+    assert!(
+        clamped_secs >= clamped_min,
+        "seconds did not wrap below minutes (no overflow), {clamped_secs} vs {clamped_min}"
+    );
 }
