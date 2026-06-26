@@ -295,21 +295,56 @@ pub(super) async fn control_tune(
     }
 }
 
-/// Body for `POST /api/higgs/models/unload`. An `id` (a served instance id)
-/// unloads JUST that model; omitting it (`{}` / no body) drains ALL local models.
-/// The local node is multi-model, so per-card Eject / Fleet Unload pass the id.
-#[derive(serde::Deserialize, Default)]
-pub(super) struct UnloadHttp {
-    #[serde(default)]
-    id: Option<String>,
-}
-
 /// `POST /api/higgs/models/unload` — unload one model by `{id}`, or ALL when no id.
+///
+/// The body is read as raw bytes and inspected as a `serde_json::Value` (NOT via the
+/// `Json` extractor or a typed struct) so that ONLY a truly absent id is the
+/// destructive drain-all. A typed `Option<String>` is unusable here: serde collapses
+/// both an omitted key AND an explicit `{"id":null}` to `None`, so a buggy per-card
+/// request with a null id would silently drain every model. Explicit inspection keeps
+/// "key present" distinct from "key absent":
+/// - empty body OR `{}` (no `id` key) → drain ALL local models (back-compat; reading
+///   raw bytes also accepts an empty body carrying `Content-Type: application/json`,
+///   which the `Json` extractor would 400);
+/// - `{"id":"org/model"}` → unload just that served instance;
+/// - a PRESENT but `null`/empty/non-string id → `400` — a per-model request with no
+///   usable id must NOT fall through to draining every model;
+/// - an unknown field (`{"model":…}`), a non-object, or malformed JSON → `400`.
 pub(super) async fn control_unload(
     State(higgs): State<Arc<Higgs>>,
-    body: Option<Json<UnloadHttp>>,
+    body: axum::body::Bytes,
 ) -> Response {
-    let id = body.and_then(|Json(b)| b.id).filter(|s| !s.is_empty());
+    fn bad(msg: impl std::fmt::Display) -> Response {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": msg.to_string() })),
+        )
+            .into_response()
+    }
+    let id: Option<String> = if body.is_empty() {
+        None
+    } else {
+        let value: serde_json::Value = match serde_json::from_slice(&body) {
+            Ok(v) => v,
+            Err(e) => return bad(format!("invalid unload body: {e}")),
+        };
+        let Some(obj) = value.as_object() else {
+            return bad("unload body must be a JSON object");
+        };
+        if let Some(unknown) = obj.keys().find(|k| k.as_str() != "id") {
+            return bad(format!("unknown field `{unknown}` in unload body"));
+        }
+        match obj.get("id") {
+            None => None, // `{}` → no id key → drain all
+            Some(serde_json::Value::String(s)) if !s.is_empty() => Some(s.clone()),
+            Some(_) => {
+                // null / "" / number / etc. — a per-model request with no usable id.
+                return bad(
+                    "unload `id` must be a non-empty model id string (omit it entirely to unload all models)",
+                );
+            }
+        }
+    };
     let result = match &id {
         Some(id) => {
             tracing::warn!(%id, "higgs: unloading model");
@@ -990,6 +1025,75 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
         assert_eq!(v["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn control_unload_one_by_id_targets_just_that_model() {
+        // Per-model unload happy path: load a model, then unload it by `{id}` — this
+        // drives `Higgs::unload_one` (served-id resolve → that worker only), distinct
+        // from the `{}` drain-all path. Afterwards the model is gone.
+        let dir = tempfile::TempDir::new().unwrap();
+        write_gguf_fixture(dir.path(), "org/model");
+        let app = make_app_with_lmstudio(dir.path().to_path_buf());
+
+        let resp = app
+            .clone()
+            .oneshot(post_json(
+                "/api/higgs/models/load",
+                &json!({"id": "org/model"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .clone()
+            .oneshot(post_json(
+                "/api/higgs/models/unload",
+                &json!({"id": "org/model"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(v["status"], "ok");
+
+        // Unloading the same id again is an idempotent no-op (now not resident).
+        let resp = app
+            .oneshot(post_json(
+                "/api/higgs/models/unload",
+                &json!({"id": "org/model"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn unload_rejects_present_but_unusable_id() {
+        // Per-model unload safety: a PRESENT but unusable id (`null` / empty) or an
+        // unknown field must 400 — it must NEVER fall through to the destructive
+        // drain-all. Only a TRULY absent id (`{}` / empty body, covered by
+        // `control_load_unload_roundtrip`) drains all. These bodies are rejected
+        // before higgs is touched, so a bare app (no loaded model) is enough.
+        let dir = tempfile::TempDir::new().unwrap();
+        let app = make_app_with_lmstudio(dir.path().to_path_buf());
+        for bad in [
+            json!({"id": null}),
+            json!({"id": ""}),
+            json!({"model": "org/m"}),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(post_json("/api/higgs/models/unload", &bad))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "unload body {bad} must be rejected, not silently drain all models"
+            );
+        }
     }
 
     // ── Test 7: control_model_by_id with a slashed HF repo id ───────────────

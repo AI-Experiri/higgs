@@ -762,6 +762,21 @@ impl Higgs {
     /// idempotent no-op (the post-condition "that id is not resident" holds either way).
     /// Shares the `lifecycle` mutex with `load`/`unload` so it can't race a concurrent
     /// load that ADDS a worker.
+    ///
+    /// KNOWN LIMITATION (served-id stability — explicitly deferred): a served id is
+    /// resolved live against the current worker set, the SAME contract as every other
+    /// control path ([`local_loaded_info`](Self::local_loaded_info), `chat_stream`, and
+    /// the remote `require_served`). For DISTINCT models (the common multi-model case)
+    /// ids are unique and stable, so a per-card unload is exact. The unstable window is
+    /// DUPLICATE instances of one raw model: suffixed ids (`org/model-1`, …) renumber
+    /// when a sibling is idle-reaped/unloaded, so a request built from a STALE snapshot
+    /// can resolve to a different instance — and, in the pathological case where a raw
+    /// model id literally ends in `-N` and collides with a generated suffix, even to a
+    /// DIFFERENT model. This is a property of higgs's served-id SCHEME (shared by chat
+    /// and the remote unload), not of this method; the proper fix is a stable
+    /// worker-id/generation selector threaded through the whole eject/unload chain
+    /// (UI card + Fleet → wire → here), DEFERRED as disproportionate to a pathological
+    /// trigger. Until then a destructive unload trusts the served id the caller saw.
     pub async fn unload_one(&self, served: &str) -> Result<(), HiggsError> {
         let _lifecycle = self.lifecycle.lock().await;
         if let Some((worker, _model)) = self.local_served().await.remove(served) {
