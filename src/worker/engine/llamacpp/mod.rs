@@ -154,14 +154,32 @@ impl HiggsEngine for LlamaCppEngine {
     fn load(&mut self, path: &str, params: &LoadParams) -> Result<(), HiggsError> {
         // Drop any resident model first — one loaded model at a time (v1).
         self.loaded = None;
+        // Reset the engine-diagnostic capture so a previous load's llama.cpp ERROR
+        // lines can't leak into THIS load's failure reason.
+        logging::clear_engine_diagnostics();
         // The worker selected the llamacpp engine, so the umbrella always carries
         // the LlamaCpp variant here; destructure it for the concrete payload. (When
         // a second engine variant lands this `let` stops being irrefutable, forcing
         // the dispatch to be made explicit — the desired compile-time reminder.)
         let LoadParams::LlamaCpp(p) = params;
-        let load_err = |e: &dyn std::fmt::Display| HiggsError::EngineLoadFailed {
-            id: path.to_string(),
-            reason: e.to_string(),
+        // Build an engine-load failure. llama.cpp emits the REAL cause (e.g.
+        // `unknown model architecture: 'gemma4'`) as a separate ERROR log event,
+        // while the FFI `Result` carries only an opaque "null result from llama
+        // cpp". Prefer the captured engine ERROR lines (drained here) over that
+        // opaque string; fall back to the binding's message when the engine logged
+        // nothing (e.g. an OOM kill). Only one failure site fires per load, so this
+        // single drain is unambiguous.
+        let load_err = |e: &dyn std::fmt::Display| {
+            let diagnostics = logging::take_engine_diagnostics();
+            let reason = if diagnostics.is_empty() {
+                e.to_string()
+            } else {
+                diagnostics.join("; ")
+            };
+            HiggsError::EngineLoadFailed {
+                id: path.to_string(),
+                reason,
+            }
         };
 
         // Safe move-based builder for the params that have plain `with_*` setters.
