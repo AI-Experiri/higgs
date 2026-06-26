@@ -21,8 +21,11 @@ pub enum HiggsError {
     #[diagnostic(code(HG002))]
     ModelNotFound { id: String },
 
-    /// Chat requested for a model that is not loaded (no JIT in v1).
-    #[snafu(display("[HG003] model not loaded: {id} — load it explicitly first"))]
+    /// Chat requested for a model that is not loaded — JIT auto-load is off, or a
+    /// transient race (a restart/reap window) left it unloaded.
+    #[snafu(display(
+        "[HG003] model not loaded: {id} — load it (or enable JIT auto-load) and retry"
+    ))]
     #[diagnostic(code(HG003))]
     ModelNotLoaded { id: String },
 
@@ -448,6 +451,15 @@ mod tests {
         };
         assert!(e.to_string().starts_with("[HG002]"));
         assert!(e.to_string().contains("google/gemma-4-12b"));
+    }
+
+    #[test]
+    fn hg003_not_loaded_remediation_names_jit() {
+        // HG003 fires when JIT auto-load is off (or a transient race); the remediation
+        // must name JIT, not the stale "no JIT in v1" / "load it (or enable JIT auto-load) and retry".
+        let m = HiggsError::ModelNotLoaded { id: "org/m".into() }.to_string();
+        assert!(m.starts_with("[HG003]"), "{m}");
+        assert!(m.contains("JIT"), "remediation names JIT auto-load: {m}");
     }
 
     #[test]
