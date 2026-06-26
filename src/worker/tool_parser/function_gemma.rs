@@ -31,7 +31,7 @@
 
 use serde_json::{Map, Value};
 
-use super::{build_tool_call, strip_leading_reasoning, ToolCallParser};
+use super::{build_tool_call, content_outside_calls, strip_leading_reasoning, ToolCallParser};
 
 const OPEN: &str = "<start_function_call>";
 const CLOSE: &str = "<end_function_call>";
@@ -78,31 +78,7 @@ impl ToolCallParser for FunctionGemmaParser {
     }
 
     fn content(&self, text: &str) -> String {
-        // Like Go, content is every text segment OUTSIDE an OPEN..CLOSE span:
-        // the preamble before the first call, the gaps between calls, and the
-        // trailing remainder after the last call. We concatenate them in order,
-        // then strip a leading reasoning block from the result.
-        let mut out = String::new();
-        let mut rest = text;
-        loop {
-            match rest.find(OPEN) {
-                Some(start) => {
-                    out.push_str(&rest[..start]);
-                    let after = &rest[start + OPEN.len()..];
-                    match after.find(CLOSE) {
-                        // Skip the whole call span; resume after the close marker.
-                        Some(end) => rest = &after[end + CLOSE.len()..],
-                        // Unterminated open: everything from OPEN on is call
-                        // markup, not content — stop without appending it.
-                        None => break,
-                    }
-                }
-                None => {
-                    out.push_str(rest);
-                    break;
-                }
-            }
-        }
+        let out = content_outside_calls(text, OPEN, CLOSE);
         strip_leading_reasoning(&out, "</think>").trim().to_string()
     }
 }

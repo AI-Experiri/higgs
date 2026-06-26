@@ -22,7 +22,7 @@
 
 use serde_json::Value;
 
-use super::{build_tool_call, strip_leading_reasoning, ToolCallParser};
+use super::{build_tool_call, content_outside_calls, strip_leading_reasoning, ToolCallParser};
 
 // DeepSeek-V3 unicode bracket tags (the `▁` is U+2581, not an ASCII underscore).
 const CALLS_BEGIN: &str = "<｜tool▁calls▁begin｜>";
@@ -82,8 +82,8 @@ impl ToolCallParser for DeepSeek3Parser {
     }
 
     fn content(&self, text: &str) -> String {
-        let head = text.find(CALLS_BEGIN).map_or(text, |i| &text[..i]);
-        strip_leading_reasoning(head, "</think>").trim().to_string()
+        let out = content_outside_calls(text, CALLS_BEGIN, CALLS_END);
+        strip_leading_reasoning(&out, "</think>").trim().to_string()
     }
 }
 

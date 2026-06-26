@@ -20,7 +20,7 @@
 
 use serde_json::{Map, Value};
 
-use super::{build_tool_call, strip_leading_reasoning, ToolCallParser};
+use super::{build_tool_call, content_outside_calls, strip_leading_reasoning, ToolCallParser};
 
 /// Parser for the XML `<function=…><parameter=…>` tool-call family.
 pub struct XmlFunctionParser;
@@ -61,8 +61,8 @@ impl ToolCallParser for XmlFunctionParser {
     }
 
     fn content(&self, text: &str) -> String {
-        let head = text.find("<tool_call>").map_or(text, |i| &text[..i]);
-        strip_leading_reasoning(head, "</think>").trim().to_string()
+        let out = content_outside_calls(text, "<tool_call>", "</tool_call>");
+        strip_leading_reasoning(&out, "</think>").trim().to_string()
     }
 }
 

@@ -33,7 +33,7 @@
 
 use serde_json::{Map, Value};
 
-use super::{build_tool_call, strip_leading_reasoning, ToolCallParser};
+use super::{build_tool_call, content_outside_calls, strip_leading_reasoning, ToolCallParser};
 
 /// Opening envelope marker for a Gemma-4 tool call.
 const OPEN_TAG: &str = "<|tool_call>";
@@ -87,8 +87,8 @@ impl ToolCallParser for Gemma4Parser {
     }
 
     fn content(&self, text: &str) -> String {
-        let head = text.find(OPEN_TAG).map_or(text, |i| &text[..i]);
-        strip_leading_reasoning(strip_channel(head), "</think>")
+        let out = content_outside_calls(text, OPEN_TAG, CLOSE_TAG);
+        strip_leading_reasoning(strip_channel(&out), "</think>")
             .trim()
             .to_string()
     }

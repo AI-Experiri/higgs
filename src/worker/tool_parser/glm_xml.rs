@@ -20,7 +20,7 @@
 
 use serde_json::{Map, Value};
 
-use super::{build_tool_call, strip_leading_reasoning, ToolCallParser};
+use super::{build_tool_call, content_outside_calls, strip_leading_reasoning, ToolCallParser};
 
 const TOOL_OPEN: &str = "<tool_call>";
 const TOOL_CLOSE: &str = "</tool_call>";
@@ -69,8 +69,8 @@ impl ToolCallParser for GlmXmlParser {
     }
 
     fn content(&self, text: &str) -> String {
-        let head = text.find(TOOL_OPEN).map_or(text, |i| &text[..i]);
-        strip_leading_reasoning(head, "</think>").trim().to_string()
+        let out = content_outside_calls(text, TOOL_OPEN, TOOL_CLOSE);
+        strip_leading_reasoning(&out, "</think>").trim().to_string()
     }
 }
 
@@ -192,8 +192,9 @@ mod tests {
     #[test]
     fn content_strips_think_and_tool_call() {
         assert_eq!(p().content(SINGLE), "");
-        let with_preamble = "Here's the answer:<tool_call>test</tool_call>done";
-        assert_eq!(p().content(with_preamble), "Here's the answer:");
+        // Only the call MARKUP is stripped; text before AND after the call survives.
+        let around = "Here's the answer:<tool_call>test</tool_call>done";
+        assert_eq!(p().content(around), "Here's the answer:done");
     }
 
     #[test]

@@ -51,6 +51,25 @@ pub(crate) fn strip_leading_reasoning<'a>(s: &'a str, close_tag: &str) -> &'a st
     }
 }
 
+/// The assistant text OUTSIDE every complete `open`..`close` tool-call span —
+/// preamble, gaps between calls, and the trailing remainder — concatenated in order,
+/// so non-call text after/between calls is preserved (the `content` contract). An
+/// unterminated `open` drops the rest (incomplete call markup, not content).
+pub(crate) fn content_outside_calls(text: &str, open: &str, close: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(open) {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + open.len()..];
+        match after.find(close) {
+            Some(end) => rest = &after[end + close.len()..],
+            None => return out,
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Build one OpenAI tool-call object from a function name and its already-
 /// serialized `arguments` JSON string.
 ///

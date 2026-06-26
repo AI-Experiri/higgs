@@ -26,7 +26,7 @@
 
 use serde_json::{json, Value};
 
-use super::{build_tool_call, strip_leading_reasoning, ToolCallParser};
+use super::{build_tool_call, content_outside_calls, strip_leading_reasoning, ToolCallParser};
 
 /// Parser for the Qwen3 ChatML JSON `<tool_call>` tool-call family.
 pub struct QwenJsonParser;
@@ -70,8 +70,8 @@ impl ToolCallParser for QwenJsonParser {
     }
 
     fn content(&self, text: &str) -> String {
-        let head = text.find("<tool_call>").map_or(text, |i| &text[..i]);
-        strip_leading_reasoning(head, "</think>").trim().to_string()
+        let out = content_outside_calls(text, "<tool_call>", "</tool_call>");
+        strip_leading_reasoning(&out, "</think>").trim().to_string()
     }
 }
 
@@ -180,5 +180,13 @@ mod tests {
         // Template forced the think block open → only a trailing </think>.
         let forced = "Reasoning about the request.\n</think>\n<tool_call>\n{\"name\": \"x\", \"arguments\": {}}\n</tool_call>";
         assert_eq!(p().content(forced), "");
+    }
+
+    #[test]
+    fn content_preserves_text_after_a_tool_call() {
+        // Contract: content is the text with tool-call markup REMOVED — text after
+        // (and between) calls must survive, not be dropped at the first marker.
+        let text = "Calling.<tool_call>{\"name\":\"f\",\"arguments\":{}}</tool_call>Done.";
+        assert_eq!(p().content(text), "Calling.Done.");
     }
 }
