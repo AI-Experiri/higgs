@@ -149,6 +149,21 @@ impl Allowlist {
     /// is atomic on the same filesystem), so disk never holds partial/empty JSON.
     fn save(&self) -> std::io::Result<()> {
         use std::io::Write;
+        // Any I/O failure persisting the store is an HG040 fault — wrap it (exactly like
+        // `load` wraps read faults) so the `[HG040]` code + remediation rides INSIDE the
+        // io::Error to every caller, including the pairing gate, which relays it to the
+        // joining node (otherwise the node sees a bare, code-less EOF). `kind` is preserved
+        // for any caller that matches on it.
+        let wrap = |e: std::io::Error| {
+            std::io::Error::new(
+                e.kind(),
+                crate::diagnostic::HiggsError::PersistenceFailed {
+                    store: "pairings".into(),
+                    path: self.path.display().to_string(),
+                    source: e,
+                },
+            )
+        };
         let bytes = serde_json::to_vec_pretty(&self.file)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let dir = self
@@ -168,10 +183,11 @@ impl Allowlist {
         };
         if let Err(e) = write_tmp() {
             let _ = std::fs::remove_file(&tmp);
-            return Err(e);
+            return Err(wrap(e));
         }
-        std::fs::rename(&tmp, &self.path).inspect_err(|_| {
+        std::fs::rename(&tmp, &self.path).map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
+            wrap(e)
         })
     }
 }

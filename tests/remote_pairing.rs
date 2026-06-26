@@ -406,9 +406,13 @@ async fn valid_token_but_unwritable_store_is_hg040() {
 
     let node_id = node.id().to_string();
     let res = dial_and_hello(&node, hub_addr, node_id, String::new(), Some(tok)).await;
+    let err = res.expect_err("unwritable store must reject pairing");
+    // The node must receive the TYPED HG040 persistence code on the HELLO stream — NOT a
+    // bare transport EOF. The hub writes an RpcError frame (carrying [HG040], which the save
+    // path now stamps) before closing; the node relays that code via `hub_rejection`.
     assert!(
-        res.is_err(),
-        "unwritable store must reject pairing: {res:?}"
+        err.to_string().contains("HG040"),
+        "node must see the typed HG040 code, not a code-less EOF: {err}"
     );
 
     let (outcome, paired) = hub_task.await.unwrap();

@@ -133,6 +133,45 @@ pub(crate) struct Handshake {
     agreed_version: u32,
 }
 
+/// Write a TYPED rejection frame on an open gated bi-stream so the node decodes the specific
+/// `HGxxx` code (via [`hub_rejection`]) instead of a bare transport EOF, then finish the
+/// stream. FAST and lock-safe: it only buffers the small frame + queues the FIN — the same
+/// kind of post-auth write the admit path already does under the lock — and never waits on
+/// the peer. Pair with [`close_after_reject`], which does the slow grace-close OUTSIDE any
+/// held lock. Used by every post-HELLO gate rejection: version (HG023), bad token (HG022),
+/// not-allowlisted (HG024), persist failure (HG040). (Handshake-stalled HG028 has no open
+/// stream, so it closes directly.)
+async fn send_reject_frame(
+    send: &mut iroh::endpoint::SendStream,
+    id: u64,
+    code: &'static str,
+    message: String,
+) -> GateOutcome {
+    let resp = RpcResponse {
+        jsonrpc: "2.0".into(),
+        id,
+        result: None,
+        error: Some(RpcError {
+            code: -32000,
+            message,
+            data: Some(serde_json::json!({ "code": code })),
+        }),
+    };
+    let _ = write_frame(send, &RpcFrame::Response(resp)).await;
+    let _ = send.finish();
+    GateOutcome::Rejected { code }
+}
+
+/// Grace-close a rejected connection: wait briefly for the peer to read the rejection frame
+/// ([`send_reject_frame`]) — a well-behaved node closes once it has — before forcing the
+/// close with `code` as the QUIC reason. MUST run with NO pairing lock held: a slow/malicious
+/// peer can stall it the full timeout, so holding `allow`/`tokens` across it would serialize
+/// every other admission and token mint/burn behind one rejected join.
+pub(crate) async fn close_after_reject(conn: &Connection, code: &'static str) {
+    let _ = tokio::time::timeout(Duration::from_secs(2), conn.closed()).await;
+    conn.close(0u32.into(), code.as_bytes());
+}
+
 /// Hub side, phase 1 (NO allowlist/token locks): accept the peer's HELLO within the deadline
 /// and run the lock-free checks — anti-spoof identity and version negotiation. Returns the
 /// validated [`Handshake`] or a `Rejected` outcome (connection already closed / replied).
@@ -194,21 +233,10 @@ pub(crate) async fn gate_read_hello(
                 ours: mismatch.ours,
             };
             tracing::warn!(error = %e, "higgs: rejecting version-mismatched peer");
-            let resp = RpcResponse {
-                jsonrpc: "2.0".into(),
-                id,
-                result: None,
-                error: Some(RpcError {
-                    code: -32000,
-                    message: e.to_string(),
-                    data: Some(serde_json::json!({ "code": "HG023" })),
-                }),
-            };
-            let _ = write_frame(&mut send, &RpcFrame::Response(resp)).await;
-            let _ = send.finish();
-            let _ = tokio::time::timeout(Duration::from_secs(2), conn.closed()).await;
-            conn.close(0u32.into(), b"HG023");
-            return Err(GateOutcome::Rejected { code: "HG023" });
+            // Lock-free here (phase 1), so the grace-close can run inline.
+            let out = send_reject_frame(&mut send, id, "HG023", e.to_string()).await;
+            close_after_reject(conn, "HG023").await;
+            return Err(out);
         }
     };
 
@@ -268,8 +296,9 @@ pub(crate) async fn gate_admit(
                         // allowlisted" (HG024). The token is NOT burned (burn is below), so a
                         // retry after fixing storage still admits the node.
                         tracing::error!(error = %e, "higgs: failed to persist new pairing");
-                        conn.close(0u32.into(), b"HG040");
-                        return GateOutcome::Rejected { code: "HG040" };
+                        // Locks are HELD here — write the frame only (fast); the caller
+                        // grace-closes via `close_after_reject` AFTER releasing the locks.
+                        return send_reject_frame(&mut send, id, "HG040", e.to_string()).await;
                     }
                     tokens.burn(tok);
                     new_label
@@ -279,8 +308,7 @@ pub(crate) async fn gate_admit(
                         detail: "expired/used/unknown".into(),
                     };
                     tracing::warn!(error = %e, peer, "higgs: rejecting bad pairing token");
-                    conn.close(0u32.into(), b"HG022");
-                    return GateOutcome::Rejected { code: "HG022" };
+                    return send_reject_frame(&mut send, id, "HG022", e.to_string()).await;
                 }
             },
             None => {
@@ -288,8 +316,7 @@ pub(crate) async fn gate_admit(
                     endpoint_id: peer.clone(),
                 };
                 tracing::warn!(error = %e, "higgs: rejecting unknown peer");
-                conn.close(0u32.into(), b"HG024");
-                return GateOutcome::Rejected { code: "HG024" };
+                return send_reject_frame(&mut send, id, "HG024", e.to_string()).await;
             }
         }
     };
@@ -334,7 +361,15 @@ pub async fn gate_connection(
 ) -> GateOutcome {
     match gate_read_hello(conn, hello_deadline).await {
         Ok(handshake) => {
-            gate_admit(conn, handshake, allow, tokens, now_ms, hub, label_for_new).await
+            // gate_admit (phase 2) writes any rejection FRAME but does not grace-close (it runs
+            // under the pairing locks in production). This convenience wrapper holds those locks
+            // itself, so it does the grace-close here once gate_admit has returned.
+            let outcome =
+                gate_admit(conn, handshake, allow, tokens, now_ms, hub, label_for_new).await;
+            if let GateOutcome::Rejected { code } = outcome {
+                close_after_reject(conn, code).await;
+            }
+            outcome
         }
         Err(rejected) => rejected,
     }

@@ -261,13 +261,20 @@ pub fn spawn_accept_loop(
                             allow.clone(),
                             fleet.clone(),
                         ));
+                        drop(allow_g);
+                        drop(tokens_g);
                     }
                     GateOutcome::Rejected { code } => {
                         tracing::warn!(node = %peer, code, "higgs hub: node rejected");
+                        // gate_admit already wrote the typed rejection frame under the lock.
+                        // Release the pairing locks BEFORE the grace-close so a slow/malicious
+                        // rejected peer can't stall other admissions/token ops for the
+                        // close-handshake timeout.
+                        drop(allow_g);
+                        drop(tokens_g);
+                        crate::node::close_after_reject(&conn, code).await;
                     }
                 }
-                drop(allow_g);
-                drop(tokens_g);
             });
         }
     });
