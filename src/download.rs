@@ -420,37 +420,42 @@ mod tests {
     }
 
     #[test]
-    fn hf_url_is_the_resolve_endpoint() {
-        assert_eq!(
-            hf_url("org/model", "main", "m.gguf"),
-            "https://huggingface.co/org/model/resolve/main/m.gguf"
-        );
-    }
-
-    #[test]
-    fn hf_url_honors_endpoint_override() {
-        // The `reqwest` FALLBACK path must target the SAME mirror/proxy as the hub-client
-        // primary (`hub::hf_client` reads the same var) — otherwise a user's `HIGGS_HF_ENDPOINT`
-        // mirror would be silently bypassed on the fallback. Trailing slash is optional;
-        // an empty value is ignored (treated as unset).
+    fn hf_url_resolve_endpoint_default_and_override() {
+        // `hf_url` builds the `resolve` URL for the reqwest FALLBACK path. It must target the
+        // SAME mirror/proxy as the hub-client primary (`hub::hf_client` reads the same var) —
+        // else a user's `HIGGS_HF_ENDPOINT` mirror is silently bypassed on the fallback. BOTH
+        // the default and the override are asserted under one `TEST_ENV_LOCK` hold (and the var
+        // is restored), so neither can race a parallel test that reads `HIGGS_HF_ENDPOINT`.
         let _env = crate::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prev = std::env::var_os("HIGGS_HF_ENDPOINT");
+
+        // Unset → the public default (removed explicitly so ambient env can't perturb it).
         // SAFETY: serialized by TEST_ENV_LOCK; restored below.
+        unsafe { std::env::remove_var("HIGGS_HF_ENDPOINT") };
+        assert_eq!(
+            hf_url("org/model", "main", "m.gguf"),
+            "https://huggingface.co/org/model/resolve/main/m.gguf",
+            "default endpoint"
+        );
+
+        // Override → the mirror, with the trailing slash trimmed.
         unsafe { std::env::set_var("HIGGS_HF_ENDPOINT", "https://mirror.example.test/") };
         assert_eq!(
             hf_url("org/model", "main", "m.gguf"),
             "https://mirror.example.test/org/model/resolve/main/m.gguf",
             "override honored, trailing slash trimmed"
         );
-        // An empty value is ignored → falls back to the public default.
+
+        // Empty value → ignored (treated as unset) → the public default.
         unsafe { std::env::set_var("HIGGS_HF_ENDPOINT", "") };
         assert_eq!(
             hf_url("org/model", "main", "m.gguf"),
             "https://huggingface.co/org/model/resolve/main/m.gguf",
             "empty override ignored"
         );
+
         // SAFETY: still under the lock.
         unsafe {
             match prev {
