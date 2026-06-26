@@ -366,7 +366,9 @@ pub async fn gate_connection(
             // itself, so it does the grace-close here once gate_admit has returned.
             let outcome =
                 gate_admit(conn, handshake, allow, tokens, now_ms, hub, label_for_new).await;
-            if let GateOutcome::Rejected { code } = outcome {
+            // Borrow (not move) `outcome` so it can be returned below; the bound `code`
+            // (`&&'static str`) auto-derefs to the `&'static str` the helper takes.
+            if let GateOutcome::Rejected { code } = &outcome {
                 close_after_reject(conn, code).await;
             }
             outcome
