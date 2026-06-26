@@ -20,6 +20,16 @@ three clean rounds, or three rounds that surface only the same already-assessed
 items (known false positives / explicitly-deferred wont-fixes). A round that
 finds a new real bug resets the count: fix it and keep going.
 
+**An integration test must validate the fix.** Every real fix ships a `tests/`
+integration test (spawn the real `higgs` over HTTP, or the in-process iroh gate)
+that you've **proven fails if the fix is reverted** — verify by actually reverting,
+running, seeing it fail, restoring; not by reasoning. **Commit the test as soon as
+it's verified**, then converge. Write *testable code, not code for tests*: use
+seams (dependency injection, pub fns, real HTTP) — never a test-only env/config/
+`cfg(test)` knob in production. If a fix is genuinely not reachable from the
+HTTP/iroh surface, say so with file:line evidence and cover it with a unit test via
+an injected seam — do not fake an integration test.
+
 **Tooling:** `codex review --base <ref>` / `--commit <sha>` do NOT accept a custom
 prompt. For scoped, prompted reviews use `codex exec --skip-git-repo-check '<prompt>'`
 (tightly scope it and tell it to CONCLUDE quickly, or it exhausts budget). Reviews
