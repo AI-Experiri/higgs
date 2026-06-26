@@ -754,6 +754,24 @@ impl Higgs {
         Ok(())
     }
 
+    /// Unload ONE resident model by its served id, leaving every other local
+    /// worker resident — the per-model counterpart to [`unload`](Self::unload)'s
+    /// drain-all. The local node is multi-model, so a UI Eject / Fleet Unload of a
+    /// single card must target only that instance. Resolves the served id (`org/model`,
+    /// `org/model-1`, …) to its worker and unloads it; an unknown/already-gone id is an
+    /// idempotent no-op (the post-condition "that id is not resident" holds either way).
+    /// Shares the `lifecycle` mutex with `load`/`unload` so it can't race a concurrent
+    /// load that ADDS a worker.
+    pub async fn unload_one(&self, served: &str) -> Result<(), HiggsError> {
+        let _lifecycle = self.lifecycle.lock().await;
+        if let Some((worker, _model)) = self.local_served().await.remove(served) {
+            // Ignore `no_worker`: the idle reaper may have removed+reaped it between
+            // the resolve and here — the end state (id not resident) is the same.
+            let _ = self.local.unload(worker).await;
+        }
+        Ok(())
+    }
+
     /// Return a live status snapshot of the PRIMARY local instance.
     ///
     /// The local node may host several models (additive load); the single-model

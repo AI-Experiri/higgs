@@ -295,10 +295,32 @@ pub(super) async fn control_tune(
     }
 }
 
-/// `POST /api/higgs/models/unload` — unload the current model.
-pub(super) async fn control_unload(State(higgs): State<Arc<Higgs>>) -> Response {
-    tracing::warn!("higgs: unloading model");
-    match higgs.unload().await {
+/// Body for `POST /api/higgs/models/unload`. An `id` (a served instance id)
+/// unloads JUST that model; omitting it (`{}` / no body) drains ALL local models.
+/// The local node is multi-model, so per-card Eject / Fleet Unload pass the id.
+#[derive(serde::Deserialize, Default)]
+pub(super) struct UnloadHttp {
+    #[serde(default)]
+    id: Option<String>,
+}
+
+/// `POST /api/higgs/models/unload` — unload one model by `{id}`, or ALL when no id.
+pub(super) async fn control_unload(
+    State(higgs): State<Arc<Higgs>>,
+    body: Option<Json<UnloadHttp>>,
+) -> Response {
+    let id = body.and_then(|Json(b)| b.id).filter(|s| !s.is_empty());
+    let result = match &id {
+        Some(id) => {
+            tracing::warn!(%id, "higgs: unloading model");
+            higgs.unload_one(id).await
+        }
+        None => {
+            tracing::warn!("higgs: unloading all models");
+            higgs.unload().await
+        }
+    };
+    match result {
         Ok(()) => Json(HiggsOk::new()).into_response(),
         Err(err) => {
             tracing::warn!(error = %err, "higgs: unload failed");
