@@ -149,12 +149,10 @@ fn parse_one(block: &str, id_seed: &str, index: usize) -> Option<Value> {
 /// Everything else (numbers, `true`/`false`/`null`, structural `{}[]:,`) is
 /// passed through untouched, so it parses as ordinary JSON.
 ///
-/// The pass works on bytes and rebuilds a `String` at the end: non-ASCII bytes
-/// (multibyte UTF-8 in a value or key) are copied byte-for-byte and never
-/// reinterpreted as a single `char`, so any Unicode survives intact. Every
-/// `&str` slice taken below is on a char boundary because the marker/delimiter
-/// scans land on ASCII bytes and `bare_key_end` advances over whole UTF-8
-/// runes.
+/// The pass works on bytes and rebuilds a `String` at the end. Every `&str` slice
+/// below lands on a char boundary: marker/delimiter scans hit ASCII bytes, and a
+/// bare value/key advances by whole UTF-8 runes (`bare_key_end` and the rune-width
+/// copy below), so Unicode survives intact.
 fn gemma4_args_to_json(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len() + 16);
@@ -185,9 +183,17 @@ fn gemma4_args_to_json(s: &str) -> String {
             }
         }
 
+        // Copy one rune: a non-ASCII lead byte begins a multibyte rune (a bare
+        // value/key), so advance its full width — a single-byte step would land `i`
+        // mid-codepoint and panic the next `s[i..]` slice.
         let c = bytes[i];
-        out.push(c);
-        i += 1;
+        let w = if c < 0x80 {
+            1
+        } else {
+            s[i..].chars().next().map_or(1, char::len_utf8)
+        };
+        out.extend_from_slice(&bytes[i..i + w]);
+        i += w;
 
         // After a `{` or `,`, a bare identifier key followed by `:` is quoted.
         if c == b'{' || c == b',' {
@@ -406,5 +412,25 @@ mod tests {
         let input =
             "<|channel>thought\nplanning<channel|>On it.\n<|tool_call>call:x{a:1}<tool_call|>";
         assert_eq!(p().content(input), "On it.");
+    }
+
+    #[test]
+    fn bare_multibyte_args_do_not_panic() {
+        // A model can emit malformed BARE (unquoted) multibyte args; the byte-walk
+        // must advance whole runes — a single-byte step lands `i` mid-codepoint and
+        // panics the next `s[i..]` slice. The call still parses; invalid bare args
+        // degrade to empty.
+        for text in [
+            "<|tool_call>call:f{a:naïve}<tool_call|>",
+            "<|tool_call>call:f{🎉:1}<tool_call|>",
+            "<|tool_call>call:f{a:café,b:naïve}<tool_call|>",
+        ] {
+            let calls = p().parse(text, "w").expect("tool call still parses");
+            assert_eq!(calls[0]["function"]["name"], "f", "name parsed: {text}");
+            assert_eq!(
+                calls[0]["function"]["arguments"], "{}",
+                "invalid bare args degrade to empty, no panic: {text}"
+            );
+        }
     }
 }
