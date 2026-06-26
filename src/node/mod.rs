@@ -261,9 +261,15 @@ pub(crate) async fn gate_admit(
                 Ok(()) => {
                     // Persist FIRST, then burn — a failed save must leave the token usable.
                     if let Err(e) = allow.add(peer.clone(), new_label.clone()) {
+                        // A failure HERE is a STORAGE problem (disk full, permissions, a
+                        // missing parent in a custom path), NOT an auth one — the token was
+                        // VALID. Surface the pairings-store WRITE code (HG040) so the operator
+                        // gets the disk/permissions remediation, not a misleading "not
+                        // allowlisted" (HG024). The token is NOT burned (burn is below), so a
+                        // retry after fixing storage still admits the node.
                         tracing::error!(error = %e, "higgs: failed to persist new pairing");
-                        conn.close(0u32.into(), b"HG024");
-                        return GateOutcome::Rejected { code: "HG024" };
+                        conn.close(0u32.into(), b"HG040");
+                        return GateOutcome::Rejected { code: "HG040" };
                     }
                     tokens.burn(tok);
                     new_label
@@ -433,7 +439,36 @@ pub async fn connect_node(
             }))
         }
     };
+    // Validate the hub's HELLO before trusting it (see [`validate_hub_hello`]).
+    validate_hub_hello(&result, &conn.remote_id().to_string())?;
     Ok((conn, result))
+}
+
+/// Validate a hub's HELLO reply against the TLS-authenticated peer — SYMMETRIC to the
+/// hub-side gate ([`gate_connection`], where a node's self-declared id must equal the TLS
+/// peer). `cli.rs` persists `result.node_id` as the saved hub id and re-dials it on every
+/// reconnect, so a malformed / incompatible reply must not poison saved state or let the
+/// session continue under a protocol we don't speak. Requires: the peer is actually a hub
+/// (`role == "hub"`), its self-declared id equals the authenticated EndpointId, and the
+/// hub-chosen `agreed_version` is one WE support.
+fn validate_hub_hello(result: &HelloResult, peer: &str) -> std::io::Result<()> {
+    use std::io::Error;
+    if result.role != "hub" || result.node_id != peer {
+        return Err(Error::other(HiggsError::ProtocolViolation {
+            peer_role: "hub".into(),
+            detail: format!(
+                "hub HELLO identity mismatch: role={:?}, node_id={:?}, authenticated peer={peer}",
+                result.role, result.node_id
+            ),
+        }));
+    }
+    if !PROTOCOL_VERSIONS.contains(&result.agreed_version) {
+        return Err(Error::other(HiggsError::VersionMismatch {
+            peer: vec![result.agreed_version],
+            ours: PROTOCOL_VERSIONS.to_vec(),
+        }));
+    }
+    Ok(())
 }
 
 /// Node side: ask the hub (on an established post-HELLO connection) to retire THIS node. Opens a
@@ -584,5 +619,47 @@ async fn handle_node_stream(
         {
             break; // stream gone
         }
+    }
+}
+
+#[cfg(test)]
+mod hub_hello_tests {
+    use super::*;
+
+    fn hub_hello(role: &str, node_id: &str, agreed_version: u32) -> HelloResult {
+        HelloResult {
+            role: role.into(),
+            node_id: node_id.into(),
+            hub_name: "hub-test".into(),
+            agreed_version,
+            software_version: "0.0.0".into(),
+            assigned_label: None,
+            capabilities: crate::remote::Capabilities::default(),
+        }
+    }
+
+    #[test]
+    fn accepts_a_well_formed_hub_hello() {
+        let r = hub_hello("hub", "peer-eid", PROTOCOL_VERSIONS[0]);
+        assert!(validate_hub_hello(&r, "peer-eid").is_ok());
+    }
+
+    #[test]
+    fn rejects_wrong_role_or_mismatched_id() {
+        // role is not "hub" → ProtocolViolation (HG038).
+        let bad_role = hub_hello("node", "peer-eid", PROTOCOL_VERSIONS[0]);
+        let e = validate_hub_hello(&bad_role, "peer-eid").unwrap_err();
+        assert!(e.to_string().contains("[HG038]"), "{e}");
+        // node_id ≠ the authenticated peer → ProtocolViolation (would poison the saved hub id).
+        let bad_id = hub_hello("hub", "claimed-other", PROTOCOL_VERSIONS[0]);
+        let e = validate_hub_hello(&bad_id, "peer-eid").unwrap_err();
+        assert!(e.to_string().contains("[HG038]"), "{e}");
+    }
+
+    #[test]
+    fn rejects_unsupported_agreed_version() {
+        let bad_ver = hub_hello("hub", "peer-eid", 999);
+        let e = validate_hub_hello(&bad_ver, "peer-eid").unwrap_err();
+        assert!(e.to_string().contains("[HG023]"), "{e}");
     }
 }

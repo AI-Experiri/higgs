@@ -210,9 +210,12 @@ higgs_ts! {
         #[ts(type = "number")]
         #[ts(optional)]
         pub seed: Option<u32>,
-        /// Per-load idle-TTL override in minutes. When set, the idle reaper uses
-        /// this instead of the global TTL for THIS loaded model. Absent = use
-        /// global. HOST-SIDE only — never forwarded to the worker/engine.
+        /// Per-load idle-TTL override in minutes. RESERVED / forward-compat: per-load
+        /// idle-TTL enforcement is a deferred follow-up, so this is currently ACCEPTED
+        /// but NOT enforced — the node reaper applies one per-node TTL to every worker
+        /// (the global TTL, `/api/higgs/settings`), and the host neither stores nor
+        /// surfaces this value. It will take effect once the reaper honors per-worker
+        /// overrides (host-side only either way — never forwarded to the worker/engine).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(type = "number")]
         #[ts(optional)]

@@ -174,10 +174,13 @@ pub struct NodeLoadParams {
     /// first (an older `deny_unknown_fields` node would reject an unknown field).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<crate::worker::engine::llamacpp::params::LlamaCppParams>,
-    // NOTE: no `idle_ttl_minutes` yet. A per-load idle TTL requires a node-side idle
-    // reaper (the local TTL lives in the host `Higgs` reaper, not the worker). The wire
-    // field and its enforcement land together in a later phase, so the node never accepts
-    // a TTL it would silently fail to honor.
+    // NOTE: no `idle_ttl_minutes` on the wire yet. The idle reaper lives in the node's
+    // `NodeRuntime` and applies ONE per-node TTL to every worker; per-WORKER (per-load)
+    // override enforcement is a deferred follow-up. The wire field and its enforcement
+    // land together in that later phase — gated behind a protocol-version bump, since an
+    // older `deny_unknown_fields` node would reject an unknown field — so the node never
+    // accepts a TTL it would silently fail to honor. (The host `HiggsLoadRequest` accepts
+    // `idle_ttl_minutes` for forward-compat but currently ignores it; see `serve::wire`.)
 }
 
 /// `{ "worker_id": <u32> }` — the target selector for `unload`/`kill`/`status`.

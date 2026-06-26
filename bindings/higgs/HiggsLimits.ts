@@ -38,7 +38,10 @@ max_concurrent_inference: number,
  */
 memory_headroom_fraction: number, 
 /**
- * Idle minutes after which the loaded model is auto-unloaded
- * ([`IDLE_UNLOAD_TTL`]).
+ * Effective idle seconds after which an idle worker is auto-unloaded — the
+ * live value the node reaper enforces (default
+ * [`DEFAULT_IDLE_TTL`](crate::node::runtime::DEFAULT_IDLE_TTL), 60 min;
+ * runtime-mutable via `/api/higgs/settings`). Always equals the settings
+ * endpoint's `idle_ttl_minutes × 60`.
  */
 idle_unload_ttl_secs: number, };

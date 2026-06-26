@@ -309,32 +309,29 @@ async fn idle_unload_settings_default_and_round_trip() {
         std::time::Duration::from_secs(30 * 60),
         "set_idle_ttl_minutes propagates to the node reaper"
     );
-}
-
-// ── Per-load idle-TTL override: default None, set/clear round-trip ────────
-
-#[tokio::test]
-async fn loaded_idle_ttl_override_defaults_none_and_round_trips() {
-    let higgs = fake_higgs(vec![]);
-    // No override by default (0 in the atomic reads back as None).
+    // `/api/higgs/system` limits report the EFFECTIVE (live) idle TTL — the same
+    // value the settings endpoint returns, never a stale fixed constant. (Regression
+    // guard: it once reported a hardcoded 5-minute constant while the default is 60.)
     assert_eq!(
-        higgs.loaded_idle_ttl_override(),
-        None,
-        "override defaults to None"
+        higgs.server_config().limits.idle_unload_ttl_secs,
+        higgs.idle_ttl_minutes() * 60,
+        "/system idle_unload_ttl_secs tracks the live TTL (settings ↔ system agree)"
     );
-    // Set an override → reads back as Some(n).
-    higgs.set_loaded_idle_ttl_override(Some(30));
+
+    // A huge request value is CLAMPED, not overflowed — `minutes * 60` would otherwise
+    // panic (debug) or wrap (release) since the TTL comes straight off the HTTP body.
+    higgs.set_idle_ttl_minutes(u64::MAX);
     assert_eq!(
-        higgs.loaded_idle_ttl_override(),
-        Some(30),
-        "set Some(30) is observed"
+        higgs.idle_ttl_minutes(),
+        MAX_IDLE_TTL_MINUTES,
+        "an out-of-range idle TTL is clamped to MAX_IDLE_TTL_MINUTES"
     );
-    // Clear with None → back to None.
-    higgs.set_loaded_idle_ttl_override(None);
+    // …and the clamped value still converts to seconds without overflow, keeping the
+    // settings ↔ system views consistent at the bound.
     assert_eq!(
-        higgs.loaded_idle_ttl_override(),
-        None,
-        "set None clears the override"
+        higgs.server_config().limits.idle_unload_ttl_secs,
+        MAX_IDLE_TTL_MINUTES * 60,
+        "clamped TTL converts to seconds without overflow"
     );
 }
 
@@ -543,6 +540,51 @@ async fn multi_model_both_served_and_reachable() {
     let st = higgs.status().await.expect("status");
     assert!(st.worker_alive);
     assert_eq!(st.loaded.expect("loaded").id, "org/a", "primary is org/a");
+}
+
+// ── Test 3e: resident-but-busy worker — local_loaded_info must not say "not served" ─
+
+/// A served id whose worker is resident but cannot answer `M_STATUS` (busy mid-generation
+/// / briefly wedged) must still resolve to a LOADED stub — NOT `None`, which would mislead
+/// the serve gate into a not-loaded `[HG003]`. The stub carries a permissive `ctx_len`
+/// (`u32::MAX`) so the host prompt-fit gate can't reject a queued chat either.
+#[tokio::test]
+async fn local_loaded_info_busy_worker_returns_permissive_stub() {
+    let dir = tempfile::TempDir::new().unwrap();
+    crate::serve::test_support::write_gguf_fixture(dir.path(), "org/busy");
+    // A node whose worker LOADS fine (so it is resident) but ERRORS every status probe.
+    let node = crate::node::test_support::fake_runtime_status_fails(vec![dir.path().to_path_buf()]);
+    let cfg = HiggsConfig {
+        lmstudio_dirs: vec![dir.path().to_path_buf()],
+        hf_dirs: vec![],
+        ollama_dirs: vec![],
+        default_load: HiggsConfig::default().default_load,
+    };
+    let higgs = Higgs::with_local(Arc::new(node), cfg);
+
+    higgs
+        .load("org/busy", None)
+        .await
+        .expect("load succeeds (M_LOAD ok)");
+
+    // The served id resolves to a resident worker, so even though the status probe errors,
+    // local_loaded_info reports a LOADED stub rather than None.
+    let info = higgs
+        .local_loaded_info("org/busy")
+        .await
+        .expect("resident worker resolves despite a failing status probe");
+    assert_eq!(info.id, "org/busy", "stub carries the served id");
+    assert_eq!(
+        info.ctx_len,
+        u32::MAX,
+        "stub ctx_len is permissive so the prompt-fit gate defers to the worker's HG005"
+    );
+
+    // And an id that is NOT served still resolves to None (no false positive).
+    assert!(
+        higgs.local_loaded_info("org/absent").await.is_none(),
+        "an unserved id is still None"
+    );
 }
 
 // ── Test 4: chat_stream delivers chunks and outcome ────────────────────────

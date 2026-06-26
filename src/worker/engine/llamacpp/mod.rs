@@ -591,9 +591,24 @@ fn run_decode(
     // ignoring the other samplers, matching llama.cpp). Otherwise the standard order:
     // penalties → top_k → typical → top_p → min_p → top_n_sigma → xtc → temp(/dynatemp)
     // → dist. The seed is the per-request `sampling.seed`, else the load-pinned seed,
-    // else fresh entropy. (Advanced samplers needing the model/vocab handle — dry,
-    // mirostat, grammar, logit_bias — are carried in the type but not built here yet.)
+    // else fresh entropy.
     let s = params.sampling.as_llamacpp();
+    // Advanced samplers needing the model/vocab handle — dry, mirostat, grammar,
+    // logit_bias — are carried in the umbrella type but not yet applied here. FAIL
+    // LOUD rather than build a chain that silently omits them: returning unconstrained
+    // / unbiased output when a caller explicitly requested a grammar or logit bias is a
+    // correctness lie. (Unreachable from today's request mappers — `build_sampling`,
+    // tune, and card parsing never populate these — so this guards a future caller, not
+    // current traffic.) HG013 is the sampling-parameter diagnostic.
+    if let Some(param) = s.unsupported_sampler() {
+        return Err(HiggsError::InvalidSamplingParam {
+            param: param.to_string(),
+            detail: "accepted by the API but not yet applied by the llama.cpp engine — \
+                     omit it so the response is never silently unconstrained/unbiased \
+                     (this sampler lands in a later release)"
+                .to_string(),
+        });
+    }
     let temp = s.temperature.unwrap_or(0.7);
     let seed = s.seed.or(lp.seed).unwrap_or_else(rand::random::<u32>);
     let mut chain: Vec<LlamaSampler> = Vec::new();

@@ -417,6 +417,17 @@ impl Actor for FleetActor {
                 let _ = reply.send(resolved);
             }
             FleetMsg::IsRemote { served, reply } => {
+                // Counts a served id with ANY durable route — including one whose node is
+                // currently DISCONNECTED (routes survive a drop; see `drop_transport_if`).
+                // This is intentional, NOT the connected-only `routed_models` set:
+                //   * a chat to a disconnected-route id routes through `chat`, whose
+                //     `transport(&node)` then returns HG027 (node unreachable → reconnect) —
+                //     an ACCURATE error (the model IS fleet-known, its host is merely offline),
+                //     strictly better than the HG002 "not found" a connected-only check would
+                //     yield for a model the fleet still routes.
+                // Residual (accepted): if the SAME model is also on local disk, a stale route
+                // to a disconnected node yields HG027 instead of a local JIT load. Narrow, and
+                // it degrades to a clear diagnostic — not a fault. See `is_remote`'s doc.
                 let _ = reply.send(self.served_ids().contains_key(&served));
             }
             FleetMsg::RoutedModels { reply } => {
@@ -886,7 +897,14 @@ impl HubFleet {
             .map(|(node, worker, _model)| (node, worker))
     }
 
-    /// Is this served instance id resident on some remote node?
+    /// Is this served instance id resident on some remote node? TRUE for ANY durable
+    /// route, even to a currently-DISCONNECTED node (routes outlive a transport drop) —
+    /// deliberately broader than [`routed_models`](Self::routed_models) (connected-only,
+    /// for `/v1/models` discovery). Used by routing (`ensure_loaded` / `chat_stream`):
+    /// a disconnected-route chat routes through [`chat`](Self::chat) → HG027 (node
+    /// unreachable → reconnect), the accurate error for a fleet-known but offline host,
+    /// vs. the misleading HG002 a connected-only check would give. See the `IsRemote`
+    /// handler for the narrow accepted residual (stale route shadowing a local JIT load).
     pub async fn is_remote(&self, served: &str) -> bool {
         self.ask(|reply| FleetMsg::IsRemote {
             served: served.to_string(),

@@ -97,14 +97,6 @@ pub struct Higgs {
     /// Server-Settings getter reads. A plain atomic — set/read in isolation, never
     /// across `.await`.
     idle_ttl_minutes: std::sync::atomic::AtomicU64,
-    /// Per-load idle-TTL override, in minutes (HOST-SIDE display only). `0` means
-    /// "no override". Set by the control settings endpoint at load time and cleared
-    /// on unload, and surfaced in [`status`](Self::status)'s `LoadedInfo`. NOTE: the
-    /// node's reaper enforces a single per-node TTL ([`IdleConfig`](crate::node::runtime::IdleConfig));
-    /// per-load override ENFORCEMENT is a documented follow-up, so today this value
-    /// is reported but not independently enforced. A plain atomic — set/read in
-    /// isolation, never across `.await`.
-    loaded_idle_ttl_override: std::sync::atomic::AtomicU64,
     /// Runtime "serving on/off" gate for the `/v1` inference surface. When `false`,
     /// the `/v1` inference endpoints return `[HG019]` → 503 while the
     /// `/api/higgs/*` control surface stays reachable so the user can re-enable.
@@ -220,23 +212,36 @@ fn default_config_path_override() -> Option<std::path::PathBuf> {
 }
 
 impl Higgs {
-    /// Construct the facade WITHOUT spawning the worker, owning a fresh
+    /// Construct the facade WITHOUT spawning the llama.cpp worker, owning a fresh
     /// [`LogBus`]. The serve-layer [`HiggsLogLayer`](crate::log_bus::HiggsLogLayer)
     /// is NOT wired to this internal bus — request events won't appear in the
     /// Developer Logs. Use [`with_log_bus`](Self::with_log_bus) when the caller
     /// installs the tracing layer.
     ///
     /// Call [`start`](Self::start) when the host is ready.
+    ///
+    /// RUNTIME: must be called from WITHIN a Tokio runtime — see
+    /// [`with_log_bus`](Self::with_log_bus).
     pub fn new(config: HiggsConfig) -> Self {
         Self::with_log_bus(config, Arc::new(LogBus::new()))
     }
 
-    /// Construct the facade WITHOUT spawning the worker, sharing `bus` with the
-    /// caller's serve-layer [`HiggsLogLayer`](crate::log_bus::HiggsLogLayer).
+    /// Construct the facade WITHOUT spawning the llama.cpp worker, sharing `bus` with
+    /// the caller's serve-layer [`HiggsLogLayer`](crate::log_bus::HiggsLogLayer).
     ///
     /// Worker stderr and captured serve-layer request events then flow into the
     /// same Developer-Log history+stream. The caller is responsible for
     /// installing `HiggsLogLayer::new(bus.clone())` on its tracing subscriber.
+    ///
+    /// RUNTIME: this is a synchronous constructor but it MUST be called from within a
+    /// Tokio runtime. It builds the co-located local [`NodeRuntime`], which spawns its
+    /// actor task + idle reaper immediately (via `tokio::spawn`) so the facade is usable
+    /// the moment it returns — `load`/`status`/chat need the actor live. "Without
+    /// spawning the worker" refers ONLY to the heavy llama.cpp subprocess (deferred to
+    /// [`load`](Self::load)); the lightweight node tasks DO start here, so constructing
+    /// outside a runtime panics with Tokio's "no reactor running". Every real caller
+    /// (the standalone server, the embedded host) already constructs inside its async
+    /// bring-up, so this is a contract note, not a behavior change.
     pub fn with_log_bus(config: HiggsConfig, bus: Arc<LogBus>) -> Self {
         // Build the co-located LOCAL node from the same config + bus. The node owns the
         // workers; it shares `bus` so local worker stderr lands in the Developer Logs.
@@ -266,7 +271,6 @@ impl Higgs {
             // Server-Settings getters read the same values the node reaper enforces.
             auto_unload_idle: std::sync::atomic::AtomicBool::new(true),
             idle_ttl_minutes: std::sync::atomic::AtomicU64::new(DEFAULT_IDLE_TTL.as_secs() / 60),
-            loaded_idle_ttl_override: std::sync::atomic::AtomicU64::new(0),
             serving_enabled: std::sync::atomic::AtomicBool::new(true),
             device_cache: parking_lot::Mutex::new(None),
             fleet: parking_lot::Mutex::new(None),
@@ -442,7 +446,8 @@ impl Higgs {
     }
 
     /// Idle minutes after which the loaded model is auto-unloaded (default seeded
-    /// from [`IDLE_UNLOAD_TTL`]). Read by the idle reaper each tick.
+    /// from the node's [`DEFAULT_IDLE_TTL`], 60 min). Mirrors the node reaper's live
+    /// TTL; [`set_idle_ttl_minutes`](Self::set_idle_ttl_minutes) keeps them in sync.
     pub fn idle_ttl_minutes(&self) -> u64 {
         self.idle_ttl_minutes
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -451,33 +456,17 @@ impl Higgs {
     /// Set the idle auto-unload TTL in minutes at runtime. Read by the idle
     /// reaper each tick, so a change takes effect without a restart.
     pub fn set_idle_ttl_minutes(&self, minutes: u64) {
+        // CLAMP the request-supplied value (an unbounded `u64` straight off
+        // `PUT /api/higgs/settings`) before the `× 60` so a huge minutes count can't
+        // overflow the seconds conversion — a debug-build panic, a release wrap. The
+        // STORED value is the clamped one, so `idle_ttl_minutes()` and `server_config()`
+        // (which both `× 60`) stay overflow-free AND mutually consistent.
+        let minutes = minutes.min(MAX_IDLE_TTL_MINUTES);
         self.idle_ttl_minutes
             .store(minutes, std::sync::atomic::Ordering::Relaxed);
         self.local
             .idle()
             .set_ttl(std::time::Duration::from_secs(minutes * 60));
-    }
-
-    /// Active per-load idle-TTL override in minutes, or `None` when no override
-    /// is set. Set at load time from the load request and cleared on unload, so
-    /// it reflects only the currently-loaded model. `0` in the atomic means "no
-    /// override" and reads back as `None`.
-    pub fn loaded_idle_ttl_override(&self) -> Option<u64> {
-        match self
-            .loaded_idle_ttl_override
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            0 => None,
-            n => Some(n),
-        }
-    }
-
-    /// Set (or clear, with `None`) the per-load idle-TTL override in minutes. The
-    /// idle reaper prefers this over [`idle_ttl_minutes`](Self::idle_ttl_minutes)
-    /// for the currently-loaded model. `None` stores `0` (no override).
-    pub fn set_loaded_idle_ttl_override(&self, minutes: Option<u64>) {
-        self.loaded_idle_ttl_override
-            .store(minutes.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Whether the `/v1` inference surface is currently serving (default `true`).
@@ -531,8 +520,6 @@ impl Higgs {
         let _lifecycle = self.lifecycle.lock().await;
         // Drain every local worker (graceful shutdown of the local node's registry).
         self.local.shutdown_all().await;
-        // No model is loaded after a full drain — drop any per-load idle-TTL override.
-        self.set_loaded_idle_ttl_override(None);
     }
 
     /// Scan all configured model directories and return the discovered models.
@@ -655,6 +642,15 @@ impl Higgs {
                 let d = self.config.lock().default_load.clone();
                 NodeLoadParams {
                     id: id.to_owned(),
+                    // A no-params load uses AUTO context (`None` → the model's TRAINED
+                    // context, capped at DEFAULT_CTX_CAP by the node, runtime.rs:842),
+                    // NOT `default_load.ctx_len`. This asymmetry with gpu_layers/threads
+                    // below is DELIBERATE: `gpu_layers = all` and a thread count are
+                    // sensible UNIVERSAL defaults, but a fixed context (the base
+                    // placeholder 4096) is NOT — the node uses a PINNED ctx_len verbatim
+                    // (runtime.rs:842 does NOT cap it at the trained context), so pinning
+                    // 4096 would rope-extend a 2048-trained model and degrade it. Auto
+                    // sizes per-model correctly. (See the fn doc + the Some(p) branch.)
                     ctx_len: None,
                     gpu_layers: Some(d.gpu_layers()),
                     threads: Some(d.threads()),
@@ -755,8 +751,6 @@ impl Higgs {
             // single pass the registry is empty.
             let _ = self.local.unload(worker).await;
         }
-        // Clear the per-load idle-TTL override so it never outlives its model.
-        self.set_loaded_idle_ttl_override(None);
         Ok(())
     }
 
@@ -899,7 +893,12 @@ impl Higgs {
             max_context_length: scanned.and_then(|m| m.ctx_train),
             size_bytes: scanned.map(|m| m.size_bytes),
             has_chat_template: scanned.map(|m| m.has_chat_template),
-            idle_ttl_minutes: self.loaded_idle_ttl_override(),
+            // Always `None` (= "uses the global idle TTL"): per-load idle-TTL
+            // ENFORCEMENT is a deferred follow-up (the node reaper applies one
+            // per-node TTL to every worker — runtime.rs `ReapIdle`), so surfacing a
+            // per-load value here would claim an override the reaper does not honor.
+            // See `LoadedInfo::idle_ttl_minutes` + the `NodeLoadParams` deferral note.
+            idle_ttl_minutes: None,
             id,
         })
     }
@@ -1126,14 +1125,36 @@ impl Higgs {
     /// SERVED id (not the raw model) so a follow-up [`chat_stream`](Self::chat_stream)
     /// resolves the SAME worker. `None` when the id is not locally served. Used by
     /// the serve layer's loaded-model gate ([`ensure_loaded`](crate::serve)).
+    ///
+    /// CRITICAL: a served id that RESOLVES is resident, so a failed/timed-out status
+    /// probe must NOT be reported as "not served" — that would mislead the serve gate
+    /// into a not-loaded `[HG003]` (or a JIT no-op then HG003) for a model that is
+    /// merely BUSY. A single worker serialises generation and cannot answer `M_STATUS`
+    /// mid-generation, so the probe times out under concurrent load. The three cases:
+    ///   * status OK + a loaded model → live params.
+    ///   * status OK but `loaded` is null → the worker was unloaded out from under us
+    ///     (a race vs idle-reap/unload) → genuinely not resident → `None` (the gate's
+    ///     JIT path then reloads it).
+    ///   * status ERR (busy / briefly wedged) → a permissive metadata stub (resident,
+    ///     `ctx_len = u32::MAX` so the host prompt-fit gate doesn't reject) so the chat
+    ///     QUEUES behind the generation; the worker's tokenizer-exact `[HG005]` stays
+    ///     the authoritative prompt-fit backstop.
     pub async fn local_loaded_info(&self, served: &str) -> Option<LoadedInfo> {
-        let (worker, _raw) = self.local_served().await.remove(served)?;
-        let v = self.local.status(worker).await.ok()?;
+        let (worker, raw) = self.local_served().await.remove(served)?;
         let scan = self.scan().await.unwrap_or_default();
-        let mut info = self.loaded_info_from(&v, &scan)?;
-        info.id = served.to_owned();
-        info.worker_id = worker.0;
-        Some(info)
+        match self.local.status(worker).await {
+            Ok(v) => {
+                let mut info = self.loaded_info_from(&v, &scan)?;
+                info.id = served.to_owned();
+                info.worker_id = worker.0;
+                Some(info)
+            }
+            Err(_) => {
+                let mut stub = self.loaded_info_stub(served.to_owned(), worker.0, &raw, &scan);
+                stub.ctx_len = u32::MAX;
+                Some(stub)
+            }
+        }
     }
 
     /// Subscribe to worker lifecycle events (ModelLoaded/ModelUnloaded) from the
@@ -1184,7 +1205,14 @@ impl Higgs {
                 max_output_tokens: crate::serve::MAX_OUTPUT_TOKENS,
                 max_concurrent_inference: MAX_CONCURRENT_INFERENCE as u32,
                 memory_headroom_fraction: MEMORY_HEADROOM_FRACTION,
-                idle_unload_ttl_secs: IDLE_UNLOAD_TTL.as_secs(),
+                // Report the EFFECTIVE (live, runtime-mutable) idle TTL — the same
+                // value `/api/higgs/settings` returns and the node reaper enforces —
+                // not a fixed constant. Defaults to `DEFAULT_IDLE_TTL` (60 min) and
+                // tracks any runtime change, so `/api/higgs/system` can never disagree
+                // with `/api/higgs/settings` (a prior stale 5-min constant did). The
+                // stored minutes are clamped to MAX_IDLE_TTL_MINUTES at the setter, so
+                // `× 60` is overflow-safe; `saturating_mul` is a belt-and-suspenders.
+                idle_unload_ttl_secs: self.idle_ttl_minutes().saturating_mul(60),
             },
         }
     }

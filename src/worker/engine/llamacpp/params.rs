@@ -434,6 +434,25 @@ impl LlamaCppSamplingParams {
             seed: over.seed.or(self.seed),
         }
     }
+
+    /// The name of the first ADVANCED sampler this set requests that the llama.cpp
+    /// engine does not yet apply (it needs the model/vocab handle to build): `grammar`,
+    /// `logit_bias`, `dry`, or `mirostat`. `None` when only supported samplers are set.
+    /// The worker uses this to FAIL LOUD ([`HG013`](crate::diagnostic::HiggsError::InvalidSamplingParam))
+    /// rather than silently return unconstrained/unbiased output — see `run_decode`.
+    pub fn unsupported_sampler(&self) -> Option<&'static str> {
+        if self.grammar.is_some() {
+            Some("grammar")
+        } else if !self.logit_bias.is_empty() {
+            Some("logit_bias")
+        } else if self.dry.is_some() {
+            Some("dry")
+        } else if self.mirostat.is_some() {
+            Some("mirostat")
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -547,6 +566,56 @@ mod tests {
         });
         assert_eq!(with_bias.logit_bias.len(), 1);
         assert_eq!(with_bias.logit_bias[0].token, 9, "request bias wins");
+    }
+
+    /// `unsupported_sampler` reports `None` for a set of only-supported samplers and
+    /// the precise field name for each not-yet-applied advanced sampler — the worker's
+    /// fail-loud guard (HG013) against silently dropping a grammar/logit_bias/dry/mirostat.
+    #[test]
+    fn unsupported_sampler_flags_only_unapplied_advanced_samplers() {
+        // Supported-only set (temperature/top_p/penalties) ⇒ nothing flagged.
+        let ok = LlamaCppSamplingParams {
+            temperature: Some(0.7),
+            top_p: Some(0.9),
+            penalty_repeat: Some(1.1),
+            ..Default::default()
+        };
+        assert_eq!(ok.unsupported_sampler(), None, "supported samplers pass");
+        // Each advanced sampler is flagged by name.
+        assert_eq!(
+            LlamaCppSamplingParams {
+                grammar: Some(GrammarParams {
+                    gbnf: "root ::= \"x\"".to_string(),
+                    root: "root".to_string(),
+                }),
+                ..Default::default()
+            }
+            .unsupported_sampler(),
+            Some("grammar"),
+        );
+        assert_eq!(
+            LlamaCppSamplingParams {
+                logit_bias: vec![LogitBias {
+                    token: 1,
+                    bias: 2.0,
+                }],
+                ..Default::default()
+            }
+            .unsupported_sampler(),
+            Some("logit_bias"),
+        );
+        assert_eq!(
+            LlamaCppSamplingParams {
+                mirostat: Some(MirostatParams {
+                    version: 2,
+                    tau: 5.0,
+                    eta: 0.1,
+                }),
+                ..Default::default()
+            }
+            .unsupported_sampler(),
+            Some("mirostat"),
+        );
     }
 
     /// `has_overrides` is false for a base-only load and true once any engine

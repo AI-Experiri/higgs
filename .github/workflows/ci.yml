@@ -96,3 +96,16 @@ jobs:
 
       - name: Test
         run: cargo test --locked
+
+      # Mirror scripts/quality.sh's bindings gate. `cargo test` above already wrote
+      # the ts-rs bindings (incl. a transient `"a"|"b"` UNION for each higgs_const_enum!
+      # type); this pass overwrites those with the const-OBJECT form (the #[ignore]d
+      # macro_run_* writers, which must run LAST to win). Then the working tree must
+      # match the committed bindings — a non-empty diff means a Rust wire-type change
+      # merged without its regenerated TypeScript, which would ship stale types to
+      # jigglebot. ts-rs output is platform-independent, so this holds on both legs.
+      - name: Regenerate const-object enum bindings
+        run: cargo test --locked macro_run -- --ignored
+
+      - name: Verify ts-rs bindings in sync
+        run: git diff --exit-code -- bindings/

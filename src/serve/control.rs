@@ -248,10 +248,11 @@ pub(super) async fn control_load(
     let started = std::time::Instant::now();
     match higgs.load(&req.id, params).await {
         Ok(()) => {
-            // Record the per-load idle-TTL override (HOST-SIDE only). It takes
-            // precedence over the global TTL in the idle reaper for THIS model
-            // and is cleared on unload. Absent = use the global TTL.
-            higgs.set_loaded_idle_ttl_override(req.idle_ttl_minutes);
+            // NOTE: `req.idle_ttl_minutes` is accepted for forward-compat but NOT yet
+            // enforced — per-load idle-TTL enforcement is a deferred follow-up (the node
+            // reaper applies one per-node TTL; see the `NodeLoadParams` deferral note).
+            // It is deliberately NOT recorded/surfaced so the API never advertises an
+            // override the reaper would silently ignore. The global TTL applies today.
             // Completion line — bookends the "loading model" start line in the
             // Developer Logs. id + elapsed go in the MESSAGE so they render in the
             // console (the log layer captures the message + the `error` field only).
@@ -826,10 +827,17 @@ pub(super) async fn control_logs_stream(
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
-/// `POST /api/higgs/worker/stop` — gracefully shut down the worker.
+/// `POST /api/higgs/worker/stop` — unload every resident worker, freeing their memory.
+/// The server STAYS UP and usable: a subsequent load (or a JIT chat) spawns a fresh
+/// worker. This is a NON-terminal bulk unload ([`Higgs::unload`]), deliberately NOT
+/// [`Higgs::stop`] — `stop` runs the node's TERMINAL `shutdown_all` drain (it marks the
+/// runtime shutting-down, so every later load is rejected until the process restarts),
+/// which is reserved for actual server shutdown ([`crate::serve`] bring-down).
 pub(super) async fn control_worker_stop(State(higgs): State<Arc<Higgs>>) -> Json<HiggsOk> {
-    tracing::warn!("higgs: stopping worker");
-    higgs.stop().await;
+    tracing::warn!("higgs: stopping (unloading) all workers");
+    // `unload` is best-effort (it ignores a worker a concurrent idle-reap already took)
+    // and always returns Ok; its post-condition is "no worker resident".
+    let _ = higgs.unload().await;
     Json(HiggsOk::new())
 }
 
@@ -1555,6 +1563,50 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
         assert_eq!(v["status"], "ok");
+    }
+
+    /// REGRESSION: `worker/stop` is NON-terminal — the server stays loadable after it.
+    /// (The endpoint must do a bulk UNLOAD, not the node's terminal `shutdown_all` drain,
+    /// which marks the runtime shutting-down and would brick every later load until the
+    /// process restarts.)
+    #[tokio::test]
+    async fn worker_stop_is_non_terminal_loads_still_work() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_gguf_fixture(dir.path(), "org/model");
+        let app = make_app_with_lmstudio(dir.path().to_path_buf());
+
+        // Load a model, then stop (unload) all workers via the endpoint.
+        let resp = app
+            .clone()
+            .oneshot(post_json(
+                "/api/higgs/models/load",
+                &json!({"id": "org/model"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "initial load ok");
+        let resp = app
+            .clone()
+            .oneshot(post_json("/api/higgs/worker/stop", &json!({})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "worker/stop ok");
+
+        // A SUBSEQUENT load must still succeed — the node is not terminally shut down.
+        let resp = app
+            .oneshot(post_json(
+                "/api/higgs/models/load",
+                &json!({"id": "org/model"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "load after worker/stop must still work (the node must not be bricked)"
+        );
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(v["status"], "ok", "reload succeeds post-stop");
     }
 
     // ── nodes/{node}/models + nodes/retire: hub-only routes ──────────────────

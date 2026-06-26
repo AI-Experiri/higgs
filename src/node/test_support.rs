@@ -278,6 +278,81 @@ pub(crate) fn fake_runtime_load_fails(lmstudio_dirs: Vec<PathBuf>) -> NodeRuntim
     )
 }
 
+/// A self-responding worker that LOADS successfully (so the node lists the model as
+/// resident) but ERRORS every `M_STATUS` — simulating a worker BUSY mid-generation that
+/// cannot answer the status probe. Exercises `Higgs::local_loaded_info`'s resident-but-
+/// unreachable fallback (a permissive stub, never "not served").
+pub(crate) fn fake_status_failing_factory() -> HalvesFactory {
+    Box::new(|_bus, _model| {
+        let (sup_end, worker_end) = tokio::io::duplex(64 * 1024);
+        let (sup_r, sup_w) = tokio::io::split(sup_end);
+        let (wr, mut ww) = tokio::io::split(worker_end);
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(wr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let Ok(RpcFrame::Request(r)) = rpc::decode(&line) else {
+                    continue;
+                };
+                if r.method == crate::worker::M_SHUTDOWN {
+                    break;
+                }
+                let resp = if r.method == crate::worker::M_STATUS {
+                    RpcResponse {
+                        jsonrpc: "2.0".into(),
+                        id: r.id,
+                        result: None,
+                        error: Some(crate::rpc::RpcError {
+                            code: -32000,
+                            message: "fake status failure (worker busy mid-generation)".into(),
+                            data: None,
+                        }),
+                    }
+                } else if r.method == crate::worker::M_LOAD {
+                    // Echo the id so the node records the worker as resident.
+                    RpcResponse {
+                        jsonrpc: "2.0".into(),
+                        id: r.id,
+                        result: Some(json!({
+                            "id": r.params.get("id").cloned().unwrap_or(Value::Null),
+                        })),
+                        error: None,
+                    }
+                } else {
+                    RpcResponse {
+                        jsonrpc: "2.0".into(),
+                        id: r.id,
+                        result: Some(json!({})),
+                        error: None,
+                    }
+                };
+                let line = format!("{}\n", rpc::encode(&RpcFrame::Response(resp)));
+                if ww.write_all(line.as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(WorkerHalves {
+            write: Box::new(sup_w),
+            read: Box::new(sup_r),
+            proc: None,
+        })
+    })
+}
+
+/// A `NodeRuntime` whose workers LOAD but fail every `M_STATUS` ([`fake_status_failing_factory`]).
+pub(crate) fn fake_runtime_status_fails(lmstudio_dirs: Vec<PathBuf>) -> NodeRuntime {
+    NodeRuntime::with_spawner(
+        NodeConfig {
+            bus: Arc::new(LogBus::new()),
+            lmstudio_dirs,
+            hf_dirs: vec![],
+            ollama_dirs: vec![],
+            idle_ttl: crate::node::runtime::DEFAULT_IDLE_TTL,
+        },
+        Arc::new(|_bus| Supervisor::with_factory(fake_status_failing_factory())),
+    )
+}
+
 /// Stage a dummy `<root>/<id>/m.gguf` so `ModelStore::scan` catalogs it (the GGUF header
 /// is read best-effort, so a non-GGUF file still catalogs — enough for resolution tests).
 /// Returns the temp scan root (keep it alive) and the model id.

@@ -174,8 +174,15 @@ impl SystemInfo {
         };
         let runtime = RuntimeInfo {
             engine: "llama.cpp".to_string(),
+            // Report the backend llama.cpp was actually COMPILED with. macOS links
+            // Metal; a Linux release built `--features cuda` (→ `llama-cpp-2/cuda`)
+            // links CUDA; everything else is a CPU build. A plain `target_os` check
+            // mislabelled CUDA builds as "CPU", misleading `/api/higgs/system` + node
+            // inventory (and any remote scheduling/diagnostics keyed on this field).
             backend: if cfg!(target_os = "macos") {
                 "Metal".to_string()
+            } else if cfg!(feature = "cuda") {
+                "CUDA".to_string()
             } else {
                 "CPU".to_string()
             },

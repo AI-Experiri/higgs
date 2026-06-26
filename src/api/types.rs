@@ -108,8 +108,11 @@ higgs_ts! {
         /// Fraction of available RAM a load may claim before `[HG017]` → 503
         /// ([`MEMORY_HEADROOM_FRACTION`]).
         pub memory_headroom_fraction: f64,
-        /// Idle minutes after which the loaded model is auto-unloaded
-        /// ([`IDLE_UNLOAD_TTL`]).
+        /// Effective idle seconds after which an idle worker is auto-unloaded — the
+        /// live value the node reaper enforces (default
+        /// [`DEFAULT_IDLE_TTL`](crate::node::runtime::DEFAULT_IDLE_TTL), 60 min;
+        /// runtime-mutable via `/api/higgs/settings`). Always equals the settings
+        /// endpoint's `idle_ttl_minutes × 60`.
         #[ts(type = "number")]
         pub idle_unload_ttl_secs: u64,
     }
@@ -189,8 +192,11 @@ higgs_ts! {
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         pub has_chat_template: Option<bool>,
-        /// Active per-load idle-TTL override in minutes, if one was set at load
-        /// time. Absent when the loaded model uses the global idle TTL.
+        /// Per-load idle-TTL override in minutes. RESERVED: per-load idle-TTL
+        /// enforcement is a deferred follow-up (the node reaper applies one per-node
+        /// TTL to every worker), so this is currently ALWAYS absent — every loaded
+        /// model uses the global idle TTL (`/api/higgs/settings`). It becomes
+        /// populated only once the reaper honors per-worker overrides.
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(type = "number")]
         #[ts(optional)]
@@ -313,23 +319,18 @@ pub const MAX_CONCURRENT_INFERENCE: usize = 8;
 /// memory as threshold to leave headroom").
 pub const MEMORY_HEADROOM_FRACTION: f64 = 0.8;
 
-/// Idle period with no inference after which the loaded model is auto-unloaded
-/// to free memory. The idle reaper (spawned by [`Higgs::start`]) checks at
-/// [`IDLE_REAP_INTERVAL`] and unloads once the time since the last chat exceeds
-/// this. 5 minutes is ollama's `keep_alive` default verbatim
-/// (`envconfig/config.go`: `keepAlive = 5 * time.Minute`).
-pub const IDLE_UNLOAD_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+/// Upper bound on the runtime-settable idle auto-unload TTL, in minutes. `PUT
+/// /api/higgs/settings` takes an unbounded `u64` straight from the request body, so
+/// [`Higgs::set_idle_ttl_minutes`] clamps to this before the `× 60` seconds conversion —
+/// otherwise a huge value would overflow `minutes * 60` (a debug-build panic, a release
+/// wrap). 100 years is "effectively never unload" (the canonical never-unload control is
+/// the `auto_unload_idle` toggle), so the clamp restricts no real use while keeping every
+/// `× 60` conversion (the reaper TTL, `/api/higgs/system`) overflow-safe and consistent.
+pub const MAX_IDLE_TTL_MINUTES: u64 = 100 * 365 * 24 * 60;
 
-/// Default idle auto-unload TTL in minutes — the seed for the runtime-mutable
-/// [`Higgs::idle_ttl_minutes`] atomic. Mirrors [`IDLE_UNLOAD_TTL`] (5 minutes,
-/// ollama `keep_alive`) expressed in the minutes unit the Server Settings UI
-/// edits. Kept as the const default; the live value is read from the atomic so
-/// a runtime change takes effect without a restart.
-pub const IDLE_UNLOAD_TTL_MINUTES: u64 = 5;
-
-/// How often the idle reaper wakes to compare idle time against
-/// [`IDLE_UNLOAD_TTL`]. No reference fixes a poll cadence (ollama uses a timer
-/// per loaded model rather than a poll); 30 s is the documented higgs value — a
-/// negligible wakeup that bounds the post-TTL unload latency to at most this
-/// interval. Grouped with the other Phase B knobs for a later config lift.
-pub const IDLE_REAP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+// NOTE: the idle auto-unload TTL + reaper cadence live with the node reaper now
+// (`node::runtime`: `DEFAULT_IDLE_TTL` = 60 min, `reap_interval()` derives the poll
+// cadence from the live TTL). The old engine-era `IDLE_UNLOAD_TTL` (5 min) /
+// `IDLE_UNLOAD_TTL_MINUTES` / `IDLE_REAP_INTERVAL` constants were removed: they were
+// dead after the reaper moved into the node and their stale 5-minute value contradicted
+// the real 60-minute default. The live TTL is read from `Higgs::idle_ttl_minutes`.

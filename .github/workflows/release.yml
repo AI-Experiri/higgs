@@ -49,6 +49,10 @@ jobs:
           fetch-tags: true
       - id: v
         shell: bash
+        env:
+          # Trusted GitHub-controlled enum (push / workflow_dispatch / …), NOT user
+          # input — safe to read in the script. A manual run is an explicit intent.
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
           # First `^version = "…"` is the [package] version ([package] is the
@@ -59,8 +63,22 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
           if git rev-parse "refs/tags/v$version" >/dev/null 2>&1; then
-            echo "tag v$version already exists — nothing to release"
-            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            # The tag exists. The publish step (softprops/action-gh-release) creates the
+            # tag TOGETHER with the release + assets, which is NOT atomic — a partial
+            # failure can leave the tag with an incomplete release. On a PUSH, treat an
+            # existing tag as "already released" (a clean no-op, so an unchanged version
+            # never re-releases). But a MANUAL workflow_dispatch is an explicit RETRY:
+            # let it proceed so the idempotent publish step UPDATES the existing release
+            # and uploads any missing assets — otherwise a half-failed release would be
+            # permanently stuck behind this gate (the operator would have to delete the
+            # tag by hand to recover).
+            if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+              echo "tag v$version exists — manual re-run: re-publishing to complete/refresh the release"
+              echo "should_release=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "tag v$version already exists — nothing to release (push)"
+              echo "should_release=false" >> "$GITHUB_OUTPUT"
+            fi
           else
             echo "v$version is new — a release will be cut"
             echo "should_release=true" >> "$GITHUB_OUTPUT"
