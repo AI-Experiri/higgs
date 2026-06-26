@@ -428,6 +428,39 @@ mod tests {
     }
 
     #[test]
+    fn hf_url_honors_endpoint_override() {
+        // The `reqwest` FALLBACK path must target the SAME mirror/proxy as the hub-client
+        // primary (`hub::hf_client` reads the same var) — otherwise a user's `HIGGS_HF_ENDPOINT`
+        // mirror would be silently bypassed on the fallback. Trailing slash is optional;
+        // an empty value is ignored (treated as unset).
+        let _env = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prev = std::env::var_os("HIGGS_HF_ENDPOINT");
+        // SAFETY: serialized by TEST_ENV_LOCK; restored below.
+        unsafe { std::env::set_var("HIGGS_HF_ENDPOINT", "https://mirror.example.test/") };
+        assert_eq!(
+            hf_url("org/model", "main", "m.gguf"),
+            "https://mirror.example.test/org/model/resolve/main/m.gguf",
+            "override honored, trailing slash trimmed"
+        );
+        // An empty value is ignored → falls back to the public default.
+        unsafe { std::env::set_var("HIGGS_HF_ENDPOINT", "") };
+        assert_eq!(
+            hf_url("org/model", "main", "m.gguf"),
+            "https://huggingface.co/org/model/resolve/main/m.gguf",
+            "empty override ignored"
+        );
+        // SAFETY: still under the lock.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("HIGGS_HF_ENDPOINT", v),
+                None => std::env::remove_var("HIGGS_HF_ENDPOINT"),
+            }
+        }
+    }
+
+    #[test]
     fn dest_path_enforces_scanner_layout_and_rejects_escapes() {
         let root = Path::new("/models");
         // (repo, file, should_succeed, why) — layout is <org>/<model>/*.gguf, and any path
