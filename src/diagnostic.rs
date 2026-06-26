@@ -421,6 +421,20 @@ pub enum HiggsError {
     ))]
     #[diagnostic(code(HG044), severity(Error))]
     ChatTaskFailed { detail: String },
+
+    /// The higgs control surface (`/api/higgs` + `/v1`) serve task EXITED while the
+    /// host process is still running, so those endpoints are now unreachable behind
+    /// a live gateway — the symptom is a connection-refused / 500 from the UI with
+    /// no other cause. The serve task is meant to run for the whole process
+    /// lifetime, so ANY exit is a fault. `reason` says HOW it ended (clean exit /
+    /// serve error / panic / abort). The lever is a process restart; a panic is a
+    /// bug — capture the backtrace and report it. Emitted by the embedding host's
+    /// serve-task supervisor, NOT returned from a request handler.
+    #[snafu(display(
+        "[HG045] higgs control surface is DOWN ({reason}) — /api/higgs + /v1 are unreachable while the gateway is still up; restart the server (a panic is a bug: capture the backtrace and report it)"
+    ))]
+    #[diagnostic(code(HG045), severity(Error))]
+    ControlSurfaceDown { reason: String },
 }
 
 #[cfg(test)]
@@ -637,6 +651,12 @@ mod tests {
                     detail: "panicked".into(),
                 },
                 "[HG044]",
+            ),
+            (
+                HiggsError::ControlSurfaceDown {
+                    reason: "serve task panicked".into(),
+                },
+                "[HG045]",
             ),
         ];
         for (err, code) in cases {
