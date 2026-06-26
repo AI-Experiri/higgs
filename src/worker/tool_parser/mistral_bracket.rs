@@ -86,8 +86,31 @@ impl ToolCallParser for MistralBracketParser {
     }
 
     fn content(&self, text: &str) -> String {
-        let head = text.find(TOOL_CALLS_TAG).map_or(text, |i| &text[..i]);
-        strip_leading_reasoning(head, THINK_END_TAG)
+        // Remove each `[TOOL_CALLS]NAME[ARGS]{json}` span and KEEP the text outside every
+        // call — preamble, gaps between calls, and the trailing remainder (the shared
+        // `content()` contract). This dialect has no closing marker, so — unlike the paired
+        // parsers' `content_outside_calls` — the span end is found exactly as `parse()` finds
+        // it: `[ARGS]` then the balanced JSON object. An incomplete trailing envelope (no
+        // `[ARGS]`, or unterminated JSON) is dropped as incomplete markup, not content.
+        let mut out = String::new();
+        let mut rest = text;
+        let trailing = loop {
+            let Some(start) = rest.find(TOOL_CALLS_TAG) else {
+                break rest; // no further call — the remainder is content
+            };
+            out.push_str(&rest[..start]);
+            let after = &rest[start + TOOL_CALLS_TAG.len()..];
+            let Some(asep) = after.find(ARGS_TAG) else {
+                break ""; // incomplete call (no [ARGS]) — drop the rest
+            };
+            let args_body = &after[asep + ARGS_TAG.len()..];
+            let Some(jend) = find_json_end(args_body) else {
+                break ""; // unterminated JSON — drop the rest
+            };
+            rest = &args_body[jend + 1..];
+        };
+        out.push_str(trailing);
+        strip_leading_reasoning(&out, THINK_END_TAG)
             .trim()
             .to_string()
     }
@@ -228,5 +251,15 @@ mod tests {
         // (ministral_test.go line 337 exercises this lead-in shape.)
         let forced = "let me think[/THINK][TOOL_CALLS]test[ARGS]{}";
         assert_eq!(p().content(forced), "");
+    }
+
+    #[test]
+    fn content_preserves_text_after_and_between_calls() {
+        // Contract: content is the text with call markup REMOVED — preamble, gaps BETWEEN
+        // calls, and trailing text all survive (this dialect has no close marker, so the span
+        // end is the balanced [ARGS] JSON, mirroring parse()). The old `content()` kept only
+        // the text before the first [TOOL_CALLS], dropping "mid" and "post".
+        let text = r#"pre[TOOL_CALLS]get_weather[ARGS]{"location":"NYC"}mid[TOOL_CALLS]get_time[ARGS]{"timezone":"EST"}post"#;
+        assert_eq!(p().content(text), "premidpost");
     }
 }
