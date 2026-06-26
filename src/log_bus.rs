@@ -204,18 +204,36 @@ impl LogBus {
     // `.to_string()` on the live path. Skipped — no net win without reworking
     // the String-typed log stream channel.
     pub fn push(&self, source: LogSource, text: String) {
-        let seq = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Assign `seq` UNDER the destination ring's lock, not before it: the seq stamp and
+        // the `push_back` must be atomic per ring. Otherwise two concurrent pushes to the
+        // same source could stamp seq=N / seq=N+1 but insert in the opposite order (the
+        // seq=N thread stalls between the fetch_add and the lock), leaving that ring's seqs
+        // out of order vs. insertion — which `snapshot(None)` (sorts by seq) and
+        // `snapshot(source)` (insertion order) would then disagree on.
         match source {
-            LogSource::Serve => push_ring(&mut self.serve.lock(), seq, text.clone()),
-            LogSource::Worker => push_ring(&mut self.worker.lock(), seq, text.clone()),
+            LogSource::Serve => {
+                let mut ring = self.serve.lock();
+                push_ring(&mut ring, self.next_seq(), text.clone());
+            }
+            LogSource::Worker => {
+                let mut ring = self.worker.lock();
+                push_ring(&mut ring, self.next_seq(), text.clone());
+            }
             LogSource::RemoteWorker { node, worker } => {
                 let mut remote = self.remote.lock();
+                let seq = self.next_seq();
                 let ring = remote.entry((node, worker)).or_default();
                 push_ring(ring, seq, text.clone());
             }
         }
         // Err means zero subscribers — fine; the ring already has the line.
         let _ = self.tx.send(LogLine { source, text });
+    }
+
+    /// Next monotonic sequence stamp. Call WHILE holding the destination ring's lock so the
+    /// stamp and the ring insertion are atomic per ring (see [`push`](Self::push)).
+    fn next_seq(&self) -> u64 {
+        self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Reclaim a remote worker's history ring (called on remote unload/kill), so a finished
@@ -486,6 +504,40 @@ mod tests {
         assert_eq!(
             bus.snapshot(usize::MAX, Some(LogSource::Worker)).len(),
             RING_CAP
+        );
+    }
+
+    #[test]
+    fn concurrent_pushes_keep_ring_seq_monotonic() {
+        // Per-ring invariant: a ring's seq stamps must increase with insertion order, even
+        // under heavy concurrent pushes to ONE source. `snapshot(None)` sorts by seq while
+        // `snapshot(source)` returns insertion order, so an out-of-order seq makes the two
+        // views disagree on near-simultaneous lines. Guards the "stamp seq UNDER the ring
+        // lock" fix; the prior fetch_add-before-lock could stamp seq=N then insert it after
+        // seq=N+1 when the N thread stalled between the fetch_add and the lock.
+        const THREADS: u64 = 8;
+        // THREADS * PER == RING_CAP → the whole window is retained (no eviction to muddy it).
+        const PER: u64 = (RING_CAP as u64) / THREADS;
+        let bus = std::sync::Arc::new(LogBus::new());
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let bus = std::sync::Arc::clone(&bus);
+                std::thread::spawn(move || {
+                    for i in 0..PER {
+                        bus.push(LogSource::Serve, format!("t{t}-{i}"));
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let seqs: Vec<u64> = bus.serve.lock().iter().map(|(q, _)| *q).collect();
+        assert_eq!(seqs.len() as u64, THREADS * PER, "no eviction at RING_CAP");
+        assert!(
+            seqs.windows(2).all(|w| w[0] < w[1]),
+            "ring seqs must strictly increase with insertion order — an inversion makes \
+             snapshot(None) reorder concurrently-pushed lines vs the per-source view",
         );
     }
 
