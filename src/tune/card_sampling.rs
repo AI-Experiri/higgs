@@ -224,8 +224,13 @@ pub fn parse_generation_config(bytes: &[u8]) -> Option<LlamaCppSamplingParams> {
             s.top_p = Some(p as f32);
         }
     }
-    if let Some(k) = v.get("top_k").and_then(serde_json::Value::as_i64) {
-        if (0..=1000).contains(&k) {
+    // `as_f64` (like temperature/top_p/min_p above): some configs write top_k as a
+    // JSON float (`20.0`); `as_i64` would silently drop it. `top_k` is a discrete
+    // count, though, so accept an integer-valued float but DROP a fractional one
+    // (`20.5`) — coercing it via truncation would persist a value the config never
+    // stated, against this parser's drop-don't-coerce contract.
+    if let Some(k) = v.get("top_k").and_then(serde_json::Value::as_f64) {
+        if k.fract() == 0.0 && (0.0..=1000.0).contains(&k) {
             s.top_k = Some(k as i32);
         }
     }
@@ -372,5 +377,22 @@ mod tests {
         // And a word containing a key before a real key doesn't block the real one.
         let s = parse_card_sampling("see the template, then set temperature 0.5");
         assert_eq!(s.temperature, Some(0.5));
+    }
+
+    #[test]
+    fn generation_config_parses_float_top_k() {
+        // Some configs write top_k as a JSON float (`20.0`); an integer-valued float must
+        // parse like the other (as_f64) params, not be silently dropped by an int-only
+        // `as_i64`.
+        let s = parse_generation_config(br#"{"top_k": 20.0}"#).expect("parsed");
+        assert_eq!(s.top_k, Some(20));
+    }
+
+    #[test]
+    fn generation_config_drops_fractional_top_k() {
+        // top_k is a discrete count: a fractional float (`20.5`) is DROPPED, not
+        // truncated to 20 — coercion would persist a value the config never stated.
+        let s = parse_generation_config(br#"{"top_k": 20.5}"#).expect("parsed");
+        assert_eq!(s.top_k, None);
     }
 }

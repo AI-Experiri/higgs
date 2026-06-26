@@ -696,4 +696,42 @@ mod tests {
             "now fits the cap"
         );
     }
+
+    #[test]
+    fn suggest_judges_corrupt_metadata_as_wont_fit() {
+        // A corrupt/hostile GGUF header (absurd block_count/ctx/heads) overflows the
+        // raw KV-byte product; `kv_cache_bytes` saturates rather than panicking. This
+        // exercises the END-TO-END contract that matters: the saturated KV must still
+        // make the model read "won't fit", through the partial-offload backoff path a
+        // VRAM cap takes (where `vram_fit` alone could cosmetically read Fits after
+        // `*frac` scaling). Because the un-offloaded KV remainder `kv*(1-frac)` is
+        // astronomically large for ANY frac, `ram_fit` (or `vram_fit`) is Overflow —
+        // the combined verdict is never a false "fits". Must not panic.
+        let evil = ModelMeta {
+            id: "org/evil".into(),
+            size_bytes: 8u64 << 30,
+            block_count: Some(u32::MAX),
+            head_count: Some(u32::MAX),
+            head_count_kv: Some(u32::MAX),
+            embedding_length: Some(u32::MAX),
+            ctx_train: Some(u64::MAX),
+            expert_count: Some(0),
+            ..Default::default()
+        };
+        let hw24 = hw(24u64 << 30, 64u64 << 30, 8);
+        // A VRAM cap forces the gpu_layers_within_budget partial-offload backoff.
+        let capped = ResourceBudget {
+            max_vram_bytes: Some(24u64 << 30),
+            ..Default::default()
+        };
+        let s = default_suggester().suggest(&evil, &hw24, &capped);
+        assert!(
+            s.vram_fit.verdict == FitVerdict::Overflow || s.ram_fit.verdict == FitVerdict::Overflow,
+            "corrupt metadata must read won't-fit, not a false 'fits' \
+             (vram={:?}, ram={:?}, rationale={:?})",
+            s.vram_fit.verdict,
+            s.ram_fit.verdict,
+            s.rationale
+        );
+    }
 }

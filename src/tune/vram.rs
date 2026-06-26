@@ -58,7 +58,13 @@ fn kv_cache_bytes(load: &LlamaCppParams, meta: &ModelMeta) -> u64 {
     let head_dim = meta.head_dim() as u64;
     let k_bytes = kv_type_bytes(load.type_k.unwrap_or(KvCacheKind::F16));
     let v_bytes = kv_type_bytes(load.type_v.unwrap_or(KvCacheKind::F16));
-    let elems = (blocks * ctx * kv_heads * head_dim) as f64;
+    // Saturating: a corrupt/hostile GGUF header (absurd block_count/ctx/heads) must not
+    // overflow the u64 product (debug panic / release garbage) — saturate so the model
+    // is judged "won't fit" rather than crashing the tune.
+    let elems = blocks
+        .saturating_mul(ctx)
+        .saturating_mul(kv_heads)
+        .saturating_mul(head_dim) as f64;
     (elems * (k_bytes + v_bytes)) as u64
 }
 
@@ -380,5 +386,26 @@ mod tests {
             "needed {}",
             on_cpu.needed_bytes
         );
+    }
+
+    #[test]
+    fn kv_cache_bytes_saturates_on_absurd_metadata() {
+        // A corrupt/hostile GGUF header with absurd dims must not overflow the u64
+        // product (a debug panic / release garbage) — the estimate saturates instead.
+        let meta = ModelMeta {
+            id: "org/evil".into(),
+            block_count: Some(u32::MAX),
+            head_count: Some(u32::MAX),
+            head_count_kv: Some(u32::MAX),
+            embedding_length: Some(u32::MAX),
+            ctx_train: Some(u64::MAX),
+            ..Default::default()
+        };
+        let load = LlamaCppParams {
+            ctx_len: 0, // → ctx from ctx_train (u64::MAX)
+            ..Default::default()
+        };
+        // Must NOT panic; saturates to a huge (finite) estimate.
+        assert!(kv_cache_bytes(&load, &meta) > 0);
     }
 }
