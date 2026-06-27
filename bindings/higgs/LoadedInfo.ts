@@ -17,17 +17,21 @@ id: string,
  */
 worker_id: number, 
 /**
- * Context window ([`CtxLen::Auto`] = the engine's trained context; `Fixed { n }` = pinned).
+ * Context window of the LIVE worker ([`CtxLen::Auto`] = trained context; `Fixed { n }`
+ * = pinned). `None` = NOT PROBED — the worker is busy mid-generation and couldn't
+ * answer the status probe; the card still shows (resident) but the live window is
+ * unknown (was the dishonest `0`/`u32::MAX` placeholder).
  */
-ctx_len: CtxLen, 
+ctx_len?: CtxLen, 
 /**
- * GPU layers offloaded (`GpuLayers::All` = every layer; `Count { n }` = explicit).
+ * GPU layers offloaded by the LIVE worker (`GpuLayers::All` / `Count { n }`).
+ * `None` = not probed (see `ctx_len`).
  */
-gpu_layers: GpuLayers, 
+gpu_layers?: GpuLayers, 
 /**
- * Worker threads used during generation.
+ * Worker threads of the LIVE worker. `None` = not probed (see `ctx_len`).
  */
-threads: number, 
+threads?: number, 
 /**
  * Model architecture read from GGUF header (e.g. `"llama"`, `"gemma3"`).
  */

@@ -159,13 +159,23 @@ higgs_ts! {
         /// per-worker card + its per-worker log pane. Always present.
         #[ts(type = "number")]
         pub worker_id: u32,
-        /// Context window ([`CtxLen::Auto`] = the engine's trained context; `Fixed { n }` = pinned).
-        pub ctx_len: CtxLen,
-        /// GPU layers offloaded (`GpuLayers::All` = every layer; `Count { n }` = explicit).
-        pub gpu_layers: GpuLayers,
-        /// Worker threads used during generation.
+        /// Context window of the LIVE worker ([`CtxLen::Auto`] = trained context; `Fixed { n }`
+        /// = pinned). `None` = NOT PROBED — the worker is busy mid-generation and couldn't
+        /// answer the status probe; the card still shows (resident) but the live window is
+        /// unknown (was the dishonest `0`/`u32::MAX` placeholder).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub ctx_len: Option<CtxLen>,
+        /// GPU layers offloaded by the LIVE worker (`GpuLayers::All` / `Count { n }`).
+        /// `None` = not probed (see `ctx_len`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub gpu_layers: Option<GpuLayers>,
+        /// Worker threads of the LIVE worker. `None` = not probed (see `ctx_len`).
+        #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(type = "number")]
-        pub threads: u32,
+        #[ts(optional)]
+        pub threads: Option<u32>,
         // Model metadata from the store — present when the worker has scanned the model.
         /// Model architecture read from GGUF header (e.g. `"llama"`, `"gemma3"`).
         #[serde(skip_serializing_if = "Option::is_none")]

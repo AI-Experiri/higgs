@@ -610,7 +610,7 @@ fn check_prompt_fits_rejects_oversized_prompt() {
             "messages": [{"role": "user", "content": long}],
             "max_tokens": 16
         })),
-        CtxLen::Fixed { n: 128 },
+        Some(CtxLen::Fixed { n: 128 }),
     )
     .expect_err("oversized prompt must overflow");
     assert!(matches!(err, HiggsError::ContextOverflow { .. }));
@@ -625,7 +625,7 @@ fn check_prompt_fits_accepts_small_prompt() {
             "messages": [{"role": "user", "content": "hello"}],
             "max_tokens": 16
         })),
-        CtxLen::Fixed { n: 4096 },
+        Some(CtxLen::Fixed { n: 4096 }),
     )
     .expect("small prompt fits a large window");
 }

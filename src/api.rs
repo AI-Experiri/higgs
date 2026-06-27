@@ -910,9 +910,10 @@ impl Higgs {
         LoadedInfo {
             id: served_id,
             worker_id,
-            ctx_len: crate::worker::engine::CtxLen::Auto,
-            gpu_layers: crate::worker::engine::GpuLayers::Count { n: 0 },
-            threads: 0,
+            // Host-built without a worker RPC: the LIVE params are unknown (not probed).
+            ctx_len: None,
+            gpu_layers: None,
+            threads: None,
             arch: scanned.and_then(|m| m.arch.clone()),
             quant: scanned.and_then(|m| m.quant.clone()),
             max_context_length: scanned.and_then(|m| m.ctx_train),
@@ -939,9 +940,10 @@ impl Higgs {
         Some(LoadedInfo {
             // None by default; the caller (status/local_loaded_info) sets the real worker id.
             worker_id: 0,
-            ctx_len: serde_json::from_value(l.get("ctx_len")?.clone()).ok()?,
-            gpu_layers: serde_json::from_value(l.get("gpu_layers")?.clone()).ok()?,
-            threads: l.get("threads")?.as_u64()? as u32,
+            // Probed live values (the worker answered M_STATUS) → Some.
+            ctx_len: Some(serde_json::from_value(l.get("ctx_len")?.clone()).ok()?),
+            gpu_layers: Some(serde_json::from_value(l.get("gpu_layers")?.clone()).ok()?),
+            threads: Some(l.get("threads")?.as_u64()? as u32),
             arch: scanned.and_then(|m| m.arch.clone()),
             quant: scanned.and_then(|m| m.quant.clone()),
             max_context_length: scanned.and_then(|m| m.ctx_train),
@@ -1204,12 +1206,11 @@ impl Higgs {
                 Some(info)
             }
             Err(_) => {
-                let mut stub = self.loaded_info_stub(served.to_owned(), worker.0, &raw, &scan);
-                // Resident but the status probe failed (busy mid-generation): AUTO keeps the
-                // host prompt-fit gate permissive (was the `u32::MAX` "unbounded" sentinel), so
-                // the chat QUEUES behind the generation; the worker's [HG005] stays authoritative.
-                stub.ctx_len = crate::worker::engine::CtxLen::Auto;
-                Some(stub)
+                // Resident but the status probe failed (busy mid-generation): the stub's live
+                // params are `None` (not probed), which the host prompt-fit gate treats as
+                // permissive — the chat QUEUES behind the generation and the worker's [HG005]
+                // stays authoritative. `None` replaces the old `ctx_len = u32::MAX` sentinel.
+                Some(self.loaded_info_stub(served.to_owned(), worker.0, &raw, &scan))
             }
         }
     }

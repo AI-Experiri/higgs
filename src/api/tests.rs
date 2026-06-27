@@ -434,9 +434,9 @@ async fn load_then_status_maps() {
     let li = st.loaded.expect("loaded should be Some");
     assert_eq!(li.id, "org/model");
     // ctx_len defaults to the model's trained context (4096) when the caller pins none.
-    assert_eq!(li.ctx_len, CtxLen::Fixed { n: 4096 });
+    assert_eq!(li.ctx_len, Some(CtxLen::Fixed { n: 4096 }));
     // gpu_layers from the host default round-trips through the worker into status.
-    assert_eq!(li.gpu_layers, expected_gpu_layers);
+    assert_eq!(li.gpu_layers, Some(expected_gpu_layers));
 }
 
 // ── Test 3b: status loaded info includes model metadata ──────────────────
@@ -580,9 +580,8 @@ async fn local_loaded_info_busy_worker_returns_permissive_stub() {
         .expect("resident worker resolves despite a failing status probe");
     assert_eq!(info.id, "org/busy", "stub carries the served id");
     assert_eq!(
-        info.ctx_len,
-        CtxLen::Auto,
-        "stub ctx_len is permissive so the prompt-fit gate defers to the worker's HG005"
+        info.ctx_len, None,
+        "busy-worker stub ctx_len is None (not probed) so the prompt-fit gate defers to HG005"
     );
 
     // And an id that is NOT served still resolves to None (no false positive).
