@@ -253,8 +253,16 @@ impl<'de> serde::Deserialize<'de> for GpuLayers {
         }
         Ok(match Wire::deserialize(deserializer)? {
             // `u32::MAX` is the legacy "all" sentinel; any other int is an explicit count.
-            Wire::Num(n) if n >= u32::MAX as u64 => GpuLayers::All,
-            Wire::Num(n) => GpuLayers::Count { n: n as u32 },
+            // Reject an out-of-u32-range legacy int — the old `gpu_layers: u32` field did too
+            // (a number > u32::MAX failed to deserialize); `as u32` would silently wrap it.
+            Wire::Num(n) => {
+                let n = u32::try_from(n).map_err(serde::de::Error::custom)?;
+                if n == u32::MAX {
+                    GpuLayers::All
+                } else {
+                    GpuLayers::Count { n }
+                }
+            }
             Wire::Tagged(Tagged::All) => GpuLayers::All,
             Wire::Tagged(Tagged::Count { n }) => GpuLayers::Count { n },
         })
@@ -341,8 +349,12 @@ impl<'de> serde::Deserialize<'de> for CtxLen {
         }
         Ok(match Wire::deserialize(deserializer)? {
             // `0` is the legacy "auto" sentinel; any other int is an explicit window.
+            // Reject an out-of-u32-range legacy int — the old `ctx_len: u32` field did too;
+            // `as u32` would silently wrap it (e.g. 4294967296 -> 0).
             Wire::Num(0) => CtxLen::Auto,
-            Wire::Num(n) => CtxLen::Fixed { n: n as u32 },
+            Wire::Num(n) => CtxLen::Fixed {
+                n: u32::try_from(n).map_err(serde::de::Error::custom)?,
+            },
             Wire::Tagged(Tagged::Auto) => CtxLen::Auto,
             Wire::Tagged(Tagged::Fixed { n }) => CtxLen::Fixed { n },
         })
@@ -483,6 +495,69 @@ mod registry_tests {
             build_engine(Some("nope")).1,
             "llamacpp",
             "unknown → default"
+        );
+    }
+
+    #[test]
+    fn gpu_layers_deserialize_is_lenient_and_range_checked() {
+        use serde_json::{from_value, json};
+        // Legacy bare int: u32::MAX = "all", else an explicit count.
+        assert_eq!(from_value::<GpuLayers>(json!(u32::MAX)).unwrap(), GpuLayers::All);
+        assert_eq!(
+            from_value::<GpuLayers>(json!(32)).unwrap(),
+            GpuLayers::Count { n: 32 }
+        );
+        // Canonical tagged object.
+        assert_eq!(
+            from_value::<GpuLayers>(json!({"kind": "all"})).unwrap(),
+            GpuLayers::All
+        );
+        assert_eq!(
+            from_value::<GpuLayers>(json!({"kind": "count", "n": 8})).unwrap(),
+            GpuLayers::Count { n: 8 }
+        );
+        // An out-of-u32-range legacy int is REJECTED, not silently wrapped to 0 (the old
+        // `gpu_layers: u32` field rejected it too). Fails if the deserialize reverts to `as u32`.
+        assert!(from_value::<GpuLayers>(json!(4_294_967_296u64)).is_err());
+        // Serialize ALWAYS emits the canonical tagged object.
+        assert_eq!(
+            serde_json::to_value(GpuLayers::All).unwrap(),
+            json!({"kind": "all"})
+        );
+        assert_eq!(
+            serde_json::to_value(GpuLayers::Count { n: 5 }).unwrap(),
+            json!({"kind": "count", "n": 5})
+        );
+    }
+
+    #[test]
+    fn ctx_len_deserialize_is_lenient_and_range_checked() {
+        use serde_json::{from_value, json};
+        // Legacy bare int: 0 = auto, else an explicit window.
+        assert_eq!(from_value::<CtxLen>(json!(0)).unwrap(), CtxLen::Auto);
+        assert_eq!(
+            from_value::<CtxLen>(json!(4096)).unwrap(),
+            CtxLen::Fixed { n: 4096 }
+        );
+        // Canonical tagged object.
+        assert_eq!(
+            from_value::<CtxLen>(json!({"kind": "auto"})).unwrap(),
+            CtxLen::Auto
+        );
+        assert_eq!(
+            from_value::<CtxLen>(json!({"kind": "fixed", "n": 2048})).unwrap(),
+            CtxLen::Fixed { n: 2048 }
+        );
+        // An out-of-u32-range legacy int is REJECTED, not silently wrapped to Fixed{0}.
+        assert!(from_value::<CtxLen>(json!(4_294_967_296u64)).is_err());
+        // Serialize ALWAYS emits the canonical tagged object.
+        assert_eq!(
+            serde_json::to_value(CtxLen::Auto).unwrap(),
+            json!({"kind": "auto"})
+        );
+        assert_eq!(
+            serde_json::to_value(CtxLen::Fixed { n: 9 }).unwrap(),
+            json!({"kind": "fixed", "n": 9})
         );
     }
 }
