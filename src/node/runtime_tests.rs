@@ -1,5 +1,6 @@
 use super::*;
 use crate::node::test_support::{fake_runtime as fake_runtime_with_dirs, fake_runtime_load_fails};
+use crate::worker::engine::GpuLayers;
 use tempfile::TempDir;
 
 /// Like `fake_runtime_with_models` but the worker fails every M_LOAD (post-spawn
@@ -46,7 +47,7 @@ fn load_params(id: &str) -> NodeLoadParams {
 fn worker_load_params_omits_null_base_and_keeps_overrides() {
     use crate::worker::engine::llamacpp::params::LlamaCppParams;
     use crate::worker::engine::{FlashAttn, KvCacheKind};
-    let mut rich = LlamaCppParams::base(0, u32::MAX, 4);
+    let mut rich = LlamaCppParams::base(0, GpuLayers::All, 4);
     rich.flash_attn = Some(FlashAttn::On);
     rich.type_k = Some(KvCacheKind::Q8_0);
     rich.cpu_moe = Some(true);
@@ -55,7 +56,7 @@ fn worker_load_params_omits_null_base_and_keeps_overrides() {
         "org/m",
         "/x.gguf",
         None,
-        Some(u32::MAX),
+        Some(GpuLayers::All),
         Some(4),
         &Some(rich),
     );
@@ -64,7 +65,7 @@ fn worker_load_params_omits_null_base_and_keeps_overrides() {
         !obj.contains_key("ctx_len"),
         "absent base field omitted, not null"
     );
-    assert_eq!(obj["gpu_layers"], u32::MAX);
+    assert_eq!(obj["gpu_layers"], serde_json::json!({ "kind": "all" }));
     assert_eq!(obj["flash_attn"], "on", "rich override survives");
     assert_eq!(obj["type_k"], "Q8_0");
     assert_eq!(obj["cpu_moe"], true);
@@ -419,7 +420,7 @@ async fn stateful_status_reports_the_loaded_model() {
         .load(NodeLoadParams {
             id: "org/stateful".into(),
             ctx_len: Some(2048),
-            gpu_layers: Some(0),
+            gpu_layers: Some(GpuLayers::Count { n: 0 }),
             threads: Some(4),
             params: None,
         })
@@ -602,7 +603,7 @@ async fn load_rejects_a_model_symlinked_outside_the_roots() {
 fn worker_load_params_merges_all_rich_overrides() {
     use crate::worker::engine::llamacpp::params::LlamaCppParams;
     use crate::worker::engine::{FlashAttn, KvCacheKind};
-    let mut rich = LlamaCppParams::base(0, 10, 8);
+    let mut rich = LlamaCppParams::base(0, GpuLayers::Count { n: 10 }, 8);
     rich.flash_attn = Some(FlashAttn::Off);
     rich.type_k = Some(KvCacheKind::Q8_0);
     rich.type_v = Some(KvCacheKind::Q8_0);
@@ -612,14 +613,17 @@ fn worker_load_params_merges_all_rich_overrides() {
         "org/m",
         "/x.gguf",
         Some(4096),
-        Some(10),
+        Some(GpuLayers::Count { n: 10 }),
         Some(8),
         &Some(rich),
     );
     let obj = v.as_object().expect("object");
     // Base fields (authoritative) present from the explicit args.
     assert_eq!(obj["ctx_len"], 4096);
-    assert_eq!(obj["gpu_layers"], 10);
+    assert_eq!(
+        obj["gpu_layers"],
+        serde_json::json!({ "kind": "count", "n": 10 })
+    );
     assert_eq!(obj["threads"], 8);
     // Every rich override merged in.
     assert_eq!(obj["flash_attn"], "off");

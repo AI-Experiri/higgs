@@ -1,5 +1,6 @@
 use super::*;
 use crate::node::test_support::fake_runtime_stateful;
+use crate::worker::engine::GpuLayers;
 
 // ── Test seam ─────────────────────────────────────────────────────────────
 
@@ -721,7 +722,7 @@ async fn load_with_engine_overrides_persists_effective_llamacpp() {
     // ctx_len 0 = AUTO; gpu_layers all; an override (use_mmap) forces the rich path.
     let params = LoadParams::llamacpp(LlamaCppParams {
         ctx_len: 0,
-        gpu_layers: u32::MAX,
+        gpu_layers: GpuLayers::All,
         threads: 4,
         use_mmap: Some(true),
         ..Default::default()
@@ -739,7 +740,7 @@ async fn load_with_engine_overrides_persists_effective_llamacpp() {
     assert_eq!(lc.use_mmap, Some(true), "the engine override is persisted");
     assert_eq!(
         lc.gpu_layers,
-        u32::MAX,
+        GpuLayers::All,
         "node-resolved gpu_layers stamped in"
     );
     assert_eq!(lc.threads, 4, "node-resolved threads stamped in");
@@ -983,7 +984,7 @@ async fn sync_saved_profile_survives_flush_failure() {
 
     // A load WITH request params triggers `sync_saved_profile` (from_request = true).
     let res = higgs
-        .load("org/model", Some(LoadParams::base(0, u32::MAX, 4)))
+        .load("org/model", Some(LoadParams::base(0, GpuLayers::All, 4)))
         .await;
 
     // Restore perms so TempDir cleanup can remove the dir regardless of the outcome.

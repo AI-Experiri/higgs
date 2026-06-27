@@ -138,10 +138,9 @@ higgs_ts! {
         #[ts(type = "number")]
         #[ts(optional)]
         pub ctx_len: Option<u32>,
-        /// GPU layers to offload; u32::MAX means all.
-        #[ts(type = "number")]
+        /// GPU layers to offload (`GpuLayers::All` = every layer; `Count { n }` = explicit).
         #[ts(optional)]
-        pub gpu_layers: Option<u32>,
+        pub gpu_layers: Option<crate::worker::engine::GpuLayers>,
         /// Worker threads used during generation.
         #[ts(type = "number")]
         #[ts(optional)]

@@ -444,7 +444,7 @@ async fn ensure_loaded(higgs: &Arc<Higgs>, model: &str) -> Result<LoadedInfo, Re
             id: model.to_owned(),
             worker_id: 0, // remote-resident placeholder — the fleet routes it, no local worker
             ctx_len: u32::MAX,
-            gpu_layers: 0,
+            gpu_layers: crate::worker::engine::GpuLayers::Count { n: 0 },
             threads: 0,
             arch: None,
             quant: None,

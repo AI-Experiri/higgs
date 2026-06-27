@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use crate::worker::engine::LoadParams;
+use crate::worker::engine::{GpuLayers, LoadParams};
 
 // ── HiggsConfig ───────────────────────────────────────────────────────────────
 
@@ -73,7 +73,7 @@ impl Default for HiggsConfig {
             lmstudio_dirs,
             hf_dirs,
             ollama_dirs,
-            default_load: LoadParams::base(4096, u32::MAX, threads),
+            default_load: LoadParams::base(4096, GpuLayers::All, threads),
         }
     }
 }
@@ -162,9 +162,8 @@ higgs_ts! {
         /// Context window size in tokens.
         #[ts(type = "number")]
         pub ctx_len: u32,
-        /// GPU layers offloaded; u32::MAX means all.
-        #[ts(type = "number")]
-        pub gpu_layers: u32,
+        /// GPU layers offloaded (`GpuLayers::All` = every layer; `Count { n }` = explicit).
+        pub gpu_layers: GpuLayers,
         /// Worker threads used during generation.
         #[ts(type = "number")]
         pub threads: u32,

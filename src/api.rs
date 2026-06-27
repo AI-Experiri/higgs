@@ -904,7 +904,7 @@ impl Higgs {
             id: served_id,
             worker_id,
             ctx_len: 0,
-            gpu_layers: 0,
+            gpu_layers: crate::worker::engine::GpuLayers::Count { n: 0 },
             threads: 0,
             arch: scanned.and_then(|m| m.arch.clone()),
             quant: scanned.and_then(|m| m.quant.clone()),
@@ -933,7 +933,7 @@ impl Higgs {
             // None by default; the caller (status/local_loaded_info) sets the real worker id.
             worker_id: 0,
             ctx_len: l.get("ctx_len")?.as_u64()? as u32,
-            gpu_layers: l.get("gpu_layers")?.as_u64()? as u32,
+            gpu_layers: serde_json::from_value(l.get("gpu_layers")?.clone()).ok()?,
             threads: l.get("threads")?.as_u64()? as u32,
             arch: scanned.and_then(|m| m.arch.clone()),
             quant: scanned.and_then(|m| m.quant.clone()),

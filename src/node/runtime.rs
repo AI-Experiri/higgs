@@ -755,7 +755,7 @@ fn worker_load_params(
     id: &str,
     path: &str,
     ctx_len: Option<u32>,
-    gpu_layers: Option<u32>,
+    gpu_layers: Option<crate::worker::engine::GpuLayers>,
     threads: Option<u32>,
     extra: &Option<crate::worker::engine::llamacpp::params::LlamaCppParams>,
 ) -> Value {
@@ -767,7 +767,10 @@ fn worker_load_params(
         obj.insert("ctx_len".into(), c.into());
     }
     if let Some(g) = gpu_layers {
-        obj.insert("gpu_layers".into(), g.into());
+        obj.insert(
+            "gpu_layers".into(),
+            serde_json::to_value(g).expect("GpuLayers serializes"),
+        );
     }
     if let Some(t) = threads {
         obj.insert("threads".into(), t.into());

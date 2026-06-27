@@ -183,7 +183,8 @@ impl HiggsEngine for LlamaCppEngine {
         };
 
         // Safe move-based builder for the params that have plain `with_*` setters.
-        let mut model_params = LlamaModelParams::default().with_n_gpu_layers(p.gpu_layers);
+        let mut model_params =
+            LlamaModelParams::default().with_n_gpu_layers(p.gpu_layers.to_n_gpu_layers());
         if let Some(b) = p.use_mmap {
             model_params = model_params.with_use_mmap(b);
         }
@@ -817,7 +818,7 @@ mod tests {
             &path,
             &LoadParams::llamacpp(LlamaCppParams {
                 ctx_len: 2048,
-                gpu_layers: u32::MAX,
+                gpu_layers: crate::worker::engine::GpuLayers::All,
                 threads: 4,
                 ..Default::default()
             }),
@@ -927,7 +928,7 @@ mod tests {
     fn umbrella_tags_engine_and_flattens_payload() {
         let lp = LoadParams::llamacpp(LlamaCppParams {
             ctx_len: 8192,
-            gpu_layers: 32,
+            gpu_layers: crate::worker::engine::GpuLayers::Count { n: 32 },
             threads: 6,
             type_k: Some(KvCacheKind::Q8_0),
             flash_attn: Some(FlashAttn::On),

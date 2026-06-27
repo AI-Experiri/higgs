@@ -8,7 +8,7 @@
 
 use crate::system::{fits_vram, HardwareInfo};
 use crate::worker::engine::llamacpp::params::LlamaCppParams;
-use crate::worker::engine::KvCacheKind;
+use crate::worker::engine::{GpuLayers, KvCacheKind};
 
 use super::{
     has_gpu, FitReport, FitVerdict, ModelMeta, RamEstimator, ResourceBudget, VramEstimator,
@@ -70,14 +70,15 @@ fn kv_cache_bytes(load: &LlamaCppParams, meta: &ModelMeta) -> u64 {
 
 /// Fraction of layers offloaded to the GPU (0.0 when CPU-only / no GPU).
 fn gpu_fraction(load: &LlamaCppParams, meta: &ModelMeta, hw: &HardwareInfo) -> f64 {
-    if !has_gpu(hw) || load.gpu_layers == 0 {
+    if !has_gpu(hw) {
         return 0.0;
     }
     let blocks = meta.block_count.unwrap_or(32) as u64;
-    if load.gpu_layers == u32::MAX || load.gpu_layers as u64 >= blocks {
-        1.0
-    } else {
-        (load.gpu_layers as f64 / blocks as f64).clamp(0.0, 1.0)
+    match load.gpu_layers {
+        GpuLayers::All => 1.0,
+        GpuLayers::Count { n: 0 } => 0.0,
+        GpuLayers::Count { n } if n as u64 >= blocks => 1.0,
+        GpuLayers::Count { n } => (n as f64 / blocks as f64).clamp(0.0, 1.0),
     }
 }
 

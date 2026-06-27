@@ -2,6 +2,7 @@ use super::*;
 use crate::system::{DeviceKind, GpuDevice};
 use crate::tune::vram::{StaticRamEstimator, StaticVramEstimator};
 use crate::tune::{FitVerdict, Suggester};
+use crate::worker::engine::GpuLayers;
 
 fn hw(vram: u64, ram: u64, cores: u32) -> HardwareInfo {
     HardwareInfo {
@@ -47,7 +48,7 @@ fn derive_defaults_all_gpu_flash_on_and_threads() {
         &hw(24u64 << 30, 64u64 << 30, 16),
         &ResourceBudget::default(),
     );
-    assert_eq!(d.gpu_layers, u32::MAX, "all layers on GPU");
+    assert_eq!(d.gpu_layers, GpuLayers::All, "all layers on GPU");
     assert_eq!(d.flash_attn, Some(FlashAttn::On));
     assert_eq!(d.threads, 8, "floor(16/2)");
     assert_eq!(d.ctx_len, 8192, "ctx_train 32768 capped to 8192");
@@ -73,7 +74,7 @@ fn no_gpu_derives_cpu_only() {
         &hw(0, 32u64 << 30, 8),
         &ResourceBudget::default(),
     );
-    assert_eq!(d.gpu_layers, 0, "no GPU → CPU-only");
+    assert_eq!(d.gpu_layers, GpuLayers::Count { n: 0 }, "no GPU → CPU-only");
     assert_eq!(d.threads, 4, "floor(8/2)");
 }
 

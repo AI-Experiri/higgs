@@ -1,4 +1,5 @@
 use super::*;
+use crate::worker::engine::GpuLayers;
 
 #[test]
 fn friendly_name_uses_role_eid8_and_host() {
@@ -156,14 +157,14 @@ fn record_load_stores_and_replaces_per_model() {
     let mut cfg = InstanceConfig::default();
     assert!(cfg.model_record("org/m").is_none());
 
-    let p1 = LoadParams::base(4096, 99, 0);
+    let p1 = LoadParams::base(4096, GpuLayers::Count { n: 99 }, 0);
     cfg.record_load("org/m", p1.clone(), 1000);
     let rec = cfg.model_record("org/m").expect("record present");
     assert_eq!(rec.load.as_ref().unwrap().ctx_len(), 4096);
     assert_eq!(rec.last_loaded_ms, 1000);
 
     // A second load of the SAME id replaces the load info (latest wins), no duplicate key.
-    let p2 = LoadParams::base(8192, 0, 0);
+    let p2 = LoadParams::base(8192, GpuLayers::Count { n: 0 }, 0);
     cfg.record_load("org/m", p2, 2000);
     assert_eq!(cfg.models.len(), 1, "keyed by id, no duplicate");
     let rec = cfg.model_record("org/m").unwrap();
@@ -181,7 +182,10 @@ fn model_record_load_accepts_legacy_flat_and_degrades_garbage() {
     let cfg: InstanceConfig = serde_json::from_str(legacy).unwrap();
     let rec = cfg.model_record("org/m").expect("legacy record present");
     assert_eq!(rec.load.as_ref().unwrap().ctx_len(), 2048);
-    assert_eq!(rec.load.as_ref().unwrap().gpu_layers(), 12);
+    assert_eq!(
+        rec.load.as_ref().unwrap().gpu_layers(),
+        GpuLayers::Count { n: 12 }
+    );
     assert_eq!(rec.last_loaded_ms, 7);
 
     // A non-object `load` value degrades to None (whole config still loads).
@@ -201,7 +205,11 @@ fn config_roundtrips_model_records() {
         name: "node-aa(box)".into(),
         ..Default::default()
     };
-    cfg.record_load("org/m", LoadParams::base(2048, 12, 0), 42);
+    cfg.record_load(
+        "org/m",
+        LoadParams::base(2048, GpuLayers::Count { n: 12 }, 0),
+        42,
+    );
     cfg.save(&path).unwrap();
 
     let back = InstanceConfig::load(&path).unwrap();

@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::system::HardwareInfo;
 use crate::worker::engine::llamacpp::params::{LlamaCppParams, LlamaCppSamplingParams};
-use crate::worker::engine::{LoadParams, SamplingParams};
+use crate::worker::engine::{GpuLayers, LoadParams, SamplingParams};
 use crate::worker::models::HiggsModel;
 
 use store::TuneRecord;
@@ -414,16 +414,23 @@ where
         //    (No cap ⇒ unchanged: all-GPU + an honest overflow verdict.)
         if budget.max_vram_bytes.is_some()
             && vram_fit.verdict == FitVerdict::Overflow
-            && load.gpu_layers > 0
+            && !load.gpu_layers.is_cpu_only()
         {
             let fitted = vram::gpu_layers_within_budget(&load, meta, hw, budget);
-            if fitted < load.gpu_layers {
-                load.gpu_layers = fitted;
+            // Reduce GPU offload to `fitted` layers when that's a genuine cut: `All` always
+            // caps to the fitted count; a partial offload caps only when it's smaller.
+            let cut = match load.gpu_layers {
+                GpuLayers::All => Some(fitted),
+                GpuLayers::Count { n } if fitted < n => Some(fitted),
+                GpuLayers::Count { .. } => None,
+            };
+            if let Some(n) = cut {
+                load.gpu_layers = GpuLayers::Count { n };
                 vram_fit = self.vram.estimate(&load, meta, hw, budget);
-                rationale.push(if fitted == 0 {
+                rationale.push(if n == 0 {
                     "no GPU offload fits the VRAM budget — using CPU-only".into()
                 } else {
-                    format!("reduced GPU offload to {fitted} layers to fit the VRAM budget")
+                    format!("reduced GPU offload to {n} layers to fit the VRAM budget")
                 });
             }
         }
@@ -672,7 +679,7 @@ mod tests {
         let s0 = default_suggester().suggest(&meta, &hw24, &zero);
         assert_eq!(
             s0.load.as_llamacpp().gpu_layers,
-            0,
+            GpuLayers::Count { n: 0 },
             "0 VRAM cap → CPU-only: {:?}",
             s0.rationale
         );
@@ -686,7 +693,7 @@ mod tests {
         };
         let ss = default_suggester().suggest(&meta, &hw24, &small);
         assert!(
-            ss.load.as_llamacpp().gpu_layers < u32::MAX,
+            ss.load.as_llamacpp().gpu_layers != GpuLayers::All,
             "small VRAM cap backs off all-GPU: {:?}",
             ss.rationale
         );

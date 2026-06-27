@@ -157,7 +157,7 @@ pub struct NodeLoadParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ctx_len: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gpu_layers: Option<u32>,
+    pub gpu_layers: Option<crate::worker::engine::GpuLayers>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threads: Option<u32>,
     /// The FULL engine load params (the rich llama.cpp override set — `use_mmap`,

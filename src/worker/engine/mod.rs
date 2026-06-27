@@ -69,7 +69,7 @@ impl LoadParams {
 
     /// Build the umbrella from just the three base llama.cpp fields (the
     /// quick-load shape; every optional left at its engine default).
-    pub fn base(ctx_len: u32, gpu_layers: u32, threads: u32) -> Self {
+    pub fn base(ctx_len: u32, gpu_layers: GpuLayers, threads: u32) -> Self {
         LoadParams::LlamaCpp(llamacpp::params::LlamaCppParams::base(
             ctx_len, gpu_layers, threads,
         ))
@@ -87,8 +87,8 @@ impl LoadParams {
         self.as_llamacpp().ctx_len
     }
 
-    /// Base-field accessor: GPU layers (`u32::MAX` = all).
-    pub fn gpu_layers(&self) -> u32 {
+    /// Base-field accessor: GPU layers ([`GpuLayers::All`] = every layer).
+    pub fn gpu_layers(&self) -> GpuLayers {
         self.as_llamacpp().gpu_layers
     }
 
@@ -166,6 +166,98 @@ higgs_const_enum! {
         Q4_1,
         /// 4-bit, block size 0 — smallest cache.
         Q4_0,
+    }
+}
+
+higgs_ts! {
+    /// How many model layers to offload to the GPU. Replaces the old `gpu_layers: u32`
+    /// where `u32::MAX` was a sentinel for "all" — the intent now lives in the type, not a
+    /// magic number. A data enum (carries `n`), so it is a ts-rs tagged union (the documented
+    /// exception to the const-enum rule), internally tagged on `kind`:
+    /// `{"kind":"all"}` / `{"kind":"count","n":32}`. Mapped to the raw `with_n_gpu_layers`
+    /// int ONLY inside `llamacpp/mod.rs`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    pub enum GpuLayers {
+        /// Offload every layer to the GPU (LM Studio "max").
+        All,
+        /// Offload exactly `n` layers; `n == 0` is CPU-only.
+        Count {
+            /// Number of layers offloaded.
+            #[ts(type = "number")]
+            n: u32,
+        },
+    }
+}
+
+impl Default for GpuLayers {
+    /// Preserves the pre-enum derived default (`gpu_layers: 0`, i.e. CPU-only).
+    fn default() -> Self {
+        GpuLayers::Count { n: 0 }
+    }
+}
+
+impl GpuLayers {
+    /// Every layer offloaded (the old `gpu_layers == u32::MAX`).
+    pub fn all() -> Self {
+        GpuLayers::All
+    }
+
+    /// Offload exactly `n` layers (`n == 0` → CPU-only).
+    pub fn count(n: u32) -> Self {
+        GpuLayers::Count { n }
+    }
+
+    /// `true` when every layer is offloaded.
+    pub fn is_all(&self) -> bool {
+        matches!(self, GpuLayers::All)
+    }
+
+    /// `true` when no layers are offloaded (CPU-only) — the old `gpu_layers == 0`.
+    pub fn is_cpu_only(&self) -> bool {
+        matches!(self, GpuLayers::Count { n: 0 })
+    }
+
+    /// The raw `with_n_gpu_layers` value for the llama.cpp FFI: `u32::MAX` for
+    /// [`GpuLayers::All`] (llama.cpp treats an over-large count as "all" — exactly the
+    /// old sentinel), else the explicit count. Called ONLY at the FFI boundary in
+    /// `llamacpp/mod.rs`.
+    pub fn to_n_gpu_layers(&self) -> u32 {
+        match self {
+            GpuLayers::All => u32::MAX,
+            GpuLayers::Count { n } => *n,
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for GpuLayers {
+    /// Lenient: accept EITHER a bare integer (the legacy/persisted form, `u32::MAX` = all)
+    /// or the canonical tagged object (`{"kind":"all"}` / `{"kind":"count","n":N}`).
+    /// [`Serialize`] always emits the tagged object, so a config.json written before this
+    /// change still reads, and migrates forward to the tagged form on its next save.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Num(u64),
+            Tagged(Tagged),
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum Tagged {
+            All,
+            Count { n: u32 },
+        }
+        Ok(match Wire::deserialize(deserializer)? {
+            // `u32::MAX` is the legacy "all" sentinel; any other int is an explicit count.
+            Wire::Num(n) if n >= u32::MAX as u64 => GpuLayers::All,
+            Wire::Num(n) => GpuLayers::Count { n: n as u32 },
+            Wire::Tagged(Tagged::All) => GpuLayers::All,
+            Wire::Tagged(Tagged::Count { n }) => GpuLayers::Count { n },
+        })
     }
 }
 

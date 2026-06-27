@@ -6,7 +6,7 @@
 
 use crate::system::HardwareInfo;
 use crate::worker::engine::llamacpp::params::LlamaCppParams;
-use crate::worker::engine::{FlashAttn, KvCacheKind};
+use crate::worker::engine::{FlashAttn, GpuLayers, KvCacheKind};
 
 use super::{has_gpu, DeriveStrategy, ModelMeta, ResourceBudget};
 
@@ -40,7 +40,11 @@ pub fn derive_default(
     LlamaCppParams {
         ctx_len: ctx,
         // All layers on GPU when one is present, else CPU-only.
-        gpu_layers: if has_gpu(hw) { u32::MAX } else { 0 },
+        gpu_layers: if has_gpu(hw) {
+            GpuLayers::All
+        } else {
+            GpuLayers::Count { n: 0 }
+        },
         threads,
         // Split batch threads from generation threads (same value by default).
         n_threads_batch: Some(threads),

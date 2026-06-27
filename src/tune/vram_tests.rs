@@ -1,5 +1,6 @@
 use super::*;
 use crate::system::{DeviceKind, GpuDevice};
+use crate::worker::engine::GpuLayers;
 
 /// A hardware snapshot with `vram` bytes of GPU VRAM, 64 GiB RAM, 16 cores.
 fn hw_gpu(vram: u64) -> HardwareInfo {
@@ -37,7 +38,7 @@ fn dense_meta_8gb() -> ModelMeta {
 fn all_gpu_load() -> LlamaCppParams {
     LlamaCppParams {
         ctx_len: 8192,
-        gpu_layers: u32::MAX,
+        gpu_layers: GpuLayers::All,
         type_k: Some(KvCacheKind::F16),
         type_v: Some(KvCacheKind::F16),
         ..Default::default()
@@ -122,7 +123,7 @@ fn cpu_only_host_vram_fits_not_overflow() {
     // verdict must read Fits, NOT a misleading Overflow (basis is also 0).
     let cpu_load = LlamaCppParams {
         ctx_len: 8192,
-        gpu_layers: 0,
+        gpu_layers: GpuLayers::Count { n: 0 },
         ..Default::default()
     };
     let v = StaticVramEstimator.estimate(
@@ -148,7 +149,7 @@ fn ram_estimate_charges_cpu_when_not_offloaded() {
     // gpu_layers = 0 (CPU-only) → all 8 GiB of weights land in RAM.
     let cpu_load = LlamaCppParams {
         ctx_len: 8192,
-        gpu_layers: 0,
+        gpu_layers: GpuLayers::Count { n: 0 },
         ..Default::default()
     };
     let on_cpu = StaticRamEstimator.estimate(&cpu_load, &meta, &hw, &ResourceBudget::default());
@@ -168,7 +169,7 @@ fn kv_type_bytes_scale_with_quantization() {
     let bytes_for = |k: KvCacheKind| {
         let load = LlamaCppParams {
             ctx_len: 8192,
-            gpu_layers: u32::MAX,
+            gpu_layers: GpuLayers::All,
             type_k: Some(k),
             type_v: Some(k),
             ..Default::default()
@@ -220,7 +221,7 @@ fn gpu_layers_within_budget_all_when_nothing_resident() {
     };
     let no_kv_load = LlamaCppParams {
         ctx_len: 8192,
-        gpu_layers: u32::MAX,
+        gpu_layers: GpuLayers::All,
         offload_kqv: Some(false), // KV stays off the GPU → kv term is 0
         ..Default::default()
     };
@@ -251,7 +252,7 @@ fn gpu_layers_within_budget_cpu_moe_pulls_experts_off() {
     };
     let plain = LlamaCppParams {
         ctx_len: 8192,
-        gpu_layers: u32::MAX,
+        gpu_layers: GpuLayers::All,
         offload_kqv: Some(false),
         ..Default::default()
     };

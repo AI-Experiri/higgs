@@ -212,7 +212,11 @@ impl WorkerState {
                 }
             };
         opts.ctx_len = ctx_len;
-        opts.gpu_layers = u32_param(&req.params, "gpu_layers", u32::MAX);
+        opts.gpu_layers = req
+            .params
+            .get("gpu_layers")
+            .and_then(|v| serde_json::from_value::<engine::GpuLayers>(v.clone()).ok())
+            .unwrap_or(engine::GpuLayers::All);
         opts.threads = u32_param(&req.params, "threads", 4);
         let params = engine::LoadParams::llamacpp(opts);
         // Scan moved host-side: the host resolves the GGUF path and passes it in

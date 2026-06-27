@@ -16,7 +16,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::worker::engine::{FlashAttn, KvCacheKind};
+use crate::worker::engine::{FlashAttn, GpuLayers, KvCacheKind};
 
 higgs_const_enum! {
     /// Multi-GPU split mode, mirroring `llama-cpp-2`'s `LlamaSplitMode`
@@ -146,9 +146,9 @@ higgs_ts! {
         /// Context window size in tokens (`with_n_ctx`).
         #[ts(type = "number")]
         pub ctx_len: u32,
-        /// Layers offloaded to GPU; `u32::MAX` = all (`with_n_gpu_layers`).
-        #[ts(type = "number")]
-        pub gpu_layers: u32,
+        /// Layers offloaded to GPU (`with_n_gpu_layers`). [`GpuLayers::All`] = every layer
+        /// (the old `u32::MAX` sentinel); [`GpuLayers::Count`] carries an explicit count.
+        pub gpu_layers: GpuLayers,
         /// Worker threads used during generation (`with_n_threads`; also seeds
         /// `n_threads_batch` when that is unset).
         #[ts(type = "number")]
@@ -360,7 +360,7 @@ higgs_ts! {
 impl LlamaCppParams {
     /// Build the three base fields (the quick-load shape), leaving every optional
     /// at its `None`/empty default — the pre-expansion behavior.
-    pub fn base(ctx_len: u32, gpu_layers: u32, threads: u32) -> Self {
+    pub fn base(ctx_len: u32, gpu_layers: GpuLayers, threads: u32) -> Self {
         Self {
             ctx_len,
             gpu_layers,

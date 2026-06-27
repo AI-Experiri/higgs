@@ -176,9 +176,11 @@ async fn load_cpu_only_zero_gpu_layers() {
     assert_eq!(st, 200, "CPU-only (gpu_layers=0) load succeeds");
 
     let snap = status(&c, &srv.base).await;
+    // The request sent the legacy numeric `gpu_layers: 0` (accepted by the lenient
+    // GpuLayers deserialize); status surfaces it canonically as the tagged union.
     assert_eq!(
-        snap["loaded"]["gpu_layers"].as_u64().unwrap(),
-        0,
+        snap["loaded"]["gpu_layers"],
+        json!({ "kind": "count", "n": 0 }),
         "gpu_layers=0 is the loaded offload: {snap}"
     );
 
