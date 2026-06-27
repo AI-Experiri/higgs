@@ -298,9 +298,15 @@ impl Default for CtxLen {
 }
 
 impl CtxLen {
-    /// A fixed `n`-token window.
+    /// A fixed `n`-token window — but `n == 0` normalizes to [`CtxLen::Auto`]: a 0-token
+    /// window is meaningless and `0` has ALWAYS meant "auto" (the trained context), so the
+    /// numeric `0` and the tagged `{"kind":"fixed","n":0}` map to the same Auto.
     pub fn fixed(n: u32) -> Self {
-        CtxLen::Fixed { n }
+        if n == 0 {
+            CtxLen::Auto
+        } else {
+            CtxLen::Fixed { n }
+        }
     }
 
     /// `true` when the engine picks the window (the old `ctx_len == 0`).
@@ -356,7 +362,8 @@ impl<'de> serde::Deserialize<'de> for CtxLen {
                 n: u32::try_from(n).map_err(serde::de::Error::custom)?,
             },
             Wire::Tagged(Tagged::Auto) => CtxLen::Auto,
-            Wire::Tagged(Tagged::Fixed { n }) => CtxLen::Fixed { n },
+            // `{"kind":"fixed","n":0}` normalizes to Auto via `fixed()`, matching numeric 0.
+            Wire::Tagged(Tagged::Fixed { n }) => CtxLen::fixed(n),
         })
     }
 }
@@ -550,6 +557,12 @@ mod registry_tests {
         );
         // An out-of-u32-range legacy int is REJECTED, not silently wrapped to Fixed{0}.
         assert!(from_value::<CtxLen>(json!(4_294_967_296u64)).is_err());
+        // A 0-token Fixed window normalizes to Auto, matching the numeric-0 = auto sentinel
+        // (so a hand-crafted `{"kind":"fixed","n":0}` doesn't persist a misleading Fixed{0}).
+        assert_eq!(
+            from_value::<CtxLen>(json!({"kind": "fixed", "n": 0})).unwrap(),
+            CtxLen::Auto
+        );
         // Serialize ALWAYS emits the canonical tagged object.
         assert_eq!(
             serde_json::to_value(CtxLen::Auto).unwrap(),
