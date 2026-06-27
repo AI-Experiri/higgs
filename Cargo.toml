@@ -63,7 +63,7 @@ rand = "0.8"
 miette = "7"
 tracing = "0.1"
 parking_lot = "0.12"
-ts-rs = { version = "10", features = ["serde-compat", "serde-json-impl"] }
+ts-rs = { version = "12", features = ["serde-compat", "serde-json-impl"] }
 llama-cpp-2 = "0.1"
 # Raw FFI for the engine version string — the safe `llama-cpp-2` crate wraps
 # neither `ggml_version()` nor `llama_print_system_info()`. Pinned to match the

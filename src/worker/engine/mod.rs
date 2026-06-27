@@ -509,7 +509,10 @@ mod registry_tests {
     fn gpu_layers_deserialize_is_lenient_and_range_checked() {
         use serde_json::{from_value, json};
         // Legacy bare int: u32::MAX = "all", else an explicit count.
-        assert_eq!(from_value::<GpuLayers>(json!(u32::MAX)).unwrap(), GpuLayers::All);
+        assert_eq!(
+            from_value::<GpuLayers>(json!(u32::MAX)).unwrap(),
+            GpuLayers::All
+        );
         assert_eq!(
             from_value::<GpuLayers>(json!(32)).unwrap(),
             GpuLayers::Count { n: 32 }

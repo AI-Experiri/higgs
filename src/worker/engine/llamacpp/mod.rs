@@ -560,7 +560,9 @@ fn run_decode(
     let threads = i32::try_from(lp.threads).unwrap_or(i32::MAX);
     // n_batch: use the pinned value when present, else the current default
     // (ctx_len.max(1) — one-shot prefill of any fit-checked prompt).
-    let n_batch = lp.n_batch.unwrap_or_else(|| effective_n_ctx(lp, model).max(1));
+    let n_batch = lp
+        .n_batch
+        .unwrap_or_else(|| effective_n_ctx(lp, model).max(1));
     // `n_threads_batch` splits from `n_threads` when set, else reuses `threads`.
     let threads_batch = lp
         .n_threads_batch
