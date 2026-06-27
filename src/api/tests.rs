@@ -1,6 +1,6 @@
 use super::*;
 use crate::node::test_support::fake_runtime_stateful;
-use crate::worker::engine::GpuLayers;
+use crate::worker::engine::{CtxLen, GpuLayers};
 
 // ── Test seam ─────────────────────────────────────────────────────────────
 
@@ -109,7 +109,11 @@ async fn load_persists_model_record() {
     let records = higgs.model_records();
     let rec = records.get("org/model").expect("record persisted on load");
     let load = rec.load.as_ref().expect("load params persisted");
-    assert_eq!(load.ctx_len(), 0, "no-params load records ctx_len 0 = auto");
+    assert_eq!(
+        load.ctx_len(),
+        CtxLen::Auto,
+        "no-params load records ctx_len 0 = auto"
+    );
     assert!(rec.last_loaded_ms > 0, "load stamps a timestamp");
 }
 
@@ -430,7 +434,7 @@ async fn load_then_status_maps() {
     let li = st.loaded.expect("loaded should be Some");
     assert_eq!(li.id, "org/model");
     // ctx_len defaults to the model's trained context (4096) when the caller pins none.
-    assert_eq!(li.ctx_len, 4096);
+    assert_eq!(li.ctx_len, CtxLen::Fixed { n: 4096 });
     // gpu_layers from the host default round-trips through the worker into status.
     assert_eq!(li.gpu_layers, expected_gpu_layers);
 }
@@ -577,7 +581,7 @@ async fn local_loaded_info_busy_worker_returns_permissive_stub() {
     assert_eq!(info.id, "org/busy", "stub carries the served id");
     assert_eq!(
         info.ctx_len,
-        u32::MAX,
+        CtxLen::Auto,
         "stub ctx_len is permissive so the prompt-fit gate defers to the worker's HG005"
     );
 
@@ -721,7 +725,7 @@ async fn load_with_engine_overrides_persists_effective_llamacpp() {
 
     // ctx_len 0 = AUTO; gpu_layers all; an override (use_mmap) forces the rich path.
     let params = LoadParams::llamacpp(LlamaCppParams {
-        ctx_len: 0,
+        ctx_len: CtxLen::Auto,
         gpu_layers: GpuLayers::All,
         threads: 4,
         use_mmap: Some(true),
@@ -744,7 +748,7 @@ async fn load_with_engine_overrides_persists_effective_llamacpp() {
         "node-resolved gpu_layers stamped in"
     );
     assert_eq!(lc.threads, 4, "node-resolved threads stamped in");
-    assert_eq!(lc.ctx_len, 0, "auto ctx_len stamped as 0");
+    assert_eq!(lc.ctx_len, CtxLen::Auto, "auto ctx_len is CtxLen::Auto");
 
     // Request params were supplied → the accepted profile is synced to models.json.
     let store = higgs.models_store().expect("models store opens");
@@ -984,7 +988,10 @@ async fn sync_saved_profile_survives_flush_failure() {
 
     // A load WITH request params triggers `sync_saved_profile` (from_request = true).
     let res = higgs
-        .load("org/model", Some(LoadParams::base(0, GpuLayers::All, 4)))
+        .load(
+            "org/model",
+            Some(LoadParams::base(CtxLen::Auto, GpuLayers::All, 4)),
+        )
         .await;
 
     // Restore perms so TempDir cleanup can remove the dir regardless of the outcome.

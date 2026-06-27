@@ -641,7 +641,9 @@ impl Higgs {
                 // reproduce the SAME auto load instead of pinning a literal 0 (which
                 // the worker would coerce to its 4096 fallback). A pinned 0 context is
                 // nonsensical anyway, so nothing meaningful is lost.
-                ctx_len: (p.ctx_len() > 0).then_some(p.ctx_len()),
+                // CtxLen::Auto → None (the node defaults it to the trained context);
+                // Fixed { n } → Some(n). Same intent as the old `(ctx_len > 0).then_some`.
+                ctx_len: p.ctx_len().fixed_n(),
                 gpu_layers: Some(p.gpu_layers()),
                 threads: Some(p.threads()),
                 // Forward the rich engine override set (type_k/flash_attn/cpu_moe/…)
@@ -683,13 +685,18 @@ impl Higgs {
         let effective = match &np.params {
             Some(lc) => {
                 let mut lc = lc.clone();
-                lc.ctx_len = np.ctx_len.unwrap_or(0);
+                lc.ctx_len = np
+                    .ctx_len
+                    .map(crate::worker::engine::CtxLen::fixed)
+                    .unwrap_or(crate::worker::engine::CtxLen::Auto);
                 lc.gpu_layers = np.gpu_layers.unwrap_or_default();
                 lc.threads = np.threads.unwrap_or_default();
                 LoadParams::llamacpp(lc)
             }
             None => LoadParams::base(
-                np.ctx_len.unwrap_or(0),
+                np.ctx_len
+                    .map(crate::worker::engine::CtxLen::fixed)
+                    .unwrap_or(crate::worker::engine::CtxLen::Auto),
                 np.gpu_layers.unwrap_or_default(),
                 np.threads.unwrap_or_default(),
             ),
@@ -903,7 +910,7 @@ impl Higgs {
         LoadedInfo {
             id: served_id,
             worker_id,
-            ctx_len: 0,
+            ctx_len: crate::worker::engine::CtxLen::Auto,
             gpu_layers: crate::worker::engine::GpuLayers::Count { n: 0 },
             threads: 0,
             arch: scanned.and_then(|m| m.arch.clone()),
@@ -932,7 +939,7 @@ impl Higgs {
         Some(LoadedInfo {
             // None by default; the caller (status/local_loaded_info) sets the real worker id.
             worker_id: 0,
-            ctx_len: l.get("ctx_len")?.as_u64()? as u32,
+            ctx_len: serde_json::from_value(l.get("ctx_len")?.clone()).ok()?,
             gpu_layers: serde_json::from_value(l.get("gpu_layers")?.clone()).ok()?,
             threads: l.get("threads")?.as_u64()? as u32,
             arch: scanned.and_then(|m| m.arch.clone()),
@@ -1198,7 +1205,10 @@ impl Higgs {
             }
             Err(_) => {
                 let mut stub = self.loaded_info_stub(served.to_owned(), worker.0, &raw, &scan);
-                stub.ctx_len = u32::MAX;
+                // Resident but the status probe failed (busy mid-generation): AUTO keeps the
+                // host prompt-fit gate permissive (was the `u32::MAX` "unbounded" sentinel), so
+                // the chat QUEUES behind the generation; the worker's [HG005] stays authoritative.
+                stub.ctx_len = crate::worker::engine::CtxLen::Auto;
                 Some(stub)
             }
         }

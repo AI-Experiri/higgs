@@ -1,5 +1,5 @@
 use super::*;
-use crate::worker::engine::GpuLayers;
+use crate::worker::engine::{CtxLen, GpuLayers};
 
 #[test]
 fn friendly_name_uses_role_eid8_and_host() {
@@ -157,18 +157,24 @@ fn record_load_stores_and_replaces_per_model() {
     let mut cfg = InstanceConfig::default();
     assert!(cfg.model_record("org/m").is_none());
 
-    let p1 = LoadParams::base(4096, GpuLayers::Count { n: 99 }, 0);
+    let p1 = LoadParams::base(CtxLen::Fixed { n: 4096 }, GpuLayers::Count { n: 99 }, 0);
     cfg.record_load("org/m", p1.clone(), 1000);
     let rec = cfg.model_record("org/m").expect("record present");
-    assert_eq!(rec.load.as_ref().unwrap().ctx_len(), 4096);
+    assert_eq!(
+        rec.load.as_ref().unwrap().ctx_len(),
+        CtxLen::Fixed { n: 4096 }
+    );
     assert_eq!(rec.last_loaded_ms, 1000);
 
     // A second load of the SAME id replaces the load info (latest wins), no duplicate key.
-    let p2 = LoadParams::base(8192, GpuLayers::Count { n: 0 }, 0);
+    let p2 = LoadParams::base(CtxLen::Fixed { n: 8192 }, GpuLayers::Count { n: 0 }, 0);
     cfg.record_load("org/m", p2, 2000);
     assert_eq!(cfg.models.len(), 1, "keyed by id, no duplicate");
     let rec = cfg.model_record("org/m").unwrap();
-    assert_eq!(rec.load.as_ref().unwrap().ctx_len(), 8192);
+    assert_eq!(
+        rec.load.as_ref().unwrap().ctx_len(),
+        CtxLen::Fixed { n: 8192 }
+    );
     assert_eq!(rec.last_loaded_ms, 2000);
 }
 
@@ -181,7 +187,10 @@ fn model_record_load_accepts_legacy_flat_and_degrades_garbage() {
     let legacy = r#"{"name":"node-x","models":{"org/m":{"load":{"ctx_len":2048,"gpu_layers":12,"threads":4},"last_loaded_ms":7}}}"#;
     let cfg: InstanceConfig = serde_json::from_str(legacy).unwrap();
     let rec = cfg.model_record("org/m").expect("legacy record present");
-    assert_eq!(rec.load.as_ref().unwrap().ctx_len(), 2048);
+    assert_eq!(
+        rec.load.as_ref().unwrap().ctx_len(),
+        CtxLen::Fixed { n: 2048 }
+    );
     assert_eq!(
         rec.load.as_ref().unwrap().gpu_layers(),
         GpuLayers::Count { n: 12 }
@@ -207,7 +216,7 @@ fn config_roundtrips_model_records() {
     };
     cfg.record_load(
         "org/m",
-        LoadParams::base(2048, GpuLayers::Count { n: 12 }, 0),
+        LoadParams::base(CtxLen::Fixed { n: 2048 }, GpuLayers::Count { n: 12 }, 0),
         42,
     );
     cfg.save(&path).unwrap();
@@ -222,7 +231,7 @@ fn config_roundtrips_model_records() {
             .as_ref()
             .unwrap()
             .ctx_len(),
-        2048
+        CtxLen::Fixed { n: 2048 }
     );
     let _ = std::fs::remove_file(&path);
 }

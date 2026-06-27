@@ -1,6 +1,6 @@
 use super::*;
 use crate::system::{DeviceKind, GpuDevice};
-use crate::worker::engine::GpuLayers;
+use crate::worker::engine::{CtxLen, GpuLayers};
 
 /// A hardware snapshot with `vram` bytes of GPU VRAM, 64 GiB RAM, 16 cores.
 fn hw_gpu(vram: u64) -> HardwareInfo {
@@ -37,7 +37,7 @@ fn dense_meta_8gb() -> ModelMeta {
 
 fn all_gpu_load() -> LlamaCppParams {
     LlamaCppParams {
-        ctx_len: 8192,
+        ctx_len: CtxLen::Fixed { n: 8192 },
         gpu_layers: GpuLayers::All,
         type_k: Some(KvCacheKind::F16),
         type_v: Some(KvCacheKind::F16),
@@ -122,7 +122,7 @@ fn cpu_only_host_vram_fits_not_overflow() {
     // No GPU + gpu_layers 0 → nothing lives in VRAM (needed == 0), so the VRAM
     // verdict must read Fits, NOT a misleading Overflow (basis is also 0).
     let cpu_load = LlamaCppParams {
-        ctx_len: 8192,
+        ctx_len: CtxLen::Fixed { n: 8192 },
         gpu_layers: GpuLayers::Count { n: 0 },
         ..Default::default()
     };
@@ -148,7 +148,7 @@ fn ram_estimate_charges_cpu_when_not_offloaded() {
 
     // gpu_layers = 0 (CPU-only) → all 8 GiB of weights land in RAM.
     let cpu_load = LlamaCppParams {
-        ctx_len: 8192,
+        ctx_len: CtxLen::Fixed { n: 8192 },
         gpu_layers: GpuLayers::Count { n: 0 },
         ..Default::default()
     };
@@ -168,7 +168,7 @@ fn kv_type_bytes_scale_with_quantization() {
     let meta = dense_meta_8gb();
     let bytes_for = |k: KvCacheKind| {
         let load = LlamaCppParams {
-            ctx_len: 8192,
+            ctx_len: CtxLen::Fixed { n: 8192 },
             gpu_layers: GpuLayers::All,
             type_k: Some(k),
             type_v: Some(k),
@@ -220,7 +220,7 @@ fn gpu_layers_within_budget_all_when_nothing_resident() {
         ..Default::default()
     };
     let no_kv_load = LlamaCppParams {
-        ctx_len: 8192,
+        ctx_len: CtxLen::Fixed { n: 8192 },
         gpu_layers: GpuLayers::All,
         offload_kqv: Some(false), // KV stays off the GPU → kv term is 0
         ..Default::default()
@@ -251,7 +251,7 @@ fn gpu_layers_within_budget_cpu_moe_pulls_experts_off() {
         ..Default::default()
     };
     let plain = LlamaCppParams {
-        ctx_len: 8192,
+        ctx_len: CtxLen::Fixed { n: 8192 },
         gpu_layers: GpuLayers::All,
         offload_kqv: Some(false),
         ..Default::default()
@@ -347,7 +347,7 @@ fn kv_cache_bytes_saturates_on_absurd_metadata() {
         ..Default::default()
     };
     let load = LlamaCppParams {
-        ctx_len: 0, // → ctx from ctx_train (u64::MAX)
+        ctx_len: CtxLen::Auto, // → ctx from ctx_train (u64::MAX)
         ..Default::default()
     };
     // Must NOT panic; saturates to a huge (finite) estimate.

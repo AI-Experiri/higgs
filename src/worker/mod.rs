@@ -211,7 +211,7 @@ impl WorkerState {
                     engine::llamacpp::params::LlamaCppParams::default()
                 }
             };
-        opts.ctx_len = ctx_len;
+        opts.ctx_len = engine::CtxLen::fixed(ctx_len);
         opts.gpu_layers = req
             .params
             .get("gpu_layers")
@@ -757,7 +757,7 @@ mod tests {
         };
         let loaded = &loaded_status.result.as_ref().unwrap()["loaded"];
         assert_eq!(loaded["id"], "google/gemma-4-12b");
-        assert_eq!(loaded["ctx_len"], 2048);
+        assert_eq!(loaded["ctx_len"], json!({"kind": "fixed", "n": 2048}));
         assert_eq!(loaded["threads"], 4, "default threads");
 
         let RpcFrame::Response(final_status) = &frames[3] else {

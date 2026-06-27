@@ -145,7 +145,7 @@ async fn load_small_ctx_len() {
 
     let snap = status(&c, &srv.base).await;
     assert_eq!(
-        snap["loaded"]["ctx_len"].as_u64().unwrap(),
+        snap["loaded"]["ctx_len"]["n"].as_u64().unwrap(),
         256,
         "the small ctx_len is the loaded window: {snap}"
     );
@@ -339,7 +339,7 @@ async fn load_batch_and_seq_params() {
 
     let snap = status(&c, &srv.base).await;
     assert_eq!(
-        snap["loaded"]["ctx_len"].as_u64().unwrap(),
+        snap["loaded"]["ctx_len"]["n"].as_u64().unwrap(),
         512,
         "ctx_len from the params object applied: {snap}"
     );

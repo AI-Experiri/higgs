@@ -75,7 +75,7 @@ async fn control_api_lifecycle() {
         .unwrap();
     assert_eq!(status["loaded"]["id"], id, "status shows loaded id");
     assert!(
-        status["loaded"]["ctx_len"].as_u64().unwrap() > 0,
+        status["loaded"]["ctx_len"]["n"].as_u64().unwrap() > 0,
         "loaded ctx_len > 0"
     );
 
@@ -114,7 +114,7 @@ async fn control_api_lifecycle() {
         "loaded model carries a persisted last_load record: {entry}"
     );
     assert!(
-        entry["last_load"]["ctx_len"].is_number()
+        entry["last_load"]["ctx_len"]["kind"].is_string()
             && entry["last_load"]["gpu_layers"]["kind"].is_string(),
         "persisted last_load carries the load params (gpu_layers is the GpuLayers union): {entry}"
     );
@@ -250,7 +250,7 @@ async fn control_api_lifecycle() {
         .await
         .unwrap();
     assert_eq!(
-        status["loaded"]["ctx_len"].as_u64().unwrap(),
+        status["loaded"]["ctx_len"]["n"].as_u64().unwrap(),
         2048,
         "explicit ctx_len honored"
     );

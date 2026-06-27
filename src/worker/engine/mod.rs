@@ -69,7 +69,7 @@ impl LoadParams {
 
     /// Build the umbrella from just the three base llama.cpp fields (the
     /// quick-load shape; every optional left at its engine default).
-    pub fn base(ctx_len: u32, gpu_layers: GpuLayers, threads: u32) -> Self {
+    pub fn base(ctx_len: CtxLen, gpu_layers: GpuLayers, threads: u32) -> Self {
         LoadParams::LlamaCpp(llamacpp::params::LlamaCppParams::base(
             ctx_len, gpu_layers, threads,
         ))
@@ -82,8 +82,8 @@ impl LoadParams {
         }
     }
 
-    /// Base-field accessor: context window in tokens.
-    pub fn ctx_len(&self) -> u32 {
+    /// Base-field accessor: context window ([`CtxLen::Auto`] = the trained context).
+    pub fn ctx_len(&self) -> CtxLen {
         self.as_llamacpp().ctx_len
     }
 
@@ -257,6 +257,94 @@ impl<'de> serde::Deserialize<'de> for GpuLayers {
             Wire::Num(n) => GpuLayers::Count { n: n as u32 },
             Wire::Tagged(Tagged::All) => GpuLayers::All,
             Wire::Tagged(Tagged::Count { n }) => GpuLayers::Count { n },
+        })
+    }
+}
+
+higgs_ts! {
+    /// The context window to load with. Replaces the old `ctx_len: u32` where `0` was a
+    /// sentinel for "AUTO" (let the engine pick the model's trained context, capped) — the
+    /// intent now lives in the type. A data enum, so a ts-rs tagged union (the const-enum
+    /// exception), internally tagged on `kind`: `{"kind":"auto"}` / `{"kind":"fixed","n":4096}`.
+    /// Mapped to the raw `with_n_ctx` int ONLY inside `llamacpp/mod.rs`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    pub enum CtxLen {
+        /// Let the engine pick — the model's trained context, capped at `DEFAULT_CTX_CAP`
+        /// (the old `ctx_len == 0`).
+        Auto,
+        /// A fixed context window of `n` tokens.
+        Fixed {
+            /// Window size in tokens.
+            #[ts(type = "number")]
+            n: u32,
+        },
+    }
+}
+
+impl Default for CtxLen {
+    /// Preserves the pre-enum derived default (`ctx_len: 0`, i.e. AUTO).
+    fn default() -> Self {
+        CtxLen::Auto
+    }
+}
+
+impl CtxLen {
+    /// A fixed `n`-token window.
+    pub fn fixed(n: u32) -> Self {
+        CtxLen::Fixed { n }
+    }
+
+    /// `true` when the engine picks the window (the old `ctx_len == 0`).
+    pub fn is_auto(&self) -> bool {
+        matches!(self, CtxLen::Auto)
+    }
+
+    /// The fixed window in tokens, or `None` for [`CtxLen::Auto`].
+    pub fn fixed_n(&self) -> Option<u32> {
+        match self {
+            CtxLen::Auto => None,
+            CtxLen::Fixed { n } => Some(*n),
+        }
+    }
+
+    /// The raw `with_n_ctx` value for the llama.cpp FFI: `0` for [`CtxLen::Auto`]
+    /// (`NonZeroU32::new(0) == None` → llama.cpp uses the trained context — exactly the
+    /// old sentinel), else the fixed window. Called ONLY at the FFI boundary.
+    pub fn to_n_ctx(&self) -> u32 {
+        match self {
+            CtxLen::Auto => 0,
+            CtxLen::Fixed { n } => *n,
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for CtxLen {
+    /// Lenient: accept EITHER a bare integer (the legacy/persisted form, `0` = auto) or the
+    /// canonical tagged object. [`Serialize`] always emits the tagged object, so a config.json
+    /// written before this change still reads and migrates forward on its next save.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Num(u64),
+            Tagged(Tagged),
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum Tagged {
+            Auto,
+            Fixed { n: u32 },
+        }
+        Ok(match Wire::deserialize(deserializer)? {
+            // `0` is the legacy "auto" sentinel; any other int is an explicit window.
+            Wire::Num(0) => CtxLen::Auto,
+            Wire::Num(n) => CtxLen::Fixed { n: n as u32 },
+            Wire::Tagged(Tagged::Auto) => CtxLen::Auto,
+            Wire::Tagged(Tagged::Fixed { n }) => CtxLen::Fixed { n },
         })
     }
 }

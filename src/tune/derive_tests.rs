@@ -2,7 +2,7 @@ use super::*;
 use crate::system::{DeviceKind, GpuDevice};
 use crate::tune::vram::{StaticRamEstimator, StaticVramEstimator};
 use crate::tune::{FitVerdict, Suggester};
-use crate::worker::engine::GpuLayers;
+use crate::worker::engine::{CtxLen, GpuLayers};
 
 fn hw(vram: u64, ram: u64, cores: u32) -> HardwareInfo {
     HardwareInfo {
@@ -51,7 +51,11 @@ fn derive_defaults_all_gpu_flash_on_and_threads() {
     assert_eq!(d.gpu_layers, GpuLayers::All, "all layers on GPU");
     assert_eq!(d.flash_attn, Some(FlashAttn::On));
     assert_eq!(d.threads, 8, "floor(16/2)");
-    assert_eq!(d.ctx_len, 8192, "ctx_train 32768 capped to 8192");
+    assert_eq!(
+        d.ctx_len,
+        CtxLen::Fixed { n: 8192 },
+        "ctx_train 32768 capped to 8192"
+    );
     assert_eq!(d.type_k, Some(KvCacheKind::F16));
     assert_eq!(d.n_seq_max, Some(1));
 }

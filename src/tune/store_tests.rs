@@ -1,9 +1,9 @@
 use super::*;
-use crate::worker::engine::GpuLayers;
+use crate::worker::engine::{CtxLen, GpuLayers};
 
 fn tune_record() -> TuneRecord {
     TuneRecord {
-        profile: LoadParams::base(8192, GpuLayers::All, 8),
+        profile: LoadParams::base(CtxLen::Fixed { n: 8192 }, GpuLayers::All, 8),
         sampling: SamplingParams::default(),
         budget: ResourceBudget::default(),
         provenance: TuneProvenance::Heuristic,
@@ -78,11 +78,15 @@ fn set_profile_updates_profile_preserving_other_fields() {
     s.put_tuning("org/m", rec);
     s.set_profile(
         "org/m",
-        LoadParams::base(1234, GpuLayers::Count { n: 0 }, 2),
+        LoadParams::base(CtxLen::Fixed { n: 1234 }, GpuLayers::Count { n: 0 }, 2),
         99,
     );
     let got = s.tuning("org/m").unwrap();
-    assert_eq!(got.profile.ctx_len(), 1234, "profile updated");
+    assert_eq!(
+        got.profile.ctx_len(),
+        CtxLen::Fixed { n: 1234 },
+        "profile updated"
+    );
     assert_eq!(
         got.profile.gpu_layers(),
         GpuLayers::Count { n: 0 },
@@ -96,9 +100,13 @@ fn set_profile_updates_profile_preserving_other_fields() {
     assert_eq!(got.bench_tps, Some(9.0), "bench_tps preserved");
     assert_eq!(got.tuned_at_ms, 99);
     // With NO prior record, set_profile creates one with defaults.
-    s.set_profile("org/new", LoadParams::base(2048, GpuLayers::All, 8), 50);
+    s.set_profile(
+        "org/new",
+        LoadParams::base(CtxLen::Fixed { n: 2048 }, GpuLayers::All, 8),
+        50,
+    );
     let fresh = s.tuning("org/new").unwrap();
-    assert_eq!(fresh.profile.ctx_len(), 2048);
+    assert_eq!(fresh.profile.ctx_len(), CtxLen::Fixed { n: 2048 });
     assert_eq!(fresh.provenance, TuneProvenance::Heuristic);
 }
 
@@ -172,7 +180,7 @@ fn profile_store_trait_delegates_to_inherent() {
     assert!(store.tuning("org/m").is_none(), "empty via trait");
     store.put_tuning("org/m", tune_record());
     let got = store.tuning("org/m").expect("written via trait");
-    assert_eq!(got.profile.ctx_len(), 8192);
+    assert_eq!(got.profile.ctx_len(), CtxLen::Fixed { n: 8192 });
     assert_eq!(got.provenance, TuneProvenance::Heuristic);
     // And the inherent reader sees the trait-written record (same backing store).
     assert!(JsonModelStore::tuning(&s, "org/m").is_some());

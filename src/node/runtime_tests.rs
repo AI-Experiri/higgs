@@ -1,6 +1,6 @@
 use super::*;
 use crate::node::test_support::{fake_runtime as fake_runtime_with_dirs, fake_runtime_load_fails};
-use crate::worker::engine::GpuLayers;
+use crate::worker::engine::{CtxLen, GpuLayers};
 use tempfile::TempDir;
 
 /// Like `fake_runtime_with_models` but the worker fails every M_LOAD (post-spawn
@@ -47,7 +47,7 @@ fn load_params(id: &str) -> NodeLoadParams {
 fn worker_load_params_omits_null_base_and_keeps_overrides() {
     use crate::worker::engine::llamacpp::params::LlamaCppParams;
     use crate::worker::engine::{FlashAttn, KvCacheKind};
-    let mut rich = LlamaCppParams::base(0, GpuLayers::All, 4);
+    let mut rich = LlamaCppParams::base(CtxLen::Auto, GpuLayers::All, 4);
     rich.flash_attn = Some(FlashAttn::On);
     rich.type_k = Some(KvCacheKind::Q8_0);
     rich.cpu_moe = Some(true);
@@ -603,7 +603,7 @@ async fn load_rejects_a_model_symlinked_outside_the_roots() {
 fn worker_load_params_merges_all_rich_overrides() {
     use crate::worker::engine::llamacpp::params::LlamaCppParams;
     use crate::worker::engine::{FlashAttn, KvCacheKind};
-    let mut rich = LlamaCppParams::base(0, GpuLayers::Count { n: 10 }, 8);
+    let mut rich = LlamaCppParams::base(CtxLen::Auto, GpuLayers::Count { n: 10 }, 8);
     rich.flash_attn = Some(FlashAttn::Off);
     rich.type_k = Some(KvCacheKind::Q8_0);
     rich.type_v = Some(KvCacheKind::Q8_0);

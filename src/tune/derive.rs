@@ -6,7 +6,7 @@
 
 use crate::system::HardwareInfo;
 use crate::worker::engine::llamacpp::params::LlamaCppParams;
-use crate::worker::engine::{FlashAttn, GpuLayers, KvCacheKind};
+use crate::worker::engine::{CtxLen, FlashAttn, GpuLayers, KvCacheKind};
 
 use super::{has_gpu, DeriveStrategy, ModelMeta, ResourceBudget};
 
@@ -38,7 +38,7 @@ pub fn derive_default(
     let ctx = (ctx_train.min(CTX_CAP as u64)).max(1) as u32;
     let threads = auto_threads(hw, budget);
     LlamaCppParams {
-        ctx_len: ctx,
+        ctx_len: CtxLen::Fixed { n: ctx },
         // All layers on GPU when one is present, else CPU-only.
         gpu_layers: if has_gpu(hw) {
             GpuLayers::All

@@ -509,7 +509,7 @@ fn fit_check(
     let tokens = model
         .str_to_token(prompt, AddBos::Always)
         .map_err(|e| gen_fail("tokenize prompt", &e))?;
-    let n_ctx = load.ctx_len as usize;
+    let n_ctx = load.ctx_len.to_n_ctx() as usize;
     if tokens.len() + gen.max_tokens > n_ctx {
         return Err(HiggsError::ContextOverflow {
             prompt_tokens: tokens.len(),
@@ -547,14 +547,14 @@ fn run_decode(
     let threads = i32::try_from(lp.threads).unwrap_or(i32::MAX);
     // n_batch: use the pinned value when present, else the current default
     // (ctx_len.max(1) — one-shot prefill of any fit-checked prompt).
-    let n_batch = lp.n_batch.unwrap_or_else(|| lp.ctx_len.max(1));
+    let n_batch = lp.n_batch.unwrap_or_else(|| lp.ctx_len.to_n_ctx().max(1));
     // `n_threads_batch` splits from `n_threads` when set, else reuses `threads`.
     let threads_batch = lp
         .n_threads_batch
         .map(|n| i32::try_from(n).unwrap_or(i32::MAX))
         .unwrap_or(threads);
     let mut ctx_params = LlamaContextParams::default()
-        .with_n_ctx(NonZeroU32::new(lp.ctx_len))
+        .with_n_ctx(NonZeroU32::new(lp.ctx_len.to_n_ctx()))
         .with_n_batch(n_batch)
         .with_n_threads(threads)
         .with_n_threads_batch(threads_batch);
@@ -817,7 +817,7 @@ mod tests {
         e.load(
             &path,
             &LoadParams::llamacpp(LlamaCppParams {
-                ctx_len: 2048,
+                ctx_len: crate::worker::engine::CtxLen::Fixed { n: 2048 },
                 gpu_layers: crate::worker::engine::GpuLayers::All,
                 threads: 4,
                 ..Default::default()
@@ -927,7 +927,7 @@ mod tests {
     #[test]
     fn umbrella_tags_engine_and_flattens_payload() {
         let lp = LoadParams::llamacpp(LlamaCppParams {
-            ctx_len: 8192,
+            ctx_len: crate::worker::engine::CtxLen::Fixed { n: 8192 },
             gpu_layers: crate::worker::engine::GpuLayers::Count { n: 32 },
             threads: 6,
             type_k: Some(KvCacheKind::Q8_0),
@@ -936,7 +936,10 @@ mod tests {
         });
         let v = serde_json::to_value(&lp).unwrap();
         assert_eq!(v["engine"], "LlamaCpp");
-        assert_eq!(v["ctx_len"], 8192);
+        assert_eq!(
+            v["ctx_len"],
+            serde_json::json!({"kind": "fixed", "n": 8192})
+        );
         assert_eq!(v["type_k"], "Q8_0");
         let back: LoadParams = serde_json::from_value(v).unwrap();
         assert_eq!(back, lp);

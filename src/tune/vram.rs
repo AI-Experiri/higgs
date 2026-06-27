@@ -8,7 +8,7 @@
 
 use crate::system::{fits_vram, HardwareInfo};
 use crate::worker::engine::llamacpp::params::LlamaCppParams;
-use crate::worker::engine::{GpuLayers, KvCacheKind};
+use crate::worker::engine::{CtxLen, GpuLayers, KvCacheKind};
 
 use super::{
     has_gpu, FitReport, FitVerdict, ModelMeta, RamEstimator, ResourceBudget, VramEstimator,
@@ -43,10 +43,9 @@ fn kv_type_bytes(kind: KvCacheKind) -> f64 {
 
 /// Effective context length for the KV estimate.
 fn effective_ctx(load: &LlamaCppParams, meta: &ModelMeta) -> u64 {
-    if load.ctx_len > 0 {
-        load.ctx_len as u64
-    } else {
-        meta.ctx_train.unwrap_or(4096)
+    match load.ctx_len {
+        CtxLen::Fixed { n } => n as u64,
+        CtxLen::Auto => meta.ctx_train.unwrap_or(4096),
     }
 }
 

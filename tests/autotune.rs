@@ -49,7 +49,7 @@ async fn tune_suggest_returns_params_fit_and_rationale() {
         s["load"]
     );
     assert!(
-        s["load"]["ctx_len"].as_u64().unwrap() > 0,
+        s["load"]["ctx_len"]["n"].as_u64().unwrap() > 0,
         "a concrete ctx_len"
     );
     // Derived defaults: flash attention on.
@@ -86,7 +86,7 @@ async fn tune_then_load_and_plain_load_reuses_profile() {
         .await
         .unwrap();
     let suggested_load = s["load"].clone();
-    let tuned_ctx = suggested_load["ctx_len"].as_u64().unwrap();
+    let tuned_ctx = suggested_load["ctx_len"]["n"].as_u64().unwrap();
 
     // 2. Load WITH the accepted suggestion (the `engine` tag is ignored by the
     //    flat LlamaCppParams deserializer).
@@ -108,7 +108,7 @@ async fn tune_then_load_and_plain_load_reuses_profile() {
         .await
         .unwrap();
     assert_eq!(
-        st["loaded"]["ctx_len"].as_u64().unwrap(),
+        st["loaded"]["ctx_len"]["n"].as_u64().unwrap(),
         tuned_ctx,
         "loaded with the tuned ctx_len: {st}"
     );

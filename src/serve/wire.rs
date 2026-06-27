@@ -134,10 +134,9 @@ higgs_ts! {
     pub struct HiggsLoadRequest {
         /// HuggingFace repo id of the model to load.
         pub id: String,
-        /// Context window size in tokens.
-        #[ts(type = "number")]
+        /// Context window ([`CtxLen::Auto`] = trained context; `Fixed { n }` = pinned).
         #[ts(optional)]
-        pub ctx_len: Option<u32>,
+        pub ctx_len: Option<crate::worker::engine::CtxLen>,
         /// GPU layers to offload (`GpuLayers::All` = every layer; `Count { n }` = explicit).
         #[ts(optional)]
         pub gpu_layers: Option<crate::worker::engine::GpuLayers>,

@@ -1,5 +1,5 @@
 use super::*;
-use crate::worker::engine::GpuLayers;
+use crate::worker::engine::{CtxLen, GpuLayers};
 
 /// A lean JSON object carrying only a couple of base fields deserializes into
 /// the full struct with every other field at its `None`/empty default — the
@@ -8,7 +8,7 @@ use crate::worker::engine::GpuLayers;
 fn lean_json_deserializes_into_full_params() {
     let p: LlamaCppParams =
         serde_json::from_value(serde_json::json!({"ctx_len": 4096, "gpu_layers": 32})).unwrap();
-    assert_eq!(p.ctx_len, 4096);
+    assert_eq!(p.ctx_len, CtxLen::Fixed { n: 4096 });
     assert_eq!(p.gpu_layers, GpuLayers::Count { n: 32 });
     assert!(p.type_k.is_none() && p.cpu_moe.is_none() && p.n_seq_max.is_none());
     assert!(p.cpu_buft_overrides.is_empty() && p.kv_overrides.is_empty());
@@ -19,7 +19,7 @@ fn lean_json_deserializes_into_full_params() {
 /// quick-load thus carries only the base fields + the empty advanced vecs.
 #[test]
 fn absent_optionals_do_not_serialize() {
-    let bare = LlamaCppParams::base(4096, GpuLayers::All, 4);
+    let bare = LlamaCppParams::base(CtxLen::Fixed { n: 4096 }, GpuLayers::All, 4);
     let v = serde_json::to_value(&bare).unwrap();
     let obj = v.as_object().unwrap();
     assert!(
@@ -45,7 +45,7 @@ fn absent_optionals_do_not_serialize() {
 #[test]
 fn full_params_round_trip() {
     let full = LlamaCppParams {
-        ctx_len: 8192,
+        ctx_len: CtxLen::Fixed { n: 8192 },
         gpu_layers: GpuLayers::All,
         threads: 8,
         cpu_moe: Some(true),
@@ -179,13 +179,13 @@ fn unsupported_sampler_flags_only_unapplied_advanced_samplers() {
 #[test]
 fn has_overrides_detects_engine_overrides() {
     assert!(
-        !LlamaCppParams::base(4096, GpuLayers::All, 8).has_overrides(),
+        !LlamaCppParams::base(CtxLen::Fixed { n: 4096 }, GpuLayers::All, 8).has_overrides(),
         "base-only load carries no overrides"
     );
-    let mut p = LlamaCppParams::base(4096, GpuLayers::All, 8);
+    let mut p = LlamaCppParams::base(CtxLen::Fixed { n: 4096 }, GpuLayers::All, 8);
     p.flash_attn = Some(FlashAttn::On);
     assert!(p.has_overrides(), "an optional override counts");
-    let mut p2 = LlamaCppParams::base(4096, GpuLayers::All, 8);
+    let mut p2 = LlamaCppParams::base(CtxLen::Fixed { n: 4096 }, GpuLayers::All, 8);
     p2.kv_overrides.push(KvOverride {
         key: "k".into(),
         value: "v".into(),

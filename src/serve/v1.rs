@@ -34,6 +34,7 @@ use axum::Json;
 
 use crate::api::{ChatOutcome, Higgs, LoadedInfo};
 use crate::diagnostic::HiggsError;
+use crate::worker::engine::CtxLen;
 
 use super::http_status;
 use super::stream;
@@ -443,7 +444,10 @@ async fn ensure_loaded(higgs: &Arc<Higgs>, model: &str) -> Result<LoadedInfo, Re
         return Ok(LoadedInfo {
             id: model.to_owned(),
             worker_id: 0, // remote-resident placeholder — the fleet routes it, no local worker
-            ctx_len: u32::MAX,
+            // The fleet routes this; the local prompt-fit gate has no window to check
+            // against, so AUTO keeps it permissive (the remote worker's [HG005] is the
+            // backstop) — replacing the old `u32::MAX` "treat as unbounded" sentinel.
+            ctx_len: CtxLen::Auto,
             gpu_layers: crate::worker::engine::GpuLayers::Count { n: 0 },
             threads: 0,
             arch: None,
@@ -755,7 +759,7 @@ fn build_sampling(req: &CreateChatCompletionRequest) -> crate::worker::engine::S
 /// (`prompt_bytes / PROMPT_BYTES_PER_TOKEN`); the worker runs the exact
 /// tokenizer check (the authoritative `[HG005]`). This only fires when the
 /// prompt is unambiguously over the window.
-fn check_prompt_fits(req: &CreateChatCompletionRequest, ctx_len: u32) -> Result<(), HiggsError> {
+fn check_prompt_fits(req: &CreateChatCompletionRequest, ctx_len: CtxLen) -> Result<(), HiggsError> {
     // Sum the byte length of every message's textual content. Serializing the
     // messages would add role/JSON-structure/escape bytes and push the estimate
     // ABOVE the true token count — turning this lower-bound precheck into a
@@ -768,7 +772,12 @@ fn check_prompt_fits(req: &CreateChatCompletionRequest, ctx_len: u32) -> Result<
         .unwrap_or(0);
     let prompt_tokens_est = prompt_bytes / PROMPT_BYTES_PER_TOKEN;
     let max_gen = effective_max_tokens(req) as usize;
-    let n_ctx = ctx_len as usize;
+    // An AUTO/unknown window can't be bounded here, so don't reject — the worker's
+    // tokenizer-exact [HG005] is the authoritative prompt-fit backstop.
+    let n_ctx = match ctx_len {
+        CtxLen::Auto => return Ok(()),
+        CtxLen::Fixed { n } => n as usize,
+    };
     if prompt_tokens_est + max_gen > n_ctx {
         return Err(HiggsError::ContextOverflow {
             prompt_tokens: prompt_tokens_est,
