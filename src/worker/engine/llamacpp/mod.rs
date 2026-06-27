@@ -20,7 +20,7 @@ use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
 
 use self::params::{LlamaCppParams, RopeScalingType, SplitMode};
-use super::{FlashAttn, GenParams, HiggsEngine, KvCacheKind, LoadParams};
+use super::{CtxLen, FlashAttn, GenParams, HiggsEngine, KvCacheKind, LoadParams};
 use crate::diagnostic::HiggsError;
 use crate::system::{DeviceKind, GpuDevice};
 use crate::worker::tool_parser::{ToolCallParser, ToolCallStreamFilter, ToolParserRegistry};
@@ -498,6 +498,19 @@ fn apply_template(
     // terminate on EOG tokens and declare no stop strings, so this is latent.
 }
 
+/// The context window the engine will ACTUALLY use: the pinned [`CtxLen::Fixed`] window,
+/// or — for [`CtxLen::Auto`] — the model's trained context (exactly what llama.cpp picks
+/// for `with_n_ctx(None)`). Keeps the `Auto` FFI sentinel (`to_n_ctx() == 0`) from being
+/// read as a real size by the fit-check / batch sizing (which would reject every chat or
+/// force a 1-token batch). In the worker path `ctx_len` is always `Fixed` (handle_load
+/// coerces), so the `Auto` arm hardens DIRECT engine loads.
+fn effective_n_ctx(load: &LlamaCppParams, model: &LlamaModel) -> u32 {
+    match load.ctx_len {
+        CtxLen::Fixed { n } => n,
+        CtxLen::Auto => model.n_ctx_train(),
+    }
+}
+
 /// Tokenize `prompt` and verify prompt + full generation budget fits `n_ctx`.
 /// Returns the prompt tokens on success, [HG005] `ContextOverflow` otherwise.
 fn fit_check(
@@ -509,7 +522,7 @@ fn fit_check(
     let tokens = model
         .str_to_token(prompt, AddBos::Always)
         .map_err(|e| gen_fail("tokenize prompt", &e))?;
-    let n_ctx = load.ctx_len.to_n_ctx() as usize;
+    let n_ctx = effective_n_ctx(load, model) as usize;
     if tokens.len() + gen.max_tokens > n_ctx {
         return Err(HiggsError::ContextOverflow {
             prompt_tokens: tokens.len(),
@@ -547,7 +560,7 @@ fn run_decode(
     let threads = i32::try_from(lp.threads).unwrap_or(i32::MAX);
     // n_batch: use the pinned value when present, else the current default
     // (ctx_len.max(1) — one-shot prefill of any fit-checked prompt).
-    let n_batch = lp.n_batch.unwrap_or_else(|| lp.ctx_len.to_n_ctx().max(1));
+    let n_batch = lp.n_batch.unwrap_or_else(|| effective_n_ctx(lp, model).max(1));
     // `n_threads_batch` splits from `n_threads` when set, else reuses `threads`.
     let threads_batch = lp
         .n_threads_batch
