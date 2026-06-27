@@ -1,4 +1,3 @@
-
 use super::*;
 
 /// The exact byte layout Qwen3 emits: a `<think>` block then a JSON object
@@ -90,4 +89,38 @@ fn content_preserves_text_after_a_tool_call() {
     // (and between) calls must survive, not be dropped at the first marker.
     let text = "Calling.<tool_call>{\"name\":\"f\",\"arguments\":{}}</tool_call>Done.";
     assert_eq!(p().content(text), "Calling.Done.");
+}
+
+#[test]
+fn id_and_open_markers() {
+    assert_eq!(p().id(), "qwen-json");
+    assert_eq!(p().open_markers(), &["<tool_call>"]);
+}
+
+#[test]
+fn content_drops_unterminated_open_marker() {
+    // An <tool_call> that never closes: the shared content_outside_calls hits its
+    // `None => return out` arm — the preamble survives, the dangling markup is
+    // dropped as incomplete (no trailing content leaks).
+    let text = "Preamble here.<tool_call>\n{\"name\": \"x\"";
+    assert_eq!(p().content(text), "Preamble here.");
+}
+
+#[test]
+fn parse_drops_call_with_invalid_json_body() {
+    // A <tool_call> whose body is not valid JSON is dropped by parse_one (its
+    // `serde_json::from_str(...).ok()?`), yielding no calls.
+    assert!(p()
+        .parse("<tool_call>\nnot json at all\n</tool_call>", "x")
+        .is_none());
+}
+
+#[test]
+fn parse_defaults_missing_arguments_to_empty_object() {
+    // A call object with `name` but no `arguments` key defaults to `{}`.
+    let calls = p()
+        .parse("<tool_call>\n{\"name\": \"ping\"}\n</tool_call>", "d")
+        .expect("one call");
+    assert_eq!(calls[0]["function"]["name"], "ping");
+    assert_eq!(calls[0]["function"]["arguments"], "{}");
 }

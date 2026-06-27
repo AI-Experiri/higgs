@@ -1,4 +1,3 @@
-
 use super::*;
 
 fn p() -> Gemma4Parser {
@@ -176,4 +175,53 @@ fn bare_multibyte_args_do_not_panic() {
             "invalid bare args degrade to empty, no panic: {text}"
         );
     }
+}
+
+#[test]
+fn id_and_open_markers() {
+    assert_eq!(p().id(), "gemma4");
+    assert_eq!(p().open_markers(), &[OPEN_TAG]);
+}
+
+#[test]
+fn empty_name_call_is_dropped() {
+    // `call:{…}` — the name before `{` is empty, so parse_one returns None and
+    // the whole parse yields no calls.
+    assert!(p()
+        .parse("<|tool_call>call:{a:1}<tool_call|>", "x")
+        .is_none());
+}
+
+#[test]
+fn unterminated_string_delimiter_degrades_to_empty() {
+    // A `<|"|>` span that never closes: gemma4_args_to_json copies the rest
+    // verbatim and stops, so the JSON does not parse → empty args. The call
+    // still emits (parse_one only requires the name + brace).
+    let text = "<|tool_call>call:f{a:<|\"|>oops}<tool_call|>";
+    let calls = p().parse(text, "u").expect("tool call still parses");
+    assert_eq!(calls[0]["function"]["name"], "f");
+    assert_eq!(calls[0]["function"]["arguments"], "{}");
+}
+
+#[test]
+fn unterminated_json_quote_degrades_to_empty() {
+    // A bare JSON double-quoted value with no closing quote: json_quoted_string_end
+    // returns None, so the verbatim-copy path is skipped and the bytes fall through
+    // to the rune copy. The malformed JSON degrades to empty args without panic.
+    let text = "<|tool_call>call:f{a:\"oops}<tool_call|>";
+    let calls = p().parse(text, "q").expect("tool call still parses");
+    assert_eq!(calls[0]["function"]["name"], "f");
+    assert_eq!(calls[0]["function"]["arguments"], "{}");
+}
+
+#[test]
+fn whitespace_after_brace_before_key_is_skipped() {
+    // skip_space advances past the space between `{`/`,` and the bare key, so the
+    // key is still recognized and quoted into valid JSON.
+    let text = "<|tool_call>call:f{ a:1, b:2}<tool_call|>";
+    let calls = p().parse(text, "s").expect("one call");
+    let args: Value =
+        serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(args["a"], 1);
+    assert_eq!(args["b"], 2);
 }

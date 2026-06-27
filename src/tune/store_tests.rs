@@ -1,4 +1,3 @@
-
 use super::*;
 
 fn tune_record() -> TuneRecord {
@@ -115,4 +114,91 @@ fn missing_file_is_empty_store() {
     let s = JsonModelStore::open(home.path()).unwrap();
     assert!(s.tuning("anything").is_none());
     assert!(s.perf("anything").is_none());
+}
+
+#[test]
+fn corrupt_file_starts_empty_not_error() {
+    // A garbage models.json is logged and treated as the empty store rather than
+    // failing open() — the GGUFs stay the source of truth, tuning/perf re-earned.
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("models.json"), b"{ this is not json ]")
+        .expect("seed corrupt file");
+    let s = JsonModelStore::open(home.path()).expect("corrupt file is not an open() error");
+    assert!(s.tuning("org/m").is_none());
+    assert!(s.perf("org/m").is_none());
+    assert!(s.entry("org/m").is_none());
+    // The recovered store is fully usable: writes + flush + reopen round-trip.
+    s.put_tuning("org/m", tune_record());
+    s.flush().unwrap();
+    let s2 = JsonModelStore::open(home.path()).unwrap();
+    assert!(s2.tuning("org/m").is_some());
+}
+
+#[test]
+fn entry_snapshots_whole_record() {
+    let home = tempfile::tempdir().unwrap();
+    let s = JsonModelStore::open(home.path()).unwrap();
+    // No record yet → None.
+    assert!(s.entry("org/m").is_none());
+    // Populate all three parts; entry() returns the coherent snapshot.
+    s.put_tuning("org/m", tune_record());
+    s.record_perf("org/m", perf_sample(12.0), 7);
+    s.put_meta("org/m", meta_cache("/m.gguf", 200, 9));
+    let e = s.entry("org/m").expect("entry present");
+    assert!(e.tuning.is_some(), "tuning part present");
+    assert!(e.perf.is_some(), "perf part present");
+    let cache = e.meta.expect("meta part present");
+    assert_eq!(cache.key.path, "/m.gguf");
+    assert_eq!(cache.key.size_bytes, 200);
+    assert_eq!(cache.key.mtime_ms, 9);
+}
+
+#[test]
+fn profile_store_trait_delegates_to_inherent() {
+    // The ProfileStore impl forwards to the inherent tuning/put_tuning so the
+    // suggester can drive the store through the trait object seam.
+    let home = tempfile::tempdir().unwrap();
+    let s = JsonModelStore::open(home.path()).unwrap();
+    let store: &dyn ProfileStore = &s;
+    assert!(store.tuning("org/m").is_none(), "empty via trait");
+    store.put_tuning("org/m", tune_record());
+    let got = store.tuning("org/m").expect("written via trait");
+    assert_eq!(got.profile.ctx_len(), 8192);
+    assert_eq!(got.provenance, TuneProvenance::Heuristic);
+    // And the inherent reader sees the trait-written record (same backing store).
+    assert!(JsonModelStore::tuning(&s, "org/m").is_some());
+}
+
+#[test]
+fn open_home_uses_higgs_home_override() {
+    // open_home() resolves the per-node home via $HIGGS_HOME (the on-disk seam the
+    // default store uses); point it at a TempDir so the test never touches ~/.higgs.
+    // Serialize with other env-mutating tests and restore the prior value (cargo runs
+    // lib tests in parallel threads of one process).
+    let _env = crate::TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let home = tempfile::tempdir().unwrap();
+    // Seed a record through the explicit-path opener, flush, then reopen via the
+    // home-resolving opener and confirm it reads the same file.
+    let seed = JsonModelStore::open(home.path()).unwrap();
+    seed.put_tuning("org/m", tune_record());
+    seed.flush().unwrap();
+
+    let prev = std::env::var_os("HIGGS_HOME");
+    // SAFETY: serialized by TEST_ENV_LOCK; restored below.
+    unsafe { std::env::set_var("HIGGS_HOME", home.path()) };
+    let opened = JsonModelStore::open_home();
+    // SAFETY: still under the lock.
+    unsafe {
+        match prev {
+            Some(v) => std::env::set_var("HIGGS_HOME", v),
+            None => std::env::remove_var("HIGGS_HOME"),
+        }
+    }
+    let opened = opened.expect("open_home under HIGGS_HOME");
+    assert!(
+        opened.tuning("org/m").is_some(),
+        "open_home read the seeded models.json under $HIGGS_HOME"
+    );
 }

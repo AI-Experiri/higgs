@@ -1,6 +1,6 @@
-
 use super::*;
 use serde_json::json;
+use std::sync::Arc;
 
 struct Counter {
     total: u64,
@@ -84,6 +84,49 @@ async fn demux_remove_pending_orphans_the_waiter() {
     // a late response for a removed id is silently dropped...
     demux.correlate(ok_response(5));
     assert!(rx.await.is_err()); // ...and the waiter never resolves
+}
+
+/// An actor that does NOT override `on_stop`, so dropping its handle exercises the
+/// trait's DEFAULT `on_stop` (`async {}`) before the recv loop ends. A drop-guard
+/// flips a flag so the test can confirm the loop actually ran to completion.
+struct DefaultStopActor {
+    stopped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Actor for DefaultStopActor {
+    type Msg = ();
+    async fn handle(&mut self, _msg: ()) {}
+    // on_stop intentionally NOT overridden — the default `async {}` runs.
+}
+
+impl Drop for DefaultStopActor {
+    fn drop(&mut self) {
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn default_on_stop_runs_on_graceful_shutdown() {
+    let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let handle = spawn_actor(DefaultStopActor {
+        stopped: stopped.clone(),
+    });
+    handle.send(()).unwrap();
+    // Dropping the only handle closes the mailbox; the loop ends and the default
+    // `on_stop` (async {}) runs before the actor state is dropped.
+    drop(handle);
+    // Yield until the spawned task has run through `on_stop` and dropped the state.
+    for _ in 0..10_000 {
+        if stopped.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        stopped.load(std::sync::atomic::Ordering::SeqCst),
+        "the recv loop ended and the default on_stop ran"
+    );
 }
 
 #[tokio::test]

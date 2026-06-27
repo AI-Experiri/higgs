@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::system::{DeviceKind, GpuDevice};
 use crate::tune::vram::{StaticRamEstimator, StaticVramEstimator};

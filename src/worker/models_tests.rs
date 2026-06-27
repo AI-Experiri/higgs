@@ -1,4 +1,3 @@
-
 use std::fs;
 
 use tempfile::TempDir;
@@ -695,6 +694,413 @@ fn hf_cache_repo_without_snapshots_skipped() {
     let models = store.scan(&[], &[root.to_path_buf()], &[]).unwrap();
     assert_eq!(models.len(), 1);
     assert_eq!(models[0].id, "org/full");
+}
+
+/// Build raw GGUF file bytes (no tensors) from a list of metadata KVs.
+/// Lets callers stage a *valid* GGUF anywhere on disk (HF cache, Ollama blob),
+/// not just under an LM Studio root the way `scan_single_gguf` does.
+fn build_gguf_bytes(kvs: &[(&str, ggus::GGufMetaDataValueType, Vec<u8>)]) -> Vec<u8> {
+    use ggus::{GGufFileHeader, GGufFileWriter};
+    use std::io::Cursor;
+
+    let header = GGufFileHeader::new(3, 0, kvs.len() as u64);
+    let mut buf = Cursor::new(Vec::<u8>::new());
+    let mut writer = GGufFileWriter::new(&mut buf, header).unwrap();
+    for (key, ty, bytes) in kvs {
+        writer.write_meta_kv(key, *ty, bytes).unwrap();
+    }
+    writer.finish::<Vec<u8>>(false).finish().unwrap();
+    buf.into_inner()
+}
+
+/// An empty `.gguf` file: open() succeeds, memmap2 maps it as a 1-byte mapping
+/// that derefs to an EMPTY slice (it does not error on zero-length), then
+/// `GGuf::new` rejects the empty slice and enrichment bails — leaving all
+/// header-derived fields empty while the model stays cataloged.
+#[test]
+fn empty_gguf_file_enrichment_tolerated() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    // Zero-length file: open() ok, mmap → empty slice, GGuf::new fails.
+    write_file(&root.join("org/m/model-Q4_K_M.gguf"), b"");
+
+    let mut store = ModelStore::default();
+    let models = store.scan(&[root.to_path_buf()], &[], &[]).unwrap();
+
+    assert_eq!(models.len(), 1, "empty gguf is still cataloged");
+    assert_eq!(models[0].arch, None);
+    assert_eq!(models[0].ctx_train, None);
+    assert!(!models[0].has_chat_template);
+    assert_eq!(models[0].size_bytes, 0);
+    // mmap failed before GGuf parse → no curated components captured.
+    assert!(models[0].gguf_components.is_empty());
+}
+
+/// A `.gguf` file whose read permission is stripped: scan lists it (dir readable),
+/// then `enrich_gguf_metadata` hits the `File::open` `Err(_) => return` branch.
+/// The model is still cataloged with empty header fields. Unix-only (chmod).
+#[cfg(unix)]
+#[test]
+fn unreadable_gguf_file_open_error_tolerated() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let gguf = root.join("org/m/model-Q4_K_M.gguf");
+    write_file(&gguf, b"GGUFxxxxxxxxxxxx");
+    // Strip read permission on the FILE (parent dirs stay readable so scan lists it).
+    fs::set_permissions(&gguf, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let mut store = ModelStore::default();
+    let result = store.scan(&[root.to_path_buf()], &[], &[]);
+
+    // Restore so TempDir cleanup works regardless of outcome.
+    fs::set_permissions(&gguf, fs::Permissions::from_mode(0o644)).unwrap();
+
+    let models = result.expect("unreadable file must not fail the scan");
+    assert_eq!(models.len(), 1, "file is cataloged despite open() failing");
+    assert_eq!(models[0].arch, None, "open failed → no enrichment");
+    assert!(models[0].gguf_components.is_empty());
+}
+
+/// A real GGUF whose `general.architecture` is `clip` is a projector sidecar and
+/// is excluded by the ARCH-based check (`is_projector_sidecar("", Some("clip"))`)
+/// that runs after enrichment — even though its filename carries no `mmproj`.
+/// Covers the LM Studio post-enrich exclusion path.
+#[test]
+fn lmstudio_clip_arch_projector_excluded_after_enrich() {
+    use ggus::GGufMetaDataValueType::String as GS;
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    // Filename has NO mmproj marker, so the pre-mmap filename check passes; the
+    // exclusion must come from the parsed clip architecture.
+    let bytes = build_gguf_bytes(&[("general.architecture", GS, gguf_str("clip"))]);
+    write_file(&root.join("org/vision/encoder-Q8_0.gguf"), &bytes);
+    // A real chat model alongside it, to prove only the projector is dropped.
+    let chat = build_gguf_bytes(&[("general.architecture", GS, gguf_str("llama"))]);
+    write_file(&root.join("org/chat/model-Q4_K_M.gguf"), &chat);
+
+    let mut store = ModelStore::default();
+    let models = store.scan(&[root.to_path_buf()], &[], &[]).unwrap();
+
+    assert_eq!(models.len(), 1, "clip-arch projector excluded, chat kept");
+    assert_eq!(models[0].id, "org/chat");
+    assert_eq!(models[0].arch.as_deref(), Some("llama"));
+}
+
+/// An LM Studio org directory whose read permission is stripped maps to
+/// `HG001 ModelDirUnreadable` from the org-level `read_dir` (not the root).
+/// Unix-only (chmod).
+#[cfg(unix)]
+#[test]
+fn lmstudio_unreadable_org_dir_errors_hg001() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let org = root.join("org");
+    fs::create_dir_all(&org).unwrap();
+    fs::set_permissions(&org, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let mut store = ModelStore::default();
+    let result = store.scan(&[root.to_path_buf()], &[], &[]);
+
+    fs::set_permissions(&org, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let err = result.expect_err("unreadable org dir must error");
+    assert!(
+        matches!(err, HiggsError::ModelDirUnreadable { ref path, .. } if path.ends_with("org")),
+        "got: {err:?}"
+    );
+}
+
+/// An LM Studio model directory whose read permission is stripped maps to
+/// `HG001 ModelDirUnreadable` from the model-level `read_dir`. Unix-only (chmod).
+#[cfg(unix)]
+#[test]
+fn lmstudio_unreadable_model_dir_errors_hg001() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let model = root.join("org/m");
+    fs::create_dir_all(&model).unwrap();
+    fs::set_permissions(&model, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let mut store = ModelStore::default();
+    let result = store.scan(&[root.to_path_buf()], &[], &[]);
+
+    fs::set_permissions(&model, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let err = result.expect_err("unreadable model dir must error");
+    assert!(
+        matches!(err, HiggsError::ModelDirUnreadable { ref path, .. } if path.ends_with('m')),
+        "got: {err:?}"
+    );
+}
+
+/// A plain file directly under an LM Studio org dir (where a model dir is
+/// expected) is skipped by the `model_path.is_dir()` guard. No error.
+#[test]
+fn lmstudio_file_at_model_level_skipped() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    // A stray file at the model level, plus a real model dir alongside it.
+    write_file(&root.join("org/loose.txt"), b"x");
+    write_file(&root.join("org/m/model-Q4_K_M.gguf"), b"gguf");
+
+    let mut store = ModelStore::default();
+    let models = store.scan(&[root.to_path_buf()], &[], &[]).unwrap();
+
+    assert_eq!(models.len(), 1, "stray model-level file ignored");
+    assert_eq!(models[0].id, "org/m");
+}
+
+/// An HF repo dir whose name has the `models--` prefix but no second `--`
+/// separator cannot be split into org/name → skipped (`split_once` None branch).
+#[test]
+fn hf_cache_repo_without_separator_skipped() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    // models--<no-second-separator> with a snapshot file: must be skipped before
+    // the snapshot is ever walked.
+    write_file(
+        &root.join("models--noseparator/snapshots/rev/model-Q4_K_M.gguf"),
+        b"gguf",
+    );
+    // A well-formed repo alongside it.
+    write_file(
+        &root.join("models--org--good/snapshots/rev/model-Q8_0.gguf"),
+        b"gguf",
+    );
+
+    let mut store = ModelStore::default();
+    let models = store.scan(&[], &[root.to_path_buf()], &[]).unwrap();
+
+    assert_eq!(models.len(), 1, "separator-less repo skipped");
+    assert_eq!(models[0].id, "org/good");
+}
+
+/// A plain file (not a dir) directly under `snapshots/` is skipped by the
+/// `rev_path.is_dir()` guard, without aborting the HF scan.
+#[test]
+fn hf_cache_file_at_revision_level_skipped() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    // A stray file where a revision DIR is expected.
+    write_file(&root.join("models--org--repo/snapshots/stray.txt"), b"x");
+    // A real revision alongside it.
+    write_file(
+        &root.join("models--org--repo/snapshots/rev/model-Q4_K_M.gguf"),
+        b"gguf",
+    );
+
+    let mut store = ModelStore::default();
+    let models = store.scan(&[], &[root.to_path_buf()], &[]).unwrap();
+
+    assert_eq!(models.len(), 1, "non-dir revision entry skipped");
+    assert_eq!(models[0].id, "org/repo");
+}
+
+/// HF cache: a `mmproj-*.gguf` file is excluded by the FILENAME check before the
+/// mmap+parse cost (the pre-enrich `is_projector_sidecar(&fname, None)` branch).
+#[test]
+fn hf_cache_mmproj_filename_projector_excluded() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    write_file(
+        &root.join("models--org--repo/snapshots/rev/mmproj-model-F16.gguf"),
+        b"gguf",
+    );
+    write_file(
+        &root.join("models--org--repo/snapshots/rev/model-Q4_K_M.gguf"),
+        b"gguf",
+    );
+
+    let mut store = ModelStore::default();
+    let models = store.scan(&[], &[root.to_path_buf()], &[]).unwrap();
+
+    assert_eq!(models.len(), 1, "mmproj sidecar excluded by filename");
+    assert!(models[0].path.ends_with("model-Q4_K_M.gguf"));
+}
+
+/// HF cache: a real GGUF with `general.architecture = clip` is excluded by the
+/// post-enrich arch check (filename carries no mmproj marker).
+#[test]
+fn hf_cache_clip_arch_projector_excluded_after_enrich() {
+    use ggus::GGufMetaDataValueType::String as GS;
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let bytes = build_gguf_bytes(&[("general.architecture", GS, gguf_str("clip"))]);
+    write_file(
+        &root.join("models--org--repo/snapshots/rev/encoder-Q8_0.gguf"),
+        &bytes,
+    );
+    let chat = build_gguf_bytes(&[("general.architecture", GS, gguf_str("llama"))]);
+    write_file(
+        &root.join("models--org--repo/snapshots/rev/model-Q4_K_M.gguf"),
+        &chat,
+    );
+
+    let mut store = ModelStore::default();
+    let models = store.scan(&[], &[root.to_path_buf()], &[]).unwrap();
+
+    assert_eq!(models.len(), 1, "clip projector excluded after enrich");
+    assert_eq!(models[0].arch.as_deref(), Some("llama"));
+}
+
+/// HF cache: the snapshots dir of one repo is unreadable → `HG001` from the
+/// snapshot-level `read_dir`. Unix-only (chmod).
+#[cfg(unix)]
+#[test]
+fn hf_cache_unreadable_snapshots_dir_errors_hg001() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let snaps = root.join("models--org--repo/snapshots");
+    fs::create_dir_all(&snaps).unwrap();
+    fs::set_permissions(&snaps, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let mut store = ModelStore::default();
+    let result = store.scan(&[], &[root.to_path_buf()], &[]);
+
+    fs::set_permissions(&snaps, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let err = result.expect_err("unreadable snapshots dir must error");
+    assert!(
+        matches!(err, HiggsError::ModelDirUnreadable { ref path, .. } if path.ends_with("snapshots")),
+        "got: {err:?}"
+    );
+}
+
+/// HF cache: a revision dir whose read permission is stripped → `HG001` from the
+/// revision-level (file-listing) `read_dir`. Unix-only (chmod).
+#[cfg(unix)]
+#[test]
+fn hf_cache_unreadable_revision_dir_errors_hg001() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let rev = root.join("models--org--repo/snapshots/rev");
+    fs::create_dir_all(&rev).unwrap();
+    fs::set_permissions(&rev, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let mut store = ModelStore::default();
+    let result = store.scan(&[], &[root.to_path_buf()], &[]);
+
+    fs::set_permissions(&rev, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let err = result.expect_err("unreadable revision dir must error");
+    assert!(
+        matches!(err, HiggsError::ModelDirUnreadable { ref path, .. } if path.ends_with("rev")),
+        "got: {err:?}"
+    );
+}
+
+/// Ollama: a real GGUF blob with `general.architecture = clip` is excluded by the
+/// post-enrich arch check (Ollama blobs are content-hashed, so only arch can flag
+/// a projector). A normal chat blob alongside it is kept.
+#[test]
+fn ollama_clip_arch_projector_excluded_after_enrich() {
+    use ggus::GGufMetaDataValueType::String as GS;
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+
+    // clip projector blob + manifest.
+    let clip = build_gguf_bytes(&[("general.architecture", GS, gguf_str("clip"))]);
+    write_file(&root.join("blobs/sha256-clipblob"), &clip);
+    let clip_manifest = r#"{"layers":[{"mediaType":"application/vnd.ollama.image.model","digest":"sha256:clipblob"}]}"#;
+    write_file(
+        &root.join("manifests/registry.ollama.ai/library/vision/latest"),
+        clip_manifest.as_bytes(),
+    );
+
+    // real chat blob + manifest.
+    let chat = build_gguf_bytes(&[("general.architecture", GS, gguf_str("llama"))]);
+    write_file(&root.join("blobs/sha256-chatblob"), &chat);
+    let chat_manifest = r#"{"layers":[{"mediaType":"application/vnd.ollama.image.model","digest":"sha256:chatblob"}]}"#;
+    write_file(
+        &root.join("manifests/registry.ollama.ai/library/llama3/latest"),
+        chat_manifest.as_bytes(),
+    );
+
+    let mut store = ModelStore::default();
+    let models = store.scan(&[], &[], &[root.to_path_buf()]).unwrap();
+
+    assert_eq!(models.len(), 1, "clip projector excluded, chat kept");
+    assert_eq!(models[0].id, "ollama/llama3:latest");
+    assert_eq!(models[0].arch.as_deref(), Some("llama"));
+}
+
+/// Ollama: a subdirectory under `manifests/` whose read permission is stripped →
+/// `HG001` from the recursive `collect_manifest_files` walk. Unix-only (chmod).
+#[cfg(unix)]
+#[test]
+fn ollama_unreadable_manifests_subdir_errors_hg001() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let sub = root.join("manifests/registry.ollama.ai/library");
+    fs::create_dir_all(&sub).unwrap();
+    fs::set_permissions(&sub, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let mut store = ModelStore::default();
+    let result = store.scan(&[], &[], &[root.to_path_buf()]);
+
+    fs::set_permissions(&sub, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let err = result.expect_err("unreadable manifests subdir must error");
+    assert!(
+        matches!(err, HiggsError::ModelDirUnreadable { .. }),
+        "got: {err:?}"
+    );
+}
+
+/// A non-existent Ollama root (no `manifests/`) is skipped silently by
+/// `collect_manifest_files` (the NotFound `=> Ok(())` branch) — scan succeeds
+/// with no models.
+#[test]
+fn ollama_missing_manifests_dir_ok() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    // Root exists but has no `manifests/` subdir.
+    fs::create_dir_all(root.join("blobs")).unwrap();
+
+    let mut store = ModelStore::default();
+    let models = store.scan(&[], &[], &[root.to_path_buf()]).unwrap();
+
+    assert!(models.is_empty(), "no manifests dir → no models, no error");
+}
+
+/// `get()` returns None for an id that was never scanned (the `find` miss path).
+#[test]
+fn get_returns_none_for_unknown_id() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    write_file(&root.join("org/m/model-Q4_K_M.gguf"), b"gguf");
+
+    let mut store = ModelStore::default();
+    store.scan(&[root.to_path_buf()], &[], &[]).unwrap();
+
+    assert!(store.get("org/m").is_some(), "known id resolves");
+    assert!(
+        store.get("nope/missing").is_none(),
+        "unknown id resolves to None"
+    );
+}
+
+/// `models()` exposes the catalog accumulated by the last scan, and a re-scan
+/// over empty roots replaces it with an empty catalog.
+#[test]
+fn models_accessor_reflects_last_scan() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    write_file(&root.join("org/m/model-Q4_K_M.gguf"), b"gguf");
+
+    let mut store = ModelStore::default();
+    store.scan(&[root.to_path_buf()], &[], &[]).unwrap();
+    assert_eq!(store.models().len(), 1);
+
+    // Re-scan with no roots → catalog cleared.
+    store.scan(&[], &[], &[]).unwrap();
+    assert!(store.models().is_empty(), "re-scan replaces the catalog");
 }
 
 /// An unreadable root directory (permissions stripped) maps to

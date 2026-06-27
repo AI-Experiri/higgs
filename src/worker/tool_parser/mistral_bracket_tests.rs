@@ -1,4 +1,3 @@
-
 use super::*;
 
 fn p() -> MistralBracketParser {
@@ -89,4 +88,55 @@ fn content_preserves_text_after_and_between_calls() {
     // the text before the first [TOOL_CALLS], dropping "mid" and "post".
     let text = r#"pre[TOOL_CALLS]get_weather[ARGS]{"location":"NYC"}mid[TOOL_CALLS]get_time[ARGS]{"timezone":"EST"}post"#;
     assert_eq!(p().content(text), "premidpost");
+}
+
+#[test]
+fn id_and_open_markers() {
+    assert_eq!(p().id(), "mistral-bracket");
+    assert_eq!(p().open_markers(), &["[TOOL_CALLS]"]);
+}
+
+#[test]
+fn empty_name_call_is_skipped_but_loop_advances() {
+    // An empty-name call is skipped (build_call not invoked), yet the loop still
+    // advances past its JSON so a following well-named call is parsed.
+    let text = r#"[TOOL_CALLS][ARGS]{}[TOOL_CALLS]real[ARGS]{"k":1}"#;
+    let calls = p().parse(text, "e").expect("the named call survives");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["function"]["name"], "real");
+}
+
+#[test]
+fn non_object_args_degrade_to_empty() {
+    // A non-object (array) ARGS body: find_json_end closes on the `]`, build_call
+    // hits the `_ => Map::new()` arm and emits the call with empty arguments.
+    let text = "[TOOL_CALLS]f[ARGS][1,2,3]";
+    let calls = p().parse(text, "n").expect("one call");
+    assert_eq!(calls[0]["function"]["name"], "f");
+    assert_eq!(calls[0]["function"]["arguments"], "{}");
+}
+
+#[test]
+fn json_string_escapes_do_not_close_early() {
+    // An escaped quote inside the JSON args must not terminate find_json_end's
+    // string tracking (exercises the backslash-escape branches).
+    let text = r#"[TOOL_CALLS]note[ARGS]{"msg":"a \"quoted\" } brace"}"#;
+    let calls = p().parse(text, "j").expect("one call");
+    let args: Value =
+        serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(args["msg"], r#"a "quoted" } brace"#);
+}
+
+#[test]
+fn content_drops_incomplete_trailing_call_no_args() {
+    // [TOOL_CALLS] with no [ARGS] separator: content() drops the trailing markup,
+    // keeping only the preamble (the `break ""` no-[ARGS] arm).
+    assert_eq!(p().content("pre[TOOL_CALLS]nameonly"), "pre");
+}
+
+#[test]
+fn content_drops_incomplete_trailing_call_unterminated_json() {
+    // [ARGS] present but the JSON never closes: content() drops the rest
+    // (the `break ""` unterminated-JSON arm).
+    assert_eq!(p().content("pre[TOOL_CALLS]f[ARGS]{unterminated"), "pre");
 }

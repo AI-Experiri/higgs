@@ -1,4 +1,3 @@
-
 use super::*;
 
 /// A scripted CPU device — the shape `FakeEngine::devices` and these tests

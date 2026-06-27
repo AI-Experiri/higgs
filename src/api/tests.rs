@@ -627,3 +627,425 @@ async fn chat_stream_delivers() {
     assert_eq!(chunk1, "he");
     assert_eq!(chunk2, "llo");
 }
+
+// ── log_bus(): delegates to the local node's shared bus ───────────────────
+
+/// `log_bus()` returns the SAME bus the local node carries (verbosity toggled on
+/// one is observed on the other), and a fresh facade's verbose default is off.
+#[tokio::test]
+async fn log_bus_returns_node_shared_bus() {
+    let higgs = fake_higgs(vec![]);
+    let bus = higgs.log_bus();
+    assert!(!bus.verbose(), "fresh bus defaults to non-verbose");
+    // The bus is the node's: flipping verbose through the facade is visible on the
+    // returned handle (same underlying LogBus, not a clone of state).
+    higgs.set_verbose(true);
+    assert!(bus.verbose(), "log_bus() hands back the node's live bus");
+}
+
+// ── set_fleet / fleet(): install + idempotent replace ─────────────────────
+
+/// `fleet()` is `None` on a pure-local facade; `set_fleet` installs one and
+/// `fleet()` then returns it, and a second `set_fleet` REPLACES it (idempotent).
+#[tokio::test]
+async fn set_fleet_installs_and_replaces() {
+    let higgs = fake_higgs(vec![]);
+    assert!(higgs.fleet().is_none(), "no fleet on a pure-local facade");
+
+    let bus = higgs.log_bus();
+    let fleet = Arc::new(crate::node::fleet::HubFleet::new(bus.clone()));
+    higgs.set_fleet(Arc::clone(&fleet));
+    assert!(higgs.fleet().is_some(), "fleet installed");
+
+    // Replacing with a fresh fleet swaps the installed handle wholesale.
+    let fleet2 = Arc::new(crate::node::fleet::HubFleet::new(bus));
+    higgs.set_fleet(Arc::clone(&fleet2));
+    assert!(
+        Arc::ptr_eq(&higgs.fleet().expect("fleet present"), &fleet2),
+        "set_fleet replaces the prior fleet"
+    );
+}
+
+// ── chat_stream: fleet installed but the model is not remote → ModelNotFound ─
+
+/// With a fleet installed but NO remote node serving the id, `chat_stream` falls
+/// through the local-served lookup AND the `fleet.is_remote` check (which is
+/// `false` for an unknown id) to the terminal [HG002] ModelNotFound. Exercises
+/// the `fleet.lock().clone()` + `is_remote` branch without iroh networking.
+#[tokio::test]
+async fn chat_stream_with_fleet_unknown_model_not_found() {
+    let higgs = fake_higgs(vec![]);
+    let bus = higgs.log_bus();
+    higgs.set_fleet(Arc::new(crate::node::fleet::HubFleet::new(bus)));
+
+    let err = higgs
+        .chat_stream(
+            "org/not-here".to_owned(),
+            r#"[{"role":"user","content":"hi"}]"#.to_owned(),
+            8,
+            greedy_sampling(),
+            None,
+        )
+        .await
+        .expect_err("no local + no remote route → ModelNotFound");
+    assert!(matches!(err, HiggsError::ModelNotFound { .. }), "got {err}");
+}
+
+// ── start(): brings up the worker-stderr log relay without error ───────────
+
+/// `start()` spawns the per-worker-stderr → Developer-Log relay and returns
+/// `Ok(())`. (The fake worker has no real process stderr, so the relay loop's
+/// per-line push is exercised by integration tests with a live worker; here we
+/// cover the bring-up path is callable and clean.)
+#[tokio::test]
+async fn start_brings_up_log_relay() {
+    let higgs = Arc::new(fake_higgs(vec![]));
+    higgs.start().await.expect("start brings up the relay");
+}
+
+// ── load with rich engine overrides: persists the effective LlamaCpp set ───
+
+/// A load carrying an ENGINE OVERRIDE beyond the base three (here `use_mmap`)
+/// crosses to the node as a `params` payload and is PERSISTED as the effective
+/// `LlamaCpp` `LoadParams` record (the `Some(lc)` effective branch), with the
+/// node-resolved base fields stamped in. Because request params were supplied,
+/// the accepted profile is also synced to `models.json`.
+#[tokio::test]
+async fn load_with_engine_overrides_persists_effective_llamacpp() {
+    use crate::worker::engine::llamacpp::params::LlamaCppParams;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    crate::serve::test_support::write_gguf_fixture(dir.path(), "org/model");
+    let higgs = fake_higgs(vec![dir.path().to_path_buf()]);
+
+    // ctx_len 0 = AUTO; gpu_layers all; an override (use_mmap) forces the rich path.
+    let params = LoadParams::llamacpp(LlamaCppParams {
+        ctx_len: 0,
+        gpu_layers: u32::MAX,
+        threads: 4,
+        use_mmap: Some(true),
+        ..Default::default()
+    });
+    higgs
+        .load("org/model", Some(params))
+        .await
+        .expect("load with overrides");
+
+    // The persisted config record reflects the effective LlamaCpp set (override kept).
+    let records = higgs.model_records();
+    let rec = records.get("org/model").expect("record persisted");
+    let load = rec.load.as_ref().expect("load params persisted");
+    let lc = load.as_llamacpp();
+    assert_eq!(lc.use_mmap, Some(true), "the engine override is persisted");
+    assert_eq!(
+        lc.gpu_layers,
+        u32::MAX,
+        "node-resolved gpu_layers stamped in"
+    );
+    assert_eq!(lc.threads, 4, "node-resolved threads stamped in");
+    assert_eq!(lc.ctx_len, 0, "auto ctx_len stamped as 0");
+
+    // Request params were supplied → the accepted profile is synced to models.json.
+    let store = higgs.models_store().expect("models store opens");
+    let tuned = store.tuning("org/model").expect("accepted profile synced");
+    assert_eq!(
+        tuned.profile.as_llamacpp().use_mmap,
+        Some(true),
+        "the synced profile carries the override"
+    );
+}
+
+// ── loaded_info_from: a null `loaded` value maps to None ──────────────────
+
+/// `loaded_info_from` returns `None` when the worker's status `loaded` field is
+/// explicitly null (nothing resident), distinct from a missing field. Covers the
+/// `l.is_null()` early-out shared by `status` and `local_loaded_info`.
+#[tokio::test]
+async fn loaded_info_from_null_loaded_is_none() {
+    let higgs = fake_higgs(vec![]);
+    let v = serde_json::json!({ "loaded": serde_json::Value::Null });
+    assert!(
+        higgs.loaded_info_from(&v, &[]).is_none(),
+        "null loaded → None"
+    );
+    // A wholly absent `loaded` key also yields None (the `?` on `v.get(\"loaded\")`).
+    let empty = serde_json::json!({});
+    assert!(
+        higgs.loaded_info_from(&empty, &[]).is_none(),
+        "missing loaded → None"
+    );
+}
+
+// ── local_node_view: local machine as a first-class NodeView ───────────────
+
+/// `local_node_view` reports the LOCAL machine as the `node_id = 0`, `is_local`,
+/// always-connected sentinel, carrying the caller's label and one
+/// [`InventoryWorker`] per resident model tagged with its served id. Covers the
+/// worker-mapping loop and the sentinel construction.
+#[tokio::test]
+async fn local_node_view_lists_resident_workers() {
+    let dir = tempfile::TempDir::new().unwrap();
+    crate::serve::test_support::write_gguf_fixture(dir.path(), "org/model");
+    let higgs = fake_higgs(vec![dir.path().to_path_buf()]);
+
+    // No workers yet: a first-class but empty local node view.
+    let empty = higgs.local_node_view("my-box".to_owned()).await;
+    assert_eq!(empty.node_id, 0, "local sentinel node id");
+    assert_eq!(empty.endpoint_id, "local");
+    assert!(empty.is_local && empty.connected, "local is first-class");
+    assert_eq!(empty.label, "my-box");
+    let inv0 = empty.inventory.expect("inventory present");
+    assert!(inv0.workers.is_empty(), "no workers before a load");
+
+    // After a load, the view lists the worker tagged with its served id.
+    higgs.load("org/model", None).await.expect("load");
+    let view = higgs.local_node_view("my-box".to_owned()).await;
+    let inv = view.inventory.expect("inventory present");
+    assert_eq!(inv.workers.len(), 1, "one resident worker listed");
+    let w = &inv.workers[0];
+    assert_eq!(w.model, "org/model", "raw model on the worker");
+    assert_eq!(w.served_id, "org/model", "served id (deduped == raw)");
+}
+
+// ── sysinfo + hardware: cache hit + the host hardware snapshot ─────────────
+
+/// `sysinfo()` returns the cached device list on a hit (no worker round-trip),
+/// and `hardware()` folds the (empty) GPU list into a full host CPU/RAM snapshot.
+/// The fake worker reports no GPUs, so a cache MISS leaves the cache empty and a
+/// non-empty result/store is only reachable with real FFI — primed here directly.
+#[tokio::test]
+async fn sysinfo_cache_hit_and_hardware_snapshot() {
+    let higgs = fake_higgs(vec![]);
+
+    // Cache MISS path: the fake sysinfo worker yields an empty list, which is NOT
+    // cached (an empty result usually means a failed gather → retry later).
+    let miss = higgs.sysinfo().await;
+    assert!(miss.is_empty(), "fake worker reports no GPUs");
+    assert!(
+        higgs.device_cache.lock().is_none(),
+        "an empty gather is not cached (so a later call retries)"
+    );
+
+    // Prime the cache directly (the only seam to a non-empty list without FFI), then
+    // a hit returns it verbatim with no worker round-trip.
+    let primed = vec![crate::system::GpuDevice {
+        name: "TestGPU".to_owned(),
+        description: "unit-test device".to_owned(),
+        kind: crate::system::DeviceKind::Gpu,
+        vram_total_bytes: 8_000_000_000,
+        vram_free_bytes: 4_000_000_000,
+    }];
+    *higgs.device_cache.lock() = Some(primed.clone());
+    let hit = higgs.sysinfo().await;
+    assert_eq!(hit.len(), 1, "a cache hit returns the cached list");
+    assert_eq!(hit[0].name, "TestGPU");
+
+    // hardware() folds the (cached) GPU list into the host CPU/RAM snapshot.
+    let hw = higgs.hardware().await;
+    assert_eq!(hw.gpus.len(), 1, "hardware carries the cached GPU list");
+    assert_eq!(hw.gpus[0].name, "TestGPU");
+    assert!(hw.cpu_cores >= 1, "host CPU cores are reported");
+}
+
+// ── tune: derive within budget + persist as the saved profile ──────────────
+
+/// `tune` (Suggest mode) for a scanned model: looks up its GGUF meta, derives a
+/// load+sampling set within the budget, and PERSISTS it as the saved profile so
+/// the next plain load reuses it. An `ollama/` id short-circuits the HF-card
+/// fetch (no network), so the static-default suggester path runs deterministically.
+#[tokio::test]
+async fn tune_derives_and_persists_profile() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let id = stage_ollama_model(dir.path(), "llama3", "8b");
+    let higgs = fake_higgs_ollama(vec![dir.path().to_path_buf()]);
+
+    let suggestion = higgs
+        .tune(TuneRequest {
+            id: id.clone(),
+            mode: None, // Suggest (default)
+            budget: None,
+        })
+        .await
+        .expect("tune suggests");
+    assert_eq!(suggestion.id, id, "suggestion is for the requested model");
+    assert_eq!(
+        suggestion.provenance,
+        crate::tune::TuneProvenance::Heuristic,
+        "no HF card for an ollama id → heuristic provenance"
+    );
+
+    // The suggestion is persisted as the saved tuning profile for this id.
+    let store = higgs.models_store().expect("models store opens");
+    let rec = store.tuning(&id).expect("tuning persisted by tune");
+    assert_eq!(
+        rec.profile, suggestion.load,
+        "the persisted profile matches the suggested load"
+    );
+}
+
+/// `tune` in Benchmark mode falls back to Suggest (P2 not yet available) and still
+/// persists a profile — covering the benchmark-mode logging branch.
+#[tokio::test]
+async fn tune_benchmark_mode_falls_back_to_suggest() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let id = stage_ollama_model(dir.path(), "qwen", "0.5b");
+    let higgs = fake_higgs_ollama(vec![dir.path().to_path_buf()]);
+
+    let suggestion = higgs
+        .tune(TuneRequest {
+            id: id.clone(),
+            mode: Some(TuneMode::Benchmark),
+            budget: None,
+        })
+        .await
+        .expect("benchmark tune falls back to suggest");
+    assert_eq!(suggestion.id, id);
+    assert!(
+        higgs.models_store().expect("store").tuning(&id).is_some(),
+        "benchmark-fallback still persists a profile"
+    );
+}
+
+/// `tune` for an id that is not scanned is [HG002] ModelNotFound, before any
+/// hardware/card work.
+#[tokio::test]
+async fn tune_unknown_model_not_found() {
+    let higgs = fake_higgs(vec![]);
+    let err = higgs
+        .tune(TuneRequest {
+            id: "org/absent".to_owned(),
+            mode: None,
+            budget: None,
+        })
+        .await
+        .expect_err("unknown model → ModelNotFound");
+    assert!(matches!(err, HiggsError::ModelNotFound { .. }), "got {err}");
+}
+
+// ── load persistence failure: best-effort warn, load still succeeds ────────
+
+/// When the per-model config record can't be persisted (the config path's parent
+/// is a regular FILE, so both load+save fail), `load` logs the failure but STILL
+/// returns success — persistence is best-effort. Covers the `with_config_mut`
+/// error/warn arm of `load`.
+#[tokio::test]
+async fn load_succeeds_despite_config_persist_failure() {
+    let dir = tempfile::TempDir::new().unwrap();
+    crate::serve::test_support::write_gguf_fixture(dir.path(), "org/model");
+    let higgs = fake_higgs(vec![dir.path().to_path_buf()]);
+
+    // Point config.json UNDER a regular file: `<file>/config.json`. `InstanceConfig`
+    // load+save both fail (the parent is not a directory), so `with_config_mut` errs.
+    let blocker = dir.path().join("not-a-dir");
+    std::fs::write(&blocker, b"x").unwrap();
+    *higgs.config_path.lock() = Some(blocker.join("config.json"));
+
+    higgs
+        .load("org/model", None)
+        .await
+        .expect("load succeeds even when the config record can't be persisted");
+
+    // The model IS resident despite the persistence failure, and no record was written.
+    assert_eq!(
+        higgs.local_served_ids().await,
+        vec!["org/model".to_owned()],
+        "the model loaded"
+    );
+    assert!(
+        higgs.model_records().is_empty(),
+        "the unwritable config holds no record"
+    );
+}
+
+/// When the accepted-profile flush fails (a read-only models home), `sync_saved_profile`
+/// logs the coded failure but the load still succeeds. Drives the
+/// `store.flush()` error arm. Skips when running as root (perms are ignored).
+#[tokio::test]
+async fn sync_saved_profile_survives_flush_failure() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Root ignores file perms, so a read-only dir wouldn't fail the write — skip.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+
+    let dir = tempfile::TempDir::new().unwrap();
+    crate::serve::test_support::write_gguf_fixture(dir.path(), "org/model");
+    let higgs = fake_higgs(vec![dir.path().to_path_buf()]);
+
+    // A READ-ONLY home dir: `models_store().open` succeeds (models.json absent →
+    // empty store) but `flush()` can't create its temp file → Err. Point config.json
+    // INSIDE this dir so `models_store` derives its home as the read-only dir.
+    let home = dir.path().join("ro-home");
+    std::fs::create_dir_all(&home).unwrap();
+    *higgs.config_path.lock() = Some(home.join("config.json"));
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    // A load WITH request params triggers `sync_saved_profile` (from_request = true).
+    let res = higgs
+        .load("org/model", Some(LoadParams::base(0, u32::MAX, 4)))
+        .await;
+
+    // Restore perms so TempDir cleanup can remove the dir regardless of the outcome.
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    res.expect("load succeeds even when the accepted profile can't be flushed");
+    assert_eq!(
+        higgs.local_served_ids().await,
+        vec!["org/model".to_owned()],
+        "the model loaded despite the flush failure"
+    );
+}
+
+// ── ollama staging helpers (for the no-network tune tests) ─────────────────
+
+/// Stage a minimal Ollama model under `root` so a host-side scan catalogs it as
+/// `ollama/<name>:<tag>` (an id `fetch_card_sampling` short-circuits, so `tune`
+/// runs offline). Writes the manifest + a `GGUF`-magic blob the digest points at.
+/// Returns the scanned model id.
+fn stage_ollama_model(root: &std::path::Path, name: &str, tag: &str) -> String {
+    // A tiny but valid-enough GGUF blob (the scanner only checks the 4-byte magic).
+    let blob_bytes = b"GGUF\x00 dummy ollama blob";
+    let hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let blob_dir = root.join("blobs");
+    std::fs::create_dir_all(&blob_dir).unwrap();
+    std::fs::write(blob_dir.join(format!("sha256-{hex}")), blob_bytes).unwrap();
+
+    let manifest = serde_json::json!({
+        "layers": [{
+            "mediaType": "application/vnd.ollama.image.model",
+            "digest": format!("sha256:{hex}"),
+        }],
+    });
+    let manifest_dir = root.join("manifests").join(name);
+    std::fs::create_dir_all(&manifest_dir).unwrap();
+    std::fs::write(manifest_dir.join(tag), manifest.to_string()).unwrap();
+
+    format!("ollama/{name}:{tag}")
+}
+
+/// A `Higgs` facade whose config + node scan the given OLLAMA dirs (so `tune`
+/// finds an `ollama/…` model staged by [`stage_ollama_model`]).
+fn fake_higgs_ollama(ollama_dirs: Vec<PathBuf>) -> Higgs {
+    let node = NodeRuntime::with_spawner(
+        crate::node::runtime::NodeConfig {
+            bus: Arc::new(crate::log_bus::LogBus::new()),
+            lmstudio_dirs: vec![],
+            hf_dirs: vec![],
+            ollama_dirs: ollama_dirs.clone(),
+            idle_ttl: DEFAULT_IDLE_TTL,
+        },
+        Arc::new(|_bus| {
+            crate::supervisor::Supervisor::with_factory(
+                crate::node::test_support::fake_worker_factory_stateful(),
+            )
+        }),
+    );
+    let cfg = HiggsConfig {
+        lmstudio_dirs: vec![],
+        hf_dirs: vec![],
+        ollama_dirs,
+        default_load: HiggsConfig::default().default_load,
+    };
+    Higgs::with_local(Arc::new(node), cfg)
+}

@@ -1,4 +1,3 @@
-
 use super::*;
 
 /// Byte layout taken verbatim from Ollama's `glm46_test.go` ground truth.
@@ -71,4 +70,46 @@ fn content_strips_forced_open_think_without_opening_tag() {
     // Template forced the think block open → only a trailing </think>.
     let forced = "Let me check the weather.\n</think>\n<tool_call>get_weather\n<arg_key>location</arg_key>\n<arg_value>Paris</arg_value>\n</tool_call>";
     assert_eq!(p().content(forced), "");
+}
+
+#[test]
+fn id_and_open_markers() {
+    assert_eq!(p().id(), "glm-xml");
+    assert_eq!(p().open_markers(), &[TOOL_OPEN]);
+}
+
+#[test]
+fn empty_name_call_is_dropped() {
+    // No name text before the first <arg_key> → empty name → parse_one returns
+    // None and the whole parse yields no calls.
+    let text = "<tool_call><arg_key>k</arg_key><arg_value>v</arg_value></tool_call>";
+    assert!(p().parse(text, "x").is_none());
+}
+
+#[test]
+fn missing_arg_key_close_breaks_with_empty_args() {
+    // <arg_key> opens but never closes within the block: the arg loop breaks, but
+    // the named call is still emitted with whatever args parsed so far (none).
+    let text = "<tool_call>f<arg_key>k</tool_call>";
+    let calls = p().parse(text, "a").expect("one call");
+    assert_eq!(calls[0]["function"]["name"], "f");
+    assert_eq!(calls[0]["function"]["arguments"], "{}");
+}
+
+#[test]
+fn missing_arg_value_open_breaks_with_empty_args() {
+    // A complete <arg_key>…</arg_key> with no following <arg_value> → break.
+    let text = "<tool_call>f<arg_key>k</arg_key>no value here</tool_call>";
+    let calls = p().parse(text, "b").expect("one call");
+    assert_eq!(calls[0]["function"]["name"], "f");
+    assert_eq!(calls[0]["function"]["arguments"], "{}");
+}
+
+#[test]
+fn missing_arg_value_close_breaks_with_empty_args() {
+    // <arg_value> opens but never closes → break; the named call still emits.
+    let text = "<tool_call>f<arg_key>k</arg_key><arg_value>v</tool_call>";
+    let calls = p().parse(text, "c").expect("one call");
+    assert_eq!(calls[0]["function"]["name"], "f");
+    assert_eq!(calls[0]["function"]["arguments"], "{}");
 }

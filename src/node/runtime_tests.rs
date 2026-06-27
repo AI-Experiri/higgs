@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::node::test_support::{fake_runtime as fake_runtime_with_dirs, fake_runtime_load_fails};
 use tempfile::TempDir;
@@ -394,3 +393,270 @@ async fn ops_after_shutdown_report_no_worker() {
     assert!(rt.status(id).await.is_err(), "stopped worker is gone");
     assert!(rt.unload(id).await.is_err(), "nothing left to unload");
 }
+
+// ── A `NodeRuntime` backed by the STATEFUL fake worker. ────────────────────────────
+
+/// A stateful-fake-backed runtime staging a dummy GGUF per `id`, so the real load path
+/// runs and `M_STATUS`/`M_UNLOAD`/`M_CHAT` behave like a (model-less) real worker.
+fn stateful_runtime_with_models(ids: &[&str]) -> (NodeRuntime, TempDir) {
+    use crate::node::test_support::fake_runtime_stateful;
+    let dir = TempDir::new().expect("staging dir");
+    for id in ids {
+        let model_dir = dir.path().join(id);
+        std::fs::create_dir_all(&model_dir).expect("model dir");
+        std::fs::write(model_dir.join("m.gguf"), b"GGUF\x00 dummy").expect("write dummy gguf");
+    }
+    let rt = fake_runtime_stateful(vec![dir.path().to_path_buf()]);
+    (rt, dir)
+}
+
+// The stateful fake records the model on M_LOAD and reports it back under `loaded` on
+// M_STATUS — so `status()` round-trips the loaded model + its ctx_len/gpu_layers/threads.
+#[tokio::test]
+async fn stateful_status_reports_the_loaded_model() {
+    let (rt, _dir) = stateful_runtime_with_models(&["org/stateful"]);
+    let id = rt
+        .load(NodeLoadParams {
+            id: "org/stateful".into(),
+            ctx_len: Some(2048),
+            gpu_layers: Some(0),
+            threads: Some(4),
+            params: None,
+        })
+        .await
+        .expect("load")
+        .0;
+    let status = rt.status(id).await.expect("status");
+    let loaded = &status["loaded"];
+    assert_eq!(
+        loaded["id"], "org/stateful",
+        "status echoes the loaded model"
+    );
+    assert_eq!(loaded["ctx_len"], 2048, "status echoes ctx_len");
+    assert_eq!(loaded["threads"], 4, "status echoes threads");
+}
+
+// Driving M_CHAT through a `ChatLease` exercises the stateful fake's chat branch (it
+// streams `he`/`llo` then a final response with token counts). The lease's Deref hands the
+// underlying Supervisor straight through, and dropping it posts ChatEnd.
+#[tokio::test]
+async fn chat_lease_drives_the_stateful_chat_path() {
+    use crate::worker::M_CHAT;
+    let (rt, _dir) = stateful_runtime_with_models(&["org/chat"]);
+    let (id, _) = rt.load(load_params("org/chat")).await.expect("load");
+    let lease = rt.chat_handle(id).await.expect("lease");
+    // Deref the lease to the Supervisor and run one chat — the fake streams chunks then
+    // a final response carrying the content + token counts.
+    let resp = lease
+        .request(
+            M_CHAT,
+            serde_json::json!({ "request_id": 1, "messages": [] }),
+        )
+        .await
+        .expect("chat response");
+    assert_eq!(
+        resp["content"], "hello",
+        "stateful fake returns the chat content"
+    );
+    assert_eq!(resp["completion_tokens"], 3, "token counts propagate");
+    // Dropping the lease ends the chat (ChatEnd) without panicking; the worker stays
+    // resident (default 60-min TTL).
+    drop(lease);
+    assert_eq!(
+        rt.worker_ids().await.len(),
+        1,
+        "worker still resident after chat"
+    );
+}
+
+// A worker whose M_STATUS always errors (busy mid-generation) still LOADS — so it is
+// resident — but `status()` surfaces the worker's RPC error rather than a stub. This is the
+// node-level view of the "resident-but-unreachable" condition (`fake_status_failing_factory`).
+#[tokio::test]
+async fn status_failing_worker_loads_but_status_errors() {
+    use crate::node::test_support::fake_runtime_status_fails;
+    let dir = TempDir::new().expect("staging dir");
+    let model_dir = dir.path().join("org/busy");
+    std::fs::create_dir_all(&model_dir).unwrap();
+    std::fs::write(model_dir.join("m.gguf"), b"GGUF\x00 dummy").unwrap();
+    let rt = fake_runtime_status_fails(vec![dir.path().to_path_buf()]);
+    // M_LOAD echoes the id → the worker is recorded as resident.
+    let (id, loaded) = rt.load(load_params("org/busy")).await.expect("load ok");
+    assert_eq!(loaded["id"], "org/busy", "load echoes the served id");
+    assert_eq!(rt.worker_ids().await.len(), 1, "worker is resident");
+    // But the status probe errors (worker busy): the node forwards the worker's failure.
+    assert!(
+        rt.status(id).await.is_err(),
+        "status probe surfaces the worker error"
+    );
+    // It is still listed in instances/inventory despite the failing probe.
+    assert_eq!(
+        rt.instances().await.len(),
+        1,
+        "resident despite status failure"
+    );
+}
+
+// Multiple DISTINCT models can be resident at once, each on its own worker with its own id;
+// instances() lists every (worker, model) pair and unloading one leaves the rest.
+#[tokio::test]
+async fn multiple_distinct_models_are_concurrently_resident() {
+    let (rt, _dir) = fake_runtime_with_models(&["org/a", "org/b", "org/c"]);
+    let (wa, _) = load(&rt, "org/a").await;
+    let (_wb, _) = load(&rt, "org/b").await;
+    let (_wc, _) = load(&rt, "org/c").await;
+    let mut insts = rt.instances().await;
+    insts.sort_by(|x, y| x.1.cmp(&y.1));
+    assert_eq!(insts.len(), 3, "three resident workers");
+    let models: Vec<&str> = insts.iter().map(|(_, m)| m.as_str()).collect();
+    assert_eq!(
+        models,
+        vec!["org/a", "org/b", "org/c"],
+        "each worker its own model"
+    );
+    // Unload the middle model: the other two stay resident.
+    rt.unload(wa).await.expect("unload a");
+    assert_eq!(rt.worker_ids().await.len(), 2, "the rest remain resident");
+}
+
+// A successful load that COMMITS during a shutdown drain is reaped (not kept) and the load
+// is refused — the terminal-shutdown guard in `LoadCommit`'s Ok branch. Driven by racing many
+// success loads against shutdown_all so some resolve mid-drain.
+#[tokio::test]
+async fn successful_load_during_shutdown_is_reaped_and_refused() {
+    let (rt, _dir) = fake_runtime_with_models(&["org/a", "org/b", "org/c", "org/d"]);
+    // Fire several loads concurrently with the drain so at least one commits after
+    // `shutting_down` is set (reaped + refused) rather than before it.
+    let (_a, _b, _c, _d, _s) = tokio::join!(
+        rt.load(load_params("org/a")),
+        rt.load(load_params("org/b")),
+        rt.load(load_params("org/c")),
+        rt.load(load_params("org/d")),
+        rt.shutdown_all(),
+    );
+    // Whatever the interleaving, the drain leaves NOTHING committed: a load that resolved
+    // before the drain was reaped by `drain()`, one that resolved during it by the Ok+
+    // shutting_down branch.
+    assert!(
+        rt.worker_ids().await.is_empty(),
+        "no worker survives the drain regardless of commit timing"
+    );
+}
+
+// A chat lease held across an UNLOAD: when the lease drops it posts ChatEnd for a worker the
+// registry no longer has, so the actor drops its stale bookkeeping (the `else` arm of
+// ChatEnd) instead of leaking it. Must not panic and must leave an empty registry.
+#[tokio::test]
+async fn chat_end_for_unloaded_worker_drops_bookkeeping() {
+    let (rt, _dir) = fake_runtime_with_models(&["org/m"]);
+    let (id, _) = load(&rt, "org/m").await;
+    let lease = rt.chat_handle(id).await.expect("lease");
+    // Unload while the chat lease is still held — the worker leaves the registry.
+    rt.unload(id).await.expect("unload");
+    assert!(rt.worker_ids().await.is_empty(), "worker gone after unload");
+    // Dropping the lease now posts ChatEnd for a worker that is no longer resident; the
+    // actor takes the `forget_activity` branch. Give the message a moment to drain.
+    drop(lease);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        rt.worker_ids().await.is_empty(),
+        "registry stays empty; stale ChatEnd dropped its bookkeeping"
+    );
+    // The actor is still healthy after the stale ChatEnd — a fresh op succeeds.
+    assert!(
+        rt.scan().await.is_ok(),
+        "actor still serving after stale ChatEnd"
+    );
+}
+
+// resolve_model's symlink-escape guard ([HG015]): a cataloged GGUF whose path canonicalizes
+// OUTSIDE every configured scan root is rejected as InvalidModelId, with no worker spawned.
+#[tokio::test]
+async fn load_rejects_a_model_symlinked_outside_the_roots() {
+    // The scan root holds a model dir, but its `m.gguf` is a symlink to a file OUTSIDE the
+    // root — so it catalogs (the symlink is under the root) yet canonicalizes to escape.
+    let root = TempDir::new().expect("scan root");
+    let outside = TempDir::new().expect("outside dir");
+    let target = outside.path().join("real.gguf");
+    std::fs::write(&target, b"GGUF\x00 dummy").expect("write outside gguf");
+    let model_dir = root.path().join("org/escape");
+    std::fs::create_dir_all(&model_dir).expect("model dir");
+    std::os::unix::fs::symlink(&target, model_dir.join("m.gguf")).expect("symlink gguf");
+
+    let rt = fake_runtime_with_dirs(vec![root.path().to_path_buf()]);
+    let err = rt.load(load_params("org/escape")).await.unwrap_err();
+    assert!(
+        err.to_string().contains("[HG015]") || err.to_string().contains("outside"),
+        "symlink-escape rejected as InvalidModelId: {err}"
+    );
+    assert!(
+        rt.worker_ids().await.is_empty(),
+        "no worker spawned for an escaping path"
+    );
+}
+
+// worker_load_params merges EVERY non-base, non-null override key into the M_LOAD object
+// (the `obj.insert(k, v)` merge loop), while base fields stay authoritative and a null is
+// skipped. Several overrides at once exercises the loop body, not just one branch.
+#[test]
+fn worker_load_params_merges_all_rich_overrides() {
+    use crate::worker::engine::llamacpp::params::LlamaCppParams;
+    use crate::worker::engine::{FlashAttn, KvCacheKind};
+    let mut rich = LlamaCppParams::base(0, 10, 8);
+    rich.flash_attn = Some(FlashAttn::Off);
+    rich.type_k = Some(KvCacheKind::Q8_0);
+    rich.type_v = Some(KvCacheKind::Q8_0);
+    rich.cpu_moe = Some(false);
+    rich.use_mmap = Some(true);
+    let v = worker_load_params(
+        "org/m",
+        "/x.gguf",
+        Some(4096),
+        Some(10),
+        Some(8),
+        &Some(rich),
+    );
+    let obj = v.as_object().expect("object");
+    // Base fields (authoritative) present from the explicit args.
+    assert_eq!(obj["ctx_len"], 4096);
+    assert_eq!(obj["gpu_layers"], 10);
+    assert_eq!(obj["threads"], 8);
+    // Every rich override merged in.
+    assert_eq!(obj["flash_attn"], "off");
+    assert_eq!(obj["type_k"], "Q8_0");
+    assert_eq!(obj["type_v"], "Q8_0");
+    assert_eq!(obj["cpu_moe"], false);
+    assert_eq!(obj["use_mmap"], true);
+}
+
+// The idle reaper task exits cleanly once the runtime is dropped: with a tiny TTL the reaper
+// ticks fast, and after the last handle drops its WeakHandle upgrade fails so the loop breaks.
+// We can only observe this indirectly (no panic / no hang); the value is exercising the
+// reaper's drop-exit branch with a fast cadence.
+#[tokio::test]
+async fn dropping_runtime_stops_the_idle_reaper() {
+    use crate::node::test_support::fake_runtime_with_idle_ttl;
+    let dir = TempDir::new().expect("staging dir");
+    let model_dir = dir.path().join("org/m");
+    std::fs::create_dir_all(&model_dir).unwrap();
+    std::fs::write(model_dir.join("m.gguf"), b"GGUF\x00 dummy").unwrap();
+    let rt = fake_runtime_with_idle_ttl(
+        vec![dir.path().to_path_buf()],
+        std::time::Duration::from_millis(50),
+    );
+    load(&rt, "org/m").await;
+    // Drop the runtime: shutdown_all first so the worker is drained, then drop the handle so
+    // the reaper's next tick sees a dead WeakHandle and exits.
+    rt.shutdown_all().await;
+    drop(rt);
+    // Let several reap intervals elapse so the reaper definitely ticks and breaks.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    // Nothing to assert beyond "no panic / no hang" — the test passing means the reaper
+    // loop broke instead of spinning against a dead handle.
+}
+
+// `worker_ids`/`instances`/`gpus` return EMPTY after the actor mailbox is gone. The mailbox
+// only closes once the last `Handle` drops — which the wrapper holds — so via the public
+// surface these graceful-empty fallbacks are not reachable without dropping the wrapper's
+// handle. Covered here only to the extent the happy path exercises them (above); the
+// actor-gone fallbacks are reported unreachable.

@@ -1,4 +1,3 @@
-
 use super::*;
 
 const M: &[&str] = &["<tool_call>"];
@@ -54,4 +53,24 @@ fn lone_lt_is_not_held_forever() {
 fn multibyte_content_not_split() {
     // CJK before a marker; bytes must stay char-aligned.
     assert_eq!(run(&["天气", "<tool_call>x"]), "天气");
+}
+
+#[test]
+fn emits_text_preceding_marker_in_same_piece() {
+    // Content and the opening marker arrive in ONE piece: the text before the
+    // marker (pos > 0) is emitted, then everything from the marker on is
+    // suppressed. Exercises the `if pos > 0 { emit(held[..pos]) }` branch.
+    assert_eq!(
+        run(&["Sure!<tool_call><function=x></function></tool_call>"]),
+        "Sure!"
+    );
+}
+
+#[test]
+#[should_panic(expected = "tool-call open markers must be non-empty")]
+fn new_rejects_empty_marker() {
+    // The debug_assert guards against an empty marker (which would underflow
+    // `partial_tail_len`'s `m.len() - 1`). Constructing with one must panic.
+    const EMPTY: &[&str] = &[""];
+    ToolCallStreamFilter::new(EMPTY);
 }

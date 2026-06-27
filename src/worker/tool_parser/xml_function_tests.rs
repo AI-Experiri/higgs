@@ -1,4 +1,3 @@
-
 use super::*;
 
 /// The exact format the Nemotron GGUF template documents.
@@ -74,4 +73,37 @@ fn parses_two_tool_calls() {
 fn no_tool_call_returns_none() {
     assert!(p().parse("just a normal answer", "x").is_none());
     assert!(p().parse("<tool_call>\n<function=x>", "x").is_none()); // unterminated
+}
+
+#[test]
+fn id_and_open_markers() {
+    assert_eq!(p().id(), "xml-function");
+    assert_eq!(p().open_markers(), &["<tool_call>"]);
+}
+
+#[test]
+fn empty_function_name_is_dropped() {
+    // `<function=>` with an empty name → parse_one returns None → no calls.
+    let text = "<tool_call><function=></function></tool_call>";
+    assert!(p().parse(text, "x").is_none());
+}
+
+#[test]
+fn missing_parameter_close_breaks_with_empty_args() {
+    // A <parameter=…> opens but never closes with </parameter>: the param loop
+    // breaks, and the named call is still emitted with no args parsed.
+    let text = "<tool_call><function=f><parameter=k>val</function></tool_call>";
+    let calls = p().parse(text, "b").expect("one call");
+    assert_eq!(calls[0]["function"]["name"], "f");
+    assert_eq!(calls[0]["function"]["arguments"], "{}");
+}
+
+#[test]
+fn parameter_without_value_close_angle_breaks() {
+    // `<parameter=k` with no closing `>` hits the `find('>') else break` arm; the
+    // named call still emits with empty args.
+    let text = "<tool_call><function=f><parameter=k</function></tool_call>";
+    let calls = p().parse(text, "c").expect("one call");
+    assert_eq!(calls[0]["function"]["name"], "f");
+    assert_eq!(calls[0]["function"]["arguments"], "{}");
 }

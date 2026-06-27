@@ -1,4 +1,3 @@
-
 use super::*;
 
 #[test]
@@ -238,6 +237,79 @@ fn load_tolerates_unknown_future_fields() {
     assert!(cfg.hubs.is_empty());
     assert!(cfg.default_hub.is_none());
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn load_io_error_is_hg040_with_kind_preserved() {
+    // A read error that is NOT NotFound (here: the path is a directory, so
+    // `std::fs::read` returns IsADirectory) is an HG040 persistence fault, distinct
+    // from the corruption (HG041) path. The original io kind is preserved.
+    let dir = tempfile::tempdir().unwrap();
+    let as_dir = dir.path().join("config-is-a-dir");
+    std::fs::create_dir(&as_dir).unwrap();
+    let err = InstanceConfig::load(&as_dir).unwrap_err();
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::IsADirectory,
+        "kind preserved"
+    );
+    let msg = err.to_string();
+    assert!(msg.contains("[HG040]"), "I/O fault carries HG040: {msg}");
+    assert!(
+        msg.contains("check free disk space"),
+        "carries the HG040 remediation: {msg}"
+    );
+}
+
+#[test]
+fn save_rename_failure_cleans_up_temp() {
+    // write_tmp SUCCEEDS (the parent dir exists) but the final atomic rename FAILS
+    // because the destination is itself a directory — exercising save's rename
+    // inspect_err closure (remove the stray temp file, surface the error).
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("config-target");
+    std::fs::create_dir(&target).unwrap(); // rename(tmp, target) fails: target is a dir
+    let cfg = InstanceConfig {
+        name: "node-x(box)".into(),
+        ..Default::default()
+    };
+    let err = cfg.save(&target).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::IsADirectory);
+    // The temp file (.config.json.tmp.*) was removed; the parent holds only the dir.
+    let strays: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(".config.json.tmp")
+        })
+        .collect();
+    assert!(strays.is_empty(), "the temp file was cleaned up on failure");
+}
+
+#[test]
+fn save_write_tmp_failure_cleans_up_and_errors() {
+    // `create_dir_all(dir)` succeeds on an already-present directory, but writing the
+    // temp file inside a READ-ONLY directory fails — exercising save's write_tmp
+    // failure arm (remove the partial temp, return the raw error). Skipped if the
+    // process is root (perms are bypassed), so the assertion stays meaningful.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let ro = dir.path().join("readonly");
+    std::fs::create_dir(&ro).unwrap();
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let cfg = InstanceConfig {
+        name: "node-y(box)".into(),
+        ..Default::default()
+    };
+    let result = cfg.save(&ro.join("config.json"));
+    // Restore perms so the TempDir can clean up regardless of the outcome.
+    let _ = std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755));
+    // Running as root bypasses the read-only bit; only assert when actually denied.
+    if let Err(e) = result {
+        assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+    }
 }
 
 #[test]

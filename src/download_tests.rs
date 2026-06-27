@@ -1,4 +1,3 @@
-
 use super::*;
 
 /// A no-network fetcher that emits canned chunks + progress. `report_total` toggles
@@ -321,6 +320,241 @@ async fn download_dual_does_not_retry_downloads_own_fs_error() {
     assert!(
         err.to_string().starts_with("[HG034]"),
         "download's own fs error surfaced verbatim (not HG036): {err}"
+    );
+}
+
+#[tokio::test]
+async fn download_maps_local_create_dir_failure_to_hg034() {
+    // `download` (not `download_dual`): put a FILE where the `org` dir must be created, so the
+    // dest-parent `create_dir_all` (download.rs:194-195) fails → mapped to a LOCAL HG034 and
+    // surfaced verbatim through `download`'s `into_inner`. No fetcher is ever consulted.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("org"), b"blocker").unwrap();
+    let fetcher = FakeFetcher::new(vec![b"never".to_vec()]);
+    let target = PullTarget::new("org/m", "x.gguf");
+    let err = download(&target, dir.path(), &fetcher, &mut |_, _| {})
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().starts_with("[HG034]"),
+        "create_dir_all failure → HG034 (HubFileWrite): {err}"
+    );
+}
+
+#[tokio::test]
+async fn download_maps_rename_failure_to_hg034_and_cleans_temp() {
+    // Force the atomic rename (download.rs:240-242) to fail: pre-create the final dest path as a
+    // NON-EMPTY directory. `rename(2)` of a regular `.part` file onto a non-empty dir fails
+    // (ENOTEMPTY/EISDIR) → mapped to a LOCAL HG034, and the `.part` temp is removed.
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dest_path(dir.path(), "org/m", "x.gguf").unwrap();
+    std::fs::create_dir_all(&dest).unwrap();
+    // A child inside the dest dir makes the rename-over-dir definitively fail.
+    std::fs::write(dest.join("occupied"), b"keep").unwrap();
+    let fetcher = FakeFetcher::new(vec![b"payload".to_vec()]);
+    let target = PullTarget::new("org/m", "x.gguf");
+    let err = download(&target, dir.path(), &fetcher, &mut |_, _| {})
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().starts_with("[HG034]"),
+        "rename onto a non-empty dir → HG034: {err}"
+    );
+    // No `.part` temp lingers next to the dest after the failed rename.
+    let leftover = std::fs::read_dir(dest.parent().unwrap())
+        .unwrap()
+        .filter_map(Result::ok)
+        .any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .to_string()
+                .contains("part.")
+        });
+    assert!(!leftover, "the .part temp is removed after a failed rename");
+}
+
+#[tokio::test]
+async fn download_dual_returns_primary_success_without_consulting_fallback() {
+    // The primary succeeds on the first attempt → `download_dual` returns its path via the
+    // `Ok(path) => Ok(path)` arm (download.rs:267); the fallback is never invoked. A fallback
+    // that would PANIC if called proves it is not consulted.
+    let dir = tempfile::tempdir().unwrap();
+    let primary = FakeFetcher::new(vec![b"primary-bytes".to_vec()]);
+    let fallback = FakeFetcher::failing(|| panic!("fallback must NOT run when primary succeeds"));
+    let target = PullTarget::new("org/m", "x.gguf");
+    let path = download_dual(&target, dir.path(), &primary, &fallback, &mut |_, _| {})
+        .await
+        .expect("primary succeeds");
+    assert_eq!(std::fs::read(&path).unwrap(), b"primary-bytes");
+}
+
+#[test]
+fn models_dir_creates_under_higgs_home() {
+    // `models_dir()` resolves `<HIGGS_HOME>/models` and creates it. Drive it through an
+    // isolated HIGGS_HOME (serialized by TEST_ENV_LOCK, restored after) so it neither reads
+    // nor mutates the dev machine's real `~/.higgs`.
+    let _env = crate::TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let home = tempfile::tempdir().unwrap();
+    let prev = std::env::var_os("HIGGS_HOME");
+    // SAFETY: serialized by TEST_ENV_LOCK; restored below.
+    unsafe { std::env::set_var("HIGGS_HOME", home.path()) };
+
+    let dir = models_dir().expect("models_dir resolves + creates");
+    assert_eq!(dir, home.path().join("models"), "lands at <HOME>/models");
+    assert!(dir.is_dir(), "the models dir is created");
+
+    // SAFETY: still under the lock.
+    unsafe {
+        match prev {
+            Some(v) => std::env::set_var("HIGGS_HOME", v),
+            None => std::env::remove_var("HIGGS_HOME"),
+        }
+    }
+}
+
+/// Spawn a local axum server on `127.0.0.1:0` serving `app`. Returns the base URL
+/// (`http://127.0.0.1:PORT`) and the server task. The `HttpFetcher` tests point
+/// `HIGGS_HF_ENDPOINT` at this so they exercise the real `reqwest` streaming path with NO
+/// network.
+async fn serve_once(app: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (base, handle)
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn http_fetcher_streams_success_body_and_reports_progress() {
+    // The reqwest FALLBACK fetcher streams a 200 `resolve` response: each chunk is handed to
+    // `on_chunk` and progress is reported with the advertised content length
+    // (download.rs:306-340). A LOCAL axum server stands in for huggingface.co via
+    // HIGGS_HF_ENDPOINT — no network. The env mutation is serialized by TEST_ENV_LOCK; the URL
+    // is built (under the lock) before the first await, so the override can't race.
+    let body = b"hello-gguf-bytes".to_vec();
+    let app = {
+        let body = body.clone();
+        axum::Router::new().fallback(move || {
+            let body = body.clone();
+            async move { body }
+        })
+    };
+    let (base, server) = serve_once(app).await;
+
+    let _env = crate::TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let prev = std::env::var_os("HIGGS_HF_ENDPOINT");
+    // SAFETY: serialized by TEST_ENV_LOCK; restored below.
+    unsafe { std::env::set_var("HIGGS_HF_ENDPOINT", &base) };
+
+    let mut got = Vec::new();
+    let mut seen: Vec<(u64, Option<u64>)> = Vec::new();
+    let res = HttpFetcher
+        .fetch(
+            &PullTarget::new("org/m", "x.gguf"),
+            &mut |b: &[u8]| got.extend_from_slice(b),
+            &mut |d, t| seen.push((d, t)),
+        )
+        .await;
+
+    // SAFETY: still under the lock.
+    unsafe {
+        match prev {
+            Some(v) => std::env::set_var("HIGGS_HF_ENDPOINT", v),
+            None => std::env::remove_var("HIGGS_HF_ENDPOINT"),
+        }
+    }
+    server.abort();
+
+    res.expect("a 200 resolve streams successfully");
+    assert_eq!(got, body, "all streamed bytes delivered to on_chunk");
+    let total: u64 = body.len() as u64;
+    assert_eq!(
+        seen.last(),
+        Some(&(total, Some(total))),
+        "final progress = full body with the advertised content length"
+    );
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn http_fetcher_classifies_non_success_status() {
+    // A non-success status routes through `hub::http_status_to_error`: 404 → HG030
+    // (download.rs:321-329). The local server returns 404 for every path.
+    let app =
+        axum::Router::new().fallback(|| async { (axum::http::StatusCode::NOT_FOUND, "missing") });
+    let (base, server) = serve_once(app).await;
+
+    let _env = crate::TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let prev = std::env::var_os("HIGGS_HF_ENDPOINT");
+    // SAFETY: serialized by TEST_ENV_LOCK; restored below.
+    unsafe { std::env::set_var("HIGGS_HF_ENDPOINT", &base) };
+
+    let res = HttpFetcher
+        .fetch(
+            &PullTarget::new("org/m", "x.gguf"),
+            &mut |_: &[u8]| {},
+            &mut |_, _| {},
+        )
+        .await;
+
+    // SAFETY: still under the lock.
+    unsafe {
+        match prev {
+            Some(v) => std::env::set_var("HIGGS_HF_ENDPOINT", v),
+            None => std::env::remove_var("HIGGS_HF_ENDPOINT"),
+        }
+    }
+    server.abort();
+
+    let err = res.expect_err("404 status must fail the fetch");
+    assert!(
+        err.to_string().starts_with("[HG030]"),
+        "404 → HubResourceNotFound (HG030): {err}"
+    );
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn http_fetcher_maps_connection_refused_to_transport() {
+    // A transport-level failure (the initial `reqwest::get`) maps to HG033 (HubTransport,
+    // download.rs:318-320). Point the endpoint at a reserved closed port so the connect fails
+    // locally with no network.
+    let _env = crate::TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let prev = std::env::var_os("HIGGS_HF_ENDPOINT");
+    // 127.0.0.1:1 — privileged/closed; the connect is refused locally (no DNS, no network).
+    // SAFETY: serialized by TEST_ENV_LOCK; restored below.
+    unsafe { std::env::set_var("HIGGS_HF_ENDPOINT", "http://127.0.0.1:1") };
+
+    let res = HttpFetcher
+        .fetch(
+            &PullTarget::new("org/m", "x.gguf"),
+            &mut |_: &[u8]| {},
+            &mut |_, _| {},
+        )
+        .await;
+
+    // SAFETY: still under the lock.
+    unsafe {
+        match prev {
+            Some(v) => std::env::set_var("HIGGS_HF_ENDPOINT", v),
+            None => std::env::remove_var("HIGGS_HF_ENDPOINT"),
+        }
+    }
+
+    let err = res.expect_err("a refused connection must fail the fetch");
+    assert!(
+        err.to_string().starts_with("[HG033]"),
+        "connection refused → HubTransport (HG033): {err}"
     );
 }
 

@@ -1,4 +1,3 @@
-
 use super::*;
 use std::sync::Arc;
 
@@ -312,6 +311,113 @@ fn remote_ring_is_capacity_bounded() {
         bus.push(a, format!("l{i}"));
     }
     assert_eq!(bus.snapshot(usize::MAX, Some(a)).len(), RING_CAP);
+}
+
+#[test]
+fn default_constructs_an_empty_bus() {
+    // `Default` defers to `new()` — a fresh bus with empty rings.
+    let bus = LogBus::default();
+    assert!(bus.snapshot(10, None).is_empty());
+    assert!(!bus.show_fields(), "DEBUG mode off by default");
+    assert!(!bus.verbose(), "verbose off by default");
+}
+
+#[test]
+fn layer_captures_debug_typed_error_and_fields() {
+    // Non-string fields (recorded via the `?` Debug sigil) route through the visitor's
+    // `record_debug` path, distinct from the string `record_str` path. The error field
+    // is always appended; the extra is appended only in DEBUG (show_fields) mode.
+    use tracing_subscriber::layer::SubscriberExt;
+    let bus = Arc::new(LogBus::new());
+    bus.set_show_fields(true);
+    let subscriber = tracing_subscriber::registry().with(HiggsLogLayer::new(bus.clone()));
+    tracing::subscriber::with_default(subscriber, || {
+        // `?value` (the Debug sigil) routes the field through the visitor's
+        // `record_debug`, distinct from the `record_str` path the string tests hit.
+        let err_val = vec![1u8, 2, 3];
+        let extra_val = Some(9u32);
+        tracing::warn!(
+            target: "higgs::test",
+            error = ?err_val,
+            extra_dbg = ?extra_val,
+            "higgs: debug-typed"
+        );
+    });
+    let snap = bus.snapshot(10, None);
+    assert_eq!(snap.len(), 1);
+    let line = &snap[0];
+    assert!(
+        line.contains("higgs: debug-typed"),
+        "message present: {line}"
+    );
+    assert!(
+        line.contains("[1, 2, 3]"),
+        "debug-typed error field appended: {line}"
+    );
+    assert!(
+        line.contains("extra_dbg=Some(9)"),
+        "debug-typed extra field shown in DEBUG mode: {line}"
+    );
+}
+
+#[test]
+fn layer_drops_debug_level_when_not_verbose() {
+    // With verbose OFF, a higgs-target DEBUG/TRACE event is dropped at the level gate
+    // (`return`) — only INFO+ reaches the Developer-Logs ring.
+    use tracing_subscriber::layer::SubscriberExt;
+    let bus = Arc::new(LogBus::new());
+    assert!(!bus.verbose());
+    let subscriber = tracing_subscriber::registry().with(HiggsLogLayer::new(bus.clone()));
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::debug!(target: "higgs::test", "higgs: a debug line");
+        tracing::info!(target: "higgs::test", "higgs: an info line");
+    });
+    let snap = bus.snapshot(10, None);
+    assert_eq!(snap.len(), 1, "only the INFO line survives the level gate");
+    assert!(
+        snap[0].contains("higgs: an info line"),
+        "the DEBUG line was dropped, the INFO line kept: {snap:?}"
+    );
+    assert!(
+        !snap[0].contains("a debug line"),
+        "the DEBUG line must not appear: {snap:?}"
+    );
+}
+
+#[test]
+fn layer_drops_event_with_no_message() {
+    // An event carrying no `message` (only structured fields) is dropped — the bus
+    // only buffers human lines, never a bare field dump.
+    use tracing_subscriber::layer::SubscriberExt;
+    let bus = Arc::new(LogBus::new());
+    let subscriber = tracing_subscriber::registry().with(HiggsLogLayer::new(bus.clone()));
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::info!(target: "higgs::test", only_field = "x");
+    });
+    assert!(
+        bus.snapshot(10, None).is_empty(),
+        "a message-less event is not buffered"
+    );
+}
+
+#[test]
+fn log_filter_admits_higgs_debug() {
+    // The per-layer filter scopes DEBUG admission to the `higgs` target only, so a
+    // higgs DEBUG event reaches the layer (its own gate then drops it unless verbose),
+    // while DEBUG from any other target is never generated for this layer.
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::Layer;
+    let bus = Arc::new(LogBus::new());
+    bus.set_verbose(true); // so admitted DEBUG survives the layer's own gate
+    let subscriber = tracing_subscriber::registry()
+        .with(HiggsLogLayer::new(bus.clone()).with_filter(log_filter()));
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::debug!(target: "higgs::test", "higgs: filtered debug");
+        tracing::debug!(target: "other::test", "should be filtered out");
+    });
+    let snap = bus.snapshot(10, None);
+    assert_eq!(snap.len(), 1, "only the higgs-target DEBUG is admitted");
+    assert!(snap[0].contains("higgs: filtered debug"), "{:?}", snap);
 }
 
 #[test]

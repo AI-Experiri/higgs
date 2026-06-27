@@ -1,4 +1,3 @@
-
 use super::*;
 
 /// Collect all payloads `assemble` produces for the given inputs. `include_usage`
@@ -206,10 +205,149 @@ async fn assemble_worker_death_mid_stream() {
     assert_eq!(payloads[3], "[DONE]", "[DONE] is always last");
 }
 
+/// Collect all payloads `assemble` produces with `verbose` toggled. Drives the
+/// verbose `log_served` branch (the only difference from `run_assemble_opts`).
+async fn run_assemble_verbose(
+    deltas: mpsc::UnboundedReceiver<String>,
+    outcome: JoinHandle<Result<ChatOutcome, HiggsError>>,
+) -> Vec<String> {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    assemble(
+        "chatcmpl-t".into(),
+        "org/model".into(),
+        1,
+        deltas,
+        outcome,
+        tx,
+        true, // verbose → log_served fires
+        std::time::Instant::now(),
+        false,
+    )
+    .await;
+    let mut out = Vec::new();
+    while let Ok(p) = rx.try_recv() {
+        out.push(p);
+    }
+    out
+}
+
+/// Verbose path: a successful outcome with `verbose=true` still emits the same
+/// role + delta + finish + [DONE] frames (the verbose `higgs: served …` line
+/// goes to tracing, not the SSE channel). Exercises the `if verbose` branch in
+/// `assemble` that calls `super::v1::log_served`.
+#[tokio::test]
+async fn assemble_verbose_still_frames_in_order() {
+    let (dtx, drx) = mpsc::unbounded_channel();
+    dtx.send("hi".to_owned()).unwrap();
+    let outcome = tokio::spawn(async {
+        Ok(ChatOutcome {
+            content: "hi".into(),
+            finish_reason: "length".into(),
+            tool_calls: None,
+            prompt_tokens: 3,
+            completion_tokens: 2,
+        })
+    });
+
+    let payloads = run_assemble_verbose(drx, outcome).await;
+    // role + delta + finish + [DONE] — the verbose serving line is a tracing
+    // event, not an SSE payload, so the frame count is unchanged.
+    assert_eq!(payloads.len(), 4, "role + delta + finish + [DONE]");
+    let parse =
+        |s: &str| -> CreateChatCompletionStreamResponse { serde_json::from_str(s).unwrap() };
+    assert_eq!(
+        parse(&payloads[0]).choices[0].delta.role,
+        Some(Role::Assistant)
+    );
+    assert_eq!(
+        parse(&payloads[1]).choices[0].delta.content.as_deref(),
+        Some("hi")
+    );
+    assert_eq!(
+        parse(&payloads[2]).choices[0].finish_reason,
+        Some(FinishReason::Length)
+    );
+    assert_eq!(payloads[3], "[DONE]");
+}
+
+/// The chat task panicked/was aborted: the `outcome` JoinHandle resolves to
+/// `Err(JoinError)` (NOT a `HiggsError`). `assemble` must surface it as the
+/// coded `[HG044]` chat-task-failed envelope, then `[DONE]`. Exercises the
+/// `Err(join_err)` arm of `assemble` (the ChatTaskFailed mapping).
+#[tokio::test]
+async fn assemble_join_error_emits_hg044_envelope() {
+    let (_dtx, drx) = mpsc::unbounded_channel::<String>();
+    // A task that never completes; aborting it makes `outcome.await` yield a
+    // JoinError (cancelled), driving the JoinError arm.
+    let outcome: JoinHandle<Result<ChatOutcome, HiggsError>> = tokio::spawn(async {
+        std::future::pending::<()>().await;
+        unreachable!("aborted before completion")
+    });
+    outcome.abort();
+
+    let payloads = run_assemble(drx, outcome).await;
+    // role + HG044 error envelope + [DONE].
+    assert_eq!(
+        payloads.len(),
+        3,
+        "role + HG044 envelope + [DONE]: {payloads:?}"
+    );
+    assert!(
+        payloads[1].contains("[HG044]"),
+        "envelope carries the chat-task-failed code: {}",
+        payloads[1]
+    );
+    assert!(
+        payloads[1].contains("server_error"),
+        "HG044 → 500 → server_error envelope type: {}",
+        payloads[1]
+    );
+    assert_eq!(payloads[2], "[DONE]");
+}
+
 /// Parse a worker `tool_calls` value through the shared interpreter (as the
 /// assemble path does), then map to streaming chunks. Mirrors the real flow.
 fn stream_from_value(v: serde_json::Value) -> Option<Vec<ChatCompletionMessageToolCallChunk>> {
     super::super::v1::interpret_tool_calls(&Some(v)).map(stream_tool_calls)
+}
+
+/// The `Custom` tool-call variant is never produced by `interpret_tool_calls`
+/// (higgs's OAI-compat parser only emits function calls), so it can't be reached
+/// through `stream_from_value`. Construct it directly to exercise the `Custom`
+/// arm of `stream_tool_calls`: it must surface the id with a function-type tag
+/// and a `None` function (no streaming-custom shape exists).
+#[test]
+fn stream_tool_calls_maps_custom_variant() {
+    use async_openai::types::chat::{ChatCompletionMessageCustomToolCall, CustomTool};
+
+    let calls = vec![
+        ChatCompletionMessageToolCalls::Custom(ChatCompletionMessageCustomToolCall {
+            id: "call_custom".into(),
+            custom_tool: CustomTool {
+                name: "shell".into(),
+                input: "ls -la".into(),
+            },
+        }),
+        ChatCompletionMessageToolCalls::Custom(ChatCompletionMessageCustomToolCall {
+            id: "call_custom2".into(),
+            custom_tool: CustomTool::default(),
+        }),
+    ];
+    let chunks = stream_tool_calls(calls);
+    assert_eq!(chunks.len(), 2);
+
+    assert_eq!(chunks[0].index, 0);
+    assert_eq!(chunks[0].id.as_deref(), Some("call_custom"));
+    // Custom calls have no streaming-function shape: type tagged Function, no fn.
+    assert_eq!(chunks[0].r#type, Some(FunctionType::Function));
+    assert!(
+        chunks[0].function.is_none(),
+        "custom call carries no function"
+    );
+
+    assert_eq!(chunks[1].index, 1);
+    assert_eq!(chunks[1].id.as_deref(), Some("call_custom2"));
+    assert!(chunks[1].function.is_none());
 }
 
 #[test]

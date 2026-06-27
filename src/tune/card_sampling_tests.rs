@@ -1,4 +1,3 @@
-
 use super::*;
 
 #[test]
@@ -114,4 +113,86 @@ fn generation_config_drops_fractional_top_k() {
     // truncated to 20 — coercion would persist a value the config never stated.
     let s = parse_generation_config(br#"{"top_k": 20.5}"#).expect("parsed");
     assert_eq!(s.top_k, None);
+}
+
+#[test]
+fn empty_and_static_sources_recommend_expected() {
+    // EmptySamplingSource always recommends nothing (the offline default).
+    let empty = EmptySamplingSource.recommend(&ModelMeta::default());
+    assert_eq!(empty, LlamaCppSamplingParams::default());
+    assert!(!has_any_sampling(&empty));
+
+    // StaticSamplingSource echoes whatever it was built with, regardless of meta.
+    let pinned = LlamaCppSamplingParams {
+        temperature: Some(0.8),
+        top_p: Some(0.92),
+        ..Default::default()
+    };
+    let src = StaticSamplingSource(pinned.clone());
+    let got = src.recommend(&ModelMeta {
+        id: "org/whatever".into(),
+        ..Default::default()
+    });
+    assert_eq!(got, pinned);
+    assert!(has_any_sampling(&got));
+}
+
+#[test]
+fn typical_p_is_mined_from_prose() {
+    // typical_p (and the hyphen spelling) round out the prose key set.
+    let s = parse_card_sampling("we set typical_p 0.85 for this run");
+    assert_eq!(s.typical_p, Some(0.85));
+    let s = parse_card_sampling("set typical-p to 0.5");
+    assert_eq!(s.typical_p, Some(0.5));
+    // Out-of-range typical_p is DROPPED, not clamped.
+    assert!(parse_card_sampling("typical_p 1.5").typical_p.is_none());
+}
+
+#[test]
+fn typical_p_is_mined_from_generation_config() {
+    let s = parse_generation_config(br#"{"typical_p": 0.9}"#).expect("parsed");
+    assert_eq!(s.typical_p, Some(0.9));
+    // Out-of-range typical_p in structured config is dropped, not clamped.
+    let s = parse_generation_config(br#"{"typical_p": 2.0}"#).expect("parsed");
+    assert!(s.typical_p.is_none());
+}
+
+#[test]
+fn negative_number_token_is_parsed() {
+    // A leading `-` starts a numeric token (e.g. a negative penalty window written
+    // next to a recognized key); first_number_in must consume the sign. top_k's
+    // range starts at 0, so a negative top_k is parsed THEN dropped as out-of-range.
+    let s = parse_card_sampling("top_k -5 was tried");
+    assert!(
+        s.top_k.is_none(),
+        "negative top_k parses then drops (range 0..=1000): {:?}",
+        s.top_k
+    );
+    // A negative value still parses for a key whose lower bound is 0.0: temperature
+    // -0.5 is in-window, parsed, and dropped (out of 0.0..=2.0).
+    let s = parse_card_sampling("temperature -0.5 reported");
+    assert!(s.temperature.is_none(), "negative temp dropped: {:?}", s);
+}
+
+#[test]
+fn trailing_sentence_period_is_stripped_from_number() {
+    // "0.0." — the trailing period is a sentence stop, not a second decimal point;
+    // the value parses as 0.0, not as an invalid "0.0.".
+    let s = parse_card_sampling("Recommended min_p 0.0. Then generate.");
+    assert_eq!(s.min_p, Some(0.0));
+    // A whole number followed by a period likewise strips the period (top_k 20.).
+    let s = parse_card_sampling("top_k 20. is plenty");
+    assert_eq!(s.top_k, Some(20));
+}
+
+#[tokio::test]
+async fn fetch_card_sampling_skips_non_hf_ids() {
+    // Fail-open, no network: ollama ids and ids without exactly one slash return
+    // None before any fetch is attempted (the early-return guard, no I/O).
+    assert!(fetch_card_sampling("ollama/llama3:8b").await.is_none());
+    assert!(fetch_card_sampling("bareword").await.is_none());
+    assert!(
+        fetch_card_sampling("a/b/c").await.is_none(),
+        "two slashes is not org/model"
+    );
 }

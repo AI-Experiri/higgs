@@ -1,4 +1,3 @@
-
 use serde_json::json;
 
 use super::*;
@@ -139,4 +138,71 @@ fn empty_name_call_is_skipped() {
     assert!(p()
         .parse("<start_function_call>call:{a:1}<end_function_call>", "x")
         .is_none());
+}
+
+#[test]
+fn id_and_open_markers() {
+    assert_eq!(p().id(), "function-gemma");
+    assert_eq!(p().open_markers(), &[OPEN]);
+}
+
+/// The `call:` prefix may be preceded by whitespace/newlines inside the block —
+/// the `or_else(trim_start)` fallback strips it.
+#[test]
+fn leading_whitespace_before_call_prefix() {
+    let text =
+        "<start_function_call>\n  call:get_weather{city:<escape>Paris<escape>}<end_function_call>";
+    let calls = p().parse(text, "w").expect("one call");
+    assert_eq!(calls[0]["function"]["name"], "get_weather");
+    assert_eq!(args_of(&calls[0])["city"], "Paris");
+}
+
+/// A block whose args do NOT end in `}` (trailing text after the args object)
+/// exercises the `rfind('}')` fallback: args are bounded by the LAST brace.
+#[test]
+fn args_with_trailing_text_after_brace() {
+    let text = "<start_function_call>call:f{a:1}trailing<end_function_call>";
+    let calls = p().parse(text, "t").expect("one call");
+    let a = args_of(&calls[0]);
+    assert_eq!(a["a"], 1); // args bounded at the last `}`, trailing ignored
+}
+
+/// A block with NO closing brace at all takes the `None => args_body` arm of
+/// the suffix fallback (the whole remainder is the args body).
+#[test]
+fn args_without_closing_brace() {
+    let text = "<start_function_call>call:f{a:1<end_function_call>";
+    let calls = p().parse(text, "n").expect("one call");
+    assert_eq!(args_of(&calls[0])["a"], 1);
+}
+
+/// A segment with no `:` is skipped (the `continue` in parse_object).
+#[test]
+fn segment_without_colon_is_skipped() {
+    let text = "<start_function_call>call:f{noColonHere,b:2}<end_function_call>";
+    let a = args_of(&p().parse(text, "c").expect("one call")[0]);
+    assert!(a.get("noColonHere").is_none());
+    assert_eq!(a["b"], 2);
+}
+
+/// `false` coerces to a JSON bool (the false arm of parse_value), an integer
+/// stays an integer, a float stays a float, and a bare unrecognized token
+/// degrades to a string (the final fall-through).
+#[test]
+fn typed_value_coercions() {
+    let text =
+        "<start_function_call>call:f{flag:false,n:7,ratio:1.5,bare:hello}<end_function_call>";
+    let a = args_of(&p().parse(text, "v").expect("one call")[0]);
+    assert_eq!(a["flag"], false);
+    assert_eq!(a["n"], 7);
+    assert_eq!(a["ratio"], 1.5);
+    assert_eq!(a["bare"], "hello"); // bare non-typed token stays a string
+}
+
+/// A nested `{…}` object value goes through the object arm of parse_value.
+#[test]
+fn nested_object_value() {
+    let text = "<start_function_call>call:f{opts:{inner:5}}<end_function_call>";
+    let a = args_of(&p().parse(text, "o").expect("one call")[0]);
+    assert_eq!(a["opts"]["inner"], 5);
 }

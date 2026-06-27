@@ -1,4 +1,3 @@
-
 use super::HiggsOk;
 
 /// `HiggsOk::default()` (the `Default` impl) yields the same `{"status":"ok"}`

@@ -1,4 +1,3 @@
-
 use super::*;
 
 /// A lean JSON object carrying only a couple of base fields deserializes into
@@ -145,6 +144,20 @@ fn unsupported_sampler_flags_only_unapplied_advanced_samplers() {
         }
         .unsupported_sampler(),
         Some("logit_bias"),
+    );
+    assert_eq!(
+        LlamaCppSamplingParams {
+            dry: Some(DryParams {
+                multiplier: 0.8,
+                base: 1.75,
+                allowed_length: 2,
+                penalty_last_n: -1,
+                sequence_breakers: vec!["\n".to_string()],
+            }),
+            ..Default::default()
+        }
+        .unsupported_sampler(),
+        Some("dry"),
     );
     assert_eq!(
         LlamaCppSamplingParams {

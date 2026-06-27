@@ -1,4 +1,3 @@
-
 use super::*;
 
 /// Single call, exact byte layout from the Ollama Go `tool_call_simple` test.
@@ -84,4 +83,49 @@ fn content_preserves_text_around_and_between_calls() {
     let env = "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>f<｜tool▁sep｜>{}<｜tool▁call▁end｜><｜tool▁calls▁end｜>";
     let text = format!("A{env}B{env}C");
     assert_eq!(p().content(&text), "ABC");
+}
+
+#[test]
+fn id_and_open_markers() {
+    // Trait identity + the streaming-filter open marker list.
+    assert_eq!(p().id(), "deepseek3");
+    assert_eq!(p().open_markers(), &[CALLS_BEGIN]);
+}
+
+#[test]
+fn unterminated_call_begin_breaks() {
+    // calls-begin present, a call-begin present, but the matching call-end is
+    // missing — the parse loop hits the `break` (no CALL_END) and yields no calls.
+    let text =
+        "before<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>{\"a\":1}";
+    assert!(p().parse(text, "x").is_none());
+}
+
+#[test]
+fn region_unbounded_when_calls_end_missing() {
+    // No CALLS_END at all: `region` is the whole remainder (the `None => region`
+    // branch), yet a complete inner call still parses.
+    let text = "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>f<｜tool▁sep｜>{\"k\":1}<｜tool▁call▁end｜>trailing";
+    let calls = p().parse(text, "y").expect("one call");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["function"]["name"], "f");
+}
+
+#[test]
+fn empty_name_call_is_dropped() {
+    // A `<｜tool▁sep｜>` with an empty (whitespace-only) name before it is rejected
+    // by parse_one's empty-name guard, so no call is emitted.
+    let text =
+        "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>   <｜tool▁sep｜>{\"a\":1}<｜tool▁call▁end｜><｜tool▁calls▁end｜>";
+    assert!(p().parse(text, "x").is_none());
+}
+
+#[test]
+fn non_object_or_invalid_args_dropped() {
+    // Args that are not a JSON object (a bare array, and outright malformed JSON)
+    // both hit parse_one's `_ => return None`.
+    let arr = "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>f<｜tool▁sep｜>[1,2,3]<｜tool▁call▁end｜><｜tool▁calls▁end｜>";
+    assert!(p().parse(arr, "x").is_none());
+    let bad = "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>f<｜tool▁sep｜>{not json}<｜tool▁call▁end｜><｜tool▁calls▁end｜>";
+    assert!(p().parse(bad, "x").is_none());
 }

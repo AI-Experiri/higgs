@@ -1,4 +1,3 @@
-
 use std::sync::{Arc, Mutex};
 
 use tracing_subscriber::fmt::MakeWriter;
@@ -138,4 +137,141 @@ fn engine_diagnostics_capture_clear_and_drain() {
         take_engine_diagnostics().is_empty(),
         "clear resets the buffer"
     );
+}
+
+/// `record_engine_diagnostic` honors the [`MAX_ENGINE_DIAGNOSTICS`] bound: lines
+/// past the cap are dropped (the false branch of the `buf.len() < MAX` guard) so
+/// a pathological engine can't grow the buffer without limit. The first lines
+/// (the root cause) are the ones retained.
+#[test]
+fn record_engine_diagnostic_caps_at_max() {
+    clear_engine_diagnostics();
+    let total = MAX_ENGINE_DIAGNOSTICS + 10;
+    for i in 0..total {
+        record_engine_diagnostic(format!("line {i}"));
+    }
+    let captured = take_engine_diagnostics();
+    assert_eq!(
+        captured.len(),
+        MAX_ENGINE_DIAGNOSTICS,
+        "buffer is bounded by MAX_ENGINE_DIAGNOSTICS, excess dropped"
+    );
+    assert_eq!(
+        captured.first().map(String::as_str),
+        Some("line 0"),
+        "the first (root-cause) lines are retained"
+    );
+    assert_eq!(
+        captured.last().map(String::as_str),
+        Some(format!("line {}", MAX_ENGINE_DIAGNOSTICS - 1).as_str()),
+        "the last retained line is exactly at the cap boundary"
+    );
+    // No leakage into a subsequent window.
+    clear_engine_diagnostics();
+}
+
+/// In normal mode an engine INFO event with NO `module` field passes the MODULE
+/// gate (the `None => true` arm of `event_enabled`): the suppression list is
+/// matched only on a present `module` value, so a module-less line is kept.
+#[test]
+fn normal_mode_keeps_engine_info_without_module_field() {
+    let buf = BufWriter::default();
+    let flag = Arc::new(AtomicBool::new(false));
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(buf.clone())
+            .with_filter(EngineLogFilter { verbose: flag }),
+    );
+    tracing::subscriber::with_default(subscriber, || {
+        // Engine INFO with no `module` field at all -> visitor.module is None.
+        tracing::info!(target: ENGINE_TARGET, "module-less engine line");
+    });
+    let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        out.contains("module-less engine line"),
+        "module-less engine INFO is kept (None arm of the MODULE gate)"
+    );
+}
+
+/// In normal mode an engine INFO event whose `module` field arrives via `Debug`
+/// (the `?value` sigil, not a string literal) is read by
+/// [`ModuleVisitor::record_debug`]. A non-noisy debug module stays visible,
+/// proving the Debug fallback populates `visitor.module` and the `Some` arm runs.
+#[test]
+fn normal_mode_reads_module_via_debug_fallback_keeps_non_noisy() {
+    let buf = BufWriter::default();
+    let flag = Arc::new(AtomicBool::new(false));
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(buf.clone())
+            .with_filter(EngineLogFilter { verbose: flag }),
+    );
+    let module_value = String::from("llama.cpp::load_tensors");
+    tracing::subscriber::with_default(subscriber, || {
+        // `?module_value` records the field via Debug, exercising record_debug.
+        tracing::info!(target: ENGINE_TARGET, module = ?module_value, "debug-module engine line");
+    });
+    let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        out.contains("debug-module engine line"),
+        "non-noisy module read via Debug fallback stays visible"
+    );
+}
+
+/// In normal mode an engine INFO event whose `module` field arrives via `Debug`
+/// AND names a noisy module is still suppressed: the Debug fallback strips the
+/// surrounding quotes so the value matches a [`NOISY_ENGINE_MODULES`] entry.
+#[test]
+fn normal_mode_reads_noisy_module_via_debug_fallback_suppresses() {
+    let buf = BufWriter::default();
+    let flag = Arc::new(AtomicBool::new(false));
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(buf.clone())
+            .with_filter(EngineLogFilter { verbose: flag }),
+    );
+    let noisy = String::from("llama.cpp::print_info");
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::info!(target: ENGINE_TARGET, module = ?noisy, "debug-noisy engine line");
+    });
+    let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        !out.contains("debug-noisy engine line"),
+        "noisy module read via Debug fallback is still suppressed (quotes stripped)"
+    );
+}
+
+/// [`MessageVisitor::record_str`] is the defensive fallback for a `message` field
+/// that arrives as a plain `&str` (rather than rendered format args via Debug).
+/// An explicit string-valued `message` field on an engine ERROR is captured into
+/// the diagnostics buffer through that `record_str` path.
+#[test]
+fn engine_diagnostics_capture_message_via_record_str() {
+    clear_engine_diagnostics();
+    let subscriber = tracing_subscriber::registry().with(EngineDiagnosticCapture);
+    tracing::subscriber::with_default(subscriber, || {
+        // An explicit `message = "..."` string field records via record_str.
+        tracing::error!(target: ENGINE_TARGET, message = "explicit string message");
+    });
+    assert_eq!(
+        take_engine_diagnostics(),
+        vec!["explicit string message".to_string()],
+        "engine ERROR with a string-valued message field is captured via record_str"
+    );
+    clear_engine_diagnostics();
+}
+
+/// [`set_engine_verbose`] is a no-op when logging was never installed (the
+/// `ENGINE_VERBOSE` OnceLock is unset, so `get()` returns None). It must not
+/// panic — the worker calls it from the `higgs/log_level` RPC unconditionally.
+#[test]
+fn set_engine_verbose_is_noop_when_uninstalled() {
+    // ENGINE_VERBOSE is only set by install_worker_logging, which performs FFI
+    // and installs a process-global subscriber; in the unit harness it is never
+    // run, so this drives the None branch. Both values must be safe to call.
+    set_engine_verbose(true);
+    set_engine_verbose(false);
 }
