@@ -808,9 +808,6 @@ fn stage_dummy(root: &std::path::Path, id: &str) {
 // Exercises the `if let Err(err) = higgs.load(...)` branch in `ensure_loaded`.
 
 #[tokio::test]
-#[ignore = "UNVERIFIED: asserts a JIT load failure (fake HG017) surfaces 503+[HG017], but \
-the actual response differs. Confirm the correct status/code mapping (possible HG017->500 gap) \
-before re-enabling."]
 async fn v1_chat_jit_load_failure_surfaces_mapped_error() {
     let dir = tempfile::TempDir::new().unwrap();
     stage_dummy(dir.path(), "org/model");

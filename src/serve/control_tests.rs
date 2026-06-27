@@ -1159,9 +1159,6 @@ async fn node_models_with_fleet_disconnected_node_errors() {
 /// hermetic temp `config.json`, never `~/.higgs`). It returns `{"status":"ok"}`
 /// and the new name surfaces in the subsequent `GET /api/higgs/nodes`.
 #[tokio::test]
-#[ignore = "UNVERIFIED: renames the local node then expects the nodes view to show the new \
-label, but it stays 'this machine'. Either make_higgs()'s config isn't hermetic/persisted, or \
-local-node rename doesn't reflect in the view (possible bug). Diagnose before re-enabling."]
 async fn nodes_label_local_renames_this_instance() {
     let higgs = make_higgs();
     let app = app_for(higgs);

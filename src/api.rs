@@ -292,6 +292,20 @@ impl Higgs {
         }
     }
 
+    /// This instance's `config.json` `name` — the local node's operator label, shown first in
+    /// `GET /api/higgs/nodes`. Read through the SAME per-instance seam ([`Self::config_file_path`])
+    /// that [`Self::with_config_mut`] writes, so a `POST /api/higgs/nodes/label {node:"local"}`
+    /// rename round-trips. (In production the seam resolves to the global `~/.higgs/config.json`;
+    /// only in unit tests is it a per-instance override — reading the global path directly there
+    /// meant the view never saw the write.) Empty/absent → `None`.
+    pub(crate) fn instance_name(&self) -> Option<String> {
+        self.config_file_path()
+            .ok()
+            .and_then(|p| crate::config::InstanceConfig::load(&p).ok())
+            .map(|c| c.name)
+            .filter(|n| !n.is_empty())
+    }
+
     /// Serialize a read-modify-write of `config.json` under [`Self::config_io`]: load the current
     /// config, apply `f`, then persist atomically — so concurrent load-record / rename / autoload
     /// writes can't clobber each other. The closure runs while the lock is held; it must not block

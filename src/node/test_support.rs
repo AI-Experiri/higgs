@@ -239,7 +239,10 @@ pub(crate) fn fake_load_failing_factory() -> HalvesFactory {
                         error: Some(crate::rpc::RpcError {
                             code: -32000,
                             message: "[HG017] fake load failure".into(),
-                            data: None,
+                            // A real worker carries its diagnostic code in JSON-RPC `data`
+                            // (supervisor's send_request reads `data.code`), so the boundary maps
+                            // HG017 → 503. Mirror that so the fake is faithful to a real load fault.
+                            data: Some(json!({ "code": "HG017" })),
                         }),
                     }
                 } else {

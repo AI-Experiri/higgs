@@ -517,11 +517,8 @@ pub(super) async fn control_nodes(
     tracing::info!("higgs: GET /api/higgs/nodes");
 
     // The local node always appears first, labelled with this instance's config.json name.
-    let local_label = crate::config::config_path()
-        .ok()
-        .and_then(|p| crate::config::InstanceConfig::load(&p).ok())
-        .map(|c| c.name)
-        .filter(|n| !n.is_empty())
+    let local_label = higgs
+        .instance_name()
         .unwrap_or_else(|| "this machine".to_string());
     let mut out = vec![higgs.local_node_view(local_label).await];
 

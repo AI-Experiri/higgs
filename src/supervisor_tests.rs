@@ -1729,9 +1729,6 @@ async fn attempt_restart_happy_path_restarts() {
 // the `Some(new_read)` continue arm (lines 959-961). The respawned worker then
 // answers a fresh request over the second transport.
 #[tokio::test]
-#[ignore = "DEADLOCKS: after a backoff-respawn the request never reaches obs2, so \
-read_request_id() awaits forever (no timeout). Either a real bug in attempt_restart's \
-serving-rewire, or a flaw in this test's mock wiring — must be diagnosed before re-enabling."]
 async fn reader_task_respawns_after_backoff_and_serves() {
     let (sup_write_1, _obs1) = tokio::io::duplex(64 * 1024);
     let (test_write_1, sup_read_1) = tokio::io::duplex(64 * 1024);
@@ -1786,18 +1783,35 @@ async fn reader_task_respawns_after_backoff_and_serves() {
     .expect("events within timeout");
     assert!(restarted, "WorkerDied then WorkerRestarted after backoff");
 
-    // The respawned worker serves a fresh request over the SECOND transport.
-    // The writer wired by attempt_restart owns sup_write_2 → frames come out
-    // on `obs2`; read the request id off the wire and reply on test_write_2.
-    let fut = sup.request("higgs/ping", json!({}));
-    let id = read_request_id(&mut obs2).await;
-    write_line(&mut test_write_2, &ok_response(id, json!({"pong": true}))).await;
-    let resp = tokio::time::timeout(std::time::Duration::from_millis(500), fut)
+    // The respawned worker serves a fresh request over the SECOND transport
+    // (attempt_restart's install_writer wired sup_write_2, so frames come out on
+    // `obs2`). `sup.request(..)` is a LAZY future — it only sends when polled — so
+    // it must be DRIVEN concurrently with reading the request off the wire; awaiting
+    // the read first would deadlock (the request is never sent). Both halves are
+    // timeout-bounded so a serving-rewire regression FAILS fast, never hangs.
+    let (resp, ()) = tokio::join!(
+        async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                sup.request("higgs/ping", json!({})),
+            )
+            .await
+            .expect("respawned worker answers within 2s")
+        },
+        async {
+            let id = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                read_request_id(&mut obs2),
+            )
+            .await
+            .expect("respawned worker received the request within 2s");
+            write_line(&mut test_write_2, &ok_response(id, json!({ "pong": true }))).await;
+        }
+    );
+    assert_eq!(resp.expect("ok response"), json!({ "pong": true }));
+    tokio::time::timeout(std::time::Duration::from_secs(2), sup.stop())
         .await
-        .expect("respawned worker answers")
-        .expect("ok response");
-    assert_eq!(resp, json!({"pong": true}));
-    sup.stop().await;
+        .expect("stop completes");
 }
 
 // ─── reader_task: stopped flips DURING the 1s backoff → break, no respawn ──
