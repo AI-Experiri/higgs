@@ -210,3 +210,22 @@ fn sampling_params_lean_round_trip() {
     assert_eq!(back, s);
     assert!(back.mirostat.is_none() && back.grammar.is_none() && back.dry.is_none());
 }
+
+/// Every `LlamaCppParams` field carries a `#[help = "…"]` annotation; the
+/// generated `PARAM_HELP` map exposes those one-line descriptions for the
+/// frontend tooltip. Spot-check a few + assert the count stays in lockstep
+/// with the struct (24 fields).
+#[test]
+fn param_help_covers_every_field() {
+    use std::collections::HashMap;
+    let help: HashMap<&str, &str> = LlamaCppParams::PARAM_HELP.iter().copied().collect();
+    // Spot-check the base fields + a few advanced ones.
+    assert_eq!(help.get("ctx_len"), Some(&"context window size"));
+    assert_eq!(help.get("gpu_layers"), Some(&"layers offloaded to GPU"));
+    assert_eq!(help.get("threads"), Some(&"generation threads"));
+    assert_eq!(help.get("flash_attn"), Some(&"flash-attention policy"));
+    assert_eq!(help.get("type_k"), Some(&"KV key cache type"));
+    assert_eq!(help.get("seed"), Some(&"sampler RNG seed"));
+    // Every field is annotated — keep this in lockstep with the struct.
+    assert_eq!(LlamaCppParams::PARAM_HELP.len(), 24);
+}

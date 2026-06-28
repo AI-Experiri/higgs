@@ -139,51 +139,61 @@ higgs_ts! {
     /// u32::MAX` means "all on GPU" (LM Studio "max" semantics). Every other field
     /// is optional: absent (`None`/empty) means "use the engine default", which
     /// reproduces the pre-expansion behavior exactly.
-    #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, higgs_macros::TsParamHelp)]
     #[serde(default)]
     pub struct LlamaCppParams {
         // ── model params (LlamaModelParams) ──────────────────────────────────
         /// Context window (`with_n_ctx`). [`CtxLen::Auto`] = the engine's trained context
         /// (the old `ctx_len == 0` sentinel); [`CtxLen::Fixed`] pins an explicit window.
+        #[help = "context window size"]
         pub ctx_len: CtxLen,
         /// Layers offloaded to GPU (`with_n_gpu_layers`). [`GpuLayers::All`] = every layer
         /// (the old `u32::MAX` sentinel); [`GpuLayers::Count`] carries an explicit count.
+        #[help = "layers offloaded to GPU"]
         pub gpu_layers: GpuLayers,
         /// Worker threads used during generation (`with_n_threads`; also seeds
         /// `n_threads_batch` when that is unset).
         #[ts(type = "number")]
+        #[help = "generation threads"]
         pub threads: u32,
         /// Memory-map the GGUF instead of reading it into RAM (`with_use_mmap`).
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
+        #[help = "memory-map the model file"]
         pub use_mmap: Option<bool>,
         /// Lock model pages in RAM, preventing swap (`with_use_mlock`).
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
+        #[help = "lock model in RAM"]
         pub use_mlock: Option<bool>,
         /// Keep MoE expert tensors on the CPU (`add_cpu_moe_override`, pinned
         /// apply). Boolean only — no numeric `n_cpu_moe` binding exists. The
         /// suggester flips this on under VRAM pressure when RAM still fits.
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
+        #[help = "keep MoE experts on CPU"]
         pub cpu_moe: Option<bool>,
         /// Per-tensor-buffer-type → CPU regex overrides (`add_cpu_buft_override`,
         /// pinned apply; advanced/manual). Drives finer MoE offload later. Always
         /// serialized (possibly `[]`) so the bindings' required-array shape is honest.
+        #[help = "CPU tensor-buffer overrides"]
         pub cpu_buft_overrides: Vec<String>,
         /// Multi-GPU split mode (`with_split_mode`). DEFERRED-derive; no-op default.
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
+        #[help = "multi-GPU split mode"]
         pub split_mode: Option<SplitMode>,
         /// Primary GPU index when `split_mode = None` (`with_main_gpu`). DEFERRED.
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(type = "number")]
         #[ts(optional)]
+        #[help = "primary GPU index"]
         pub main_gpu: Option<i32>,
         /// Explicit device selection (`with_devices`). DEFERRED (multi-GPU). Wire
         /// type is `u32` (ts-portable); the apply path converts to `usize`.
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
+        #[help = "explicit GPU devices"]
         pub devices: Option<Vec<u32>>,
         // ── context params (LlamaContextParams) ──────────────────────────────
         /// Logical batch size for prompt decode (`with_n_batch`). `None` keeps the
@@ -191,65 +201,79 @@ higgs_ts! {
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(type = "number")]
         #[ts(optional)]
+        #[help = "prompt batch size"]
         pub n_batch: Option<u32>,
         /// Physical (micro) batch size (`with_n_ubatch`).
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(type = "number")]
         #[ts(optional)]
+        #[help = "physical micro-batch size"]
         pub n_ubatch: Option<u32>,
         /// Parallel sequence slots (`with_n_seq_max`); default 1.
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(type = "number")]
         #[ts(optional)]
+        #[help = "parallel sequence slots"]
         pub n_seq_max: Option<u32>,
         /// Threads for batch/prompt processing (`with_n_threads_batch`). `None`
         /// reuses `threads` (today's shared behavior).
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(type = "number")]
         #[ts(optional)]
+        #[help = "prompt-processing threads"]
         pub n_threads_batch: Option<u32>,
         /// Flash-attention policy (`with_flash_attention_policy`).
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
+        #[help = "flash-attention policy"]
         pub flash_attn: Option<FlashAttn>,
         /// Offload the KV cache & KQV ops to the GPU (`with_offload_kqv`).
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
+        #[help = "KV cache on GPU"]
         pub offload_kqv: Option<bool>,
         /// Full sliding-window attention (`with_swa_full`).
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
+        #[help = "full sliding-window attention"]
         pub swa_full: Option<bool>,
         /// KV cache key data type (`with_type_k`).
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
+        #[help = "KV key cache type"]
         pub type_k: Option<KvCacheKind>,
         /// KV cache value data type (`with_type_v`).
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
+        #[help = "KV value cache type"]
         pub type_v: Option<KvCacheKind>,
         /// RoPE scaling type (`with_rope_scaling_type`).
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
+        #[help = "RoPE scaling mode"]
         pub rope_scaling_type: Option<RopeScalingType>,
         /// RoPE base frequency override (`with_rope_freq_base`).
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(type = "number")]
         #[ts(optional)]
+        #[help = "RoPE base frequency"]
         pub rope_freq_base: Option<f32>,
         /// RoPE frequency scale / context extension (`with_rope_freq_scale`).
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(type = "number")]
         #[ts(optional)]
+        #[help = "RoPE frequency scale"]
         pub rope_freq_scale: Option<f32>,
         /// GGUF metadata overrides (`append_kv_override`, pinned apply; advanced).
         /// Always serialized (possibly `[]`) — honest required-array binding.
+        #[help = "GGUF metadata overrides"]
         pub kv_overrides: Vec<KvOverride>,
         /// Load-pinned sampler RNG seed. `None` = a fresh random seed per request.
         /// A per-request `LlamaCppSamplingParams::seed` overrides this when set.
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(type = "number")]
         #[ts(optional)]
+        #[help = "sampler RNG seed"]
         pub seed: Option<u32>,
     }
 }
