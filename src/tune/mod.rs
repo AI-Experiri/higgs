@@ -16,6 +16,7 @@
 //! are abstracted, so extension happens at the strategy/source layer.
 
 pub mod card_sampling;
+pub mod context;
 pub mod derive;
 pub mod store;
 pub mod vram;
@@ -24,7 +25,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::system::HardwareInfo;
 use crate::worker::engine::llamacpp::params::{LlamaCppParams, LlamaCppSamplingParams};
-use crate::worker::engine::{GpuLayers, LoadParams, SamplingParams};
+use crate::worker::engine::{CtxLen, GpuLayers, KvCacheKind, LoadParams, SamplingParams};
 use crate::worker::models::HiggsModel;
 
 use store::TuneRecord;
@@ -157,6 +158,63 @@ higgs_ts! {
         // DEFERRED — the user edits the suggestion in the UI and loads with the full
         // engine-tagged `params` on the load request (explicit, end-to-end). Re-adding
         // them needs a proper partial type (all fields `Option`), a later phase.
+    }
+}
+
+higgs_ts! {
+    /// Request for `POST /api/higgs/models/estimate`: the memory footprint of a
+    /// CANDIDATE load (the user's current context window / KV types / GPU offload),
+    /// so the UI shows "≈ X GiB VRAM · Fits/Tight/Overflow" live as they edit. Pure +
+    /// cheap (no model load) — higgs OWNS the formula (reuses the suggester's VRAM/RAM
+    /// estimators); the frontend never reimplements it. The verdict is measured against
+    /// the supplied `budget` (the app's % cap resolved to bytes — so the live verdict
+    /// matches the budget-aware tune), or the detected machine when no budget is sent.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct EstimateRequest {
+        /// The model whose footprint to estimate (a scanned id).
+        pub id: String,
+        /// Candidate context window.
+        pub ctx_len: CtxLen,
+        /// Candidate GPU offload (`None` ⇒ all layers).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub gpu_layers: Option<GpuLayers>,
+        /// Candidate KV key cache type (`None` ⇒ F16).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub type_k: Option<KvCacheKind>,
+        /// Candidate KV value cache type (`None` ⇒ F16).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub type_v: Option<KvCacheKind>,
+        /// Candidate KV-cache offload (`Some(false)` keeps KV in host RAM, not VRAM;
+        /// `None` ⇒ on GPU, the default). Memory-affecting, so the estimate honors it.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub offload_kqv: Option<bool>,
+        /// Candidate MoE expert offload to CPU (a tuned, non-visible param that moves
+        /// expert weights off the GPU). `None` ⇒ off. Memory-affecting on MoE models.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub cpu_moe: Option<bool>,
+        /// Resource cap the verdict is measured against (the app's % budget resolved
+        /// to bytes). `None` ⇒ the detected machine — keeps the live estimate
+        /// consistent with the budget-aware tune when a budget is set.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub budget: Option<ResourceBudget>,
+    }
+}
+
+higgs_ts! {
+    /// Response for `POST /api/higgs/models/estimate`: the VRAM + RAM footprint of the
+    /// candidate load against the detected machine (verdict + needed/basis bytes).
+    #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+    pub struct EstimateReport {
+        /// GPU-VRAM footprint + fit verdict.
+        pub vram: FitReport,
+        /// Host-RAM footprint + fit verdict.
+        pub ram: FitReport,
     }
 }
 
@@ -426,7 +484,7 @@ where
             };
             if let Some(n) = cut {
                 load.gpu_layers = GpuLayers::Count { n };
-                vram_fit = self.vram.estimate(&load, meta, hw, budget);
+                // (vram_fit is recomputed in step 6 against the final load + context.)
                 rationale.push(if n == 0 {
                     "no GPU offload fits the VRAM budget — using CPU-only".into()
                 } else {
@@ -435,7 +493,36 @@ where
             }
         }
 
-        // 6. Final RAM fit + verdict notes.
+        // 5b. Re-derive the context for the FINAL offload. The base context was derived
+        //     for the initial all-GPU placement; the MoE / VRAM back-offs above may have
+        //     moved experts to CPU or reduced GPU layers, which changes where the KV
+        //     lands and thus how large a window the budget affords. `derive_ctx` inverts
+        //     the forward estimators for the FINAL `load`, so a CPU-only fallback derives
+        //     against RAM and a partial offload against whichever pool binds — instead of
+        //     being pinned at MIN_CTX. Idempotent for an unchanged all-GPU load. Done
+        //     BEFORE the RAM fit so the verdict reflects the final context.
+        let (ctx, deriv) = derive::derive_ctx(&load, meta, hw, budget);
+        load.ctx_len = CtxLen::Fixed { n: ctx };
+        let mut ctx_note = match meta.ctx_train {
+            Some(t) if u64::from(ctx) >= t => {
+                format!("context {ctx} — the model's full trained window")
+            }
+            _ => format!("context {ctx} — the largest that fits the budget"),
+        };
+        if deriv.methods > 1 {
+            ctx_note.push_str(&format!(
+                " (avg of {} methods, range {}–{})",
+                deriv.methods, deriv.min, deriv.max
+            ));
+        } else {
+            ctx_note.push_str(" (analytical)");
+        }
+        rationale.push(ctx_note);
+
+        // 6. Final fit verdicts — recomputed against the FINAL load (incl. the
+        //    re-derived context in 5b, which for a partial offload changes the
+        //    GPU-resident KV), so the verdicts reflect exactly what will load.
+        vram_fit = self.vram.estimate(&load, meta, hw, budget);
         let ram_fit = self.ram.estimate(&load, meta, hw, budget);
         rationale.push(verdict_note("GPU VRAM", vram_fit));
         rationale.push(verdict_note("system RAM", ram_fit));
@@ -601,6 +688,42 @@ mod tests {
             s.rationale
         );
         assert!(matches!(s.load, LoadParams::LlamaCpp(_)));
+    }
+
+    #[test]
+    fn cpu_only_backoff_rederives_context_against_ram() {
+        // GPU host, but an explicit VRAM cap too small to hold the 8 GiB model → the
+        // suggester backs GPU offload off to CPU-only. The context must THEN be
+        // re-derived against the (ample) RAM budget — not left pinned at MIN_CTX from
+        // the tiny VRAM basis. This is the derive↔back-off interaction codex flagged.
+        let budget = ResourceBudget {
+            // Below the ~800 MiB compute overhead → not even one layer fits the GPU,
+            // so the back-off goes all the way to CPU-only (not a partial offload).
+            max_vram_bytes: Some(500u64 << 20),
+            ..Default::default()
+        };
+        let s = default_suggester().suggest(
+            &dense_meta(8u64 << 30),
+            &hw(24u64 << 30, 128u64 << 30, 8),
+            &budget,
+        );
+        // LoadParams has a single (LlamaCpp) variant today — an irrefutable bind.
+        let LoadParams::LlamaCpp(load) = &s.load;
+        assert!(
+            load.gpu_layers.is_cpu_only(),
+            "a tiny VRAM budget backs off to CPU-only: {:?}",
+            load.gpu_layers
+        );
+        // 128 GiB RAM easily holds the 8 GiB model + KV for the full 8192 window, so
+        // the CPU-only context recovers ctx_train — NOT the MIN_CTX it would be pinned
+        // at if the context were never re-derived off the 2 GiB VRAM basis.
+        let CtxLen::Fixed { n } = load.ctx_len else {
+            panic!("expected a fixed ctx")
+        };
+        assert_eq!(
+            n, 8192,
+            "CPU-only context re-derived against RAM to the trained window, got {n}"
+        );
     }
 
     #[test]

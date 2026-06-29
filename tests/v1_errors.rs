@@ -495,3 +495,96 @@ async fn v1_models_openai_shape_after_load() {
         "created is a numeric unix timestamp: {m:?}"
     );
 }
+
+/// Load the tiny model with an EXPLICIT small context window so the overflow / clamp
+/// behavior is deterministic regardless of the model's trained window.
+async fn load_tiny_with_ctx(client: &reqwest::Client, base: &str, n: u32) {
+    let load = client
+        .post(format!("{base}/api/higgs/models/load"))
+        .json(&json!({
+            "id": TINY_MODEL_ID,
+            "params": { "engine": "LlamaCpp", "ctx_len": { "kind": "fixed", "n": n } }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        load.status().is_success(),
+        "load with ctx {n} succeeded, got {}",
+        load.status()
+    );
+}
+
+// ── Step 5: prompt that ALONE overflows → 400 `context_length_exceeded` ───────────
+//
+// A prompt larger than the window can't generate anything → the genuine overflow,
+// surfaced with the OpenAI-standard `context_length_exceeded` code (was `null`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prompt_overflow_400_context_length_exceeded() {
+    let Some(gguf) = tiny_gguf_path() else {
+        eprintln!("SKIP prompt_overflow: tiny gguf not found");
+        return;
+    };
+    let srv = spawn_with_tiny_model(12110, &gguf).await;
+    let c = reqwest::Client::new();
+    load_tiny_with_ctx(&c, &srv.base, 256).await;
+
+    // ~5000 estimated tokens (20000 chars / 4 bytes) ≫ the 256-token window.
+    let resp = c
+        .post(format!("{}/v1/chat/completions", srv.base))
+        .json(&json!({
+            "model": TINY_MODEL_ID, "stream": false,
+            "messages": [{ "role": "user", "content": "x".repeat(20000) }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "an over-window prompt is a 400");
+    let env: Value = resp.json().await.unwrap();
+    assert_eq!(
+        env["error"]["code"], "context_length_exceeded",
+        "the standard OpenAI code, not null: {env:?}"
+    );
+}
+
+// ── Step 5: oversized max_tokens is CLAMPED, not rejected ─────────────────────────
+//
+// A small prompt with a `max_tokens` far larger than the window used to 400 [HG005].
+// Now the budget is clamped (serve layer AND the worker's tokenizer-exact backstop)
+// so the request succeeds and generates, truncating at the window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversized_max_tokens_is_clamped_not_rejected() {
+    let Some(gguf) = tiny_gguf_path() else {
+        eprintln!("SKIP clamp: tiny gguf not found");
+        return;
+    };
+    let srv = spawn_with_tiny_model(12111, &gguf).await;
+    let c = reqwest::Client::new();
+    load_tiny_with_ctx(&c, &srv.base, 256).await;
+
+    let resp = c
+        .post(format!("{}/v1/chat/completions", srv.base))
+        .json(&json!({
+            "model": TINY_MODEL_ID, "stream": false,
+            "max_tokens": 16384, // ≫ the 256 window: OLD → 400; NEW → clamp → 200
+            "messages": [{ "role": "user", "content": "hi" }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "an oversized max_tokens is clamped to fit, not rejected"
+    );
+    let body: Value = resp.json().await.unwrap();
+    assert!(
+        body["choices"][0]["message"].is_object(),
+        "a completion was generated: {body:?}"
+    );
+    // It truncated at the window (didn't run the full 16384) → finish_reason length.
+    assert_eq!(
+        body["choices"][0]["finish_reason"], "length",
+        "generation truncated at the window: {body:?}"
+    );
+}

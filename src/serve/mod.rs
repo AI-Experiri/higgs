@@ -184,6 +184,10 @@ pub fn router(higgs: Arc<Higgs>) -> Router {
         .route("/api/higgs/models", get(control::control_models))
         .route("/api/higgs/models/load", post(control::control_load))
         .route("/api/higgs/models/tune", post(control::control_tune))
+        .route(
+            "/api/higgs/models/estimate",
+            post(control::control_estimate),
+        )
         .route("/api/higgs/models/unload", post(control::control_unload))
         .route("/api/higgs/models/{*id}", get(control::control_model_by_id))
         .route("/api/higgs/status", get(control::control_status))

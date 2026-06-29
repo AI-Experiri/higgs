@@ -4,6 +4,13 @@ use tracing_subscriber::fmt::MakeWriter;
 
 use super::*;
 
+/// Serializes the tests that touch the PROCESS-WIDE engine-diagnostics buffer
+/// (`record_engine_diagnostic` / `take_engine_diagnostics` / `EngineDiagnosticCapture`).
+/// They share one global buffer, so running them concurrently lets one test's
+/// captured lines leak into another's assertion. Each such test takes this lock for
+/// its whole body. Poison-tolerant: a panic in one test must not wedge the rest.
+static DIAG_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 /// Capturing writer: collects everything the fmt layer emits so a test can
 /// assert which engine lines survived the filter.
 #[derive(Clone, Default)]
@@ -100,6 +107,9 @@ fn verbose_mode_shows_everything() {
 /// (this is the only test that installs the capturing layer).
 #[test]
 fn engine_diagnostics_capture_clear_and_drain() {
+    let _diag_guard = DIAG_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     clear_engine_diagnostics();
     let subscriber = tracing_subscriber::registry().with(EngineDiagnosticCapture);
     tracing::subscriber::with_default(subscriber, || {
@@ -145,6 +155,9 @@ fn engine_diagnostics_capture_clear_and_drain() {
 /// (the root cause) are the ones retained.
 #[test]
 fn record_engine_diagnostic_caps_at_max() {
+    let _diag_guard = DIAG_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     clear_engine_diagnostics();
     let total = MAX_ENGINE_DIAGNOSTICS + 10;
     for i in 0..total {
@@ -250,6 +263,9 @@ fn normal_mode_reads_noisy_module_via_debug_fallback_suppresses() {
 /// the diagnostics buffer through that `record_str` path.
 #[test]
 fn engine_diagnostics_capture_message_via_record_str() {
+    let _diag_guard = DIAG_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     clear_engine_diagnostics();
     let subscriber = tracing_subscriber::registry().with(EngineDiagnosticCapture);
     tracing::subscriber::with_default(subscriber, || {

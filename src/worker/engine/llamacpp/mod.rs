@@ -292,8 +292,9 @@ impl HiggsEngine for LlamaCppEngine {
         let template = load_template(&loaded.model);
         let tmpl_result = apply_template(&loaded.model, &template, messages_json, params)?;
 
-        // 2. Tokenize and fit-check before any decode.
-        let tokens = fit_check(
+        // 2. Tokenize and resolve the context-fitted generation budget (clamps an
+        //    oversized max_tokens; rejects [HG005] only if the prompt alone overflows).
+        let (tokens, fitted_max_tokens) = fit_check(
             &loaded.model,
             tmpl_result.prompt.as_str(),
             &loaded.params,
@@ -327,8 +328,13 @@ impl HiggsEngine for LlamaCppEngine {
         // all known open markers; deferred since target models are covered.
         let selected_parser = self.select_parser(&template, params);
 
-        // 3. Decode loop — streams content deltas (filtered) into `sink`.
-        let decoded = run_decode(loaded, tokens, params, selected_parser, sink)?;
+        // 3. Decode loop — streams content deltas (filtered) into `sink`. Use the
+        //    context-FITTED budget so generation truncates at the window, not [HG005].
+        let gen_params = GenParams {
+            max_tokens: fitted_max_tokens,
+            ..params.clone()
+        };
+        let decoded = run_decode(loaded, tokens, &gen_params, selected_parser, sink)?;
 
         // 4. Parse the full generation into an OpenAI message (content + tool_calls).
         let (content, tool_calls) = parse_output(&tmpl_result, &decoded.full, selected_parser)?;
@@ -511,26 +517,36 @@ fn effective_n_ctx(load: &LlamaCppParams, model: &LlamaModel) -> u32 {
     }
 }
 
-/// Tokenize `prompt` and verify prompt + full generation budget fits `n_ctx`.
-/// Returns the prompt tokens on success, [HG005] `ContextOverflow` otherwise.
+/// Tokenize `prompt` and resolve the GENERATION budget against `n_ctx` — the largest
+/// generation that fits after the prompt. Returns `(prompt_tokens, fitted_max_gen)`.
+///
+/// Rejects with [HG005] `ContextOverflow` ONLY when the prompt ALONE exceeds the
+/// window (no room left to generate). Otherwise CLAMPS the budget to `n_ctx − prompt`
+/// (≥ 1) so an oversized `max_tokens` truncates (`finish_reason: "length"`) rather
+/// than failing. This is the authoritative, tokenizer-exact backstop for the serve
+/// layer's lower-bound `fit_generation_budget` estimate, which can leave the budget a
+/// few tokens too high (chat-template tokens it can't see).
 fn fit_check(
     model: &LlamaModel,
     prompt: &str,
     load: &LlamaCppParams,
     gen: &GenParams,
-) -> Result<Vec<LlamaToken>, HiggsError> {
+) -> Result<(Vec<LlamaToken>, usize), HiggsError> {
     let tokens = model
         .str_to_token(prompt, AddBos::Always)
         .map_err(|e| gen_fail("tokenize prompt", &e))?;
     let n_ctx = effective_n_ctx(load, model) as usize;
-    if tokens.len() + gen.max_tokens > n_ctx {
+    // The prompt alone can't fit → no room to generate → genuine overflow.
+    if tokens.len() >= n_ctx {
         return Err(HiggsError::ContextOverflow {
             prompt_tokens: tokens.len(),
             max_gen: gen.max_tokens,
             n_ctx,
         });
     }
-    Ok(tokens)
+    // Clamp the generation budget to the room left after the prompt (≥ 1 token).
+    let fitted_max_gen = gen.max_tokens.min(n_ctx - tokens.len()).max(1);
+    Ok((tokens, fitted_max_gen))
 }
 
 /// The result of [`run_decode`]: the full generated text, the OpenAI finish

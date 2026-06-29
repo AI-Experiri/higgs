@@ -46,6 +46,33 @@ fn all_gpu_load() -> LlamaCppParams {
 }
 
 #[test]
+fn resolve_estimate_ctx_caps_auto_at_default() {
+    let cap = crate::api::DEFAULT_CTX_CAP;
+    // Auto with a trained window ABOVE the cap → capped to DEFAULT_CTX_CAP (the live
+    // estimate must match the node-capped load, not the full 1M trained window).
+    assert_eq!(
+        resolve_estimate_ctx(CtxLen::Auto, Some(1_048_576)),
+        CtxLen::Fixed { n: cap }
+    );
+    // Auto with a trained window BELOW the cap → the trained window (never over-caps).
+    assert_eq!(
+        resolve_estimate_ctx(CtxLen::Auto, Some(4096)),
+        CtxLen::Fixed { n: 4096 }
+    );
+    // Auto with no known trained window → the worker fallback (4096), NOT the cap —
+    // the metadata-less load uses 4096, so the estimate must too (no 8× over).
+    assert_eq!(
+        resolve_estimate_ctx(CtxLen::Auto, None),
+        CtxLen::Fixed { n: 4096 }
+    );
+    // A Fixed request passes through untouched, regardless of ctx_train.
+    assert_eq!(
+        resolve_estimate_ctx(CtxLen::Fixed { n: 2048 }, Some(1_048_576)),
+        CtxLen::Fixed { n: 2048 }
+    );
+}
+
+#[test]
 fn vram_estimate_uses_gqa_kv_and_tiers() {
     let meta = dense_meta_8gb();
     let load = all_gpu_load();
@@ -330,6 +357,53 @@ fn cpu_moe_charges_experts_to_ram() {
         "cpu_moe charges experts to RAM ({} > {})",
         r_moe.needed_bytes,
         r_plain.needed_bytes
+    );
+}
+
+#[test]
+fn explicit_budget_is_the_ceiling_no_double_headroom() {
+    // An EXPLICIT budget is the user's hard ceiling — they already carved their
+    // margin (e.g. 75% of free) — so higgs must NOT re-apply the 0.8 detected-total
+    // headroom on top (no `0.75 × 0.8` double-discount). Same byte basis, two roles:
+    // a DETECTED total applies the 0.8/0.95 tiers; an EXPLICIT budget fills to 100%.
+    let meta = dense_meta_8gb();
+    let load = all_gpu_load();
+    // Raw need against an unconstrained budget (weights + KV + overhead).
+    let need = StaticVramEstimator
+        .estimate(
+            &load,
+            &meta,
+            &hw_gpu(64u64 << 30),
+            &ResourceBudget::default(),
+        )
+        .needed_bytes;
+    // A basis where need ≈ 98% of it: above the 0.95 Tight ceiling, below 100%.
+    let basis = need + need / 50;
+
+    // As a DETECTED total → need (98%) exceeds the 0.95 ceiling → Overflow.
+    let detected =
+        StaticVramEstimator.estimate(&load, &meta, &hw_gpu(basis), &ResourceBudget::default());
+    assert_eq!(
+        detected.verdict,
+        FitVerdict::Overflow,
+        "detected total applies the 0.8/0.95 headroom (need {need} of {basis})"
+    );
+
+    // The SAME bytes as an EXPLICIT budget → the budget is the ceiling (fit=1.0) →
+    // need (98%) ≤ 100% → Fits. Fails if the explicit budget re-applies 0.8.
+    let explicit = StaticVramEstimator.estimate(
+        &load,
+        &meta,
+        &hw_gpu(64u64 << 30),
+        &ResourceBudget {
+            max_vram_bytes: Some(basis),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        explicit.verdict,
+        FitVerdict::Fits,
+        "an explicit budget fills to its ceiling — no double headroom (need {need} of {basis})"
     );
 }
 

@@ -117,10 +117,9 @@ async fn assemble(
         }
         Ok(Err(err)) => {
             tracing::warn!(error = %err, "higgs: chat stream failed mid-generation");
-            send(super::v1::v1_envelope_json(
-                super::http_status(&err),
-                &err.to_string(),
-            ));
+            // `v1_sse_error` maps the code (a worker-exact [HG005] →
+            // context_length_exceeded), matching the non-streaming path.
+            send(super::v1::v1_sse_error(&err));
         }
         // JoinError: the chat task panicked or was aborted — not a HiggsError.
         // Surface it as a coded HG044 so the SSE error envelope says what to do.
@@ -129,10 +128,7 @@ async fn assemble(
                 detail: join_err.to_string(),
             };
             tracing::warn!(error = %e, "higgs: chat task failed");
-            send(super::v1::v1_envelope_json(
-                super::http_status(&e),
-                &e.to_string(),
-            ));
+            send(super::v1::v1_sse_error(&e));
         }
     }
     send("[DONE]".to_owned());

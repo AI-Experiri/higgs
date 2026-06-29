@@ -728,3 +728,195 @@ async fn idle_ttl_effective_report_and_overflow_clamp() {
         "seconds did not wrap below minutes (no overflow), {clamped_secs} vs {clamped_min}"
     );
 }
+
+/// `POST …/estimate` returns the VRAM/RAM footprint of a CANDIDATE load, and the
+/// footprint grows with context (KV cache is linear in n_ctx) — the math the live
+/// UI estimate reads. A missing model is a 404.
+#[tokio::test]
+async fn estimate_returns_footprint_growing_with_context() {
+    let Some(gguf) = tiny_gguf_path() else {
+        eprintln!("SKIP estimate: no tiny GGUF (set HIGGS_TEST_GGUF)");
+        return;
+    };
+    let srv = spawn_with_tiny_model(11513, &gguf).await;
+    let c = reqwest::Client::new();
+
+    let small: serde_json::Value = c
+        .post(format!("{}/api/higgs/models/estimate", srv.base))
+        .json(
+            &serde_json::json!({ "id": TINY_MODEL_ID, "ctx_len": { "kind": "fixed", "n": 2048 } }),
+        )
+        .send()
+        .await
+        .expect("estimate request")
+        .json()
+        .await
+        .unwrap();
+    // RAM is always charged (weights + overhead) on any host; a CPU-only host reports
+    // vram == 0, so assert on RAM to confirm a real footprint was computed everywhere.
+    assert!(
+        small["ram"]["needed_bytes"].as_u64().unwrap() > 0,
+        "footprint present: {small}"
+    );
+    assert!(
+        small["vram"]["verdict"].is_string(),
+        "vram verdict: {small}"
+    );
+    assert!(small["ram"]["verdict"].is_string(), "ram verdict: {small}");
+
+    let large: serde_json::Value = c
+        .post(format!("{}/api/higgs/models/estimate", srv.base))
+        .json(
+            &serde_json::json!({ "id": TINY_MODEL_ID, "ctx_len": { "kind": "fixed", "n": 16384 } }),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    // KV cache is linear in n_ctx → a bigger context needs strictly more memory.
+    // Assert on the TOTAL (VRAM + RAM): the KV lives in VRAM on a GPU host and in RAM
+    // on a CPU-only host, so the combined footprint grows on EITHER (a VRAM-only
+    // assertion would be 0 vs 0 on a CPU-only box).
+    let total = |v: &serde_json::Value| {
+        v["vram"]["needed_bytes"].as_u64().unwrap() + v["ram"]["needed_bytes"].as_u64().unwrap()
+    };
+    assert!(
+        total(&large) > total(&small),
+        "bigger context → bigger total footprint (small {} vs large {})",
+        total(&small),
+        total(&large)
+    );
+
+    // A missing model → 404 (not a 500 or a silent 0).
+    let missing = c
+        .post(format!("{}/api/higgs/models/estimate", srv.base))
+        .json(
+            &serde_json::json!({ "id": "nope/missing", "ctx_len": { "kind": "fixed", "n": 2048 } }),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 404, "missing model → 404");
+}
+
+/// `POST …/estimate` measures the verdict against the supplied resource budget, not
+/// just the detected machine — so the live UI footprint agrees with the budget-aware
+/// tune. A 1 MiB RAM cap (which no real model fits) flips RAM Fits → Overflow. Uses
+/// the RAM budget so the assertion holds on GPU AND CPU-only hosts (a CPU-only host
+/// charges no VRAM, but always charges RAM).
+#[tokio::test]
+async fn estimate_honors_resource_budget() {
+    let Some(gguf) = tiny_gguf_path() else {
+        eprintln!("SKIP estimate_budget: no tiny GGUF (set HIGGS_TEST_GGUF)");
+        return;
+    };
+    let srv = spawn_with_tiny_model(11514, &gguf).await;
+    let c = reqwest::Client::new();
+
+    // Baseline: no budget → RAM comfortably fits the machine.
+    let base: serde_json::Value = c
+        .post(format!("{}/api/higgs/models/estimate", srv.base))
+        .json(
+            &serde_json::json!({ "id": TINY_MODEL_ID, "ctx_len": { "kind": "fixed", "n": 2048 } }),
+        )
+        .send()
+        .await
+        .expect("estimate request")
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        base["ram"]["verdict"], "Fits",
+        "no budget → RAM fits machine: {base}"
+    );
+
+    // A 1 MiB RAM budget can't hold the model+overhead → Overflow. Proves the verdict
+    // is measured against the budget, not the detected machine.
+    let capped: serde_json::Value = c
+        .post(format!("{}/api/higgs/models/estimate", srv.base))
+        .json(&serde_json::json!({
+            "id": TINY_MODEL_ID,
+            "ctx_len": { "kind": "fixed", "n": 2048 },
+            "budget": { "max_ram_bytes": 1u64 << 20 }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        capped["ram"]["verdict"], "Overflow",
+        "a 1 MiB RAM budget overflows → the estimate honors the budget: {capped}"
+    );
+}
+
+/// `POST …/estimate` honors `offload_kqv`: disabling KV offload moves the KV cache
+/// off the GPU, so the VRAM footprint drops (and the param is threaded, not dropped).
+/// GPU-gated — on a CPU-only host nothing lives in VRAM either way. (`cpu_moe` is
+/// MoE-only; the tiny test model is dense, so its estimator math is unit-tested.)
+#[tokio::test]
+async fn estimate_honors_offload_kqv() {
+    let Some(gguf) = tiny_gguf_path() else {
+        eprintln!("SKIP estimate_offload_kqv: no tiny GGUF (set HIGGS_TEST_GGUF)");
+        return;
+    };
+    let srv = spawn_with_tiny_model(11515, &gguf).await;
+    let c = reqwest::Client::new();
+    let body = |kqv: bool| {
+        serde_json::json!({
+            "id": TINY_MODEL_ID,
+            "ctx_len": { "kind": "fixed", "n": 16384 },
+            "offload_kqv": kqv
+        })
+    };
+    let on: serde_json::Value = c
+        .post(format!("{}/api/higgs/models/estimate", srv.base))
+        .json(&body(true))
+        .send()
+        .await
+        .expect("estimate request")
+        .json()
+        .await
+        .unwrap();
+    let off: serde_json::Value = c
+        .post(format!("{}/api/higgs/models/estimate", srv.base))
+        .json(&body(false))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let sys: serde_json::Value = c
+        .get(format!("{}/api/higgs/system", srv.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let has_gpu = sys["hardware"]["gpus"]
+        .as_array()
+        .is_some_and(|a| a.iter().any(|g| g["kind"] == "Gpu"));
+    if has_gpu {
+        // KV leaves the GPU when offload_kqv=false → strictly less VRAM than on.
+        assert!(
+            off["vram"]["needed_bytes"].as_u64().unwrap()
+                < on["vram"]["needed_bytes"].as_u64().unwrap(),
+            "offload_kqv=false drops KV off the GPU (off {} vs on {})",
+            off["vram"]["needed_bytes"],
+            on["vram"]["needed_bytes"]
+        );
+    }
+    // RAM is always charged (weights + overhead) regardless of GPU presence — so this
+    // confirms the request was accepted + estimated on ANY host (a CPU-only host
+    // reports vram == 0, so asserting vram > 0 would falsely fail there).
+    assert!(
+        on["ram"]["needed_bytes"].as_u64().unwrap() > 0,
+        "estimate accepted + threaded offload_kqv: {on}"
+    );
+}

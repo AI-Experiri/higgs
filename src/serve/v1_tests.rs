@@ -601,10 +601,11 @@ fn effective_max_tokens_precedence() {
 }
 
 #[test]
-fn check_prompt_fits_rejects_oversized_prompt() {
-    // A tiny window with a long prompt overflows the conservative estimate.
+fn fit_budget_rejects_prompt_that_alone_overflows() {
+    // A tiny window with a long prompt: the prompt ALONE exceeds n_ctx → genuine
+    // overflow (no room to generate even one token).
     let long = "x".repeat(8000); // ~2000 estimated tokens at 4 bytes/token.
-    let err = check_prompt_fits(
+    let err = fit_generation_budget(
         &req(json!({
             "model": "m",
             "messages": [{"role": "user", "content": long}],
@@ -612,14 +613,15 @@ fn check_prompt_fits_rejects_oversized_prompt() {
         })),
         Some(CtxLen::Fixed { n: 128 }),
     )
-    .expect_err("oversized prompt must overflow");
+    .expect_err("a prompt larger than the window overflows");
     assert!(matches!(err, HiggsError::ContextOverflow { .. }));
     assert!(err.to_string().starts_with("[HG005]"));
 }
 
 #[test]
-fn check_prompt_fits_accepts_small_prompt() {
-    check_prompt_fits(
+fn fit_budget_honors_a_request_that_fits() {
+    // Small prompt, large window, modest request → the request is honored as-is.
+    let budget = fit_generation_budget(
         &req(json!({
             "model": "m",
             "messages": [{"role": "user", "content": "hello"}],
@@ -627,7 +629,95 @@ fn check_prompt_fits_accepts_small_prompt() {
         })),
         Some(CtxLen::Fixed { n: 4096 }),
     )
-    .expect("small prompt fits a large window");
+    .expect("a fitting request is honored");
+    assert_eq!(budget, 16, "a request that fits is honored unchanged");
+}
+
+#[test]
+fn fit_budget_clamps_oversized_max_tokens_instead_of_rejecting() {
+    // The exact case the user hit: prompt fits, but max_tokens + prompt > n_ctx. The
+    // OLD behavior rejected (400 [HG005]); the new behavior CLAMPS to what fits so the
+    // request proceeds and truncates (finish_reason "length").
+    let budget = fit_generation_budget(
+        &req(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 16384
+        })),
+        Some(CtxLen::Fixed { n: 8192 }),
+    )
+    .expect("an oversized max_tokens is clamped, not rejected");
+    assert!(
+        budget > 0 && budget <= 8192,
+        "clamped to the space after the prompt (< the requested 16384): {budget}"
+    );
+}
+
+#[test]
+fn fit_budget_infers_full_window_when_max_tokens_omitted() {
+    // No max_tokens → infer the remaining window (n_ctx − prompt), NOT the 1024 default.
+    let budget = fit_generation_budget(
+        &req(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}]
+        })),
+        Some(CtxLen::Fixed { n: 8192 }),
+    )
+    .expect("inferred budget");
+    assert!(
+        budget > 1024 && budget <= 8192,
+        "inferred ~n_ctx, not the flat 1024 default: {budget}"
+    );
+}
+
+#[test]
+fn fit_budget_auto_window_honors_request_capped() {
+    // An AUTO/unknown window can't be bounded here → honor the request (worker
+    // [HG005] backstops), capped at the absolute MAX_OUTPUT_TOKENS limit.
+    let budget = fit_generation_budget(
+        &req(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 500
+        })),
+        Some(CtxLen::Auto),
+    )
+    .expect("auto window");
+    assert_eq!(budget, 500);
+}
+
+#[test]
+fn v1_sse_error_carries_context_length_exceeded() {
+    // The streaming error path must surface the same code as the non-streaming one.
+    let json = v1_sse_error(&HiggsError::ContextOverflow {
+        prompt_tokens: 9000,
+        max_gen: 0,
+        n_ctx: 8192,
+    });
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        v["error"]["code"], "context_length_exceeded",
+        "SSE error envelope carries the OpenAI code: {v}"
+    );
+}
+
+#[test]
+fn v1_error_code_maps_context_overflow() {
+    // A context overflow surfaces the OpenAI-standard code (was `null`).
+    let overflow = HiggsError::ContextOverflow {
+        prompt_tokens: 9000,
+        max_gen: 0,
+        n_ctx: 8192,
+    };
+    assert_eq!(v1_error_code(&overflow), Some("context_length_exceeded"));
+    // An unrelated error gets no special code.
+    assert_eq!(
+        v1_error_code(&HiggsError::InvalidSamplingParam {
+            param: "top_p".into(),
+            detail: "x".into(),
+        }),
+        None
+    );
 }
 
 // ── chat_response: pure ChatOutcome → response mapping ────────────────────

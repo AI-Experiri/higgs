@@ -114,16 +114,44 @@ fn redact_paths(message: &str) -> String {
         .join(" ")
 }
 
-/// Serialize the `/v1` error envelope to a JSON string (SSE `data:` payloads).
-pub(super) fn v1_envelope_json(status: StatusCode, message: &str) -> String {
-    serde_json::to_string(&v1_envelope(status, message))
-        .expect("error envelope serialization cannot fail")
+/// The OpenAI-standard `error.code` for higgs errors that map to one. A context
+/// overflow — raised locally by the prompt pre-check or propagated from the worker's
+/// tokenizer-exact `[HG005]` — surfaces as `context_length_exceeded` (the code the
+/// OpenAI SDK and downstream clients special-case), rather than the `null` it was.
+fn v1_error_code(err: &HiggsError) -> Option<&'static str> {
+    match err {
+        HiggsError::ContextOverflow { .. } => Some("context_length_exceeded"),
+        HiggsError::WorkerRpc { worker_code, .. } if worker_code.as_deref() == Some("HG005") => {
+            Some("context_length_exceeded")
+        }
+        _ => None,
+    }
+}
+
+/// Build the OpenAI error envelope for a `HiggsError`: the shared status-based
+/// envelope plus the specific OpenAI `code` when one applies ([`v1_error_code`]).
+/// Shared by the non-streaming response ([`v1_error`]) and the SSE error payload
+/// ([`v1_sse_error`]) so a context overflow surfaces `context_length_exceeded` on
+/// BOTH the streaming and non-streaming paths.
+fn v1_envelope_for(err: &HiggsError) -> WrappedError {
+    let mut env = v1_envelope(http_status(err), &err.to_string());
+    if let Some(code) = v1_error_code(err) {
+        env.error.code = Some(code.to_owned());
+    }
+    env
 }
 
 /// `/v1` error response: mapped status + OpenAI error envelope body.
 fn v1_error(err: &HiggsError) -> (StatusCode, Json<WrappedError>) {
-    let status = http_status(err);
-    (status, Json(v1_envelope(status, &err.to_string())))
+    (http_status(err), Json(v1_envelope_for(err)))
+}
+
+/// The SSE error-payload JSON for a mid-stream `HiggsError` — same status + code
+/// mapping as [`v1_error`], so a streaming context overflow (the worker's
+/// tokenizer-exact `[HG005]` after the serve-layer lower-bound check passed) carries
+/// `context_length_exceeded` just like the non-streaming path.
+pub(super) fn v1_sse_error(err: &HiggsError) -> String {
+    serde_json::to_string(&v1_envelope_for(err)).expect("error envelope serialization cannot fail")
 }
 
 /// `/v1` error response for a non-[`HiggsError`] failure (a malformed body, a
@@ -306,8 +334,8 @@ pub(super) async fn v1_chat_completions(
     // Returns the resolved (now-resident) model id, which binds the chat dispatch:
     // the worker rejects (HG018) if a concurrent JIT load swaps it out before
     // generation, so a swap errors instead of serving the wrong model.
-    let resolved_model = match gate_and_validate(&higgs, &req).await {
-        Ok(id) => id,
+    let (resolved_model, max_tokens) = match gate_and_validate(&higgs, &req).await {
+        Ok(pair) => pair,
         Err(resp) => return resp,
     };
 
@@ -330,8 +358,9 @@ pub(super) async fn v1_chat_completions(
         Err(resp) => return *resp,
     };
 
-    // Effective generation budget (validated above to be in [1, MAX_OUTPUT_TOKENS]).
-    let max_tokens = effective_max_tokens(&req) as usize;
+    // `max_tokens` is the context-clamped generation budget from `gate_and_validate`
+    // (`min(requested or inferred, n_ctx − prompt, MAX_OUTPUT_TOKENS)`), so dispatch
+    // always asks for a budget that fits the loaded window.
     // Per-request sampler set from the OpenAI body (only the fields the client
     // actually sent become `Some`). `chat_stream` overlays this onto the model's
     // tuned/card-recommended base, so a tuned model serves with its recommendation
@@ -527,7 +556,7 @@ async fn ensure_loaded(higgs: &Arc<Higgs>, model: &str) -> Result<LoadedInfo, Re
 async fn gate_and_validate(
     higgs: &Arc<Higgs>,
     req: &CreateChatCompletionRequest,
-) -> Result<String, Response> {
+) -> Result<(String, usize), Response> {
     // Loaded-model gate (JIT-aware): resolve the model that will serve this
     // request, loading it on demand when JIT is on. Returns the LoadedInfo for
     // the now-resident requested model, or the mapped error response.
@@ -540,14 +569,17 @@ async fn gate_and_validate(
         return Err(v1_error(&err).into_response());
     }
 
-    // Early prompt-vs-context reject: a prompt whose conservative token estimate
-    // plus the generation budget cannot fit the loaded window is a client error
-    // (400 [HG005]) — reject here instead of shipping it to the worker. The
-    // worker's tokenizer-exact [HG005] check remains the authoritative backstop.
-    if let Err(err) = check_prompt_fits(req, loaded.ctx_len) {
-        tracing::warn!(error = %err, "higgs: chat prompt exceeds context window");
-        return Err(v1_error(&err).into_response());
-    }
+    // Resolve the generation budget against the loaded window: CLAMP `max_tokens` to
+    // what fits after the prompt (so a large budget truncates rather than erroring),
+    // rejecting (400 `context_length_exceeded`) ONLY when the prompt alone overflows.
+    // The worker's tokenizer-exact [HG005] check remains the authoritative backstop.
+    let max_gen = match fit_generation_budget(req, loaded.ctx_len) {
+        Ok(budget) => budget,
+        Err(err) => {
+            tracing::warn!(error = %err, "higgs: chat prompt exceeds context window");
+            return Err(v1_error(&err).into_response());
+        }
+    };
 
     // v1 is text-only: reject image/audio/file/refusal content parts → 400.
     // (Validation only — the flattened pairs are discarded; the engine receives
@@ -557,9 +589,9 @@ async fn gate_and_validate(
         tracing::warn!(detail = %reject, "higgs: chat request rejected");
         return Err(v1_bad_request(&reject).into_response());
     }
-    // The resolved model id (its `.id` is the model the gate proved resident),
-    // returned so the caller binds the chat to it (worker HG018 check).
-    Ok(loaded.id)
+    // The resolved model id (the gate proved it resident) + the context-clamped
+    // generation budget, so the caller dispatches with a budget that always fits.
+    Ok((loaded.id, max_gen))
 }
 
 /// Serialize the OpenAI `messages` array verbatim for the chat template — the
@@ -753,43 +785,58 @@ fn build_sampling(req: &CreateChatCompletionRequest) -> crate::worker::engine::S
     })
 }
 
-/// Cheap early reject when the prompt's conservative token estimate plus the
-/// generation budget cannot fit the loaded context window — `Err(ContextOverflow)`
-/// (→ 400). The serve layer has no tokenizer, so the estimate is a LOWER bound
-/// (`prompt_bytes / PROMPT_BYTES_PER_TOKEN`); the worker runs the exact
-/// tokenizer check (the authoritative `[HG005]`). This only fires when the
-/// prompt is unambiguously over the window.
-fn check_prompt_fits(
+/// Resolve the GENERATION budget for a request against the loaded context window —
+/// the largest `max_tokens` that fits after the prompt, INFERRED when the client
+/// didn't ask. Returns `Err(ContextOverflow)` (→ 400 `context_length_exceeded`) ONLY
+/// when the prompt ALONE cannot fit the window (no room left to generate) — the
+/// genuine overflow. When the prompt fits, the budget is CLAMPED to
+/// `min(requested or available, available, MAX_OUTPUT_TOKENS)` rather than rejected,
+/// so an oversized `max_tokens` truncates (`finish_reason: "length"`) instead of
+/// failing the request.
+///
+/// The serve layer has no tokenizer, so the prompt count is a conservative LOWER
+/// bound (`prompt_bytes / PROMPT_BYTES_PER_TOKEN`) — the worker runs the exact
+/// tokenizer check. An AUTO/unknown window can't be bounded here, so the requested
+/// budget (or the 1024 default) stands, capped at the absolute limit; the worker's
+/// `[HG005]` is the backstop.
+#[allow(deprecated)]
+fn fit_generation_budget(
     req: &CreateChatCompletionRequest,
     ctx_len: Option<CtxLen>,
-) -> Result<(), HiggsError> {
-    // Sum the byte length of every message's textual content. Serializing the
-    // messages would add role/JSON-structure/escape bytes and push the estimate
-    // ABOVE the true token count — turning this lower-bound precheck into a
-    // false-reject. Counting only the extracted content text (the same pairs the
-    // worker sees) keeps `bytes / PROMPT_BYTES_PER_TOKEN` a conservative lower
-    // bound. A non-text part here just means 0 bytes; the worker still runs the
-    // authoritative tokenizer check.
+) -> Result<usize, HiggsError> {
+    // Sum the byte length of every message's textual content (the same pairs the
+    // worker sees). Serializing the messages would add role/JSON-structure/escape
+    // bytes and push the estimate ABOVE the true token count; counting only the
+    // content keeps `bytes / PROMPT_BYTES_PER_TOKEN` a conservative LOWER bound.
     let prompt_bytes: usize = messages_to_pairs(&req.messages)
         .map(|pairs| pairs.iter().map(|(_, content)| content.len()).sum())
         .unwrap_or(0);
     let prompt_tokens_est = prompt_bytes / PROMPT_BYTES_PER_TOKEN;
-    let max_gen = effective_max_tokens(req) as usize;
-    // An AUTO/unknown window can't be bounded here, so don't reject — the worker's
-    // tokenizer-exact [HG005] is the authoritative prompt-fit backstop.
-    let n_ctx = match ctx_len {
-        // Not probed (None) or AUTO → can't bound it here; defer to the worker's [HG005].
-        None | Some(CtxLen::Auto) => return Ok(()),
-        Some(CtxLen::Fixed { n }) => n as usize,
-    };
-    if prompt_tokens_est + max_gen > n_ctx {
-        return Err(HiggsError::ContextOverflow {
-            prompt_tokens: prompt_tokens_est,
-            max_gen,
-            n_ctx,
-        });
+    let requested = req
+        .max_completion_tokens
+        .or(req.max_tokens)
+        .map(|t| t as usize);
+    match ctx_len {
+        // Not probed (None) or AUTO → can't bound by context here; honor the request
+        // (or the 1024 default), capped at the absolute limit. Worker [HG005] backstops.
+        None | Some(CtxLen::Auto) => Ok(requested.unwrap_or(1024).min(MAX_OUTPUT_TOKENS as usize)),
+        Some(CtxLen::Fixed { n }) => {
+            let n_ctx = n as usize;
+            // The prompt ALONE doesn't fit → no room to generate → genuine overflow.
+            if prompt_tokens_est >= n_ctx {
+                return Err(HiggsError::ContextOverflow {
+                    prompt_tokens: prompt_tokens_est,
+                    max_gen: requested.unwrap_or(0),
+                    n_ctx,
+                });
+            }
+            // Room left after the prompt. Infer the budget when omitted; otherwise
+            // honor the request but CLAMP to what fits + the absolute cap (≥ 1).
+            let available = n_ctx - prompt_tokens_est;
+            let budget = requested.unwrap_or(available);
+            Ok(budget.min(available).min(MAX_OUTPUT_TOKENS as usize).max(1))
+        }
     }
-    Ok(())
 }
 
 /// Flatten OpenAI request messages into the worker's `(role, content)` pairs.

@@ -295,6 +295,23 @@ pub(super) async fn control_tune(
     }
 }
 
+/// `POST /api/higgs/models/estimate` — the VRAM/RAM footprint of a CANDIDATE load
+/// (context / KV types / GPU offload in the BODY), reusing the suggester's own
+/// estimators. Never loads; pure + cheap so the load-params UI can call it on every
+/// edit to show the live "≈ X GiB VRAM · verdict". higgs owns the formula.
+pub(super) async fn control_estimate(
+    State(higgs): State<Arc<Higgs>>,
+    Json(req): Json<crate::tune::EstimateRequest>,
+) -> Response {
+    match higgs.estimate(req).await {
+        Ok(report) => Json(report).into_response(),
+        Err(err) => {
+            tracing::warn!(error = %err, "higgs: estimate failed");
+            control_error(&err).into_response()
+        }
+    }
+}
+
 /// `POST /api/higgs/models/unload` — unload one model by `{id}`, or ALL when no id.
 ///
 /// The body is read as raw bytes and inspected as a `serde_json::Value` (NOT via the

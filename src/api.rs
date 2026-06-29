@@ -22,7 +22,10 @@ use crate::remote::{InventoryWorker, NodeInventory, NodeLoadParams};
 use crate::supervisor::HiggsEvent;
 use crate::system::HardwareInfo;
 use crate::tune::store::{JsonModelStore, TuneRecord};
-use crate::tune::{ModelMeta, Suggester, TuneMode, TuneRequest, TuneSuggestion};
+use crate::tune::{
+    EstimateReport, EstimateRequest, ModelMeta, RamEstimator, Suggester, TuneMode, TuneRequest,
+    TuneSuggestion, VramEstimator,
+};
 use crate::worker::engine::LoadParams;
 use crate::worker::models::HiggsModel;
 
@@ -45,6 +48,12 @@ pub use types::*;
 /// serve-layer toggles — while the node owns the worker processes, RPC
 /// correlation, idle auto-unload, and the load-replay state. Constructing `Higgs`
 /// does not start a worker; workers are spawned lazily, one per [`load`](Self::load).
+///
+/// Freshness window for the live-estimate per-id metadata memo
+/// ([`Higgs::estimate`]). Long enough that a burst of slider edits reuses one scan,
+/// short enough that a model deleted/replaced underneath the UI self-heals quickly.
+const ESTIMATE_META_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
 pub struct Higgs {
     /// The co-located LOCAL node (P4b): an in-process multi-worker `NodeRuntime`, the same
     /// engine remote nodes run. Local inference/load/unload/status route through it; a remote
@@ -110,6 +119,16 @@ pub struct Higgs {
     /// request retries. A plain `parking_lot::Mutex` — held only for the
     /// read/insert, never across `.await`.
     device_cache: parking_lot::Mutex<Option<Vec<crate::system::GpuDevice>>>,
+    /// Per-id GGUF-metadata memo for the LIVE estimate path (`estimate`). The
+    /// load-params UI calls `/models/estimate` on every edit; a full `scan()` walks
+    /// every model dir + re-mmaps each GGUF, so without this each keystroke would
+    /// re-scan. Caches the LAST resolved `(id, ModelMeta, fetched_at)` — repeated
+    /// estimates for the same model within [`ESTIMATE_META_TTL`] reuse it; a different
+    /// id or an expired entry re-scans + replaces. The short TTL bounds staleness so a
+    /// model deleted/replaced underneath the UI self-heals (→ a fresh scan → 404 or
+    /// current metadata) within a couple of seconds. `load`/`tune` always scan fresh.
+    /// A plain `parking_lot::Mutex` — held only for the read/insert, never across `.await`.
+    estimate_meta_cache: parking_lot::Mutex<Option<(String, ModelMeta, std::time::Instant)>>,
     /// The remote fleet (paired nodes + model routing), installed when the hub runs an
     /// iroh listener. `None` for a pure-local higgs. `/v1` chat for a remote-resident model
     /// routes through this instead of the local `Supervisor` (the two correlation domains
@@ -273,6 +292,7 @@ impl Higgs {
             idle_ttl_minutes: std::sync::atomic::AtomicU64::new(DEFAULT_IDLE_TTL.as_secs() / 60),
             serving_enabled: std::sync::atomic::AtomicBool::new(true),
             device_cache: parking_lot::Mutex::new(None),
+            estimate_meta_cache: parking_lot::Mutex::new(None),
             fleet: parking_lot::Mutex::new(None),
             api_keys: parking_lot::Mutex::new(std::sync::Arc::new(crate::keys::ApiKeys::default())),
             hub: parking_lot::Mutex::new(None),
@@ -1397,6 +1417,71 @@ impl Higgs {
             }
         }
         Ok(suggestion)
+    }
+
+    /// Estimate the VRAM/RAM footprint of a CANDIDATE load (no model load). Reuses
+    /// the suggester's own VRAM/RAM estimators — the single source of truth for the
+    /// formula — so the UI shows the live cost ("≈ X GiB VRAM · verdict") as the user
+    /// edits context / KV types / GPU offload. Pure + cheap: a GGUF-metadata lookup +
+    /// the cached hardware read, no worker round-trip beyond that.
+    pub async fn estimate(&self, req: EstimateRequest) -> Result<EstimateReport, HiggsError> {
+        // Resolve the GGUF metadata, memoized per-id: the UI hits this on every edit,
+        // so re-scanning all model dirs each keystroke would be wasteful on large
+        // libraries. A fresh cache hit for the same model skips the scan; an expired
+        // entry (TTL) re-scans so a deleted/replaced model self-heals to 404/current.
+        let now = std::time::Instant::now();
+        let meta = {
+            let hit = self.estimate_meta_cache.lock().clone();
+            match hit {
+                Some((id, meta, at))
+                    if id == req.id && now.duration_since(at) < ESTIMATE_META_TTL =>
+                {
+                    meta
+                }
+                _ => {
+                    let model = self
+                        .scan()
+                        .await?
+                        .into_iter()
+                        .find(|m| m.id == req.id)
+                        .ok_or_else(|| HiggsError::ModelNotFound { id: req.id.clone() })?;
+                    let meta = ModelMeta::from_model(&model);
+                    *self.estimate_meta_cache.lock() = Some((req.id.clone(), meta.clone(), now));
+                    meta
+                }
+            }
+        };
+        let hw = self.hardware().await;
+        // Resolve `Auto` the SAME way the load path does (the node caps an auto/trained
+        // context at `DEFAULT_CTX_CAP`) so the estimate matches what would actually load
+        // — see `resolve_estimate_ctx`.
+        let ctx_len = crate::tune::vram::resolve_estimate_ctx(req.ctx_len, meta.ctx_train);
+        let load = crate::worker::engine::llamacpp::params::LlamaCppParams {
+            ctx_len,
+            gpu_layers: req
+                .gpu_layers
+                .unwrap_or(crate::worker::engine::GpuLayers::All),
+            type_k: Some(
+                req.type_k
+                    .unwrap_or(crate::worker::engine::KvCacheKind::F16),
+            ),
+            type_v: Some(
+                req.type_v
+                    .unwrap_or(crate::worker::engine::KvCacheKind::F16),
+            ),
+            // The remaining memory-affecting params so the verdict matches the real
+            // load (KV-on-CPU and MoE-experts-on-CPU both shift bytes VRAM↔RAM).
+            offload_kqv: req.offload_kqv,
+            cpu_moe: req.cpu_moe,
+            ..Default::default()
+        };
+        // Verdict against the caller's budget when supplied (so the live estimate
+        // agrees with the budget-aware tune), else the detected machine.
+        let budget = req.budget.unwrap_or_default();
+        Ok(EstimateReport {
+            vram: crate::tune::vram::StaticVramEstimator.estimate(&load, &meta, &hw, &budget),
+            ram: crate::tune::vram::StaticRamEstimator.estimate(&load, &meta, &hw, &budget),
+        })
     }
 }
 

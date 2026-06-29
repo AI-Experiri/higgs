@@ -51,13 +51,46 @@ fn derive_defaults_all_gpu_flash_on_and_threads() {
     assert_eq!(d.gpu_layers, GpuLayers::All, "all layers on GPU");
     assert_eq!(d.flash_attn, Some(FlashAttn::On));
     assert_eq!(d.threads, 8, "floor(16/2)");
+    // Budget-aware: 24 GiB VRAM easily fits the full 32768 trained window for a 4 GiB
+    // model, so the derive uses it — NOT a flat 8192 cap (the old behavior).
     assert_eq!(
         d.ctx_len,
-        CtxLen::Fixed { n: 8192 },
-        "ctx_train 32768 capped to 8192"
+        CtxLen::Fixed { n: 32768 },
+        "ample VRAM → the full trained context, not a flat cap"
     );
     assert_eq!(d.type_k, Some(KvCacheKind::F16));
     assert_eq!(d.n_seq_max, Some(1));
+}
+
+#[test]
+fn tight_vram_budget_shrinks_context_within_window() {
+    // A 6 GiB VRAM cap can't hold the full 32768 KV for a 4 GiB model, so the derived
+    // context backs OFF — but stays clamped to [MIN_CTX, ctx_train]. This is the whole
+    // point of budget-aware derivation: context scales with available memory.
+    let budget = ResourceBudget {
+        max_vram_bytes: Some(6u64 << 30),
+        ..Default::default()
+    };
+    let d = derive_default(&dense_meta(), &hw(24u64 << 30, 64u64 << 30, 16), &budget);
+    let CtxLen::Fixed { n } = d.ctx_len else {
+        panic!("expected a fixed ctx, got {:?}", d.ctx_len)
+    };
+    assert!(
+        (MIN_CTX..32768).contains(&n),
+        "tight budget shrinks context within [{MIN_CTX}, 32768): got {n}"
+    );
+
+    // And a GENEROUS explicit budget recovers the full trained window.
+    let generous = ResourceBudget {
+        max_vram_bytes: Some(40u64 << 30),
+        ..Default::default()
+    };
+    let dg = derive_default(&dense_meta(), &hw(48u64 << 30, 64u64 << 30, 16), &generous);
+    assert_eq!(
+        dg.ctx_len,
+        CtxLen::Fixed { n: 32768 },
+        "a generous budget recovers the full trained context"
+    );
 }
 
 #[test]

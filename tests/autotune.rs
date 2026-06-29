@@ -61,6 +61,84 @@ async fn tune_suggest_returns_params_fit_and_rationale() {
         !s["rationale"].as_array().unwrap().is_empty(),
         "rationale explains the choices: {s}"
     );
+    // Step 4: the context is DERIVED from the budget (not a flat cap), and the
+    // rationale names the method. This line exists only once derive_ctx is wired —
+    // a flat-8192 derive never pushes it (fail-on-revert).
+    assert!(
+        s["rationale"].as_array().unwrap().iter().any(|r| r
+            .as_str()
+            .is_some_and(|t| t.contains("context") && t.contains("analytical"))),
+        "rationale explains the budget-derived context (analytical): {}",
+        s["rationale"]
+    );
+    assert!(
+        s["load"]["ctx_len"]["n"].as_u64().unwrap() > 0,
+        "a concrete derived context: {s}"
+    );
+}
+
+/// An explicit VRAM budget that the all-GPU load overflows makes the suggester
+/// back off GPU offload to fit the cap (the `gpu_layers_within_budget` path, dead
+/// until a budget is actually supplied). A 1 MiB cap can't hold the model+overhead,
+/// so the suggestion drops to CPU-only (`gpu_layers` count 0) with a rationale note.
+#[tokio::test]
+async fn tune_vram_budget_backs_off_gpu_offload() {
+    let Some(gguf) = tiny_gguf_path() else {
+        eprintln!("SKIP tune_vram_budget: no tiny GGUF (set HIGGS_TEST_GGUF)");
+        return;
+    };
+    let srv = spawn_with_tiny_model(11544, &gguf).await;
+    let c = reqwest::Client::new();
+
+    let resp = c
+        .post(format!("{}/api/higgs/models/tune", srv.base))
+        .json(&serde_json::json!({
+            "id": TINY_MODEL_ID,
+            "mode": "suggest",
+            // 1 MiB — far below the ~800 MiB compute overhead, so an all-GPU load
+            // overflows it and the suggester must reduce GPU offload to fit.
+            "budget": { "max_vram_bytes": 1u64 << 20 }
+        }))
+        .send()
+        .await
+        .expect("tune request");
+    assert_eq!(resp.status(), 200, "tune with a VRAM budget");
+    let s: serde_json::Value = resp.json().await.unwrap();
+
+    // CPU-only is `{kind:"count", n:0}`; the all-GPU default `{kind:"all"}` would
+    // mean the budget was ignored. This holds on a GPU host (backed off to fit the
+    // 1 MiB cap) AND on a CPU-only host (CPU-only from the start) — env-robust.
+    let gpu = &s["load"]["gpu_layers"];
+    assert_eq!(
+        gpu["n"].as_u64(),
+        Some(0),
+        "1 MiB VRAM budget → CPU-only offload: {gpu}"
+    );
+
+    // The "VRAM budget" rationale only appears when there IS a GPU to back off from.
+    // On a CPU-only host the heuristic derives CPU-only without ever entering the
+    // budget-backoff path, so gate that assertion on detected GPU presence (else the
+    // test would falsely fail on CPU-only CI/dev hosts).
+    let sys: serde_json::Value = c
+        .get(format!("{}/api/higgs/system", srv.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let has_gpu = sys["hardware"]["gpus"]
+        .as_array()
+        .is_some_and(|a| a.iter().any(|g| g["kind"] == "Gpu"));
+    if has_gpu {
+        let rationale = s["rationale"].as_array().unwrap();
+        assert!(
+            rationale.iter().any(|n| n
+                .as_str()
+                .is_some_and(|t| t.to_lowercase().contains("vram budget"))),
+            "rationale notes the VRAM-budget backoff: {rationale:?}"
+        );
+    }
 }
 
 /// Tune → load WITH the suggestion → non-streaming chat serves; then a PLAIN

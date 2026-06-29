@@ -280,12 +280,12 @@ async fn multi_message_conversation() {
     );
 }
 
-/// HG005 ContextOverflow: the model loads at the default `ctx_len = 4096`, so a
-/// `max_tokens` above the window (still <= MAX_OUTPUT_TOKENS = 32768) makes
-/// `prompt_est + max_gen > n_ctx`, and the serve layer rejects with 400 [HG005]
-/// (`invalid_request_error`; `code` is null — only 404 carries model_not_found).
-/// We JIT-load the model first (a small chat) so `ensure_loaded` reports the real
-/// 4096 ctx_len rather than the remote/permissive placeholder.
+/// HG005 ContextOverflow, post-Step-5: a `max_tokens` beyond the window is now
+/// CLAMPED (not rejected — see `v1_errors::oversized_max_tokens_is_clamped`); the
+/// ONLY remaining 400 overflow is a prompt that ALONE exceeds the window, and it
+/// carries the OpenAI-standard `context_length_exceeded` code. The model loads at the
+/// default `ctx_len = 4096`; we JIT-load it first (a small chat) so `ensure_loaded`
+/// reports the real 4096 window rather than the remote/permissive placeholder.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn context_overflow_is_hg005() {
     let Some(gguf) = tiny_gguf_path() else {
@@ -307,12 +307,13 @@ async fn context_overflow_is_hg005() {
     .await;
     assert_well_formed(&warm);
 
-    // max_tokens 30000 > 4096 ctx_len ⇒ prompt_est + max_gen > n_ctx ⇒ 400 HG005.
+    // A prompt that ALONE exceeds 4096 tokens (~6000 est tokens at 4 bytes) has no
+    // room to generate ⇒ genuine 400 overflow with the standard code.
     let over = c
         .post(format!("{}/v1/chat/completions", srv.base))
         .json(&json!({
-            "model": TINY_MODEL_ID, "stream": false, "max_tokens": 30000,
-            "messages": [{ "role": "user", "content": "Tell a story." }]
+            "model": TINY_MODEL_ID, "stream": false, "max_tokens": 16,
+            "messages": [{ "role": "user", "content": "x".repeat(24000) }]
         }))
         .send()
         .await
@@ -320,12 +321,16 @@ async fn context_overflow_is_hg005() {
     assert_eq!(
         over.status(),
         400,
-        "max_tokens beyond the context window is a 400 [HG005]"
+        "a prompt larger than the window is a 400 [HG005]"
     );
     let env: Value = over.json().await.unwrap();
     assert_eq!(
         env["error"]["type"], "invalid_request_error",
         "context overflow is an invalid_request_error: {env:?}"
+    );
+    assert_eq!(
+        env["error"]["code"], "context_length_exceeded",
+        "the standard OpenAI code (Step 5), not null: {env:?}"
     );
     assert!(
         env["error"]["message"]

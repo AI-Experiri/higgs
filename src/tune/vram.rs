@@ -29,6 +29,54 @@ const FIT_HEADROOM: f64 = crate::api::MEMORY_HEADROOM_FRACTION;
 /// The "Tight" upper bound (fraction of the budget basis).
 const TIGHT_CEILING: f64 = 0.95;
 
+/// "Fits" headroom fraction. An EXPLICIT budget (`max_*_bytes` set) is the user's
+/// hard ceiling — they already carved their margin (e.g. 75% of FREE) — so we do
+/// NOT re-apply the 80% safety on top (no `0.75 × 0.8` double-discount): the budget
+/// is filled directly (`1.0`). The DETECTED total keeps the 80% safety tier.
+fn fit_frac(explicit_budget: bool) -> f64 {
+    if explicit_budget {
+        1.0
+    } else {
+        FIT_HEADROOM
+    }
+}
+
+/// "Tight" upper bound; collapses to the ceiling (`1.0`) for an explicit budget,
+/// so an explicit budget reads Fits up to its ceiling and Overflow beyond it.
+fn tight_frac(explicit_budget: bool) -> f64 {
+    if explicit_budget {
+        1.0
+    } else {
+        TIGHT_CEILING
+    }
+}
+
+/// Resolve a candidate context window for ESTIMATION the same way the load path
+/// resolves it: `Auto` becomes the model's trained window **capped at**
+/// [`crate::api::DEFAULT_CTX_CAP`] (the node's auto-context cap), so a live estimate
+/// matches what would actually load. Estimating a long-context model's full
+/// `ctx_train` (e.g. 1M) would otherwise show a huge KV / false Overflow for a load
+/// that the node will cap. A `Fixed` request passes through untouched.
+pub fn resolve_estimate_ctx(ctx_len: CtxLen, ctx_train: Option<u64>) -> CtxLen {
+    match ctx_len {
+        CtxLen::Auto => {
+            let cap = crate::api::DEFAULT_CTX_CAP as u64;
+            // No trained-context metadata → the load leaves `ctx_len` absent and the
+            // worker falls back to 4096 (llama.cpp's default n_ctx). Estimate against
+            // THAT, not the cap, or a metadata-less model overstates KV by up to 8×.
+            let trained = ctx_train.unwrap_or(WORKER_FALLBACK_CTX);
+            CtxLen::Fixed {
+                n: trained.min(cap) as u32,
+            }
+        }
+        other => other,
+    }
+}
+
+/// llama.cpp's default `n_ctx` when a load leaves the context unset and the GGUF
+/// carries no trained-context metadata — the worker's fallback window.
+const WORKER_FALLBACK_CTX: u64 = 4096;
+
 /// Bytes-per-element for a KV-cache element type (block-quant overhead folded in
 /// approximately). Defaults to F16 (2 bytes) for the practical KV set.
 fn kv_type_bytes(kind: KvCacheKind) -> f64 {
@@ -81,9 +129,11 @@ fn gpu_fraction(load: &LlamaCppParams, meta: &ModelMeta, hw: &HardwareInfo) -> f
     }
 }
 
-/// Build a tri-state [`FitReport`] from a need against a budget basis. `system::
-/// fits_vram` gives the `Fits` (≤ 80%) tier; `Tight` runs to 95%; above is `Overflow`.
-fn report(needed: u64, basis: u64) -> FitReport {
+/// Build a tri-state [`FitReport`] from a need against a budget basis. `fit_f` is
+/// the "Fits" headroom fraction and `tight_f` the "Tight" upper bound (see
+/// [`fit_frac`]/[`tight_frac`]): a detected total uses `0.8`/`0.95`; an explicit
+/// budget uses `1.0`/`1.0` (the budget IS the ceiling — no double headroom).
+fn report(needed: u64, basis: u64, fit_f: f64, tight_f: f64) -> FitReport {
     // A zero need always fits — notably a CPU-only load uses no VRAM (`needed == 0`)
     // even on a host with no GPU (`basis == 0`), which must read as Fits, not Overflow.
     if needed == 0 {
@@ -100,9 +150,9 @@ fn report(needed: u64, basis: u64) -> FitReport {
             budget_bytes: 0,
         };
     }
-    let verdict = if fits_vram(needed, basis, FIT_HEADROOM).fits {
+    let verdict = if fits_vram(needed, basis, fit_f).fits {
         FitVerdict::Fits
-    } else if (needed as f64) <= basis as f64 * TIGHT_CEILING {
+    } else if (needed as f64) <= basis as f64 * tight_f {
         FitVerdict::Tight
     } else {
         FitVerdict::Overflow
@@ -128,7 +178,8 @@ pub fn gpu_layers_within_budget(
         return 0;
     }
     let basis = budget.max_vram_bytes.unwrap_or(hw.vram_total_bytes);
-    let safe = basis as f64 * FIT_HEADROOM;
+    // An explicit VRAM budget is the ceiling (no extra 0.8); the detected total keeps it.
+    let safe = basis as f64 * fit_frac(budget.max_vram_bytes.is_some());
     let overhead = COMPUTE_OVERHEAD_BYTES as f64;
     // Weights resident on the GPU at full offload (cpu_moe pulls experts off).
     let weights = meta.size_bytes as f64
@@ -189,7 +240,8 @@ impl VramEstimator for StaticVramEstimator {
         };
         let needed = (gpu_weights + kv_on_gpu + overhead) as u64;
         let basis = budget.max_vram_bytes.unwrap_or(hw.vram_total_bytes);
-        report(needed, basis)
+        let explicit = budget.max_vram_bytes.is_some();
+        report(needed, basis, fit_frac(explicit), tight_frac(explicit))
     }
 }
 
@@ -221,7 +273,8 @@ impl RamEstimator for StaticRamEstimator {
         let cpu_kv = (kv_total - kv_on_gpu).max(0.0);
         let needed = (cpu_weights + cpu_kv + COMPUTE_OVERHEAD_BYTES as f64) as u64;
         let basis = budget.max_ram_bytes.unwrap_or(hw.ram_total_bytes);
-        report(needed, basis)
+        let explicit = budget.max_ram_bytes.is_some();
+        report(needed, basis, fit_frac(explicit), tight_frac(explicit))
     }
 }
 
