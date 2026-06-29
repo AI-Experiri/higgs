@@ -9,6 +9,9 @@ fn tune_record() -> TuneRecord {
         provenance: TuneProvenance::Heuristic,
         bench_tps: None,
         tuned_at_ms: 100,
+        hw_fingerprint: "v0r0n0".into(),
+        model_file_sig: "123:456".into(),
+        resolved_ctx: 8192,
     }
 }
 

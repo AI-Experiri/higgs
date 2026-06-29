@@ -123,6 +123,10 @@ higgs_ts! {
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         pub last_load: Option<LoadParams>,
+        /// Readiness state for this model on THIS node — the contract the UI badges
+        /// and (future) autonomous agents read. Derived from profile presence,
+        /// staleness, residency, live resource fit, and the serving toggle.
+        pub readiness: crate::serve::readiness::ModelReadiness,
     }
 }
 

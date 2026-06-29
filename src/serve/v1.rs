@@ -124,6 +124,11 @@ fn v1_error_code(err: &HiggsError) -> Option<&'static str> {
         HiggsError::WorkerRpc { worker_code, .. } if worker_code.as_deref() == Some("HG005") => {
             Some("context_length_exceeded")
         }
+        // A model that isn't Prepared (or whose profile is stale) can't be served
+        // until the user acts — surface one client-stable code for both.
+        HiggsError::NotPrepared { .. } | HiggsError::ProfileStale { .. } => {
+            Some("model_not_prepared")
+        }
         _ => None,
     }
 }
@@ -516,8 +521,30 @@ async fn ensure_loaded(higgs: &Arc<Higgs>, model: &str) -> Result<LoadedInfo, Re
         return Err(v1_error(&err).into_response());
     }
 
-    // Load on demand (host defaults). One always-on INFO line so the load is
-    // visible in the Developer Logs. The local load is ADDITIVE — it spawns a new
+    // Readiness gate: JIT only loads a model that has been Prepared (a fresh,
+    // canonical tuning profile). An un-profiled or stale model is REFUSED with a
+    // coded error — never a silent load with dumb defaults (the old behaviour that
+    // produced a wrong context window). See `crate::serve::readiness`.
+    match higgs.profile_state(model).await {
+        crate::api::ProfileState::Missing => {
+            let err = HiggsError::NotPrepared {
+                id: model.to_owned(),
+            };
+            tracing::warn!(model = %model, "higgs: JIT chat for un-prepared model");
+            return Err(v1_error(&err).into_response());
+        }
+        crate::api::ProfileState::Stale => {
+            let err = HiggsError::ProfileStale {
+                id: model.to_owned(),
+            };
+            tracing::warn!(model = %model, "higgs: JIT chat for stale profile");
+            return Err(v1_error(&err).into_response());
+        }
+        crate::api::ProfileState::Ready => {}
+    }
+
+    // Load on demand (from the saved profile). One always-on INFO line so the load
+    // is visible in the Developer Logs. The local load is ADDITIVE — it spawns a new
     // worker alongside any others (and is idempotent per model), no swap.
     tracing::info!("higgs: JIT loading {model}");
     if let Err(err) = higgs.load(model, None).await {

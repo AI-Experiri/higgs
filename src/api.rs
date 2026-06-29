@@ -40,6 +40,41 @@ use guards::validate_repo_id;
 pub(crate) use guards::{guard_memory_headroom, path_within_roots};
 pub use types::*;
 
+/// Freshness verdict for a saved tuning profile, consumed by the JIT gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProfileState {
+    /// No profile — the model was never Prepared.
+    Missing,
+    /// Profile exists but the hardware or model file changed since Prepare.
+    Stale,
+    /// Profile exists and matches the current hardware + file.
+    Ready,
+}
+
+/// Is the saved profile stale for the given on-disk path + current hardware?
+/// Stale when either anchor differs (an empty stored anchor — e.g. a bare load,
+/// not a Prepare — never matches, so it reads as stale → must Re-tune).
+fn profile_stale(rec: &TuneRecord, path: &str, hw: &crate::system::HardwareInfo) -> bool {
+    rec.hw_fingerprint != hw.fingerprint() || rec.model_file_sig != file_sig(path)
+}
+
+/// Cheap model-file identity (`"{len}:{mtime_ms}"`) for staleness checks on a
+/// tuning profile. Empty string when the file can't be stat'd — an empty sig
+/// never matches a real one, so the profile reads as stale (needs Re-tune),
+/// which fails safe.
+pub(crate) fn file_sig(path: &str) -> String {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return String::new();
+    };
+    let mtime_ms = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    format!("{}:{}", meta.len(), mtime_ms)
+}
+
 /// The in-process handle to the higgs runtime. One instance per host app.
 ///
 /// The host-facing facade over the co-located LOCAL [`NodeRuntime`]. `Higgs` owns
@@ -1404,6 +1439,17 @@ impl Higgs {
                         provenance: suggestion.provenance,
                         bench_tps: None,
                         tuned_at_ms: now_unix_ms(),
+                        // Staleness anchors: the hardware + model file this profile
+                        // was derived against, and the concrete n_ctx it loads at.
+                        hw_fingerprint: hw.fingerprint(),
+                        model_file_sig: file_sig(&model.path),
+                        resolved_ctx: match crate::tune::vram::resolve_estimate_ctx(
+                            suggestion.load.as_llamacpp().ctx_len,
+                            meta.ctx_train,
+                        ) {
+                            crate::worker::engine::CtxLen::Fixed { n } => n,
+                            crate::worker::engine::CtxLen::Auto => 0,
+                        },
                     },
                 );
                 if let Err(e) = store.flush() {
@@ -1424,6 +1470,86 @@ impl Higgs {
     /// formula — so the UI shows the live cost ("≈ X GiB VRAM · verdict") as the user
     /// edits context / KV types / GPU offload. Pure + cheap: a GGUF-metadata lookup +
     /// the cached hardware read, no worker round-trip beyond that.
+    /// Live readiness for one scanned model on this node. Gathers profile
+    /// presence + staleness + residency + serving, and evaluates the (heavier)
+    /// resource fit ONLY when the derived state would depend on it — a profiled,
+    /// fresh, non-resident model with serving on. See [`crate::serve::readiness`].
+    pub(crate) async fn model_readiness(
+        &self,
+        model: &HiggsModel,
+        loaded_set: &[String],
+        hw: &crate::system::HardwareInfo,
+    ) -> crate::serve::readiness::ModelReadiness {
+        use crate::serve::readiness::{derive_readiness, ReadinessInputs};
+        let loaded = loaded_set.iter().any(|id| id == &model.id);
+        let rec = self.models_store().ok().and_then(|s| s.tuning(&model.id));
+        let profiled = rec.is_some();
+        let stale = rec
+            .as_ref()
+            .is_some_and(|r| profile_stale(r, &model.path, hw));
+        let serving = self.serving_enabled();
+        let fits = if profiled && !stale && !loaded && serving {
+            self.profile_fits(&model.id).await
+        } else {
+            false
+        };
+        derive_readiness(&ReadinessInputs {
+            on_disk: true,
+            profiled,
+            stale,
+            loaded,
+            fits,
+            serving,
+        })
+    }
+
+    /// Does the saved profile for `id` fit current free VRAM **and** RAM? Reuses
+    /// the estimate path with the profile's own params; any error ⇒ does not fit.
+    async fn profile_fits(&self, id: &str) -> bool {
+        let Some(rec) = self.models_store().ok().and_then(|s| s.tuning(id)) else {
+            return false;
+        };
+        let lc = rec.profile.as_llamacpp();
+        let req = EstimateRequest {
+            id: id.to_owned(),
+            ctx_len: lc.ctx_len,
+            gpu_layers: Some(lc.gpu_layers),
+            type_k: lc.type_k,
+            type_v: lc.type_v,
+            offload_kqv: lc.offload_kqv,
+            cpu_moe: lc.cpu_moe,
+            budget: Some(rec.budget.clone()),
+        };
+        match self.estimate(req).await {
+            Ok(r) => {
+                r.vram.verdict != crate::tune::FitVerdict::Overflow
+                    && r.ram.verdict != crate::tune::FitVerdict::Overflow
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Classify the saved profile for `id` for the JIT gate: `Missing` (never
+    /// Prepared), `Stale` (hardware or model file changed since Prepare), or
+    /// `Ready`. The gate refuses `Missing`/`Stale` rather than load dumb defaults.
+    pub(crate) async fn profile_state(&self, id: &str) -> ProfileState {
+        let Some(rec) = self.models_store().ok().and_then(|s| s.tuning(id)) else {
+            return ProfileState::Missing;
+        };
+        let hw = self.hardware().await;
+        let path = self
+            .scan()
+            .await
+            .ok()
+            .and_then(|ms| ms.into_iter().find(|m| m.id == id).map(|m| m.path))
+            .unwrap_or_default();
+        if profile_stale(&rec, &path, &hw) {
+            ProfileState::Stale
+        } else {
+            ProfileState::Ready
+        }
+    }
+
     pub async fn estimate(&self, req: EstimateRequest) -> Result<EstimateReport, HiggsError> {
         // Resolve the GGUF metadata, memoized per-id: the UI hits this on every edit,
         // so re-scanning all model dirs each keystroke would be wasteful on large

@@ -2,6 +2,7 @@
 import type { GgufComponent } from "./GgufComponent";
 import type { HiggsModelSource } from "./HiggsModelSource";
 import type { LoadParams } from "./LoadParams";
+import type { ModelReadiness } from "./ModelReadiness";
 
 /**
  * Per-model entry in `GET /api/higgs/models`: enriches [`HiggsModel`] with
@@ -43,6 +44,12 @@ support_reason?: string,
  * context, capped) — the UI should render that as "auto", not "0".
  */
 last_load?: LoadParams, 
+/**
+ * Readiness state for this model on THIS node — the contract the UI badges
+ * and (future) autonomous agents read. Derived from profile presence,
+ * staleness, residency, live resource fit, and the serving toggle.
+ */
+readiness: ModelReadiness, 
 /**
  * HuggingFace repo id, `org/model` — the identity used everywhere.
  * Ollama-sourced models keep their established Ollama name (`ollama/{name}:{tag}`);

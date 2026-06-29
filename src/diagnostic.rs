@@ -443,6 +443,24 @@ pub enum HiggsError {
     ))]
     #[diagnostic(code(HG045), severity(Error))]
     ControlSurfaceDown { reason: String },
+
+    /// A chat/load targeted a model with no canonical load profile. JIT will not
+    /// load with silent defaults — the model must be Prepared (autotuned) first
+    /// so it loads with the right context/offload for this hardware.
+    #[snafu(display(
+        "[HG046] model not prepared: {id} — run autotune (Prepare) to pin a load profile before serving"
+    ))]
+    #[diagnostic(code(HG046))]
+    NotPrepared { id: String },
+
+    /// A chat/load targeted a model whose profile is stale — the hardware or the
+    /// model file changed since it was Prepared, so the profile may no longer fit.
+    /// Re-tune before loading (a stale profile hard-blocks, by design).
+    #[snafu(display(
+        "[HG047] profile stale for {id}: hardware or model file changed since Prepare — Re-tune before loading"
+    ))]
+    #[diagnostic(code(HG047))]
+    ProfileStale { id: String },
 }
 
 #[cfg(test)]

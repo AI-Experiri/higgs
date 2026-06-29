@@ -110,6 +110,7 @@ fn model_entry(
     mut model: HiggsModel,
     loaded_ids: &[String],
     last_load: Option<LoadParams>,
+    readiness: crate::serve::readiness::ModelReadiness,
 ) -> HiggsModelEntry {
     // Multi-model: this model is "loaded" if it is among the resident ids, not only
     // when it is the primary.
@@ -132,6 +133,7 @@ fn model_entry(
         tool_calls,
         support_reason,
         last_load,
+        readiness,
         model,
     }
 }
@@ -150,13 +152,15 @@ pub(super) async fn control_models(State(higgs): State<Arc<Higgs>>) -> Response 
     // Non-consuming lookup — the scan can list multiple rows for one id (e.g. several
     // HF cache revisions), and they should all carry the same persisted `last_load`.
     let records = higgs.model_records();
-    let entries: Vec<HiggsModelEntry> = models
-        .into_iter()
-        .map(|m| {
-            let last_load = records.get(&m.id).and_then(|r| r.load.clone());
-            model_entry(m, &loaded_set, last_load)
-        })
-        .collect();
+    // One hardware snapshot for the whole list — readiness (staleness + fit) is
+    // computed against it per model.
+    let hw = higgs.hardware().await;
+    let mut entries: Vec<HiggsModelEntry> = Vec::with_capacity(models.len());
+    for m in models {
+        let last_load = records.get(&m.id).and_then(|r| r.load.clone());
+        let readiness = higgs.model_readiness(&m, &loaded_set, &hw).await;
+        entries.push(model_entry(m, &loaded_set, last_load, readiness));
+    }
     Json(HiggsModelsResponse {
         models: entries,
         loaded_id: primary,
@@ -182,7 +186,9 @@ pub(super) async fn control_model_by_id(
     match models.into_iter().find(|m| m.id == id) {
         Some(model) => {
             let last_load = higgs.model_records().remove(&model.id).and_then(|r| r.load);
-            Json(model_entry(model, &loaded_set, last_load)).into_response()
+            let hw = higgs.hardware().await;
+            let readiness = higgs.model_readiness(&model, &loaded_set, &hw).await;
+            Json(model_entry(model, &loaded_set, last_load, readiness)).into_response()
         }
         None => {
             let err = HiggsError::ModelNotFound { id };

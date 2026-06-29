@@ -18,6 +18,7 @@
 //! 3. Register it in [`router`] under `/api/higgs/<name>`.
 
 mod control;
+pub(crate) mod readiness;
 mod stream;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -104,7 +105,11 @@ pub(crate) fn http_status(err: &HiggsError) -> StatusCode {
         // Client-side request errors caught at the boundary before dispatch.
         HiggsError::ContextOverflow { .. }
         | HiggsError::InvalidSamplingParam { .. }
-        | HiggsError::InvalidModelId { .. } => StatusCode::BAD_REQUEST,
+        | HiggsError::InvalidModelId { .. }
+        // A model that isn't Prepared (or whose profile is stale) is a client
+        // precondition failure — the caller must Prepare/Re-tune first.
+        | HiggsError::NotPrepared { .. }
+        | HiggsError::ProfileStale { .. } => StatusCode::BAD_REQUEST,
         // Capacity / infrastructure-down — retryable.
         HiggsError::WorkerSpawnFailed { .. }
         | HiggsError::WorkerDead { .. }

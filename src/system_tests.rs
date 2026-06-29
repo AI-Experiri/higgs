@@ -1,5 +1,47 @@
 use super::*;
 
+/// Minimal `HardwareInfo` for fingerprint tests — no FFI, no sampling.
+fn fp_hw(vram: u64, ram: u64, gpus: Vec<GpuDevice>) -> HardwareInfo {
+    HardwareInfo {
+        cpu_name: "test".into(),
+        arch: "test".into(),
+        cpu_cores: 8,
+        ram_total_bytes: ram,
+        ram_used_bytes: 0,
+        cpu_usage_percent: 0.0,
+        gpus,
+        vram_total_bytes: vram,
+    }
+}
+
+#[test]
+fn fingerprint_is_stable_and_hardware_sensitive() {
+    let hw = fp_hw(24 << 30, 64 << 30, vec![]);
+    let a = hw.fingerprint();
+    assert_eq!(a, hw.fingerprint(), "same hardware → same fingerprint");
+
+    // VRAM total change → new fingerprint.
+    assert_ne!(a, fp_hw(25 << 30, 64 << 30, vec![]).fingerprint());
+    // RAM total change → new fingerprint.
+    assert_ne!(a, fp_hw(24 << 30, 32 << 30, vec![]).fingerprint());
+    // GPU roster change → new fingerprint.
+    assert_ne!(
+        a,
+        fp_hw(24 << 30, 64 << 30, vec![cpu_device()]).fingerprint()
+    );
+}
+
+#[test]
+fn fingerprint_ignores_volatile_fields() {
+    // usage % and free bytes (RuntimeInfo / per-device free) are not part of the
+    // signature, so they must not flip it. Only used_memory differs here.
+    let mut a = fp_hw(24 << 30, 64 << 30, vec![]);
+    let base = a.fingerprint();
+    a.ram_used_bytes = 10 << 30;
+    a.cpu_usage_percent = 88.0;
+    assert_eq!(base, a.fingerprint());
+}
+
 /// A scripted CPU device — the shape `FakeEngine::devices` and these tests
 /// use so the VRAM-sum and fit logic run without real FFI.
 fn cpu_device() -> GpuDevice {

@@ -116,6 +116,28 @@ pub fn hostname() -> String {
     System::host_name().unwrap_or_default()
 }
 
+impl HardwareInfo {
+    /// Stable signature over the facts that change what fits: total VRAM, total
+    /// RAM, and the GPU roster (name + per-device VRAM). Excludes volatile fields
+    /// (usage %, free bytes) so it flips only on a real hardware change — used to
+    /// detect a stale tuning profile (`ModelReadiness::NeedsRetune`).
+    pub fn fingerprint(&self) -> String {
+        use std::fmt::Write as _;
+        let mut s = String::new();
+        let _ = write!(
+            s,
+            "v{}r{}n{}",
+            self.vram_total_bytes,
+            self.ram_total_bytes,
+            self.gpus.len()
+        );
+        for g in &self.gpus {
+            let _ = write!(s, "|{}:{}", g.name, g.vram_total_bytes);
+        }
+        s
+    }
+}
+
 impl SystemInfo {
     /// Gather a fresh snapshot. Blocking (samples CPU usage over a short
     /// interval) — call from a blocking context, not directly in an async task.

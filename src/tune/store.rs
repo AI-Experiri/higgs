@@ -78,6 +78,19 @@ pub struct TuneRecord {
     pub bench_tps: Option<f32>,
     /// Unix-ms when this profile was saved.
     pub tuned_at_ms: u64,
+    /// Hardware signature at Prepare time (`HardwareInfo::fingerprint`). A
+    /// mismatch vs current hardware marks the profile stale → `NeedsRetune`.
+    /// `#[serde(default)]` so pre-existing `models.json` records load unchanged.
+    #[serde(default)]
+    pub hw_fingerprint: String,
+    /// Model-file identity (`"{size}:{mtime_ms}"`) at Prepare time. A mismatch
+    /// vs the on-disk file marks the profile stale → `NeedsRetune`.
+    #[serde(default)]
+    pub model_file_sig: String,
+    /// Concrete `n_ctx` the profile loads at — seeds the session Context Size so
+    /// it cannot drift from the model's real window (Gap-2 fix).
+    #[serde(default)]
+    pub resolved_ctx: u32,
 }
 
 /// Observed passive performance (§7.1) — real decode timing, never synthetic.
@@ -182,6 +195,12 @@ impl JsonModelStore {
                     provenance: TuneProvenance::Heuristic,
                     bench_tps: None,
                     tuned_at_ms: now_ms,
+                    // A profile created by a bare load (not Prepare/tune) carries no
+                    // staleness anchors — empty fingerprint reads as "not Prepared
+                    // for this hardware", so readiness treats it as needing a tune.
+                    hw_fingerprint: String::new(),
+                    model_file_sig: String::new(),
+                    resolved_ctx: 0,
                 });
             }
         }
