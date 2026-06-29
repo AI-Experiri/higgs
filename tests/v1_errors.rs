@@ -38,6 +38,55 @@ async fn load_tiny(client: &reqwest::Client, base: &str) {
     );
 }
 
+// ── Un-prepared model chat (JIT) → 400 model_not_prepared [HG046] ────────────
+//
+// A scanned-but-never-Prepared model must NOT silently JIT-load with default
+// params: the readiness gate refuses it with a coded error. This is the fix for
+// the "loads with the wrong context" class of bug. Fails-on-revert: drop the
+// gate in `ensure_loaded` and the chat 200s (the model loads) instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unprepared_model_chat_is_model_not_prepared() {
+    let Some(gguf) = tiny_gguf_path() else {
+        eprintln!("SKIP unprepared_model_chat_is_model_not_prepared: tiny gguf not found");
+        return;
+    };
+    let srv = spawn_with_tiny_model(12113, &gguf).await;
+    let c = reqwest::Client::new();
+    // Deliberately NO load_tiny / tune — the model is scanned but un-Prepared, so
+    // the chat hits the JIT path and must be refused.
+    let resp = c
+        .post(format!("{}/v1/chat/completions", srv.base))
+        .json(&json!({
+            "model": TINY_MODEL_ID, "stream": false,
+            "messages": [{ "role": "user", "content": "hi" }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        400,
+        "un-prepared JIT chat is a 400, got {}",
+        resp.status()
+    );
+    let env: Value = resp.json().await.unwrap();
+    assert_eq!(
+        env["error"]["code"], "model_not_prepared",
+        "coded model_not_prepared: {env:?}"
+    );
+    // And it never became resident — no silent default load.
+    let models: Value = c
+        .get(format!("{}/v1/models", srv.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let resident = models["data"].as_array().map(Vec::len).unwrap_or(0);
+    assert_eq!(resident, 0, "no model resident after a refused JIT: {models:?}");
+}
+
 // ── Out-of-range sampling param → 400 [HG013] invalid_request_error ──────────
 //
 // `top_p` must be in (0, 1]; 2.0 is out of range. The model is loaded first so
