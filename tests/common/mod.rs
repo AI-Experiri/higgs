@@ -107,6 +107,24 @@ pub async fn spawn_with_tiny_model(port: u16, gguf: &Path) -> ServerGuard {
     spawn_with_models(port, gguf, &[TINY_MODEL_ID]).await
 }
 
+/// Prepare (autotune) the tiny model so a subsequent JIT chat is allowed by the
+/// readiness gate — JIT refuses an un-profiled model. Tests that intentionally
+/// exercise the JIT happy path call this once after spawn; tests that explicitly
+/// `POST /models/load` don't need it (an explicit load bypasses the gate).
+pub async fn prepare_tiny(base: &str) {
+    let r = reqwest::Client::new()
+        .post(format!("{base}/api/higgs/models/tune"))
+        .json(&serde_json::json!({ "id": TINY_MODEL_ID }))
+        .send()
+        .await
+        .expect("send tune request");
+    assert!(
+        r.status().is_success(),
+        "Prepare (tune) tiny model succeeded, got {}",
+        r.status()
+    );
+}
+
 /// Like [`spawn_with_tiny_model`] but stages one model per id in `ids` (each loadable under that
 /// id), for multi-model / multi-worker tests.
 #[allow(clippy::zombie_processes)]

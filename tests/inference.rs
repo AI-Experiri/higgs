@@ -40,6 +40,7 @@ async fn inference_and_tools() {
         return;
     };
     let srv = spawn_with_tiny_model(11501, &gguf).await;
+    common::prepare_tiny(&srv.base).await;
     let c = reqwest::Client::new();
     let id = TINY_MODEL_ID;
 

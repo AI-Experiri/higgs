@@ -69,6 +69,7 @@ async fn high_temperature_top_p_top_k() {
         return;
     };
     let srv = spawn_with_tiny_model(12600, &gguf).await;
+    common::prepare_tiny(&srv.base).await;
     let resp = chat_json(
         &srv.base,
         json!({
@@ -90,6 +91,7 @@ async fn low_temperature_min_p() {
         return;
     };
     let srv = spawn_with_tiny_model(12601, &gguf).await;
+    common::prepare_tiny(&srv.base).await;
     let resp = chat_json(
         &srv.base,
         json!({
@@ -114,6 +116,7 @@ async fn greedy_temperature_is_deterministic() {
         return;
     };
     let srv = spawn_with_tiny_model(12602, &gguf).await;
+    common::prepare_tiny(&srv.base).await;
     let body = json!({
         "model": TINY_MODEL_ID, "stream": false, "max_tokens": 12, "temperature": 0.0,
         "messages": [{ "role": "user", "content": "Say a fixed greeting." }]
@@ -138,6 +141,7 @@ async fn seeded_request_is_well_formed() {
         return;
     };
     let srv = spawn_with_tiny_model(12603, &gguf).await;
+    common::prepare_tiny(&srv.base).await;
     let resp = chat_json(
         &srv.base,
         json!({
@@ -160,6 +164,7 @@ async fn max_tokens_one_caps_completion() {
         return;
     };
     let srv = spawn_with_tiny_model(12604, &gguf).await;
+    common::prepare_tiny(&srv.base).await;
     let resp = chat_json(
         &srv.base,
         json!({
@@ -184,6 +189,7 @@ async fn larger_max_completion_tokens() {
         return;
     };
     let srv = spawn_with_tiny_model(12605, &gguf).await;
+    common::prepare_tiny(&srv.base).await;
     let resp = chat_json(
         &srv.base,
         json!({
@@ -215,6 +221,7 @@ async fn stop_sequence_is_accepted() {
         return;
     };
     let srv = spawn_with_tiny_model(12606, &gguf).await;
+    common::prepare_tiny(&srv.base).await;
     let resp = chat_json(
         &srv.base,
         json!({
@@ -238,6 +245,7 @@ async fn presence_frequency_penalties() {
         return;
     };
     let srv = spawn_with_tiny_model(12607, &gguf).await;
+    common::prepare_tiny(&srv.base).await;
     let resp = chat_json(
         &srv.base,
         json!({
@@ -260,6 +268,7 @@ async fn multi_message_conversation() {
         return;
     };
     let srv = spawn_with_tiny_model(12608, &gguf).await;
+    common::prepare_tiny(&srv.base).await;
     let resp = chat_json(
         &srv.base,
         json!({
@@ -293,6 +302,7 @@ async fn context_overflow_is_hg005() {
         return;
     };
     let srv = spawn_with_tiny_model(12609, &gguf).await;
+    common::prepare_tiny(&srv.base).await;
     let c = reqwest::Client::new();
 
     // Load the model on demand with a tiny, in-window request first, so the
@@ -350,6 +360,7 @@ async fn streaming_with_sampling_params() {
         return;
     };
     let srv = spawn_with_tiny_model(12610, &gguf).await;
+    common::prepare_tiny(&srv.base).await;
     let body = reqwest::Client::new()
         .post(format!("{}/v1/chat/completions", srv.base))
         .json(&json!({
