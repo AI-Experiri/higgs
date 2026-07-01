@@ -213,11 +213,79 @@ higgs_ts! {
 }
 
 higgs_ts! {
+    /// A model load currently IN FLIGHT on the local node — surfaced so the UI can
+    /// show a progress indicator during the (multi-second) load instead of a silent
+    /// wait. Present on [`HiggsStatus`] only while a `load` is running; cleared on
+    /// completion (success or failure).
+    #[derive(Debug, Clone, serde::Serialize)]
+    pub struct ModelLoading {
+        /// Repo id of the model being loaded.
+        pub id: String,
+        /// Unix-ms when the load began — the UI animates a progress bar from here
+        /// against its own size-based estimate (it already has the model's size).
+        #[ts(type = "number")]
+        pub started_ms: u64,
+    }
+}
+
+higgs_const_enum! {
+    /// Lifecycle phase of an in-flight model load, pushed as a live
+    /// [`ModelLoadEvent`] over `GET /api/higgs/events` (SSE) at each real seam in
+    /// [`Higgs::load`](crate::api::Higgs::load) so the UI can show WHAT the load is
+    /// doing — not just a spinner. Every variant maps to an observable transition in
+    /// `load_inner`; no phase is faked. `Queued`/`Preparing`/`LoadingWeights`/
+    /// `Finalizing` are progress phases; `Ready`/`Failed` are terminal.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ModelLoadPhase {
+        /// Waiting behind another in-flight load (the per-facade load lock is held).
+        Queued,
+        /// Validating the id/profile, resolving load params, capturing tune anchors.
+        Preparing,
+        /// The multi-second worker load — mmap weights → GPU upload → KV alloc.
+        LoadingWeights,
+        /// Load succeeded; persisting the load record + syncing the tuning profile.
+        Finalizing,
+        /// Terminal: the model is resident and serving.
+        Ready,
+        /// Terminal: the load failed. The `code` on [`ModelLoadEvent`] carries the `HGxxx`.
+        Failed,
+    }
+}
+
+higgs_ts! {
+    /// A live model-load lifecycle event, streamed over `GET /api/higgs/events`
+    /// (SSE). One is pushed at every [`ModelLoadPhase`] transition of a load, so the
+    /// UI shows/updates/hides the loading indicator from PUSH events instead of
+    /// polling `status`. Terminal phases (`Ready`/`Failed`) close out the bar;
+    /// `Failed` carries the diagnostic `code`.
+    #[derive(Debug, Clone, serde::Serialize)]
+    pub struct ModelLoadEvent {
+        /// Repo id of the model being loaded.
+        pub id: String,
+        /// The phase this event announces.
+        pub phase: ModelLoadPhase,
+        /// Unix-ms when the phase was entered.
+        #[ts(type = "number")]
+        pub at_ms: u64,
+        /// The `HGxxx` diagnostic code — present only on [`ModelLoadPhase::Failed`].
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub code: Option<String>,
+    }
+}
+
+higgs_ts! {
     /// Live status snapshot returned by [`Higgs::status`].
     #[derive(Debug, Clone, serde::Serialize)]
     pub struct HiggsStatus {
         /// Whether the worker process is currently alive.
         pub worker_alive: bool,
+        /// A load currently in flight on the local node (for a progress indicator),
+        /// or `None` when nothing is loading.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub loading: Option<ModelLoading>,
         /// Info about the PRIMARY loaded model (lowest worker id), if any. Kept for the status
         /// bar + provider seeding; `loaded_all` carries every resident model.
         #[serde(skip_serializing_if = "Option::is_none")]

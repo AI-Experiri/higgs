@@ -187,7 +187,8 @@ pub fn router(higgs: Arc<Higgs>) -> Router {
     // worker chat-RPC timeout; the live log stream is unbounded by design.
     let streaming = Router::new()
         .route("/v1/chat/completions", post(v1::v1_chat_completions))
-        .route("/api/higgs/logs/stream", get(control::control_logs_stream));
+        .route("/api/higgs/logs/stream", get(control::control_logs_stream))
+        .route("/api/higgs/events", get(control::control_events_stream));
 
     // Control + non-streaming surface: a generous whole-request timeout is safe
     // and prevents a wedged request pinning a connection.

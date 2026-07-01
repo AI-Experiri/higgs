@@ -918,6 +918,57 @@ pub(super) async fn control_logs_stream(
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
+/// `GET /api/higgs/events` — LIVE model-load lifecycle events over SSE.
+///
+/// Each [`ModelLoadEvent`](crate::api::types::ModelLoadEvent) (a phase transition of
+/// an in-flight load) arrives as one SSE `data:` frame carrying the event JSON. The
+/// UI subscribes once and drives its loading indicator from these PUSH events —
+/// showing the bar on the first non-terminal phase, updating the label per phase, and
+/// hiding it on the terminal `ready`/`failed` — so NO `status` polling is needed to
+/// watch a load. There is no replay ring (unlike the log stream): the bar is
+/// transient, and a subscriber that joins mid-load still gets every remaining phase
+/// plus the terminal event. A slow client that overflows the buffer gets `Lagged`;
+/// the handler skips the gap and keeps streaming (the terminal event still clears the
+/// bar). Stream ends on client disconnect or when the sender is permanently closed.
+pub(super) async fn control_events_stream(
+    State(higgs): State<Arc<Higgs>>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    tracing::info!("higgs: GET /api/higgs/events");
+    // Unfold DIRECTLY over the broadcast receiver — no intermediate forwarding
+    // task. axum polls this stream from the connection, so when the client
+    // disconnects the stream is dropped and the receiver with it: no idle task or
+    // subscriber lingers during quiet periods (the load-event channel is silent
+    // between loads). KeepAlive comments detect a dead connection without traffic.
+    let rx = higgs.subscribe_load_events();
+    let stream = futures::stream::unfold(rx, |mut rx| async move {
+        loop {
+            match rx.recv().await {
+                // Serialize the typed event to JSON for the SSE `data:` frame. A
+                // serialization error is impossible for this plain struct; skip that
+                // frame rather than crash if it ever occurred.
+                Ok(ev) => match serde_json::to_string(&ev) {
+                    Ok(json) => {
+                        return Some((Ok::<_, Infallible>(Event::default().data(json)), rx))
+                    }
+                    Err(_) => continue,
+                },
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    // RESIDUAL (bounded): a skipped event is not resent. The channel
+                    // caps at 256 and a load emits ~5 events, so lag would need ~50
+                    // loads interleaved faster than the connection drains — not
+                    // reachable in practice; and a dropped mid-phase only coarsens the
+                    // bar. Skip the gap and keep streaming.
+                    tracing::warn!(skipped, "higgs: load-event stream subscriber lagged");
+                    continue;
+                }
+                // Sender dropped (facade gone) — end the stream cleanly.
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    });
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
 /// `POST /api/higgs/worker/stop` — unload every resident worker, freeing their memory.
 /// The server STAYS UP and usable: a subsequent load (or a JIT chat) spawns a fresh
 /// worker. This is a NON-terminal bulk unload ([`Higgs::unload`]), deliberately NOT

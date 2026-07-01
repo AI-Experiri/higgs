@@ -176,6 +176,85 @@ async fn load_inner_reuse_does_not_resync_saved_profile() {
     assert_eq!(saved.tuned_at_ms, 111, "a reuse load did NOT re-stamp it");
 }
 
+/// `status.loading` surfaces an in-flight load (for the UI progress bar) and is
+/// cleared once the load finishes. Fails-on-revert: stop reading `self.loading`
+/// in `status()` and the injected in-flight load no longer shows; stop clearing
+/// it around `local.load` and it stays set after the load.
+#[tokio::test]
+async fn status_surfaces_and_clears_in_flight_load() {
+    let dir = tempfile::TempDir::new().unwrap();
+    crate::serve::test_support::write_gguf_fixture(dir.path(), "org/model");
+    let higgs = fake_higgs(vec![dir.path().to_path_buf()]);
+
+    // Idle → no in-flight load.
+    assert!(higgs.status().await.unwrap().loading.is_none());
+
+    // An injected in-flight load is surfaced by `status`.
+    *higgs.loading.lock() = Some(crate::api::types::ModelLoading {
+        id: "org/model".into(),
+        started_ms: 123,
+    });
+    let st = higgs.status().await.unwrap();
+    assert_eq!(
+        st.loading.as_ref().map(|l| l.id.as_str()),
+        Some("org/model"),
+        "an in-flight load is surfaced on status"
+    );
+
+    // A real load clears it (set + cleared around `local.load`).
+    higgs.load("org/model", None).await.expect("load");
+    assert!(
+        higgs.status().await.unwrap().loading.is_none(),
+        "loading cleared once the load finished"
+    );
+}
+
+/// A successful load pushes the full ordered phase sequence
+/// (`queued`→`preparing`→`loading_weights`→`finalizing`→`ready`) to load-event
+/// subscribers; a failed load pushes a terminal `failed` carrying the HG code.
+#[tokio::test]
+async fn load_events_emit_ordered_phases_and_terminal() {
+    use crate::api::types::ModelLoadPhase;
+    let dir = tempfile::TempDir::new().unwrap();
+    crate::serve::test_support::write_gguf_fixture(dir.path(), "org/model");
+    let higgs = fake_higgs(vec![dir.path().to_path_buf()]);
+
+    // Subscribe BEFORE the load so no phase is missed.
+    let mut rx = higgs.subscribe_load_events();
+    higgs.load("org/model", None).await.expect("load");
+
+    let mut phases = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        phases.push(ev.phase);
+    }
+    assert_eq!(
+        phases,
+        vec![
+            ModelLoadPhase::Queued,
+            ModelLoadPhase::Preparing,
+            ModelLoadPhase::LoadingWeights,
+            ModelLoadPhase::Finalizing,
+            ModelLoadPhase::Ready,
+        ],
+        "successful load emits the ordered phase sequence"
+    );
+
+    // A failing load (bad id) emits a terminal `failed` carrying its HG code.
+    let mut rx = higgs.subscribe_load_events();
+    let _ = higgs.load("bad id with spaces", None).await;
+    let mut events = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        events.push(ev);
+    }
+    let last = events.last().expect("at least one event");
+    assert_eq!(last.phase, ModelLoadPhase::Failed, "terminal is failed");
+    assert_eq!(
+        last.code.as_deref(),
+        Some("HG015"),
+        "failed terminal carries the diagnostic code: {events:?}"
+    );
+}
+
 /// The inference admission gate returns `ServerBusy` once all permits are
 /// taken; releasing a permit re-opens a slot.
 #[tokio::test]

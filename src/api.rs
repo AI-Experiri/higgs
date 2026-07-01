@@ -201,6 +201,20 @@ pub struct Higgs {
     /// `parking_lot::Mutex` — held only across synchronous file I/O, never an
     /// `.await`. Mirrors [`Self::config_io`].
     models_io: parking_lot::Mutex<()>,
+    /// The model load CURRENTLY in flight on the local node, or `None`. Set around
+    /// the blocking [`local.load`](crate::node::runtime::NodeRuntime::load) so a
+    /// concurrent `status` request can surface a "loading…" progress indicator to
+    /// the UI. A plain `parking_lot::Mutex` — set/cleared in isolation, never held
+    /// across the load `.await`.
+    loading: parking_lot::Mutex<Option<crate::api::types::ModelLoading>>,
+    /// Live fan-out of model-load lifecycle events ([`ModelLoadEvent`]) to
+    /// `GET /api/higgs/events` SSE subscribers. Pushed at each real phase seam in
+    /// [`load_inner`](Self::load_inner) so the UI drives its loading indicator from
+    /// PUSH events instead of polling `status`. A `send` with no subscribers is a
+    /// harmless no-op; late subscribers simply miss already-past phases (the bar is
+    /// transient — a subscriber that joins mid-load still gets the remaining phases +
+    /// the terminal event).
+    load_events: tokio::sync::broadcast::Sender<crate::api::types::ModelLoadEvent>,
     /// Override for the `config.json` path. `None` in production → the real
     /// [`crate::config::config_path`] (`~/.higgs` or `$HIGGS_HOME`). Set to a unique temp
     /// path for in-crate unit tests (see [`default_config_path_override`]) so `load`'s
@@ -336,6 +350,12 @@ impl Higgs {
             hub_lifecycle: tokio::sync::Mutex::new(()),
             config_io: parking_lot::Mutex::new(()),
             models_io: parking_lot::Mutex::new(()),
+            loading: parking_lot::Mutex::new(None),
+            // Capacity mirrors the log bus. Load events are low-rate (~5 per load),
+            // so 256 makes a lagging subscriber effectively impossible: it would take
+            // ~50 loads interleaved faster than a subscriber polls. A lagged SSE
+            // client skips the gap and keeps streaming.
+            load_events: tokio::sync::broadcast::channel(256).0,
             config_path: parking_lot::Mutex::new(default_config_path_override()),
         }
     }
@@ -671,6 +691,64 @@ impl Higgs {
         params: Option<LoadParams>,
         from_request: bool,
     ) -> Result<(), HiggsError> {
+        use crate::api::types::ModelLoadPhase;
+        // PUSH the load lifecycle to `GET /api/higgs/events` subscribers. `Queued`
+        // fires FIRST — before the (possibly contended) lifecycle lock — so the UI's
+        // bar appears the instant a load is requested, even while it waits behind
+        // another in-flight load. The inner impl emits the mid-load phases
+        // (`Preparing`/`LoadingWeights`/`Finalizing`) at their real seams; here we
+        // bracket it with the terminal `Ready`/`Failed` so the bar is ALWAYS closed
+        // out (including the idempotent resident no-op, which emits Queued→Ready).
+        self.emit_load_phase(id, ModelLoadPhase::Queued, None);
+        // A DROP GUARD so the bar is closed even on CANCELLATION: if the caller's
+        // future is dropped mid-load (e.g. an HTTP client disconnects during
+        // `local.load().await`), the `.await` below never returns and the explicit
+        // terminal never fires — so this guard emits a terminal `Failed` on drop.
+        // Disarmed once we reach the explicit terminal, so the normal path emits
+        // exactly one terminal. (Mirrors the `LoadingGuard` that clears `loading`.)
+        struct TerminalGuard<'a> {
+            higgs: &'a Higgs,
+            id: &'a str,
+            armed: bool,
+        }
+        impl Drop for TerminalGuard<'_> {
+            fn drop(&mut self) {
+                if self.armed {
+                    self.higgs.emit_load_phase(
+                        self.id,
+                        crate::api::types::ModelLoadPhase::Failed,
+                        Some("cancelled".to_owned()),
+                    );
+                }
+            }
+        }
+        let mut term = TerminalGuard {
+            higgs: self,
+            id,
+            armed: true,
+        };
+        let result = self.load_inner_impl(id, params, from_request).await;
+        term.armed = false; // reached a real terminal — the guard must not also fire
+        match &result {
+            Ok(()) => self.emit_load_phase(id, ModelLoadPhase::Ready, None),
+            Err(e) => {
+                let code = miette::Diagnostic::code(e).map(|c| c.to_string());
+                self.emit_load_phase(id, ModelLoadPhase::Failed, code);
+            }
+        }
+        result
+    }
+
+    /// The load body — see [`load_inner`](Self::load_inner), which brackets this with
+    /// the `Queued`/`Ready`/`Failed` load-event phases. This impl emits the mid-load
+    /// phases at their real seams.
+    async fn load_inner_impl(
+        &self,
+        id: &str,
+        params: Option<LoadParams>,
+        from_request: bool,
+    ) -> Result<(), HiggsError> {
+        use crate::api::types::ModelLoadPhase;
         // Serialize concurrent loads at the facade so two racing JIT loads of the
         // same id can't each spawn a worker (the node load is additive — it never
         // dedups). Held for the whole method body.
@@ -708,6 +786,9 @@ impl Higgs {
             // model's saved profile, unload then load.
             return Ok(());
         }
+        // Committed to a real load now (past the resident no-op): announce the
+        // pre-load work — id/profile validation, param resolution, anchor capture.
+        self.emit_load_phase(id, ModelLoadPhase::Preparing, None);
         // Load-seam precedence (DESIGN-autotune §3.1): explicit request params win;
         // else a saved per-model tuning profile (a prior `tune` the user kept, in
         // `models.json`) is reused — "tune once, loads that way every time"; else
@@ -849,7 +930,29 @@ impl Higgs {
         // Additive load on the local node: spawns a fresh worker for `id` (the
         // node emits `ModelLoaded` on commit). resolve / headroom / path-traversal
         // failures surface as their mapped HiggsError.
+        //
+        // Publish the in-flight load so a concurrent `status` can show a progress
+        // indicator during the (multi-second) load. A DROP GUARD clears it on ANY
+        // exit from the load — success, error (`?`), or CANCELLATION (the load
+        // future dropped mid-`.await`, e.g. the caller disconnects) — so `status`
+        // can't report a phantom load forever. The lock is never held across the
+        // `.await` (only in the guard's `drop`).
+        struct LoadingGuard<'a>(&'a parking_lot::Mutex<Option<crate::api::types::ModelLoading>>);
+        impl Drop for LoadingGuard<'_> {
+            fn drop(&mut self) {
+                *self.0.lock() = None;
+            }
+        }
+        *self.loading.lock() = Some(crate::api::types::ModelLoading {
+            id: id.to_owned(),
+            started_ms: now_unix_ms(),
+        });
+        let _loading_guard = LoadingGuard(&self.loading);
+        // The multi-second worker load starts now (mmap → GPU → KV alloc).
+        self.emit_load_phase(id, ModelLoadPhase::LoadingWeights, None);
         self.local.load(np).await?;
+        // Weights are resident; the remaining work is fast bookkeeping.
+        self.emit_load_phase(id, ModelLoadPhase::Finalizing, None);
         // Persist the per-model load record (best-effort — never fail a good load).
         let now = now_unix_ms();
         if let Err(e) = self.with_config_mut(|c| c.record_load(id, effective.clone(), now)) {
@@ -979,6 +1082,7 @@ impl Higgs {
         let Some(primary) = instances.first().map(|(w, _)| *w) else {
             return Ok(HiggsStatus {
                 worker_alive: false,
+                loading: self.loading.lock().clone(),
                 loaded: None,
                 loaded_all: Vec::new(),
                 models_on_disk,
@@ -1038,6 +1142,7 @@ impl Higgs {
 
         Ok(HiggsStatus {
             worker_alive,
+            loading: self.loading.lock().clone(),
             loaded,
             loaded_all,
             models_on_disk,
@@ -1382,6 +1487,34 @@ impl Higgs {
     /// replay-then-live delivery; filter each by [`LogLine::source`].
     pub fn subscribe_logs(&self) -> tokio::sync::broadcast::Receiver<LogLine> {
         self.local.bus().subscribe()
+    }
+
+    /// Subscribe to live model-load lifecycle events ([`ModelLoadEvent`]) pushed
+    /// AFTER this call — the source for the `GET /api/higgs/events` SSE endpoint.
+    /// Unlike the log bus there is no replay ring: the loading bar is transient, so
+    /// a subscriber that joins mid-load still receives every REMAINING phase plus the
+    /// terminal `Ready`/`Failed` that closes it out.
+    pub fn subscribe_load_events(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::api::types::ModelLoadEvent> {
+        self.load_events.subscribe()
+    }
+
+    /// Push one model-load lifecycle event to live SSE subscribers. A `send` with no
+    /// subscribers is a harmless no-op (the load proceeds regardless). `code` is set
+    /// only for [`ModelLoadPhase::Failed`].
+    fn emit_load_phase(
+        &self,
+        id: &str,
+        phase: crate::api::types::ModelLoadPhase,
+        code: Option<String>,
+    ) {
+        let _ = self.load_events.send(crate::api::types::ModelLoadEvent {
+            id: id.to_owned(),
+            phase,
+            at_ms: now_unix_ms(),
+            code,
+        });
     }
 
     /// Snapshot of the configured default load parameters.
