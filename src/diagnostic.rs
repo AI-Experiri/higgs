@@ -461,6 +461,24 @@ pub enum HiggsError {
     ))]
     #[diagnostic(code(HG047))]
     ProfileStale { id: String },
+
+    /// A `/v1` or `/api/higgs` request presented no API key, or one that does not
+    /// match the node's `api_keys.json`. Carries the code so a `401` is as
+    /// diagnosable as any other reply.
+    #[snafu(display(
+        "[HG048] unauthorized: missing or insufficient API key — send `Authorization: Bearer <key>` with a key from the node's api_keys.json (or remove that file to disable auth)"
+    ))]
+    #[diagnostic(code(HG048))]
+    Unauthorized,
+
+    /// A `/v1` request body failed validation before reaching the engine (a
+    /// malformed message/tool list, or a rejected field). `detail` is the
+    /// specific reason; codes the otherwise-bare `400` so it states the fix.
+    #[snafu(display(
+        "[HG049] {detail} — check the request body against the OpenAI chat schema and retry"
+    ))]
+    #[diagnostic(code(HG049))]
+    InvalidRequest { detail: String },
 }
 
 #[cfg(test)]

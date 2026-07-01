@@ -41,21 +41,23 @@ pub(crate) use guards::{guard_memory_headroom, path_within_roots};
 pub use types::*;
 
 /// Freshness verdict for a saved tuning profile, consumed by the JIT gate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) enum ProfileState {
     /// No profile — the model was never Prepared.
     Missing,
     /// Profile exists but the hardware or model file changed since Prepare.
     Stale,
-    /// Profile exists and matches the current hardware + file.
-    Ready,
+    /// Profile exists and matches the current hardware + file. Carries the
+    /// VALIDATED `LoadParams` so the JIT path loads exactly what was checked,
+    /// without a second `models.json` read (closing the check-then-load race).
+    Ready(LoadParams),
 }
 
 /// Is the saved profile stale for the given on-disk path + current hardware?
 /// Stale when either anchor differs (an empty stored anchor — e.g. a bare load,
 /// not a Prepare — never matches, so it reads as stale → must Re-tune).
 fn profile_stale(rec: &TuneRecord, path: &str, hw: &crate::system::HardwareInfo) -> bool {
-    rec.hw_fingerprint != hw.fingerprint() || rec.model_file_sig != file_sig(path)
+    rec.is_stale(&hw.fingerprint(), &file_sig(path))
 }
 
 /// Cheap model-file identity (`"{len}:{mtime_ms}"`) for staleness checks on a
@@ -390,6 +392,31 @@ impl Higgs {
             .unwrap_or_default()
     }
 
+    /// Every saved tuning record (from `models.json`), keyed by model id. Loaded
+    /// ONCE per `/api/higgs/models` pass and threaded into `model_readiness` so
+    /// the listing doesn't reopen + reparse the store per model.
+    ///
+    /// A store-OPEN failure (models.json exists but is unreadable — a directory,
+    /// bad perms) is surfaced as `PersistenceFailed`, NOT collapsed to "no
+    /// profiles": otherwise the listing would badge every prepared model
+    /// `discovered` exactly in the persistence-failure case, contradicting the JIT
+    /// path's HG040 and telling the user to Prepare again (which would also fail).
+    /// A MISSING store is not an error — `models_store()` returns an empty store,
+    /// so a fresh node lists fine.
+    pub(crate) fn tuning_records(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, crate::tune::store::TuneRecord>, HiggsError>
+    {
+        let store = self
+            .models_store()
+            .map_err(|e| HiggsError::PersistenceFailed {
+                store: "models".into(),
+                path: "models.json".into(),
+                source: e,
+            })?;
+        Ok(store.all_tuning())
+    }
+
     /// Install the remote fleet (hub mode) — `/v1` chat for a remote-resident model then
     /// routes through it. Idempotent; replaces any prior fleet.
     pub fn set_fleet(&self, fleet: Arc<crate::node::fleet::HubFleet>) {
@@ -627,6 +654,23 @@ impl Higgs {
     /// autoload can reload it the same way. Persistence is best-effort: a config
     /// write failure is logged, never failing an otherwise-successful load.
     pub async fn load(&self, id: &str, params: Option<LoadParams>) -> Result<(), HiggsError> {
+        let from_request = params.is_some();
+        self.load_inner(id, params, from_request).await
+    }
+
+    /// `load` core, parameterized by `from_request` — whether to PERSIST `params`
+    /// as the saved profile after a successful load. The public [`load`] derives it
+    /// from `params.is_some()`. The JIT path passes a VALIDATED profile with
+    /// `from_request = false`: a no-resync REUSE that loads exactly the profile the
+    /// readiness gate just checked, with NO second `models.json` read — closing the
+    /// check-then-load race where the profile could vanish and fall back to dumb
+    /// defaults.
+    pub(crate) async fn load_inner(
+        &self,
+        id: &str,
+        params: Option<LoadParams>,
+        from_request: bool,
+    ) -> Result<(), HiggsError> {
         // Serialize concurrent loads at the facade so two racing JIT loads of the
         // same id can't each spawn a worker (the node load is additive — it never
         // dedups). Held for the whole method body.
@@ -669,17 +713,44 @@ impl Higgs {
         // `models.json`) is reused — "tune once, loads that way every time"; else
         // (`None`) the node's default_load / ctx-cap path. (The `autotune_on_load`
         // suggester branch slots between saved-profile and default_load — P1.5.)
-        // Track explicit-vs-reused: an EXPLICIT load (request carried params — a fresh
-        // suggestion or an accepted edit) updates the saved profile below; a load that
-        // REUSED the saved profile leaves it unchanged.
-        let from_request = params.is_some();
+        // Track explicit-vs-reused (`from_request`, a parameter): an EXPLICIT load
+        // (request carried params — a fresh suggestion or an accepted edit) updates
+        // the saved profile below; a load that REUSED a profile leaves it unchanged.
         let params = match params {
             Some(p) => Some(p),
-            None => self
-                .models_store()
-                .ok()
-                .and_then(|s| s.tuning(id))
-                .map(|t| t.profile),
+            // Reusing the saved profile: a STALE one hard-blocks (same contract as
+            // the JIT gate) so an explicit `load(id, None)` can't reuse a profile
+            // whose hardware/model file changed since Prepare. Re-tune, or load with
+            // explicit params, to recover. A Missing profile (no record) falls
+            // through to `None` → the node's default_load.
+            //
+            // The store open is BEST-EFFORT here (`.ok()`): explicit load is
+            // user-initiated and persistence-resilient — an unreadable store falls
+            // through to a default load rather than failing the load. (The JIT gate
+            // and the readiness LISTING surface the same store fault as HG040, where
+            // the contract is "don't silently mislead"; an explicit load is not that.)
+            None => match self.models_store().ok().and_then(|s| s.tuning(id)) {
+                Some(rec) => {
+                    // Validate staleness on THE SAME record we're about to reuse —
+                    // NOT a fresh `profile_state()` re-read, which a concurrent tune
+                    // could swap underneath us (validate one record, load another). A
+                    // model absent from the scan isn't stale; let the load surface the
+                    // real not-found instead of a misleading Re-tune.
+                    if let Some(path) = self
+                        .scan()
+                        .await
+                        .ok()
+                        .and_then(|ms| ms.into_iter().find(|m| m.id == id).map(|m| m.path))
+                    {
+                        let hw = self.hardware().await;
+                        if profile_stale(&rec, &path, &hw) {
+                            return Err(HiggsError::ProfileStale { id: id.to_owned() });
+                        }
+                    }
+                    Some(rec.profile)
+                }
+                None => None,
+            },
         };
         // Map the host `LoadParams` onto the node's `NodeLoadParams`. The base
         // fields (id/ctx_len/gpu_layers/threads) drive the node's resolve/ctx-cap;
@@ -756,6 +827,25 @@ impl Higgs {
                 np.threads.unwrap_or_default(),
             ),
         };
+        // For an ACCEPTED explicit load we'll anchor the saved profile to the file
+        // it was validated against — capture the hardware fingerprint + file
+        // signature BEFORE the (slow) load, so a GGUF swapped mid-load can't mark
+        // the profile fresh for a file it wasn't loaded against (the same race
+        // `tune` avoids). Skipped for reuse loads (`!from_request`), which don't
+        // re-anchor.
+        let anchors = if from_request {
+            let hw_fp = self.hardware().await.fingerprint();
+            let sig = self
+                .scan()
+                .await
+                .ok()
+                .and_then(|ms| ms.into_iter().find(|m| m.id == id).map(|m| m.path))
+                .map(|p| file_sig(&p))
+                .unwrap_or_default();
+            Some((hw_fp, sig))
+        } else {
+            None
+        };
         // Additive load on the local node: spawns a fresh worker for `id` (the
         // node emits `ModelLoaded` on commit). resolve / headroom / path-traversal
         // failures surface as their mapped HiggsError.
@@ -769,8 +859,8 @@ impl Higgs {
         // plain reload reuses the accepted/edited params — not a stale tune suggestion.
         // A load that merely REUSED the saved profile (no request params) leaves it
         // unchanged. (The resident-model early return above does the same sync.)
-        if from_request {
-            self.sync_saved_profile(id, &effective);
+        if let Some((hw_fp, sig)) = anchors {
+            self.sync_saved_profile(id, &effective, &hw_fp, &sig).await;
         }
         Ok(())
     }
@@ -779,10 +869,15 @@ impl Higgs {
     /// accepted explicit load — so a later plain reload reuses it. Serialized through
     /// `models_io` with a fresh re-read (the whole `models.json` is rewritten on
     /// flush). Best-effort: a write failure is logged, never fails the load.
-    fn sync_saved_profile(&self, id: &str, profile: &LoadParams) {
+    /// Persist `profile` as the saved tuning profile for `id`, anchored to the
+    /// `hw_fp` + `file_sig` the CALLER captured BEFORE the (slow) load — NOT
+    /// re-sampled here. Sampling after the load would let a GGUF swapped mid-load
+    /// anchor the new file to a profile validated against the old (the same race
+    /// `tune` avoids by capturing the signature up front).
+    async fn sync_saved_profile(&self, id: &str, profile: &LoadParams, hw_fp: &str, sig: &str) {
         let _guard = self.models_io.lock();
         if let Ok(store) = self.models_store() {
-            store.set_profile(id, profile.clone(), now_unix_ms());
+            store.set_profile(id, profile.clone(), hw_fp, sig, now_unix_ms());
             if let Err(e) = store.flush() {
                 // Best-effort (a load already succeeded), but log the coded HG040 so a
                 // recurring persistence problem is diagnosable from the warning.
@@ -1396,6 +1491,12 @@ impl Higgs {
             .find(|m| m.id == id)
             .ok_or_else(|| HiggsError::ModelNotFound { id: id.clone() })?;
         let meta = ModelMeta::from_model(&model);
+        // Capture the file signature ALONGSIDE the metadata the profile is derived
+        // from — NOT at persist time below. The bounded HF-card fetch can take ~10s;
+        // a GGUF swapped in that window would otherwise have its NEW signature
+        // anchored to a profile tuned for the OLD file, so the JIT gate would later
+        // admit a mismatched profile as fresh instead of `NeedsRetune`.
+        let model_file_sig = file_sig(&model.path);
 
         // 2. Host hardware + budget.
         let hw = self.hardware().await;
@@ -1429,89 +1530,102 @@ impl Higgs {
         //    different models don't clobber each other's record (whole-file rewrite).
         {
             let _guard = self.models_io.lock();
-            if let Ok(store) = self.models_store() {
-                store.put_tuning(
-                    &id,
-                    TuneRecord {
-                        profile: suggestion.load.clone(),
-                        sampling: suggestion.sampling.clone(),
-                        budget: suggestion.budget.clone(),
-                        provenance: suggestion.provenance,
-                        bench_tps: None,
-                        tuned_at_ms: now_unix_ms(),
-                        // Staleness anchors: the hardware + model file this profile
-                        // was derived against, and the concrete n_ctx it loads at.
-                        hw_fingerprint: hw.fingerprint(),
-                        model_file_sig: file_sig(&model.path),
-                        resolved_ctx: match crate::tune::vram::resolve_estimate_ctx(
-                            suggestion.load.as_llamacpp().ctx_len,
-                            meta.ctx_train,
-                        ) {
-                            crate::worker::engine::CtxLen::Fixed { n } => n,
-                            crate::worker::engine::CtxLen::Auto => 0,
-                        },
-                    },
-                );
-                if let Err(e) = store.flush() {
-                    let pe = HiggsError::PersistenceFailed {
-                        store: "models".into(),
-                        path: "models.json".into(),
-                        source: e,
-                    };
-                    tracing::warn!(id, error = %pe, "higgs: failed to persist tuning");
-                }
+            // The readiness gate makes a PERSISTED profile a serving precondition,
+            // so a Prepare that can't save must FAIL loudly — otherwise the client
+            // sees a "successful" tune followed by a refused `model_not_prepared`
+            // chat (unwritable HIGGS_HOME, disk full, …). BOTH the store-open and
+            // the flush are surfaced as errors, not silently skipped.
+            let persist = |source: std::io::Error| HiggsError::PersistenceFailed {
+                store: "models".into(),
+                path: "models.json".into(),
+                source,
+            };
+            let store = self.models_store().map_err(persist)?;
+            store.put_tuning(
+                &id,
+                TuneRecord {
+                    profile: suggestion.load.clone(),
+                    sampling: suggestion.sampling.clone(),
+                    budget: suggestion.budget.clone(),
+                    provenance: suggestion.provenance,
+                    bench_tps: None,
+                    tuned_at_ms: now_unix_ms(),
+                    // Staleness anchors: the hardware + model file this profile
+                    // was derived against.
+                    hw_fingerprint: hw.fingerprint(),
+                    model_file_sig: model_file_sig.clone(),
+                },
+            );
+            if let Err(e) = store.flush() {
+                let pe = persist(e);
+                tracing::warn!(id, error = %pe, "higgs: failed to persist tuning");
+                return Err(pe);
             }
         }
         Ok(suggestion)
     }
 
-    /// Estimate the VRAM/RAM footprint of a CANDIDATE load (no model load). Reuses
-    /// the suggester's own VRAM/RAM estimators — the single source of truth for the
-    /// formula — so the UI shows the live cost ("≈ X GiB VRAM · verdict") as the user
-    /// edits context / KV types / GPU offload. Pure + cheap: a GGUF-metadata lookup +
-    /// the cached hardware read, no worker round-trip beyond that.
     /// Live readiness for one scanned model on this node. Gathers profile
     /// presence + staleness + residency + serving, and evaluates the (heavier)
     /// resource fit ONLY when the derived state would depend on it — a profiled,
     /// fresh, non-resident model with serving on. See [`crate::serve::readiness`].
-    pub(crate) async fn model_readiness(
+    /// Sync + cheap per row: it reuses the caller's `hw` snapshot and the
+    /// already-scanned `model`, so listing N models costs ONE scan + ONE hw sample.
+    pub(crate) fn model_readiness(
         &self,
         model: &HiggsModel,
         loaded_set: &[String],
         hw: &crate::system::HardwareInfo,
-    ) -> crate::serve::readiness::ModelReadiness {
+        tuning: &std::collections::BTreeMap<String, crate::tune::store::TuneRecord>,
+    ) -> (
+        crate::serve::readiness::ModelReadiness,
+        Option<crate::serve::wire::ModelFit>,
+    ) {
         use crate::serve::readiness::{derive_readiness, ReadinessInputs};
         let loaded = loaded_set.iter().any(|id| id == &model.id);
-        let rec = self.models_store().ok().and_then(|s| s.tuning(&model.id));
+        // The whole tuning set is loaded ONCE by the caller — an in-memory lookup
+        // here, no per-model `models.json` reopen.
+        let rec = tuning.get(&model.id);
         let profiled = rec.is_some();
-        let stale = rec
-            .as_ref()
-            .is_some_and(|r| profile_stale(r, &model.path, hw));
+        let stale = rec.is_some_and(|r| profile_stale(r, &model.path, hw));
         let serving = self.serving_enabled();
-        let fits = if profiled && !stale && !loaded && serving {
-            self.profile_fits(&model.id).await
-        } else {
-            false
+        // The fit is computed (and surfaced) only when a profile is actually
+        // evaluated for serving — i.e. the `servable`/`unservable` branch.
+        let (fits, fit) = match rec {
+            Some(rec) if !stale && !loaded && serving => {
+                let (fits, detail) = self.profile_fit(model, rec, hw);
+                (fits, Some(detail))
+            }
+            _ => (false, None),
         };
-        derive_readiness(&ReadinessInputs {
+        let readiness = derive_readiness(&ReadinessInputs {
             on_disk: true,
             profiled,
             stale,
             loaded,
             fits,
             serving,
-        })
+        });
+        (readiness, fit)
     }
 
-    /// Does the saved profile for `id` fit current free VRAM **and** RAM? Reuses
-    /// the estimate path with the profile's own params; any error ⇒ does not fit.
-    async fn profile_fits(&self, id: &str) -> bool {
-        let Some(rec) = self.models_store().ok().and_then(|s| s.tuning(id)) else {
-            return false;
-        };
+    /// Does the saved profile for `model` fit the resources free **right now**?
+    /// Computes the footprint from the already-scanned metadata + the caller's
+    /// `hw` snapshot (NO re-scan, NO hardware re-sample), then compares each
+    /// pool's needed bytes against CURRENT free VRAM/RAM (`vram_free_bytes` per
+    /// GPU; RAM total minus used) — not totals or the tune-time budget — so
+    /// `Servable` reflects what can actually load given other resident models.
+    /// Returns `(fits, detail)`: the verdict plus the needed-vs-free numbers the
+    /// UI shows as the `Servable`/`Unservable` gap.
+    fn profile_fit(
+        &self,
+        model: &HiggsModel,
+        rec: &crate::tune::store::TuneRecord,
+        hw: &crate::system::HardwareInfo,
+    ) -> (bool, crate::serve::wire::ModelFit) {
         let lc = rec.profile.as_llamacpp();
         let req = EstimateRequest {
-            id: id.to_owned(),
+            id: model.id.clone(),
             ctx_len: lc.ctx_len,
             gpu_layers: Some(lc.gpu_layers),
             type_k: lc.type_k,
@@ -1520,36 +1634,83 @@ impl Higgs {
             cpu_moe: lc.cpu_moe,
             budget: Some(rec.budget.clone()),
         };
-        match self.estimate(req).await {
-            Ok(r) => {
-                r.vram.verdict != crate::tune::FitVerdict::Overflow
-                    && r.ram.verdict != crate::tune::FitVerdict::Overflow
-            }
-            Err(_) => false,
-        }
+        let report = estimate_footprint(&ModelMeta::from_model(model), hw, &req);
+        // GPU-only free (a CPU/accel device reports system memory as its "vram").
+        //
+        // RESIDUAL (assessed, deferred): `free_vram` comes from the cached device
+        // snapshot (`Higgs::sysinfo`), whose `vram_free_bytes` can lag a recent VRAM
+        // change. Refreshing it spawns a TRANSIENT sysinfo worker per call — too
+        // costly for the 5s `/api/higgs/models` poll — so the snapshot is reused.
+        // `Servable`/`Unservable` is therefore an ADVISORY badge: it degrades
+        // safely because the load path is gated independently (`profile_state` does
+        // not use free VRAM), so a genuinely-too-tight load fails with a real
+        // engine error rather than being wrongly admitted by a stale badge.
+        let free_vram = hw.free_vram_bytes();
+        let free_ram = hw.ram_total_bytes.saturating_sub(hw.ram_used_bytes);
+        let fits = crate::serve::readiness::footprint_fits_free(
+            report.vram.needed_bytes,
+            report.ram.needed_bytes,
+            free_vram,
+            free_ram,
+            hw.is_unified_memory(),
+        );
+        (
+            fits,
+            crate::serve::wire::ModelFit {
+                needed_vram_bytes: report.vram.needed_bytes,
+                needed_ram_bytes: report.ram.needed_bytes,
+                free_vram_bytes: free_vram,
+                free_ram_bytes: free_ram,
+            },
+        )
     }
 
     /// Classify the saved profile for `id` for the JIT gate: `Missing` (never
     /// Prepared), `Stale` (hardware or model file changed since Prepare), or
     /// `Ready`. The gate refuses `Missing`/`Stale` rather than load dumb defaults.
-    pub(crate) async fn profile_state(&self, id: &str) -> ProfileState {
-        let Some(rec) = self.models_store().ok().and_then(|s| s.tuning(id)) else {
-            return ProfileState::Missing;
+    pub(crate) async fn profile_state(&self, id: &str) -> Result<ProfileState, HiggsError> {
+        // A store-OPEN failure (models.json unreadable — a directory, bad perms)
+        // is a persistence fault, NOT an absent profile: surface it as HG040 so the
+        // JIT gate doesn't mislead the user into re-Preparing (which would also fail
+        // to persist). An absent *record* in a readable store is genuinely Missing.
+        let store = self
+            .models_store()
+            .map_err(|e| HiggsError::PersistenceFailed {
+                store: "models".into(),
+                path: "models.json".into(),
+                source: e,
+            })?;
+        let Some(rec) = store.tuning(id) else {
+            return Ok(ProfileState::Missing);
         };
-        let hw = self.hardware().await;
-        let path = self
+        // Resolve the on-disk path. If the model is NOT in the scan (its GGUF was
+        // removed) or the scan failed, do NOT classify the profile as stale —
+        // staleness is only meaningful for a present file, and re-tuning can't fix
+        // a missing model. Return `Ready` so the actual load surfaces the real
+        // not-found/scan error instead of a misleading `HG047` "Re-tune". (The JIT
+        // path already rejects unknown ids with `ModelNotFound` before this.)
+        let Some(path) = self
             .scan()
             .await
             .ok()
             .and_then(|ms| ms.into_iter().find(|m| m.id == id).map(|m| m.path))
-            .unwrap_or_default();
-        if profile_stale(&rec, &path, &hw) {
+        else {
+            return Ok(ProfileState::Ready(rec.profile));
+        };
+        let hw = self.hardware().await;
+        let stale = profile_stale(&rec, &path, &hw);
+        Ok(if stale {
             ProfileState::Stale
         } else {
-            ProfileState::Ready
-        }
+            ProfileState::Ready(rec.profile)
+        })
     }
 
+    /// Estimate the VRAM/RAM footprint of a CANDIDATE load (no model load). Reuses
+    /// the suggester's own VRAM/RAM estimators — the single source of truth for the
+    /// formula — so the UI shows the live cost ("≈ X GiB VRAM · verdict") as the user
+    /// edits context / KV types / GPU offload. Pure + cheap: a GGUF-metadata lookup +
+    /// the cached hardware read, no worker round-trip beyond that.
     pub async fn estimate(&self, req: EstimateRequest) -> Result<EstimateReport, HiggsError> {
         // Resolve the GGUF metadata, memoized per-id: the UI hits this on every edit,
         // so re-scanning all model dirs each keystroke would be wasteful on large
@@ -1578,36 +1739,49 @@ impl Higgs {
             }
         };
         let hw = self.hardware().await;
-        // Resolve `Auto` the SAME way the load path does (the node caps an auto/trained
-        // context at `DEFAULT_CTX_CAP`) so the estimate matches what would actually load
-        // — see `resolve_estimate_ctx`.
-        let ctx_len = crate::tune::vram::resolve_estimate_ctx(req.ctx_len, meta.ctx_train);
-        let load = crate::worker::engine::llamacpp::params::LlamaCppParams {
-            ctx_len,
-            gpu_layers: req
-                .gpu_layers
-                .unwrap_or(crate::worker::engine::GpuLayers::All),
-            type_k: Some(
-                req.type_k
-                    .unwrap_or(crate::worker::engine::KvCacheKind::F16),
-            ),
-            type_v: Some(
-                req.type_v
-                    .unwrap_or(crate::worker::engine::KvCacheKind::F16),
-            ),
-            // The remaining memory-affecting params so the verdict matches the real
-            // load (KV-on-CPU and MoE-experts-on-CPU both shift bytes VRAM↔RAM).
-            offload_kqv: req.offload_kqv,
-            cpu_moe: req.cpu_moe,
-            ..Default::default()
-        };
-        // Verdict against the caller's budget when supplied (so the live estimate
-        // agrees with the budget-aware tune), else the detected machine.
-        let budget = req.budget.unwrap_or_default();
-        Ok(EstimateReport {
-            vram: crate::tune::vram::StaticVramEstimator.estimate(&load, &meta, &hw, &budget),
-            ram: crate::tune::vram::StaticRamEstimator.estimate(&load, &meta, &hw, &budget),
-        })
+        Ok(estimate_footprint(&meta, &hw, &req))
+    }
+}
+
+/// Pure footprint computation shared by [`Higgs::estimate`] (live UI) and the
+/// readiness fit check ([`Higgs::profile_fits`]): given already-resolved GGUF
+/// metadata + a hardware snapshot + a candidate request, return the VRAM/RAM
+/// fit. No I/O and no hardware sampling — the caller supplies `meta` and `hw`,
+/// so listing many models costs ONE scan + ONE hardware sample total (not one
+/// per model). Reuses the suggester's own estimators (the single formula home).
+fn estimate_footprint(
+    meta: &ModelMeta,
+    hw: &crate::system::HardwareInfo,
+    req: &EstimateRequest,
+) -> EstimateReport {
+    // Resolve `Auto` the SAME way the load path does (the node caps an auto/trained
+    // context at `DEFAULT_CTX_CAP`) so the estimate matches what would actually load.
+    let ctx_len = crate::tune::vram::resolve_estimate_ctx(req.ctx_len, meta.ctx_train);
+    let load = crate::worker::engine::llamacpp::params::LlamaCppParams {
+        ctx_len,
+        gpu_layers: req
+            .gpu_layers
+            .unwrap_or(crate::worker::engine::GpuLayers::All),
+        type_k: Some(
+            req.type_k
+                .unwrap_or(crate::worker::engine::KvCacheKind::F16),
+        ),
+        type_v: Some(
+            req.type_v
+                .unwrap_or(crate::worker::engine::KvCacheKind::F16),
+        ),
+        // The remaining memory-affecting params so the verdict matches the real
+        // load (KV-on-CPU and MoE-experts-on-CPU both shift bytes VRAM↔RAM).
+        offload_kqv: req.offload_kqv,
+        cpu_moe: req.cpu_moe,
+        ..Default::default()
+    };
+    // Verdict against the caller's budget when supplied (so the live estimate
+    // agrees with the budget-aware tune), else the detected machine.
+    let budget = req.budget.clone().unwrap_or_default();
+    EstimateReport {
+        vram: crate::tune::vram::StaticVramEstimator.estimate(&load, meta, hw, &budget),
+        ram: crate::tune::vram::StaticRamEstimator.estimate(&load, meta, hw, &budget),
     }
 }
 

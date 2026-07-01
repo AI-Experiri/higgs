@@ -920,3 +920,90 @@ async fn estimate_honors_offload_kqv() {
         "estimate accepted + threaded offload_kqv: {on}"
     );
 }
+
+/// A Prepared, fitting model surfaces its readiness `servable` AND the `fit`
+/// detail (the needed-vs-free numbers behind the badge) on `GET /api/higgs/models`.
+/// Fails-on-revert: drop the `fit` field on `HiggsModelEntry` and the entry has
+/// no `fit` object, so the `is_object()` assertion fails.
+#[tokio::test]
+async fn servable_model_entry_carries_fit_numbers() {
+    let Some(gguf) = tiny_gguf_path() else {
+        eprintln!("SKIP servable_model_entry_carries_fit_numbers: tiny gguf not found");
+        return;
+    };
+    let srv = spawn_with_tiny_model(11517, &gguf).await;
+    // Prepare → the tiny model gets a profile; serving is on by default and it
+    // easily fits, so it reads back `servable` with the fit numbers attached.
+    common::prepare_tiny(&srv.base).await;
+    let c = reqwest::Client::new();
+    let models: serde_json::Value = c
+        .get(format!("{}/api/higgs/models", srv.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let entry = models["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == serde_json::json!(TINY_MODEL_ID))
+        .expect("tiny model listed");
+    assert_eq!(
+        entry["readiness"],
+        serde_json::json!("servable"),
+        "prepared tiny model is servable: {entry}"
+    );
+    let fit = &entry["fit"];
+    assert!(
+        fit.is_object(),
+        "servable entry carries the fit detail: {entry}"
+    );
+    assert!(
+        fit["needed_ram_bytes"].as_u64().unwrap_or(0) > 0,
+        "fit reports the RAM the profile needs: {fit}"
+    );
+    assert!(
+        fit.get("free_ram_bytes").is_some(),
+        "fit reports current free RAM: {fit}"
+    );
+}
+
+/// `GET /api/higgs/models` surfaces a store-read failure as HG040 instead of
+/// badging a prepared model `discovered` (the misleading state in exactly the
+/// persistence-failure scenario). Fails-on-revert: collapse `tuning_records()` to
+/// an empty map on error and the list 200s with `readiness:"discovered"`.
+#[tokio::test]
+async fn models_list_with_unreadable_store_is_hg040() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(gguf) = tiny_gguf_path() else {
+        eprintln!("SKIP models_list_with_unreadable_store_is_hg040: tiny gguf not found");
+        return;
+    };
+    let srv = spawn_with_tiny_model(11518, &gguf).await;
+    common::prepare_tiny(&srv.base).await;
+    let mj = srv.home().join("models.json");
+    std::fs::set_permissions(&mj, std::fs::Permissions::from_mode(0o000))
+        .expect("chmod models.json unreadable");
+    let c = reqwest::Client::new();
+    let resp = c
+        .get(format!("{}/api/higgs/models", srv.base))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        !resp.status().is_success(),
+        "models list fails when the store is unreadable, got {}",
+        resp.status()
+    );
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("[HG040]"),
+        "surfaces the persistence error: {body}"
+    );
+    assert!(
+        !body.contains("\"discovered\""),
+        "prepared model NOT mislabeled discovered: {body}"
+    );
+}

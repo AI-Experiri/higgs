@@ -29,6 +29,15 @@ fn fingerprint_is_stable_and_hardware_sensitive() {
         a,
         fp_hw(24 << 30, 64 << 30, vec![cpu_device()]).fingerprint()
     );
+    // CPU core count change → new fingerprint: the tuner derives `threads` /
+    // `n_threads_batch` from `cpu_cores`, so a different CPU must re-tune.
+    let mut more_cores = fp_hw(24 << 30, 64 << 30, vec![]);
+    more_cores.cpu_cores = 16;
+    assert_ne!(
+        a,
+        more_cores.fingerprint(),
+        "cpu core count change → new fingerprint (re-tune)"
+    );
 }
 
 #[test]
@@ -42,6 +51,32 @@ fn fingerprint_ignores_volatile_fields() {
     assert_eq!(base, a.fingerprint());
 }
 
+#[test]
+fn free_vram_counts_only_gpu_devices() {
+    let gpu = GpuDevice {
+        name: "Metal".into(),
+        description: "GPU".into(),
+        kind: DeviceKind::Gpu,
+        vram_total_bytes: 16 << 30,
+        vram_free_bytes: 8 << 30,
+    };
+    let cpu = GpuDevice {
+        name: "CPU".into(),
+        description: "cpu".into(),
+        kind: DeviceKind::Cpu,
+        vram_total_bytes: 0,
+        // A CPU/accel device reports SYSTEM memory here — must be excluded from
+        // GPU headroom, else readiness would over-report `Servable`.
+        vram_free_bytes: 64 << 30,
+    };
+    let hw = fp_hw(16 << 30, 64 << 30, vec![gpu, cpu]);
+    assert_eq!(
+        hw.free_vram_bytes(),
+        8 << 30,
+        "only the GPU device's free VRAM counts toward the fit check"
+    );
+}
+
 /// A scripted CPU device — the shape `FakeEngine::devices` and these tests
 /// use so the VRAM-sum and fit logic run without real FFI.
 fn cpu_device() -> GpuDevice {
@@ -52,6 +87,43 @@ fn cpu_device() -> GpuDevice {
         vram_total_bytes: 0,
         vram_free_bytes: 0,
     }
+}
+
+#[test]
+fn is_unified_memory_needs_apple_silicon_and_metal() {
+    let metal = GpuDevice {
+        name: "Metal".into(),
+        description: "Apple M3 Max".into(),
+        kind: DeviceKind::Gpu,
+        vram_total_bytes: 64 << 30,
+        vram_free_bytes: 40 << 30,
+    };
+    // Apple Silicon: aarch64 + Metal → unified (the fit check must sum VRAM + RAM).
+    let mut apple = fp_hw(64 << 30, 64 << 30, vec![metal.clone()]);
+    apple.arch = "aarch64".into();
+    assert!(apple.is_unified_memory(), "apple silicon + metal → unified");
+    // Intel Mac: x86_64 + Metal but a DISCRETE AMD GPU → NOT unified.
+    let mut intel = fp_hw(64 << 30, 64 << 30, vec![metal]);
+    intel.arch = "x86_64".into();
+    assert!(
+        !intel.is_unified_memory(),
+        "intel mac Metal is a discrete GPU"
+    );
+    // aarch64 with a discrete CUDA GPU (not Metal) → not unified.
+    let cuda = GpuDevice {
+        name: "CUDA0".into(),
+        description: "NVIDIA".into(),
+        kind: DeviceKind::Gpu,
+        vram_total_bytes: 24 << 30,
+        vram_free_bytes: 20 << 30,
+    };
+    let mut arm_cuda = fp_hw(24 << 30, 64 << 30, vec![cuda]);
+    arm_cuda.arch = "aarch64".into();
+    assert!(!arm_cuda.is_unified_memory(), "aarch64 + CUDA is discrete");
+    // No GPU at all → not unified.
+    let mut nogpu = fp_hw(0, 64 << 30, vec![]);
+    nogpu.arch = "aarch64".into();
+    assert!(!nogpu.is_unified_memory());
 }
 
 // `Higgs::new` constructs the co-located node (which spawns its actor task), so

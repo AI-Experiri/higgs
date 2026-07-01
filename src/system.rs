@@ -117,24 +117,57 @@ pub fn hostname() -> String {
 }
 
 impl HardwareInfo {
-    /// Stable signature over the facts that change what fits: total VRAM, total
-    /// RAM, and the GPU roster (name + per-device VRAM). Excludes volatile fields
-    /// (usage %, free bytes) so it flips only on a real hardware change — used to
-    /// detect a stale tuning profile (`ModelReadiness::NeedsRetune`).
+    /// Stable signature over the facts that change a tuned profile: total VRAM,
+    /// total RAM, CPU core count (the tuner derives `threads`/`n_threads_batch`
+    /// from it — see `tune::derive`), and the GPU roster (name + per-device VRAM).
+    /// Excludes volatile fields (usage %, free bytes) so it flips only on a real
+    /// hardware change — used to detect a stale tuning profile
+    /// (`ModelReadiness::NeedsRetune`).
     pub fn fingerprint(&self) -> String {
         use std::fmt::Write as _;
         let mut s = String::new();
         let _ = write!(
             s,
-            "v{}r{}n{}",
+            "v{}r{}c{}n{}",
             self.vram_total_bytes,
             self.ram_total_bytes,
+            self.cpu_cores,
             self.gpus.len()
         );
         for g in &self.gpus {
             let _ = write!(s, "|{}:{}", g.name, g.vram_total_bytes);
         }
         s
+    }
+
+    /// Free VRAM across GPU devices ONLY. A CPU/accel device reports *system*
+    /// memory as its `vram_free_bytes`, so summing every device would overstate
+    /// GPU headroom — the same reason `vram_total_bytes` is GPU-filtered in
+    /// `gather_hardware_runtime`. Used by the readiness fit check so a profiled
+    /// model isn't marked `Servable` when actual GPU free memory is insufficient.
+    pub fn free_vram_bytes(&self) -> u64 {
+        self.gpus
+            .iter()
+            .filter(|g| g.kind == DeviceKind::Gpu)
+            .map(|g| g.vram_free_bytes)
+            .sum()
+    }
+
+    /// True on a UNIFIED-memory system (Apple Silicon), where the GPU's "VRAM" is
+    /// the same physical pool as system RAM. The readiness fit check must then SUM
+    /// the VRAM + RAM footprints against one free pool rather than checking them
+    /// independently (which would double-count the shared memory and over-report
+    /// `Servable`).
+    ///
+    /// Signalled by a Metal GPU on an `aarch64` host: Intel Macs ALSO run Metal
+    /// but with a DISCRETE AMD GPU (separate VRAM), so a bare "Metal" name isn't
+    /// enough — gate on the arm64 arch too.
+    pub fn is_unified_memory(&self) -> bool {
+        self.arch == "aarch64"
+            && self
+                .gpus
+                .iter()
+                .any(|g| g.kind == DeviceKind::Gpu && g.name == "Metal")
     }
 }
 

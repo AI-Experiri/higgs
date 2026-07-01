@@ -69,6 +69,20 @@ impl ServerGuard {
     pub fn pid(&self) -> u32 {
         self.child.id()
     }
+
+    /// Absolute path of the staged GGUF for `id` (the `stage_models` layout
+    /// `<model_dir>/<id>/stories260K.gguf`). Lets staleness tests mutate the file
+    /// so its `model_file_sig` changes and a saved profile reads back as stale.
+    pub fn staged_gguf(&self, id: &str) -> PathBuf {
+        self._model_dir.path().join(id).join("stories260K.gguf")
+    }
+
+    /// The server's isolated `HIGGS_HOME` — where `models.json` / `config.json`
+    /// live. Lets a test induce a persistence failure (e.g. occupy `models.json`
+    /// with a directory so the store flush can't write the file).
+    pub fn home(&self) -> &std::path::Path {
+        self._home.path()
+    }
 }
 
 /// Stage `gguf` into a temp LM-Studio layout (`<tmp>/higgs-test/stories260k/`)
@@ -138,6 +152,13 @@ pub async fn spawn_with_models(port: u16, gguf: &Path, ids: &[&str]) -> ServerGu
         .env("HIGGS_PORT", port.to_string())
         .env("HIGGS_MODEL_DIR", staged.path())
         .env("HIGGS_HOME", home.path())
+        // Point the HF hub at a dead local port so `Prepare`/tune's best-effort card
+        // fetch FAILS FAST (connection refused) instead of paying the 10s bounded
+        // timeout on offline/firewalled CI — `prepare_tiny` runs in many tests. The
+        // tiny fixture is pre-staged on disk (never downloaded), so no test here
+        // needs a live hub; the download tests set their OWN endpoint and don't use
+        // this helper.
+        .env("HIGGS_HF_ENDPOINT", "http://127.0.0.1:1")
         .env("RUST_LOG", "warn")
         .spawn()
         .expect("spawn higgs");

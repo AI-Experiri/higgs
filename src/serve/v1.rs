@@ -166,9 +166,14 @@ fn v1_envelope_response(status: StatusCode, message: &str) -> (StatusCode, Json<
     (status, Json(v1_envelope(status, message)))
 }
 
-/// `/v1` 400 response with a custom message (malformed request body).
+/// `/v1` 400 response with a custom message (malformed request body). Routed
+/// through [`HiggsError::InvalidRequest`] so the body carries the `[HG049]` code
+/// + resolution, like every other non-success reply.
 fn v1_bad_request(message: &str) -> (StatusCode, Json<WrappedError>) {
-    v1_envelope_response(StatusCode::BAD_REQUEST, message)
+    let err = HiggsError::InvalidRequest {
+        detail: message.to_owned(),
+    };
+    v1_envelope_response(StatusCode::BAD_REQUEST, &err.to_string())
 }
 
 /// `/v1` 500 response with a custom message (an internal, non-`HiggsError` failure).
@@ -525,29 +530,39 @@ async fn ensure_loaded(higgs: &Arc<Higgs>, model: &str) -> Result<LoadedInfo, Re
     // canonical tuning profile). An un-profiled or stale model is REFUSED with a
     // coded error — never a silent load with dumb defaults (the old behaviour that
     // produced a wrong context window). See `crate::serve::readiness`.
-    match higgs.profile_state(model).await {
-        crate::api::ProfileState::Missing => {
+    // Capture the VALIDATED profile from the readiness check so the load below uses
+    // exactly what was gated — no second `models.json` read that a concurrent
+    // unlink/chmod/retune could turn into a silent default load (gate bypass).
+    let profile = match higgs.profile_state(model).await {
+        Ok(crate::api::ProfileState::Ready(p)) => p,
+        Ok(crate::api::ProfileState::Missing) => {
             let err = HiggsError::NotPrepared {
                 id: model.to_owned(),
             };
             tracing::warn!(model = %model, "higgs: JIT chat for un-prepared model");
             return Err(v1_error(&err).into_response());
         }
-        crate::api::ProfileState::Stale => {
+        Ok(crate::api::ProfileState::Stale) => {
             let err = HiggsError::ProfileStale {
                 id: model.to_owned(),
             };
             tracing::warn!(model = %model, "higgs: JIT chat for stale profile");
             return Err(v1_error(&err).into_response());
         }
-        crate::api::ProfileState::Ready => {}
-    }
+        // A store-read failure (models.json unreadable) is surfaced as HG040, not
+        // masked as `model_not_prepared`.
+        Err(e) => {
+            tracing::warn!(model = %model, error = %e, "higgs: JIT readiness check failed");
+            return Err(v1_error(&e).into_response());
+        }
+    };
 
-    // Load on demand (from the saved profile). One always-on INFO line so the load
-    // is visible in the Developer Logs. The local load is ADDITIVE — it spawns a new
-    // worker alongside any others (and is idempotent per model), no swap.
+    // Load on demand with the VALIDATED profile, as a no-resync REUSE
+    // (`from_request = false`). One always-on INFO line so the load is visible in
+    // the Developer Logs. The local load is ADDITIVE — it spawns a new worker
+    // alongside any others (and is idempotent per model), no swap.
     tracing::info!("higgs: JIT loading {model}");
-    if let Err(err) = higgs.load(model, None).await {
+    if let Err(err) = higgs.load_inner(model, Some(profile), false).await {
         tracing::warn!(model = %model, error = %err, "higgs: JIT load failed");
         return Err(v1_error(&err).into_response());
     }

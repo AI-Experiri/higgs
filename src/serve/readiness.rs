@@ -44,6 +44,30 @@ pub struct ReadinessInputs {
     pub serving: bool,
 }
 
+/// Does an estimated footprint fit the model into the resources free **right
+/// now**? Compares the needed bytes against current free VRAM/RAM — NOT totals
+/// or the tune-time budget — so `Servable` reflects what can actually load given
+/// other resident models / memory pressure. Pure for unit testing.
+///
+/// `unified` = the host shares ONE physical pool for GPU + CPU memory (Apple
+/// Metal). There, VRAM and RAM free figures are views of the SAME memory, so a
+/// per-pool check would double-count it (a 20 GB-VRAM + 20 GB-RAM model would
+/// "fit" 32 GB of unified free). On unified we instead require the COMBINED
+/// footprint to fit the conservative shared free (`min(free_vram, free_ram)`).
+pub fn footprint_fits_free(
+    needed_vram: u64,
+    needed_ram: u64,
+    free_vram: u64,
+    free_ram: u64,
+    unified: bool,
+) -> bool {
+    if unified {
+        needed_vram.saturating_add(needed_ram) <= free_vram.min(free_ram)
+    } else {
+        needed_vram <= free_vram && needed_ram <= free_ram
+    }
+}
+
 /// Collapse the facts into one state.
 ///
 /// Precedence: `Loaded` (resident — true regardless of staleness/fit) > not on

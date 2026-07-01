@@ -84,7 +84,124 @@ async fn unprepared_model_chat_is_model_not_prepared() {
         .await
         .unwrap();
     let resident = models["data"].as_array().map(Vec::len).unwrap_or(0);
-    assert_eq!(resident, 0, "no model resident after a refused JIT: {models:?}");
+    assert_eq!(
+        resident, 0,
+        "no model resident after a refused JIT: {models:?}"
+    );
+}
+
+// ── Explicit load of a STALE profile is refused [HG047] ──────────────────────
+//
+// The JIT gate hard-blocks a stale profile; the explicit /api/higgs/models/load
+// endpoint must too — it reuses the saved profile when called with just an id.
+// Prepare records the file/hardware anchors; mutating the GGUF changes its file
+// signature so the profile reads back stale and the reuse is refused. Fails-on-
+// revert: drop the stale guard in `Higgs::load` and the explicit load no longer
+// 400s with HG047.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_load_of_stale_profile_is_refused() {
+    let Some(gguf) = tiny_gguf_path() else {
+        eprintln!("SKIP explicit_load_of_stale_profile_is_refused: tiny gguf not found");
+        return;
+    };
+    let srv = spawn_with_tiny_model(12114, &gguf).await;
+    let c = reqwest::Client::new();
+    // Prepare → a saved profile with anchors for the current hardware + file.
+    common::prepare_tiny(&srv.base).await;
+    // Make the on-disk model differ from the profile's recorded file signature by
+    // growing it one byte (the GGUF header still scans fine).
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(srv.staged_gguf(TINY_MODEL_ID))
+            .expect("open staged gguf");
+        f.write_all(b"\0").expect("append to staged gguf");
+    }
+    // Explicit load reusing the now-stale saved profile → 400 [HG047].
+    let resp = c
+        .post(format!("{}/api/higgs/models/load", srv.base))
+        .json(&json!({ "id": TINY_MODEL_ID }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        400,
+        "stale profile reuse is refused, got {}",
+        resp.status()
+    );
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("[HG047]"), "carries HG047 stale: {body}");
+}
+
+// ── Removed model is NOT reported stale (preserve not-found) ─────────────────
+//
+// A previously-Prepared model whose GGUF is then removed must surface the real
+// not-found/load failure, NOT a misleading [HG047] "Re-tune" — re-tuning can't
+// fix a missing model. Fails-on-revert: restore `profile_state`'s path
+// `unwrap_or_default()` and the load reports HG047 instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_load_of_removed_model_is_not_reported_stale() {
+    let Some(gguf) = tiny_gguf_path() else {
+        eprintln!("SKIP explicit_load_of_removed_model_is_not_reported_stale: tiny gguf not found");
+        return;
+    };
+    let srv = spawn_with_tiny_model(12115, &gguf).await;
+    let c = reqwest::Client::new();
+    // Prepare → a saved profile with anchors, then delete the model file.
+    common::prepare_tiny(&srv.base).await;
+    std::fs::remove_file(srv.staged_gguf(TINY_MODEL_ID)).expect("remove staged gguf");
+    let resp = c
+        .post(format!("{}/api/higgs/models/load", srv.base))
+        .json(&json!({ "id": TINY_MODEL_ID }))
+        .send()
+        .await
+        .unwrap();
+    // It must fail (the model is gone) but NOT as a stale/Re-tune.
+    assert!(
+        !resp.status().is_success(),
+        "load of a removed model fails, got {}",
+        resp.status()
+    );
+    let body = resp.text().await.unwrap();
+    assert!(
+        !body.contains("[HG047]"),
+        "a removed model is not reported stale: {body}"
+    );
+}
+
+// ── Prepare that can't persist FAILS (not a silent success) ──────────────────
+//
+// The readiness gate makes a PERSISTED profile a serving precondition, so a tune
+// that can't write `models.json` must surface the error — otherwise a client sees
+// a "successful" Prepare followed by a refused `model_not_prepared` chat. We force
+// the persistence failure by occupying `models.json` with a directory so the
+// store's temp→rename flush can't create the file. Fails-on-revert: make `tune`
+// log-and-`Ok` again and the request 2xx's despite saving nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepare_that_cannot_persist_fails_loudly() {
+    let Some(gguf) = tiny_gguf_path() else {
+        eprintln!("SKIP prepare_that_cannot_persist_fails_loudly: tiny gguf not found");
+        return;
+    };
+    let srv = spawn_with_tiny_model(12116, &gguf).await;
+    let c = reqwest::Client::new();
+    // Occupy models.json with a NON-EMPTY directory → the flush rename can't write.
+    let mj = srv.home().join("models.json");
+    let _ = std::fs::remove_file(&mj);
+    std::fs::create_dir_all(mj.join("blocker")).expect("occupy models.json with a dir");
+    let resp = c
+        .post(format!("{}/api/higgs/models/tune", srv.base))
+        .json(&json!({ "id": TINY_MODEL_ID }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        !resp.status().is_success(),
+        "Prepare that can't persist must fail, got {}",
+        resp.status()
+    );
 }
 
 // ── Out-of-range sampling param → 400 [HG013] invalid_request_error ──────────
@@ -132,6 +249,91 @@ async fn invalid_sampling_param_top_p_400_hg013() {
     assert!(
         env["error"]["code"].is_null(),
         "HG013 4xx carries no `code`: {env:?}"
+    );
+}
+
+// ── Unreadable store on a Prepared model → HG040, not model_not_prepared ──────
+//
+// A store-READ failure (models.json exists but can't be opened) must NOT be
+// masked as an absent profile: that would tell a user who DID Prepare to Prepare
+// again (which also can't persist), hiding the real persistence fault. Prepare
+// writes the profile, then we make models.json unreadable; the JIT readiness gate
+// must surface [HG040], not `model_not_prepared`. Fails-on-revert: restore the
+// `.ok()` swallow in `profile_state` and the chat returns `model_not_prepared`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn jit_unreadable_store_surfaces_persistence_error() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(gguf) = tiny_gguf_path() else {
+        eprintln!("SKIP jit_unreadable_store_surfaces_persistence_error: tiny gguf not found");
+        return;
+    };
+    let srv = spawn_with_tiny_model(12122, &gguf).await;
+    let c = reqwest::Client::new();
+    common::prepare_tiny(&srv.base).await; // writes models.json with the profile
+                                           // Make models.json exist-but-unreadable (owner read denied) so the store open
+                                           // fails when the JIT gate reads the profile.
+    let mj = srv.home().join("models.json");
+    std::fs::set_permissions(&mj, std::fs::Permissions::from_mode(0o000))
+        .expect("chmod models.json unreadable");
+    let resp = c
+        .post(format!("{}/v1/chat/completions", srv.base))
+        .json(&json!({
+            "model": TINY_MODEL_ID, "stream": false,
+            "messages": [{ "role": "user", "content": "hi" }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("[HG040]"),
+        "unreadable store surfaces the persistence error: {body}"
+    );
+    assert!(
+        !body.contains("model_not_prepared"),
+        "a read failure is NOT masked as unprepared: {body}"
+    );
+}
+
+// ── Malformed request body (text-only rejects image content) → 400 [HG049] ───
+//
+// `/v1` is text-only, so an `image_url` content part is rejected by the request
+// validator (`messages_to_pairs`), which returns the otherwise-bare 400 through
+// the coded `HG049` path. Proves every non-success reply — including a malformed
+// body — carries a diagnostic code. Fails-on-revert: route `v1_bad_request` back
+// to a plain message and the body no longer mentions HG049.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_image_content_400_hg049() {
+    let Some(gguf) = tiny_gguf_path() else {
+        eprintln!("SKIP malformed_image_content_400_hg049: tiny gguf not found");
+        return;
+    };
+    let srv = spawn_with_tiny_model(12120, &gguf).await;
+    let c = reqwest::Client::new();
+    load_tiny(&c, &srv.base).await;
+
+    let resp = c
+        .post(format!("{}/v1/chat/completions", srv.base))
+        .json(&json!({
+            "model": TINY_MODEL_ID, "stream": false,
+            "messages": [{
+                "role": "user",
+                "content": [{ "type": "image_url", "image_url": { "url": "http://example/x.png" } }]
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        400,
+        "image content in text-only /v1 is a 400"
+    );
+    let env: Value = resp.json().await.unwrap();
+    let msg = env["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("[HG049]"),
+        "malformed-body 400 carries the HG049 code: {env:?}"
     );
 }
 

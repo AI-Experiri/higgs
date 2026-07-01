@@ -81,6 +81,14 @@ async fn api_keys_gate_the_http_surface() {
         no_key.headers().contains_key("www-authenticate"),
         "challenges with WWW-Authenticate"
     );
+    // The 401 body carries the HG048 diagnostic code + resolution, so an auth
+    // failure is as diagnosable as every other reply (fails-on-revert: drop the
+    // coded message in `unauthorized()` and the body no longer mentions HG048).
+    let no_key_body = no_key.text().await.unwrap();
+    assert!(
+        no_key_body.contains("[HG048]") && no_key_body.contains("Authorization: Bearer"),
+        "401 body carries the HG048 code + resolution, got: {no_key_body}"
+    );
 
     // Chat-scoped key can't list models (needs Models) → 401.
     let chat_on_models = c

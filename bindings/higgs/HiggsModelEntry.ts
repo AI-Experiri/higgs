@@ -2,6 +2,7 @@
 import type { GgufComponent } from "./GgufComponent";
 import type { HiggsModelSource } from "./HiggsModelSource";
 import type { LoadParams } from "./LoadParams";
+import type { ModelFit } from "./ModelFit";
 import type { ModelReadiness } from "./ModelReadiness";
 
 /**
@@ -50,6 +51,12 @@ last_load?: LoadParams,
  * staleness, residency, live resource fit, and the serving toggle.
  */
 readiness: ModelReadiness, 
+/**
+ * The resource fit numbers behind a `servable`/`unservable` readiness —
+ * `Some` only when a profile was evaluated for fit, so the UI can show
+ * the needed-vs-free gap. `None` for the other states.
+ */
+fit?: ModelFit, 
 /**
  * HuggingFace repo id, `org/model` — the identity used everywhere.
  * Ollama-sourced models keep their established Ollama name (`ollama/{name}:{tag}`);

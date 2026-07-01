@@ -11,8 +11,38 @@ fn tune_record() -> TuneRecord {
         tuned_at_ms: 100,
         hw_fingerprint: "v0r0n0".into(),
         model_file_sig: "123:456".into(),
-        resolved_ctx: 8192,
     }
+}
+
+#[test]
+fn legacy_profile_without_anchors_is_grandfathered_not_stale() {
+    // A pre-existing models.json profile (from before staleness tracking) loads
+    // with empty anchors via serde defaults; it must NOT be marked stale, or
+    // every upgraded user's saved profiles would flip to NeedsRetune.
+    let mut rec = tune_record();
+    rec.hw_fingerprint = String::new();
+    rec.model_file_sig = String::new();
+    assert!(
+        !rec.is_stale("v1r1n1", "999:999"),
+        "empty anchors are grandfathered → never stale"
+    );
+}
+
+#[test]
+fn present_anchor_mismatch_marks_stale() {
+    let rec = tune_record(); // anchors: hw "v0r0n0", file "123:456"
+    assert!(
+        !rec.is_stale("v0r0n0", "123:456"),
+        "matching anchors → fresh"
+    );
+    assert!(
+        rec.is_stale("vXrXnX", "123:456"),
+        "hardware changed → stale"
+    );
+    assert!(
+        rec.is_stale("v0r0n0", "999:999"),
+        "model file changed → stale"
+    );
 }
 
 fn perf_sample(gen: f32) -> BenchResult {
@@ -82,6 +112,8 @@ fn set_profile_updates_profile_preserving_other_fields() {
     s.set_profile(
         "org/m",
         LoadParams::base(CtxLen::Fixed { n: 1234 }, GpuLayers::Count { n: 0 }, 2),
+        "v0r0n0",
+        "123:456",
         99,
     );
     let got = s.tuning("org/m").unwrap();
@@ -106,11 +138,48 @@ fn set_profile_updates_profile_preserving_other_fields() {
     s.set_profile(
         "org/new",
         LoadParams::base(CtxLen::Fixed { n: 2048 }, GpuLayers::All, 8),
+        "vNew",
+        "sigNew",
         50,
     );
     let fresh = s.tuning("org/new").unwrap();
     assert_eq!(fresh.profile.ctx_len(), CtxLen::Fixed { n: 2048 });
     assert_eq!(fresh.provenance, TuneProvenance::Heuristic);
+}
+
+#[test]
+fn set_profile_refreshes_anchors_to_current_preserving_future_detection() {
+    let home = tempfile::tempdir().unwrap();
+    let s = JsonModelStore::open(home.path()).unwrap();
+    // A Prepared profile carrying anchors for the ORIGINAL hardware/file.
+    s.put_tuning("org/m", tune_record()); // hw "v0r0n0", file "123:456"
+                                          // An accepted load anchors the profile to the CURRENT hardware/file.
+    s.set_profile(
+        "org/m",
+        LoadParams::base(CtxLen::Fixed { n: 1024 }, GpuLayers::All, 4),
+        "vCURrCUR",
+        "999:999",
+        123,
+    );
+    let rec = s.tuning("org/m").unwrap();
+    // Anchors are REFRESHED to current (not cleared) — so the accepted load reads
+    // back fresh, AND a later hardware/file change is still detected as stale.
+    assert_eq!(
+        rec.hw_fingerprint, "vCURrCUR",
+        "hw anchor refreshed to current"
+    );
+    assert_eq!(
+        rec.model_file_sig, "999:999",
+        "file anchor refreshed to current"
+    );
+    assert!(
+        !rec.is_stale("vCURrCUR", "999:999"),
+        "matches current → fresh"
+    );
+    assert!(
+        rec.is_stale("vLATER", "999:999"),
+        "a LATER hardware change is still detected (detection preserved)"
+    );
 }
 
 #[test]

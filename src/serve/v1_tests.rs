@@ -287,7 +287,7 @@ async fn v1_chat_jit_on_scanned_loads_then_serves() {
     // with the completion proves the JIT load path ran.
     let dir = tempfile::TempDir::new().unwrap();
     write_gguf_fixture(dir.path(), "org/model");
-    let app = make_app_with_lmstudio(dir.path().to_path_buf());
+    let app = make_app_with_lmstudio_prepared(dir.path().to_path_buf(), "org/model").await;
 
     let req = post_json(
         "/v1/chat/completions",
@@ -883,14 +883,6 @@ fn facade_over(
     Arc::new(Higgs::with_local(Arc::new(node), cfg))
 }
 
-/// Stage a dummy `<root>/<id>/m.gguf` so a host-side `scan()` catalogs `id`
-/// (the GGUF header is read best-effort; a non-GGUF file still catalogs).
-fn stage_dummy(root: &std::path::Path, id: &str) {
-    let model_dir = root.join(id);
-    std::fs::create_dir_all(&model_dir).expect("model dir");
-    std::fs::write(model_dir.join("m.gguf"), b"GGUF\x00 dummy").expect("write dummy gguf");
-}
-
 // ── JIT ON + scanned model whose load FAILS → mapped error, not 404 ───────
 //
 // JIT is on. A chat for a scanned model triggers a JIT load; when the load
@@ -901,9 +893,21 @@ fn stage_dummy(root: &std::path::Path, id: &str) {
 #[tokio::test]
 async fn v1_chat_jit_load_failure_surfaces_mapped_error() {
     let dir = tempfile::TempDir::new().unwrap();
-    stage_dummy(dir.path(), "org/model");
+    // A valid GGUF (not a dummy) so Prepare can read its metadata; the node still
+    // fails the actual LOAD regardless of the file.
+    write_gguf_fixture(dir.path(), "org/model");
     let node = crate::node::test_support::fake_runtime_load_fails(vec![dir.path().to_path_buf()]);
     let higgs = facade_over(node, vec![dir.path().to_path_buf()]);
+    // Prepare so the readiness gate admits the model; the load then fails (the
+    // path under test) rather than being refused as un-prepared.
+    higgs
+        .tune(crate::tune::TuneRequest {
+            id: "org/model".into(),
+            mode: None,
+            budget: None,
+        })
+        .await
+        .expect("Prepare the test fixture model");
     let app = app_for(higgs);
 
     let req = post_json(
@@ -941,7 +945,7 @@ async fn v1_chat_jit_load_failure_surfaces_mapped_error() {
 async fn v1_chat_gate_rejects_bad_sampling_400() {
     let dir = tempfile::TempDir::new().unwrap();
     write_gguf_fixture(dir.path(), "org/model");
-    let app = make_app_with_lmstudio(dir.path().to_path_buf());
+    let app = make_app_with_lmstudio_prepared(dir.path().to_path_buf(), "org/model").await;
 
     let req = post_json(
         "/v1/chat/completions",
@@ -969,7 +973,7 @@ async fn v1_chat_gate_rejects_bad_sampling_400() {
 async fn v1_chat_gate_rejects_oversized_prompt_400() {
     let dir = tempfile::TempDir::new().unwrap();
     write_gguf_fixture(dir.path(), "org/model");
-    let app = make_app_with_lmstudio(dir.path().to_path_buf());
+    let app = make_app_with_lmstudio_prepared(dir.path().to_path_buf(), "org/model").await;
 
     // The fixture loads with the GGUF's 4096-token window. A ~40k-char prompt is
     // ~10k estimated tokens, well over the window → ContextOverflow 400.
@@ -995,7 +999,7 @@ async fn v1_chat_gate_rejects_oversized_prompt_400() {
 async fn v1_chat_gate_rejects_image_part_400() {
     let dir = tempfile::TempDir::new().unwrap();
     write_gguf_fixture(dir.path(), "org/model");
-    let app = make_app_with_lmstudio(dir.path().to_path_buf());
+    let app = make_app_with_lmstudio_prepared(dir.path().to_path_buf(), "org/model").await;
 
     let req = post_json(
         "/v1/chat/completions",

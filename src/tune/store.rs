@@ -87,10 +87,24 @@ pub struct TuneRecord {
     /// vs the on-disk file marks the profile stale → `NeedsRetune`.
     #[serde(default)]
     pub model_file_sig: String,
-    /// Concrete `n_ctx` the profile loads at — seeds the session Context Size so
-    /// it cannot drift from the model's real window (Gap-2 fix).
-    #[serde(default)]
-    pub resolved_ctx: u32,
+}
+
+impl TuneRecord {
+    /// Is this saved profile stale for the current hardware + model file?
+    ///
+    /// Stale ONLY when a recorded anchor is present AND no longer matches.
+    /// **Empty anchors are grandfathered**: a profile from before staleness
+    /// tracking (or one written by a bare load, not a Prepare) has no anchors,
+    /// and we can't tell whether it's stale — so we do NOT force a Re-tune. This
+    /// keeps pre-existing `models.json` profiles loadable across an upgrade
+    /// instead of all flipping to `NeedsRetune` / `model_not_prepared`.
+    pub fn is_stale(&self, current_hw_fingerprint: &str, current_model_file_sig: &str) -> bool {
+        let hw_changed =
+            !self.hw_fingerprint.is_empty() && self.hw_fingerprint != current_hw_fingerprint;
+        let file_changed =
+            !self.model_file_sig.is_empty() && self.model_file_sig != current_model_file_sig;
+        hw_changed || file_changed
+    }
 }
 
 /// Observed passive performance (§7.1) — real decode timing, never synthetic.
@@ -164,6 +178,18 @@ impl JsonModelStore {
         self.inner.lock().models.get(id)?.tuning.clone()
     }
 
+    /// Every saved tuning record, keyed by model id — for callers that need the
+    /// whole set at once (e.g. the `/api/higgs/models` readiness pass) so they
+    /// open + parse `models.json` ONCE rather than per-model.
+    pub fn all_tuning(&self) -> BTreeMap<String, TuneRecord> {
+        self.inner
+            .lock()
+            .models
+            .iter()
+            .filter_map(|(id, e)| e.tuning.clone().map(|t| (id.clone(), t)))
+            .collect()
+    }
+
     /// Persist (in memory) a tuning record for `id`.
     pub fn put_tuning(&self, id: &str, record: TuneRecord) {
         self.inner
@@ -179,13 +205,28 @@ impl JsonModelStore {
     /// provenance — or defaulting them when there is no record yet. This keeps the
     /// saved profile a plain load reuses in sync with the LAST accepted load, so an
     /// unload/reload doesn't silently revert to a stale tune suggestion.
-    pub fn set_profile(&self, id: &str, profile: LoadParams, now_ms: u64) {
+    ///
+    /// The accepted load just PROVED this profile loads on the CURRENT hardware +
+    /// file, so the staleness anchors are REFRESHED to those current values (passed
+    /// by the caller, which has the hardware/path). Refreshing — not clearing —
+    /// keeps future staleness detection intact: a LATER hardware or GGUF change is
+    /// then correctly flagged `NeedsRetune`.
+    pub fn set_profile(
+        &self,
+        id: &str,
+        profile: LoadParams,
+        hw_fingerprint: &str,
+        model_file_sig: &str,
+        now_ms: u64,
+    ) {
         let mut guard = self.inner.lock();
         let entry = guard.models.entry(id.to_string()).or_default();
         match entry.tuning.as_mut() {
             Some(rec) => {
                 rec.profile = profile;
                 rec.tuned_at_ms = now_ms;
+                rec.hw_fingerprint = hw_fingerprint.to_owned();
+                rec.model_file_sig = model_file_sig.to_owned();
             }
             None => {
                 entry.tuning = Some(TuneRecord {
@@ -195,12 +236,8 @@ impl JsonModelStore {
                     provenance: TuneProvenance::Heuristic,
                     bench_tps: None,
                     tuned_at_ms: now_ms,
-                    // A profile created by a bare load (not Prepare/tune) carries no
-                    // staleness anchors — empty fingerprint reads as "not Prepared
-                    // for this hardware", so readiness treats it as needing a tune.
-                    hw_fingerprint: String::new(),
-                    model_file_sig: String::new(),
-                    resolved_ctx: 0,
+                    hw_fingerprint: hw_fingerprint.to_owned(),
+                    model_file_sig: model_file_sig.to_owned(),
                 });
             }
         }

@@ -111,6 +111,7 @@ fn model_entry(
     loaded_ids: &[String],
     last_load: Option<LoadParams>,
     readiness: crate::serve::readiness::ModelReadiness,
+    fit: Option<crate::serve::wire::ModelFit>,
 ) -> HiggsModelEntry {
     // Multi-model: this model is "loaded" if it is among the resident ids, not only
     // when it is the primary.
@@ -134,6 +135,7 @@ fn model_entry(
         support_reason,
         last_load,
         readiness,
+        fit,
         model,
     }
 }
@@ -152,14 +154,22 @@ pub(super) async fn control_models(State(higgs): State<Arc<Higgs>>) -> Response 
     // Non-consuming lookup — the scan can list multiple rows for one id (e.g. several
     // HF cache revisions), and they should all carry the same persisted `last_load`.
     let records = higgs.model_records();
+    // Load the per-model config records AND tuning profiles ONCE for the whole
+    // list; readiness then does in-memory lookups (no per-model store reopen). A
+    // genuinely unreadable store surfaces HG040 rather than badging every prepared
+    // model `discovered` (the JIT path surfaces the same fault as HG040).
+    let tuning = match higgs.tuning_records() {
+        Ok(t) => t,
+        Err(err) => return control_error(&err).into_response(),
+    };
     // One hardware snapshot for the whole list — readiness (staleness + fit) is
     // computed against it per model.
     let hw = higgs.hardware().await;
     let mut entries: Vec<HiggsModelEntry> = Vec::with_capacity(models.len());
     for m in models {
         let last_load = records.get(&m.id).and_then(|r| r.load.clone());
-        let readiness = higgs.model_readiness(&m, &loaded_set, &hw).await;
-        entries.push(model_entry(m, &loaded_set, last_load, readiness));
+        let (readiness, fit) = higgs.model_readiness(&m, &loaded_set, &hw, &tuning);
+        entries.push(model_entry(m, &loaded_set, last_load, readiness, fit));
     }
     Json(HiggsModelsResponse {
         models: entries,
@@ -187,8 +197,12 @@ pub(super) async fn control_model_by_id(
         Some(model) => {
             let last_load = higgs.model_records().remove(&model.id).and_then(|r| r.load);
             let hw = higgs.hardware().await;
-            let readiness = higgs.model_readiness(&model, &loaded_set, &hw).await;
-            Json(model_entry(model, &loaded_set, last_load, readiness)).into_response()
+            let tuning = match higgs.tuning_records() {
+                Ok(t) => t,
+                Err(err) => return control_error(&err).into_response(),
+            };
+            let (readiness, fit) = higgs.model_readiness(&model, &loaded_set, &hw, &tuning);
+            Json(model_entry(model, &loaded_set, last_load, readiness, fit)).into_response()
         }
         None => {
             let err = HiggsError::ModelNotFound { id };

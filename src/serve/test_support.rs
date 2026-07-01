@@ -87,6 +87,49 @@ pub(crate) fn make_app_with_lmstudio(dir: PathBuf) -> Router {
     router(make_higgs_with_lmstudio(dir))
 }
 
+/// Like [`make_app_with_lmstudio`] but Prepares (autotunes) `id` first, so the
+/// JIT readiness gate admits it. Use for tests that exercise the JIT load/serve
+/// or post-load validation paths — an un-prepared model is refused by the gate
+/// before those paths run, so they need a fresh, matching profile in place.
+pub(crate) async fn make_app_with_lmstudio_prepared(dir: PathBuf, id: &str) -> Router {
+    let higgs = make_higgs_with_lmstudio(dir);
+    seed_prepared_profile(&higgs, id).await;
+    app_for(higgs)
+}
+
+/// Seed a fresh tuning profile DIRECTLY into the store — NOT `Higgs::tune`, which
+/// runs a bounded HF card fetch (`fetch_card_bounded`) that stalls ~10s on offline
+/// or firewalled CI. Anchored to the CURRENT hardware + model file so
+/// `profile_state` reads it as `Ready` (the JIT gate admits it), exactly like a
+/// real Prepare. The serve tests use FAKE workers, so the profile's params don't
+/// need to load llama.cpp — only the staleness anchors matter. Keeps these unit
+/// tests hermetic and fast.
+async fn seed_prepared_profile(higgs: &Higgs, id: &str) {
+    use crate::worker::engine::{CtxLen, GpuLayers, LoadParams};
+    let hw = higgs.hardware().await;
+    let path = higgs
+        .scan()
+        .await
+        .ok()
+        .and_then(|ms| ms.into_iter().find(|m| m.id == id).map(|m| m.path))
+        .expect("fixture model is scannable");
+    let store = higgs.models_store().expect("open models store");
+    store.put_tuning(
+        id,
+        crate::tune::store::TuneRecord {
+            profile: LoadParams::base(CtxLen::Auto, GpuLayers::All, 8),
+            sampling: crate::worker::engine::SamplingParams::default(),
+            budget: crate::tune::ResourceBudget::default(),
+            provenance: crate::tune::TuneProvenance::Heuristic,
+            bench_tps: None,
+            tuned_at_ms: 0,
+            hw_fingerprint: hw.fingerprint(),
+            model_file_sig: crate::api::file_sig(&path),
+        },
+    );
+    store.flush().expect("persist seeded profile");
+}
+
 /// The serve router with JIT turned OFF — for the `/v1` tests that assert the
 /// explicit-load HG003 404 path (chat against an unloaded model).
 pub(crate) fn make_app_jit_off() -> Router {

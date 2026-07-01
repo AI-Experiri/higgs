@@ -87,6 +87,32 @@ higgs_ts! {
 }
 
 higgs_ts! {
+    /// The analytical resource fit for a model's saved profile against the node's
+    /// CURRENT free resources — the numbers behind the `Servable`/`Unservable`
+    /// badge, so the UI can say "≈22 GB needed, 18 GB free" instead of a bare
+    /// verdict. Present only when a profile was actually evaluated for fit
+    /// (i.e. the model is `servable` or `unservable`); `None` otherwise.
+    ///
+    /// ADVISORY: `free_*` come from the cached device snapshot (a live refresh
+    /// would spawn a sysinfo worker per poll), so render the figures as "≈".
+    #[derive(Debug, Clone, serde::Serialize)]
+    pub struct ModelFit {
+        /// Estimated VRAM the profile needs to load + serve.
+        #[ts(type = "number")]
+        pub needed_vram_bytes: u64,
+        /// Estimated system RAM the profile needs.
+        #[ts(type = "number")]
+        pub needed_ram_bytes: u64,
+        /// GPU free VRAM at the last device snapshot.
+        #[ts(type = "number")]
+        pub free_vram_bytes: u64,
+        /// System free RAM at the last device snapshot.
+        #[ts(type = "number")]
+        pub free_ram_bytes: u64,
+    }
+}
+
+higgs_ts! {
     /// Per-model entry in `GET /api/higgs/models`: enriches [`HiggsModel`] with
     /// request-derived fields computed by the control handler.
     #[derive(Debug, serde::Serialize)]
@@ -127,6 +153,12 @@ higgs_ts! {
         /// and (future) autonomous agents read. Derived from profile presence,
         /// staleness, residency, live resource fit, and the serving toggle.
         pub readiness: crate::serve::readiness::ModelReadiness,
+        /// The resource fit numbers behind a `servable`/`unservable` readiness —
+        /// `Some` only when a profile was evaluated for fit, so the UI can show
+        /// the needed-vs-free gap. `None` for the other states.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub fit: Option<ModelFit>,
     }
 }
 

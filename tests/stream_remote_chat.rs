@@ -91,6 +91,7 @@ async fn stream_finish_reason_length_verbose_and_usage_order() {
         return;
     };
     let srv = spawn_with_tiny_model(13100, &gguf).await;
+    common::prepare_tiny(&srv.base).await;
     let c = reqwest::Client::new();
 
     // Turn VERBOSE on via the runtime settings endpoint so the streamed-completion
@@ -211,6 +212,7 @@ async fn stream_client_drops_midstream_then_server_keeps_serving() {
         return;
     };
     let srv = spawn_with_tiny_model(13101, &gguf).await;
+    common::prepare_tiny(&srv.base).await;
     let c = reqwest::Client::new();
 
     // Open a streaming chat with a generous budget so there is plenty of stream left to

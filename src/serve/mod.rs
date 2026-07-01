@@ -18,7 +18,11 @@
 //! 3. Register it in [`router`] under `/api/higgs/<name>`.
 
 mod control;
-pub(crate) mod readiness;
+// `pub` (not `pub(crate)`) because `ModelReadiness` is a field type on the
+// publicly re-exported `wire::HiggsModelEntry` (`pub use wire::*`), matching the
+// other wire field types' modules (`pub mod engine` / `pub mod models`). Keeps
+// the public `serve` surface self-consistent — every wire field type is nameable.
+pub mod readiness;
 mod stream;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -102,10 +106,13 @@ pub(crate) fn http_status(err: &HiggsError) -> StatusCode {
         HiggsError::ModelNotFound { .. } | HiggsError::ModelNotLoaded { .. } => {
             StatusCode::NOT_FOUND
         }
+        // Missing/insufficient API key.
+        HiggsError::Unauthorized => StatusCode::UNAUTHORIZED,
         // Client-side request errors caught at the boundary before dispatch.
         HiggsError::ContextOverflow { .. }
         | HiggsError::InvalidSamplingParam { .. }
         | HiggsError::InvalidModelId { .. }
+        | HiggsError::InvalidRequest { .. }
         // A model that isn't Prepared (or whose profile is stale) is a client
         // precondition failure — the caller must Prepare/Re-tune first.
         | HiggsError::NotPrepared { .. }
@@ -316,10 +323,13 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
 }
 
 /// The `401` envelope (OpenAI-style `error` object) for a missing/insufficient key.
+/// The message is the coded [`HiggsError::Unauthorized`] display ("[HG048] …"),
+/// so the `401` carries a diagnostic code + resolution like every other reply,
+/// while the OpenAI `code: "unauthorized"` stays for client compatibility.
 fn unauthorized() -> Response {
     let body = axum::Json(serde_json::json!({
         "error": {
-            "message": "missing or insufficient API key",
+            "message": HiggsError::Unauthorized.to_string(),
             "type": "invalid_request_error",
             "code": "unauthorized",
         }

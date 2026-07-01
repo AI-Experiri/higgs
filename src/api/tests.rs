@@ -117,6 +117,65 @@ async fn load_persists_model_record() {
     assert!(rec.last_loaded_ms > 0, "load stamps a timestamp");
 }
 
+/// `load_inner` with `from_request = false` is a REUSE — it loads the given
+/// profile but does NOT re-write the saved tuning record. This is the JIT path's
+/// no-resync seam: the JIT load passes the profile the readiness gate VALIDATED
+/// (`from_request = false`), so it can't silently default-load if `models.json`
+/// changes after the check (the check-then-load race), and doesn't churn the
+/// saved profile on every JIT load. Fails-on-revert: have JIT load via the public
+/// `load(.., None)` (re-read + reuse) and this seam is unused / the saved profile
+/// re-syncs.
+#[tokio::test]
+async fn load_inner_reuse_does_not_resync_saved_profile() {
+    use crate::worker::engine::{CtxLen, GpuLayers, LoadParams};
+    let dir = tempfile::TempDir::new().unwrap();
+    crate::serve::test_support::write_gguf_fixture(dir.path(), "org/model");
+    let higgs = fake_higgs(vec![dir.path().to_path_buf()]);
+
+    // Seed a known saved profile (ctx 4096, tuned_at 111).
+    let store = higgs.models_store().expect("open store");
+    store.put_tuning(
+        "org/model",
+        crate::tune::store::TuneRecord {
+            profile: LoadParams::base(CtxLen::Fixed { n: 4096 }, GpuLayers::All, 8),
+            sampling: Default::default(),
+            budget: Default::default(),
+            provenance: crate::tune::TuneProvenance::Heuristic,
+            bench_tps: None,
+            tuned_at_ms: 111,
+            hw_fingerprint: String::new(),
+            model_file_sig: String::new(),
+        },
+    );
+    store.flush().expect("flush seed");
+
+    // REUSE load with DIFFERENT params must NOT rewrite the saved profile.
+    higgs
+        .load_inner(
+            "org/model",
+            Some(LoadParams::base(
+                CtxLen::Fixed { n: 1024 },
+                GpuLayers::All,
+                2,
+            )),
+            false,
+        )
+        .await
+        .expect("reuse load");
+
+    let saved = higgs
+        .models_store()
+        .expect("reopen store")
+        .tuning("org/model")
+        .expect("profile still present");
+    assert_eq!(
+        saved.profile.ctx_len(),
+        CtxLen::Fixed { n: 4096 },
+        "a reuse load did NOT re-write the saved profile"
+    );
+    assert_eq!(saved.tuned_at_ms, 111, "a reuse load did NOT re-stamp it");
+}
+
 /// The inference admission gate returns `ServerBusy` once all permits are
 /// taken; releasing a permit re-opens a slot.
 #[tokio::test]
