@@ -886,9 +886,10 @@ pub(super) async fn control_logs_stream(
         loop {
             match rx.recv().await {
                 Ok(line) => {
-                    // Drop lines from other sources when a `?source=` filter is set.
+                    // Drop lines from other sources when a `?source=` filter is set
+                    // (`worker` is a union filter matching every local worker's lines).
                     if let Some(f) = filter {
-                        if line.source != f {
+                        if !line.source.matches_filter(f) {
                             continue;
                         }
                     }

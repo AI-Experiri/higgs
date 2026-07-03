@@ -65,8 +65,14 @@ const HIGGS_TARGET_PREFIX: &str = "higgs";
 pub enum LogSource {
     /// higgs serve-layer / control-plane tracing (the `higgs: …` lines).
     Serve,
-    /// The LOCAL model worker process's stderr (llama.cpp / ggml output).
+    /// The LOCAL model worker process's stderr (llama.cpp / ggml output),
+    /// legacy UNKEYED form. Kept as the union FILTER selector (`?source=worker`
+    /// matches every local worker) and for push sites that have no worker id
+    /// (the transient sysinfo/GPU probes).
     Worker,
+    /// One LOCAL worker's stderr, keyed by its [`WorkerId`] so each loaded
+    /// model's console can be streamed on its own tab (`?source=worker:<id>`).
+    LocalWorker { worker: WorkerId },
     /// A remote node's worker stderr, relayed over iroh and keyed by which node +
     /// which worker on it (`?source=node:<node>:<worker>`).
     RemoteWorker { node: NodeId, worker: WorkerId },
@@ -74,12 +80,18 @@ pub enum LogSource {
 
 impl LogSource {
     /// Parse a `?source=` query value; `None` (absent/unknown) means all sources.
-    /// Remote selector form: `node:<node-id>:<worker-id>` (e.g. `node:1:2`).
+    /// Local per-worker form: `worker:<worker-id>` (e.g. `worker:3`). Remote
+    /// selector form: `node:<node-id>:<worker-id>` (e.g. `node:1:2`).
     pub fn parse(s: &str) -> Option<LogSource> {
         match s {
             "serve" => Some(LogSource::Serve),
             "worker" => Some(LogSource::Worker),
             _ => {
+                if let Some(w) = s.strip_prefix("worker:") {
+                    return Some(LogSource::LocalWorker {
+                        worker: WorkerId(w.parse().ok()?),
+                    });
+                }
                 let rest = s.strip_prefix("node:")?;
                 let (n, w) = rest.split_once(':')?;
                 Some(LogSource::RemoteWorker {
@@ -88,6 +100,15 @@ impl LogSource {
                 })
             }
         }
+    }
+
+    /// Whether a line tagged `self` should pass a `?source=` filter of `filter`.
+    /// Exact match, plus one union rule: filter [`Worker`](LogSource::Worker)
+    /// matches every [`LocalWorker`](LogSource::LocalWorker) line, so the legacy
+    /// "worker" console shows all local workers' output interleaved.
+    pub fn matches_filter(self, filter: LogSource) -> bool {
+        self == filter
+            || (filter == LogSource::Worker && matches!(self, LogSource::LocalWorker { .. }))
     }
 }
 
@@ -131,8 +152,13 @@ pub struct LogBus {
     /// Serve-layer history ring (`(seq, text)`, oldest first). `parking_lot`
     /// mutex held only for push/read — never across `.await`.
     serve: Mutex<Ring>,
-    /// Worker-stderr history ring (`(seq, text)`, oldest first).
+    /// Worker-stderr history ring (`(seq, text)`, oldest first) — the legacy
+    /// UNKEYED ring, still fed by push sites without a worker id (transient probes).
     worker: Mutex<Ring>,
+    /// Per-LOCAL-worker stderr history rings, created on a worker's first line and
+    /// reclaimed by [`evict_local`](Self::evict_local) on unload/idle-reap so a dead
+    /// worker's ring doesn't leak. Each ring is independently `RING_CAP`-bounded.
+    local: Mutex<HashMap<WorkerId, Ring>>,
     /// Per-(node,worker) remote-stderr history rings, created on the first relayed
     /// line and reclaimed by [`evict_remote`](Self::evict_remote) on unload/kill/retire
     /// so a dead worker's ring doesn't leak. Each ring is independently `RING_CAP`-bounded.
@@ -163,6 +189,7 @@ impl LogBus {
         Self {
             serve: Mutex::new(VecDeque::with_capacity(RING_CAP)),
             worker: Mutex::new(VecDeque::with_capacity(RING_CAP)),
+            local: Mutex::new(HashMap::new()),
             remote: Mutex::new(HashMap::new()),
             seq: std::sync::atomic::AtomicU64::new(0),
             tx,
@@ -219,6 +246,12 @@ impl LogBus {
                 let mut ring = self.worker.lock();
                 push_ring(&mut ring, self.next_seq(), text.clone());
             }
+            LogSource::LocalWorker { worker } => {
+                let mut local = self.local.lock();
+                let seq = self.next_seq();
+                let ring = local.entry(worker).or_default();
+                push_ring(ring, seq, text.clone());
+            }
             LogSource::RemoteWorker { node, worker } => {
                 let mut remote = self.remote.lock();
                 let seq = self.next_seq();
@@ -234,6 +267,16 @@ impl LogBus {
     /// stamp and the ring insertion are atomic per ring (see [`push`](Self::push)).
     fn next_seq(&self) -> u64 {
         self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Reclaim a LOCAL worker's history ring (called when the worker leaves the node
+    /// registry: unload, kill, or idle-reap), so a dead worker's lines don't linger
+    /// forever. A no-op if it never logged. Called AFTER the worker's stop completes
+    /// (its stderr pipe is closed), so only a line already in flight in the async
+    /// relay chain can recreate a tiny ring — bounded at a few lines, accepted
+    /// rather than serializing eviction against the relay task.
+    pub fn evict_local(&self, worker: WorkerId) {
+        self.local.lock().remove(&worker);
     }
 
     /// Reclaim a remote worker's history ring (called on remote unload/kill), so a finished
@@ -252,9 +295,34 @@ impl LogBus {
     /// Up to `n` most-recent line texts (oldest first), restricted to one
     /// [`LogSource`] or, with `None`, the two rings re-interleaved by arrival.
     pub fn snapshot(&self, n: usize, filter: Option<LogSource>) -> Vec<String> {
+        /// Merge several rings' `(seq, text)` entries by seq and keep the last `n`.
+        fn merged<'a, I: Iterator<Item = &'a (u64, String)>>(iter: I, n: usize) -> Vec<String> {
+            let mut all: Vec<(u64, &str)> = iter.map(|(q, t)| (*q, t.as_str())).collect();
+            all.sort_by_key(|(q, _)| *q);
+            let skip = all.len().saturating_sub(n);
+            all.into_iter()
+                .skip(skip)
+                .map(|(_, t)| t.to_owned())
+                .collect()
+        }
         match filter {
             Some(LogSource::Serve) => last_n(&self.serve.lock(), n),
-            Some(LogSource::Worker) => last_n(&self.worker.lock(), n),
+            // `worker` is the UNION selector: the legacy unkeyed ring plus every
+            // local per-worker ring, re-interleaved by arrival (seq).
+            Some(LogSource::Worker) => {
+                let worker = self.worker.lock();
+                let local = self.local.lock();
+                merged(
+                    worker.iter().chain(local.values().flat_map(|r| r.iter())),
+                    n,
+                )
+            }
+            Some(LogSource::LocalWorker { worker }) => self
+                .local
+                .lock()
+                .get(&worker)
+                .map(|ring| last_n(ring, n))
+                .unwrap_or_default(),
             Some(LogSource::RemoteWorker { node, worker }) => self
                 .remote
                 .lock()
@@ -262,22 +330,19 @@ impl LogBus {
                 .map(|ring| last_n(ring, n))
                 .unwrap_or_default(),
             None => {
-                // Always lock in a consistent order (serve, worker, remote) — no deadlock.
+                // Always lock in a consistent order (serve, worker, local, remote) — no deadlock.
                 let serve = self.serve.lock();
                 let worker = self.worker.lock();
+                let local = self.local.lock();
                 let remote = self.remote.lock();
-                let mut all: Vec<(u64, &str)> = serve
-                    .iter()
-                    .chain(worker.iter())
-                    .chain(remote.values().flat_map(|r| r.iter()))
-                    .map(|(q, t)| (*q, t.as_str()))
-                    .collect();
-                all.sort_by_key(|(q, _)| *q);
-                let skip = all.len().saturating_sub(n);
-                all.into_iter()
-                    .skip(skip)
-                    .map(|(_, t)| t.to_owned())
-                    .collect()
+                merged(
+                    serve
+                        .iter()
+                        .chain(worker.iter())
+                        .chain(local.values().flat_map(|r| r.iter()))
+                        .chain(remote.values().flat_map(|r| r.iter())),
+                    n,
+                )
             }
         }
     }

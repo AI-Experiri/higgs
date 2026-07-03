@@ -87,8 +87,11 @@ pub enum HiggsError {
     /// A generation-time failure inside the engine: context creation, prompt decode,
     /// sampling, detokenize, or the decode loop. Usually transient (resource pressure)
     /// or a too-aggressive load — a reload with a smaller `ctx_len`/`gpu_layers` (less
-    /// VRAM/RAM pressure) is the lever; a persistent failure points at a corrupt GGUF.
-    #[snafu(display("[HG011] generation failed at {stage}: {reason} — retry; if it recurs, reload the model with a smaller ctx_len/gpu_layers (relieves VRAM/RAM pressure), or re-verify the GGUF is not corrupt"))]
+    /// VRAM/RAM pressure) is the lever; `create context` failures can also be a
+    /// rejected param combo (llama.cpp hard-fails a FORCED `flash_attn: on` when the
+    /// model has no FA kernel, and a quantized `type_v` KV cache REQUIRES flash
+    /// attention); a persistent failure points at a corrupt GGUF.
+    #[snafu(display("[HG011] generation failed at {stage}: {reason} — retry; if it recurs, reload with a smaller ctx_len/gpu_layers (relieves VRAM/RAM pressure); for `create context` also try flash_attn=auto/off and an F16 KV cache (a forced flash_attn fails on models without an FA kernel, and a quantized type_v REQUIRES flash attention); or re-verify the GGUF is not corrupt"))]
     #[diagnostic(code(HG011))]
     GenerationFailed { stage: String, reason: String },
 
@@ -479,6 +482,16 @@ pub enum HiggsError {
     ))]
     #[diagnostic(code(HG049))]
     InvalidRequest { detail: String },
+
+    /// The model's GGUF-embedded Jinja chat template failed to render over
+    /// this request (llama.cpp's `common_chat` template apply, via the
+    /// AI-Experiri llama-cpp-rs fork). Distinct from [HG011] so an agent can
+    /// tell "the prompt could not even be built" from an engine failure:
+    /// generation never started, and retrying the identical request will fail
+    /// identically.
+    #[snafu(display("[HG050] chat template render failed: {reason} — the request cannot build a prompt for this model; if the request carried `tools`, retry WITHOUT tools (the template may not support them); if it recurs on plain chat, the GGUF's embedded template is broken or uses unsupported Jinja — re-download the model or pick a different one"))]
+    #[diagnostic(code(HG050))]
+    TemplateRenderFailed { reason: String },
 }
 
 #[cfg(test)]

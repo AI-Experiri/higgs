@@ -12,8 +12,9 @@
 //!   - `gpu_layers: 0` (CPU-only offload branch),
 //!   - explicit `n_threads` + `n_threads_batch` split,
 //!   - `flash_attn` on AND off (the `with_flash_attention_policy` branch, both ways),
-//!   - a quantized KV cache (`type_k`/`type_v` = Q8_0, paired with flash_attn as
-//!     llama.cpp requires) — the `with_type_k`/`with_type_v` branches,
+//!   - a quantized KV cache (`type_k` = Q8_0; K-only + no FA — the one combo the
+//!     toy model supports, see the test doc) — the `with_type_k`/`with_type_v`
+//!     branches,
 //!   - `n_batch` + `n_ubatch` + `n_seq_max` + `swa_full` (context-param branches),
 //!   - `use_mmap`/`use_mlock` (model-param `with_use_mmap`/`with_use_mlock` branches),
 //!   - `rope_scaling_type` + `rope_freq_base`/`rope_freq_scale` (RoPE branches).
@@ -268,10 +269,17 @@ async fn load_flash_attn_on_then_off() {
     unload_all(&c, &srv.base).await;
 }
 
-/// A quantized KV cache: `type_k` = `type_v` = `Q8_0`, paired with `flash_attn: on`
-/// (llama.cpp requires flash attention for a non-F16 V cache). Drives the
-/// `with_type_k`/`with_type_v` + `kv_cache_to_llama` branches with a NON-default
-/// (quantized) cache type — the engine default is F16, which every other test uses.
+/// A quantized KV cache: `type_k` = `Q8_0` (with `type_v` = default F16 and
+/// `flash_attn: off`). Drives the `with_type_k`/`with_type_v` +
+/// `kv_cache_to_llama` branches with a NON-default (quantized) cache type —
+/// the engine default is F16, which every other test uses.
+///
+/// K-only, no FA, because of the llama.cpp shipped with llama-cpp-2 ≥ 0.1.150:
+/// a FORCED `flash_attn: on` now fails context creation when no FA kernel
+/// exists for the model's head size (the toy `stories260K` has none — the old
+/// engine silently fell back), and a quantized V cache requires FA — so
+/// K-quant-without-FA is the only quantized-KV combination the toy can serve.
+/// Real target models (head size 128) take Q8_0 K+V with FA fine.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn load_quantized_kv_cache() {
     let Some(gguf) = tiny_gguf_path() else {
@@ -281,17 +289,17 @@ async fn load_quantized_kv_cache() {
     let srv = spawn_with_tiny_model(12904, &gguf).await;
     let c = reqwest::Client::new();
 
-    // type_k/type_v are flat fields; flash_attn on satisfies the quantized-V
-    // requirement. KvCacheKind serializes as its variant name ("Q8_0").
+    // type_k/type_v are flat fields; KvCacheKind serializes as its variant
+    // name ("Q8_0").
     let (st, _) = load(
         &c,
         &srv.base,
         json!({
             "id": TINY_MODEL_ID,
             "ctx_len": 512,
-            "flash_attn": "on",
+            "flash_attn": "off",
             "type_k": "Q8_0",
-            "type_v": "Q8_0"
+            "type_v": "F16"
         }),
     )
     .await;

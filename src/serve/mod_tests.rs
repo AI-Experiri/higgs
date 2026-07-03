@@ -434,6 +434,12 @@ fn http_status_mapping_table() {
         StatusCode::BAD_REQUEST
     );
     assert_eq!(
+        http_status(&HiggsError::TemplateRenderFailed {
+            reason: "unknown filter".into(),
+        }),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
         http_status(&HiggsError::WorkerDead {
             context: "gone".into(),
         }),
@@ -547,6 +553,9 @@ fn worker_rpc_maps_by_worker_code() {
     assert_eq!(http_status(&rpc(Some("HG002"))), StatusCode::NOT_FOUND);
     assert_eq!(http_status(&rpc(Some("HG003"))), StatusCode::NOT_FOUND);
     assert_eq!(http_status(&rpc(Some("HG005"))), StatusCode::BAD_REQUEST);
+    // HG050: template render failed in the worker → client error (a changed
+    // request — e.g. dropping tools — may succeed; identical retry won't).
+    assert_eq!(http_status(&rpc(Some("HG050"))), StatusCode::BAD_REQUEST);
     assert_eq!(
         http_status(&rpc(Some("HG007"))),
         StatusCode::SERVICE_UNAVAILABLE

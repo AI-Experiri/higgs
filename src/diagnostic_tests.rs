@@ -238,6 +238,12 @@ fn subsystem_fault_codes_render_with_remediation() {
             },
             "[HG045]",
         ),
+        (
+            HiggsError::TemplateRenderFailed {
+                reason: "unknown filter foo".into(),
+            },
+            "[HG050]",
+        ),
     ];
     for (err, code) in cases {
         let s = err.to_string();

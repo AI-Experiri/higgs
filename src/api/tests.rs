@@ -689,8 +689,9 @@ async fn multi_model_both_served_and_reachable() {
 
 /// A served id whose worker is resident but cannot answer `M_STATUS` (busy mid-generation
 /// / briefly wedged) must still resolve to a LOADED stub — NOT `None`, which would mislead
-/// the serve gate into a not-loaded `[HG003]`. The stub carries a permissive `ctx_len`
-/// (`u32::MAX`) so the host prompt-fit gate can't reject a queued chat either.
+/// the serve gate into a not-loaded `[HG003]`. The stub's params come from the PERSISTED
+/// load record (what the worker was actually loaded with), so the prompt-fit gate sees the
+/// real context window even while the worker is unprobeable.
 #[tokio::test]
 async fn local_loaded_info_busy_worker_returns_permissive_stub() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -717,9 +718,9 @@ async fn local_loaded_info_busy_worker_returns_permissive_stub() {
         .await
         .expect("resident worker resolves despite a failing status probe");
     assert_eq!(info.id, "org/busy", "stub carries the served id");
-    assert_eq!(
-        info.ctx_len, None,
-        "busy-worker stub ctx_len is None (not probed) so the prompt-fit gate defers to HG005"
+    assert!(
+        info.ctx_len.is_some(),
+        "busy-worker stub ctx_len comes from the persisted load record (not a probe)"
     );
 
     // And an id that is NOT served still resolves to None (no false positive).

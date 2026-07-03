@@ -116,7 +116,11 @@ pub(crate) fn http_status(err: &HiggsError) -> StatusCode {
         // A model that isn't Prepared (or whose profile is stale) is a client
         // precondition failure — the caller must Prepare/Re-tune first.
         | HiggsError::NotPrepared { .. }
-        | HiggsError::ProfileStale { .. } => StatusCode::BAD_REQUEST,
+        | HiggsError::ProfileStale { .. }
+        // HG050: the prompt could not be BUILT for this request+model (e.g.
+        // the template rejects `tools`); an identical retry fails identically,
+        // but a changed request (drop tools) may succeed → client error.
+        | HiggsError::TemplateRenderFailed { .. } => StatusCode::BAD_REQUEST,
         // Capacity / infrastructure-down — retryable.
         HiggsError::WorkerSpawnFailed { .. }
         | HiggsError::WorkerDead { .. }
@@ -139,7 +143,9 @@ pub(crate) fn http_status(err: &HiggsError) -> StatusCode {
         // reaches the client as its true status instead of a generic 500.
         HiggsError::WorkerRpc { worker_code, .. } => match worker_code.as_deref() {
             Some("HG002") | Some("HG003") => StatusCode::NOT_FOUND,
-            Some("HG005") => StatusCode::BAD_REQUEST,
+            // HG050: template render failed in the worker — same client-error
+            // reasoning as the direct arm above.
+            Some("HG005") | Some("HG050") => StatusCode::BAD_REQUEST,
             // HG006/HG007: worker down. HG017: remote node couldn't fit the model.
             // HG018: the resolved model was swapped out by a concurrent JIT load
             // (transient) — the client should retry, which re-JITs the model.

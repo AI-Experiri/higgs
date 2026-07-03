@@ -2,7 +2,8 @@
 //! `POST /v1/chat/completions`.
 //!
 //! All bodies are `async-openai` wire types verbatim — nothing hand-rolled.
-//! `/v1/models` lists LOADED models only. Chat has JIT (just-in-time loading)
+//! `/v1/models` lists what chat can REACH: loaded models plus servable
+//! (JIT-loadable) catalog models. Chat has JIT (just-in-time loading)
 //! ON by default: a request for a scanned-but-unloaded model loads it on demand
 //! (swapping out any resident model — higgs serves one at a time) before
 //! serving; with JIT off, chat against an unloaded model is a 404. Errors render
@@ -272,8 +273,11 @@ fn chatcmpl_id() -> String {
     format!("chatcmpl-{}", uuid::Uuid::new_v4().simple())
 }
 
-/// `GET /v1/models` — LOADED models only: answers "what can serve chat right
-/// now", never the on-disk catalog (that is the control `models` route).
+/// `GET /v1/models` — answers "what can serve chat right now": every LOADED
+/// model plus every SERVABLE one (prepared + fits + serving on — JIT loads it
+/// on demand). Never the raw on-disk catalog (that is the control `models`
+/// route): unprepared/stale/oversized models are excluded because the JIT gate
+/// would refuse them.
 ///
 /// The local node may host several models at once (additive load); each resident
 /// instance is one served id (`org/model`, `org/model-1`, …). Nothing loaded
@@ -293,6 +297,20 @@ pub(super) async fn v1_models(State(higgs): State<Arc<Higgs>>) -> Response {
             owned_by: "higgs".to_owned(),
         })
         .collect();
+    // Advertise SERVABLE catalog models too: JIT is on by default, so a chat
+    // against a prepared-and-fitting unloaded model succeeds (higgs loads it on
+    // demand) — the list must match what chat can actually reach. Unservable /
+    // unprepared / stale-profile models stay hidden (the JIT gate refuses them).
+    for id in higgs.servable_model_ids().await {
+        if !data.iter().any(|m| m.id == id) {
+            data.push(Model {
+                id,
+                object: "model".to_owned(),
+                created: now_secs(),
+                owned_by: "higgs".to_owned(),
+            });
+        }
+    }
     // Also advertise remote-resident models — they are valid chat targets routed
     // through the fleet (skip any already listed by a local worker).
     if let Some(fleet) = higgs.fleet() {

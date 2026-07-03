@@ -1,0 +1,10 @@
+[
+  {
+    "function": {
+      "arguments": "{\"city\":\"Paris\"}",
+      "name": "get_weather"
+    },
+    "id": "call_goldenseed_0",
+    "type": "function"
+  }
+]

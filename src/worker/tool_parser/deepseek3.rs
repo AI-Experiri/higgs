@@ -87,18 +87,43 @@ impl ToolCallParser for DeepSeek3Parser {
     }
 }
 
-/// Parse one `NAME<｜tool▁sep｜>{args}` call body into an OpenAI tool-call object.
+/// Parse one call body into an OpenAI tool-call object — either DeepSeek
+/// dialect:
 ///
-/// The name is everything before the separator; the arguments are the raw JSON
-/// object after it. Only well-formed JSON object args are accepted (matching the
-/// Go parser, which `json.Unmarshal`s into a map and drops the call on error).
+/// - **V3**: `NAME<｜tool▁sep｜>{args}` — name before the separator, raw JSON
+///   object after it (the Ollama Go parser's format).
+/// - **R1**: `function<｜tool▁sep｜>NAME\n```json\n{args}\n````` — the literal
+///   word `function` (the call TYPE) before the separator, the name on the
+///   first line after it, and the arguments inside a ```json fence. This is
+///   what the R1-distill GGUF chat templates render, so it is what those
+///   models emit (caught by the fleet golden: the V3-only parser could not
+///   parse the R1 template's own output).
+///
+/// Only well-formed JSON object args are accepted (matching the Go parser,
+/// which `json.Unmarshal`s into a map and drops the call on error).
 fn parse_one(body: &str, id_seed: &str, index: usize) -> Option<Value> {
     let sep = body.find(TOOL_SEP)?;
-    let name = body[..sep].trim();
+    let before = body[..sep].trim();
+    let after = body[sep + TOOL_SEP.len()..].trim();
+    if before.is_empty() {
+        return None;
+    }
+
+    // R1 dialect: type before the sep, `NAME\n```json\n{args}\n``` ` after it.
+    let (name, args_raw) = if before == "function" {
+        let (name, rest) = after.split_once('\n')?;
+        let fenced = rest.trim();
+        let inner = fenced
+            .strip_prefix("```json")
+            .and_then(|s| s.strip_suffix("```"))?;
+        (name.trim(), inner.trim())
+    } else {
+        // V3 dialect: name before the sep, raw JSON object after it.
+        (before, after)
+    };
     if name.is_empty() {
         return None;
     }
-    let args_raw = body[sep + TOOL_SEP.len()..].trim();
 
     // Go unmarshals into ToolCallFunctionArguments (a JSON object) and drops the
     // call on any error, including an empty body; reject the call if the args are

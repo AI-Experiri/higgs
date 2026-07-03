@@ -145,55 +145,55 @@ higgs_ts! {
         // ── model params (LlamaModelParams) ──────────────────────────────────
         /// Context window (`with_n_ctx`). [`CtxLen::Auto`] = the engine's trained context
         /// (the old `ctx_len == 0` sentinel); [`CtxLen::Fixed`] pins an explicit window.
-        #[help = "context window size"]
+        #[help = "How many tokens of conversation the model can hold at once — prompt, chat history, and the reply all share this window. Larger windows let long chats and big documents fit without truncation, but the KV cache grows with it, costing more RAM/VRAM and slower prompt processing; Auto uses the model's trained maximum."]
         pub ctx_len: CtxLen,
         /// Layers offloaded to GPU (`with_n_gpu_layers`). [`GpuLayers::All`] = every layer
         /// (the old `u32::MAX` sentinel); [`GpuLayers::Count`] carries an explicit count.
-        #[help = "layers offloaded to GPU"]
+        #[help = "How many of the model's transformer layers run on the GPU instead of the CPU; All puts the entire model in VRAM for the fastest generation. Lower the count when the model doesn't fit in VRAM — each layer moved to the CPU frees GPU memory but slows inference, since CPU layers are much slower per token."]
         pub gpu_layers: GpuLayers,
         /// Worker threads used during generation (`with_n_threads`; also seeds
         /// `n_threads_batch` when that is unset).
         #[ts(type = "number")]
-        #[help = "generation threads"]
+        #[help = "Number of CPU threads used while generating tokens (and for prompt processing unless a separate batch-thread count is set). More threads speed up the CPU-bound parts up to roughly your physical core count; going beyond that adds scheduling overhead and can compete with other applications for CPU time."]
         pub threads: u32,
         /// Memory-map the GGUF instead of reading it into RAM (`with_use_mmap`).
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
-        #[help = "memory-map the model file"]
+        #[help = "Maps the GGUF file directly from disk instead of copying it into process memory, so loads are near-instant and the OS shares pages between processes. Disabling it forces a full read into RAM, which slows loading but avoids page-fault stalls on slow disks during the first pass through the weights."]
         pub use_mmap: Option<bool>,
         /// Lock model pages in RAM, preventing swap (`with_use_mlock`).
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
-        #[help = "lock model in RAM"]
+        #[help = "Pins the model's memory pages so the OS can never swap them out to disk, keeping generation latency steady under memory pressure. Only enable it when there's comfortably enough free RAM — locked pages are unavailable to every other application and can starve the rest of the system."]
         pub use_mlock: Option<bool>,
         /// Keep MoE expert tensors on the CPU (`add_cpu_moe_override`, pinned
         /// apply). Boolean only — no numeric `n_cpu_moe` binding exists. The
         /// suggester flips this on under VRAM pressure when RAM still fits.
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
-        #[help = "keep MoE experts on CPU"]
+        #[help = "For Mixture-of-Experts models, keeps the large expert tensors in system RAM while the attention layers stay on the GPU. This lets an MoE model far bigger than your VRAM still run GPU-accelerated, at the cost of slower expert lookups over the CPU-GPU bus; it does nothing for dense (non-MoE) models."]
         pub cpu_moe: Option<bool>,
         /// Per-tensor-buffer-type → CPU regex overrides (`add_cpu_buft_override`,
         /// pinned apply; advanced/manual). Drives finer MoE offload later. Always
         /// serialized (possibly `[]`) so the bindings' required-array shape is honest.
-        #[help = "CPU tensor-buffer overrides"]
+        #[help = "Advanced: regex patterns matching tensor names that should be kept in CPU memory rather than offloaded to the GPU. Useful for hand-tuning which weights occupy scarce VRAM (e.g. pinning select expert tensors), but a wrong pattern silently moves hot tensors to the CPU and degrades speed."]
         pub cpu_buft_overrides: Vec<String>,
         /// Multi-GPU split mode (`with_split_mode`). DEFERRED-derive; no-op default.
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
-        #[help = "multi-GPU split mode"]
+        #[help = "How the model is divided across multiple GPUs: by layer (each GPU owns whole layers) or by row (tensors are sharded across GPUs). Layer splitting is simpler and usually faster for generation; row splitting can balance very large models better but adds inter-GPU traffic. Irrelevant with a single GPU."]
         pub split_mode: Option<SplitMode>,
         /// Primary GPU index when `split_mode = None` (`with_main_gpu`). DEFERRED.
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(type = "number")]
         #[ts(optional)]
-        #[help = "primary GPU index"]
+        #[help = "Which GPU hosts the scratch buffers and small tensors when the model is not being split across devices. Change it to steer the load onto a specific card in a multi-GPU machine (e.g. keep the display GPU free); on single-GPU systems index 0 is the only valid choice."]
         pub main_gpu: Option<i32>,
         /// Explicit device selection (`with_devices`). DEFERRED (multi-GPU). Wire
         /// type is `u32` (ts-portable); the apply path converts to `usize`.
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
-        #[help = "explicit GPU devices"]
+        #[help = "Restricts the load to a specific set of GPUs instead of letting the engine use every visible device. Useful to reserve a card for other work or to avoid a slow GPU dragging down a multi-GPU split; listing a single device effectively pins the whole model to it."]
         pub devices: Option<Vec<u32>>,
         // ── context params (LlamaContextParams) ──────────────────────────────
         /// Logical batch size for prompt decode (`with_n_batch`). `None` keeps the
@@ -201,79 +201,79 @@ higgs_ts! {
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(type = "number")]
         #[ts(optional)]
-        #[help = "prompt batch size"]
+        #[help = "Maximum number of prompt tokens submitted to the engine in one logical batch during prefill. Larger batches process long prompts faster by amortizing per-call overhead, but need bigger compute buffers; the default covers the whole context in one pass."]
         pub n_batch: Option<u32>,
         /// Physical (micro) batch size (`with_n_ubatch`).
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(type = "number")]
         #[ts(optional)]
-        #[help = "physical micro-batch size"]
+        #[help = "The number of tokens actually computed simultaneously in one kernel launch — the logical batch is chopped into chunks of this size. Raising it improves prompt-processing throughput on strong GPUs; lowering it shrinks the compute-buffer memory footprint when VRAM is tight."]
         pub n_ubatch: Option<u32>,
         /// Parallel sequence slots (`with_n_seq_max`); default 1.
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(type = "number")]
         #[ts(optional)]
-        #[help = "parallel sequence slots"]
+        #[help = "How many independent sequences the context can serve at once (each gets its own slice of KV cache). Above 1 enables serving concurrent requests from one loaded model, but every extra slot multiplies KV-cache memory; leave at 1 for a single-user chat."]
         pub n_seq_max: Option<u32>,
         /// Threads for batch/prompt processing (`with_n_threads_batch`). `None`
         /// reuses `threads` (today's shared behavior).
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(type = "number")]
         #[ts(optional)]
-        #[help = "prompt-processing threads"]
+        #[help = "CPU threads used only for the batch/prefill phase, separate from the generation-thread count. Prefill parallelizes better than generation, so it can profitably use more threads; unset, it simply reuses the generation thread count."]
         pub n_threads_batch: Option<u32>,
         /// Flash-attention policy (`with_flash_attention_policy`).
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
-        #[help = "flash-attention policy"]
+        #[help = "Whether to use the fused flash-attention kernel, which computes attention with far less memory traffic — typically faster and lighter on VRAM for long contexts. Forcing it on fails on backends without the kernel, and quantized KV-cache types require it; Auto lets the engine decide per device."]
         pub flash_attn: Option<FlashAttn>,
         /// Offload the KV cache & KQV ops to the GPU (`with_offload_kqv`).
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
-        #[help = "KV cache on GPU"]
+        #[help = "Keeps the KV cache and the attention (KQV) computation on the GPU rather than in system RAM. On = faster attention at the cost of VRAM that grows with context length; off frees that VRAM for model layers but every generated token pays a slow CPU attention pass."]
         pub offload_kqv: Option<bool>,
         /// Full sliding-window attention (`with_swa_full`).
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
-        #[help = "full sliding-window attention"]
+        #[help = "For models trained with sliding-window attention (e.g. Gemma), allocates the full KV cache instead of only the window. This enables correct cache reuse for prompts longer than the window (faster re-prompting), but costs the same KV memory as a non-windowed model of equal context."]
         pub swa_full: Option<bool>,
         /// KV cache key data type (`with_type_k`).
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
-        #[help = "KV key cache type"]
+        #[help = "Data type used to store the attention keys, normally f16. Quantized types (q8_0, q4_0) shrink the KV cache substantially — letting much longer contexts fit in memory — at a small accuracy cost, and they require flash attention to be available."]
         pub type_k: Option<KvCacheKind>,
         /// KV cache value data type (`with_type_v`).
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
-        #[help = "KV value cache type"]
+        #[help = "Data type used to store the attention values, normally f16. Quantizing values compounds the memory savings of a quantized key cache for long contexts, but is the more accuracy-sensitive half — prefer quantizing keys first, and note quantized types require flash attention."]
         pub type_v: Option<KvCacheKind>,
         /// RoPE scaling type (`with_rope_scaling_type`).
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
-        #[help = "RoPE scaling mode"]
+        #[help = "Strategy (linear or YaRN) for stretching the model's rotary position embeddings so it can attend beyond its trained context length. Needed only when forcing a context larger than the model was trained for; the wrong mode for a given model degrades long-range coherence."]
         pub rope_scaling_type: Option<RopeScalingType>,
         /// RoPE base frequency override (`with_rope_freq_base`).
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(type = "number")]
         #[ts(optional)]
-        #[help = "RoPE base frequency"]
+        #[help = "Overrides the base frequency of the rotary position embedding, the constant that sets how position information rotates through the dimensions. Some fine-tunes ship a non-standard base to reach longer contexts; setting it incorrectly scrambles positional understanding, so only override when the model card says to."]
         pub rope_freq_base: Option<f32>,
         /// RoPE frequency scale / context extension (`with_rope_freq_scale`).
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(type = "number")]
         #[ts(optional)]
-        #[help = "RoPE frequency scale"]
+        #[help = "Linear scale factor applied to RoPE positions — 0.5 makes the model treat a 2x-trained-length context as if it were in range. A quick way to extend context without YaRN, but coherence degrades as the factor shrinks; leave unset to respect the trained length."]
         pub rope_freq_scale: Option<f32>,
         /// GGUF metadata overrides (`append_kv_override`, pinned apply; advanced).
         /// Always serialized (possibly `[]`) — honest required-array binding.
-        #[help = "GGUF metadata overrides"]
+        #[help = "Advanced: key=value overrides applied on top of the GGUF file's own metadata at load time, e.g. to correct a wrong architecture field or force an experimental setting. These change how the engine interprets the model, so a bad override can make a working model fail to load or produce garbage."]
         pub kv_overrides: Vec<KvOverride>,
         /// Load-pinned sampler RNG seed. `None` = a fresh random seed per request.
         /// A per-request `LlamaCppSamplingParams::seed` overrides this when set.
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(type = "number")]
         #[ts(optional)]
-        #[help = "sampler RNG seed"]
+        #[help = "Fixes the random seed used by the samplers for every request served by this load, making generations reproducible for testing and comparisons. Unset, each request draws a fresh seed for natural variety; a per-request seed in the sampling parameters still overrides this value."]
         pub seed: Option<u32>,
     }
 }

@@ -20,6 +20,7 @@ mod deepseek3;
 mod function_gemma;
 mod gemma4;
 mod glm_xml;
+mod llama_json;
 mod mistral_bracket;
 mod qwen_json;
 mod stream_filter;
@@ -31,6 +32,7 @@ pub use deepseek3::DeepSeek3Parser;
 pub use function_gemma::FunctionGemmaParser;
 pub use gemma4::Gemma4Parser;
 pub use glm_xml::GlmXmlParser;
+pub use llama_json::LlamaJsonParser;
 pub use mistral_bracket::MistralBracketParser;
 pub use qwen_json::QwenJsonParser;
 pub use stream_filter::ToolCallStreamFilter;
@@ -151,7 +153,8 @@ impl ToolParserRegistry {
                 Box::new(MistralBracketParser), // [TOOL_CALLS] … [ARGS]
                 Box::new(Gemma4Parser),      // <|tool_call> … <tool_call|>
                 Box::new(FunctionGemmaParser), // <start_function_call> … <end_function_call>
-                Box::new(QwenJsonParser),    // <tool_call>{json} — generic, last
+                Box::new(LlamaJsonParser), // <|python_tag|> / bare {"name","parameters"} (Llama-3)
+                Box::new(QwenJsonParser),  // <tool_call>{json} — generic, last
             ],
         }
     }

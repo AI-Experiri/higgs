@@ -64,11 +64,17 @@ miette = "7"
 tracing = "0.1"
 parking_lot = "0.12"
 ts-rs = { version = "12", features = ["serde-compat", "serde-json-impl"] }
-llama-cpp-2 = "0.1"
+# AI-Experiri FORK of llama-cpp-rs: upstream 0.1.147 removed the OpenAI-compat
+# chat API (template apply + tool-call/reasoning parse over llama.cpp's
+# common/chat.cpp); the fork restores it — see the fork's README.fork.md for
+# the update-from-upstream playbook. Pinned to a rev on the
+# `higgs-restore-oaicompat` branch; bump by merging upstream in the fork,
+# pushing, and updating this rev.
+llama-cpp-2 = { git = "https://github.com/AI-Experiri/llama-cpp-rs.git", rev = "fab021552fabeb464a34aaa8ac229071bd5eecf7" }
 # Raw FFI for the engine version string — the safe `llama-cpp-2` crate wraps
-# neither `ggml_version()` nor `llama_print_system_info()`. Pinned to match the
-# `llama-cpp-2` resolution so both link the same vendored llama.cpp.
-llama-cpp-sys-2 = "0.1"
+# neither `ggml_version()` nor `llama_print_system_info()`. Same fork rev so
+# both link the same vendored llama.cpp.
+llama-cpp-sys-2 = { git = "https://github.com/AI-Experiri/llama-cpp-rs.git", rev = "fab021552fabeb464a34aaa8ac229071bd5eecf7" }
 # token_to_piece (the crate's non-deprecated detokenizer) takes &mut encoding_rs::Decoder
 encoding_rs = "0.8"
 # Header-only GGUF metadata reading (memory-maps the file; weights are never loaded)

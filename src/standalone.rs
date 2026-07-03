@@ -27,7 +27,7 @@ pub struct StandaloneConfig {
     /// Bind host (e.g. `127.0.0.1`, `0.0.0.0`). A non-loopback value triggers a
     /// security warning (no-auth surface beyond localhost).
     pub bind: String,
-    /// Listen port (e.g. `11434`).
+    /// Listen port (default [`crate::DEFAULT_PORT`], 31415).
     pub port: u16,
     /// Runtime config for the [`Higgs`] facade (scan dirs, default load params).
     pub higgs: HiggsConfig,
@@ -111,7 +111,19 @@ pub async fn run_standalone(
 
     higgs.start().await?;
 
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    // A bind failure is almost always "port already in use" (another higgs /
+    // another app) or an address this machine doesn't own — say so, with the
+    // exact knobs to fix it, instead of a bare os error. This is the message an
+    // operator sees when standing higgs up on a fresh/remote machine.
+    let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
+        format!(
+            "cannot listen on {addr}: {e}
+               → the port may already be in use — pick another with HIGGS_PORT=<port>
+               → to serve other machines on the network, bind with HIGGS_BIND=0.0.0.0
+               → current defaults: HIGGS_BIND=127.0.0.1 HIGGS_PORT={default}",
+            default = crate::DEFAULT_PORT
+        )
+    })?;
 
     tracing::info!(%addr, "higgs listening — /v1 (OpenAI) + /api/higgs (control)");
     // Graceful shutdown on SIGTERM/Ctrl-C: drain requests, then stop the worker.

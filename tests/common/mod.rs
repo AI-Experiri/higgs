@@ -139,6 +139,89 @@ pub async fn prepare_tiny(base: &str) {
     );
 }
 
+/// The chat-template/parser test fleet: REAL small instruct models (downloaded
+/// from HF via `scripts/fetch_test_fleet.sh`, test-only — never under the live
+/// app's scan root). The dir is an LM-Studio layout
+/// (`<root>/{org}/{model}/*.gguf`) so both `ModelStore::scan` and a spawned
+/// server catalog it directly. Override with `HIGGS_TEST_FLEET`.
+///
+/// Default matches the fetch script: `$HOME/.cache/higgs-test-models` (higgs
+/// targets Unix/macOS only, so `HOME` is always set).
+fn default_fleet_dir() -> PathBuf {
+    PathBuf::from(std::env::var("HOME").expect("HOME set on Unix/macOS"))
+        .join(".cache/higgs-test-models")
+}
+
+/// `(fixture slug, catalog id, gguf file name)` for each fleet model.
+pub const FLEET: [(&str, &str, &str); 4] = [
+    ("qwen3-0.6b", "qwen/Qwen3-0.6B", "Qwen3-0.6B-Q8_0.gguf"),
+    (
+        "gemma-3-1b-it",
+        "google/gemma-3-1b-it",
+        "gemma-3-1b-it-Q4_K_M.gguf",
+    ),
+    (
+        "llama-3.2-1b",
+        "meta-llama/Llama-3.2-1B-Instruct",
+        "Llama-3.2-1B-Instruct-Q4_0.gguf",
+    ),
+    (
+        "deepseek-r1-1.5b",
+        "deepseek/DeepSeek-R1-Distill-Qwen-1.5B",
+        "DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf",
+    ),
+];
+
+/// Resolve the fleet scan root: `HIGGS_TEST_FLEET` if set, else the default
+/// cache dir. Returns `None` (so the test SKIPs) unless EVERY fleet GGUF is
+/// present — a partial fleet would make per-model tests pass/fail by accident
+/// of which download finished.
+pub fn fleet_dir() -> Option<PathBuf> {
+    let root = std::env::var("HIGGS_TEST_FLEET")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| default_fleet_dir());
+    FLEET
+        .iter()
+        .all(|(_, id, file)| root.join(id).join(file).is_file())
+        .then_some(root)
+}
+
+/// Spawn `higgs` with `HIGGS_MODEL_DIR` pointed at an EXISTING scan root (the
+/// fleet dir) instead of a staged temp copy — the fleet GGUFs are hundreds of
+/// MB each, so copying them per test is not viable. The isolated `HIGGS_HOME`
+/// still applies.
+#[allow(clippy::zombie_processes)]
+pub async fn spawn_with_model_root(port: u16, root: &Path) -> ServerGuard {
+    // Dummy staging dir: ServerGuard owns TempDirs for lifetime symmetry.
+    let staged = TempDir::new().expect("create dummy staging dir");
+    let home = TempDir::new().expect("create temp HIGGS_HOME");
+    let child = Command::new(env!("CARGO_BIN_EXE_higgs"))
+        .env("HIGGS_BIND", "127.0.0.1")
+        .env("HIGGS_PORT", port.to_string())
+        .env("HIGGS_MODEL_DIR", root)
+        .env("HIGGS_HOME", home.path())
+        .env("HIGGS_HF_ENDPOINT", "http://127.0.0.1:1")
+        .env("RUST_LOG", "warn")
+        .spawn()
+        .expect("spawn higgs");
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    for _ in 0..150 {
+        if let Ok(r) = client.get(format!("{base}/api/higgs/status")).send().await {
+            if r.status().is_success() {
+                return ServerGuard {
+                    child,
+                    base,
+                    _model_dir: staged,
+                    _home: home,
+                };
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    panic!("higgs never became ready on {base}");
+}
+
 /// Like [`spawn_with_tiny_model`] but stages one model per id in `ids` (each loadable under that
 /// id), for multi-model / multi-worker tests.
 #[allow(clippy::zombie_processes)]

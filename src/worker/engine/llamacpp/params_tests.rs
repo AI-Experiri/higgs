@@ -219,13 +219,26 @@ fn sampling_params_lean_round_trip() {
 fn param_help_covers_every_field() {
     use std::collections::HashMap;
     let help: HashMap<&str, &str> = LlamaCppParams::PARAM_HELP.iter().copied().collect();
-    // Spot-check the base fields + a few advanced ones.
-    assert_eq!(help.get("ctx_len"), Some(&"context window size"));
-    assert_eq!(help.get("gpu_layers"), Some(&"layers offloaded to GPU"));
-    assert_eq!(help.get("threads"), Some(&"generation threads"));
-    assert_eq!(help.get("flash_attn"), Some(&"flash-attention policy"));
-    assert_eq!(help.get("type_k"), Some(&"KV key cache type"));
-    assert_eq!(help.get("seed"), Some(&"sampler RNG seed"));
-    // Every field is annotated — keep this in lockstep with the struct.
+    // Every help text is a REAL description: at least two sentences (mechanism +
+    // trade-off), never a restatement of the field label.
+    for (field, text) in LlamaCppParams::PARAM_HELP {
+        let sentences = text.matches(". ").count() + usize::from(text.trim_end().ends_with('.'));
+        assert!(
+            sentences >= 2,
+            "help for `{field}` must be at least two sentences, got: {text:?}"
+        );
+        assert!(
+            text.len() >= 80,
+            "help for `{field}` is too short to be a description: {text:?}"
+        );
+    }
+    // Spot-check the base fields carry substance (mechanism keywords).
+    assert!(help["ctx_len"].contains("tokens"), "{}", help["ctx_len"]);
+    assert!(
+        help["gpu_layers"].contains("VRAM"),
+        "{}",
+        help["gpu_layers"]
+    );
+    assert!(help["threads"].contains("CPU"), "{}", help["threads"]);
     assert_eq!(LlamaCppParams::PARAM_HELP.len(), 24);
 }

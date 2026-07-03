@@ -16,7 +16,7 @@
 //!
 //! Configuration (env):
 //!   HIGGS_BIND        bind address  (default `127.0.0.1` — localhost only)
-//!   HIGGS_PORT        listen port   (default `11434`)
+//!   HIGGS_PORT        listen port   (default `31415`)
 //!   HIGGS_MODEL_DIR   extra model scan root in LM-Studio layout
 //!                     (`<dir>/{org}/{model}/*.gguf`), appended to the default
 //!                     scan dirs. Lets an operator (or CI) point higgs at an
@@ -24,7 +24,7 @@
 //!   RUST_LOG          tracing filter (default `info`)
 //!
 //! ```text
-//! higgs                       # 127.0.0.1:11434
+//! higgs                       # 127.0.0.1:31415
 //! HIGGS_BIND=0.0.0.0 HIGGS_PORT=1234 higgs   # LAN-reachable on :1234
 //! ```
 
@@ -87,18 +87,18 @@ fn main() {
     let bind = std::env::var("HIGGS_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
     // Parse HIGGS_PORT; an unset var is silently the default, but a SET-but-bad
     // value (non-numeric, out of u16 range) is a misconfiguration the operator
-    // must see — warn naming the bad value and the fallback before using 11434.
+    // must see — warn naming the bad value and the fallback before using the default.
     let port: u16 = match std::env::var("HIGGS_PORT") {
         Ok(raw) => raw.parse().unwrap_or_else(|e| {
             tracing::warn!(
                 value = %raw,
                 error = %e,
-                fallback = 11434,
-                "HIGGS_PORT is not a valid port — falling back to 11434"
+                fallback = higgs::DEFAULT_PORT,
+                "HIGGS_PORT is not a valid port — falling back to the default"
             );
-            11434
+            higgs::DEFAULT_PORT
         }),
-        Err(_) => 11434,
+        Err(_) => higgs::DEFAULT_PORT,
     };
 
     let rt = tokio::runtime::Builder::new_multi_thread()

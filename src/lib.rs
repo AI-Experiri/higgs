@@ -52,5 +52,13 @@ pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 /// (`ggml_version()`). The binding crate exposes no runtime version constant of
 /// its own, so it is baked from the lock file as a compile-time const. Single
 /// home — both the `/api/higgs/version` and `/api/higgs/system` responses read
-/// the `binding` field from here.
-pub(crate) const LLAMA_CPP_2_VERSION: &str = "0.1.139";
+/// the `binding` field from here. The crate resolves from the AI-Experiri
+/// fork (restored OpenAI-compat chat API — see Cargo.toml), which keeps
+/// upstream's version number.
+/// Default listen port for the standalone `higgs` binary (and the documented
+/// default for external clients): 31415 (pi). Chosen to be memorable and to
+/// NOT collide with well-known local-LLM ports (ollama's 11434, LM Studio's
+/// 1234). Override with `HIGGS_PORT`.
+pub const DEFAULT_PORT: u16 = 31415;
+
+pub(crate) const LLAMA_CPP_2_VERSION: &str = "0.1.151";

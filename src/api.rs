@@ -617,7 +617,9 @@ impl Higgs {
         tokio::spawn(async move {
             loop {
                 match logs.recv().await {
-                    Ok((_worker, line)) => bus.push(LogSource::Worker, line),
+                    // Keyed per worker so each loaded model gets its own log console;
+                    // the legacy `?source=worker` filter still matches these (union).
+                    Ok((worker, line)) => bus.push(LogSource::LocalWorker { worker }, line),
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
@@ -1120,6 +1122,9 @@ impl Higgs {
             i
         });
 
+        // Persisted load records, read ONCE per status pass — the stub's fallback
+        // for ctx/gpu/threads on workers that aren't live-probed.
+        let records = self.model_records();
         let mut loaded_all = Vec::with_capacity(instances.len());
         for (worker, raw) in &instances {
             let served_id = worker_to_served.get(worker).cloned().unwrap_or(raw.clone());
@@ -1133,9 +1138,11 @@ impl Higgs {
                         i.worker_id = worker.0;
                         i
                     })
-                    .unwrap_or_else(|| self.loaded_info_stub(served_id, worker.0, raw, &scan))
+                    .unwrap_or_else(|| {
+                        self.loaded_info_stub(served_id, worker.0, raw, &scan, &records)
+                    })
             } else {
-                self.loaded_info_stub(served_id, worker.0, raw, &scan)
+                self.loaded_info_stub(served_id, worker.0, raw, &scan, &records)
             };
             loaded_all.push(info);
         }
@@ -1150,9 +1157,11 @@ impl Higgs {
     }
 
     /// A [`LoadedInfo`] built WITHOUT a worker RPC: `id`/`worker_id` + host-side scan metadata
-    /// (`arch`/`quant`/`size_bytes`/`max_context_length`). The live load params
-    /// (`ctx_len`/`gpu_layers`/`threads`) default to `0` — [`status`](Self::status) enriches them
-    /// from a bounded probe when the worker answers in time. Lets EVERY resident worker appear in
+    /// (`arch`/`quant`/`size_bytes`/`max_context_length`). The load params
+    /// (`ctx_len`/`gpu_layers`/`threads`) are filled from the model's PERSISTED load record
+    /// (what it was last successfully loaded with — which is what the resident worker runs),
+    /// `None` if no record survives; [`status`](Self::status) still overrides with a bounded
+    /// live probe when the worker answers in time. Lets EVERY resident worker appear in
     /// `loaded_all` even while its worker is busy generating (and so can't answer `M_STATUS`).
     fn loaded_info_stub(
         &self,
@@ -1160,15 +1169,40 @@ impl Higgs {
         worker_id: u32,
         raw_model: &str,
         scan: &[HiggsModel],
+        records: &std::collections::BTreeMap<String, crate::config::ModelRecord>,
     ) -> LoadedInfo {
         let scanned = scan.iter().find(|m| m.id == raw_model);
+        // Live params aren't probed (no worker RPC) — fall back to the persisted
+        // load record: what this model was last successfully loaded with, which is
+        // exactly what the resident worker is running (a successful load always
+        // records). Last-known from the record, not a live probe.
+        let (ctx_len, gpu_layers, threads) = match records
+            .get(raw_model)
+            .and_then(|r| r.load.as_ref())
+        {
+            Some(LoadParams::LlamaCpp(p)) => {
+                // A recorded `Auto` was resolved BY THE NODE at load time to the trained
+                // context capped at DEFAULT_CTX_CAP (runtime.rs `load_worker`) — mirror
+                // that resolution so the reported window is the real one, not the
+                // unresolved sentinel. No trained context known → `None` (unknown).
+                let ctx = match p.ctx_len {
+                    crate::worker::engine::CtxLen::Auto => {
+                        scanned.and_then(|m| m.ctx_train).map(|t| {
+                            crate::worker::engine::CtxLen::fixed((t as u32).min(DEFAULT_CTX_CAP))
+                        })
+                    }
+                    fixed => Some(fixed),
+                };
+                (ctx, Some(p.gpu_layers), Some(p.threads))
+            }
+            None => (None, None, None),
+        };
         LoadedInfo {
             id: served_id,
             worker_id,
-            // Host-built without a worker RPC: the LIVE params are unknown (not probed).
-            ctx_len: None,
-            gpu_layers: None,
-            threads: None,
+            ctx_len,
+            gpu_layers,
+            threads,
             arch: scanned.and_then(|m| m.arch.clone()),
             quant: scanned.and_then(|m| m.quant.clone()),
             max_context_length: scanned.and_then(|m| m.ctx_train),
@@ -1461,11 +1495,19 @@ impl Higgs {
                 Some(info)
             }
             Err(_) => {
-                // Resident but the status probe failed (busy mid-generation): the stub's live
-                // params are `None` (not probed), which the host prompt-fit gate treats as
-                // permissive — the chat QUEUES behind the generation and the worker's [HG005]
-                // stays authoritative. `None` replaces the old `ctx_len = u32::MAX` sentinel.
-                Some(self.loaded_info_stub(served.to_owned(), worker.0, &raw, &scan))
+                // Resident but the status probe failed (busy mid-generation): the stub's
+                // params come from the PERSISTED load record (what the worker was actually
+                // loaded with), so the prompt-fit gate sees the real context window; with
+                // no surviving record they're `None`, which the gate treats as permissive —
+                // the chat QUEUES behind the generation and the worker's [HG005] stays
+                // authoritative. `None` replaced the old `ctx_len = u32::MAX` sentinel.
+                Some(self.loaded_info_stub(
+                    served.to_owned(),
+                    worker.0,
+                    &raw,
+                    &scan,
+                    &self.model_records(),
+                ))
             }
         }
     }
@@ -1700,6 +1742,37 @@ impl Higgs {
 
     /// Live readiness for one scanned model on this node. Gathers profile
     /// presence + staleness + residency + serving, and evaluates the (heavier)
+    /// Catalog models that are SERVABLE right now — prepared (fresh profile),
+    /// fits free resources, serving on, not already resident. These are valid
+    /// JIT chat targets, so `/v1/models` advertises them alongside resident
+    /// models (an OpenAI client may pick any listed id and chat will serve it).
+    /// Best-effort: any scan/store/hardware failure yields an empty list rather
+    /// than failing the listing (resident models are still returned by the caller).
+    pub async fn servable_model_ids(&self) -> Vec<String> {
+        let Ok(models) = self.scan().await else {
+            return Vec::new();
+        };
+        let Ok(tuning) = self.tuning_records() else {
+            return Vec::new();
+        };
+        let loaded_set: Vec<String> = self
+            .local
+            .instances()
+            .await
+            .into_iter()
+            .map(|(_, m)| m)
+            .collect();
+        let hw = self.hardware().await;
+        models
+            .into_iter()
+            .filter(|m| {
+                let (readiness, _) = self.model_readiness(m, &loaded_set, &hw, &tuning);
+                readiness == crate::serve::readiness::ModelReadiness::Servable
+            })
+            .map(|m| m.id)
+            .collect()
+    }
+
     /// resource fit ONLY when the derived state would depend on it — a profiled,
     /// fresh, non-resident model with serving on. See [`crate::serve::readiness`].
     /// Sync + cheap per row: it reuses the caller's `hw` snapshot and the

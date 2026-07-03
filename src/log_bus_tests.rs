@@ -429,3 +429,89 @@ fn timestamp_has_expected_shape() {
     assert_eq!(&ts[10..11], " ");
     assert_eq!(&ts[13..14], ":");
 }
+
+#[test]
+fn parses_local_worker_source_selector() {
+    assert_eq!(
+        LogSource::parse("worker:3"),
+        Some(LogSource::LocalWorker {
+            worker: WorkerId(3)
+        })
+    );
+    assert_eq!(LogSource::parse("worker:"), None);
+    assert_eq!(LogSource::parse("worker:x"), None);
+    // The bare legacy selector still parses to the union filter.
+    assert_eq!(LogSource::parse("worker"), Some(LogSource::Worker));
+}
+
+#[test]
+fn worker_filter_is_a_union_over_local_workers() {
+    let lw = LogSource::LocalWorker {
+        worker: WorkerId(1),
+    };
+    assert!(lw.matches_filter(LogSource::Worker), "union rule");
+    assert!(lw.matches_filter(lw), "exact match");
+    assert!(!lw.matches_filter(LogSource::LocalWorker {
+        worker: WorkerId(2)
+    }));
+    assert!(!lw.matches_filter(LogSource::Serve));
+    // The union rule is one-directional: a legacy unkeyed line does NOT match
+    // a per-worker filter.
+    assert!(!LogSource::Worker.matches_filter(lw));
+}
+
+#[test]
+fn local_worker_lines_are_keyed_and_separable() {
+    let bus = LogBus::new();
+    let w1 = LogSource::LocalWorker {
+        worker: WorkerId(1),
+    };
+    let w2 = LogSource::LocalWorker {
+        worker: WorkerId(2),
+    };
+    bus.push(w1, "one-a".into());
+    bus.push(w2, "two-a".into());
+    bus.push(w1, "one-b".into());
+    assert_eq!(bus.snapshot(10, Some(w1)), vec!["one-a", "one-b"]);
+    assert_eq!(bus.snapshot(10, Some(w2)), vec!["two-a"]);
+}
+
+#[test]
+fn worker_snapshot_unions_legacy_and_local_rings_in_arrival_order() {
+    let bus = LogBus::new();
+    bus.push(LogSource::Worker, "legacy".into());
+    bus.push(
+        LogSource::LocalWorker {
+            worker: WorkerId(1),
+        },
+        "w1".into(),
+    );
+    bus.push(
+        LogSource::LocalWorker {
+            worker: WorkerId(2),
+        },
+        "w2".into(),
+    );
+    bus.push(LogSource::Serve, "serve".into());
+    assert_eq!(
+        bus.snapshot(10, Some(LogSource::Worker)),
+        vec!["legacy", "w1", "w2"],
+        "union of the legacy ring and every local worker ring, no serve lines"
+    );
+    // The unfiltered snapshot interleaves all four ring kinds by arrival.
+    assert_eq!(bus.snapshot(10, None), vec!["legacy", "w1", "w2", "serve"]);
+}
+
+#[test]
+fn evict_local_reclaims_a_dead_workers_ring() {
+    let bus = LogBus::new();
+    let w = LogSource::LocalWorker {
+        worker: WorkerId(7),
+    };
+    bus.push(w, "line".into());
+    assert_eq!(bus.snapshot(10, Some(w)).len(), 1);
+    bus.evict_local(WorkerId(7));
+    assert!(bus.snapshot(10, Some(w)).is_empty());
+    // Idempotent on a never-logged / already-evicted worker.
+    bus.evict_local(WorkerId(7));
+}

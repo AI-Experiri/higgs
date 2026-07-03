@@ -375,7 +375,7 @@ impl Actor for NodeActor {
                         if self.shutting_down {
                             // Shutdown started while this load was in flight — reap the worker
                             // (tracked, so shutdown_all awaits it) and refuse the load.
-                            self.reap(sup, None);
+                            self.reap(id, sup, None);
                             let _ = reply.send(Err(shutting_down()));
                         } else {
                             // Deliver the result FIRST, then commit only if the caller is
@@ -393,7 +393,7 @@ impl Actor for NodeActor {
                                     self.last_activity.insert(id, Instant::now());
                                     self.emit(HiggsEvent::ModelLoaded { id: model });
                                 }
-                                Err(_) => self.reap(sup, None),
+                                Err(_) => self.reap(id, sup, None),
                             }
                         }
                     }
@@ -401,7 +401,7 @@ impl Actor for NodeActor {
                         // Reserved id is a harmless gap. A worker spawned before the failure is
                         // reaped (tracked), so a racing shutdown_all still awaits its stop.
                         if let Some(sup) = sup {
-                            self.reap(sup, None);
+                            self.reap(id, sup, None);
                         }
                         let _ = reply.send(Err(error));
                     }
@@ -419,7 +419,7 @@ impl Actor for NodeActor {
                     Some(sup) => {
                         let model = sup.loaded_model_id().unwrap_or_default();
                         self.forget_activity(id);
-                        self.reap(sup, Some(reply));
+                        self.reap(id, sup, Some(reply));
                         self.emit(HiggsEvent::ModelUnloaded { id: model });
                     }
                     None => {
@@ -515,7 +515,7 @@ impl Actor for NodeActor {
                         if let Some(sup) = self.registry.remove(id) {
                             let model = sup.loaded_model_id().unwrap_or_default();
                             self.forget_activity(id);
-                            self.reap(sup, None);
+                            self.reap(id, sup, None);
                             self.emit(HiggsEvent::ModelUnloaded { id: model });
                         }
                     }
@@ -557,8 +557,8 @@ impl Actor for NodeActor {
                 // AND `inflight_stops` both reach 0 — i.e. every load resolved and every stop
                 // (these + any racing unload/kill + late in-flight loads) has finished.
                 self.shutting_down = true;
-                for sup in self.drain() {
-                    self.reap(sup, None);
+                for (id, sup) in self.drain() {
+                    self.reap(id, sup, None);
                 }
                 self.maybe_finish_shutdown(); // handle the no-workers / nothing-in-flight case
             }
@@ -581,20 +581,21 @@ impl Actor for NodeActor {
         // its own `sup.stop()` to completion; this is the best-effort drop path. The awaited
         // guarantee is `shutdown_all`, which the daemon uses.)
         self.shutting_down = true;
-        for sup in self.drain() {
+        for (id, sup) in self.drain() {
             sup.stop().await;
+            self.config.bus.evict_local(id);
         }
     }
 }
 
 impl NodeActor {
     /// Remove every resident worker from the registry, returning them for teardown.
-    fn drain(&mut self) -> Vec<Arc<Supervisor>> {
+    fn drain(&mut self) -> Vec<(WorkerId, Arc<Supervisor>)> {
         let out = self
             .registry
             .ids()
             .into_iter()
-            .filter_map(|id| self.registry.remove(id))
+            .filter_map(|id| self.registry.remove(id).map(|sup| (id, sup)))
             .collect();
         self.last_activity.clear();
         self.in_flight.clear();
@@ -602,6 +603,9 @@ impl NodeActor {
     }
 
     /// Drop a worker's idle bookkeeping (called whenever it leaves the registry).
+    /// Its per-worker log ring is reclaimed by [`reap`](Self::reap) AFTER the stop
+    /// completes, not here (evicting before the stop would let shutdown stderr
+    /// recreate the ring).
     fn forget_activity(&mut self, id: WorkerId) {
         self.last_activity.remove(&id);
         self.in_flight.remove(&id);
@@ -611,16 +615,26 @@ impl NodeActor {
     /// can wait for all of them: bumps `inflight_stops`, runs `sup.stop()` off-thread, then
     /// posts `ReapDone` to decrement and (optionally) answer the op's caller. `done` carries
     /// the `unload`/`kill` reply so it fires only once the stop has actually completed.
+    /// The worker's per-worker log ring on the node bus is reclaimed AFTER the stop —
+    /// evicting earlier would let shutdown-time stderr recreate the ring, and worker ids
+    /// are never reused, so a recreated ring would linger forever.
     fn reap(
         &mut self,
+        id: WorkerId,
         sup: Arc<Supervisor>,
         done: Option<oneshot::Sender<Result<(), HiggsError>>>,
     ) {
         self.inflight_stops += 1;
         self.refresh_keepalive();
         let self_handle = self.self_handle.clone();
+        let bus = self.config.bus.clone();
         tokio::spawn(async move {
             sup.stop().await;
+            // Process reaped (stderr pipe closed) — reclaim its log ring. RESIDUAL:
+            // a line already in flight in the async relay chain can land after this
+            // and recreate a tiny ring; bounded at a few lines, accepted over
+            // serializing eviction against the relay.
+            bus.evict_local(id);
             // The keepalive keeps the actor alive until this completes, so the upgrade
             // succeeds and the count/reply are handled on-thread — UNLESS the runtime was
             // dropped without shutdown_all (accepted Drop residual), where the stop has

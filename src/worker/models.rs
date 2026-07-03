@@ -215,13 +215,44 @@ fn enrich_gguf_metadata(model: &mut HiggsModel) {
         Ok(m) => m,
         Err(_) => return,
     };
-    let gguf = match GGuf::new(&mmap) {
-        Ok(g) => g,
-        Err(_) => return,
+    // ggus 0.5.1 PANICS (not errors) on inputs it dislikes: `GGuf::new` slices
+    // out of range on a TRUNCATED file (a model mid-download in a watched
+    // LM-Studio dir) or a quant type whose block size it mis-sizes (observed:
+    // bartowski IQ4_XS), and its GETTERS unwrap internally (e.g.
+    // `llm_context_length()` unwraps `general_architecture()` — a GGUF without
+    // `general.architecture` panics). A single such file must not crash the
+    // whole scan, so the ENTIRE enrichment is unwind-caught; the model stays
+    // cataloged with whatever fields were set before the panic. ggus types are
+    // not UnwindSafe (interior refs), which AssertUnwindSafe waives — sound
+    // here because the closure only writes plain field values into `model`.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        enrich_from_gguf(model, &mmap);
+    }));
+    if outcome.is_err() {
+        tracing::warn!(
+            path = %model.path,
+            "GGUF header parse panicked (truncated file, unsupported quant, or missing keys); model cataloged with partial enrichment"
+        );
+    }
+}
+
+/// The panicky part of [`enrich_gguf_metadata`]: every `ggus` call lives here,
+/// inside the caller's `catch_unwind`.
+fn enrich_from_gguf(model: &mut HiggsModel, mmap: &memmap2::Mmap) {
+    let Ok(gguf) = GGuf::new(mmap) else {
+        return;
     };
     let arch = gguf.general_architecture().ok().map(ToString::to_string);
     model.arch = arch.clone();
-    model.ctx_train = gguf.llm_context_length().ok().map(|n| n as u64);
+    // NOT ggus's `llm_context_length()` — it UNWRAPS `general_architecture()`
+    // internally, panicking on an arch-less GGUF and aborting the rest of the
+    // enrichment (the catch_unwind above turns that into partial fields).
+    // Read the arch-scoped key directly instead.
+    model.ctx_train = arch.as_deref().and_then(|a| {
+        gguf.get_usize(&format!("{a}.context_length"))
+            .ok()
+            .map(|n| n as u64)
+    });
     // Typed tuning fields (arch-scoped). Read the GQA KV head count
     // (`attention.head_count_kv`) — the KV-cache size driver — NOT the query
     // `head_count`, which over-estimates KV by the GQA factor.
@@ -242,8 +273,14 @@ fn enrich_gguf_metadata(model: &mut HiggsModel) {
     let template = gguf.tokenizer_chat_template().ok();
     model.has_chat_template = template.is_some();
     if let Some(t) = template {
-        model.supports_tools =
-            t.contains("tool_call") || t.contains("[TOOL_CALLS]") || t.contains("<function");
+        // `supports_tools` means "higgs can serve tool calls for this model".
+        // The registry sniff is the capability signal: the crate's primary
+        // parser (llama.cpp common_chat, via the fork) covers at least these
+        // families, and the registry is the fallback — one sniff, no drifting
+        // marker list (the old list missed Llama-3's JSON-instruction family).
+        model.supports_tools = crate::worker::tool_parser::ToolParserRegistry::default()
+            .select(t)
+            .is_some();
         model.supports_reasoning = t.contains("</think>")
             || t.contains("<think>")
             || t.to_lowercase().contains("thinking");

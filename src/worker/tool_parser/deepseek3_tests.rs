@@ -129,3 +129,42 @@ fn non_object_or_invalid_args_dropped() {
     let bad = "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>f<｜tool▁sep｜>{not json}<｜tool▁call▁end｜><｜tool▁calls▁end｜>";
     assert!(p().parse(bad, "x").is_none());
 }
+
+// --- R1 dialect (`function<｜tool▁sep｜>NAME` + ```json fence) — what the ---
+// --- R1-distill GGUF templates render (fleet golden caught the gap). ------
+
+#[test]
+fn r1_dialect_fenced_json_call_parses() {
+    let text = "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n{\"city\": \"Paris\"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>";
+    let calls = DeepSeek3Parser
+        .parse(text, "seed")
+        .expect("R1 dialect parses");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["function"]["name"], "get_weather");
+    assert_eq!(calls[0]["function"]["arguments"], "{\"city\":\"Paris\"}");
+}
+
+#[test]
+fn r1_dialect_without_fence_is_dropped() {
+    // `function<sep>` promises the R1 shape; a missing ```json fence is malformed.
+    let text = "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n{\"city\": \"Paris\"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>";
+    assert!(DeepSeek3Parser.parse(text, "seed").is_none());
+}
+
+#[test]
+fn v3_dialect_still_parses_after_r1_support() {
+    let text = "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>{\"city\": \"Paris\"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>";
+    let calls = DeepSeek3Parser
+        .parse(text, "seed")
+        .expect("V3 dialect parses");
+    assert_eq!(calls[0]["function"]["name"], "get_weather");
+}
+
+#[test]
+fn v3_tool_literally_named_function_needs_the_fence_shape() {
+    // A V3 tool genuinely named "function" is ambiguous with the R1 type
+    // keyword; the R1 interpretation wins and raw-JSON args are rejected.
+    // Documented residual: no real tool is named "function".
+    let text = "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>{\"x\": 1}<｜tool▁call▁end｜><｜tool▁calls▁end｜>";
+    assert!(DeepSeek3Parser.parse(text, "seed").is_none());
+}

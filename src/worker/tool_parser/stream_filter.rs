@@ -26,6 +26,9 @@
 pub struct ToolCallStreamFilter {
     markers: &'static [&'static str],
     held: String,
+    /// Everything withheld since the opening marker (marker included) — kept
+    /// so a turn that does NOT parse as a call can be flushed after the fact.
+    suppressed: String,
     suppressing: bool,
 }
 
@@ -45,6 +48,7 @@ impl ToolCallStreamFilter {
         Self {
             markers,
             held: String::new(),
+            suppressed: String::new(),
             suppressing: false,
         }
     }
@@ -52,6 +56,12 @@ impl ToolCallStreamFilter {
     /// Feed one generated piece; `emit` receives the content safe to stream now.
     pub fn push(&mut self, piece: &str, emit: &mut dyn FnMut(&str)) {
         if self.suppressing {
+            // Keep buffering: if the turn turns out NOT to parse as a tool
+            // call, the caller retrieves this via [`Self::take_suppressed`]
+            // and streams it after all (a false-positive marker — e.g. a
+            // JSON-output answer that happens to start like a call — must
+            // not silently lose content).
+            self.suppressed.push_str(piece);
             return;
         }
         self.held.push_str(piece);
@@ -63,6 +73,8 @@ impl ToolCallStreamFilter {
                 let safe = self.held[..pos].to_string();
                 emit(&safe);
             }
+            let withheld = self.held.split_off(pos);
+            self.suppressed.push_str(&withheld);
             self.held.clear();
             self.suppressing = true;
             return;
@@ -84,6 +96,16 @@ impl ToolCallStreamFilter {
             let rest = std::mem::take(&mut self.held);
             emit(&rest);
         }
+    }
+
+    /// The text withheld since the opening marker (marker included), if any.
+    /// The decode loop calls this AFTER the turn completes: when the full text
+    /// does NOT parse as a tool call, the withheld text was a false positive
+    /// and is streamed after all — keeping streaming content identical to the
+    /// non-streaming response.
+    pub fn take_suppressed(&mut self) -> Option<String> {
+        (self.suppressing && !self.suppressed.is_empty())
+            .then(|| std::mem::take(&mut self.suppressed))
     }
 
     /// Earliest byte index where any marker fully occurs in `held`.

@@ -497,7 +497,9 @@ fn apply_template(
     };
     model
         .apply_chat_template_oaicompat(template, &oai_params)
-        .map_err(|e| gen_fail("apply chat template", &e))
+        .map_err(|e| HiggsError::TemplateRenderFailed {
+            reason: e.to_string(),
+        })
     // KNOWN LIMITATION: `tmpl_result.additional_stops` (stop STRINGS the template
     // declares) is not honored — the decode loop stops only on EOG tokens /
     // max_tokens. The supported families (Qwen, Llama-3, Gemma, Nemotron)
@@ -752,9 +754,18 @@ fn run_decode(
         full.push_str(&tail);
     }
     // Flush any safe content the filter held back (a tail that never became a
-    // marker); suppressed content stays withheld.
+    // marker). Then the false-positive check: if the filter suppressed on an
+    // opening marker but the FULL text does not actually parse as a tool call
+    // (e.g. a JSON answer that merely looks like one), stream the withheld
+    // text after all — streaming content must match the non-streaming
+    // response, which returns the raw text when no call parses.
     if let Some(f) = stream_filter.as_mut() {
         f.finish(sink);
+        if let (Some(sup), Some(p)) = (f.take_suppressed(), parser) {
+            if p.parse(&full, "stream-probe").is_none() {
+                sink(&sup);
+            }
+        }
     }
 
     Ok(DecodeOutput {

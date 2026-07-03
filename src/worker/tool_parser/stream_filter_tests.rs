@@ -74,3 +74,31 @@ fn new_rejects_empty_marker() {
     const EMPTY: &[&str] = &[""];
     ToolCallStreamFilter::new(EMPTY);
 }
+
+#[test]
+fn suppressed_text_is_buffered_and_takeable() {
+    let mut f = ToolCallStreamFilter::new(&["<tool_call>"]);
+    let mut out = String::new();
+    let mut emit = |s: &str| out.push_str(s);
+    f.push("hello <tool_call>{\"x\":1}", &mut emit);
+    f.push("</tool_call>", &mut emit);
+    f.finish(&mut emit);
+    assert_eq!(out, "hello ", "prefix streamed, call withheld");
+    assert_eq!(
+        f.take_suppressed().as_deref(),
+        Some("<tool_call>{\"x\":1}</tool_call>"),
+        "withheld text (marker included) is retrievable for the false-positive flush"
+    );
+    assert!(f.take_suppressed().is_none(), "take drains once");
+}
+
+#[test]
+fn no_suppression_means_no_suppressed_text() {
+    let mut f = ToolCallStreamFilter::new(&["<tool_call>"]);
+    let mut out = String::new();
+    let mut emit = |s: &str| out.push_str(s);
+    f.push("plain text only", &mut emit);
+    f.finish(&mut emit);
+    assert_eq!(out, "plain text only");
+    assert!(f.take_suppressed().is_none());
+}

@@ -453,7 +453,7 @@ fn enrich_detects_tool_and_reasoning_capabilities() {
             (
                 "tokenizer.chat_template",
                 GS,
-                gguf_str("{% if tools %}{{ tool_call }}{% endif %}<think></think>"),
+                gguf_str("{% if tools %}<tool_call>{}</tool_call>{% endif %}<think></think>"),
             ),
         ],
         "qwen/q3/model-Q4_K_M.gguf",
@@ -461,7 +461,10 @@ fn enrich_detects_tool_and_reasoning_capabilities() {
     assert_eq!(model.arch.as_deref(), Some("qwen3"));
     assert_eq!(model.ctx_train, Some(32768));
     assert!(model.has_chat_template);
-    assert!(model.supports_tools, "template references tools/tool_call");
+    assert!(
+        model.supports_tools,
+        "template carries a format a registry parser handles (<tool_call>)"
+    );
     assert!(model.supports_reasoning, "template references <think>");
 }
 
@@ -1126,5 +1129,84 @@ fn unreadable_root_errors_hg001() {
     assert!(
         matches!(err, HiggsError::ModelDirUnreadable { .. }),
         "got: {err:?}"
+    );
+}
+
+/// A GGUF whose header declares more tensor data than the file holds must not
+/// crash the scan. ggus 0.5.1 PANICS (slice out of range) on such files — a
+/// model mid-download, or a quant type ggus mis-sizes (observed: IQ4_XS) —
+/// and `enrich_gguf_metadata` unwind-catches it so the model stays cataloged
+/// with empty enrichment. Fail-on-revert for that catch: without it this test
+/// aborts the harness with the ggus panic.
+#[test]
+fn truncated_gguf_survives_scan_without_enrichment() {
+    let dir = TempDir::new().unwrap();
+    let model_dir = dir.path().join("org").join("truncated");
+    fs::create_dir_all(&model_dir).unwrap();
+
+    // Minimal GGUF v3: magic, version, 1 tensor, 0 KVs, then one F32 tensor
+    // info declaring 1M elements (4MB of data). Alignment padding (default 32)
+    // follows so ggus gets past its padding skip and reaches the data-section
+    // length check, then only 8 data bytes — far short of the declared 4MB —
+    // so its `&data[..data_len]` slice overruns (the observed panic).
+    let mut bytes: Vec<u8> = Vec::new();
+    bytes.extend_from_slice(b"GGUF");
+    bytes.extend_from_slice(&3u32.to_le_bytes()); // version
+    bytes.extend_from_slice(&1u64.to_le_bytes()); // tensor_count
+    bytes.extend_from_slice(&0u64.to_le_bytes()); // kv_count
+    let name = b"weights";
+    bytes.extend_from_slice(&(name.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(name);
+    bytes.extend_from_slice(&1u32.to_le_bytes()); // n_dims
+    bytes.extend_from_slice(&1_000_000u64.to_le_bytes()); // dim[0]
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // type F32
+    bytes.extend_from_slice(&0u64.to_le_bytes()); // offset
+    let padding = (32 - bytes.len() % 32) % 32;
+    bytes.extend(std::iter::repeat_n(0u8, padding + 8));
+    fs::write(model_dir.join("truncated.gguf"), &bytes).unwrap();
+
+    let mut store = ModelStore::default();
+    let models = store
+        .scan(&[dir.path().to_path_buf()], &[], &[])
+        .expect("scan survives the truncated GGUF");
+    assert_eq!(models.len(), 1, "the model is still cataloged");
+    let m = &models[0];
+    assert!(!m.has_chat_template, "no enrichment from the bad header");
+    assert!(m.arch.is_none(), "no arch from the bad header");
+}
+
+/// `supports_tools` is the REGISTRY sniff (the registry is the sole tool-call
+/// parser), so a Llama-3.2-style JSON-instruction template — which the old
+/// marker list missed — must advertise tools, and a plain chat template must
+/// not.
+#[test]
+fn supports_tools_follows_the_parser_registry_sniff() {
+    use ggus::GGufMetaDataValueType::String as GS;
+    let llama = scan_single_gguf(
+        &[(
+            "tokenizer.chat_template",
+            GS,
+            gguf_str(
+                r#"Respond in the format {"name": function name, "parameters": dictionary of argument name and its value}."#,
+            ),
+        )],
+        "meta/llama-ish/model-Q4_0.gguf",
+    );
+    assert!(
+        llama.supports_tools,
+        "llama JSON-instruction template advertises tools (llama_json parser)"
+    );
+
+    let plain = scan_single_gguf(
+        &[(
+            "tokenizer.chat_template",
+            GS,
+            gguf_str("{% for m in messages %}{{ m.content }}{% endfor %}"),
+        )],
+        "misc/plain/model-Q4_0.gguf",
+    );
+    assert!(
+        !plain.supports_tools,
+        "plain chat template advertises no tools"
     );
 }
