@@ -93,13 +93,13 @@ higgs_const_enum! {
     #[derive(higgs_macros::TsParamHelp)]
     pub enum FitVerdict {
         /// Comfortably within the budget (≤ 80%).
-        #[help = "The estimated memory footprint uses at most 80% of your resource budget for this device. There is comfortable headroom for the OS, other apps, and cache growth during long chats — safe to load."]
+        #[help = "The estimated memory footprint uses at most 80% of your resource budget for this device. There is comfortable headroom for the OS, other apps, and cache growth during long chats — safe to load. The resource budget is set in Settings → Hardware."]
         Fits,
         /// Close to the budget (80–95%) — loads, but little headroom.
-        #[help = "The estimated footprint lands between 80% and 95% of your resource budget. It should load and serve, but headroom is thin — memory pressure from other apps or very long prompts can tip it over; consider a smaller context length or a quantized KV cache."]
+        #[help = "The estimated footprint lands between 80% and 95% of your resource budget. It should load and serve, but headroom is thin — memory pressure from other apps or very long prompts can tip it over. Consider a smaller context length, a quantized KV cache, or a higher resource budget in Settings → Hardware."]
         Tight,
         /// Exceeds the budget (> 95%) — will likely OOM or fail to load.
-        #[help = "The estimated footprint exceeds 95% of your resource budget, so the load will most likely fail or force the system into swapping. Lower the context length, quantize the KV cache, offload fewer GPU layers, or raise the budget in Hardware settings."]
+        #[help = "The estimated footprint exceeds 95% of your resource budget, so the load will most likely fail or force the system into swapping. Lower the context length, quantize the KV cache, offload fewer GPU layers, or raise the resource budget in Settings → Hardware."]
         Overflow,
     }
 }
