@@ -1,6 +1,16 @@
 use super::*;
+use crate::worker::engine::{ChatDelta, ChatDeltaKind};
 use crate::worker::M_CHAT;
 use serde_json::json;
+
+/// A content-kind [`ChatDelta`] — what plain string chunks became (the legacy
+/// `{request_id, delta}` wire shape decodes as `Content`).
+fn content_delta(text: &str) -> ChatDelta {
+    ChatDelta {
+        kind: ChatDeltaKind::Content,
+        text: text.into(),
+    }
+}
 
 // ── Test seam ─────────────────────────────────────────────────────────────
 //
@@ -252,7 +262,7 @@ async fn chat_chunks_routed() {
 
     for expected in &deltas {
         let got = rx.try_recv().expect("delta expected");
-        assert_eq!(got, *expected);
+        assert_eq!(got, content_delta(expected));
     }
 
     sup.remove_chat_sink(42);
@@ -281,15 +291,15 @@ async fn two_keyed_sinks_route_independently() {
     // rx1 must only see deltas tagged request_id=1.
     let r1_a = rx1.try_recv().expect("rx1 first chunk");
     let r1_b = rx1.try_recv().expect("rx1 second chunk");
-    assert_eq!(r1_a, "beta");
-    assert_eq!(r1_b, "delta");
+    assert_eq!(r1_a, content_delta("beta"));
+    assert_eq!(r1_b, content_delta("delta"));
     assert!(rx1.try_recv().is_err(), "rx1 must have no more chunks");
 
     // rx2 must only see deltas tagged request_id=2.
     let r2_a = rx2.try_recv().expect("rx2 first chunk");
     let r2_b = rx2.try_recv().expect("rx2 second chunk");
-    assert_eq!(r2_a, "alpha");
-    assert_eq!(r2_b, "gamma");
+    assert_eq!(r2_a, content_delta("alpha"));
+    assert_eq!(r2_b, content_delta("gamma"));
     assert!(rx2.try_recv().is_err(), "rx2 must have no more chunks");
 
     sup.remove_chat_sink(1);
@@ -695,7 +705,7 @@ async fn route_notification_ignores_malformed() {
             params: json!({"request_id": 7, "delta": "hi"}),
         },
     );
-    assert_eq!(rx.try_recv().unwrap(), "hi");
+    assert_eq!(rx.try_recv().unwrap(), content_delta("hi"));
 }
 
 // ─── Transient-worker factory helper (sysinfo) ───────────────────────────

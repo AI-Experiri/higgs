@@ -1,9 +1,17 @@
 use super::*;
 
+/// A content-kind [`ChatDelta`] — what plain string chunks became.
+fn content_delta(text: &str) -> ChatDelta {
+    ChatDelta {
+        kind: ChatDeltaKind::Content,
+        text: text.into(),
+    }
+}
+
 /// Collect all payloads `assemble` produces for the given inputs. `include_usage`
 /// toggles the OpenAI `stream_options.include_usage` terminal usage chunk.
 async fn run_assemble_opts(
-    deltas: mpsc::UnboundedReceiver<String>,
+    deltas: mpsc::UnboundedReceiver<ChatDelta>,
     outcome: JoinHandle<Result<ChatOutcome, HiggsError>>,
     include_usage: bool,
 ) -> Vec<String> {
@@ -29,7 +37,7 @@ async fn run_assemble_opts(
 
 /// The common case: assemble without the usage chunk.
 async fn run_assemble(
-    deltas: mpsc::UnboundedReceiver<String>,
+    deltas: mpsc::UnboundedReceiver<ChatDelta>,
     outcome: JoinHandle<Result<ChatOutcome, HiggsError>>,
 ) -> Vec<String> {
     run_assemble_opts(deltas, outcome, false).await
@@ -45,13 +53,14 @@ fn finish_reason_mapping() {
 #[tokio::test]
 async fn assemble_frames_in_order() {
     let (dtx, drx) = mpsc::unbounded_channel();
-    dtx.send("hel".to_owned()).unwrap();
-    dtx.send("lo".to_owned()).unwrap();
+    dtx.send(content_delta("hel")).unwrap();
+    dtx.send(content_delta("lo")).unwrap();
     let outcome = tokio::spawn(async {
         Ok(ChatOutcome {
             content: "hello".into(),
             finish_reason: "stop".into(),
             tool_calls: None,
+            reasoning_content: None,
             prompt_tokens: 0,
             completion_tokens: 0,
         })
@@ -85,12 +94,13 @@ async fn assemble_frames_in_order() {
 #[tokio::test]
 async fn include_usage_emits_a_terminal_usage_chunk() {
     let (dtx, drx) = mpsc::unbounded_channel();
-    dtx.send("hi".to_owned()).unwrap();
+    dtx.send(content_delta("hi")).unwrap();
     let outcome = tokio::spawn(async {
         Ok(ChatOutcome {
             content: "hi".into(),
             finish_reason: "stop".into(),
             tool_calls: None,
+            reasoning_content: None,
             prompt_tokens: 11,
             completion_tokens: 4,
         })
@@ -117,12 +127,13 @@ async fn include_usage_emits_a_terminal_usage_chunk() {
 #[tokio::test]
 async fn no_usage_chunk_without_include_usage() {
     let (dtx, drx) = mpsc::unbounded_channel();
-    dtx.send("hi".to_owned()).unwrap();
+    dtx.send(content_delta("hi")).unwrap();
     let outcome = tokio::spawn(async {
         Ok(ChatOutcome {
             content: "hi".into(),
             finish_reason: "stop".into(),
             tool_calls: None,
+            reasoning_content: None,
             prompt_tokens: 11,
             completion_tokens: 4,
         })
@@ -146,7 +157,7 @@ async fn no_usage_chunk_without_include_usage() {
 
 #[tokio::test]
 async fn assemble_error_emits_envelope_then_done() {
-    let (_dtx, drx) = mpsc::unbounded_channel::<String>();
+    let (_dtx, drx) = mpsc::unbounded_channel::<ChatDelta>();
     let outcome = tokio::spawn(async {
         Err(HiggsError::WorkerDead {
             context: "gone".into(),
@@ -170,7 +181,7 @@ async fn assemble_error_emits_envelope_then_done() {
 #[tokio::test]
 async fn assemble_worker_death_mid_stream() {
     let (dtx, drx) = mpsc::unbounded_channel();
-    dtx.send("he".to_owned()).unwrap();
+    dtx.send(content_delta("he")).unwrap();
     // Drop the sender to simulate worker death closing the delta channel.
     drop(dtx);
 
@@ -208,7 +219,7 @@ async fn assemble_worker_death_mid_stream() {
 /// Collect all payloads `assemble` produces with `verbose` toggled. Drives the
 /// verbose `log_served` branch (the only difference from `run_assemble_opts`).
 async fn run_assemble_verbose(
-    deltas: mpsc::UnboundedReceiver<String>,
+    deltas: mpsc::UnboundedReceiver<ChatDelta>,
     outcome: JoinHandle<Result<ChatOutcome, HiggsError>>,
 ) -> Vec<String> {
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -238,12 +249,13 @@ async fn run_assemble_verbose(
 #[tokio::test]
 async fn assemble_verbose_still_frames_in_order() {
     let (dtx, drx) = mpsc::unbounded_channel();
-    dtx.send("hi".to_owned()).unwrap();
+    dtx.send(content_delta("hi")).unwrap();
     let outcome = tokio::spawn(async {
         Ok(ChatOutcome {
             content: "hi".into(),
             finish_reason: "length".into(),
             tool_calls: None,
+            reasoning_content: None,
             prompt_tokens: 3,
             completion_tokens: 2,
         })
@@ -276,7 +288,7 @@ async fn assemble_verbose_still_frames_in_order() {
 /// `Err(join_err)` arm of `assemble` (the ChatTaskFailed mapping).
 #[tokio::test]
 async fn assemble_join_error_emits_hg044_envelope() {
-    let (_dtx, drx) = mpsc::unbounded_channel::<String>();
+    let (_dtx, drx) = mpsc::unbounded_channel::<ChatDelta>();
     // A task that never completes; aborting it makes `outcome.await` yield a
     // JoinError (cancelled), driving the JoinError arm.
     let outcome: JoinHandle<Result<ChatOutcome, HiggsError>> = tokio::spawn(async {
@@ -401,7 +413,7 @@ fn stream_tool_calls_none_for_empty_or_malformed() {
 /// stop/length signal), before `[DONE]`.
 #[tokio::test]
 async fn assemble_tool_calls_path() {
-    let (_dtx, drx) = mpsc::unbounded_channel::<String>();
+    let (_dtx, drx) = mpsc::unbounded_channel::<ChatDelta>();
     let outcome = tokio::spawn(async {
         Ok(ChatOutcome {
             content: String::new(),
@@ -412,6 +424,7 @@ async fn assemble_tool_calls_path() {
                 "type": "function",
                 "function": { "name": "search", "arguments": "{\"q\":\"x\"}" }
             }])),
+            reasoning_content: None,
             prompt_tokens: 0,
             completion_tokens: 0,
         })
@@ -455,12 +468,13 @@ async fn assemble_tool_calls_path() {
 /// engine signal and no tool-call delta chunk is emitted.
 #[tokio::test]
 async fn assemble_empty_tool_calls_falls_back_to_finish_reason() {
-    let (_dtx, drx) = mpsc::unbounded_channel::<String>();
+    let (_dtx, drx) = mpsc::unbounded_channel::<ChatDelta>();
     let outcome = tokio::spawn(async {
         Ok(ChatOutcome {
             content: "done".into(),
             finish_reason: "length".into(),
             tool_calls: Some(serde_json::json!([])),
+            reasoning_content: None,
             prompt_tokens: 0,
             completion_tokens: 0,
         })
@@ -484,13 +498,14 @@ async fn assemble_empty_tool_calls_falls_back_to_finish_reason() {
 /// `chat_response_malformed_tool_calls_degrade_to_none`.
 #[tokio::test]
 async fn assemble_malformed_tool_calls_degrade_to_finish_reason() {
-    let (_dtx, drx) = mpsc::unbounded_channel::<String>();
+    let (_dtx, drx) = mpsc::unbounded_channel::<ChatDelta>();
     let outcome = tokio::spawn(async {
         Ok(ChatOutcome {
             content: "text".into(),
             finish_reason: "stop".into(),
             // `[{}]` — a non-empty array whose element lacks id/type/function.
             tool_calls: Some(serde_json::json!([{}])),
+            reasoning_content: None,
             prompt_tokens: 1,
             completion_tokens: 1,
         })
@@ -508,4 +523,140 @@ async fn assemble_malformed_tool_calls_degrade_to_finish_reason() {
         "malformed tool_calls must not force a tool_calls finish reason"
     );
     assert_eq!(payloads[2], "[DONE]");
+}
+
+// ── Reasoning + streamed tool-fragment chunks ─────────────────────────────────
+
+/// A reasoning-kind [`ChatDelta`].
+fn reasoning_delta(text: &str) -> ChatDelta {
+    ChatDelta {
+        kind: ChatDeltaKind::Reasoning,
+        text: text.into(),
+    }
+}
+
+/// A tool-call-fragment [`ChatDelta`] (the text is the fragment JSON).
+fn tool_delta(fragment_json: &str) -> ChatDelta {
+    ChatDelta {
+        kind: ChatDeltaKind::ToolCall,
+        text: fragment_json.into(),
+    }
+}
+
+/// A stop outcome with no tool calls and no reasoning (delta-only tests).
+fn stop_outcome() -> ChatOutcome {
+    ChatOutcome {
+        content: String::new(),
+        finish_reason: "stop".into(),
+        tool_calls: None,
+        reasoning_content: None,
+        prompt_tokens: 0,
+        completion_tokens: 0,
+    }
+}
+
+#[tokio::test]
+async fn reasoning_deltas_emit_reasoning_content_chunks() {
+    let (dtx, drx) = mpsc::unbounded_channel();
+    dtx.send(reasoning_delta("thin")).unwrap();
+    dtx.send(reasoning_delta("king")).unwrap();
+    dtx.send(content_delta("answer")).unwrap();
+    let outcome = tokio::spawn(async { Ok(stop_outcome()) });
+
+    let payloads = run_assemble(drx, outcome).await;
+    assert_eq!(
+        payloads.len(),
+        6,
+        "role + 2 reasoning + 1 content + finish + [DONE]: {payloads:?}"
+    );
+    // Parse as Value: reasoning_content is higgs's extension field, absent from
+    // the async-openai structs (and absent from non-reasoning chunks).
+    let v = |i: usize| serde_json::from_str::<serde_json::Value>(&payloads[i]).unwrap();
+    assert_eq!(v(1)["choices"][0]["delta"]["reasoning_content"], "thin");
+    assert!(
+        v(1)["choices"][0]["delta"]["content"].is_null(),
+        "reasoning chunk carries no content text: {}",
+        payloads[1]
+    );
+    assert_eq!(v(2)["choices"][0]["delta"]["reasoning_content"], "king");
+    let content = v(3);
+    assert_eq!(content["choices"][0]["delta"]["content"], "answer");
+    assert!(
+        content["choices"][0]["delta"]
+            .get("reasoning_content")
+            .is_none(),
+        "content chunk omits reasoning_content entirely: {}",
+        payloads[3]
+    );
+}
+
+/// One well-formed OpenAI tool-call fragment (the shape the fork's streaming
+/// parse emits and `delta_chunk` forwards).
+const FRAGMENT: &str = r#"{"index":0,"id":"call_s1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}"#;
+
+#[tokio::test]
+async fn streamed_tool_fragment_skips_terminal_tool_chunk() {
+    let (dtx, drx) = mpsc::unbounded_channel();
+    dtx.send(tool_delta(FRAGMENT)).unwrap();
+    let outcome = tokio::spawn(async {
+        Ok(ChatOutcome {
+            tool_calls: Some(serde_json::json!([{
+                "id": "call_final", "type": "function",
+                "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}
+            }])),
+            ..stop_outcome()
+        })
+    });
+
+    let payloads = run_assemble(drx, outcome).await;
+    // role + streamed fragment + finish + [DONE] — NO terminal buffered chunk.
+    assert_eq!(
+        payloads.len(),
+        4,
+        "terminal tool chunk skipped: {payloads:?}"
+    );
+    let frag: serde_json::Value = serde_json::from_str(&payloads[1]).unwrap();
+    assert_eq!(
+        frag["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
+        "get_weather"
+    );
+    assert_eq!(
+        frag["choices"][0]["delta"]["tool_calls"][0]["id"], "call_s1",
+        "the STREAMED fragment's id is what clients see: {}",
+        payloads[1]
+    );
+    let finish: serde_json::Value = serde_json::from_str(&payloads[2]).unwrap();
+    assert_eq!(finish["choices"][0]["finish_reason"], "tool_calls");
+}
+
+#[tokio::test]
+async fn malformed_tool_fragment_falls_back_to_terminal_chunk() {
+    let (dtx, drx) = mpsc::unbounded_channel();
+    dtx.send(tool_delta("{not json")).unwrap();
+    let outcome = tokio::spawn(async {
+        Ok(ChatOutcome {
+            tool_calls: Some(serde_json::json!([{
+                "id": "call_final", "type": "function",
+                "function": {"name": "get_weather", "arguments": "{}"}
+            }])),
+            ..stop_outcome()
+        })
+    });
+
+    let payloads = run_assemble(drx, outcome).await;
+    // The malformed fragment is dropped, so the terminal buffered chunk MUST
+    // still fire — finish_reason:"tool_calls" with zero call data would strand
+    // the client. role + terminal tool chunk + finish + [DONE].
+    assert_eq!(
+        payloads.len(),
+        4,
+        "fallback terminal chunk emitted: {payloads:?}"
+    );
+    let tc: serde_json::Value = serde_json::from_str(&payloads[1]).unwrap();
+    assert_eq!(
+        tc["choices"][0]["delta"]["tool_calls"][0]["id"],
+        "call_final"
+    );
+    let finish: serde_json::Value = serde_json::from_str(&payloads[2]).unwrap();
+    assert_eq!(finish["choices"][0]["finish_reason"], "tool_calls");
 }

@@ -75,4 +75,3 @@ Developer Logs.
 
 - The `Engine` trait + registry → `../` (`worker/engine`).
 - The RPC loop + worker state → `../../` (`worker/mod.rs`).
-- Tool-call parsing logic → `../../tool_parser`.

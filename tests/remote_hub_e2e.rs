@@ -97,7 +97,7 @@ async fn admit_node(
 /// Drain a chat delta stream + final outcome, returning the chunk count and whether any
 /// tokens were produced (chunks or non-empty content).
 async fn drain_chat(
-    deltas: tokio::sync::mpsc::UnboundedReceiver<String>,
+    deltas: tokio::sync::mpsc::UnboundedReceiver<higgs::worker::engine::ChatDelta>,
     handle: tokio::task::JoinHandle<Result<higgs::api::ChatOutcome, higgs::diagnostic::HiggsError>>,
 ) -> bool {
     let collector = tokio::spawn(async move {
@@ -210,7 +210,7 @@ async fn two_nodes_same_model_two_served_ids_stream_each_then_retire_one() {
     let prompt = "[{\"role\":\"user\",\"content\":\"Once upon a time\"}]";
     for sid in [TINY_MODEL_ID.to_string(), suffixed.clone()] {
         let (deltas, handle) = higgs
-            .chat_stream(sid.clone(), prompt.to_string(), 8, greedy(), None)
+            .chat_stream(sid.clone(), prompt.to_string(), 8, greedy(), None, None)
             .await
             .unwrap_or_else(|e| panic!("chat_stream {sid}: {e}"));
         assert!(
@@ -238,6 +238,7 @@ async fn two_nodes_same_model_two_served_ids_stream_each_then_retire_one() {
             prompt.to_string(),
             8,
             greedy(),
+            None,
             None,
         )
         .await
@@ -327,6 +328,7 @@ async fn hub_v1_chat_routes_to_remote_node() {
             "[{\"role\":\"user\",\"content\":\"Once upon a time\"}]".to_string(),
             8,
             greedy(),
+            None,
             None,
         )
         .await
@@ -422,7 +424,7 @@ async fn hub_v1_chat_routes_to_remote_node() {
     // Chat to the now-unrouted model errors (no route) rather than hanging.
     assert!(
         fleet
-            .chat(TINY_MODEL_ID, "[]".into(), 8, 0.0, None)
+            .chat(TINY_MODEL_ID, "[]".into(), 8, 0.0, None, None)
             .await
             .is_err(),
         "chat to an unrouted model errors"
@@ -566,6 +568,7 @@ async fn node_reconnects_and_route_survives() {
             8,
             greedy(),
             Some(tools.to_string()),
+            None,
         )
         .await
         .expect("chat after reconnect");

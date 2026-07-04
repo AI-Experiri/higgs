@@ -1276,9 +1276,10 @@ impl Higgs {
         max_tokens: usize,
         sampling: crate::worker::engine::SamplingParams,
         tools_json: Option<String>,
+        chat_template_kwargs: Option<String>,
     ) -> Result<
         (
-            mpsc::UnboundedReceiver<String>,
+            mpsc::UnboundedReceiver<crate::worker::engine::ChatDelta>,
             tokio::task::JoinHandle<Result<ChatOutcome, HiggsError>>,
         ),
         HiggsError,
@@ -1331,7 +1332,14 @@ impl Higgs {
             // all of it lives in `Supervisor::chat` (reached via the lease's `Deref`).
             // `rx` is returned to the caller now; `call` (and the lease that keeps the
             // worker alive) ride the spawned generation task with the admission permit.
-            let (rx, call) = lease.chat(raw_model, messages_json, max_tokens, merged, tools_json);
+            let (rx, call) = lease.chat(
+                raw_model,
+                messages_json,
+                max_tokens,
+                merged,
+                tools_json,
+                chat_template_kwargs,
+            );
             let handle = tokio::spawn(async move {
                 // Hold the admission permit AND the lease for the whole generation;
                 // dropping them here (on any return path) releases the gate slot and
@@ -1366,7 +1374,14 @@ impl Higgs {
                 // it from the umbrella; the rest of the sampler set applies locally.
                 let temperature = sampling.as_llamacpp().temperature.unwrap_or(0.7);
                 let (rx, fut) = fleet
-                    .chat(&model, messages_json, max_tokens, temperature, tools_json)
+                    .chat(
+                        &model,
+                        messages_json,
+                        max_tokens,
+                        temperature,
+                        tools_json,
+                        chat_template_kwargs,
+                    )
                     .await?;
                 let handle = tokio::spawn(async move {
                     let _permit = permit; // held for the whole remote generation

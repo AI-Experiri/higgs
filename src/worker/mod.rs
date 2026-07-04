@@ -5,7 +5,6 @@
 
 pub mod engine;
 pub mod models;
-pub mod tool_parser;
 
 use std::io::{BufRead, Write};
 
@@ -340,13 +339,23 @@ impl WorkerState {
                 .get("tools")
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned),
+            chat_template_kwargs: req
+                .params
+                .get("chat_template_kwargs")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
         };
         let mut chunk_write_failed = false;
-        let mut sink = |delta: &str| {
+        let mut sink = |delta: engine::EngineDelta<'_>| {
+            // Additive wire shape (kind/tool keys) — see ChatDelta::encode_chunk_params.
             let note = RpcNotification {
                 jsonrpc: "2.0".into(),
                 method: N_CHAT_CHUNK.into(),
-                params: json!({"request_id": request_id.clone(), "delta": delta}),
+                params: engine::ChatDelta::encode_chunk_params(
+                    &request_id,
+                    delta.kind(),
+                    delta.text(),
+                ),
             };
             if writeln!(writer, "{}", encode(&RpcFrame::Notification(note))).is_err() {
                 chunk_write_failed = true;
@@ -365,6 +374,8 @@ impl WorkerState {
             "tool_calls": result.tool_calls,
             "prompt_tokens": result.prompt_tokens,
             "completion_tokens": result.completion_tokens,
+            // Additive: absent on old workers, tolerated by chat_outcome_from_value.
+            "reasoning_content": result.reasoning_content,
         }))
     }
 }
@@ -459,14 +470,14 @@ mod tests {
             &mut self,
             _messages_json: &str,
             params: &engine::GenParams,
-            sink: &mut dyn FnMut(&str),
+            sink: &mut dyn FnMut(engine::EngineDelta<'_>),
         ) -> Result<engine::ChatResult, HiggsError> {
             // Record the temperature the worker threaded out of the M_CHAT
             // `sampling` sub-object, so a test can assert the deserialization.
             let temp = params.sampling.as_llamacpp().temperature.unwrap_or(0.7);
             self.calls.lock().push(format!("chat temp={temp}"));
-            sink("he");
-            sink("llo");
+            sink(engine::EngineDelta::Content("he"));
+            sink(engine::EngineDelta::Content("llo"));
             Ok(engine::ChatResult {
                 content: "hello".into(),
                 finish_reason: "stop",
@@ -474,6 +485,7 @@ mod tests {
                 // Scripted counts: 5 prompt tokens, 2 completion tokens.
                 prompt_tokens: 5,
                 completion_tokens: 2,
+                reasoning_content: None,
             })
         }
     }

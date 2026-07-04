@@ -91,7 +91,6 @@ Two independent line-coverage gates, run by `scripts/coverage.sh`
   live-iroh async files `node/{mod,hub,fleet,transport,data}.rs` (their unit % is
   flaky from spawned tasks). New logic in those files is covered by integration
   tests, not the unit gate.
-- **Integration gate excludes** `tool_parser/*` (pure logic, unit's job).
 - **Integration tests spawn a real `higgs` process** and need a tiny GGUF
   (`HIGGS_TEST_GGUF`, else the on-disk default); they **skip** when it's absent, so
   integration coverage collapses — set the GGUF before measuring. Tear processes

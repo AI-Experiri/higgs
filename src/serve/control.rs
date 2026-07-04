@@ -86,14 +86,17 @@ async fn scan_with_loaded(
     Ok((models, loaded_set, primary))
 }
 
-/// Gate 2 (host-side, zero FFI): does any registered tool-call parser recognize
-/// this model's chat template? `false` when there is no template or none matches.
-/// The `tool_parser` registry is pure Rust, so this runs in-process — no worker.
+/// Gate 2 (host-side, zero FFI): does this model's chat template declare tool
+/// handling? llama.cpp's auto-parser derives the actual parser from the
+/// template at load time, so the scan-time signal is the template mentioning
+/// tools/functions (same heuristic as the scan's `supports_tools`); `false`
+/// when there is no template (the legacy route renders no tool grammar).
 fn tool_calls_supported(model: &HiggsModel) -> bool {
     match model.chat_template.as_deref() {
-        Some(tmpl) => crate::worker::tool_parser::ToolParserRegistry::with_defaults()
-            .select(tmpl)
-            .is_some(),
+        Some(tmpl) => {
+            let tl = tmpl.to_lowercase();
+            tl.contains("tool") || tl.contains("function")
+        }
         None => false,
     }
 }

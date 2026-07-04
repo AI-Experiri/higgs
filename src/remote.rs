@@ -265,6 +265,10 @@ pub struct NodeChatParams {
     /// hub sending the worker-compatible `tools` field is not silently dropped.
     #[serde(rename = "tools", default, skip_serializing_if = "Option::is_none")]
     pub tools_json: Option<String>,
+    /// Per-request chat-template kwargs (JSON-object string), forwarded to the
+    /// worker's template apply. Additive optional — absent from old hubs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_template_kwargs: Option<String>,
 }
 
 /// No agreed protocol version (maps to HG023, a fatal typed close).

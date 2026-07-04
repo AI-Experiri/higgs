@@ -17,7 +17,6 @@ catalog** — the host scans and passes a resolved GGUF path in `M_LOAD`.
 | `models.rs` | The model store: read-only discovery across LM Studio / HuggingFace-cache / Ollama dirs, enriching GGUF headers (arch, quant, trained context, chat template, tool/reasoning support). Pure Rust (no FFI) — so it runs **host-side** (the host scans; `M_LOAD` carries the resolved path). It lives here next to the model types it produces. |
 | `engine/` | The `HiggsEngine` trait + the pluggable engine registry (`HIGGS_ENGINE`). The seam the rest of higgs is written against. Has its own README/DESIGN. |
 | `engine/llamacpp/` | The concrete llama.cpp engine — the only FFI boundary. Has its own README/DESIGN. |
-| `tool_parser/` | Engine-agnostic tool-call parser registry (pure text transforms), selected per model by GGUF chat-template sniff. Has its own README/DESIGN. |
 
 ## The RPC protocol (defined in `mod.rs`)
 

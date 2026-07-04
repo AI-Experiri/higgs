@@ -22,7 +22,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-# EXCLUSION: the tool_parser/* AND tune/* subtrees are pure logic — tool-call
+# EXCLUSION: the tune/* subtree is pure logic — autotune
 # dialect parsing and the autotune suggester (derive/vram/card/store/merge). Both
 # are exhaustively covered by the UNIT gate; integration can only reach them
 # indirectly (a real model emitting a dialect; the spawned process's suggester),
@@ -44,5 +44,5 @@ exec cargo llvm-cov \
   --test remote_node_e2e \
   --test remote_pairing \
   --test worker_roundtrip \
-  --ignore-filename-regex 'tool_parser|/tune/' \
+  --ignore-filename-regex '/tune/' \
   --fail-under-lines 75 "$@"

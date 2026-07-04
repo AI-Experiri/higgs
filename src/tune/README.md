@@ -25,7 +25,7 @@ design + the binding-gated parameter inventory: `docs/DESIGN-autotune.md`.
   llama.cpp-concrete (`LlamaCppParams`); only the *behaviors* sit behind traits,
   so a new recommendation source / derivation heuristic / bench backend / store
   is a new trait impl, not a param-type change.
-- **Pure & unit-tested**, like `tool_parser/*` — estimators/derive/parse are pure
+- **Pure & unit-tested** — estimators/derive/parse are pure
   over their inputs, tested with fakes (no worker, no disk, no network), which is
   what keeps the unit gate green.
 - **Reuse, don't re-port.** The VRAM budget primitive is `system::fits_vram`; the
@@ -36,5 +36,5 @@ design + the binding-gated parameter inventory: `docs/DESIGN-autotune.md`.
 ## Coverage
 
 `tune/*` is the **unit gate's** job (pure logic, ≥90% lines) — it is on the unit
-coverage set like `tool_parser/*`. The end-to-end `tune` route + load path lands
+coverage set. The end-to-end `tune` route + load path lands
 on the integration gate.

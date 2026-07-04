@@ -62,8 +62,12 @@ async fn inference_and_tools() {
         "scan lists the staged tiny model"
     );
 
-    // ── /v1/models is EMPTY before any model is loaded ────────────────────────
-    let empty: Value = c
+    // ── /v1/models lists the SERVABLE (prepared, unloaded) tiny model ─────────
+    // JIT truth: a chat against a servable model succeeds (the gate loads it on
+    // demand), so it is advertised BEFORE any load. The dedicated fail-on-revert
+    // coverage lives in tests/v1_models_servable.rs; this pins the same contract
+    // on the inference path (prepare_tiny ran above).
+    let listed: Value = c
         .get(format!("{}/v1/models", srv.base))
         .send()
         .await
@@ -71,10 +75,14 @@ async fn inference_and_tools() {
         .json()
         .await
         .unwrap();
-    assert_eq!(empty["object"], "list", "/v1/models is a list");
+    assert_eq!(listed["object"], "list", "/v1/models is a list");
     assert!(
-        empty["data"].as_array().unwrap().is_empty(),
-        "/v1/models is empty with nothing loaded"
+        listed["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["id"] == json!(id)),
+        "servable tiny model is advertised before any load: {listed}"
     );
 
     // ── Chat for an UNKNOWN model id → 404 OpenAI error envelope ──────────────

@@ -84,13 +84,13 @@ async fn chat_relays_to_routed_worker() {
     let (fleet, node_key, model_id, _root) = fleet_with_one_node().await;
     fleet.load(&node_key, &model_id).await.unwrap();
     let (mut rx, fut) = fleet
-        .chat(&model_id, "[]".into(), 8, 0.0, None)
+        .chat(&model_id, "[]".into(), 8, 0.0, None, None)
         .await
         .unwrap();
     let collector = tokio::spawn(async move {
         let mut got = Vec::new();
         while let Some(d) = rx.recv().await {
-            got.push(d);
+            got.push(d.text);
         }
         got
     });
@@ -178,7 +178,7 @@ async fn unload_and_chat_unrouted_model_error() {
     assert!(fleet.kill("nope/none").await.is_err());
     assert!(fleet.resolve("nope/none").await.is_none());
     assert!(fleet
-        .chat("nope/none", "[]".into(), 8, 0.0, None)
+        .chat("nope/none", "[]".into(), 8, 0.0, None, None)
         .await
         .is_err());
 }
@@ -373,7 +373,7 @@ async fn retire_drops_node_and_routes() {
     assert!(fleet.node_ids().await.is_empty());
     assert!(!fleet.is_remote(&model_id).await);
     assert!(fleet
-        .chat(&model_id, "[]".into(), 8, 0.0, None)
+        .chat(&model_id, "[]".into(), 8, 0.0, None, None)
         .await
         .is_err());
 }

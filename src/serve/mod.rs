@@ -27,6 +27,7 @@ mod stream;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod v1;
+mod v1_wire;
 pub(crate) mod wire;
 
 use std::sync::Arc;

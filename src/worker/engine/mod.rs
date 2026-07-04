@@ -36,6 +36,11 @@ pub struct GenParams {
     /// renders the tool grammar and selects the matching tool-call parser. We
     /// invent no parser of our own.
     pub tools_json: Option<String>,
+    /// llama.cpp-style per-request chat-template kwargs as a JSON-object
+    /// string (e.g. `{"enable_thinking":false}`), or `None`. Passed verbatim
+    /// to the template apply; the template decides what the keys mean.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_template_kwargs: Option<String>,
 }
 
 higgs_ts! {
@@ -368,6 +373,117 @@ impl<'de> serde::Deserialize<'de> for CtxLen {
     }
 }
 
+/// Which stream a chat delta belongs to. The engine's incremental parse
+/// (the crate's `common_chat` PEG parser) splits the generation into the
+/// assistant-visible answer, model thinking, and tool-call fragments; every
+/// hop above the engine (worker RPC → supervisor demux → serve SSE / fleet
+/// relay) carries this tag so the `/v1` stream can emit `delta.content`,
+/// `delta.reasoning_content`, and `delta.tool_calls` chunks — never a bare
+/// string that loses the distinction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatDeltaKind {
+    /// Assistant answer text (`delta.content` on `/v1`).
+    Content,
+    /// Model thinking (`delta.reasoning_content` on `/v1`).
+    Reasoning,
+    /// One OpenAI tool-call fragment (`delta.tool_calls[…]` on `/v1`); the
+    /// text is the fragment's JSON, produced by the crate's streaming parse.
+    ToolCall,
+}
+
+impl ChatDeltaKind {
+    /// Parse the wire `kind` value; absent/unknown ⇒ `Content` (old-peer default).
+    pub(crate) fn from_wire(kind: Option<&str>) -> Self {
+        match kind {
+            Some("reasoning") => ChatDeltaKind::Reasoning,
+            Some("tool_call") => ChatDeltaKind::ToolCall,
+            _ => ChatDeltaKind::Content,
+        }
+    }
+}
+
+/// One owned streamed chat delta — the item type of every chat delta channel
+/// (supervisor demux, `Higgs::chat_stream`, fleet relay).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatDelta {
+    pub kind: ChatDeltaKind,
+    /// The delta payload: answer/thinking text, or (for
+    /// [`ChatDeltaKind::ToolCall`]) the OpenAI tool-call fragment JSON.
+    pub text: String,
+}
+
+impl ChatDelta {
+    /// Encode one delta as `N_CHAT_CHUNK` notification params. The shape is
+    /// ADDITIVE over the pre-reasoning wire (`{request_id, delta}`):
+    /// - Content   → `{request_id, delta}` (unchanged — old peers just work)
+    /// - Reasoning → `{request_id, delta, kind:"reasoning"}` (old peers show
+    ///   the thinking as content — the pre-feature behavior)
+    /// - ToolCall  → `{request_id, delta:"", kind:"tool_call", tool:<json>}`
+    ///   (the fragment rides `tool`, NOT `delta`, so an old peer reading only
+    ///   `delta` forwards a harmless empty chunk instead of leaking call JSON)
+    pub(crate) fn encode_chunk_params(
+        request_id: &serde_json::Value,
+        kind: ChatDeltaKind,
+        text: &str,
+    ) -> serde_json::Value {
+        match kind {
+            ChatDeltaKind::Content => {
+                serde_json::json!({"request_id": request_id, "delta": text})
+            }
+            ChatDeltaKind::Reasoning => {
+                serde_json::json!({"request_id": request_id, "delta": text, "kind": "reasoning"})
+            }
+            ChatDeltaKind::ToolCall => serde_json::json!({
+                "request_id": request_id, "delta": "", "kind": "tool_call", "tool": text
+            }),
+        }
+    }
+
+    /// Decode a delta from `N_CHAT_CHUNK` params (the inverse of
+    /// [`encode_chunk_params`](Self::encode_chunk_params)); `None` when the
+    /// payload field is missing/malformed (chunk dropped, matching the old
+    /// behavior for a missing `delta`).
+    pub(crate) fn decode_chunk_params(params: &serde_json::Value) -> Option<ChatDelta> {
+        let kind = ChatDeltaKind::from_wire(params.get("kind").and_then(|v| v.as_str()));
+        let text = match kind {
+            ChatDeltaKind::ToolCall => params.get("tool")?.as_str()?,
+            _ => params.get("delta")?.as_str()?,
+        };
+        Some(ChatDelta {
+            kind,
+            text: text.to_owned(),
+        })
+    }
+}
+
+/// One borrowed chat delta as the engine emits it into the sink (zero-copy;
+/// the worker serializes it straight onto the RPC wire).
+#[derive(Debug, Clone, Copy)]
+pub enum EngineDelta<'a> {
+    /// Assistant answer text.
+    Content(&'a str),
+    /// Model thinking.
+    Reasoning(&'a str),
+    /// OpenAI tool-call fragment JSON from the streaming parse.
+    ToolCall(&'a str),
+}
+
+impl EngineDelta<'_> {
+    pub fn text(&self) -> &str {
+        match self {
+            EngineDelta::Content(s) | EngineDelta::Reasoning(s) | EngineDelta::ToolCall(s) => s,
+        }
+    }
+
+    pub fn kind(&self) -> ChatDeltaKind {
+        match self {
+            EngineDelta::Content(_) => ChatDeltaKind::Content,
+            EngineDelta::Reasoning(_) => ChatDeltaKind::Reasoning,
+            EngineDelta::ToolCall(_) => ChatDeltaKind::ToolCall,
+        }
+    }
+}
+
 /// Result returned by [`HiggsEngine::chat`], carrying the generated text,
 /// finish reason, and token counts for OpenAI-standard `usage` reporting.
 pub struct ChatResult {
@@ -388,6 +504,11 @@ pub struct ChatResult {
     pub prompt_tokens: u32,
     /// Number of tokens emitted during the decode loop.
     pub completion_tokens: u32,
+    /// Model thinking extracted by the parse (`reasoning_content` on the OpenAI
+    /// message), or `None` when the model emitted none / the template has no
+    /// reasoning markers. Truncation mid-think is NOT an error: `content` may be
+    /// empty while this carries the partial thinking (lenient parse).
+    pub reasoning_content: Option<String>,
 }
 
 /// A local inference engine able to host one loaded model (v1).
@@ -399,8 +520,10 @@ pub trait HiggsEngine: Send {
     /// True when a model is resident.
     fn is_loaded(&self) -> bool;
     /// Render the GGUF-embedded chat template over `messages_json` and stream
-    /// completion deltas into `sink`. Returns a [`ChatResult`] with the full
-    /// text, finish reason, and prompt/completion token counts.
+    /// completion deltas into `sink` — each tagged content / reasoning /
+    /// tool-call ([`EngineDelta`]) by the engine's incremental parse. Returns a
+    /// [`ChatResult`] with the full text, finish reason, reasoning, and
+    /// prompt/completion token counts.
     ///
     /// `messages_json` is the request's OpenAI `messages` array serialized
     /// verbatim — including assistant `tool_calls` and tool `tool_call_id`, so
@@ -416,7 +539,7 @@ pub trait HiggsEngine: Send {
         &mut self,
         messages_json: &str,
         params: &GenParams,
-        sink: &mut dyn FnMut(&str),
+        sink: &mut dyn FnMut(EngineDelta<'_>),
     ) -> Result<ChatResult, HiggsError>;
 
     /// Enumerate the host's compute devices (CPU/GPU/accel) as this engine sees

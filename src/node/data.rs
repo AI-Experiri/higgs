@@ -69,6 +69,7 @@ pub(crate) async fn relay_chat(
         params.max_tokens.unwrap_or(1024),
         sampling,
         params.tools_json,
+        params.chat_template_kwargs,
     );
     // `Supervisor::chat`'s future is `'static` (owns its own Arc) and removes the chat
     // sink on ANY outcome. Drive it in its own task so that cleanup runs even if the hub
@@ -258,12 +259,22 @@ async fn write_progress(
     write_notification(send, crate::remote::N_PROGRESS, params).await
 }
 
-/// Write one `N_CHAT_CHUNK` notification carrying the hub's `request_id` + delta.
-async fn write_chunk(send: &mut SendStream, request_id: u64, delta: &str) -> std::io::Result<()> {
+/// Write one `N_CHAT_CHUNK` notification carrying the hub's `request_id` +
+/// the tagged delta (additive `kind`/`tool` wire shape — an old hub reading
+/// only `delta` degrades reasoning to content and tool fragments to "").
+async fn write_chunk(
+    send: &mut SendStream,
+    request_id: u64,
+    delta: &crate::worker::engine::ChatDelta,
+) -> std::io::Result<()> {
     write_notification(
         send,
         N_CHAT_CHUNK,
-        json!({ "request_id": request_id, "delta": delta }),
+        crate::worker::engine::ChatDelta::encode_chunk_params(
+            &serde_json::json!(request_id),
+            delta.kind,
+            &delta.text,
+        ),
     )
     .await
 }

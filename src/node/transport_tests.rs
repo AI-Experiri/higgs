@@ -65,7 +65,7 @@ async fn chat_unknown_worker_errors() {
     // future resolves to an error rather than streaming.
     let (t, _model_id, _root) = paired_transport().await;
     let (_rx, fut) = t
-        .chat(999, "m".into(), "[]".into(), 8, 0.0, None)
+        .chat(999, "m".into(), "[]".into(), 8, 0.0, None, None)
         .await
         .unwrap();
     assert!(fut.await.is_err(), "unknown worker → chat error");
@@ -81,7 +81,15 @@ async fn chat_streams_chunks_then_final() {
         .as_u64()
         .unwrap() as u32;
     let (mut rx, fut) = t
-        .chat(worker_id, "higgs-test/m".into(), "[]".into(), 8, 0.0, None)
+        .chat(
+            worker_id,
+            "higgs-test/m".into(),
+            "[]".into(),
+            8,
+            0.0,
+            None,
+            None,
+        )
         .await
         .unwrap();
     // Drain chunks concurrently with driving `fut` (the future IS the reader that
@@ -89,7 +97,7 @@ async fn chat_streams_chunks_then_final() {
     let collector = tokio::spawn(async move {
         let mut got = Vec::new();
         while let Some(d) = rx.recv().await {
-            got.push(d);
+            got.push(d.text);
         }
         got
     });

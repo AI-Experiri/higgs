@@ -43,7 +43,7 @@ async fn v1_models_lists_servable_unloaded_model() {
         .await
         .expect("status json");
     assert_eq!(
-        status["loaded_all"].as_array().map(|a| a.len()),
+        status["loaded_all"].as_array().map(Vec::len),
         Some(0),
         "listing came from servability, not residency: {status}"
     );

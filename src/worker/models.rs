@@ -274,13 +274,12 @@ fn enrich_from_gguf(model: &mut HiggsModel, mmap: &memmap2::Mmap) {
     model.has_chat_template = template.is_some();
     if let Some(t) = template {
         // `supports_tools` means "higgs can serve tool calls for this model".
-        // The registry sniff is the capability signal: the crate's primary
-        // parser (llama.cpp common_chat, via the fork) covers at least these
-        // families, and the registry is the fallback — one sniff, no drifting
-        // marker list (the old list missed Llama-3's JSON-instruction family).
-        model.supports_tools = crate::worker::tool_parser::ToolParserRegistry::default()
-            .select(t)
-            .is_some();
+        // llama.cpp's PEG auto-parser derives a tool parser from ANY jinja
+        // template, so the capability signal is the template itself declaring
+        // tool/function handling — the same heuristic class as
+        // `supports_reasoning` below, no curated parser list.
+        let tl = t.to_lowercase();
+        model.supports_tools = tl.contains("tool") || tl.contains("function");
         model.supports_reasoning = t.contains("</think>")
             || t.contains("<think>")
             || t.to_lowercase().contains("thinking");

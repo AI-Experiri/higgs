@@ -279,6 +279,7 @@ async fn inference_gate_rejects_when_full() {
             8,
             greedy_sampling(),
             None,
+            None,
         )
         .await
         .expect_err("gate full → ServerBusy");
@@ -304,6 +305,7 @@ async fn chat_stream_unloaded_model_not_found() {
             r#"[{"role":"user","content":"hi"}]"#.to_owned(),
             8,
             greedy_sampling(),
+            None,
             None,
         )
         .await
@@ -668,6 +670,7 @@ async fn multi_model_both_served_and_reachable() {
                 32,
                 greedy_sampling(),
                 None,
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("chat_stream {id}: {e}"));
@@ -748,6 +751,7 @@ async fn chat_stream_delivers() {
             256,
             greedy_sampling(),
             None,
+            None,
         )
         .await
         .expect("chat_stream should succeed");
@@ -767,8 +771,8 @@ async fn chat_stream_delivers() {
     // The streamed deltas must have arrived in order.
     let chunk1 = rx.recv().await.expect("chunk 1");
     let chunk2 = rx.recv().await.expect("chunk 2");
-    assert_eq!(chunk1, "he");
-    assert_eq!(chunk2, "llo");
+    assert_eq!(chunk1.text, "he");
+    assert_eq!(chunk2.text, "llo");
 }
 
 // ── log_bus(): delegates to the local node's shared bus ───────────────────
@@ -827,6 +831,7 @@ async fn chat_stream_with_fleet_unknown_model_not_found() {
             r#"[{"role":"user","content":"hi"}]"#.to_owned(),
             8,
             greedy_sampling(),
+            None,
             None,
         )
         .await

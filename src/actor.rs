@@ -10,6 +10,7 @@ use parking_lot::Mutex;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::rpc::RpcResponse;
+use crate::worker::engine::ChatDelta;
 
 // `Actor` / `spawn_actor` / `Handle` are the generic mailbox runtime, written once
 // here. Consumed now by `NodeRuntime` (P1) and `ReplyDemux` by `Supervisor`; the
@@ -125,7 +126,7 @@ struct DemuxInner {
     /// Request id → response waiter (RPC correlation).
     pending: Mutex<HashMap<u64, oneshot::Sender<RpcResponse>>>,
     /// request_id → chat-chunk sink (streaming delta routing).
-    chat_sinks: Mutex<HashMap<u64, mpsc::UnboundedSender<String>>>,
+    chat_sinks: Mutex<HashMap<u64, mpsc::UnboundedSender<ChatDelta>>>,
 }
 
 impl ReplyDemux {
@@ -164,7 +165,7 @@ impl ReplyDemux {
     }
 
     /// Register a chat-chunk sink under a `request_id`; deltas arrive on the receiver.
-    pub(crate) fn register_sink(&self, request_id: u64) -> mpsc::UnboundedReceiver<String> {
+    pub(crate) fn register_sink(&self, request_id: u64) -> mpsc::UnboundedReceiver<ChatDelta> {
         let (tx, rx) = mpsc::unbounded_channel();
         self.inner.chat_sinks.lock().insert(request_id, tx);
         rx
@@ -176,9 +177,9 @@ impl ReplyDemux {
     }
 
     /// Route a streamed delta to its sink. Unknown request_ids are dropped (no panic).
-    pub(crate) fn route_chunk(&self, request_id: u64, delta: &str) {
+    pub(crate) fn route_chunk(&self, request_id: u64, delta: ChatDelta) {
         if let Some(tx) = self.inner.chat_sinks.lock().get(&request_id) {
-            let _ = tx.send(delta.to_string());
+            let _ = tx.send(delta);
         }
     }
 

@@ -1,6 +1,15 @@
 use super::*;
+use crate::worker::engine::{ChatDelta, ChatDeltaKind};
 use serde_json::json;
 use std::sync::Arc;
+
+/// A content-kind [`ChatDelta`] — what plain string chunks became.
+fn content_delta(text: &str) -> ChatDelta {
+    ChatDelta {
+        kind: ChatDeltaKind::Content,
+        text: text.into(),
+    }
+}
 
 struct Counter {
     total: u64,
@@ -68,11 +77,11 @@ async fn demux_correlates_response_by_id() {
 async fn demux_routes_chunks_by_request_id() {
     let demux = ReplyDemux::new();
     let mut rx = demux.register_sink(3);
-    demux.route_chunk(3, "he");
-    demux.route_chunk(3, "llo");
-    demux.route_chunk(4, "ignored"); // no sink for 4 ⇒ dropped, no panic
-    assert_eq!(rx.recv().await.unwrap(), "he");
-    assert_eq!(rx.recv().await.unwrap(), "llo");
+    demux.route_chunk(3, content_delta("he"));
+    demux.route_chunk(3, content_delta("llo"));
+    demux.route_chunk(4, content_delta("ignored")); // no sink for 4 ⇒ dropped, no panic
+    assert_eq!(rx.recv().await.unwrap(), content_delta("he"));
+    assert_eq!(rx.recv().await.unwrap(), content_delta("llo"));
     demux.remove_sink(3);
 }
 

@@ -943,9 +943,10 @@ impl HubFleet {
         max_tokens: usize,
         temperature: f32,
         tools_json: Option<String>,
+        chat_template_kwargs: Option<String>,
     ) -> Result<
         (
-            mpsc::UnboundedReceiver<String>,
+            mpsc::UnboundedReceiver<crate::worker::engine::ChatDelta>,
             impl std::future::Future<Output = Result<serde_json::Value, HiggsError>> + Send,
         ),
         HiggsError,
@@ -960,6 +961,7 @@ impl HubFleet {
                 max_tokens,
                 temperature,
                 tools_json,
+                chat_template_kwargs,
             )
             .await
         {

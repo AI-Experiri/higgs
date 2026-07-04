@@ -480,7 +480,10 @@ impl Supervisor {
     /// and returns `rx`.  Infallible: concurrent callers each get their own
     /// channel and their own deltas routed independently.  The caller must
     /// call [`remove_chat_sink`](Self::remove_chat_sink) when done.
-    pub(crate) fn register_chat_sink(&self, request_id: u64) -> mpsc::UnboundedReceiver<String> {
+    pub(crate) fn register_chat_sink(
+        &self,
+        request_id: u64,
+    ) -> mpsc::UnboundedReceiver<crate::worker::engine::ChatDelta> {
         self.inner.demux.register_sink(request_id)
     }
 
@@ -519,8 +522,9 @@ impl Supervisor {
         max_tokens: usize,
         sampling: crate::worker::engine::SamplingParams,
         tools_json: Option<String>,
+        chat_template_kwargs: Option<String>,
     ) -> (
-        mpsc::UnboundedReceiver<String>,
+        mpsc::UnboundedReceiver<crate::worker::engine::ChatDelta>,
         impl std::future::Future<Output = Result<Value, HiggsError>>,
     ) {
         // One id for both the RPC frame `id` (response correlation) and the
@@ -551,6 +555,9 @@ impl Supervisor {
                         // worker rebuilds the ordered sampler chain from it.
                         "sampling": sampling,
                         "tools": tools_json,
+                        // Per-request template knobs (JSON-object string, e.g.
+                        // {"enable_thinking":false}); null when absent.
+                        "chat_template_kwargs": chat_template_kwargs,
                     }),
                 )
                 .await;
@@ -1129,7 +1136,9 @@ fn route_notification(inner: &Arc<Inner>, notif: &RpcNotification) {
     else {
         return;
     };
-    let Some(delta) = notif.params.get("delta").and_then(|v| v.as_str()) else {
+    // Additive wire shape: `kind` + (for tool fragments) `tool` ride next to
+    // `delta` — decode is tolerant, absent kind ⇒ content (old-worker default).
+    let Some(delta) = crate::worker::engine::ChatDelta::decode_chunk_params(&notif.params) else {
         return;
     };
     inner.demux.route_chunk(request_id, delta);

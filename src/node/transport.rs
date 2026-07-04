@@ -93,6 +93,7 @@ impl NodeTransport {
     /// value for the JSON-RPC `id` and `params.request_id` (codex), so the per-stream
     /// reader routes both by one id.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub async fn chat(
         &self,
         worker_id: u32,
@@ -101,7 +102,14 @@ impl NodeTransport {
         max_tokens: usize,
         temperature: f32,
         tools_json: Option<String>,
-    ) -> Result<(mpsc::UnboundedReceiver<String>, ChatDone), HiggsError> {
+        chat_template_kwargs: Option<String>,
+    ) -> Result<
+        (
+            mpsc::UnboundedReceiver<crate::worker::engine::ChatDelta>,
+            ChatDone,
+        ),
+        HiggsError,
+    > {
         let id = self.alloc_id();
         let (mut send, recv) = self.conn.open_bi().await.map_err(transport_dead)?;
         let mut params = json!({
@@ -112,8 +120,15 @@ impl NodeTransport {
             "max_tokens": max_tokens,
             "temperature": temperature,
         });
-        if let (Some(obj), Some(t)) = (params.as_object_mut(), tools_json) {
-            obj.insert("tools".into(), Value::String(t));
+        if let Some(obj) = params.as_object_mut() {
+            if let Some(t) = tools_json {
+                obj.insert("tools".into(), Value::String(t));
+            }
+            // Additive optional field — NodeChatParams is not deny_unknown_fields,
+            // so an old node simply ignores it (chat passthrough policy).
+            if let Some(k) = chat_template_kwargs {
+                obj.insert("chat_template_kwargs".into(), Value::String(k));
+            }
         }
         let req = RpcRequest {
             jsonrpc: "2.0".into(),
@@ -138,9 +153,14 @@ impl NodeTransport {
                                 .map_err(|e| transport_dead(e.to_string()))?
                             {
                                 RpcFrame::Notification(n) if n.method == N_CHAT_CHUNK => {
-                                    if let Some(d) = n.params.get("delta").and_then(|v| v.as_str())
+                                    // Tolerant additive decode: absent `kind` ⇒
+                                    // content (chunks from an old node just work).
+                                    if let Some(d) =
+                                        crate::worker::engine::ChatDelta::decode_chunk_params(
+                                            &n.params,
+                                        )
                                     {
-                                        let _ = tx.send(d.to_string());
+                                        let _ = tx.send(d);
                                     }
                                 }
                                 RpcFrame::Response(resp) => break extract_result(M_CHAT, resp),

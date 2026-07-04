@@ -319,6 +319,11 @@ pub(crate) fn chat_outcome_from_value(result: &serde_json::Value) -> ChatOutcome
             .unwrap_or("stop")
             .to_owned(),
         tool_calls: result.get("tool_calls").filter(|v| !v.is_null()).cloned(),
+        reasoning_content: result
+            .get("reasoning_content")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned),
         prompt_tokens: result
             .get("prompt_tokens")
             .and_then(serde_json::Value::as_u64)
@@ -340,6 +345,10 @@ pub struct ChatOutcome {
     pub finish_reason: String,
     /// Parsed OpenAI `tool_calls` array, or `None` when the turn emitted none.
     pub tool_calls: Option<serde_json::Value>,
+    /// Model thinking (`reasoning_content` on the OpenAI message), or `None`
+    /// when the model emitted none (absent-tolerant: old remote nodes never
+    /// send the key). Truncation mid-think keeps this and may empty `content`.
+    pub reasoning_content: Option<String>,
     /// Prompt token count from the engine (for OpenAI `usage.prompt_tokens`).
     pub prompt_tokens: u32,
     /// Completion token count from the engine (for OpenAI `usage.completion_tokens`).

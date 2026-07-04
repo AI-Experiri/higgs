@@ -1,6 +1,8 @@
 use super::*;
 use crate::worker::engine::CtxLen;
-use async_openai::types::chat::CreateChatCompletionStreamResponse;
+use async_openai::types::chat::{
+    CreateChatCompletionRequest, CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
+};
 use serde_json::json;
 use tower::ServiceExt;
 
@@ -728,6 +730,7 @@ fn chat_response_without_tool_calls() {
         content: "hi there".into(),
         finish_reason: "stop".into(),
         tool_calls: None,
+        reasoning_content: None,
         prompt_tokens: 10,
         completion_tokens: 7,
     };
@@ -751,6 +754,7 @@ fn chat_response_length_finish_reason_passthrough() {
         content: "truncated".into(),
         finish_reason: "length".into(),
         tool_calls: None,
+        reasoning_content: None,
         prompt_tokens: 3,
         completion_tokens: 1024,
     };
@@ -773,6 +777,7 @@ fn chat_response_with_tool_calls_forces_finish_reason() {
             "type": "function",
             "function": {"name": "search", "arguments": "{\"q\":\"rust\"}"}
         }])),
+        reasoning_content: None,
         prompt_tokens: 20,
         completion_tokens: 4,
     };
@@ -814,6 +819,7 @@ fn chat_response_malformed_tool_calls_degrade_to_none() {
         finish_reason: "stop".into(),
         // A bare string is not a tool_calls array.
         tool_calls: Some(json!("not a tool call array")),
+        reasoning_content: None,
         prompt_tokens: 1,
         completion_tokens: 1,
     };
@@ -1164,4 +1170,35 @@ async fn v1_chat_jit_off_with_fleet_consults_is_remote_then_404() {
     );
     let body = String::from_utf8(body_bytes(resp).await).unwrap();
     assert!(body.contains("[HG003]"), "carries HG003: {body}");
+}
+
+// ── Raw messages passthrough (reasoning echo-back survives) ───────────────────
+
+/// The raw `messages` array must reach the template VERBATIM: assistant
+/// `reasoning_content` echo-back (DeepSeek/Kimi multi-turn convention — genai
+/// sends it) is not modeled by async-openai's typed structs, so re-serializing
+/// the typed request would silently DROP it. Fails on reverting
+/// `raw_messages_json` back to a typed re-serialization.
+#[test]
+fn raw_messages_json_preserves_reasoning_echo_back() {
+    let raw = serde_json::json!({
+        "model": "m",
+        "messages": [
+            { "role": "user", "content": "hi" },
+            { "role": "assistant", "content": "4", "reasoning_content": "2+2 is 4" },
+            { "role": "user", "content": "why?" }
+        ]
+    });
+    let out = raw_messages_json(&raw);
+    assert!(
+        out.contains("\"reasoning_content\":\"2+2 is 4\""),
+        "echo-back field survives to the template: {out}"
+    );
+    // Sanity: the typed round-trip WOULD drop it (the reason this fn exists).
+    let typed: CreateChatCompletionRequest = serde_json::from_value(raw).unwrap();
+    let retyped = serde_json::to_string(&typed.messages).unwrap();
+    assert!(
+        !retyped.contains("reasoning_content"),
+        "typed re-serialization drops the field (proves the raw path is load-bearing)"
+    );
 }

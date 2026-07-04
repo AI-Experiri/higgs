@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use async_openai::error::{ApiError, WrappedError};
 use async_openai::types::chat::{
-    ChatChoice, ChatCompletionMessageToolCalls,
+    ChatCompletionMessageToolCalls,
     ChatCompletionRequestAssistantMessageContent as AssistantContent,
     ChatCompletionRequestAssistantMessageContentPart as AssistantPart,
     ChatCompletionRequestDeveloperMessageContent as DeveloperContent,
@@ -24,8 +24,8 @@ use async_openai::types::chat::{
     ChatCompletionRequestToolMessageContent as ToolContent,
     ChatCompletionRequestToolMessageContentPart as ToolPart,
     ChatCompletionRequestUserMessageContent as UserContent,
-    ChatCompletionRequestUserMessageContentPart as UserPart, ChatCompletionResponseMessage,
-    CompletionUsage, CreateChatCompletionRequest, CreateChatCompletionResponse, FinishReason, Role,
+    ChatCompletionRequestUserMessageContentPart as UserPart, CompletionUsage,
+    CreateChatCompletionRequest, FinishReason, Role,
 };
 use async_openai::types::models::{ListModelResponse, Model};
 use axum::extract::State;
@@ -339,8 +339,21 @@ pub(super) async fn v1_models(State(higgs): State<Arc<Higgs>>) -> Response {
 /// the HG003 404.
 pub(super) async fn v1_chat_completions(
     State(higgs): State<Arc<Higgs>>,
-    Json(req): Json<CreateChatCompletionRequest>,
+    Json(raw): Json<serde_json::Value>,
 ) -> Response {
+    // Deserialize through the typed struct for VALIDATION (same 4xx semantics,
+    // now in the OpenAI error envelope), but KEEP the raw body: fields the
+    // async-openai types do not model must survive to the chat template —
+    // notably assistant `reasoning_content` echo-back (DeepSeek/Kimi multi-turn
+    // convention; genai echoes it) and `chat_template_kwargs` (llama.cpp's
+    // per-request template knobs, e.g. `{"enable_thinking": false}`).
+    let req: CreateChatCompletionRequest = match serde_json::from_value(raw.clone()) {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::warn!(error = %err, "higgs: chat body failed typed validation");
+            return v1_bad_request(&format!("invalid request body: {err}")).into_response();
+        }
+    };
     tracing::info!(model = %req.model, stream = req.stream.unwrap_or(false), "higgs: POST /v1/chat/completions");
     // Start the serve clock now so the optional verbose completion line can
     // report wall-clock elapsed (gate + validation + generation) per request.
@@ -375,16 +388,22 @@ pub(super) async fn v1_chat_completions(
         log_incoming(&req.model, &req.messages);
     }
 
-    // Serialize the OpenAI `messages` and `tools` arrays for the chat template,
-    // or 400 on a malformed body.
-    let messages_json = match serialize_messages(&req) {
-        Ok(s) => s,
-        Err(resp) => return *resp,
-    };
+    // The RAW `messages` array rides to the chat template verbatim (typed
+    // validation already passed above), so extension fields the typed structs
+    // would drop — assistant `reasoning_content` — reach the template render.
+    let messages_json = raw_messages_json(&raw);
     let tools_json = match serialize_tools(&req) {
         Ok(t) => t,
         Err(resp) => return *resp,
     };
+    // llama.cpp-style per-request template knobs (object → JSON string for the
+    // template apply). Non-object values are ignored rather than 400 — the
+    // typed validation above never sees this key, matching llama.cpp's lenient
+    // handling of its own extension field.
+    let chat_template_kwargs = raw
+        .get("chat_template_kwargs")
+        .filter(|v| v.is_object())
+        .map(ToString::to_string);
 
     // `max_tokens` is the context-clamped generation budget from `gate_and_validate`
     // (`min(requested or inferred, n_ctx − prompt, MAX_OUTPUT_TOKENS)`), so dispatch
@@ -402,6 +421,7 @@ pub(super) async fn v1_chat_completions(
             max_tokens,
             sampling,
             tools_json,
+            chat_template_kwargs,
         )
         .await
     {
@@ -654,15 +674,17 @@ async fn gate_and_validate(
     Ok((loaded.id, max_gen))
 }
 
-/// Serialize the OpenAI `messages` array verbatim for the chat template — the
-/// engine feeds it to the GGUF template via the crate's OAI-compat apply, which
-/// parses assistant tool_calls and tool tool_call_id natively. `Err(400)` on a
-/// malformed body.
-fn serialize_messages(req: &CreateChatCompletionRequest) -> Result<String, Box<Response>> {
-    serde_json::to_string(&req.messages).map_err(|err| {
-        tracing::warn!(error = %err, "higgs: messages serialization failed");
-        Box::new(v1_bad_request(&format!("invalid messages: {err}")).into_response())
-    })
+/// The RAW `messages` array from the request body, serialized verbatim for the
+/// chat template. The typed deserialize already validated the array's shape;
+/// passing the raw JSON (not a re-serialization of the typed structs) preserves
+/// extension fields async-openai does not model — assistant `reasoning_content`
+/// echo-back — which the crate's `common_chat` message parser accepts and uses.
+fn raw_messages_json(raw: &serde_json::Value) -> String {
+    // `messages` exists: the typed validation above required it.
+    raw.get("messages")
+        .cloned()
+        .unwrap_or(serde_json::Value::Array(vec![]))
+        .to_string()
 }
 
 /// Serialize the OpenAI `tools` array (if present) to a JSON string for the chat
@@ -710,7 +732,11 @@ pub(super) fn interpret_tool_calls(
 }
 
 /// Build the non-streaming chat completion response from a final outcome.
-fn chat_response(model: String, out: &ChatOutcome) -> CreateChatCompletionResponse {
+///
+/// The body is the local [`v1_wire`](super::v1_wire) mirror — byte-parity with
+/// async-openai's `CreateChatCompletionResponse` plus the `reasoning_content`
+/// message field the crate lacks (absent when the model emitted no thinking).
+fn chat_response(model: String, out: &ChatOutcome) -> super::v1_wire::ReasoningChatResponse {
     let tool_calls = interpret_tool_calls(&out.tool_calls);
     // Per the OpenAI spec, a turn that emits tool calls reports finish_reason
     // "tool_calls" regardless of the engine's stop/length signal.
@@ -719,15 +745,11 @@ fn chat_response(model: String, out: &ChatOutcome) -> CreateChatCompletionRespon
     } else {
         stream::finish_reason_from(&out.finish_reason)
     };
-    // function_call / system_fingerprint are deprecated-but-required fields of
-    // the async-openai wire structs; populating them with None is the only way
-    // to construct the type.
-    #[allow(deprecated)]
-    CreateChatCompletionResponse {
+    super::v1_wire::ReasoningChatResponse {
         id: chatcmpl_id(),
-        choices: vec![ChatChoice {
+        choices: vec![super::v1_wire::ReasoningChatChoice {
             index: 0,
-            message: ChatCompletionResponseMessage {
+            message: super::v1_wire::ReasoningResponseMessage {
                 // OpenAI: a tool-call turn carries content: null. Emit None when
                 // there are tool calls and no surviving text content.
                 content: if tool_calls.is_some() && out.content.is_empty() {
@@ -737,18 +759,13 @@ fn chat_response(model: String, out: &ChatOutcome) -> CreateChatCompletionRespon
                 },
                 refusal: None,
                 tool_calls,
-                annotations: None,
                 role: Role::Assistant,
-                function_call: None,
-                audio: None,
+                reasoning_content: out.reasoning_content.clone(),
             },
             finish_reason: Some(finish_reason),
-            logprobs: None,
         }],
         created: now_secs(),
         model,
-        service_tier: None,
-        system_fingerprint: None,
         object: "chat.completion".to_owned(),
         // Real token counts from the engine, wired through ChatOutcome.
         usage: Some(CompletionUsage {
