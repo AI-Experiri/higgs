@@ -85,14 +85,21 @@ higgs_const_enum! {
 }
 
 higgs_const_enum! {
-    /// Tri-state memory fit verdict.
+    /// Tri-state memory fit verdict. Each variant carries a `#[help]`
+    /// explanation surfaced to the frontend as `FitVerdictHelp.ts` (tooltip on
+    /// the verdict chips), so the wording lives HERE, next to the thresholds
+    /// that define it — not hand-copied into the UI.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[derive(higgs_macros::TsParamHelp)]
     pub enum FitVerdict {
         /// Comfortably within the budget (≤ 80%).
+        #[help = "The estimated memory footprint uses at most 80% of your resource budget for this device. There is comfortable headroom for the OS, other apps, and cache growth during long chats — safe to load."]
         Fits,
         /// Close to the budget (80–95%) — loads, but little headroom.
+        #[help = "The estimated footprint lands between 80% and 95% of your resource budget. It should load and serve, but headroom is thin — memory pressure from other apps or very long prompts can tip it over; consider a smaller context length or a quantized KV cache."]
         Tight,
         /// Exceeds the budget (> 95%) — will likely OOM or fail to load.
+        #[help = "The estimated footprint exceeds 95% of your resource budget, so the load will most likely fail or force the system into swapping. Lower the context length, quantize the KV cache, offload fewer GPU layers, or raise the budget in Hardware settings."]
         Overflow,
     }
 }
@@ -863,5 +870,25 @@ mod tests {
             s.ram_fit.verdict,
             s.rationale
         );
+    }
+    /// The FitVerdict tooltip help follows the param-help convention: every
+    /// variant annotated, ≥2 sentences, real thresholds — the frontend renders
+    /// these verbatim (FitVerdictHelp.ts), so this is the wording gate.
+    #[test]
+    fn fit_verdict_help_covers_every_variant() {
+        let keys: Vec<&str> = FitVerdict::PARAM_HELP.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, ["Fits", "Tight", "Overflow"]);
+        for (variant, text) in FitVerdict::PARAM_HELP {
+            let sentences =
+                text.matches(". ").count() + usize::from(text.trim_end().ends_with('.'));
+            assert!(
+                sentences >= 2,
+                "help for `{variant}` must be ≥2 sentences: {text:?}"
+            );
+            assert!(
+                text.contains('%'),
+                "help for `{variant}` cites its real threshold: {text:?}"
+            );
+        }
     }
 }

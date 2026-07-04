@@ -151,9 +151,11 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
     })
 }
 
-/// Derive a per-field help-text emitter for a named-field struct.
+/// Derive a per-field help-text emitter for a named-field struct, or a
+/// per-variant one for a unit-variant enum (e.g. `FitVerdict` — the frontend
+/// tooltips a verdict chip with the variant's explanation).
 ///
-/// Reads `#[help = "…"]` on each field and emits:
+/// Reads `#[help = "…"]` on each field/variant and emits:
 ///   * a Rust `impl <Struct> { pub const PARAM_HELP: &[(&str,&str)] = …; }`
 ///     (unit-testable in the consuming crate), and
 ///   * a `#[ignore]` `macro_run_ts_param_help_<snake>` test that writes
@@ -175,19 +177,6 @@ fn expand_param_help(input: &DeriveInput) -> syn::Result<TokenStream2> {
     let struct_name = &input.ident;
     let struct_name_str = struct_name.to_string();
 
-    let Data::Struct(data) = &input.data else {
-        return Err(syn::Error::new(
-            input.span(),
-            "#[derive(TsParamHelp)] only supports structs",
-        ));
-    };
-    let Fields::Named(named) = &data.fields else {
-        return Err(syn::Error::new(
-            input.span(),
-            "#[derive(TsParamHelp)] only supports named-field structs",
-        ));
-    };
-
     // Reuse ts-rs's export_to so the .ts lands beside the type's own binding.
     let ts_export_to = find_ts_export_to(&input.attrs).ok_or_else(|| {
         syn::Error::new(
@@ -202,23 +191,56 @@ fn expand_param_help(input: &DeriveInput) -> syn::Result<TokenStream2> {
     // name (unless a field overrides it with its own #[serde(rename = "…")]).
     let rename_all = find_serde_rename_all(&input.attrs);
 
-    // Collect (wire_name, help) for every field carrying #[help = "..."]. The
-    // wire name mirrors what serde/ts-rs serialize: an explicit field rename
-    // wins, else the container rename_all rule applied to the field ident, else
-    // the ident verbatim.
+    // Collect (wire_name, help) for every field/variant carrying
+    // `#[help = "..."]`. The wire name mirrors what serde/ts-rs serialize: an
+    // explicit rename wins, else the container rename_all rule applied to the
+    // ident, else the ident verbatim.
     let mut pairs: Vec<(String, String)> = Vec::new();
-    for f in &named.named {
-        let Some(help) = find_field_help(&f.attrs) else {
-            continue;
-        };
-        let ident = f
-            .ident
-            .as_ref()
-            .expect("named field has an ident")
-            .to_string();
-        let wire = find_serde_rename(&f.attrs)
-            .unwrap_or_else(|| apply_rename_all_field(&ident, rename_all.as_deref()));
-        pairs.push((wire, help));
+    match &input.data {
+        Data::Struct(data) => {
+            let Fields::Named(named) = &data.fields else {
+                return Err(syn::Error::new(
+                    input.span(),
+                    "#[derive(TsParamHelp)] only supports named-field structs",
+                ));
+            };
+            for f in &named.named {
+                let Some(help) = find_field_help(&f.attrs) else {
+                    continue;
+                };
+                let ident = f
+                    .ident
+                    .as_ref()
+                    .expect("named field has an ident")
+                    .to_string();
+                let wire = find_serde_rename(&f.attrs)
+                    .unwrap_or_else(|| apply_rename_all_field(&ident, rename_all.as_deref()));
+                pairs.push((wire, help));
+            }
+        }
+        Data::Enum(data) => {
+            for v in &data.variants {
+                let Fields::Unit = &v.fields else {
+                    return Err(syn::Error::new(
+                        v.ident.span(),
+                        "#[derive(TsParamHelp)] on an enum supports unit variants only",
+                    ));
+                };
+                let Some(help) = find_field_help(&v.attrs) else {
+                    continue;
+                };
+                let wire = find_serde_rename(&v.attrs).unwrap_or_else(|| {
+                    apply_rename_all_variant(&v.ident.to_string(), rename_all.as_deref())
+                });
+                pairs.push((wire, help));
+            }
+        }
+        Data::Union(_) => {
+            return Err(syn::Error::new(
+                input.span(),
+                "#[derive(TsParamHelp)] supports structs and enums, not unions",
+            ));
+        }
     }
 
     // Rust const (unit-testable in the consuming crate).
@@ -446,6 +468,43 @@ fn apply_rename_all(name: &str, rule: Option<&str>) -> String {
 /// are snake_case at the source, so the word boundaries (and thus the camelCase/
 /// PascalCase conversions) differ. Used so [`TsParamHelp`](derive_ts_param_help)
 /// keys match the serialized/ts-rs wire names under a container rename.
+/// Apply serde's container `rename_all` rule to a PascalCase VARIANT ident
+/// (the variant analogue of [`apply_rename_all_field`]; serde leaves variants
+/// untouched without a rule).
+fn apply_rename_all_variant(variant: &str, rule: Option<&str>) -> String {
+    match rule {
+        None | Some("PascalCase") => variant.to_string(),
+        Some("lowercase") => variant.to_lowercase(),
+        Some("UPPERCASE") => variant.to_uppercase(),
+        Some("snake_case") => pascal_to_snake(variant),
+        Some("SCREAMING_SNAKE_CASE") => pascal_to_snake(variant).to_uppercase(),
+        Some("camelCase") => {
+            let mut c = variant.chars();
+            match c.next() {
+                Some(f) => f.to_lowercase().collect::<String>() + c.as_str(),
+                None => String::new(),
+            }
+        }
+        Some(other) => panic!("TsParamHelp: unsupported rename_all rule {other:?}"),
+    }
+}
+
+/// `PascalCase` → `snake_case` (serde's variant snake_case rule).
+fn pascal_to_snake(s: &str) -> String {
+    let mut out = String::new();
+    for (i, ch) in s.chars().enumerate() {
+        if ch.is_uppercase() {
+            if i > 0 {
+                out.push('_');
+            }
+            out.extend(ch.to_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 fn apply_rename_all_field(field: &str, rule: Option<&str>) -> String {
     match rule {
         // serde leaves snake_case fields untouched for None/lowercase/snake_case.
