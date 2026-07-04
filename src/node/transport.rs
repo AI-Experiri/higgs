@@ -155,12 +155,16 @@ impl NodeTransport {
                                 RpcFrame::Notification(n) if n.method == N_CHAT_CHUNK => {
                                     // Tolerant additive decode: absent `kind` ⇒
                                     // content (chunks from an old node just work).
-                                    if let Some(d) =
-                                        crate::worker::engine::ChatDelta::decode_chunk_params(
-                                            &n.params,
-                                        )
-                                    {
-                                        let _ = tx.send(d);
+                                    match crate::worker::engine::ChatDelta::decode_chunk_params(
+                                        &n.params,
+                                    ) {
+                                        Some(d) => {
+                                            let _ = tx.send(d);
+                                        }
+                                        None => tracing::warn!(
+                                            params = %n.params,
+                                            "[HG051] undecodable remote chat chunk dropped"
+                                        ),
                                     }
                                 }
                                 RpcFrame::Response(resp) => break extract_result(M_CHAT, resp),

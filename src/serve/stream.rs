@@ -160,7 +160,7 @@ fn delta_chunk(delta: &ChatDelta) -> Option<ReasoningStreamDelta> {
                 ..Default::default()
             }),
             Err(err) => {
-                tracing::debug!(error = %err, "higgs: dropped malformed streamed tool-call fragment");
+                tracing::warn!(error = %err, fragment = %delta.text, "[HG056] malformed streamed tool-call fragment dropped; terminal buffered chunk covers the call");
                 None
             }
         },

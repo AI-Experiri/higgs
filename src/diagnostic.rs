@@ -1,6 +1,22 @@
 //! Higgs diagnostics. Standalone snafu+miette infra (no jigglebot imports);
 //! follows the project's four-pillar conventions by style: code baked into
 //! Display, origin-only logging, severity for fatality, append-only codes.
+//!
+//! # Log-only diagnostic codes (no `HiggsError` variant)
+//!
+//! Degrade-don't-fail events carry an `[HGxxx]` token in their `tracing` line
+//! instead of an error variant — the request still succeeds, but a debugging
+//! agent can grep the Developer Logs for the code. Same append-only registry
+//! as the variants above; NEVER reuse a number:
+//!
+//! | code  | site | meaning |
+//! |-------|------|---------|
+//! | HG051 | supervisor / hub transport | `N_CHAT_CHUNK` payload undecodable — chunk dropped (wire bug or skewed peer) |
+//! | HG052 | engine `run_decode` | incremental chat parse failed mid-generation — raw content deltas for the remainder |
+//! | HG053 | engine `parse_output` | crate parse rejected the full generation — raw text returned as content |
+//! | HG054 | engine `parse_output` | crate parse returned non-JSON (internal bug) — raw text returned |
+//! | HG055 | serve `/v1` | `chat_template_kwargs` present but not a JSON object — ignored |
+//! | HG056 | serve stream | streamed tool-call fragment malformed — dropped; terminal buffered chunk covers the call |
 
 use snafu::Snafu;
 

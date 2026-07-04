@@ -399,11 +399,16 @@ pub(super) async fn v1_chat_completions(
     // llama.cpp-style per-request template knobs (object → JSON string for the
     // template apply). Non-object values are ignored rather than 400 — the
     // typed validation above never sees this key, matching llama.cpp's lenient
-    // handling of its own extension field.
-    let chat_template_kwargs = raw
-        .get("chat_template_kwargs")
-        .filter(|v| v.is_object())
-        .map(ToString::to_string);
+    // handling of its own extension field — but leave a coded trace so a
+    // client whose kwargs silently do nothing can be debugged from the logs.
+    let chat_template_kwargs = match raw.get("chat_template_kwargs") {
+        Some(v) if v.is_object() => Some(v.to_string()),
+        Some(v) => {
+            tracing::warn!(value = %v, "[HG055] chat_template_kwargs is not a JSON object; ignored");
+            None
+        }
+        None => None,
+    };
 
     // `max_tokens` is the context-clamped generation budget from `gate_and_validate`
     // (`min(requested or inferred, n_ctx − prompt, MAX_OUTPUT_TOKENS)`), so dispatch

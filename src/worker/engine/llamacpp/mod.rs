@@ -769,7 +769,9 @@ fn emit_piece(
         if route_parsed_deltas(st, piece, true, sink) {
             return;
         }
-        tracing::warn!("incremental chat parse failed mid-stream; raw deltas for the remainder");
+        tracing::warn!(
+            "[HG052] incremental chat parse failed mid-generation; raw content deltas for the remainder"
+        );
         *stream_state = None;
         // fall through: emit this piece raw so the stream keeps flowing
     }
@@ -876,7 +878,7 @@ fn parse_output(tmpl_result: &ChatTemplateResult, full: &str) -> ParsedOutput {
             Err(e) => {
                 // The crate returned non-JSON — an internal bug, not a model
                 // quirk. Preserve the raw text so the turn still answers.
-                tracing::error!(error = %e, "crate parse returned unparseable message json; returning raw text");
+                tracing::error!(error = %e, "[HG054] crate parse returned non-JSON message (internal bug); returning raw text");
                 ParsedOutput {
                     content: full.to_string(),
                     tool_calls: None,
@@ -885,7 +887,7 @@ fn parse_output(tmpl_result: &ChatTemplateResult, full: &str) -> ParsedOutput {
             }
         },
         Err(e) => {
-            tracing::warn!(error = %e, "crate parse rejected output; returning raw text");
+            tracing::warn!(error = %e, "[HG053] crate parse rejected the generation; returning raw text as content");
             ParsedOutput {
                 content: full.to_string(),
                 tool_calls: None,

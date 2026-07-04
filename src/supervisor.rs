@@ -1139,6 +1139,9 @@ fn route_notification(inner: &Arc<Inner>, notif: &RpcNotification) {
     // Additive wire shape: `kind` + (for tool fragments) `tool` ride next to
     // `delta` — decode is tolerant, absent kind ⇒ content (old-worker default).
     let Some(delta) = crate::worker::engine::ChatDelta::decode_chunk_params(&notif.params) else {
+        // A chunk with a missing/malformed payload would otherwise vanish as a
+        // silently missing word in the answer — leave a coded trace instead.
+        tracing::warn!(params = %notif.params, "[HG051] undecodable chat chunk dropped");
         return;
     };
     inner.demux.route_chunk(request_id, delta);
