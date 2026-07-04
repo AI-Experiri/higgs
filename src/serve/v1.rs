@@ -301,14 +301,19 @@ pub(super) async fn v1_models(State(higgs): State<Arc<Higgs>>) -> Response {
     // against a prepared-and-fitting unloaded model succeeds (higgs loads it on
     // demand) — the list must match what chat can actually reach. Unservable /
     // unprepared / stale-profile models stay hidden (the JIT gate refuses them).
-    for id in higgs.servable_model_ids().await {
-        if !data.iter().any(|m| m.id == id) {
-            data.push(Model {
-                id,
-                object: "model".to_owned(),
-                created: now_secs(),
-                owned_by: "higgs".to_owned(),
-            });
+    // …but ONLY while the JIT gate is ON: with JIT disabled, an unloaded
+    // servable model is NOT reachable (`ensure_loaded` refuses instead of
+    // loading), so advertising it would break this endpoint's contract.
+    if higgs.jit_enabled() {
+        for id in higgs.servable_model_ids().await {
+            if !data.iter().any(|m| m.id == id) {
+                data.push(Model {
+                    id,
+                    object: "model".to_owned(),
+                    created: now_secs(),
+                    owned_by: "higgs".to_owned(),
+                });
+            }
         }
     }
     // Also advertise remote-resident models — they are valid chat targets routed
