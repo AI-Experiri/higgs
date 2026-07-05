@@ -14,16 +14,20 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-/// What a key is allowed to do. `Admin` implies every other scope.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Scope {
-    /// `POST /v1/chat/completions`.
-    Chat,
-    /// Model listing/details (`GET /v1/models`, `GET /api/higgs/models*`).
-    Models,
-    /// Everything, including management (load/unload/settings/worker/nodes).
-    Admin,
+higgs_const_enum! {
+    /// What a key is allowed to do. `Admin` implies every other scope. Wire
+    /// type for the key-management surface (`/api/higgs/keys`), so the
+    /// frontend gets the const-object form.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub enum Scope {
+        /// `POST /v1/chat/completions`.
+        Chat,
+        /// Model listing/details (`GET /v1/models`, `GET /api/higgs/models*`).
+        Models,
+        /// Everything, including management (load/unload/settings/worker/nodes/keys).
+        Admin,
+    }
 }
 
 impl Scope {
@@ -39,7 +43,7 @@ impl Scope {
 }
 
 /// One stored key: its digest, a human label, and its granted scopes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct ApiKey {
     /// Lowercase hex SHA-256 of the plaintext token. The plaintext is never stored.
     pub sha256: String,
@@ -49,6 +53,19 @@ pub struct ApiKey {
     pub scopes: Vec<Scope>,
 }
 
+/// Redacted: only a short digest prefix ever reaches `Debug` output (logs,
+/// panics, `{:?}` in errors). The full digest is not itself a credential, but
+/// it is a stable key identifier — keep it out of anything greppable by habit.
+impl std::fmt::Debug for ApiKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiKey")
+            .field("label", &self.label)
+            .field("scopes", &self.scopes)
+            .field("sha256", &format_args!("{}…", self.sha256_prefix()))
+            .finish()
+    }
+}
+
 impl ApiKey {
     /// Does this key satisfy `required`? `Admin` satisfies anything.
     fn grants(&self, required: Scope) -> bool {
@@ -56,10 +73,16 @@ impl ApiKey {
             .iter()
             .any(|s| *s == Scope::Admin || *s == required)
     }
+
+    /// The first 12 hex chars of the digest — the display identifier the CLI
+    /// and the key-management API show (never the plaintext, never the full digest).
+    pub fn sha256_prefix(&self) -> &str {
+        &self.sha256[..self.sha256.len().min(12)]
+    }
 }
 
 /// The keystore: the set of [`ApiKey`]s loaded from `api_keys.json`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ApiKeys {
     #[serde(default)]
     keys: Vec<ApiKey>,
@@ -219,7 +242,7 @@ fn run_keys_at(path: &Path, args: &[String]) -> std::io::Result<()> {
                         "{:<16} {:?}  sha256:{}…",
                         k.label,
                         k.scopes,
-                        &k.sha256[..12]
+                        k.sha256_prefix()
                     );
                 }
             }

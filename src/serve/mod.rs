@@ -67,6 +67,19 @@ pub const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 /// chat-RPC timeout, a different layer).
 pub const CONTROL_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Whole-request timeout for the LONG model-op routes (`POST
+/// /api/higgs/models/load` and `/api/higgs/models/tune`), exempt from the tighter
+/// [`CONTROL_TIMEOUT`]. A **load** can walk the G5 OOM degrade-retry ladder (the
+/// initial load plus several rungs, each a worker load bounded by the control-RPC
+/// timeout, with a `SETTLE_BEFORE_RETRY` pause between); a Turbotune **benchmark**
+/// loads + measures several candidate configs back-to-back. On a normal-size model
+/// both easily exceed two minutes — under `CONTROL_TIMEOUT` the request would be
+/// cancelled (408) before the ladder returns [HG060] / a profile is saved. This
+/// generous cap is still a backstop: each underlying load/decode is independently
+/// bounded by the worker load/RPC timeouts, so a wedged op can't run forever. The
+/// fast analytical Suggest mode and a fits-first-time load complete well within it.
+pub const LONG_OP_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+
 /// Upper cap on a chat request's generation budget (`max_tokens` /
 /// `max_completion_tokens`). A request asking for more is rejected with
 /// `400 [HG013]` BEFORE dispatch. Bounds per-request work on the no-auth server
@@ -109,6 +122,22 @@ pub(crate) fn http_status(err: &HiggsError) -> StatusCode {
         }
         // Missing/insufficient API key.
         HiggsError::Unauthorized => StatusCode::UNAUTHORIZED,
+        // Refused state transition (last-key revoke on a LAN bind): the
+        // request is well-formed but conflicts with the server's live
+        // exposure state — mint a replacement first.
+        HiggsError::LastKeyOnLan { .. } => StatusCode::CONFLICT,
+        // Revoking the last Admin key while other keys remain would lock out the
+        // key-management surface ([HG066]) — a conflict with the current key set.
+        HiggsError::LastAdminKey { .. } => StatusCode::CONFLICT,
+        // Benchmark refused because the model is loaded ([HG067]) — a conflict the
+        // client resolves by unloading first.
+        HiggsError::BenchModelLoaded { .. } => StatusCode::CONFLICT,
+        // Load/chat refused because a benchmark owns the model ([HG068]) — a
+        // transient capacity condition; retry after the benchmark finishes.
+        HiggsError::BenchInProgress { .. } => StatusCode::SERVICE_UNAVAILABLE,
+        // A Turbotune benchmark cancelled by a concurrent load/unload/stop — a
+        // transient conflict; re-run when idle.
+        HiggsError::BenchCancelled => StatusCode::CONFLICT,
         // Client-side request errors caught at the boundary before dispatch.
         HiggsError::ContextOverflow { .. }
         | HiggsError::InvalidSamplingParam { .. }
@@ -127,6 +156,13 @@ pub(crate) fn http_status(err: &HiggsError) -> StatusCode {
         | HiggsError::WorkerDead { .. }
         | HiggsError::ServerBusy { .. }
         | HiggsError::InsufficientMemory { .. }
+        // A load that OOM'd through the whole degrade ladder — the machine is
+        // out of memory right now; freeing VRAM or a smaller footprint may fix
+        // it, so it's a retryable capacity signal, not a client error.
+        | HiggsError::LoadOomExhausted { .. }
+        // A Turbotune benchmark that found no fitting config — same retryable
+        // capacity signal (free VRAM / lower the budget and re-run).
+        | HiggsError::BenchExhausted { .. }
         // A retired/unreachable remote node is infrastructure-down — retryable.
         | HiggsError::NodeUnreachable { .. }
         | HiggsError::ServingDisabled => StatusCode::SERVICE_UNAVAILABLE,
@@ -150,7 +186,10 @@ pub(crate) fn http_status(err: &HiggsError) -> StatusCode {
             // HG006/HG007: worker down. HG017: remote node couldn't fit the model.
             // HG018: the resolved model was swapped out by a concurrent JIT load
             // (transient) — the client should retry, which re-JITs the model.
-            Some("HG006") | Some("HG007") | Some("HG017") | Some("HG018") => {
+            // HG060: a REMOTE node's load exhausted the OOM ladder — the same
+            // retryable capacity signal as the direct `LoadOomExhausted` arm,
+            // propagated back as a worker code (codex r19).
+            Some("HG006") | Some("HG007") | Some("HG017") | Some("HG018") | Some("HG060") => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
             // HG016: a remote chat that timed out, propagated as a worker code.
@@ -189,6 +228,35 @@ async fn health() -> StatusCode {
 ///   streaming `/v1/chat/completions` is left un-timed at the HTTP layer so a
 ///   long SSE stream is never aborted mid-flight.
 pub fn router(higgs: Arc<Higgs>) -> Router {
+    // Embedded hosts bind loopback, so the DNS-rebinding Host guard is on.
+    router_with_host_policy(higgs, true, CONTROL_TIMEOUT, LONG_OP_TIMEOUT)
+}
+
+/// [`router`] with the Host-guard policy made explicit. `enforce_loopback_host`
+/// is true for a loopback bind (the no-auth surface needs the DNS-rebinding
+/// defense) and false for a DELIBERATE non-loopback bind — which [HG058]
+/// guarantees is key-gated, so a rebound page gains nothing (401) and LAN
+/// clients' natural `Host: <lan-ip>:<port>` must not 403 ([HG012]) before auth.
+///
+/// `control_timeout` / `tune_timeout` are injected (not read straight from the
+/// consts) so a test can build the REAL router with tiny timeouts and prove the
+/// tune route is exempt from the tighter control bound. Production callers pass
+/// [`CONTROL_TIMEOUT`] / [`LONG_OP_TIMEOUT`].
+///
+/// `pub(crate)` — NOT `pub` (codex r5): the relaxed (`false`) host policy must be
+/// reachable ONLY through [`serve_with_shutdown`] (which runs the [HG058] keyless-LAN
+/// and [HG069] no-Admin refusals and records `lan_exposed` BEFORE building it) or the
+/// loopback-guarded [`router`]. A `pub` constructor would let an out-of-crate embedder
+/// merge a relaxed-host router into its own Axum app with an empty keystore and no
+/// exposure state — serving unauthenticated on a LAN with the Host guard off.
+/// `pub(crate)` keeps it crate-internal (embedders can't reach it), exposing it only to
+/// the in-crate timeout test.
+pub(crate) fn router_with_host_policy(
+    higgs: Arc<Higgs>,
+    enforce_loopback_host: bool,
+    control_timeout: Duration,
+    long_op_timeout: Duration,
+) -> Router {
     // Streaming surface: NO whole-request timeout (an SSE stream must outlive
     // any per-request bound). The chat duration is bounded separately by the
     // worker chat-RPC timeout; the live log stream is unbounded by design.
@@ -202,8 +270,6 @@ pub fn router(higgs: Arc<Higgs>) -> Router {
     let control = Router::new()
         .route("/v1/models", get(v1::v1_models))
         .route("/api/higgs/models", get(control::control_models))
-        .route("/api/higgs/models/load", post(control::control_load))
-        .route("/api/higgs/models/tune", post(control::control_tune))
         .route(
             "/api/higgs/models/estimate",
             post(control::control_estimate),
@@ -240,15 +306,40 @@ pub fn router(higgs: Arc<Higgs>) -> Router {
             "/api/higgs/settings",
             get(control::control_settings).put(control::control_set_settings),
         )
+        .route(
+            "/api/higgs/keys",
+            get(control::control_keys_list).post(control::control_keys_mint),
+        )
+        .route(
+            "/api/higgs/keys/{label}",
+            axum::routing::delete(control::control_keys_revoke),
+        )
         .route("/api/higgs/worker/stop", post(control::control_worker_stop))
         .route("/api/higgs/version", get(control::control_version))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
-            CONTROL_TIMEOUT,
+            control_timeout,
+        ));
+
+    // Long model-op surface: `/api/higgs/models/load` and `/api/higgs/models/tune`
+    // get their OWN, much longer timeout ([`LONG_OP_TIMEOUT`]). A load walks the G5
+    // OOM degrade-retry ladder (several worker loads + settle sleeps) and a Turbotune
+    // benchmark loads + measures several candidate configs — both routinely outlive
+    // the tighter control bound, so under `control_timeout` a big model would be
+    // cancelled (408) before the ladder finishes / a profile is saved. Split into a
+    // separate group so only these two routes are exempted; the rest of the control
+    // surface keeps the tight cap.
+    let long_ops = Router::new()
+        .route("/api/higgs/models/load", post(control::control_load))
+        .route("/api/higgs/models/tune", post(control::control_tune))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            long_op_timeout,
         ));
 
     streaming
         .merge(control)
+        .merge(long_ops)
         .route("/health", get(health))
         .route("/api/higgs/health", get(health))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
@@ -256,8 +347,10 @@ pub fn router(higgs: Arc<Higgs>) -> Router {
         // Auth runs AFTER the host guard (outer layers run first): reject a non-loopback
         // Host before doing any key work. `from_fn_with_state` gives the guard the keystore.
         .layer(middleware::from_fn_with_state(higgs.clone(), auth_guard))
-        .layer(middleware::from_fn(host_guard))
-        .layer(local_cors())
+        .layer(middleware::from_fn(move |req, next| {
+            host_guard(enforce_loopback_host, req, next)
+        }))
+        .layer(local_cors(higgs.extra_cors_origins()))
         .with_state(higgs)
 }
 
@@ -267,7 +360,13 @@ pub fn router(higgs: Arc<Higgs>) -> Router {
 /// DNS-rebind its own hostname to `127.0.0.1` and reach this server from the
 /// victim's browser. A missing `Host` header is rejected (ollama behavior). On
 /// rejection: `403` carrying the `[HG012]` diagnostic.
-async fn host_guard(req: Request, next: Next) -> Response {
+async fn host_guard(enforce_loopback_host: bool, req: Request, next: Next) -> Response {
+    if !enforce_loopback_host {
+        // Keyed non-loopback bind: every data route is bearer-gated, so DNS
+        // rebinding gains nothing — and LAN clients legitimately send their
+        // server's LAN ip/hostname in `Host`.
+        return next.run(req).await;
+    }
     match host_allowed(req.headers()) {
         Ok(()) => next.run(req).await,
         Err(host) => {
@@ -334,7 +433,7 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
 /// The message is the coded [`HiggsError::Unauthorized`] display ("[HG048] …"),
 /// so the `401` carries a diagnostic code + resolution like every other reply,
 /// while the OpenAI `code: "unauthorized"` stays for client compatibility.
-fn unauthorized() -> Response {
+pub(super) fn unauthorized() -> Response {
     let body = axum::Json(serde_json::json!({
         "error": {
             "message": HiggsError::Unauthorized.to_string(),
@@ -408,7 +507,63 @@ pub async fn serve_with_shutdown(
     listener: tokio::net::TcpListener,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
-    let app = router(Arc::clone(&higgs));
+    // The Host-guard policy follows the REAL bound address: loopback keeps the
+    // DNS-rebinding defense; a deliberate non-loopback bind (key-gated per
+    // [HG058]) must accept LAN `Host` values or the mode is unusable.
+    let enforce_loopback_host = listener
+        .local_addr()
+        .map(|a| a.ip().is_loopback())
+        .unwrap_or(true); // unknowable ⇒ fail CLOSED (strictest policy)
+                          // [HG058] AT THE ENFORCEMENT POINT: a non-loopback listener with zero keys
+                          // must never serve — auth would be off AND the Host guard below would be
+                          // relaxed, exposing the whole surface. `run_standalone` refuses earlier
+                          // (before even binding — nicer failure), but THIS is the last line for
+                          // library/embedded callers who hand us their own listener.
+    if !enforce_loopback_host && higgs.api_keys().is_empty() {
+        let bind = listener
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| "<unknown>".into());
+        // Refusing to serve, but an embedded caller may have already
+        // `start()`ed this facade (spawning a worker). Tear it down before the
+        // early return so the rejected serve attempt doesn't LEAK the worker /
+        // runtime (codex r11) — same cleanup the normal exit path runs.
+        higgs.stop().await;
+        return Err(std::io::Error::other(
+            HiggsError::LanBindWithoutKeys { bind }.to_string(),
+        ));
+    }
+    // [HG069] AT THE ENFORCEMENT POINT: a non-loopback listener whose keys are ALL
+    // non-Admin locks out the Admin-only key-management API (mint/revoke) — mirror
+    // `run_standalone`'s guard so a library/embedded caller handing us its own
+    // listener can't bypass it. Zero-keys is already refused above, so at least one
+    // key exists here; refuse if none is Admin-capable.
+    if !enforce_loopback_host
+        && !higgs
+            .api_keys()
+            .iter()
+            .any(|k| k.scopes.contains(&crate::keys::Scope::Admin))
+    {
+        let bind = listener
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| "<unknown>".into());
+        // Same worker-teardown-before-refuse as the [HG058] path (no leak).
+        higgs.stop().await;
+        return Err(std::io::Error::other(
+            HiggsError::LanBindWithoutAdminKey { bind }.to_string(),
+        ));
+    }
+    // Record the exposure on the facade: key management refuses to revoke the
+    // LAST key while LAN-exposed ([HG059]) — revoke-to-empty would reopen the
+    // whole surface at runtime, bypassing the [HG058] startup guarantee.
+    higgs.set_lan_exposed(!enforce_loopback_host);
+    let app = router_with_host_policy(
+        Arc::clone(&higgs),
+        enforce_loopback_host,
+        CONTROL_TIMEOUT,
+        LONG_OP_TIMEOUT,
+    );
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
         .await?;
@@ -424,12 +579,15 @@ pub async fn serve_with_shutdown(
 /// here). Rather than enumerate ports, allow any localhost/127.0.0.1 origin
 /// plus the tauri webview origins. higgs is localhost/webview only — not a
 /// public surface — so trusting any loopback origin matches its threat model.
-fn local_cors() -> CorsLayer {
+fn local_cors(extra_origins: Vec<String>) -> CorsLayer {
     CorsLayer::new()
-        .allow_origin(AllowOrigin::predicate(|origin: &HeaderValue, _req| {
+        .allow_origin(AllowOrigin::predicate(move |origin: &HeaderValue, _req| {
             is_local_origin(origin)
+                || origin
+                    .to_str()
+                    .is_ok_and(|o| extra_origins.iter().any(|e| e == o))
         }))
-        .allow_methods([Method::GET, Method::POST, Method::PUT])
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
         .allow_headers(tower_http::cors::Any)
 }
 

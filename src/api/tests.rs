@@ -768,11 +768,10 @@ async fn chat_stream_delivers() {
     assert_eq!(outcome.prompt_tokens, 10);
     assert_eq!(outcome.completion_tokens, 3);
 
-    // The streamed deltas must have arrived in order.
-    let chunk1 = rx.recv().await.expect("chunk 1");
-    let chunk2 = rx.recv().await.expect("chunk 2");
-    assert_eq!(chunk1.text, "he");
-    assert_eq!(chunk2.text, "llo");
+    // The streamed deltas arrived — buffered same-kind chunks merge in the
+    // delta queue into one run with the text intact and in order.
+    let chunk = rx.recv().await.expect("merged content run");
+    assert_eq!(chunk.text, "hello");
 }
 
 // ── log_bus(): delegates to the local node's shared bus ───────────────────
@@ -1199,4 +1198,1323 @@ fn fake_higgs_ollama(ollama_dirs: Vec<PathBuf>) -> Higgs {
         default_load: HiggsConfig::default().default_load,
     };
     Higgs::with_local(Arc::new(node), cfg)
+}
+
+// ── G5: OOM degrade-retry ladder (run_oom_ladder) via an injected loader ─────
+
+fn oom_err(msg: &str) -> HiggsError {
+    HiggsError::EngineLoadFailed {
+        id: "org/model".into(),
+        reason: format!("ggml_backend_alloc_ctx_tensors: {msg}: out of memory"),
+    }
+}
+
+fn corrupt_err() -> HiggsError {
+    HiggsError::EngineLoadFailed {
+        id: "org/model".into(),
+        reason: "done_getting_tensors: wrong number of tensors".into(),
+    }
+}
+
+fn np_count(n: u32) -> crate::remote::NodeLoadParams {
+    crate::remote::NodeLoadParams {
+        id: "org/model".into(),
+        ctx_len: None,
+        gpu_layers: Some(GpuLayers::Count { n }),
+        threads: None,
+        params: None,
+    }
+}
+
+/// A load that fits first try makes exactly ONE call — no ladder built (the
+/// common jigglebot path is unchanged).
+#[tokio::test]
+async fn ladder_load_that_fits_calls_once() {
+    let calls = std::cell::Cell::new(0);
+    let r = run_oom_ladder(
+        "org/model",
+        np_count(40),
+        None,
+        std::time::Duration::ZERO,
+        |_p| {
+            calls.set(calls.get() + 1);
+            async { Ok(()) }
+        },
+    )
+    .await;
+    assert!(r.is_ok());
+    assert_eq!(calls.get(), 1, "a fitting load makes one attempt");
+}
+
+/// OOM on attempt 0, then success on the first ladder rung (plain retry): the
+/// ladder RESCUES the load. Fail-on-revert: a single-shot loader (no retry
+/// loop) returns the OOM error instead of Ok.
+#[tokio::test]
+async fn ladder_retries_after_oom_then_succeeds() {
+    let n = std::cell::Cell::new(0);
+    let r = run_oom_ladder(
+        "org/model",
+        np_count(40),
+        None,
+        std::time::Duration::ZERO,
+        |_p| {
+            let attempt = n.get();
+            n.set(attempt + 1);
+            async move {
+                if attempt == 0 {
+                    Err(oom_err("first"))
+                } else {
+                    Ok(())
+                }
+            }
+        },
+    )
+    .await;
+    assert!(r.is_ok(), "OOM then rescued on the plain-retry rung");
+    assert_eq!(n.get(), 2, "attempt 0 + one rung");
+}
+
+/// When the ladder is rescued on a DEGRADED rung (KV-off, not the plain retry),
+/// `run_oom_ladder` returns THAT rung's params so the caller persists the config
+/// that actually loaded — not the seed that OOMed. Fail-on-revert: return the seed
+/// `np` instead of the successful rung's params and the returned config equals the
+/// failing seed, so this `assert_ne!` fails (and `load_inner_impl` would save the
+/// wrong profile that re-OOMs on every future load).
+#[tokio::test]
+async fn ladder_returns_the_degraded_rung_that_loaded() {
+    let n = std::cell::Cell::new(0);
+    let seed = np_count(40);
+    let loaded = run_oom_ladder(
+        "org/model",
+        seed.clone(),
+        Some(40),
+        std::time::Duration::ZERO,
+        |_p| {
+            let a = n.get();
+            n.set(a + 1);
+            // seed (0) + plain-retry rung (1) OOM; the KV-off rung (2) loads.
+            async move {
+                if a < 2 {
+                    Err(oom_err("oom"))
+                } else {
+                    Ok(())
+                }
+            }
+        },
+    )
+    .await
+    .expect("rescued on the KV-off rung");
+    assert_ne!(
+        loaded, seed,
+        "returned the DEGRADED rung params (KV off), not the seed that OOMed"
+    );
+}
+
+/// Every attempt OOMs → the aggregate [HG060] with the attempt count and the
+/// LAST reason. A 40-layer base has 4 attempts (0 + retry + kv-off + halve).
+#[tokio::test]
+async fn ladder_exhausts_to_aggregate_hg060() {
+    let n = std::cell::Cell::new(0);
+    let r = run_oom_ladder(
+        "org/model",
+        np_count(40),
+        None,
+        std::time::Duration::ZERO,
+        |_p| {
+            let i = n.get();
+            n.set(i + 1);
+            async move { Err(oom_err(&format!("rung{i}"))) }
+        },
+    )
+    .await;
+    match r {
+        Err(HiggsError::LoadOomExhausted { attempts, last }) => {
+            assert_eq!(attempts, 4, "attempt 0 + 3 rungs for a Count base");
+            assert!(last.contains("rung3"), "carries the final reason: {last}");
+        }
+        other => panic!("expected HG060 aggregate, got {other:?}"),
+    }
+    assert_eq!(n.get(), 4);
+}
+
+/// A NON-OOM failure is returned immediately — no retry (a corrupt GGUF fails
+/// identically however it's loaded). Fail-on-revert: retrying regardless would
+/// make more than one call.
+#[tokio::test]
+async fn ladder_does_not_retry_non_oom() {
+    let n = std::cell::Cell::new(0);
+    let r = run_oom_ladder(
+        "org/model",
+        np_count(40),
+        None,
+        std::time::Duration::ZERO,
+        |_p| {
+            n.set(n.get() + 1);
+            async { Err(corrupt_err()) }
+        },
+    )
+    .await;
+    assert!(matches!(r, Err(HiggsError::EngineLoadFailed { .. })));
+    assert_eq!(n.get(), 1, "non-OOM is not retried");
+}
+
+/// A different (non-OOM) fault surfacing on a degraded rung stops the ladder
+/// and is surfaced as-is (the config change exposed a new problem).
+#[tokio::test]
+async fn ladder_stops_on_non_oom_mid_ladder() {
+    let n = std::cell::Cell::new(0);
+    let r = run_oom_ladder(
+        "org/model",
+        np_count(40),
+        None,
+        std::time::Duration::ZERO,
+        |_p| {
+            let i = n.get();
+            n.set(i + 1);
+            async move {
+                if i == 0 {
+                    Err(oom_err("first"))
+                } else {
+                    Err(corrupt_err()) // a rung reveals a non-memory fault
+                }
+            }
+        },
+    )
+    .await;
+    assert!(
+        matches!(r, Err(HiggsError::EngineLoadFailed { reason, .. }) if reason.contains("tensors"))
+    );
+    assert_eq!(
+        n.get(),
+        2,
+        "attempt 0 OOM + one rung that revealed the fault"
+    );
+}
+
+// ── G6 Turbotune: run_benchmark orchestration (injected measure + cancel) ────
+
+fn cand(label: &'static str) -> crate::tune::bench::Candidate {
+    crate::tune::bench::Candidate {
+        load: crate::worker::engine::llamacpp::params::LlamaCppParams::default(),
+        label,
+    }
+}
+
+fn bench(tps: f32) -> crate::tune::BenchResult {
+    crate::tune::BenchResult {
+        gen_tps: tps,
+        ..Default::default()
+    }
+}
+
+/// The orchestrator measures each candidate and returns the fastest.
+#[tokio::test]
+async fn benchmark_picks_the_fastest_candidate() {
+    let cands = vec![cand("a"), cand("b"), cand("c")];
+    let tps = std::cell::RefCell::new(vec![10.0f32, 25.0, 18.0].into_iter());
+    let (winner, result) = run_benchmark(
+        cands,
+        |_c| {
+            let v = tps.borrow_mut().next().unwrap();
+            async move { Ok(bench(v)) }
+        },
+        || false,
+    )
+    .await
+    .expect("a winner");
+    assert_eq!(winner.label, "b", "b has the highest tps");
+    assert_eq!(result.gen_tps, 25.0);
+}
+
+/// A candidate that FAILS to measure is skipped; a later one can still win.
+#[tokio::test]
+async fn benchmark_skips_failed_candidates() {
+    let cands = vec![cand("bad"), cand("good")];
+    let n = std::cell::Cell::new(0);
+    let (winner, _) = run_benchmark(
+        cands,
+        |_c| {
+            let i = n.get();
+            n.set(i + 1);
+            async move {
+                if i == 0 {
+                    Err(HiggsError::EngineLoadFailed {
+                        id: "x".into(),
+                        reason: "oom".into(),
+                    })
+                } else {
+                    Ok(bench(30.0))
+                }
+            }
+        },
+        || false,
+    )
+    .await
+    .expect("the good one wins");
+    assert_eq!(winner.label, "good");
+}
+
+/// Every candidate failing yields the aggregate [HG063] with each named.
+#[tokio::test]
+async fn benchmark_all_fail_gives_aggregate_hg063() {
+    let cands = vec![cand("one"), cand("two")];
+    let err = run_benchmark(
+        cands,
+        |c| {
+            let label = c.label;
+            async move {
+                Err(HiggsError::EngineLoadFailed {
+                    id: label.into(),
+                    reason: "nope".into(),
+                })
+            }
+        },
+        || false,
+    )
+    .await
+    .expect_err("all failed");
+    match err {
+        HiggsError::BenchExhausted { detail } => {
+            assert!(
+                detail.contains("one") && detail.contains("two"),
+                "names each: {detail}"
+            );
+        }
+        other => panic!("expected HG063, got {other:?}"),
+    }
+}
+
+/// A cancel signal that flips true aborts the run with [HG064] before the next
+/// candidate. Fail-on-revert: never checking `cancelled` benches all candidates.
+#[tokio::test]
+async fn benchmark_cancels_between_candidates() {
+    let cands = vec![cand("first"), cand("second")];
+    let measured = std::cell::Cell::new(0);
+    let err = run_benchmark(
+        cands,
+        |_c| {
+            measured.set(measured.get() + 1);
+            async move { Ok(bench(10.0)) }
+        },
+        // Cancel AFTER the first candidate is measured.
+        || measured.get() >= 1,
+    )
+    .await
+    .expect_err("cancelled");
+    assert!(matches!(err, HiggsError::BenchCancelled));
+    assert_eq!(measured.get(), 1, "the second candidate was never benched");
+}
+
+/// A benchmark's teardown (`bench_unload_id`) unloads ONLY the benched model's
+/// worker — never other resident/serving models on a multi-model node. Fail-on-
+/// revert: drain every worker (the old unscoped `bench_unload_all`) and the
+/// unrelated model is evicted too.
+#[tokio::test]
+async fn bench_unload_id_leaves_other_models_resident() {
+    let dir = tempfile::TempDir::new().unwrap();
+    crate::serve::test_support::write_gguf_fixture(dir.path(), "org/a");
+    crate::serve::test_support::write_gguf_fixture(dir.path(), "org/b");
+    let higgs = fake_higgs(vec![dir.path().to_path_buf()]);
+    higgs.load("org/a", None).await.expect("load a");
+    higgs.load("org/b", None).await.expect("load b");
+
+    // Scoped teardown for "org/a" must leave "org/b" resident.
+    higgs.bench_unload_id("org/a").await;
+
+    let resident: Vec<String> = higgs
+        .local
+        .instances()
+        .await
+        .into_iter()
+        .map(|(_, m)| m)
+        .collect();
+    assert!(
+        !resident.iter().any(|m| m == "org/a"),
+        "the benched model's worker was unloaded"
+    );
+    assert!(
+        resident.iter().any(|m| m == "org/b"),
+        "the unrelated model must survive a scoped bench teardown: {resident:?}"
+    );
+}
+
+/// A benchmark loads candidates through a DIRECT node load (not `load_inner`), so it
+/// does NOT write a per-model `last_load` record to config for each candidate — the
+/// bench persists only its winning tuning profile. Fail-on-revert: load candidates
+/// via `load_inner` and the model gets a spurious `last_load` (the last benched
+/// config) even though nothing was explicitly loaded.
+#[tokio::test]
+async fn benchmark_does_not_write_config_load_records() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let id = stage_ollama_model(dir.path(), "tiny", "1b");
+    let higgs = fake_higgs_ollama(vec![dir.path().to_path_buf()]);
+
+    higgs
+        .tune(TuneRequest {
+            id: id.clone(),
+            mode: Some(TuneMode::Benchmark),
+            budget: None,
+        })
+        .await
+        .expect("benchmark");
+
+    assert!(
+        higgs
+            .model_records()
+            .get(&id)
+            .and_then(|r| r.load.as_ref())
+            .is_none(),
+        "the bench's candidate loads must NOT write a last_load config record"
+    );
+}
+
+/// A benchmark REFUSES to run on a LOADED model ([HG067]) — it would disrupt the
+/// live worker and contaminate the measurement; the model must be unloaded first.
+/// Fail-on-revert: drop the instances-loaded check in `turbotune_bench` and the
+/// benchmark proceeds against the resident model instead of refusing.
+#[tokio::test]
+async fn benchmark_refuses_a_loaded_model() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let id = stage_ollama_model(dir.path(), "tiny", "1b");
+    let higgs = fake_higgs_ollama(vec![dir.path().to_path_buf()]);
+    higgs.load(&id, None).await.expect("load");
+
+    let err = higgs
+        .tune(TuneRequest {
+            id: id.clone(),
+            mode: Some(TuneMode::Benchmark),
+            budget: None,
+        })
+        .await
+        .expect_err("benchmark must refuse a loaded model");
+    assert!(
+        matches!(err, HiggsError::BenchModelLoaded { .. }),
+        "expected HG067 BenchModelLoaded, got {err:?}"
+    );
+}
+
+/// A public load REFUSES while the model is being benchmarked ([HG068]), and
+/// succeeds again once the benchmark finishes. Fail-on-revert: drop the
+/// `is_benchmarking` gate in `load_inner_impl` and the load proceeds against the
+/// benchmarking model, racing the bench for it.
+#[tokio::test]
+async fn load_refuses_while_benchmarking() {
+    let dir = tempfile::TempDir::new().unwrap();
+    crate::serve::test_support::write_gguf_fixture(dir.path(), "org/model");
+    let higgs = fake_higgs(vec![dir.path().to_path_buf()]);
+
+    // Mark the model benchmarking (hold the guard) — a load must now refuse.
+    let bench = higgs.begin_benchmark("org/model");
+    let err = higgs
+        .load("org/model", None)
+        .await
+        .expect_err("load must refuse while benchmarking");
+    assert!(
+        matches!(err, HiggsError::BenchInProgress { .. }),
+        "expected HG068 BenchInProgress, got {err:?}"
+    );
+
+    // Once the benchmark ends, the load works again.
+    drop(bench);
+    higgs
+        .load("org/model", None)
+        .await
+        .expect("load works after the benchmark releases the model");
+}
+
+/// `unload` (drain-all) REFUSES while any model is being benchmarked ([HG068]) —
+/// a benchmark owns its candidate worker, and a drain would evict it mid-measure.
+/// Fail-on-revert: drop the benchmarking guard in `unload` and it drains happily.
+#[tokio::test]
+async fn unload_all_refuses_while_benchmarking() {
+    let higgs = fake_higgs(vec![]);
+    let bench = higgs.begin_benchmark("org/model");
+    let err = higgs
+        .unload()
+        .await
+        .expect_err("unload-all must refuse while a benchmark runs");
+    assert!(
+        matches!(err, HiggsError::BenchInProgress { .. }),
+        "expected HG068 BenchInProgress, got {err:?}"
+    );
+    // Releasing the benchmark lets the drain proceed again.
+    drop(bench);
+    higgs
+        .unload()
+        .await
+        .expect("unload works after the release");
+}
+
+/// `unload_one` REFUSES ejecting a resident model that a benchmark owns ([HG068]),
+/// so a per-card Eject can't evict the bench's candidate mid-measure. Fail-on-revert:
+/// drop the `is_benchmarking` check in `unload_one` and the eject succeeds.
+#[tokio::test]
+async fn unload_one_refuses_while_benchmarking() {
+    let dir = tempfile::TempDir::new().unwrap();
+    crate::serve::test_support::write_gguf_fixture(dir.path(), "org/model");
+    let higgs = fake_higgs(vec![dir.path().to_path_buf()]);
+    higgs.load("org/model", None).await.expect("load");
+    let bench = higgs.begin_benchmark("org/model");
+    let err = higgs
+        .unload_one("org/model")
+        .await
+        .expect_err("unload_one must refuse ejecting a benchmarking model");
+    assert!(
+        matches!(err, HiggsError::BenchInProgress { .. }),
+        "expected HG068 BenchInProgress, got {err:?}"
+    );
+    drop(bench);
+    higgs
+        .unload_one("org/model")
+        .await
+        .expect("unload_one works after the release");
+}
+
+/// A SECOND benchmark for the same model REFUSES ([HG068]) instead of interleaving
+/// with the first (their `bench_unload_id` calls would evict each other's candidate
+/// workers). Fail-on-revert: drop the `is_benchmarking` check in `turbotune_bench`
+/// and the second benchmark runs to completion (returns Ok) instead of erroring.
+#[tokio::test]
+async fn benchmark_refuses_while_already_benchmarking() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let id = stage_ollama_model(dir.path(), "tiny", "1b");
+    let higgs = fake_higgs_ollama(vec![dir.path().to_path_buf()]);
+    // A benchmark already owns the model (guard held).
+    let bench = higgs.begin_benchmark(&id);
+    let err = higgs
+        .tune(TuneRequest {
+            id: id.clone(),
+            mode: Some(TuneMode::Benchmark),
+            budget: None,
+        })
+        .await
+        .expect_err("a second concurrent benchmark must refuse");
+    assert!(
+        matches!(err, HiggsError::BenchInProgress { .. }),
+        "expected HG068 BenchInProgress, got {err:?}"
+    );
+    drop(bench);
+}
+
+/// A Turbotune benchmark deliberately outlives the tight control timeout: it loads
+/// + measures several candidates back-to-back (each preceded by a 750ms settle), so
+/// on a real model it runs for minutes. The `/api/higgs/models/tune` route lives in
+/// its own longer-timeout group, so it must NOT be aborted by the control timeout.
+/// Here the REAL router is built with a 200ms control timeout — shorter than a
+/// single settle — yet the benchmark completes (200), because tune uses the 30s
+/// bound. Fail-on-revert: put the tune route back under the control timeout and the
+/// benchmark is cancelled (408) instead.
+#[tokio::test]
+async fn benchmark_tune_outlives_the_control_timeout() {
+    use tower::ServiceExt as _;
+    let dir = tempfile::TempDir::new().unwrap();
+    let id = stage_ollama_model(dir.path(), "tiny", "1b");
+    let higgs = Arc::new(fake_higgs_ollama(vec![dir.path().to_path_buf()]));
+    // The REAL router, but with a control timeout FAR shorter than the benchmark's
+    // own settle pauses and a generous tune timeout.
+    let app = crate::serve::router_with_host_policy(
+        higgs,
+        true,
+        std::time::Duration::from_millis(200), // control surface
+        std::time::Duration::from_secs(30),    // tune surface
+    );
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/api/higgs/models/tune")
+        .header("host", "127.0.0.1")
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            serde_json::json!({ "id": id, "mode": "benchmark" }).to_string(),
+        ))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        axum::http::StatusCode::OK,
+        "benchmark tune (multi-candidate, >200ms) must survive the control timeout — \
+         it is in the longer long-op timeout group, not the control group"
+    );
+}
+
+/// A model LOAD also escapes the tight control timeout: it can walk the OOM
+/// degrade-retry ladder (several worker loads + settle sleeps), so it lives in the
+/// long-op timeout group beside tune. Here the REAL router is built with a 1ms
+/// control timeout — which would 408 any real control op — yet the load completes
+/// (200) via the 30s long-op bound. Fail-on-revert: move the load route back under
+/// the control timeout and the load is cancelled (408) instead.
+#[tokio::test]
+async fn model_load_outlives_the_control_timeout() {
+    use tower::ServiceExt as _;
+    let dir = tempfile::TempDir::new().unwrap();
+    crate::serve::test_support::write_gguf_fixture(dir.path(), "org/model");
+    let higgs = Arc::new(fake_higgs(vec![dir.path().to_path_buf()]));
+    let app = crate::serve::router_with_host_policy(
+        higgs,
+        true,
+        std::time::Duration::from_millis(1), // control surface — trips on any real op
+        std::time::Duration::from_secs(30),  // long-op surface
+    );
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/api/higgs/models/load")
+        .header("host", "127.0.0.1")
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            serde_json::json!({ "id": "org/model" }).to_string(),
+        ))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        axum::http::StatusCode::OK,
+        "model load must survive the control timeout — it is in the long-op group"
+    );
+}
+
+/// A terminal `stop` (shutdown) aborts an in-flight Turbotune benchmark with
+/// [HG064] rather than iterating candidates against the draining node. Here `stop`
+/// runs FIRST (setting the shutdown flag + draining the node); the subsequent
+/// benchmark trips the cancel hook before loading a single candidate. Fail-on-revert:
+/// with the hook hard-coded `|| false`, the benchmark instead loads candidates
+/// against the terminal node and every one fails → HG063 (BenchExhausted), not HG064.
+#[tokio::test]
+async fn benchmark_cancels_on_shutdown() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let id = stage_ollama_model(dir.path(), "tiny", "1b");
+    let higgs = fake_higgs_ollama(vec![dir.path().to_path_buf()]);
+    // Terminal shutdown: sets `shutting_down` and drains the local node.
+    higgs.stop().await;
+    let err = higgs
+        .tune(TuneRequest {
+            id,
+            mode: Some(TuneMode::Benchmark),
+            budget: None,
+        })
+        .await
+        .expect_err("a benchmark racing shutdown must cancel");
+    assert!(
+        matches!(err, HiggsError::BenchCancelled),
+        "shutdown aborts the benchmark with HG064 BenchCancelled, got {err:?}"
+    );
+}
+
+// ── G6 Turbotune end-to-end via the fake worker (measure → persist Bench) ────
+
+/// `tune` in Benchmark mode (Turbotune) does NOT fall back to Suggest: it LOADS +
+/// MEASURES candidate configs through the stateful fake worker (`turbotune_bench`
+/// → `run_benchmark` → `measure_gen_tps` → `bench_unload_all`) and saves the
+/// FASTEST as a measured profile. Provenance flips to `Bench`, the persisted record
+/// carries a positive `bench_tps` from a real (fake) decode, and the rationale gains
+/// the "Turbotune measured …" line. Fail-on-revert: make Benchmark mode skip
+/// `turbotune_bench` (Suggest fallback) and provenance stays `Heuristic`, `bench_tps`
+/// stays `None`, and the line is absent. An `ollama/` id short-circuits the HF-card
+/// fetch, so no network is touched (and no GPU is present, so every KV-variant
+/// candidate fits → at least one gets benched).
+#[tokio::test]
+async fn tune_benchmark_measures_and_persists_bench_profile() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let id = stage_ollama_model(dir.path(), "tiny", "1b");
+    let higgs = fake_higgs_ollama(vec![dir.path().to_path_buf()]);
+
+    let suggestion = higgs
+        .tune(TuneRequest {
+            id: id.clone(),
+            mode: Some(TuneMode::Benchmark),
+            budget: None,
+        })
+        .await
+        .expect("turbotune benchmark measures a config");
+
+    assert_eq!(
+        suggestion.provenance,
+        crate::tune::TuneProvenance::Bench,
+        "a measured benchmark stamps Bench provenance (not the Suggest fallback)"
+    );
+    assert!(
+        suggestion
+            .rationale
+            .iter()
+            .any(|r| r.contains("Turbotune measured")),
+        "the measured throughput is explained in the rationale: {:?}",
+        suggestion.rationale
+    );
+
+    // The persisted saved profile carries the MEASURED tok/s (a real fake decode
+    // streams 3 completion tokens in >0 seconds, so gen_tps is strictly positive).
+    let rec = higgs
+        .models_store()
+        .expect("models store opens")
+        .tuning(&id)
+        .expect("bench profile persisted");
+    assert_eq!(
+        rec.provenance,
+        crate::tune::TuneProvenance::Bench,
+        "the saved profile is the measured winner"
+    );
+    let tps = rec
+        .bench_tps
+        .expect("bench_tps recorded on the saved profile");
+    assert!(
+        tps > 0.0,
+        "measured a positive generation throughput: {tps}"
+    );
+}
+
+// ── Readiness / servable / fit: the JIT-serving classification ────────────────
+
+/// Seed a FRESH tuning profile straight into the per-instance store, anchored to
+/// the CURRENT hardware fingerprint + on-disk model file signature so
+/// `profile_stale` reads it as NOT stale (exactly like a real Prepare). `ctx` keeps
+/// the KV footprint small so the RAM fit is dominated by the fixed compute overhead
+/// (fits any dev host with free RAM). No llama.cpp — only the staleness anchors and
+/// the load params matter to the readiness math.
+async fn seed_fresh_profile(higgs: &Higgs, id: &str, ctx: CtxLen) {
+    use crate::worker::engine::LoadParams;
+    let hw = higgs.hardware().await;
+    let path = higgs
+        .scan()
+        .await
+        .ok()
+        .and_then(|ms| ms.into_iter().find(|m| m.id == id).map(|m| m.path))
+        .expect("fixture model is scannable");
+    let store = higgs.models_store().expect("open models store");
+    store.put_tuning(
+        id,
+        crate::tune::store::TuneRecord {
+            profile: LoadParams::base(ctx, GpuLayers::All, 8),
+            sampling: Default::default(),
+            budget: Default::default(),
+            provenance: crate::tune::TuneProvenance::Heuristic,
+            bench_tps: None,
+            tuned_at_ms: 1,
+            hw_fingerprint: hw.fingerprint(),
+            model_file_sig: file_sig(&path),
+        },
+    );
+    store.flush().expect("persist seeded profile");
+}
+
+/// The readiness classifier + `servable_model_ids` reflect the LIVE serving toggle
+/// and residency. A fresh, fitting, non-resident profile with serving on is
+/// `Servable` (a valid JIT target, surfaced by `servable_model_ids`) and carries a
+/// `ModelFit`; turning serving OFF makes it `Profiled` (no fit, dropped from the
+/// servable list); loading it makes it `Loaded` (dropped again — it's already
+/// resident). Fail-on-revert: break the serving/loaded precedence in
+/// `derive_readiness` (or drop the servable filter) and one of these transitions
+/// misclassifies.
+#[tokio::test]
+async fn servable_readiness_reflects_serving_and_residency() {
+    let dir = tempfile::TempDir::new().unwrap();
+    crate::serve::test_support::write_gguf_fixture(dir.path(), "org/model");
+    let higgs = fake_higgs(vec![dir.path().to_path_buf()]);
+    seed_fresh_profile(&higgs, "org/model", CtxLen::Fixed { n: 512 }).await;
+
+    let model = higgs
+        .scan()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|m| m.id == "org/model")
+        .expect("scanned");
+    let hw = higgs.hardware().await;
+    let tuning = higgs.tuning_records().expect("tuning records");
+
+    // Servable: profiled, fresh, fits free resources, serving on, not resident.
+    let (readiness, fit) = higgs.model_readiness(&model, &[], &hw, &tuning);
+    assert_eq!(
+        readiness,
+        crate::serve::readiness::ModelReadiness::Servable,
+        "fresh + fitting + serving on + not resident → Servable"
+    );
+    let fit = fit.expect("a servable model surfaces its needed-vs-free fit numbers");
+    assert!(
+        fit.needed_ram_bytes > 0,
+        "the RAM footprint was actually computed"
+    );
+    assert_eq!(
+        higgs.servable_model_ids().await,
+        vec!["org/model".to_owned()],
+        "a Servable model is advertised as a JIT target"
+    );
+
+    // Serving OFF → Profiled (cannot serve now), no fit computed, dropped from the list.
+    higgs.set_serving_enabled(false);
+    let (readiness, fit) = higgs.model_readiness(&model, &[], &hw, &tuning);
+    assert_eq!(
+        readiness,
+        crate::serve::readiness::ModelReadiness::Profiled,
+        "serving off → Profiled"
+    );
+    assert!(fit.is_none(), "no fit is computed while serving is off");
+    assert!(
+        higgs.servable_model_ids().await.is_empty(),
+        "serving off → nothing is servable"
+    );
+    higgs.set_serving_enabled(true);
+
+    // Resident → Loaded (precedence over fit), and no longer a JIT target.
+    higgs.load("org/model", None).await.expect("load");
+    let loaded_set = vec!["org/model".to_owned()];
+    let (readiness, _) = higgs.model_readiness(&model, &loaded_set, &hw, &tuning);
+    assert_eq!(
+        readiness,
+        crate::serve::readiness::ModelReadiness::Loaded,
+        "a resident model is Loaded regardless of fit"
+    );
+    assert!(
+        higgs.servable_model_ids().await.is_empty(),
+        "a resident model isn't re-advertised as servable"
+    );
+}
+
+/// The readiness classifier's Discovered (no profile) and NeedsRetune (stale
+/// profile) branches. A scanned model with NO saved profile is `Discovered` (must
+/// Prepare); a saved profile whose hardware fingerprint no longer matches is
+/// `NeedsRetune` (hard-blocks serving). Neither is servable. Fail-on-revert: drop
+/// the staleness check in `model_readiness` and the stale profile reads `Servable`
+/// instead of `NeedsRetune`.
+#[tokio::test]
+async fn model_readiness_discovered_and_needs_retune() {
+    let dir = tempfile::TempDir::new().unwrap();
+    crate::serve::test_support::write_gguf_fixture(dir.path(), "org/model");
+    let higgs = fake_higgs(vec![dir.path().to_path_buf()]);
+
+    let model = higgs
+        .scan()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|m| m.id == "org/model")
+        .expect("scanned");
+    let hw = higgs.hardware().await;
+
+    // No profile → Discovered, not servable.
+    let tuning = higgs.tuning_records().expect("tuning records");
+    let (readiness, fit) = higgs.model_readiness(&model, &[], &hw, &tuning);
+    assert_eq!(
+        readiness,
+        crate::serve::readiness::ModelReadiness::Discovered,
+        "on disk, no profile → Discovered"
+    );
+    assert!(fit.is_none());
+    assert!(higgs.servable_model_ids().await.is_empty());
+
+    // A STALE profile (mismatched hardware fingerprint, right file sig) → NeedsRetune.
+    let store = higgs.models_store().expect("store");
+    store.put_tuning(
+        "org/model",
+        crate::tune::store::TuneRecord {
+            profile: crate::worker::engine::LoadParams::base(
+                CtxLen::Fixed { n: 512 },
+                GpuLayers::All,
+                8,
+            ),
+            sampling: Default::default(),
+            budget: Default::default(),
+            provenance: crate::tune::TuneProvenance::Heuristic,
+            bench_tps: None,
+            tuned_at_ms: 1,
+            hw_fingerprint: "some-other-machine".into(),
+            model_file_sig: file_sig(&model.path),
+        },
+    );
+    store.flush().expect("flush");
+
+    let tuning = higgs.tuning_records().expect("tuning records");
+    let (readiness, fit) = higgs.model_readiness(&model, &[], &hw, &tuning);
+    assert_eq!(
+        readiness,
+        crate::serve::readiness::ModelReadiness::NeedsRetune,
+        "a hardware-mismatched profile → NeedsRetune"
+    );
+    assert!(fit.is_none(), "no fit for a stale profile");
+    assert!(
+        higgs.servable_model_ids().await.is_empty(),
+        "a stale profile is not servable"
+    );
+}
+
+/// `profile_state` (the JIT gate's freshness verdict): `Missing` with no record,
+/// `Ready(profile)` for a fresh matching record (carrying the validated params),
+/// `Stale` when the hardware fingerprint no longer matches, and a store-OPEN
+/// failure surfaces as [HG040] `PersistenceFailed` — NOT a misleading `Missing`.
+/// Fail-on-revert: map the store-open error to `Missing` and the last assertion
+/// (an Err) fails; drop the staleness check and the stale record reads `Ready`.
+#[tokio::test]
+async fn profile_state_missing_ready_stale_and_store_fault() {
+    let dir = tempfile::TempDir::new().unwrap();
+    crate::serve::test_support::write_gguf_fixture(dir.path(), "org/model");
+    let higgs = fake_higgs(vec![dir.path().to_path_buf()]);
+
+    // No record → Missing.
+    assert!(
+        matches!(
+            higgs.profile_state("org/model").await.unwrap(),
+            ProfileState::Missing
+        ),
+        "no saved profile → Missing"
+    );
+
+    // Fresh matching record → Ready, carrying the validated load params.
+    seed_fresh_profile(&higgs, "org/model", CtxLen::Fixed { n: 512 }).await;
+    match higgs.profile_state("org/model").await.unwrap() {
+        ProfileState::Ready(p) => assert_eq!(
+            p.ctx_len(),
+            CtxLen::Fixed { n: 512 },
+            "Ready carries the validated profile params"
+        ),
+        other => panic!("expected Ready, got {other:?}"),
+    }
+
+    // Overwrite with a stale record (mismatched hardware fingerprint) → Stale.
+    let path = higgs
+        .scan()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|m| m.id == "org/model")
+        .map(|m| m.path)
+        .unwrap();
+    let store = higgs.models_store().expect("store");
+    store.put_tuning(
+        "org/model",
+        crate::tune::store::TuneRecord {
+            profile: crate::worker::engine::LoadParams::base(
+                CtxLen::Fixed { n: 512 },
+                GpuLayers::All,
+                8,
+            ),
+            sampling: Default::default(),
+            budget: Default::default(),
+            provenance: crate::tune::TuneProvenance::Heuristic,
+            bench_tps: None,
+            tuned_at_ms: 1,
+            hw_fingerprint: "some-other-machine".into(),
+            model_file_sig: file_sig(&path),
+        },
+    );
+    store.flush().expect("flush");
+    assert!(
+        matches!(
+            higgs.profile_state("org/model").await.unwrap(),
+            ProfileState::Stale
+        ),
+        "a hardware-mismatched profile → Stale"
+    );
+
+    // A store that can't be OPENED (home is a regular FILE, so `models.json` under
+    // it is ENOTDIR) surfaces as HG040 — a persistence fault, not `Missing`.
+    let blocker = dir.path().join("blocker-file");
+    std::fs::write(&blocker, b"x").unwrap();
+    *higgs.config_path.lock() = Some(blocker.join("config.json"));
+    let err = higgs
+        .profile_state("org/model")
+        .await
+        .expect_err("an unopenable store is a fault, not Missing");
+    assert!(
+        matches!(err, HiggsError::PersistenceFailed { .. }),
+        "store-open failure → HG040 PersistenceFailed, got {err}"
+    );
+}
+
+/// `estimate` returns the VRAM+RAM footprint for a candidate load and MEMOIZES the
+/// resolved GGUF metadata per id (the second call is a cache hit — no re-scan), and
+/// an unknown id is [HG002] ModelNotFound. Fail-on-revert: drop the meta memo and
+/// the second call still works (so the cache-hit branch is what this exercises for
+/// coverage); a broken scan-find would 404 a present model.
+#[tokio::test]
+async fn estimate_returns_footprint_and_memoizes_meta() {
+    let dir = tempfile::TempDir::new().unwrap();
+    crate::serve::test_support::write_gguf_fixture(dir.path(), "org/model");
+    let higgs = fake_higgs(vec![dir.path().to_path_buf()]);
+
+    let req = EstimateRequest {
+        id: "org/model".to_owned(),
+        ctx_len: CtxLen::Fixed { n: 2048 },
+        gpu_layers: None,
+        type_k: None,
+        type_v: None,
+        offload_kqv: None,
+        cpu_moe: None,
+        budget: None,
+    };
+    let first = higgs.estimate(req.clone()).await.expect("estimate");
+    assert!(
+        first.ram.needed_bytes > 0,
+        "the RAM footprint is actually computed"
+    );
+    // The per-id metadata memo is now primed; a second call hits it (same result).
+    let second = higgs.estimate(req).await.expect("estimate (cache hit)");
+    assert_eq!(second, first, "a cache hit returns the same footprint");
+
+    // Unknown id → ModelNotFound (the scan-find miss).
+    let err = higgs
+        .estimate(EstimateRequest {
+            id: "org/absent".to_owned(),
+            ctx_len: CtxLen::Auto,
+            gpu_layers: None,
+            type_k: None,
+            type_v: None,
+            offload_kqv: None,
+            cpu_moe: None,
+            budget: None,
+        })
+        .await
+        .expect_err("unknown model → ModelNotFound");
+    assert!(matches!(err, HiggsError::ModelNotFound { .. }), "got {err}");
+}
+
+/// A REJECTED (non-mutating) key mutation must NOT write the keystore: an unwritable
+/// `api_keys.json` would otherwise turn the intended 4xx (unauthorized mint, duplicate
+/// label, unknown revoke, last-key/admin conflict) into an HG040 500, and rejected
+/// requests would do pointless disk writes. Fail-on-revert: the old unconditional
+/// `keys.save(...)` writes the store even when the closure changed nothing, so the
+/// file appears.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // TEST_ENV_LOCK spans the test (serializes HIGGS_HOME)
+async fn rejected_key_mutation_does_not_write_the_keystore() {
+    let _env = crate::TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let home = tempfile::tempdir().unwrap();
+    let prev = std::env::var_os("HIGGS_HOME");
+    // SAFETY: serialized by TEST_ENV_LOCK; restored below.
+    unsafe { std::env::set_var("HIGGS_HOME", home.path()) };
+
+    let higgs = fake_higgs(vec![]);
+    // A closure that REJECTS without touching the store — the keystore is unchanged.
+    let decision = higgs
+        .mutate_api_keys(|_ks| "rejected")
+        .expect("a rejected mutation returns Ok(decision), never an io error");
+    assert_eq!(decision, "rejected");
+    assert!(
+        !home.path().join("api_keys.json").exists(),
+        "a rejected (non-mutating) key op must NOT write api_keys.json"
+    );
+
+    // Sanity (the guard still persists a REAL change): an accepting mutation writes.
+    higgs
+        .mutate_api_keys(|ks| {
+            ks.add(
+                &crate::keys::mint_token([3u8; 16]),
+                "ci".into(),
+                vec![crate::keys::Scope::Chat],
+            );
+        })
+        .expect("accept persists");
+    assert!(
+        home.path().join("api_keys.json").exists(),
+        "an accepting mutation DOES write api_keys.json"
+    );
+
+    // SAFETY: serialized by TEST_ENV_LOCK.
+    unsafe {
+        match prev {
+            Some(v) => std::env::set_var("HIGGS_HOME", v),
+            None => std::env::remove_var("HIGGS_HOME"),
+        }
+    }
+}
+
+/// PUBLIC `chat_stream` must SKIP a locally-resident worker whose model is being
+/// benchmarked — it is a transient Turbotune candidate (the serve gate routed the
+/// request elsewhere), and the bench unloads it between candidates. With no remote
+/// fleet the skip falls through to ModelNotFound rather than streaming from it. The
+/// bench's OWN measurement (`serve_public=false`, via `chat_stream_inner`) is exempt
+/// and still reaches its candidate — covered by the end-to-end benchmark test.
+/// Fail-on-revert: drop the benchmark filter in `chat_stream_inner` and the public
+/// chat serves the bench-owned worker (Ok), failing this `expect_err`.
+#[tokio::test]
+async fn public_chat_skips_a_benchmarking_local_worker() {
+    let dir = tempfile::TempDir::new().unwrap();
+    crate::serve::test_support::write_gguf_fixture(dir.path(), "org/model");
+    let higgs = fake_higgs(vec![dir.path().to_path_buf()]);
+    higgs.load("org/model", None).await.expect("load candidate");
+    // The race state: the id is resident as a transient benchmark candidate.
+    let _bench = higgs.begin_benchmark("org/model");
+    let err = higgs
+        .chat_stream(
+            "org/model".to_owned(),
+            r#"[{"role":"user","content":"hi"}]"#.to_owned(),
+            8,
+            greedy_sampling(),
+            None,
+            None,
+        )
+        .await
+        .expect_err("public chat must skip a benchmarking local worker");
+    assert!(
+        matches!(err, HiggsError::ModelNotFound { .. }),
+        "skips the local bench candidate → ModelNotFound (no remote), got {err:?}"
+    );
+}
+
+/// A `Higgs` whose loads OOM twice then degrade (fake `oom_twice`), for the G5
+/// degraded-reuse-persist test.
+fn fake_higgs_oom_twice(dirs: Vec<PathBuf>) -> Higgs {
+    let node = crate::node::test_support::fake_runtime_oom_twice(dirs.clone());
+    let cfg = HiggsConfig {
+        lmstudio_dirs: dirs,
+        hf_dirs: vec![],
+        ollama_dirs: vec![],
+        default_load: HiggsConfig::default().default_load,
+    };
+    Higgs::with_local(Arc::new(node), cfg)
+}
+
+/// A REUSE load (a saved profile, `from_request = false`) that the OOM ladder has to
+/// DEGRADE must write the FITTING config back to the saved tuning profile — else every
+/// reload re-reads the OOMing profile and re-walks the ladder (codex r10). Fail-on-revert:
+/// restore `if let Some(anchors) { sync }` (sync only for explicit loads) and the degraded
+/// reuse leaves the profile as the OOMing seed, so the `assert_ne` fails.
+#[tokio::test]
+async fn degraded_reuse_load_persists_the_fitting_profile() {
+    let dir = tempfile::TempDir::new().unwrap();
+    crate::serve::test_support::write_gguf_fixture(dir.path(), "org/model");
+    let higgs = fake_higgs_oom_twice(vec![dir.path().to_path_buf()]);
+    // Seed a saved tuning profile with the ORIGINAL (OOMing) params + Bench provenance.
+    let seed = LoadParams::base(CtxLen::Auto, GpuLayers::All, 8);
+    let store = higgs.models_store().unwrap();
+    store.put_tuning(
+        "org/model",
+        crate::tune::store::TuneRecord {
+            profile: seed.clone(),
+            sampling: Default::default(),
+            budget: Default::default(),
+            provenance: crate::tune::TuneProvenance::Bench,
+            bench_tps: Some(42.0),
+            tuned_at_ms: 1,
+            hw_fingerprint: "old".into(),
+            model_file_sig: "old".into(),
+        },
+    );
+    store.flush().unwrap();
+    // REUSE the saved profile: OOMs twice, then the ladder loads a DEGRADED rung.
+    higgs
+        .load_inner("org/model", Some(seed.clone()), false)
+        .await
+        .expect("degraded reuse load succeeds");
+    let rec = higgs
+        .models_store()
+        .unwrap()
+        .tuning("org/model")
+        .expect("profile still present");
+    assert_ne!(
+        rec.profile, seed,
+        "degraded reuse load persisted the FITTING config, not the OOMing seed"
+    );
+    // The degraded fallback was NOT benchmarked — the store must NOT keep the old Bench
+    // provenance / bench_tps for it (codex r11). Fail-on-revert: preserve them in
+    // `set_profile` (clear_bench=false) and these stay Bench/Some(42.0), failing here.
+    assert_eq!(
+        rec.provenance,
+        crate::tune::TuneProvenance::Heuristic,
+        "degraded config: stale Bench provenance cleared"
+    );
+    assert_eq!(
+        rec.bench_tps, None,
+        "degraded config: stale bench_tps cleared"
+    );
+}
+
+/// The bench's OWN measurement (`serve_public = false`) must NOT compete with public
+/// chats for the admission gate: with the gate saturated by chats on OTHER models, a
+/// public chat refuses (ServerBusy) but the measurement still reaches its candidate —
+/// otherwise gate contention masquerades as an HG065 candidate failure and skews
+/// `pick_winner` (Fable r1). Fail-on-revert: acquire the permit unconditionally in
+/// `chat_stream_inner` and the measurement returns ServerBusy, failing the expect.
+#[tokio::test]
+async fn bench_measurement_bypasses_the_public_admission_gate() {
+    let dir = tempfile::TempDir::new().unwrap();
+    crate::serve::test_support::write_gguf_fixture(dir.path(), "org/model");
+    let higgs = fake_higgs(vec![dir.path().to_path_buf()]);
+    higgs.load("org/model", None).await.expect("load");
+
+    // Saturate the PUBLIC admission gate (as 8 in-flight chats on other models would).
+    let mut held = Vec::new();
+    for _ in 0..MAX_CONCURRENT_INFERENCE {
+        held.push(
+            Arc::clone(&higgs.inference_gate)
+                .try_acquire_owned()
+                .expect("saturate gate"),
+        );
+    }
+
+    // Public chat is refused — the gate is doing its job.
+    let err = higgs
+        .chat_stream(
+            "org/model".to_owned(),
+            r#"[{"role":"user","content":"hi"}]"#.to_owned(),
+            8,
+            greedy_sampling(),
+            None,
+            None,
+        )
+        .await
+        .expect_err("public chat refuses on a full gate");
+    assert!(matches!(err, HiggsError::ServerBusy { .. }), "got {err:?}");
+
+    // The bench measurement is UNGATED and completes end-to-end.
+    let (mut rx, handle) = higgs
+        .chat_stream_inner(
+            "org/model".to_owned(),
+            r#"[{"role":"user","content":"hi"}]"#.to_owned(),
+            8,
+            greedy_sampling(),
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect("bench measurement bypasses the full public gate");
+    while rx.recv().await.is_some() {}
+    let outcome = handle.await.expect("join").expect("chat ok");
+    assert_eq!(
+        outcome.content, "hello",
+        "fake worker served the measurement"
+    );
+}
+
+/// A benchmark future dropped mid-candidate must NOT leak the candidate worker as a
+/// publicly-servable model (codex r15) — AND the [HG068] flag must OUTLIVE the
+/// reclaim (codex r16): clearing it before the unload commits would open a window
+/// where the doomed candidate is registered but no longer gated, so a public chat
+/// could adopt it just before the unload kills it. This polls the invariant
+/// "not-benchmarking ⇒ no worker resident" at every step. Fail-on-revert: clear the
+/// flag synchronously in the guard's drop (the old two-guard order) and the first
+/// poll sees the flag down while the worker is still registered.
+#[tokio::test]
+async fn dropped_benchmark_reclaims_the_live_candidate_worker() {
+    let dir = tempfile::TempDir::new().unwrap();
+    crate::serve::test_support::write_gguf_fixture(dir.path(), "org/model");
+    let higgs = fake_higgs(vec![dir.path().to_path_buf()]);
+    higgs.load("org/model", None).await.expect("load candidate");
+    let (worker, _) = higgs.local.instances().await[0];
+
+    // The exact state a dropped benchmark future leaves behind: the guard's
+    // live-candidate slot holds the worker and the guard drops without a normal exit.
+    let guard = higgs.begin_benchmark("org/model");
+    *guard.live.lock() = Some(worker);
+    drop(guard);
+
+    // The spawned reclaim unloads the candidate and ONLY THEN clears the flag.
+    let mut reclaimed = false;
+    for _ in 0..100 {
+        // Read the flag FIRST: the guard clears it strictly AFTER the unload commits,
+        // so observing the flag down guarantees the worker is already gone at any
+        // LATER read. (Reading residency first would race the reclaim completing
+        // between the two reads and trip a spurious failure.)
+        let gated = higgs.is_benchmarking("org/model");
+        let resident = !higgs.local.instances().await.is_empty();
+        assert!(
+            gated || !resident,
+            "the HG068 gate must outlive the reclaim — never registered-but-ungated"
+        );
+        if !resident && !gated {
+            reclaimed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(reclaimed, "worker reclaimed and flag cleared");
+
+    // Normal-exit path: an EMPTY slot clears the flag synchronously and touches no
+    // worker — load a fresh (user) worker, drop an empty guard, worker survives.
+    higgs.load("org/model", None).await.expect("user reload");
+    drop(higgs.begin_benchmark("org/model"));
+    assert!(
+        !higgs.is_benchmarking("org/model"),
+        "sync clear on normal exit"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        higgs.local.instances().await.len(),
+        1,
+        "an empty guard never stomps a user worker"
+    );
+}
+
+/// Candidates that "succeed" at 0 tok/s measured NOTHING (immediate EOS / empty
+/// decode window): an all-zero run must surface as [HG063] BenchExhausted naming
+/// every candidate — never crown the first candidate by ordering and persist a
+/// Bench profile claiming a measurement (Fable r8). Fail-on-revert: accept Ok
+/// results unconditionally in `run_benchmark` and this returns Ok(0.0 winner).
+#[tokio::test]
+async fn all_zero_measurements_exhaust_the_benchmark() {
+    let err = run_benchmark(
+        vec![cand("a"), cand("b")],
+        |_c| async move { Ok(bench(0.0)) },
+        || false,
+    )
+    .await
+    .expect_err("all-zero measurements must exhaust, not crown a winner");
+    match err {
+        HiggsError::BenchExhausted { detail } => {
+            assert!(
+                detail.contains("a: no measurable decode") && detail.contains("b:"),
+                "detail names each zero-scored candidate: {detail}"
+            );
+        }
+        other => panic!("expected HG063 BenchExhausted, got {other:?}"),
+    }
+    // A mixed run still works: the positive measurement wins, zeros are failures.
+    let vals = std::cell::RefCell::new(vec![0.0f32, 7.5].into_iter());
+    let (winner, result) = run_benchmark(
+        vec![cand("a"), cand("b")],
+        |_c| {
+            let v = vals.borrow_mut().next().unwrap();
+            async move { Ok(bench(v)) }
+        },
+        || false,
+    )
+    .await
+    .expect("the positive candidate wins");
+    assert_eq!(winner.label, "b");
+    assert!(result.gen_tps > 7.0);
+}
+
+/// Benchmark candidates must respect the RAM budget too (codex r20): with an
+/// explicit 1-byte RAM cap, EVERY candidate RAM-overflows, so the benchmark must
+/// refuse with [HG063] "no candidate configs fit" — never load, measure, and
+/// persist a config the RAM estimator calls Overflow. Fail-on-revert: filter on
+/// the VRAM estimator alone (CPU-only budget_bytes=0 → passes) and the benchmark
+/// runs to a persisted Bench "success".
+#[tokio::test]
+async fn benchmark_candidates_respect_the_ram_budget() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let id = stage_ollama_model(dir.path(), "tiny", "1b");
+    let higgs = fake_higgs_ollama(vec![dir.path().to_path_buf()]);
+    let err = higgs
+        .tune(TuneRequest {
+            id,
+            mode: Some(TuneMode::Benchmark),
+            budget: Some(crate::tune::ResourceBudget {
+                max_ram_bytes: Some(1),
+                ..Default::default()
+            }),
+        })
+        .await
+        .expect_err("a 1-byte RAM cap must exhaust the candidate set");
+    assert!(
+        matches!(err, HiggsError::BenchExhausted { .. }),
+        "expected HG063 BenchExhausted, got {err:?}"
+    );
+}
+
+/// A per-model unload for a model that is benchmarking BETWEEN candidates
+/// (nothing resident) must refuse with [HG068] — not return a false success while
+/// the benchmark keeps running (codex r20). Fail-on-revert: gate only on the
+/// resolved resident worker and this returns Ok.
+#[tokio::test]
+async fn unload_one_refuses_between_candidates() {
+    let higgs = fake_higgs(vec![]);
+    let _bench = higgs.begin_benchmark("org/model");
+    let err = higgs
+        .unload_one("org/model")
+        .await
+        .expect_err("between-candidates per-model unload must refuse");
+    assert!(
+        matches!(err, HiggsError::BenchInProgress { .. }),
+        "expected HG068 BenchInProgress, got {err:?}"
+    );
 }

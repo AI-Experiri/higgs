@@ -82,7 +82,7 @@ Two independent line-coverage gates, run by `scripts/coverage.sh`
 | Gate | Command | Threshold |
 |------|---------|-----------|
 | **Unit** | `coverage-unit.sh` (`cargo test --lib`) | **≥ 90% lines** |
-| **Integration** | `coverage-integration.sh` (the `tests/` targets) | **≥ 75% lines** |
+| **Integration** | `coverage-integration.sh` (the `tests/` targets) | **≥ 80% lines** |
 
 - The gated metric is the **LAST `%` column** in `cargo llvm-cov` output (LINES),
   not regions.

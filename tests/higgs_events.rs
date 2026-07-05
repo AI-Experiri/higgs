@@ -74,6 +74,9 @@ async fn events_stream_pushes_load_phases_in_order() {
     let loader = tokio::spawn(async move {
         reqwest::Client::new()
             .post(format!("{base}/api/higgs/models/load"))
+            // Belt-and-braces above the server's own 120s control timeout: a
+            // fully wedged server must fail this test in minutes, never hang it.
+            .timeout(Duration::from_secs(150))
             .json(&serde_json::json!({ "id": id }))
             .send()
             .await

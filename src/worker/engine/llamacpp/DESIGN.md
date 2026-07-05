@@ -3,75 +3,205 @@
 ## Why this is the only FFI file
 
 All `unsafe`/FFI lives behind the `HiggsEngine` trait so the rest of higgs never touches C
-bindings. This directory is the one place that touches `llama_cpp_2` / `llama_cpp_sys_2`
-(`mod.rs` for the engine/model FFI, `logging.rs` only to route the C log callback into
-`tracing`); the trait is the seam a second engine (MLX, …) would implement without changing any
-caller. It runs in the `worker/` subprocess, so an FFI fault is isolated to that process.
+bindings. `mod.rs` is the one place that names `llama_cpp_2` / `llama_cpp_sys_2` (the engine +
+model FFI); `logging.rs` names `llama_cpp_2` only to install the log hook. The trait is the seam a
+second engine (MLX, …) implements without changing any caller (`engine::REGISTRY`). The engine
+runs in the `worker/` subprocess, so an FFI fault is isolated there.
 
-Build is **Unix/macOS-only**: the vendored llama.cpp is built with Metal on macOS, CPU
-elsewhere; Windows is unsupported (a compile-time feature of the binding, not a runtime gate).
+**Unix/macOS-only.** The vendored llama.cpp builds with Metal on macOS, CPU elsewhere; Windows is
+unsupported (a compile-time feature of the binding, not a runtime gate). higgs is pinned to the
+**AI-Experiri `llama-cpp-rs` fork** specifically because it restores the crate's `oaicompat` chat
+API — `apply_chat_template_oaicompat` / `parse_response_oaicompat` / the streaming
+`ChatParseStateOaicompat`. That restoration is why higgs has **no minijinja layer**: llama.cpp's
+own `common_chat` both renders the GGUF chat template and parses the model's raw output back into
+OpenAI content / tool-calls / reasoning. higgs never hand-parses chat markup.
+
+## Process-wide backend
+
+`LlamaBackend::init()` is a once-per-process global (the FFI global init). It is held in a
+`static BACKEND: OnceLock<LlamaBackend>` and reached via `backend()`; the only init error is
+`BackendAlreadyInitialized`, unreachable under `OnceLock`. `device_info()` forces `backend()`
+first so device registration has happened even on a cold, model-less worker.
 
 ## The chat pipeline (`chat` → helpers)
 
-1. **Template.** Load the GGUF's embedded `tokenizer.chat_template`; apply it OAI-compat
-   (`add_bos = false` — the tokenizer adds BOS) to the OpenAI `messages` (+ tools when a parser
-   wants them). A model with no embedded template falls back to `chatml`.
-2. **Fit-check (`[HG005]`).** Tokenize the rendered prompt (`AddBos::Always`) once, then reject
-   if `prompt_tokens + max_tokens > n_ctx` BEFORE any decode. This is the authoritative
-   tokenizer check (the serve layer's byte-estimate is only a cheap pre-filter).
-3. **Streaming decode (`run_decode`).** Build a `LlamaContext` from the load-time context params
-   (n_ctx, n_batch/n_ubatch, offload_kqv, rope_freq_*, flash_attn, type_k/type_v), feed the
-   prompt batch (logits on the last token only), then loop: sample → `accept` → detokenize →
-   stream the piece via `sink` → re-batch the one token → decode. Stops on an EOG token
-   (`finish_reason = "stop"`) or `max_tokens` (`"length"`).
-4. **Final parse.** Parse the full generated turn into `{content, finish_reason, tool_calls,
-   prompt_tokens, completion_tokens}`.
+1. **Template apply** (`load_template` + `apply_template`). Load the GGUF's embedded chat template
+   (falling back to the built-in `"chatml"` when the model embeds none), then
+   `apply_chat_template_oaicompat` over the verbatim OpenAI `messages` JSON (+ `tools` when
+   present). Key `OpenAIChatTemplateParams` choices: `use_jinja: true`; `add_bos: false` (the
+   prompt is tokenized with `AddBos::Always`, so the template must not also prepend BOS);
+   `add_generation_prompt: true`; `reasoning_format: Some("auto")` and `enable_thinking: true` so
+   reasoning-capable templates (Qwen3/DeepSeek-style) separate `reasoning_content` from `content`
+   in both the final parse and the streaming diffs (matches llama.cpp's server defaults);
+   `parse_tool_calls` on iff the request carried `tools`. Failure → **`[HG050]`**
+   `TemplateRenderFailed` (distinct from a generation failure: the prompt could not even be built).
+   The result carries the rendered prompt **and** the serialized PEG parser + `chat_format` that
+   `common_chat` selected; the caller keeps it alive across the decode so the final parse reuses
+   the exact same parser — none is invented here.
+2. **Fit-check** (`fit_check`). Tokenize the rendered prompt once (`str_to_token`, `AddBos::Always`)
+   and resolve the generation budget against the effective context window (`effective_n_ctx`:
+   `CtxLen::Fixed { n }`, or the model's trained context for `CtxLen::Auto`). Semantics: **reject
+   with `[HG005]` `ContextOverflow` ONLY when the prompt alone `>= n_ctx`** (no room to generate);
+   otherwise **CLAMP** `max_tokens` to `n_ctx − prompt_tokens` (≥ 1) so an oversized request
+   truncates (`finish_reason: "length"`) instead of failing. This is the authoritative,
+   tokenizer-exact backstop for the serve layer's cheaper lower-bound estimate, which can leave the
+   budget a few chat-template tokens too high.
+3. **Streaming decode** (`run_decode`). Build a fresh `LlamaContext` from the load-time context
+   params (`n_ctx`, `n_batch`/`n_ubatch`, `n_seq_max`, `n_threads`/`n_threads_batch`, `offload_kqv`,
+   `swa_full`, `rope_freq_*`, `rope_scaling_type`, `flash_attn`, `type_k`/`type_v`), feed the prompt
+   batch (logits on the last prompt token only), then loop: `sample` → `accept` → EOG check →
+   `token_to_piece` → route the piece → re-batch the one token → `decode`. Stops on an EOG token
+   (`finish_reason = "stop"`) or `max_tokens` (`"length"`). `n_batch` defaults to
+   `effective_n_ctx.max(1)` so any fit-checked prompt prefills in one `decode` call (mirrors
+   llama.cpp's `simple.cpp`).
+4. **Final parse** (`parse_output`). `parse_response_oaicompat` on the full generated text yields
+   an OpenAI message; higgs extracts `content`, `tool_calls`, and `reasoning_content` (trimmed).
+   `content` is left empty on a pure tool-call turn (OpenAI requires it); on a non-tool turn a
+   `null` content falls back to the raw text.
 
-UTF-8 across detokenization: an `encoding_rs` decoder buffers partial multi-byte sequences so a
-token boundary mid-CJK/emoji never corrupts a character.
+### UTF-8 across detokenization
+
+An `encoding_rs` UTF-8 decoder buffers partial multi-byte sequences, so a token boundary
+mid-CJK/emoji never corrupts a character. Only non-empty decoded pieces are forwarded; after the
+loop a final `decode_to_string(&[], …, last=true)` drains any buffered trailing bytes (a response
+ending mid-multi-byte sequence would otherwise silently truncate its last character).
+
+## Streaming: incremental parse → tagged deltas
+
+When the template apply produced a serialized parser, `run_decode` obtains a
+`ChatParseStateOaicompat` (`streaming_state_oaicompat`). Each raw piece is fed to
+`update(piece, is_partial=true)` (`route_parsed_deltas`), and every returned OpenAI delta JSON is
+split independently into `EngineDelta::Reasoning` / `Content` / `ToolCall` — one diff can carry
+several keys at once (llama.cpp's diff shape), so nothing is dropped because a neighbor key was
+present. Tool-call fragments are forwarded verbatim; the serve layer re-emits them as
+`delta.tool_calls` chunks. A single terminal `update("", false)` after the loop releases text the
+lenient parser held back (including the tail of a truncated think block).
+
+**Degradation, not death.** A mid-stream parser error drops the state and streams the remainder as
+raw `Content` (warned once, **`[HG052]`**); the non-streaming result is still shaped by the final
+`parse_output`. The final parse itself is lenient: a rejected parse preserves the raw text as
+content (**`[HG053]`** warn), and a non-JSON message from the crate (an internal bug) does the same
+(**`[HG054]`** error). When there is no serialized parser (only the legacy non-jinja route, which
+emits no tool/reasoning markup), pieces stream as plain `Content`.
 
 ## Sampling & reproducibility
 
-A fresh `LlamaSampler` per request: greedy when `temperature <= 0`, else temperature +
-distribution. When `LoadParams.seed` is set, sampling is seeded (deterministic across runs);
-unset draws a fresh random seed per request (per-request entropy), greedy ignores the seed.
+`run_decode` builds a fresh `LlamaSampler` chain per request from the merged
+`LlamaCppSamplingParams` (`params.sampling.as_llamacpp()`):
 
-## Tool-call streaming filter (and its known limitation)
+- `temperature <= 0` ⇒ `greedy()` (deterministic argmax; the other samplers and the seed are
+  ignored, matching llama.cpp).
+- Otherwise the fixed order: `penalties` → `top_k` → `typical` → `top_p` → `min_p` → `top_n_sigma`
+  → `xtc` → `temp`/`temp_ext` (dynatemp when `dynatemp_range` is set) → `dist`. Each sampler is
+  appended only when its param is set (`None` ⇒ omitted).
+- Seed precedence: per-request `sampling.seed`, else the load-pinned `LlamaCppParams.seed`, else
+  fresh `rand::random()` entropy.
 
-When a registry parser matches the model's chat template, a `ToolCallStreamFilter` suppresses
-the tool-call *envelope* (open marker onward) from the streamed deltas — clients see clean
-content, and the full turn is parsed for structured `tool_calls` AFTER streaming completes, so
-the structured data is never lost. KNOWN LIMITATION: the filter is installed only when a
-*registry* parser matches; a model whose tool format is handled by the crate's primary
-OAI-compat parser but recognized by no registry parser (e.g. Llama-3 `<|python_tag|>`) streams
-raw markup in the deltas (the final structured parse still succeeds). The target families
-(Gemma, Qwen, DeepSeek, Nemotron) are covered. Template-declared `additional_stops` are also not
-honored mid-decode (only EOG + `max_tokens`); latent because supported families terminate on
-EOG.
+**Fail-loud on unbuilt samplers.** `grammar`, `logit_bias`, `dry`, and `mirostat` are representable
+in `LlamaCppSamplingParams` but not yet applied by this engine (they need the model/vocab handle).
+Rather than silently return unconstrained/unbiased output, `run_decode` rejects such a request with
+**`[HG013]`** `InvalidSamplingParam` (via `LlamaCppSamplingParams::unsupported_sampler`). This is
+unreachable from today's request mappers (none populate those fields) — it guards a future caller.
 
-## FFI safety
+## Load-time params & the pinned builder (`load`)
 
-The handful of `unsafe` blocks are narrow and documented at their call sites:
+The common path uses the move-based `LlamaModelParams` builder (`with_n_gpu_layers`, `with_use_mmap`,
+`with_use_mlock`, and — carried but derivation-DEFERRED for the single-GPU/Metal target —
+`with_split_mode`/`with_main_gpu`/`with_devices`). Three knobs build a **self-referential** struct
+(the params hold raw pointers into override vecs / pattern CStrings): `cpu_moe`
+(`add_cpu_moe_override`), `cpu_buft_overrides` (`add_cpu_buft_override`), and `kv_overrides`
+(`append_kv_override`). When any is requested the params are `Box::pin`ned, mutated through the pin,
+and the pattern `CString`s are kept alive across `load_from_file`. Guards: a `kv_override` key whose
+NUL-terminated form exceeds llama.cpp's fixed 128-byte buffer is **skipped with a warn** (llama.cpp
+would `memcpy` past the buffer with no bounds check); `parse_kv_override_value` guesses the override
+kind bool → int → float → string (127-byte C field).
 
-- `ggml_version()` / device strings — read static, NUL-terminated C strings (no allocation,
-  no lifetime hazard).
-- `device_info()` enumerates `ggml_backend_dev_*` by index after `backend()` registers the
-  backends; it bounds the index, skips null/failed handles, and never panics on a report
-  failure.
-- Position/index conversions to `i32` use `try_from` → `[HG011]` on overflow rather than a
-  panic (unreachable in practice — positions never exceed `n_ctx`).
+`gpu_layers`/`ctx_len` use engine-agnostic enums (`GpuLayers::All`, `CtxLen::Auto`) rather than the
+raw `u32::MAX`/`0` FFI sentinels; `to_n_gpu_layers()` / `to_n_ctx()` / `effective_n_ctx()` convert
+only at the FFI edge, and `effective_n_ctx` keeps the `Auto` sentinel (`to_n_ctx() == 0`) from being
+read as a real size by the fit-check / batch sizing.
+
+## Error codes this module owns
+
+Returned as `HiggsError`:
+
+| Code | Variant | Where |
+|------|---------|-------|
+| `HG003` | `ModelNotLoaded` | defensive guard at the top of `chat` (the worker checks first). |
+| `HG004` | `EngineLoadFailed` | `load` failure; reason is the drained engine ERROR text (see logging). |
+| `HG005` | `ContextOverflow` | `fit_check`, only when the prompt alone exceeds `n_ctx`. |
+| `HG011` | `GenerationFailed` | `gen_fail(stage, …)` at each decode stage (tokenize, create context, prompt/loop decode, batch add, position `i32` conversion, detokenize). |
+| `HG013` | `InvalidSamplingParam` | `run_decode`, an advanced sampler was requested but is not yet applied. |
+| `HG050` | `TemplateRenderFailed` | `apply_template`, the GGUF Jinja template failed over this request. |
+
+Log-only diagnostics (never returned, only traced): `HG052` (incremental parse failed mid-stream →
+raw remainder), `HG053` (final parse rejected → raw text as content), `HG054` (crate parse returned
+non-JSON — internal bug → raw text).
 
 ## Logging (`logging.rs`)
 
-Only THIS engine's logging lives here (a future engine ships its own). It routes the binding's
-C log callback into `tracing` and gates verbosity with a two-stage filter: engine events pass at
-INFO+ (normal) or DEBUG+ (verbose); load-time noise (the `llama_model_loader` KV dump, the
-`print_info` hyperparameter block) is dropped in normal mode unless it is WARN/ERROR. The verbose
-flag is an atomic flipped live by `M_LOG_LEVEL`, read per event, so it takes effect without a
-restart. Output is plain stderr (no ANSI) because the host drains it as raw text into the
-Developer Logs.
+Only THIS engine's logging lives here (a future engine ships its own). `install_worker_logging`
+builds a `tracing_subscriber::registry` with two layers:
+
+1. **`EngineDiagnosticCapture`** — a standalone `Layer`, filtered to the `"llama-cpp-2"` target at
+   `ERROR` only, that appends each engine ERROR line to a bounded (`MAX_ENGINE_DIAGNOSTICS = 64`)
+   `Mutex<Vec<String>>`. It is independent of the UI verbosity gate; its per-layer filter scopes
+   callsite INTEREST to ERROR so it does not re-enable the DEBUG/INFO engine traffic the fmt layer
+   suppresses at the source. This exists because a failed `load_from_file` returns only an opaque
+   binding error ("null result from llama cpp") while the REAL cause (e.g.
+   `unknown model architecture: 'gemma4'`) is emitted as a separate log event. `load` calls
+   `clear_engine_diagnostics()` before the attempt and `take_engine_diagnostics()` on failure,
+   joining the captured lines into the `[HG004]` reason (falling back to the binding string when the
+   engine logged nothing, e.g. an OOM kill).
+2. **fmt layer** — stderr, `with_ansi(false)` (the supervisor renders the drain as plain text;
+   color escapes would show as literal garbage), gated by `EngineLogFilter`.
+
+`EngineLogFilter` has two gates, both keyed off a live-atomic `verbose` flag seeded from
+`HIGGS_WORKER_VERBOSE=1` at spawn and flipped at runtime by `set_engine_verbose` (called from the
+worker's log-level RPC — read per event, so it takes effect without a restart): a **level** gate
+(`"llama-cpp-2"` events pass at INFO+ normal, DEBUG+ verbose; other targets always pass) and a
+**module** gate that drops `NOISY_ENGINE_MODULES` — the `llama_model_loader` per-KV dump and the
+`print_info` hyperparameter block, which llama.cpp emits unconditionally at INFO — in normal mode,
+while always surfacing WARN/ERROR. `route_engine_logs_to_tracing` (`send_logs_to_tracing`) is the
+only place allowed to touch the binding's log hook.
+
+## Concurrency / locking
+
+The engine holds one model and is driven by the single-threaded worker RPC loop — no per-engine
+lock. The only shared mutable state is in `logging.rs`: `BACKEND` (`OnceLock`, init-once),
+`ENGINE_VERBOSE` (`OnceLock<Arc<AtomicBool>>`, `Relaxed` load/store), and `ENGINE_DIAGNOSTICS`
+(`Mutex<Vec<String>>`). The diagnostic buffer is cleared → written (by the log layer during load) →
+drained on failure within a single `load` call; because the worker serves loads one at a time,
+there is no interleaving of two load windows over the buffer.
+
+## FFI safety
+
+The `unsafe` blocks are narrow and documented at their call sites: `engine_version()` and the device
+name/description strings read static, NUL-terminated C strings (no allocation, no lifetime hazard);
+`device_info()` enumerates `ggml_backend_dev_*` by index after `backend()` registers the backends,
+bounds the index, skips null handles, and never panics on a report failure. Position/index
+conversions to `i32` use `try_from` → `[HG011]` on overflow rather than panicking (unreachable in
+practice — positions never exceed `n_ctx`).
+
+## Known limitations / deferred
+
+- **Template `additional_stops`** (stop STRINGS a template declares) are NOT honored — the decode
+  loop stops only on EOG tokens / `max_tokens`. Latent: the supported families (Qwen, Llama-3,
+  Gemma, DeepSeek, Nemotron) terminate on EOG and declare no stop strings.
+- **Grammar-constrained sampling** (`tmpl_result.grammar`) and the advanced samplers
+  (`grammar`/`logit_bias`/`dry`/`mirostat`) are deferred — requested use fails loud with `[HG013]`
+  rather than silently degrading.
+- **Multi-GPU** (`split_mode`/`main_gpu`/`devices`, `tensor_split`) is carried in `LlamaCppParams`
+  for completeness but its derivation is deferred (single-GPU/Metal target); `tensor_split` has no
+  safe setter and is intentionally absent. Speculative/NextN decoding is C++-only in the vendored
+  tree and out of scope.
+- **One model / one context (v1).** The engine hosts a single model, and every chat builds a fresh
+  `LlamaContext` (naive full re-prefill per request — no KV reuse across turns yet).
 
 ## Boundaries / what does NOT belong here
 
-- The `Engine` trait + registry → `../` (`worker/engine`).
+- The `HiggsEngine` trait, the engine registry, and the engine-agnostic umbrellas
+  (`LoadParams`/`SamplingParams`/`GenParams`/`EngineDelta`/`ChatResult`, `CtxLen`/`GpuLayers`/
+  `FlashAttn`/`KvCacheKind`) → `../` (`worker/engine`).
 - The RPC loop + worker state → `../../` (`worker/mod.rs`).
+- The autotune suggester that derives `LlamaCppParams` → `src/tune/`.

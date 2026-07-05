@@ -15,6 +15,7 @@
 //! Data types stay llama.cpp-concrete ([`LlamaCppParams`]); only the *behaviors*
 //! are abstracted, so extension happens at the strategy/source layer.
 
+pub mod bench;
 pub mod card_sampling;
 pub mod context;
 pub mod derive;

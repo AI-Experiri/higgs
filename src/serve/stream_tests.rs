@@ -11,11 +11,11 @@ fn content_delta(text: &str) -> ChatDelta {
 /// Collect all payloads `assemble` produces for the given inputs. `include_usage`
 /// toggles the OpenAI `stream_options.include_usage` terminal usage chunk.
 async fn run_assemble_opts(
-    deltas: mpsc::UnboundedReceiver<ChatDelta>,
+    deltas: crate::delta_queue::DeltaReceiver,
     outcome: JoinHandle<Result<ChatOutcome, HiggsError>>,
     include_usage: bool,
 ) -> Vec<String> {
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::channel(4096);
     assemble(
         "chatcmpl-t".into(),
         "org/model".into(),
@@ -37,7 +37,7 @@ async fn run_assemble_opts(
 
 /// The common case: assemble without the usage chunk.
 async fn run_assemble(
-    deltas: mpsc::UnboundedReceiver<ChatDelta>,
+    deltas: crate::delta_queue::DeltaReceiver,
     outcome: JoinHandle<Result<ChatOutcome, HiggsError>>,
 ) -> Vec<String> {
     run_assemble_opts(deltas, outcome, false).await
@@ -52,9 +52,9 @@ fn finish_reason_mapping() {
 
 #[tokio::test]
 async fn assemble_frames_in_order() {
-    let (dtx, drx) = mpsc::unbounded_channel();
-    dtx.send(content_delta("hel")).unwrap();
-    dtx.send(content_delta("lo")).unwrap();
+    let (dtx, drx) = crate::delta_queue::delta_channel();
+    dtx.send(content_delta("hel"));
+    dtx.send(content_delta("lo"));
     let outcome = tokio::spawn(async {
         Ok(ChatOutcome {
             content: "hello".into(),
@@ -67,7 +67,9 @@ async fn assemble_frames_in_order() {
     });
 
     let payloads = run_assemble(drx, outcome).await;
-    assert_eq!(payloads.len(), 5, "role + 2 deltas + finish + [DONE]");
+    // Both deltas were buffered before assembly drained them, so the merging
+    // queue delivers ONE content run: role + merged delta + finish + [DONE].
+    assert_eq!(payloads.len(), 4, "role + merged delta + finish + [DONE]");
 
     let parse =
         |s: &str| -> CreateChatCompletionStreamResponse { serde_json::from_str(s).unwrap() };
@@ -77,24 +79,20 @@ async fn assemble_frames_in_order() {
 
     assert_eq!(
         parse(&payloads[1]).choices[0].delta.content.as_deref(),
-        Some("hel")
-    );
-    assert_eq!(
-        parse(&payloads[2]).choices[0].delta.content.as_deref(),
-        Some("lo")
+        Some("hello")
     );
 
-    let finish = parse(&payloads[3]);
+    let finish = parse(&payloads[2]);
     assert_eq!(finish.choices[0].finish_reason, Some(FinishReason::Stop));
     assert_eq!(finish.choices[0].delta.content, None);
 
-    assert_eq!(payloads[4], "[DONE]");
+    assert_eq!(payloads[3], "[DONE]");
 }
 
 #[tokio::test]
 async fn include_usage_emits_a_terminal_usage_chunk() {
-    let (dtx, drx) = mpsc::unbounded_channel();
-    dtx.send(content_delta("hi")).unwrap();
+    let (dtx, drx) = crate::delta_queue::delta_channel();
+    dtx.send(content_delta("hi"));
     let outcome = tokio::spawn(async {
         Ok(ChatOutcome {
             content: "hi".into(),
@@ -126,8 +124,8 @@ async fn include_usage_emits_a_terminal_usage_chunk() {
 
 #[tokio::test]
 async fn no_usage_chunk_without_include_usage() {
-    let (dtx, drx) = mpsc::unbounded_channel();
-    dtx.send(content_delta("hi")).unwrap();
+    let (dtx, drx) = crate::delta_queue::delta_channel();
+    dtx.send(content_delta("hi"));
     let outcome = tokio::spawn(async {
         Ok(ChatOutcome {
             content: "hi".into(),
@@ -157,7 +155,7 @@ async fn no_usage_chunk_without_include_usage() {
 
 #[tokio::test]
 async fn assemble_error_emits_envelope_then_done() {
-    let (_dtx, drx) = mpsc::unbounded_channel::<ChatDelta>();
+    let (_dtx, drx) = crate::delta_queue::delta_channel();
     let outcome = tokio::spawn(async {
         Err(HiggsError::WorkerDead {
             context: "gone".into(),
@@ -180,8 +178,8 @@ async fn assemble_error_emits_envelope_then_done() {
 /// delivered delta payloads, then the error envelope, then `[DONE]`.
 #[tokio::test]
 async fn assemble_worker_death_mid_stream() {
-    let (dtx, drx) = mpsc::unbounded_channel();
-    dtx.send(content_delta("he")).unwrap();
+    let (dtx, drx) = crate::delta_queue::delta_channel();
+    dtx.send(content_delta("he"));
     // Drop the sender to simulate worker death closing the delta channel.
     drop(dtx);
 
@@ -219,10 +217,10 @@ async fn assemble_worker_death_mid_stream() {
 /// Collect all payloads `assemble` produces with `verbose` toggled. Drives the
 /// verbose `log_served` branch (the only difference from `run_assemble_opts`).
 async fn run_assemble_verbose(
-    deltas: mpsc::UnboundedReceiver<ChatDelta>,
+    deltas: crate::delta_queue::DeltaReceiver,
     outcome: JoinHandle<Result<ChatOutcome, HiggsError>>,
 ) -> Vec<String> {
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::channel(4096);
     assemble(
         "chatcmpl-t".into(),
         "org/model".into(),
@@ -248,8 +246,8 @@ async fn run_assemble_verbose(
 /// `assemble` that calls `super::v1::log_served`.
 #[tokio::test]
 async fn assemble_verbose_still_frames_in_order() {
-    let (dtx, drx) = mpsc::unbounded_channel();
-    dtx.send(content_delta("hi")).unwrap();
+    let (dtx, drx) = crate::delta_queue::delta_channel();
+    dtx.send(content_delta("hi"));
     let outcome = tokio::spawn(async {
         Ok(ChatOutcome {
             content: "hi".into(),
@@ -288,7 +286,7 @@ async fn assemble_verbose_still_frames_in_order() {
 /// `Err(join_err)` arm of `assemble` (the ChatTaskFailed mapping).
 #[tokio::test]
 async fn assemble_join_error_emits_hg044_envelope() {
-    let (_dtx, drx) = mpsc::unbounded_channel::<ChatDelta>();
+    let (_dtx, drx) = crate::delta_queue::delta_channel();
     // A task that never completes; aborting it makes `outcome.await` yield a
     // JoinError (cancelled), driving the JoinError arm.
     let outcome: JoinHandle<Result<ChatOutcome, HiggsError>> = tokio::spawn(async {
@@ -413,7 +411,7 @@ fn stream_tool_calls_none_for_empty_or_malformed() {
 /// stop/length signal), before `[DONE]`.
 #[tokio::test]
 async fn assemble_tool_calls_path() {
-    let (_dtx, drx) = mpsc::unbounded_channel::<ChatDelta>();
+    let (_dtx, drx) = crate::delta_queue::delta_channel();
     let outcome = tokio::spawn(async {
         Ok(ChatOutcome {
             content: String::new(),
@@ -468,7 +466,7 @@ async fn assemble_tool_calls_path() {
 /// engine signal and no tool-call delta chunk is emitted.
 #[tokio::test]
 async fn assemble_empty_tool_calls_falls_back_to_finish_reason() {
-    let (_dtx, drx) = mpsc::unbounded_channel::<ChatDelta>();
+    let (_dtx, drx) = crate::delta_queue::delta_channel();
     let outcome = tokio::spawn(async {
         Ok(ChatOutcome {
             content: "done".into(),
@@ -498,7 +496,7 @@ async fn assemble_empty_tool_calls_falls_back_to_finish_reason() {
 /// `chat_response_malformed_tool_calls_degrade_to_none`.
 #[tokio::test]
 async fn assemble_malformed_tool_calls_degrade_to_finish_reason() {
-    let (_dtx, drx) = mpsc::unbounded_channel::<ChatDelta>();
+    let (_dtx, drx) = crate::delta_queue::delta_channel();
     let outcome = tokio::spawn(async {
         Ok(ChatOutcome {
             content: "text".into(),
@@ -557,36 +555,38 @@ fn stop_outcome() -> ChatOutcome {
 
 #[tokio::test]
 async fn reasoning_deltas_emit_reasoning_content_chunks() {
-    let (dtx, drx) = mpsc::unbounded_channel();
-    dtx.send(reasoning_delta("thin")).unwrap();
-    dtx.send(reasoning_delta("king")).unwrap();
-    dtx.send(content_delta("answer")).unwrap();
+    let (dtx, drx) = crate::delta_queue::delta_channel();
+    dtx.send(reasoning_delta("thin"));
+    dtx.send(reasoning_delta("king"));
+    dtx.send(content_delta("answer"));
     let outcome = tokio::spawn(async { Ok(stop_outcome()) });
 
     let payloads = run_assemble(drx, outcome).await;
+    // Buffered deltas merge per kind (never across kinds): the two reasoning
+    // deltas coalesce into one run, the content run stays separate and ordered
+    // AFTER the reasoning — role + reasoning + content + finish + [DONE].
     assert_eq!(
         payloads.len(),
-        6,
-        "role + 2 reasoning + 1 content + finish + [DONE]: {payloads:?}"
+        5,
+        "role + merged reasoning + content + finish + [DONE]: {payloads:?}"
     );
     // Parse as Value: reasoning_content is higgs's extension field, absent from
     // the async-openai structs (and absent from non-reasoning chunks).
     let v = |i: usize| serde_json::from_str::<serde_json::Value>(&payloads[i]).unwrap();
-    assert_eq!(v(1)["choices"][0]["delta"]["reasoning_content"], "thin");
+    assert_eq!(v(1)["choices"][0]["delta"]["reasoning_content"], "thinking");
     assert!(
         v(1)["choices"][0]["delta"]["content"].is_null(),
         "reasoning chunk carries no content text: {}",
         payloads[1]
     );
-    assert_eq!(v(2)["choices"][0]["delta"]["reasoning_content"], "king");
-    let content = v(3);
+    let content = v(2);
     assert_eq!(content["choices"][0]["delta"]["content"], "answer");
     assert!(
         content["choices"][0]["delta"]
             .get("reasoning_content")
             .is_none(),
         "content chunk omits reasoning_content entirely: {}",
-        payloads[3]
+        payloads[2]
     );
 }
 
@@ -596,8 +596,8 @@ const FRAGMENT: &str = r#"{"index":0,"id":"call_s1","type":"function","function"
 
 #[tokio::test]
 async fn streamed_tool_fragment_skips_terminal_tool_chunk() {
-    let (dtx, drx) = mpsc::unbounded_channel();
-    dtx.send(tool_delta(FRAGMENT)).unwrap();
+    let (dtx, drx) = crate::delta_queue::delta_channel();
+    dtx.send(tool_delta(FRAGMENT));
     let outcome = tokio::spawn(async {
         Ok(ChatOutcome {
             tool_calls: Some(serde_json::json!([{
@@ -631,8 +631,8 @@ async fn streamed_tool_fragment_skips_terminal_tool_chunk() {
 
 #[tokio::test]
 async fn malformed_tool_fragment_falls_back_to_terminal_chunk() {
-    let (dtx, drx) = mpsc::unbounded_channel();
-    dtx.send(tool_delta("{not json")).unwrap();
+    let (dtx, drx) = crate::delta_queue::delta_channel();
+    dtx.send(tool_delta("{not json"));
     let outcome = tokio::spawn(async {
         Ok(ChatOutcome {
             tool_calls: Some(serde_json::json!([{
@@ -659,4 +659,81 @@ async fn malformed_tool_fragment_falls_back_to_terminal_chunk() {
     );
     let finish: serde_json::Value = serde_json::from_str(&payloads[2]).unwrap();
     assert_eq!(finish["choices"][0]["finish_reason"], "tool_calls");
+}
+
+// ── G1: bounded payload channel + merging queue under a stalled client ──────
+
+/// THE bounded/merging-backpressure contract, end to end through the REAL
+/// `assemble` + a real `SSE_BUFFER_CHUNKS`-deep payload channel: a client that
+/// reads the role chunk and then STALLS while 300 single-token deltas stream
+/// must, on resume, receive the full text in a BOUNDED number of chunks —
+/// the first ~SSE_BUFFER_CHUNKS individually (they filled the payload buffer
+/// before the stall bit), the rest coalesced by the upstream merging queue.
+/// Reverting either half (unbounded payload channel, or a non-merging delta
+/// channel) yields ~300 per-token chunks and fails the bound.
+#[tokio::test]
+async fn stalled_client_resumes_to_merged_runs_not_per_token_chunks() {
+    let (dtx, drx) = crate::delta_queue::delta_channel();
+    let (otx, orx) = tokio::sync::oneshot::channel::<Result<ChatOutcome, HiggsError>>();
+    let outcome = tokio::spawn(async move { orx.await.expect("outcome sent") });
+    let (tx, mut rx) = mpsc::channel(SSE_BUFFER_CHUNKS);
+    let task = tokio::spawn(assemble(
+        "chatcmpl-t".into(),
+        "org/model".into(),
+        1,
+        drx,
+        outcome,
+        tx,
+        false,
+        std::time::Instant::now(),
+        false,
+    ));
+
+    // Read ONLY the role chunk, then stall (nobody reads rx).
+    let role = rx.recv().await.expect("role chunk");
+    assert!(
+        role.contains("assistant"),
+        "first chunk is the role: {role}"
+    );
+
+    // 300 single-token deltas stream in while the client is stalled.
+    for _ in 0..300 {
+        dtx.send(content_delta("t"));
+    }
+    // Let assemble fill the payload buffer and block on the full channel, so
+    // the remaining backlog demonstrably merges UPSTREAM in the delta queue.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Generation completes; the client resumes reading everything.
+    otx.send(Ok(stop_outcome())).expect("send outcome");
+    drop(dtx);
+    let mut payloads = vec![role];
+    while let Some(p) = rx.recv().await {
+        payloads.push(p);
+    }
+    task.await.expect("assemble task");
+
+    // Lossless: every token is delivered, in order.
+    let v = |p: &String| serde_json::from_str::<serde_json::Value>(p).ok();
+    let content: String = payloads
+        .iter()
+        .filter_map(|p| {
+            v(p).and_then(|c| {
+                c["choices"][0]["delta"]["content"]
+                    .as_str()
+                    .map(str::to_owned)
+            })
+        })
+        .collect();
+    assert_eq!(content, "t".repeat(300), "no token lost or reordered");
+
+    // Bounded: the stalled backlog arrives as merged runs. Budget: role +
+    // ~SSE_BUFFER_CHUNKS pre-stall payloads + a handful of merged runs +
+    // finish + [DONE] — far below the ~300 a per-token pipeline emits.
+    assert!(
+        payloads.len() <= SSE_BUFFER_CHUNKS + 20,
+        "stalled backlog must coalesce (got {} payloads)",
+        payloads.len()
+    );
+    assert_eq!(payloads.last().map(String::as_str), Some("[DONE]"));
 }

@@ -357,3 +357,62 @@ higgs_ts! {
         pub supported_formats: Vec<String>,
     }
 }
+
+higgs_ts! {
+    /// One configured API key as the management surface lists it: label,
+    /// scopes, and a short digest prefix as its display identifier. NEVER the
+    /// plaintext token (shown once at mint) and never the full digest.
+    #[derive(Debug, Clone, serde::Serialize)]
+    pub struct HiggsKeyEntry {
+        pub label: String,
+        pub scopes: Vec<crate::keys::Scope>,
+        /// First 12 hex chars of the stored SHA-256 digest.
+        pub sha256_prefix: String,
+    }
+}
+
+higgs_ts! {
+    /// `GET /api/higgs/keys` — the configured keys plus whether auth is
+    /// currently gating the surface (false ⇔ zero keys ⇔ open).
+    #[derive(Debug, Clone, serde::Serialize)]
+    pub struct HiggsKeysList {
+        pub auth_enabled: bool,
+        pub keys: Vec<HiggsKeyEntry>,
+    }
+}
+
+higgs_ts! {
+    /// `POST /api/higgs/keys` request: mint a key. Omitted `scopes` defaults to
+    /// `[chat, models]` (the CLI's default) — pass `["admin"]` explicitly for a
+    /// management key.
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    pub struct HiggsMintKeyRequest {
+        pub label: String,
+        #[ts(optional)]
+        pub scopes: Option<Vec<crate::keys::Scope>>,
+    }
+}
+
+higgs_ts! {
+    /// `POST /api/higgs/keys` response. `token` is the plaintext — shown THIS
+    /// ONCE, never persisted, never logged; the caller must store it now.
+    #[derive(Debug, Clone, serde::Serialize)]
+    pub struct HiggsMintKeyResponse {
+        pub label: String,
+        pub scopes: Vec<crate::keys::Scope>,
+        pub token: String,
+    }
+}
+
+higgs_ts! {
+    /// `DELETE /api/higgs/keys/{label}` response: how many keys the label matched.
+    /// Revoking the last key turns auth OFF on a LOOPBACK bind only; a
+    /// LAN-exposed server REFUSES last-key revocation outright ([HG059], 409) —
+    /// the runtime counterpart of the [HG058] startup guarantee.
+    #[derive(Debug, Clone, serde::Serialize)]
+    pub struct HiggsKeyRemoved {
+        #[ts(type = "number")]
+        pub removed: u64,
+        pub auth_enabled: bool,
+    }
+}

@@ -1230,3 +1230,729 @@ async fn logs_stream_source_filter_drops_other_sources() {
         "the worker line was filtered out: {text}"
     );
 }
+
+// ── G4: key-management handlers over the real router ────────────────────────
+
+/// Serialize HIGGS_HOME mutation (keys_path reads it) and give this test its
+/// own empty keystore. Runs the WHOLE lifecycle through the router, so the
+/// auth_guard's authorized path is exercised too (after the first mint, every
+/// request must carry the bearer).
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // TEST_ENV_LOCK spans the test (serializes HIGGS_HOME)
+async fn keys_handlers_mint_list_revoke_and_validation() {
+    let _env = crate::TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let home = tempfile::tempdir().unwrap();
+    let prev = std::env::var_os("HIGGS_HOME");
+    // SAFETY: under TEST_ENV_LOCK.
+    unsafe { std::env::set_var("HIGGS_HOME", home.path()) };
+    struct Restore(Option<std::ffi::OsString>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            // SAFETY: still under TEST_ENV_LOCK.
+            unsafe {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("HIGGS_HOME", v),
+                    None => std::env::remove_var("HIGGS_HOME"),
+                }
+            }
+        }
+    }
+    let _restore = Restore(prev);
+
+    let app = make_app();
+
+    // Validation: empty / unroutable labels and empty scope lists are coded 400s.
+    let r = app
+        .clone()
+        .oneshot(post_json("/api/higgs/keys", &json!({ "label": "a/b" })))
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        StatusCode::BAD_REQUEST,
+        "a slash label could never be revoked via DELETE /{{label}}"
+    );
+    let r = app
+        .clone()
+        .oneshot(post_json("/api/higgs/keys", &json!({ "label": "  " })))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    let r = app
+        .clone()
+        .oneshot(post_json(
+            "/api/higgs/keys",
+            &json!({ "label": "x", "scopes": [] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+
+    // Mint an admin key; the response carries the plaintext ONCE.
+    let r = app
+        .clone()
+        .oneshot(post_json(
+            "/api/higgs/keys",
+            &json!({ "label": "boss", "scopes": ["admin"] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let minted: serde_json::Value = body_json(r).await;
+    let token = minted["token"].as_str().unwrap().to_owned();
+    assert!(token.starts_with("hgk_"));
+
+    // Auth flipped ON in-memory (hot swap): unkeyed list 401s, keyed lists.
+    let r = app.clone().oneshot(get("/api/higgs/keys")).await.unwrap();
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    let r = app
+        .clone()
+        .oneshot(with_bearer(get("/api/higgs/keys"), &token))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let list: serde_json::Value = body_json(r).await;
+    assert_eq!(list["auth_enabled"], true);
+    assert_eq!(list["keys"][0]["label"], "boss");
+    assert!(
+        !serde_json::to_string(&list).unwrap().contains(&token),
+        "plaintext never appears in the list"
+    );
+
+    // Default scopes (chat+models) when omitted; duplicate label is a 400.
+    let r = app
+        .clone()
+        .oneshot(with_bearer(
+            post_json("/api/higgs/keys", &json!({ "label": "dev" })),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let dev: serde_json::Value = body_json(r).await;
+    assert_eq!(dev["scopes"], json!(["chat", "models"]));
+    let r = app
+        .clone()
+        .oneshot(with_bearer(
+            post_json("/api/higgs/keys", &json!({ "label": "dev" })),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+
+    // Revoke: unknown label 400; real label removes and reports auth state.
+    let r = app
+        .clone()
+        .oneshot(with_bearer(delete("/api/higgs/keys/ghost"), &token))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    let r = app
+        .clone()
+        .oneshot(with_bearer(delete("/api/higgs/keys/dev"), &token))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let removed: serde_json::Value = body_json(r).await;
+    assert_eq!(removed["removed"], 1);
+    assert_eq!(removed["auth_enabled"], true);
+
+    // Keystore I/O failure surfaces as the coded [HG040] store error: occupy
+    // the api_keys.json path with a DIRECTORY so the save's rename fails.
+    std::fs::remove_file(home.path().join("api_keys.json")).unwrap();
+    std::fs::create_dir(home.path().join("api_keys.json")).unwrap();
+    let r = app
+        .clone()
+        .oneshot(with_bearer(
+            post_json("/api/higgs/keys", &json!({ "label": "io" })),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let err: serde_json::Value = body_json(r).await;
+    assert!(err["error"].as_str().unwrap().contains("[HG040]"));
+}
+
+/// G4 CORS allowlist: an origin listed in `config.json`'s `cors_origins` is
+/// allowed (echoed on preflight) alongside the built-in loopback set; an
+/// unlisted non-local origin gets no allow-origin header. Also pins that
+/// preflight needs NO key while auth is irrelevant here (empty keystore).
+#[tokio::test]
+async fn configured_cors_origin_is_allowed_on_preflight() {
+    let higgs = make_higgs();
+    higgs
+        .with_config_mut(|c| c.cors_origins = vec!["https://tools.example".into()])
+        .expect("write cors_origins");
+    let app = app_for(higgs);
+
+    let preflight = |origin: &str| {
+        axum::http::Request::builder()
+            .method("OPTIONS")
+            .uri("/v1/chat/completions")
+            .header("host", "127.0.0.1")
+            .header("origin", origin)
+            .header("access-control-request-method", "POST")
+            .body(axum::body::Body::empty())
+            .unwrap()
+    };
+
+    let r = app
+        .clone()
+        .oneshot(preflight("https://tools.example"))
+        .await
+        .unwrap();
+    assert_eq!(
+        r.headers()
+            .get("access-control-allow-origin")
+            .and_then(|v| v.to_str().ok()),
+        Some("https://tools.example"),
+        "configured origin allowed"
+    );
+
+    let r = app
+        .clone()
+        .oneshot(preflight("https://evil.example"))
+        .await
+        .unwrap();
+    assert!(
+        r.headers().get("access-control-allow-origin").is_none(),
+        "unlisted origin gets no CORS allowance"
+    );
+}
+
+/// G4 [HG059]: while LAN-exposed, revoking the LAST key is refused (409) — an
+/// empty keystore would reopen the whole surface at runtime, bypassing the
+/// [HG058] startup guarantee. Not-last revokes still work, and a loopback
+/// server may still revoke to empty.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // TEST_ENV_LOCK spans the test (serializes HIGGS_HOME)
+async fn last_key_revoke_is_refused_while_lan_exposed() {
+    let _env = crate::TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let home = tempfile::tempdir().unwrap();
+    let prev = std::env::var_os("HIGGS_HOME");
+    // SAFETY: under TEST_ENV_LOCK.
+    unsafe { std::env::set_var("HIGGS_HOME", home.path()) };
+    struct Restore(Option<std::ffi::OsString>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            // SAFETY: still under TEST_ENV_LOCK.
+            unsafe {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("HIGGS_HOME", v),
+                    None => std::env::remove_var("HIGGS_HOME"),
+                }
+            }
+        }
+    }
+    let _restore = Restore(prev);
+
+    let higgs = make_higgs();
+    higgs.set_lan_exposed(true);
+    let app = app_for(higgs.clone());
+
+    // Mint the only key.
+    let r = app
+        .clone()
+        .oneshot(post_json(
+            "/api/higgs/keys",
+            &json!({ "label": "only", "scopes": ["admin"] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let token = body_json(r).await["token"].as_str().unwrap().to_owned();
+
+    // Refused: it is the last key and the server is LAN-exposed.
+    let r = app
+        .clone()
+        .oneshot(with_bearer(delete("/api/higgs/keys/only"), &token))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::CONFLICT);
+    let err = body_json(r).await;
+    assert!(err["error"].as_str().unwrap().contains("[HG059]"));
+
+    // With a second key present, revoking the first is fine (not last).
+    let r = app
+        .clone()
+        .oneshot(with_bearer(
+            post_json(
+                "/api/higgs/keys",
+                &json!({ "label": "spare", "scopes": ["admin"] }),
+            ),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let spare_token = body_json(r).await["token"].as_str().unwrap().to_owned();
+    let r = app
+        .clone()
+        .oneshot(with_bearer(delete("/api/higgs/keys/only"), &token))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK, "not-last revoke proceeds");
+
+    // "spare" is now the last key — refused again while still LAN-exposed.
+    let r = app
+        .clone()
+        .oneshot(with_bearer(delete("/api/higgs/keys/spare"), &spare_token))
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        StatusCode::CONFLICT,
+        "the invariant follows the live set"
+    );
+
+    // Back on loopback, revoke-to-empty is allowed (auth intentionally off).
+    higgs.set_lan_exposed(false);
+    let r = app
+        .clone()
+        .oneshot(with_bearer(delete("/api/higgs/keys/spare"), &spare_token))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK, "loopback may revoke to empty");
+    assert_eq!(body_json(r).await["auth_enabled"], false);
+}
+
+/// G4 embedded boundary: a STALE `api_keys.json` on disk (standalone/CLI
+/// leftovers) must NOT be resurrected by a runtime mutation on a host whose
+/// live keystore started empty — mutations act on the LIVE store and the file
+/// is synced to it. Fail-on-revert: reload-from-file in `mutate_api_keys`
+/// re-arms the stale key and the old-token assertion fails.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // TEST_ENV_LOCK spans the test (serializes HIGGS_HOME)
+async fn stale_disk_keys_are_not_resurrected_by_runtime_mutations() {
+    let _env = crate::TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let home = tempfile::tempdir().unwrap();
+    let prev = std::env::var_os("HIGGS_HOME");
+    // SAFETY: under TEST_ENV_LOCK.
+    unsafe { std::env::set_var("HIGGS_HOME", home.path()) };
+    struct Restore(Option<std::ffi::OsString>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            // SAFETY: still under TEST_ENV_LOCK.
+            unsafe {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("HIGGS_HOME", v),
+                    None => std::env::remove_var("HIGGS_HOME"),
+                }
+            }
+        }
+    }
+    let _restore = Restore(prev);
+
+    // A stale on-disk keystore from some earlier standalone/CLI session.
+    let stale_token = crate::keys::mint_token([7u8; 16]);
+    let mut stale = crate::keys::ApiKeys::default();
+    stale.add(
+        &stale_token,
+        "stale".into(),
+        vec![crate::keys::Scope::Admin],
+    );
+    stale
+        .save(&home.path().join("api_keys.json"))
+        .expect("seed stale keystore");
+
+    // Embedded-style host: live keystore starts EMPTY (file not loaded).
+    let higgs = make_higgs();
+    let app = app_for(higgs.clone());
+
+    // Runtime mint on the empty live store.
+    let r = app
+        .clone()
+        .oneshot(post_json(
+            "/api/higgs/keys",
+            &json!({ "label": "fresh", "scopes": ["admin"] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let fresh_token = body_json(r).await["token"].as_str().unwrap().to_owned();
+
+    // The stale key must NOT have been resurrected: only "fresh" authorizes.
+    let live = higgs.api_keys();
+    assert!(!live.authorizes(&stale_token, crate::keys::Scope::Admin));
+    assert!(live.authorizes(&fresh_token, crate::keys::Scope::Admin));
+    assert_eq!(
+        live.iter().count(),
+        1,
+        "live store holds only the fresh key"
+    );
+
+    // And the file was synced TO the live state (stale entry gone).
+    let disk = crate::keys::ApiKeys::load(&home.path().join("api_keys.json")).unwrap();
+    assert_eq!(disk.iter().count(), 1);
+    assert_eq!(disk.iter().next().unwrap().label, "fresh");
+}
+
+/// G4 bootstrap default: the FIRST mint with omitted scopes gets [admin] — a
+/// [chat, models] default would flip auth on and lock the Admin-scoped key
+/// management API out of itself. Later omitted-scopes mints keep the
+/// [chat, models] default (asserted in the lifecycle test above).
+/// Fail-on-revert: an unconditional [chat, models] default fails the scope
+/// assertion AND the follow-up authorized list call.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // TEST_ENV_LOCK spans the test (serializes HIGGS_HOME)
+async fn bootstrap_mint_defaults_to_admin() {
+    let _env = crate::TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let home = tempfile::tempdir().unwrap();
+    let prev = std::env::var_os("HIGGS_HOME");
+    // SAFETY: under TEST_ENV_LOCK.
+    unsafe { std::env::set_var("HIGGS_HOME", home.path()) };
+    struct Restore(Option<std::ffi::OsString>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            // SAFETY: still under TEST_ENV_LOCK.
+            unsafe {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("HIGGS_HOME", v),
+                    None => std::env::remove_var("HIGGS_HOME"),
+                }
+            }
+        }
+    }
+    let _restore = Restore(prev);
+
+    let app = make_app();
+    let r = app
+        .clone()
+        .oneshot(post_json("/api/higgs/keys", &json!({ "label": "first" })))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let minted = body_json(r).await;
+    assert_eq!(
+        minted["scopes"],
+        json!(["admin"]),
+        "bootstrap default is admin"
+    );
+    let token = minted["token"].as_str().unwrap().to_owned();
+
+    // The bootstrap key can manage keys — no self-lockout.
+    let r = app
+        .clone()
+        .oneshot(with_bearer(get("/api/higgs/keys"), &token))
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        StatusCode::OK,
+        "first key reaches key management"
+    );
+}
+
+/// G4 bootstrap-race defense at the SEAM ([codex r9]): `decide_mint` derives
+/// `bootstrap` from the LOCKED store it is handed, so the empty-store window
+/// cannot be raced — a second unauthenticated mint that reaches the lock after
+/// the first key landed sees a NON-empty store and is refused. This is the
+/// deterministic core the HTTP handler runs inside `keys_io`. Fail-on-revert:
+/// deciding `bootstrap` from a pre-lock snapshot (the bug) makes the
+/// "non-empty store + no bearer" case mint instead of refuse.
+#[test]
+fn decide_mint_derives_bootstrap_from_the_locked_store() {
+    use crate::keys::{ApiKeys, Scope};
+
+    // Empty store: the bootstrap mint is allowed UNAUTHENTICATED and defaults
+    // to Admin (so it isn't locked out of key management it just enabled).
+    let empty = ApiKeys::default();
+    match super::decide_mint(&empty, None, None, "first") {
+        super::Mint::Ok(scopes) => {
+            assert_eq!(scopes, vec![Scope::Admin], "bootstrap defaults admin")
+        }
+        _ => panic!("empty store must allow the unauthenticated bootstrap mint"),
+    }
+    // Explicit ADMIN-inclusive bootstrap scopes are honored.
+    match super::decide_mint(&empty, None, Some(vec![Scope::Admin, Scope::Chat]), "first") {
+        super::Mint::Ok(scopes) => assert_eq!(scopes, vec![Scope::Admin, Scope::Chat]),
+        _ => panic!("explicit admin-inclusive bootstrap scopes honored"),
+    }
+    // Explicit NON-admin bootstrap scopes are REJECTED (codex r10): a chat-only
+    // first key would flip auth on and lock the Admin-scoped key-management API
+    // out of itself. Fail-on-revert: honoring them makes this Mint::Ok.
+    assert!(
+        matches!(
+            super::decide_mint(&empty, None, Some(vec![Scope::Chat]), "first"),
+            super::Mint::BootstrapNeedsAdmin
+        ),
+        "a non-admin first key is refused"
+    );
+
+    // Non-empty store: the race loser (no bearer) is REFUSED — this is the
+    // decision that a pre-lock bootstrap snapshot would get wrong.
+    let mut seeded = ApiKeys::default();
+    let admin_tok = crate::keys::mint_token([3u8; 16]);
+    seeded.add(&admin_tok, "boss".into(), vec![Scope::Admin]);
+    assert!(
+        matches!(
+            super::decide_mint(&seeded, None, None, "second"),
+            super::Mint::Unauthorized
+        ),
+        "non-empty store + no bearer must be refused"
+    );
+    // A non-admin bearer is also refused for a management mint.
+    let mut chat_only = ApiKeys::default();
+    let chat_tok = crate::keys::mint_token([4u8; 16]);
+    chat_only.add(&chat_tok, "reader".into(), vec![Scope::Chat]);
+    assert!(
+        matches!(
+            super::decide_mint(&chat_only, Some(&chat_tok), None, "x"),
+            super::Mint::Unauthorized
+        ),
+        "a non-admin bearer cannot mint"
+    );
+    // A valid Admin bearer mints, defaulting to [chat, models] (non-bootstrap).
+    match super::decide_mint(&seeded, Some(&admin_tok), None, "svc") {
+        super::Mint::Ok(scopes) => assert_eq!(scopes, vec![Scope::Chat, Scope::Models]),
+        _ => panic!("admin bearer mints with the non-bootstrap default"),
+    }
+    // Duplicate label is caught regardless.
+    assert!(
+        matches!(
+            super::decide_mint(&seeded, Some(&admin_tok), None, "boss"),
+            super::Mint::Duplicate
+        ),
+        "duplicate label rejected"
+    );
+}
+
+/// G4/G5 revoke bootstrap-race defense at the SEAM ([codex r7]): `decide_revoke`
+/// derives authorization from the LOCKED store, so a DELETE admitted while the
+/// store was empty (auth off) is refused if a bootstrap mint made the store
+/// non-empty before the lock — no unauthenticated deletion of a freshly minted
+/// key. Fail-on-revert: dropping the locked-store auth check makes the
+/// "non-empty store + no bearer" case Remove instead of Unauthorized.
+#[test]
+fn decide_revoke_rechecks_auth_against_the_locked_store() {
+    use crate::keys::{ApiKeys, Scope};
+
+    // Empty store: nothing to remove, but not an auth error (auth is off).
+    let empty = ApiKeys::default();
+    assert!(
+        matches!(
+            super::decide_revoke(&empty, None, "x", false),
+            super::Revoke::Removed(0)
+        ),
+        "empty store: 0 removed, not an auth failure"
+    );
+
+    // Non-empty store, NO bearer → refused (the race loser).
+    let mut seeded = ApiKeys::default();
+    let admin = crate::keys::mint_token([5u8; 16]);
+    seeded.add(&admin, "boss".into(), vec![Scope::Admin]);
+    assert!(
+        matches!(
+            super::decide_revoke(&seeded, None, "boss", false),
+            super::Revoke::Unauthorized
+        ),
+        "non-empty store + no bearer must be refused"
+    );
+    // Non-admin bearer also refused.
+    let mut chat = ApiKeys::default();
+    let ct = crate::keys::mint_token([6u8; 16]);
+    chat.add(&ct, "reader".into(), vec![Scope::Chat]);
+    assert!(
+        matches!(
+            super::decide_revoke(&chat, Some(&ct), "reader", false),
+            super::Revoke::Unauthorized
+        ),
+        "non-admin bearer cannot revoke"
+    );
+    // Valid admin bearer → removes (1 match).
+    assert!(
+        matches!(
+            super::decide_revoke(&seeded, Some(&admin), "boss", false),
+            super::Revoke::Removed(1)
+        ),
+        "admin bearer revokes"
+    );
+    // Last key on a LAN-exposed server → refused ([HG059]) even WITH the bearer.
+    assert!(
+        matches!(
+            super::decide_revoke(&seeded, Some(&admin), "boss", true),
+            super::Revoke::LastKeyOnLan
+        ),
+        "last-key revoke refused while LAN-exposed"
+    );
+}
+
+/// Revoking the LAST Admin-capable key while other (non-Admin) keys remain is
+/// refused ([HG066]): it would leave auth ON but the Admin-only management surface
+/// unreachable — an operator lockout. Emptying the whole store (auth OFF) is still
+/// allowed. Fail-on-revert: drop the admin-remains check in `decide_revoke` and the
+/// first assertion returns `Removed(1)`, stranding the operator.
+#[test]
+fn decide_revoke_preserves_the_last_admin_key() {
+    use crate::keys::{ApiKeys, Scope};
+    let mut ks = ApiKeys::default();
+    let admin = crate::keys::mint_token([7u8; 16]);
+    let reader = crate::keys::mint_token([8u8; 16]);
+    ks.add(&admin, "boss".into(), vec![Scope::Admin]);
+    ks.add(&reader, "reader".into(), vec![Scope::Chat, Scope::Models]);
+
+    assert!(
+        matches!(
+            super::decide_revoke(&ks, Some(&admin), "boss", false),
+            super::Revoke::LastAdminKey
+        ),
+        "revoking the last Admin key while a non-Admin key remains must be refused"
+    );
+    assert!(
+        matches!(
+            super::decide_revoke(&ks, Some(&admin), "reader", false),
+            super::Revoke::Removed(1)
+        ),
+        "revoking a non-Admin key leaves Admin access intact"
+    );
+
+    // An admin-only store: revoking it empties the store (auth OFF) — allowed.
+    let mut solo = ApiKeys::default();
+    let only = crate::keys::mint_token([9u8; 16]);
+    solo.add(&only, "boss".into(), vec![Scope::Admin]);
+    assert!(
+        matches!(
+            super::decide_revoke(&solo, Some(&only), "boss", false),
+            super::Revoke::Removed(1)
+        ),
+        "revoking the entire store (turns auth off) is allowed, not a lockout"
+    );
+}
+
+// ── control_estimate: live candidate-load footprint ──────────────────────────
+
+/// `POST /api/higgs/models/estimate` returns the VRAM+RAM footprint of a candidate
+/// load for a discoverable fixture, computed host-side (no worker) by reusing the
+/// suggester's own estimators. Fail-on-revert: a broken route/handler drops the
+/// typed `vram`/`ram` report; an absent id funnels through the scan-find miss to a
+/// 404 HG002 (the `Err(err)` arm of `control_estimate`).
+#[tokio::test]
+async fn control_estimate_returns_footprint_and_404s_unknown() {
+    let dir = tempfile::TempDir::new().unwrap();
+    write_gguf_fixture(dir.path(), "org/model");
+    let app = make_app_with_lmstudio(dir.path().to_path_buf());
+
+    let resp = app
+        .clone()
+        .oneshot(post_json(
+            "/api/higgs/models/estimate",
+            // `ctx_len` accepts the lenient bare-int form (2048 → a fixed window).
+            &json!({ "id": "org/model", "ctx_len": 2048 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    assert!(v["vram"].is_object(), "carries a vram fit report: {v}");
+    assert!(
+        v["ram"]["needed_bytes"].as_u64().is_some(),
+        "carries the RAM needed bytes: {v}"
+    );
+
+    // An id absent from the catalog → 404 HG002 at the scan-find step.
+    let resp = app
+        .oneshot(post_json(
+            "/api/higgs/models/estimate",
+            &json!({ "id": "org/nope", "ctx_len": 0 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    assert!(
+        v["error"].as_str().unwrap().contains("[HG002]"),
+        "estimate of an unknown model is HG002: {v}"
+    );
+}
+
+// ── control_events_stream: model-load lifecycle over SSE ─────────────────────
+
+/// `GET /api/higgs/events` streams the model-load lifecycle as SSE `data:` frames.
+/// Subscribing (the handler call) BEFORE a load, then driving a real load through
+/// the fake worker, delivers the ordered phase events ending in the terminal
+/// `ready`, each carrying the model id. Fail-on-revert: stop pushing load events
+/// (or unfold over the wrong receiver) and no `ready` frame ever arrives (the read
+/// times out). The stream is drained to the terminal and dropped — never left open.
+#[tokio::test]
+async fn events_stream_pushes_load_lifecycle_phases() {
+    use super::control_events_stream;
+    use axum::extract::State;
+    use axum::response::IntoResponse;
+    use futures::StreamExt;
+    use std::time::Duration;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    write_gguf_fixture(dir.path(), "org/model");
+    let higgs = make_higgs_with_lmstudio(dir.path().to_path_buf());
+
+    // The handler subscribes on call, so subscribe BEFORE the load (no phase missed).
+    let resp = control_events_stream(State(higgs.clone()))
+        .await
+        .into_response();
+    assert_eq!(
+        resp.headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("text/event-stream"),
+        "SSE content-type"
+    );
+    let mut body = resp.into_body().into_data_stream();
+
+    // A real load emits queued → preparing → loading_weights → finalizing → ready.
+    higgs
+        .load("org/model", None)
+        .await
+        .expect("load emits lifecycle events");
+
+    // Read frames until the terminal `ready` phase arrives.
+    let mut seen = String::new();
+    while !seen.contains("\"ready\"") {
+        let frame = tokio::time::timeout(Duration::from_secs(2), body.next())
+            .await
+            .expect("load-event frame within timeout")
+            .expect("body not ended")
+            .expect("frame ok");
+        seen.push_str(&String::from_utf8_lossy(&frame));
+    }
+    assert!(
+        seen.contains("\"queued\""),
+        "the ordered phase sequence streamed ahead of ready: {seen}"
+    );
+    assert!(
+        seen.contains("org/model"),
+        "each load event carries the model id: {seen}"
+    );
+}
+
+/// Dot-segment labels (`.` / `..`) pass the charset check but URL parsers normalize
+/// them out of `DELETE /api/higgs/keys/{label}` before Axum captures the segment —
+/// such a key could be minted but never revoked through the API (codex r16).
+/// Fail-on-revert: drop the dot-label rejection and both mints return 200.
+#[tokio::test]
+async fn mint_rejects_dot_segment_labels() {
+    for label in [".", ".."] {
+        let app = make_app();
+        let resp = app
+            .oneshot(post_json(
+                "/api/higgs/keys",
+                &serde_json::json!({ "label": label }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "label {label:?} must be rejected at mint"
+        );
+    }
+}

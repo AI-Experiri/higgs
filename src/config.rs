@@ -110,6 +110,13 @@ pub struct InstanceConfig {
     /// diff-friendly JSON ordering. Empty by default; populated on the first successful load.
     #[serde(default)]
     pub models: BTreeMap<String, ModelRecord>,
+    /// Extra CORS origins allowed on the HTTP surface beyond the built-in
+    /// loopback/tauri set (exact match against the request `Origin`, e.g.
+    /// `"https://tools.example"`). Applied at server start — restart to change.
+    /// CORS only protects BROWSER clients; non-browser access is gated by API
+    /// keys, not this list.
+    #[serde(default)]
+    pub cors_origins: Vec<String>,
 }
 
 impl InstanceConfig {

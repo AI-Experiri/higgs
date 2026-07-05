@@ -317,19 +317,28 @@ pub(super) async fn v1_models(State(higgs): State<Arc<Higgs>>) -> Response {
         }
     }
     // Also advertise remote-resident models — they are valid chat targets routed
-    // through the fleet (skip any already listed by a local worker).
-    if let Some(fleet) = higgs.fleet() {
-        for id in fleet.routed_models().await {
-            if !data.iter().any(|m| m.id == id) {
-                data.push(Model {
-                    id,
-                    object: "model".to_owned(),
-                    created: now_secs(),
-                    owned_by: "higgs".to_owned(),
-                });
-            }
+    // through the fleet (skip any already listed by a local worker). Collect the
+    // remote-served ids so the benchmark filter below can spare them.
+    let remote_ids: std::collections::HashSet<String> = match higgs.fleet() {
+        Some(fleet) => fleet.routed_models().await.into_iter().collect(),
+        None => std::collections::HashSet::new(),
+    };
+    for id in &remote_ids {
+        if !data.iter().any(|m| &m.id == id) {
+            data.push(Model {
+                id: id.clone(),
+                object: "model".to_owned(),
+                created: now_secs(),
+                owned_by: "higgs".to_owned(),
+            });
         }
     }
+    // A model being BENCHMARKED (Turbotune) can't be served from its transiently-resident
+    // LOCAL candidate — `ensure_loaded` refuses ([HG068]) so `/v1/models` shouldn't
+    // advertise it. BUT if a connected remote node ALSO serves the id, chat routes there
+    // (dispatch skips the local candidate and falls through to the fleet — codex r10), so
+    // it stays reachable: keep it in the listing (codex r12).
+    data.retain(|m| !higgs.is_benchmarking(&m.id) || remote_ids.contains(&m.id));
     Json(ListModelResponse {
         object: "list".to_owned(),
         data,
@@ -515,9 +524,26 @@ async fn ensure_loaded(higgs: &Arc<Higgs>, model: &str) -> Result<LoadedInfo, Re
     // Already locally served (by served id) — serve it, no load. The local node is
     // multi-model: this resolves the SPECIFIC resident instance (`org/model`,
     // `org/model-1`, …), so a chat for an already-loaded model never re-loads.
-    if let Some(loaded) = higgs.local_loaded_info(model).await {
-        return Ok(loaded);
-    }
+    // Benchmark exclusivity ([HG068]): a model being BENCHMARKED (Turbotune) is owned
+    // by the bench, which loads/unloads candidate configs to measure them. The check is
+    // AFTER the awaited resident lookup — not before it: a benchmark could start and make
+    // its candidate TRANSIENTLY resident during that await, so a pre-check would go stale
+    // (codex r7). `begin_benchmark` sets the flag BEFORE loading any candidate, so a
+    // resident benchmark worker always trips this.
+    let local_bench_candidate = if let Some(loaded) = higgs.local_loaded_info(model).await {
+        if !higgs.is_benchmarking(model) {
+            return Ok(loaded);
+        }
+        // The resident worker is a benchmark candidate — do NOT serve from it (the bench
+        // unloads it between candidates). But don't refuse outright yet: a REMOTE node may
+        // still serve this id (the dispatch path skips bench-owned local workers and falls
+        // through to the fleet). Fall through to the remote check below; refuse ([HG068])
+        // only if nothing else can serve it (codex r10). The bench's OWN measurement calls
+        // `chat_stream` directly (not this serve path), so it is unaffected.
+        true
+    } else {
+        false
+    };
 
     // Remote-resident model: the fleet routes the chat to its node, so skip the LOCAL
     // scan/JIT gate (which would 404 it as HG003/HG002). The remote worker enforces the
@@ -544,6 +570,20 @@ async fn ensure_loaded(higgs: &Arc<Higgs>, model: &str) -> Result<LoadedInfo, Re
             has_chat_template: None,
             idle_ttl_minutes: None,
         });
+    }
+
+    // A benchmark owns this model AND no remote node serves the id: NOW refuse
+    // ([HG068]) rather than fall through. The re-check on the raw flag covers the
+    // BETWEEN-CANDIDATES phase (flag set, no worker resident — `local_bench_candidate`
+    // is false then): without it a JIT-off chat would flap to the HG003 404 there,
+    // making the public error depend on the benchmark phase (codex r18). With JIT on
+    // the load path's own gate refuses identically, so the code is consistent either
+    // way. Retry once the benchmark finishes.
+    if local_bench_candidate || higgs.is_benchmarking(model) {
+        return Err(v1_error(&HiggsError::BenchInProgress {
+            id: model.to_owned(),
+        })
+        .into_response());
     }
 
     // Not loaded. With JIT off, keep the explicit-load behavior: 404 [HG003].

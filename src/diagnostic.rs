@@ -17,6 +17,9 @@
 //! | HG054 | engine `parse_output` | crate parse returned non-JSON (internal bug) — raw text returned |
 //! | HG055 | serve `/v1` | `chat_template_kwargs` present but not a JSON object — ignored |
 //! | HG056 | serve stream | streamed tool-call fragment malformed — dropped; terminal buffered chunk covers the call |
+//! | HG061 | api `load_inner_impl` | OOM degrade-retry rung taken — a load OOM'd and is being retried with a cheaper config (settle/KV-to-RAM/fewer layers) |
+//! | HG062 | api `load_inner_impl` | VRAM-recovery wait timed out — the just-unloaded model's VRAM did not free before the deadline; the load proceeds anyway (may OOM → HG060 ladder) |
+//! | HG065 | api Turbotune `run_benchmark` | a benchmark candidate was rejected/failed (didn't fit, OOM'd, or a log-fault watchdog match) — moving to the next candidate |
 
 use snafu::Snafu;
 
@@ -508,6 +511,121 @@ pub enum HiggsError {
     #[snafu(display("[HG050] chat template render failed: {reason} — the request cannot build a prompt for this model; if the request carried `tools`, retry WITHOUT tools (the template may not support them); if it recurs on plain chat, the GGUF's embedded template is broken or uses unsupported Jinja — re-download the model or pick a different one"))]
     #[diagnostic(code(HG050))]
     TemplateRenderFailed { reason: String },
+
+    /// A streaming client stalled long enough that its undelivered chat deltas
+    /// exceeded the per-request buffer cap ([`delta_queue::CAP_BYTES`]), so the
+    /// buffered stream was dropped rather than growing without bound. The
+    /// generation itself completed on the worker; only this client's incremental
+    /// view was truncated, and the request errors LOUDLY instead of silently
+    /// omitting text. Reissue the request (non-streaming, or with a client that
+    /// keeps reading).
+    ///
+    /// [`delta_queue::CAP_BYTES`]: crate::delta_queue::CAP_BYTES
+    #[snafu(display(
+        "[HG057] chat stream buffer overflow: the client stopped reading and {buffered_bytes} buffered delta bytes exceeded the cap — the stream was aborted (the generation finished server-side); retry non-streaming or keep the connection drained"
+    ))]
+    #[diagnostic(code(HG057))]
+    ChatStreamOverflow { buffered_bytes: usize },
+
+    /// Startup refused: a non-loopback bind (`HIGGS_BIND` beyond `127.0.0.1`)
+    /// with ZERO configured API keys would expose the open control + `/v1`
+    /// surface to the whole network — the Host guard and CORS only protect
+    /// browser clients. Fail closed at startup instead of serving wide open:
+    /// mint a key first (`higgs keys add <label>`), or bind loopback.
+    #[snafu(display(
+        "[HG058] refusing to bind {bind}: no API keys are configured, so the entire control + /v1 surface would be OPEN to the network — run `higgs keys add <label> admin` first (an Admin-capable key is required on a LAN bind, [HG069]), or bind 127.0.0.1"
+    ))]
+    #[diagnostic(code(HG058), severity(Error))]
+    LanBindWithoutKeys { bind: String },
+
+    /// A model load exhausted the OOM degrade-retry ladder (G5): every rung —
+    /// the plain retry, KV-cache-to-system-memory, and reduced GPU layers — hit
+    /// an out-of-memory failure. The machine genuinely can't fit this model as
+    /// configured right now. `attempts` is how many loads were tried; `last`
+    /// is the final engine reason. The lever is a smaller footprint (lower
+    /// `ctx_len`/`gpu_layers`, a smaller quant) or freeing VRAM (close other GPU
+    /// apps); a re-tune (Prepare) derives a fitting profile for this hardware.
+    #[snafu(display(
+        "[HG060] model load ran out of memory after {attempts} attempts (plain retry → KV to system memory → fewer GPU layers): {last} — free VRAM (close other GPU apps), lower ctx_len/gpu_layers, pick a smaller quant, or re-tune (Prepare) for this hardware"
+    ))]
+    #[diagnostic(code(HG060), severity(Error))]
+    LoadOomExhausted { attempts: usize, last: String },
+
+    /// A Turbotune (measured) benchmark run (`TuneMode::Benchmark`) produced no
+    /// usable measurement: every candidate config either did not fit the budget
+    /// or failed to load/measure. `detail` names each candidate and why. The
+    /// analytical `Suggest` tune still works — the machine just can't be
+    /// measured for this model right now (free VRAM, or lower the budget).
+    #[snafu(display(
+        "[HG063] Turbotune benchmark found no working config: {detail} — free VRAM or lower the resource budget, or use the analytical tune (Suggest) instead"
+    ))]
+    #[diagnostic(code(HG063), severity(Error))]
+    BenchExhausted { detail: String },
+
+    /// A Turbotune benchmark run was CANCELLED because a load / unload / stop
+    /// arrived for the same facade while it was benching (a bench holds the
+    /// worker to measure it, so a concurrent model op takes precedence). Re-run
+    /// the benchmark when the machine is idle.
+    #[snafu(display(
+        "[HG064] Turbotune benchmark cancelled: a model load/unload/stop arrived mid-run — re-run the benchmark when idle"
+    ))]
+    #[diagnostic(code(HG064))]
+    BenchCancelled,
+
+    /// Refused to revoke the LAST API key while the server is bound beyond
+    /// loopback: an empty keystore turns auth OFF, and on a LAN bind (whose
+    /// Host guard is deliberately relaxed for keyed clients) that would leave
+    /// the entire control + `/v1` surface open to the network at runtime —
+    /// silently bypassing the [HG058] startup protection. Mint a replacement
+    /// key first, or restart bound to `127.0.0.1` to manage keys freely.
+    #[snafu(display(
+        "[HG059] refusing to revoke the last API key {label:?} while bound beyond loopback — the surface would go fully OPEN to the network; mint a replacement key first, or restart bound to 127.0.0.1"
+    ))]
+    #[diagnostic(code(HG059), severity(Error))]
+    LastKeyOnLan { label: String },
+
+    /// Refusing to revoke the last Admin-capable key while other (non-Admin) keys
+    /// remain: auth would stay ON but the Admin-only key-management surface
+    /// (`/api/higgs/keys`) becomes unreachable — an operator lockout recoverable
+    /// only by editing the keystore out-of-band. Mint a replacement Admin key
+    /// first, or revoke every key (which turns auth off) instead.
+    #[snafu(display(
+        "[HG066] refusing to revoke {label:?}: it holds the last Admin-capable key, and other keys remain — the key-management API would lock out; mint a replacement Admin key first, or revoke all keys to disable auth"
+    ))]
+    #[diagnostic(code(HG066), severity(Error))]
+    LastAdminKey { label: String },
+
+    /// A benchmark was requested for a model that is currently LOADED. Benchmarking
+    /// measures candidate configs by loading/unloading the model, so it needs the
+    /// model unloaded first — otherwise it would disrupt the live worker and the
+    /// numbers would be contaminated by the resident model. Unload it, then bench.
+    #[snafu(display(
+        "[HG067] model {id:?} is loaded — unload it first to benchmark (benchmarking loads/unloads candidate configs and needs the model offline)"
+    ))]
+    #[diagnostic(code(HG067), severity(Error))]
+    BenchModelLoaded { id: String },
+
+    /// A load/chat was requested for a model that is currently being BENCHMARKED. The
+    /// benchmark owns the model while it measures candidate configs; the request is
+    /// refused rather than racing it. Retry once the benchmark finishes (~5 min).
+    #[snafu(display(
+        "[HG068] model {id:?} is being benchmarked — retry in ~5 min (a benchmark owns the model while it measures candidate configs)"
+    ))]
+    #[diagnostic(code(HG068), severity(Error))]
+    BenchInProgress { id: String },
+
+    /// Startup refused: a non-loopback bind with keys present but NONE holding the
+    /// `Admin` scope. Auth would be ON, but every Admin-scoped control/key route
+    /// (mint/revoke) is then rejected — the operator can't manage keys over the API
+    /// on the running LAN server and must edit the keystore out-of-band or restart.
+    /// `higgs keys add <label>` defaults to `chat,models`, so this is the easy
+    /// footgun. Fail closed at startup: add an Admin key (`higgs keys add <label>
+    /// admin`) and restart, or bind loopback. Symmetric to [HG058].
+    #[snafu(display(
+        "[HG069] refusing to bind {bind}: API keys are configured but NONE is Admin-capable, so the key-management API (/api/higgs/keys) would be locked out on this LAN bind — add an Admin key (`higgs keys add <label> admin`) and restart, or bind 127.0.0.1"
+    ))]
+    #[diagnostic(code(HG069), severity(Error))]
+    LanBindWithoutAdminKey { bind: String },
 }
 
 #[cfg(test)]

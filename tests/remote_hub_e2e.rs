@@ -97,7 +97,7 @@ async fn admit_node(
 /// Drain a chat delta stream + final outcome, returning the chunk count and whether any
 /// tokens were produced (chunks or non-empty content).
 async fn drain_chat(
-    deltas: tokio::sync::mpsc::UnboundedReceiver<higgs::worker::engine::ChatDelta>,
+    deltas: higgs::delta_queue::DeltaReceiver,
     handle: tokio::task::JoinHandle<Result<higgs::api::ChatOutcome, higgs::diagnostic::HiggsError>>,
 ) -> bool {
     let collector = tokio::spawn(async move {

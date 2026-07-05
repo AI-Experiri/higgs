@@ -23,8 +23,16 @@ use tokio::task::JoinHandle;
 
 use super::v1_wire::{ReasoningChoiceStream, ReasoningStreamChunk, ReasoningStreamDelta};
 use crate::api::ChatOutcome;
+use crate::delta_queue::DeltaReceiver;
 use crate::diagnostic::HiggsError;
 use crate::worker::engine::{ChatDelta, ChatDeltaKind};
+
+/// Payload-channel depth between assembly and the SSE body writer. Small on
+/// purpose: once a stalled client fills it, `push` blocks, assembly stops
+/// pulling, and the upstream [`delta_queue`](crate::delta_queue) MERGES the
+/// backlog into a few growing runs instead of fragmenting it here — that
+/// blocking is the backpressure this pipeline is built around.
+const SSE_BUFFER_CHUNKS: usize = 32;
 
 /// Build the SSE response for one streaming chat completion.
 ///
@@ -36,13 +44,13 @@ pub(crate) fn chat_sse(
     id: String,
     model: String,
     created: u32,
-    deltas: mpsc::UnboundedReceiver<ChatDelta>,
+    deltas: DeltaReceiver,
     outcome: JoinHandle<Result<ChatOutcome, HiggsError>>,
     verbose: bool,
     started: std::time::Instant,
     include_usage: bool,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let (tx, rx) = mpsc::unbounded_channel::<String>();
+    let (tx, rx) = mpsc::channel::<String>(SSE_BUFFER_CHUNKS);
     tokio::spawn(assemble(
         id,
         model,
@@ -62,6 +70,14 @@ pub(crate) fn chat_sse(
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
+/// Send one payload toward the SSE body. Blocks while the client is
+/// [`SSE_BUFFER_CHUNKS`] payloads behind (driving upstream merging); a closed
+/// channel (client disconnected) discards silently so assembly still runs to
+/// the outcome and the spawned task joins clean.
+async fn push(tx: &mpsc::Sender<String>, payload: String) {
+    let _ = tx.send(payload).await;
+}
+
 /// Drive one chat stream to completion, pushing `data:` payloads into `tx`.
 ///
 /// The supervisor's chat sink only closes on worker death — end of generation
@@ -74,31 +90,42 @@ async fn assemble(
     id: String,
     model: String,
     created: u32,
-    deltas: mpsc::UnboundedReceiver<ChatDelta>,
+    deltas: DeltaReceiver,
     outcome: JoinHandle<Result<ChatOutcome, HiggsError>>,
-    tx: mpsc::UnboundedSender<String>,
+    tx: mpsc::Sender<String>,
     verbose: bool,
     started: std::time::Instant,
     include_usage: bool,
 ) {
-    let send = |payload: String| {
-        // client disconnected — sends discard silently; assemble still runs to outcome so the spawned task joins clean
-        let _ = tx.send(payload);
-    };
+    push(
+        &tx,
+        chunk_payload(
+            &id,
+            &model,
+            created,
+            ReasoningStreamDelta {
+                role: Some(Role::Assistant),
+                ..Default::default()
+            },
+            None,
+        ),
+    )
+    .await;
 
-    send(chunk_payload(
-        &id,
-        &model,
-        created,
-        ReasoningStreamDelta {
-            role: Some(Role::Assistant),
-            ..Default::default()
-        },
-        None,
-    ));
+    let (joined, streamed_tool_calls, overflow) =
+        drain_deltas(&id, &model, created, deltas, outcome, &tx).await;
 
-    let (joined, streamed_tool_calls) =
-        drain_deltas(&id, &model, created, deltas, outcome, &send).await;
+    // A tripped delta-buffer cap ([HG057]) means this client's undelivered
+    // backlog was dropped — the streamed content is incomplete, so fail the
+    // stream LOUDLY instead of finishing as if everything was delivered (the
+    // generation itself completed on the worker).
+    if let Some(buffered_bytes) = overflow {
+        let e = HiggsError::ChatStreamOverflow { buffered_bytes };
+        tracing::warn!(error = %e, "higgs: chat stream buffer overflowed");
+        push(&tx, super::v1::v1_sse_error(&e)).await;
+        push(&tx, "[DONE]".to_owned()).await;
+        return;
+    }
 
     match joined {
         Ok(Ok(out)) => {
@@ -108,25 +135,29 @@ async fn assemble(
             if verbose {
                 super::v1::log_served(&model, &out.finish_reason, out.completion_tokens, started);
             }
-            emit_outcome(&id, &model, created, &out, streamed_tool_calls, &send);
+            emit_outcome(&id, &model, created, &out, streamed_tool_calls, &tx).await;
             // OpenAI `stream_options.include_usage`: after the finish chunk, emit one final
             // chunk with empty `choices` and the populated `usage` block (real engine token
             // counts), so a streaming client gets the same accounting as the non-stream path.
             if include_usage {
-                send(usage_payload(
-                    &id,
-                    &model,
-                    created,
-                    out.prompt_tokens,
-                    out.completion_tokens,
-                ));
+                push(
+                    &tx,
+                    usage_payload(
+                        &id,
+                        &model,
+                        created,
+                        out.prompt_tokens,
+                        out.completion_tokens,
+                    ),
+                )
+                .await;
             }
         }
         Ok(Err(err)) => {
             tracing::warn!(error = %err, "higgs: chat stream failed mid-generation");
             // `v1_sse_error` maps the code (a worker-exact [HG005] →
             // context_length_exceeded), matching the non-streaming path.
-            send(super::v1::v1_sse_error(&err));
+            push(&tx, super::v1::v1_sse_error(&err)).await;
         }
         // JoinError: the chat task panicked or was aborted — not a HiggsError.
         // Surface it as a coded HG044 so the SSE error envelope says what to do.
@@ -135,10 +166,10 @@ async fn assemble(
                 detail: join_err.to_string(),
             };
             tracing::warn!(error = %e, "higgs: chat task failed");
-            send(super::v1::v1_sse_error(&e));
+            push(&tx, super::v1::v1_sse_error(&e)).await;
         }
     }
-    send("[DONE]".to_owned());
+    push(&tx, "[DONE]".to_owned()).await;
 }
 
 /// Map one tagged worker delta onto its OpenAI chunk delta, or `None` for a
@@ -168,51 +199,69 @@ fn delta_chunk(delta: &ChatDelta) -> Option<ReasoningStreamDelta> {
 }
 
 /// Stream tagged delta chunks until generation completes, returning the joined
-/// outcome plus whether any tool-call fragment was streamed (so the terminal
-/// buffered tool-call chunk is emitted ONLY as the fallback). Deltas are
-/// drained ahead of the finish (biased select) so all content precedes it; on
-/// early sink close (worker death) the outcome carries the error.
+/// outcome, whether any tool-call fragment was streamed (so the terminal
+/// buffered tool-call chunk is emitted ONLY as the fallback), and — when the
+/// delta queue's overflow guard tripped — the buffered byte count for the
+/// `[HG057]` error. Deltas are drained ahead of the finish (biased select) so
+/// all content precedes it; on early sink close (worker death) the outcome
+/// carries the error.
 async fn drain_deltas(
     id: &str,
     model: &str,
     created: u32,
-    mut deltas: mpsc::UnboundedReceiver<ChatDelta>,
+    mut deltas: DeltaReceiver,
     mut outcome: JoinHandle<Result<ChatOutcome, HiggsError>>,
-    send: &impl Fn(String),
+    tx: &mpsc::Sender<String>,
 ) -> (
     Result<Result<ChatOutcome, HiggsError>, tokio::task::JoinError>,
     bool,
+    Option<usize>,
 ) {
     let mut streamed_tool_calls = false;
-    let mut emit = |delta: ChatDelta| {
-        if let Some(d) = delta_chunk(&delta) {
-            // Count a tool fragment as streamed only when it actually EMITTED —
-            // a malformed (dropped) fragment must not suppress the terminal
-            // buffered tool-call chunk, or the client would see
-            // finish_reason:"tool_calls" with no call data at all.
-            streamed_tool_calls |= delta.kind == ChatDeltaKind::ToolCall;
-            send(chunk_payload(id, model, created, d, None));
-        }
-    };
     let joined = loop {
         tokio::select! {
             // Drain deltas first so all content precedes the finish chunk.
             biased;
             maybe = deltas.recv() => match maybe {
-                Some(delta) => emit(delta),
-                // Sink closed early: worker died — the outcome carries the error.
+                Some(delta) => {
+                    emit_delta(id, model, created, &delta, &mut streamed_tool_calls, tx).await;
+                }
+                // Sink closed early (worker death or [HG057] overflow — the
+                // caller disambiguates via the returned overflow marker); the
+                // outcome carries any worker error.
                 None => break outcome.await,
             },
             joined = &mut outcome => {
                 // Generation finished; flush deltas still queued in the channel.
-                while let Ok(delta) = deltas.try_recv() {
-                    emit(delta);
+                while let Some(delta) = deltas.try_recv() {
+                    emit_delta(id, model, created, &delta, &mut streamed_tool_calls, tx).await;
                 }
                 break joined;
             }
         }
     };
-    (joined, streamed_tool_calls)
+    let overflow = deltas.overflowed().then(|| deltas.buffered_bytes());
+    (joined, streamed_tool_calls, overflow)
+}
+
+/// Emit one tagged delta as its OpenAI chunk (skipping a malformed tool
+/// fragment — see [`delta_chunk`]).
+async fn emit_delta(
+    id: &str,
+    model: &str,
+    created: u32,
+    delta: &ChatDelta,
+    streamed_tool_calls: &mut bool,
+    tx: &mpsc::Sender<String>,
+) {
+    if let Some(d) = delta_chunk(delta) {
+        // Count a tool fragment as streamed only when it actually EMITTED —
+        // a malformed (dropped) fragment must not suppress the terminal
+        // buffered tool-call chunk, or the client would see
+        // finish_reason:"tool_calls" with no call data at all.
+        *streamed_tool_calls |= delta.kind == ChatDeltaKind::ToolCall;
+        push(tx, chunk_payload(id, model, created, d, None)).await;
+    }
 }
 
 /// Map a completed outcome onto its terminal chunks: an optional tool-call
@@ -228,13 +277,13 @@ async fn drain_deltas(
 /// reports `tool_calls` either way.
 ///
 /// [`interpret_tool_calls`]: super::v1::interpret_tool_calls
-fn emit_outcome(
+async fn emit_outcome(
     id: &str,
     model: &str,
     created: u32,
     out: &ChatOutcome,
     streamed_tool_calls: bool,
-    send: &impl Fn(String),
+    tx: &mpsc::Sender<String>,
 ) {
     let tool_calls = super::v1::interpret_tool_calls(&out.tool_calls).map(stream_tool_calls);
     let finish = if streamed_tool_calls || tool_calls.is_some() {
@@ -243,24 +292,32 @@ fn emit_outcome(
         finish_reason_from(&out.finish_reason)
     };
     if let Some(tc) = tool_calls.filter(|_| !streamed_tool_calls) {
-        send(chunk_payload(
+        push(
+            tx,
+            chunk_payload(
+                id,
+                model,
+                created,
+                ReasoningStreamDelta {
+                    tool_calls: Some(tc),
+                    ..Default::default()
+                },
+                None,
+            ),
+        )
+        .await;
+    }
+    push(
+        tx,
+        chunk_payload(
             id,
             model,
             created,
-            ReasoningStreamDelta {
-                tool_calls: Some(tc),
-                ..Default::default()
-            },
-            None,
-        ));
-    }
-    send(chunk_payload(
-        id,
-        model,
-        created,
-        ReasoningStreamDelta::default(),
-        Some(finish),
-    ));
+            ReasoningStreamDelta::default(),
+            Some(finish),
+        ),
+    )
+    .await;
 }
 
 /// Convert validated OpenAI tool calls (from the shared

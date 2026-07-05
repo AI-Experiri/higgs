@@ -223,6 +223,16 @@ impl JsonModelStore {
         let entry = guard.models.entry(id.to_string()).or_default();
         match entry.tuning.as_mut() {
             Some(rec) => {
+                // The record's `provenance`/`bench_tps` describe the CURRENT params. When
+                // the new profile DIFFERS — an OOM-degraded fallback (codex r11) OR an
+                // explicit reload with edited params (codex r12) — those measured metrics
+                // no longer apply: drop them rather than claim the old benchmark throughput
+                // for a different, unbenchmarked config. Re-anchoring the SAME params keeps
+                // them (the tuned config is just being re-validated on current hardware).
+                if rec.profile != profile {
+                    rec.provenance = TuneProvenance::Heuristic;
+                    rec.bench_tps = None;
+                }
                 rec.profile = profile;
                 rec.tuned_at_ms = now_ms;
                 rec.hw_fingerprint = hw_fingerprint.to_owned();

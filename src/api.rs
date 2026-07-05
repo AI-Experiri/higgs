@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 
 use crate::diagnostic::HiggsError;
 use crate::log_bus::{LogBus, LogLine, LogSource};
@@ -23,8 +23,8 @@ use crate::supervisor::HiggsEvent;
 use crate::system::HardwareInfo;
 use crate::tune::store::{JsonModelStore, TuneRecord};
 use crate::tune::{
-    EstimateReport, EstimateRequest, ModelMeta, RamEstimator, Suggester, TuneMode, TuneRequest,
-    TuneSuggestion, VramEstimator,
+    BenchResult, EstimateReport, EstimateRequest, ModelMeta, RamEstimator, Suggester, TuneMode,
+    TuneRequest, TuneSuggestion, VramEstimator,
 };
 use crate::worker::engine::LoadParams;
 use crate::worker::models::HiggsModel;
@@ -222,6 +222,31 @@ pub struct Higgs {
     /// and parallel tests don't share state. A `Mutex` only to satisfy `Sync` cheaply; it is
     /// set once at construction and read thereafter.
     config_path: parking_lot::Mutex<Option<std::path::PathBuf>>,
+    /// Serializes runtime API-key mutations (mint/revoke). Held across the whole
+    /// clone-live → mutate → save → re-install so two concurrent mutations can't
+    /// each derive from the same live snapshot and have the last save clobber the
+    /// other's change. A plain `parking_lot::Mutex` — held only across synchronous
+    /// file I/O, never an `.await`. Mirrors [`Self::models_io`]/[`Self::config_io`].
+    keys_io: parking_lot::Mutex<()>,
+    /// Whether the HTTP listener is bound BEYOND loopback (a LAN/0.0.0.0 bind).
+    /// Set once at serve start ([`Self::set_lan_exposed`]); read by the key-revoke
+    /// gate so revoking the LAST key while LAN-exposed is refused ([HG059]) — an
+    /// open LAN surface must never fall back to no-auth.
+    lan_exposed: std::sync::atomic::AtomicBool,
+    /// Model ids currently being BENCHMARKED (Turbotune). A benchmark refuses to
+    /// start if the model is loaded ([HG067]); while it runs, its id sits here so a
+    /// concurrent public load/JIT-chat is refused ([HG068]) rather than racing the
+    /// bench for the model. Set/cleared by a [`BenchmarkingGuard`]; the bench's OWN
+    /// candidate loads use the PRIVATE `local.load` so they bypass this gate.
+    benchmarking: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
+    /// Set once by [`stop`](Self::stop) (terminal shutdown), read by the Turbotune
+    /// benchmark's per-candidate cancel hook so a shutdown that races an in-flight
+    /// benchmark aborts it cleanly with [HG064] instead of letting it iterate
+    /// candidates against a tearing-down node (surfacing confusing HG063/worker
+    /// errors). In the normal graceful path the benchmark request DRAINS before
+    /// `stop` runs, so this is defense-in-depth (e.g. a future shutdown drain
+    /// deadline on a long benchmark) — never a hot path.
+    shutting_down: std::sync::atomic::AtomicBool,
 }
 
 /// Resolve the effective per-request sampling for a local chat: overlay the
@@ -243,6 +268,207 @@ fn overlay_sampling(
             base.as_llamacpp().overlaid_with(request.as_llamacpp()),
         ),
         None => request,
+    }
+}
+
+/// RAII guard marking a model as BENCHMARKING for its scope, WITH cancellation-safe
+/// candidate cleanup. `id` sits in [`Higgs::benchmarking`] while alive; `live` holds
+/// the CURRENT candidate's [`WorkerId`] (Some only between a candidate's load and its
+/// post-measure unload).
+///
+/// Drop semantics (codex r15 + r16):
+/// - Normal exit (slot `None`): the [HG068] flag is cleared synchronously — no worker
+///   is resident, nothing to reclaim.
+/// - CANCEL-drop with a live candidate (long-op route timeout / client disconnect):
+///   the flag must OUTLIVE the reclaim — clearing it first would open a window where
+///   the doomed candidate is still registered but no longer HG068-gated, so a public
+///   chat/load could adopt it just before the unload kills it (codex r16). The drop
+///   spawns ONE task that unloads exactly that worker and THEN clears the flag.
+///   Worker-id-scoped, so it can never stomp a worker a user loads later.
+pub(crate) struct BenchmarkingGuard {
+    benchmarking: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
+    local: Arc<NodeRuntime>,
+    id: String,
+    live: Arc<parking_lot::Mutex<Option<WorkerId>>>,
+}
+
+impl Drop for BenchmarkingGuard {
+    fn drop(&mut self) {
+        if let Some(worker) = self.live.lock().take() {
+            let benchmarking = Arc::clone(&self.benchmarking);
+            let local = Arc::clone(&self.local);
+            let id = std::mem::take(&mut self.id);
+            tokio::spawn(async move {
+                let _ = local.unload(worker).await;
+                benchmarking.lock().remove(&id);
+            });
+        } else {
+            self.benchmarking.lock().remove(&self.id);
+        }
+    }
+}
+
+/// Drive a Turbotune (G6) benchmark over an ORDERED candidate set, measuring
+/// each with an injected async `measure` (the ONLY dependency on the real
+/// load/generate path — production loads+times+unloads; tests pass a fake).
+/// `cancelled` is polled between candidates so a terminal shutdown (`stop`)
+/// aborts the run ([HG064]) rather than iterating candidates against a draining
+/// node. Returns the winning candidate + its measurement, or an aggregate
+/// `[HG063]` when every candidate fails.
+///
+/// This is the orchestration seam kept separate from `Higgs` so the
+/// loop/cancel/winner/aggregate logic is unit-tested without a real FFI load.
+async fn run_benchmark<M, Fut>(
+    candidates: Vec<crate::tune::bench::Candidate>,
+    mut measure: M,
+    mut cancelled: impl FnMut() -> bool,
+) -> Result<(crate::tune::bench::Candidate, crate::tune::BenchResult), HiggsError>
+where
+    M: FnMut(&crate::tune::bench::Candidate) -> Fut,
+    Fut: std::future::Future<Output = Result<crate::tune::BenchResult, HiggsError>>,
+{
+    use crate::tune::bench::{aggregate_failure, pick_winner};
+    let mut results: Vec<(crate::tune::bench::Candidate, crate::tune::BenchResult)> = Vec::new();
+    let mut failures: Vec<(&'static str, String)> = Vec::new();
+
+    for cand in candidates {
+        // A terminal shutdown aborts the bench rather than loading the next
+        // candidate against a node that is being torn down.
+        if cancelled() {
+            return Err(HiggsError::BenchCancelled);
+        }
+        match measure(&cand).await {
+            // A 0 tok/s "success" (immediate EOS / empty decode window) measured
+            // NOTHING — treating it as a result would let `pick_winner` crown the
+            // first candidate by ORDERING and persist a Bench profile that claims a
+            // measurement (Fable r8). It is a candidate failure like any other.
+            Ok(bench) if bench.gen_tps > 0.0 => results.push((cand, bench)),
+            Ok(_) => {
+                tracing::warn!(
+                    candidate = cand.label,
+                    "[HG065] benchmark candidate produced no measurable decode (0 tok/s) — trying the next config"
+                );
+                failures.push((cand.label, "no measurable decode (0 tok/s)".to_owned()));
+            }
+            Err(HiggsError::BenchCancelled) => return Err(HiggsError::BenchCancelled),
+            Err(e) => {
+                tracing::warn!(
+                    candidate = cand.label,
+                    error = %e,
+                    "[HG065] benchmark candidate failed — trying the next config"
+                );
+                failures.push((cand.label, e.to_string()));
+            }
+        }
+    }
+
+    match pick_winner(&results) {
+        Some(i) => Ok(results.swap_remove(i)),
+        None => Err(HiggsError::BenchExhausted {
+            detail: aggregate_failure(&failures),
+        }),
+    }
+}
+
+/// Walk the G5 OOM degrade-retry ladder over an injected `load` (the ONLY
+/// dependency; production passes `self.local.load`, tests pass a fake). Attempt
+/// 0 uses the caller's `np` unchanged — the fits-first-time path is one call,
+/// no ladder built. ONLY an out-of-memory failure
+/// ([`is_oom_reason`](crate::load_robustness::is_oom_reason)) walks the ladder;
+/// each rung is announced `[HG061]`. A non-OOM failure returns immediately; a
+/// non-OOM failure surfacing on a degraded rung stops the ladder and returns.
+/// Exhausting every rung yields the aggregate `[HG060]`. `settle` is slept
+/// before each degraded retry so VRAM from the failed attempt drains first
+/// (tests inject `Duration::ZERO`); `layer_count` lets the ladder turn a default
+/// `GpuLayers::All` OOM into a concrete half-offload rung.
+async fn run_oom_ladder<F, Fut>(
+    id: &str,
+    np: crate::remote::NodeLoadParams,
+    layer_count: Option<u32>,
+    settle: std::time::Duration,
+    mut load: F,
+) -> Result<crate::remote::NodeLoadParams, HiggsError>
+where
+    F: FnMut(crate::remote::NodeLoadParams) -> Fut,
+    Fut: std::future::Future<Output = Result<(), HiggsError>>,
+{
+    use crate::load_robustness::{is_oom_reason, oom_ladder};
+
+    // Extract an OOM reason from a load error, or `None` if it isn't OOM
+    // (corrupt GGUF, unsupported arch — a degraded retry can't help).
+    fn oom_reason(e: &HiggsError) -> Option<String> {
+        match e {
+            HiggsError::EngineLoadFailed { reason, .. } if is_oom_reason(reason) => {
+                Some(reason.clone())
+            }
+            HiggsError::WorkerRpc {
+                message,
+                worker_code: Some(c),
+                ..
+            } if c == "HG004" && is_oom_reason(message) => Some(message.clone()),
+            _ => None,
+        }
+    }
+
+    // Attempt 0: the caller's params, unchanged.
+    let mut last = match load(np.clone()).await {
+        Ok(()) => return Ok(np), // loaded as-requested — persist these params
+        Err(e) => match oom_reason(&e) {
+            Some(r) => r,
+            None => return Err(e), // non-OOM: no retry
+        },
+    };
+
+    // Degrade ladder: plain retry → KV to system memory → fewer GPU layers.
+    let rungs = oom_ladder(&np, layer_count);
+    let total = rungs.len();
+    for (i, rung) in rungs.into_iter().enumerate() {
+        tracing::warn!(
+            id,
+            attempt = i + 2, // attempt 0 + this rung (1-based for humans)
+            degrade = if rung.what.is_empty() {
+                "plain retry"
+            } else {
+                rung.what
+            },
+            "[HG061] load OOM — retrying with a cheaper config"
+        );
+        // Let VRAM from the failed attempt drain before retrying (mechanism #6).
+        tokio::time::sleep(settle).await;
+        match load(rung.params.clone()).await {
+            // This degraded rung loaded — return ITS params so the caller persists
+            // the config that actually runs, not the seed that already OOMed.
+            Ok(()) => return Ok(rung.params),
+            Err(e) => match oom_reason(&e) {
+                Some(r) => last = r,   // still OOM — next rung
+                None => return Err(e), // a different fault appeared — surface it
+            },
+        }
+    }
+
+    // Every rung OOMed — the aggregate [HG060] with the attempt count + last reason.
+    Err(HiggsError::LoadOomExhausted {
+        attempts: total + 1,
+        last,
+    })
+}
+
+/// Map a host [`LoadParams`] to the node's `NodeLoadParams` for an EXACT load —
+/// the `Some(params)` case of [`Higgs::load_inner`](Higgs::load_inner_impl). The
+/// Turbotune bench loads candidates through this + `self.local.load` directly, so a
+/// candidate is measured VERBATIM: no OOM-ladder degrade (the candidate set is
+/// itself the degrade ladder) and no `config.json` persist (the bench saves only
+/// its winning profile, once, at the end).
+fn node_params_for(id: &str, p: &LoadParams) -> crate::remote::NodeLoadParams {
+    crate::remote::NodeLoadParams {
+        id: id.to_owned(),
+        ctx_len: p.ctx_len().fixed_n(),
+        gpu_layers: Some(p.gpu_layers()),
+        threads: Some(p.threads()),
+        params: {
+            let lc = p.as_llamacpp();
+            lc.has_overrides().then(|| lc.clone())
+        },
     }
 }
 
@@ -357,6 +583,10 @@ impl Higgs {
             // client skips the gap and keeps streaming.
             load_events: tokio::sync::broadcast::channel(256).0,
             config_path: parking_lot::Mutex::new(default_config_path_override()),
+            keys_io: parking_lot::Mutex::new(()),
+            lan_exposed: std::sync::atomic::AtomicBool::new(false),
+            benchmarking: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
+            shutting_down: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -458,6 +688,284 @@ impl Higgs {
     /// serve-layer auth middleware on each request.
     pub fn api_keys(&self) -> Arc<crate::keys::ApiKeys> {
         self.api_keys.lock().clone()
+    }
+
+    /// Atomically read-modify-write the API-key store under [`Self::keys_io`], then
+    /// PERSIST to `api_keys.json` and re-install the live store. `f` sees a mutable
+    /// clone of the LIVE keys and returns any decision value; the whole thing is
+    /// serialized so a concurrent mint/revoke can't lose an update.
+    ///
+    /// EMBEDDED-HOST BOUNDARY (jigglebot): the embed never loads
+    /// `api_keys.json` at boot (its keystore starts empty — "embedded host
+    /// wants no gate"), so keys minted here are live for THIS process and
+    /// persisted to disk, but do not re-arm auth on the next embedded start.
+    /// That is deliberate: the jigglebot frontend does not attach bearers yet
+    /// (G4b), and a silently re-armed keystore would 401 its own UI. The
+    /// standalone binary loads the file at startup as before. Consistently,
+    /// mutations act on the LIVE store (cloned below), never on the file —
+    /// stale on-disk keys are never resurrected mid-session; the file is
+    /// overwritten with the live-derived state.
+    pub fn mutate_api_keys<T>(
+        &self,
+        f: impl FnOnce(&mut crate::keys::ApiKeys) -> T,
+    ) -> std::io::Result<T> {
+        let _guard = self.keys_io.lock();
+        // The LIVE keystore is authoritative — never reload the file here. An
+        // embedded host deliberately starts with an empty live store even when
+        // a stale `api_keys.json` exists (standalone/CLI leftovers); loading
+        // the file would RESURRECT those keys on any mutation (even a failed
+        // duplicate mint) and lock out a UI that holds no bearer. Mutations
+        // act on what `GET /api/higgs/keys` shows, and the file is synced TO
+        // the live state.
+        let before = self.api_keys();
+        let mut keys = (*before).clone();
+        let out = f(&mut keys);
+        // Persist + re-install ONLY when `f` actually changed the store. A REJECTED
+        // request (unauthorized mint, duplicate label, unknown revoke, last-key-on-LAN
+        // / last-Admin conflict) leaves the clone identical to the live store: persisting
+        // it would do a pointless disk write AND, on an unwritable keystore, turn the
+        // intended 401/400/409 into an HG040 500 (codex r8). The decision `out` — which
+        // carries the rejection the caller maps to its status — is returned regardless.
+        if keys != *before {
+            keys.save(&crate::keys::keys_path()?)?;
+            self.set_api_keys(std::sync::Arc::new(keys));
+        }
+        Ok(out)
+    }
+
+    /// Record whether the listener is bound beyond loopback (see field docs).
+    pub fn set_lan_exposed(&self, exposed: bool) {
+        self.lan_exposed
+            .store(exposed, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the listener is bound beyond loopback ([HG059] revoke gate).
+    pub(crate) fn lan_exposed(&self) -> bool {
+        self.lan_exposed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether `id` is currently being benchmarked — a public load / JIT chat must
+    /// refuse it ([HG068]) rather than race the benchmark for the model. Read by
+    /// `load_inner_impl` (the load gate) AND by the serve layer's `ensure_loaded`
+    /// (the chat gate), so it is `pub(crate)`.
+    pub(crate) fn is_benchmarking(&self, id: &str) -> bool {
+        self.benchmarking.lock().contains(id)
+    }
+
+    /// Mark `id` as benchmarking and return the RAII guard that clears it on drop.
+    /// The bench's own candidate loads go through the PRIVATE `local.load`, so they
+    /// are not gated by this flag; only PUBLIC loads/JIT-chats are. `pub(crate)` so
+    /// the serve-layer benchmarking-gate test can hold the guard deterministically.
+    pub(crate) fn begin_benchmark(&self, id: &str) -> BenchmarkingGuard {
+        self.benchmarking.lock().insert(id.to_owned());
+        BenchmarkingGuard {
+            benchmarking: Arc::clone(&self.benchmarking),
+            local: Arc::clone(&self.local),
+            id: id.to_owned(),
+            live: Arc::new(parking_lot::Mutex::new(None)),
+        }
+    }
+
+    /// Extra CORS origins from `config.json` (`cors_origins`), matched exactly
+    /// against the request `Origin` in addition to the built-in loopback/tauri
+    /// set. Read once at router build — a change needs a restart (G7 owns live
+    /// rebind). Errors read as empty (the built-in set still applies).
+    pub(crate) fn extra_cors_origins(&self) -> Vec<String> {
+        self.config_file_path()
+            .ok()
+            .and_then(|p| crate::config::InstanceConfig::load(&p).ok())
+            .map(|c| c.cors_origins)
+            .unwrap_or_default()
+    }
+
+    /// Run the Turbotune (G6) benchmark: generate an ordered, fit-and-headroom
+    /// filtered candidate set from the analytical `suggestion`, LOAD + time each
+    /// candidate through the real chat path, and return the winning params + its
+    /// [`BenchResult`]. Each measure loads the candidate (via the PRIVATE node
+    /// `local.load`, bypassing the [HG068] gate), runs a short real decode to time
+    /// generation, and tears the worker down. The benchmark is EXCLUSIVE — concurrent
+    /// public load/chat/unload/worker-stop are refused ([HG068]) — and a terminal
+    /// `stop` (shutdown) aborts it ([HG064]); every candidate failing yields [HG063].
+    async fn turbotune_bench(
+        &self,
+        id: &str,
+        meta: &ModelMeta,
+        hw: &crate::system::HardwareInfo,
+        budget: &crate::tune::ResourceBudget,
+        suggestion: &TuneSuggestion,
+    ) -> Result<
+        (
+            crate::worker::engine::llamacpp::params::LlamaCppParams,
+            BenchResult,
+        ),
+        HiggsError,
+    > {
+        let seed = suggestion.load.as_llamacpp().clone();
+        // Phase 1 (cheap): fit-and-headroom-filtered candidate set, no loads. The
+        // filter must respect BOTH estimators: candidates like the half-GPU-layers
+        // rung SHIFT memory into system RAM, so a VRAM-only check would load,
+        // measure, and persist a config the RAM estimator calls Overflow under an
+        // explicit RAM cap (codex r20). A RAM-overflowing candidate returns the RAM
+        // report (verdict Overflow → filtered by `passes_headroom`); otherwise the
+        // VRAM report drives the fit + absolute-headroom gate as before.
+        let candidates = crate::tune::bench::bench_candidates(&seed, meta.block_count, |lc| {
+            let ram = crate::tune::vram::StaticRamEstimator.estimate(lc, meta, hw, budget);
+            if ram.verdict == crate::tune::FitVerdict::Overflow {
+                return ram;
+            }
+            crate::tune::vram::StaticVramEstimator.estimate(lc, meta, hw, budget)
+        });
+
+        // EXCLUSIVE benchmark contract: refuse if the model is LOADED ([HG067]) — a
+        // bench loads/unloads candidate configs and must not disrupt a live worker —
+        // and mark it benchmarking so concurrent public loads / JIT chats are refused
+        // ([HG068]). The loaded-check AND the flag-set happen UNDER `lifecycle` (which
+        // `load_inner_impl` also holds when it reads the flag), so a racing load can't
+        // slip between them. The guard clears the flag on every exit (incl. drop).
+        let _bench_guard = {
+            let _lifecycle = self.lifecycle.lock().await;
+            // A benchmark is already running for this id: refuse the second one ([HG068])
+            // rather than let two benches interleave (between candidates `instances()` is
+            // momentarily empty, so the loaded-check below can't catch a concurrent bench,
+            // and their `bench_unload_id` calls would evict each other's candidate workers).
+            if self.is_benchmarking(id) {
+                return Err(HiggsError::BenchInProgress { id: id.to_owned() });
+            }
+            if self.local.instances().await.iter().any(|(_, m)| m == id) {
+                return Err(HiggsError::BenchModelLoaded { id: id.to_owned() });
+            }
+            self.begin_benchmark(id)
+        };
+
+        // Phase 2 (slow): load + measure each candidate. The `_bench_guard` above
+        // makes the model EXCLUSIVE to this benchmark — public loads / JIT chats for
+        // it are refused ([HG068]) — so no concurrent op can touch it and the loop
+        // needs NO cancellation or teardown-race handling. The load is a DIRECT node
+        // load (not `load_inner`): no OOM-ladder degrade, no config persist — a
+        // candidate is measured EXACTLY as specified (the candidate set is itself the
+        // degrade ladder; an OOMing candidate just fails and the next is tried).
+        //
+        // CANCELLATION SAFETY (codex r15/r16): if this future is dropped
+        // mid-candidate (long-op route timeout / client disconnect), the guard's drop
+        // spawns an unload of exactly the live candidate worker and clears the [HG068]
+        // flag only AFTER that unload commits — so the doomed candidate is never
+        // registered-but-ungated. On every normal exit the slot is `None` (each
+        // candidate is unloaded right after its measurement), so the drop no-ops.
+        let live_candidate = Arc::clone(&_bench_guard.live);
+        let winner = run_benchmark(
+            candidates,
+            |cand| {
+                let load = cand.load.clone();
+                let live = Arc::clone(&live_candidate);
+                async move {
+                    // GPU settle before the load (mechanism #6, shared const).
+                    tokio::time::sleep(crate::load_robustness::SETTLE_BEFORE_RETRY).await;
+                    // Tear down this model's prior candidate worker, then load THIS
+                    // candidate verbatim, measure it, and unload it. The live-candidate
+                    // slot is Some ONLY between the load and the post-measure unload —
+                    // exactly the window a dropped future would leak the worker.
+                    self.bench_unload_id(id).await;
+                    let (worker, _) = self
+                        .local
+                        .load(node_params_for(
+                            id,
+                            &crate::worker::engine::LoadParams::llamacpp(load),
+                        ))
+                        .await?;
+                    *live.lock() = Some(worker);
+                    let bench = self.measure_gen_tps(id).await;
+                    self.bench_unload_id(id).await;
+                    *live.lock() = None;
+                    bench
+                }
+            },
+            // The benchmarking gate keeps the model EXCLUSIVE against concurrent public
+            // ops (load/chat/unload/worker-stop are refused [HG068]). The one op that is
+            // NOT refused is a terminal `stop` (shutdown) — so the ONLY cancel signal is
+            // the shutdown flag: abort with [HG064] rather than load more candidates
+            // against a draining node. (Normally the benchmark request drains before
+            // `stop` runs; this is the defense-in-depth path.)
+            || {
+                self.shutting_down
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            },
+        )
+        .await?;
+        Ok((winner.0.load, winner.1))
+    }
+
+    /// Unload every worker serving `id` (the bench's own model) via the PRIVATE node
+    /// `local.unload` — the bench's teardown between candidates. SCOPED to `id` so a
+    /// benchmark never evicts OTHER resident/serving models on a multi-model node;
+    /// distinct from the public [`unload`](Self::unload), which is REFUSED ([HG068])
+    /// while a benchmark owns a model.
+    async fn bench_unload_id(&self, id: &str) {
+        for (worker, model) in self.local.instances().await {
+            if model == id {
+                let _ = self.local.unload(worker).await;
+            }
+        }
+    }
+
+    /// Measure generation throughput for the currently-resident `id`: run a short
+    /// real decode and time it. `gen_tps` is the DECODE-ONLY rate (prefill excluded
+    /// via [`bench::bench_gen_tps`](crate::tune::bench::bench_gen_tps)); `ttft_ms` =
+    /// time to the first delta (the prefill window). An honest measurement of the
+    /// loaded config on this hardware.
+    async fn measure_gen_tps(&self, id: &str) -> Result<BenchResult, HiggsError> {
+        const BENCH_MAX_TOKENS: usize = 64;
+        let messages = r#"[{"role":"user","content":"Write a detailed paragraph about the ocean and its tides."}]"#;
+        let sampling = crate::worker::engine::SamplingParams::llamacpp(
+            crate::worker::engine::llamacpp::params::LlamaCppSamplingParams {
+                temperature: Some(0.0),
+                ..Default::default()
+            },
+        );
+        let start = std::time::Instant::now();
+        // `serve_public = false`: this is the bench's OWN measurement, so it MUST reach
+        // its (benchmark-owned) candidate worker — the public benchmark-skip is bypassed.
+        let (mut deltas, handle) = self
+            .chat_stream_inner(
+                id.to_owned(),
+                messages.to_owned(),
+                BENCH_MAX_TOKENS,
+                sampling,
+                None,
+                None,
+                false,
+            )
+            .await?;
+        // Time to the first token = the prefill window. Captured from the same
+        // `start` as `total` below, so `total - ttft` is EXACTLY the decode window.
+        let mut ttft: Option<std::time::Duration> = None;
+        while let Some(_delta) = deltas.recv().await {
+            if ttft.is_none() {
+                ttft = Some(start.elapsed());
+            }
+        }
+        let outcome = handle.await.map_err(|e| HiggsError::ChatTaskFailed {
+            detail: e.to_string(),
+        })??;
+        let total = start.elapsed();
+        // No token ever arrived ⇒ ttft = total ⇒ empty decode window ⇒ gen_tps 0.
+        let ttft = ttft.unwrap_or(total);
+        let ttft_ms = ttft.as_secs_f32() * 1000.0;
+        // Generation throughput EXCLUDES prompt prefill (see `bench::bench_gen_tps`),
+        // so `pick_winner` ranks candidates by real decode rate, not end-to-end
+        // latency skewed by differing prompt-processing costs.
+        let gen_tps = crate::tune::bench::bench_gen_tps(outcome.completion_tokens, ttft, total);
+        // Prompt throughput approximated from prompt tokens over TTFT (the
+        // prefill window); exact prefill timing is a worker-side refinement.
+        let prompt_tps = if ttft_ms > 0.0 {
+            outcome.prompt_tokens as f32 / (ttft_ms / 1000.0)
+        } else {
+            0.0
+        };
+        Ok(BenchResult {
+            gen_tps,
+            prompt_tps,
+            ttft_ms,
+        })
     }
 
     /// Install the running hub (P3 hub mode) so the pairing API can mint node-join tokens.
@@ -635,6 +1143,12 @@ impl Higgs {
     /// past the drain). The node's drain reaps each worker's process and clears its
     /// load-replay state, so no worker survives to be auto-restarted.
     pub async fn stop(&self) {
+        // Signal a terminal shutdown BEFORE taking the lock: an in-flight Turbotune
+        // benchmark (which does NOT hold `lifecycle` during its candidate loop) polls
+        // this between candidates and aborts cleanly with [HG064] rather than loading
+        // more candidates against the node we're about to drain.
+        self.shutting_down
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let _lifecycle = self.lifecycle.lock().await;
         // Drain every local worker (graceful shutdown of the local node's registry).
         self.local.shutdown_all().await;
@@ -755,6 +1269,14 @@ impl Higgs {
         // same id can't each spawn a worker (the node load is additive — it never
         // dedups). Held for the whole method body.
         let _lifecycle = self.lifecycle.lock().await;
+        // A benchmark owns this model while it measures candidate configs — refuse a
+        // public/JIT load rather than race it ([HG068]). Checked UNDER `lifecycle`,
+        // which `turbotune_bench` also holds when it sets the flag, so the flag and
+        // this check can't interleave. The bench's OWN candidate loads use the
+        // private `local.load` and are not gated here.
+        if self.is_benchmarking(id) {
+            return Err(HiggsError::BenchInProgress { id: id.to_owned() });
+        }
         // 1. Charset guard ([HG015]) — reject traversal/escape ids before any FS
         //    use. The node does resolve ([HG002]), the path-traversal guard
         //    ([HG015]), and the RAM headroom guard ([HG017]); this charset check
@@ -835,6 +1357,12 @@ impl Higgs {
                 None => None,
             },
         };
+        // A REUSE load of a SAVED profile (JIT / a plain reload passes the profile with
+        // `from_request = false`). If the OOM ladder has to DEGRADE such a load, the
+        // fitting config it discovers must be written back to the saved profile — else
+        // every reload re-reads the original OOMing profile and re-walks the ladder
+        // (codex r10). A default load (`params = None`) is NOT a profile reuse.
+        let reused_profile = !from_request && params.is_some();
         // Map the host `LoadParams` onto the node's `NodeLoadParams`. The base
         // fields (id/ctx_len/gpu_layers/threads) drive the node's resolve/ctx-cap;
         // the FULL engine override set rides `params` and is applied by the worker
@@ -886,37 +1414,14 @@ impl Higgs {
                 }
             }
         };
-        // The params we PERSIST on success — derived from `np` so the record reflects
-        // EXACTLY what crossed to the node (and a future autoload reproduces it). Now
-        // that the rich overrides DO cross (the `params` field), persist the full set
-        // with the node-resolved base fields stamped in. A `ctx_len` of 0 means AUTO
-        // (node called with `ctx_len: None` → trained context, capped).
-        let effective = match &np.params {
-            Some(lc) => {
-                let mut lc = lc.clone();
-                lc.ctx_len = np
-                    .ctx_len
-                    .map(crate::worker::engine::CtxLen::fixed)
-                    .unwrap_or(crate::worker::engine::CtxLen::Auto);
-                lc.gpu_layers = np.gpu_layers.unwrap_or_default();
-                lc.threads = np.threads.unwrap_or_default();
-                LoadParams::llamacpp(lc)
-            }
-            None => LoadParams::base(
-                np.ctx_len
-                    .map(crate::worker::engine::CtxLen::fixed)
-                    .unwrap_or(crate::worker::engine::CtxLen::Auto),
-                np.gpu_layers.unwrap_or_default(),
-                np.threads.unwrap_or_default(),
-            ),
-        };
         // For an ACCEPTED explicit load we'll anchor the saved profile to the file
         // it was validated against — capture the hardware fingerprint + file
         // signature BEFORE the (slow) load, so a GGUF swapped mid-load can't mark
         // the profile fresh for a file it wasn't loaded against (the same race
-        // `tune` avoids). Skipped for reuse loads (`!from_request`), which don't
-        // re-anchor.
-        let anchors = if from_request {
+        // `tune` avoids). Captured for an explicit load AND a reuse load (the latter so
+        // a DEGRADED reuse can re-anchor the fitting config it discovered); a pure
+        // default load never syncs, so it captures nothing.
+        let anchors = if from_request || reused_profile {
             let hw_fp = self.hardware().await.fingerprint();
             let sig = self
                 .scan()
@@ -952,20 +1457,77 @@ impl Higgs {
         let _loading_guard = LoadingGuard(&self.loading);
         // The multi-second worker load starts now (mmap → GPU → KV alloc).
         self.emit_load_phase(id, ModelLoadPhase::LoadingWeights, None);
-        self.local.load(np).await?;
+        // G5: walk the OOM degrade-retry ladder around the real node load. The model's
+        // transformer block count lets the ladder turn a default `GpuLayers::All` OOM
+        // into a concrete half-offload rung; a scan miss leaves it `None` (the ladder
+        // then falls back to all-CPU). A fits-first-time load is one call, no ladder.
+        let layer_count = self
+            .scan()
+            .await
+            .ok()
+            .and_then(|ms| ms.into_iter().find(|m| m.id == id))
+            .and_then(|m| m.block_count);
+        let requested_np = np.clone();
+        let loaded_np = run_oom_ladder(
+            id,
+            np,
+            layer_count,
+            crate::load_robustness::SETTLE_BEFORE_RETRY,
+            |p| async move { self.local.load(p).await.map(|_| ()) },
+        )
+        .await?;
+        // Whether the OOM ladder had to DEGRADE — the loaded rung differs from what was
+        // requested. A degraded REUSE load must write the fitting config back to the
+        // saved profile (below), or every reload re-walks the ladder (codex r10).
+        let degraded = loaded_np != requested_np;
         // Weights are resident; the remaining work is fast bookkeeping.
         self.emit_load_phase(id, ModelLoadPhase::Finalizing, None);
+        // The params we PERSIST are the ones that ACTUALLY loaded — `run_oom_ladder`
+        // returns the successful rung, so after an OOM degrade this is the cheaper
+        // (KV-off / fewer-layers) config, NOT the seed that OOMed. The record + a
+        // future autoload therefore reproduce the config that fits. Derived from the
+        // node params so it reflects EXACTLY what crossed the wire; `ctx_len` of 0
+        // means AUTO (node called with `ctx_len: None` → trained context, capped).
+        let effective = match &loaded_np.params {
+            Some(lc) => {
+                let mut lc = lc.clone();
+                lc.ctx_len = loaded_np
+                    .ctx_len
+                    .map(crate::worker::engine::CtxLen::fixed)
+                    .unwrap_or(crate::worker::engine::CtxLen::Auto);
+                lc.gpu_layers = loaded_np.gpu_layers.unwrap_or_default();
+                lc.threads = loaded_np.threads.unwrap_or_default();
+                LoadParams::llamacpp(lc)
+            }
+            None => LoadParams::base(
+                loaded_np
+                    .ctx_len
+                    .map(crate::worker::engine::CtxLen::fixed)
+                    .unwrap_or(crate::worker::engine::CtxLen::Auto),
+                loaded_np.gpu_layers.unwrap_or_default(),
+                loaded_np.threads.unwrap_or_default(),
+            ),
+        };
         // Persist the per-model load record (best-effort — never fail a good load).
         let now = now_unix_ms();
         if let Err(e) = self.with_config_mut(|c| c.record_load(id, effective.clone(), now)) {
             tracing::warn!(id, error = %e, "higgs: failed to persist load record to config.json");
         }
-        // Keep the saved tuning profile in sync with an ACCEPTED explicit load, so a
-        // plain reload reuses the accepted/edited params — not a stale tune suggestion.
-        // A load that merely REUSED the saved profile (no request params) leaves it
-        // unchanged. (The resident-model early return above does the same sync.)
+        // Keep the saved tuning profile in sync with the config that ACTUALLY loaded:
+        // - an ACCEPTED EXPLICIT load persists the accepted/edited params (as before), so
+        //   a plain reload reuses them, not a stale tune suggestion; and
+        // - a REUSE load that the OOM ladder had to DEGRADE writes the fitting config back
+        //   (codex r10) so the next reload uses it instead of re-walking the ladder.
+        // A reuse load that loaded AS-IS is left unchanged (no drift; `degraded` is false).
+        // (The resident-model early return above does the same sync.) `sync_saved_profile`
+        // → `set_profile` drops the record's stale `provenance`/`bench_tps` whenever the
+        // written params DIFFER from the saved profile — an OOM-degraded fallback (r11) or
+        // an explicitly edited reload (r12); an as-requested reload of the tuned params
+        // keeps them.
         if let Some((hw_fp, sig)) = anchors {
-            self.sync_saved_profile(id, &effective, &hw_fp, &sig).await;
+            if from_request || degraded {
+                self.sync_saved_profile(id, &effective, &hw_fp, &sig).await;
+            }
         }
         Ok(())
     }
@@ -982,6 +1544,8 @@ impl Higgs {
     async fn sync_saved_profile(&self, id: &str, profile: &LoadParams, hw_fp: &str, sig: &str) {
         let _guard = self.models_io.lock();
         if let Ok(store) = self.models_store() {
+            // `set_profile` itself drops stale bench metrics if these params differ from
+            // the saved profile (codex r11/r12), so the caller need not decide.
             store.set_profile(id, profile.clone(), hw_fp, sig, now_unix_ms());
             if let Err(e) = store.flush() {
                 // Best-effort (a load already succeeded), but log the coded HG040 so a
@@ -1021,6 +1585,15 @@ impl Higgs {
     /// headroom guard, and multi-model workers coexist by design anyway).
     pub async fn unload(&self) -> Result<(), HiggsError> {
         let _lifecycle = self.lifecycle.lock().await;
+        // A benchmark owns its model exclusively while it measures candidate configs.
+        // A drain-all here would evict the bench's transiently-resident candidate worker
+        // mid-measurement (contaminating the numbers / failing the run), so refuse while
+        // ANY benchmark is in flight ([HG068]) — retry once it finishes. The bench's OWN
+        // teardown uses the private `local.unload`, not this facade drain, so it is not
+        // blocked. (Checked under `lifecycle`, the same order the bench sets the flag.)
+        if let Some(id) = self.benchmarking.lock().iter().next().cloned() {
+            return Err(HiggsError::BenchInProgress { id });
+        }
         for (worker, _model) in self.local.instances().await {
             // Ignore `no_worker`: a concurrent idle-reap already removed+reaped it
             // (see the CONCURRENCY note above). The reaper never ADDS, so after this
@@ -1055,7 +1628,22 @@ impl Higgs {
     /// trigger. Until then a destructive unload trusts the served id the caller saw.
     pub async fn unload_one(&self, served: &str) -> Result<(), HiggsError> {
         let _lifecycle = self.lifecycle.lock().await;
-        if let Some((worker, _model)) = self.local_served().await.remove(served) {
+        // BETWEEN candidate loads the benchmarked model has no served worker, so the
+        // resolution below misses it — without this bare-flag check a per-model unload
+        // would return a FALSE success while the benchmark keeps running (codex r20).
+        // (Benchmarks target RAW ids; a suffixed served id is never a bench target.)
+        if self.is_benchmarking(served) {
+            return Err(HiggsError::BenchInProgress {
+                id: served.to_owned(),
+            });
+        }
+        if let Some((worker, raw)) = self.local_served().await.remove(served) {
+            // The resolved model is being benchmarked: refuse to eject its candidate
+            // worker ([HG068]) — evicting it mid-measurement would contaminate/fail the
+            // run. The bench's own teardown uses the private `local.unload`, not this.
+            if self.is_benchmarking(&raw) {
+                return Err(HiggsError::BenchInProgress { id: raw });
+            }
             // Ignore `no_worker`: the idle reaper may have removed+reaped it between
             // the resolve and here — the end state (id not resident) is the same.
             let _ = self.local.unload(worker).await;
@@ -1269,6 +1857,11 @@ impl Higgs {
     /// per-request keyed channel; the worker executes requests serially (single-
     /// threaded stdin loop) so throughput is sequential but callers never clobber
     /// each other's streams.
+    /// PUBLIC chat entry (the serve layer's dispatch). Delegates to
+    /// [`chat_stream_inner`](Self::chat_stream_inner) with `serve_public = true`, so a
+    /// benchmark-owned local candidate worker is SKIPPED rather than served to public
+    /// traffic (the Turbotune isolation the serve gate enforces, closed against the
+    /// gate→dispatch re-resolution race).
     pub async fn chat_stream(
         &self,
         model: String,
@@ -1279,7 +1872,42 @@ impl Higgs {
         chat_template_kwargs: Option<String>,
     ) -> Result<
         (
-            mpsc::UnboundedReceiver<crate::worker::engine::ChatDelta>,
+            crate::delta_queue::DeltaReceiver,
+            tokio::task::JoinHandle<Result<ChatOutcome, HiggsError>>,
+        ),
+        HiggsError,
+    > {
+        self.chat_stream_inner(
+            model,
+            messages_json,
+            max_tokens,
+            sampling,
+            tools_json,
+            chat_template_kwargs,
+            true,
+        )
+        .await
+    }
+
+    /// The chat dispatch body. `serve_public` gates benchmark isolation: `true` (public
+    /// serve path) SKIPS a locally-resident worker whose raw model is being benchmarked
+    /// — a TRANSIENT Turbotune candidate the serve gate did not route to (it chose
+    /// remote/JIT because the id was not publicly resident), which the bench unloads
+    /// between candidates. `false` is the bench's OWN measurement
+    /// ([`measure_gen_tps`](Self::measure_gen_tps)), which MUST reach its candidate.
+    #[allow(clippy::too_many_arguments)]
+    async fn chat_stream_inner(
+        &self,
+        model: String,
+        messages_json: String,
+        max_tokens: usize,
+        sampling: crate::worker::engine::SamplingParams,
+        tools_json: Option<String>,
+        chat_template_kwargs: Option<String>,
+        serve_public: bool,
+    ) -> Result<
+        (
+            crate::delta_queue::DeltaReceiver,
             tokio::task::JoinHandle<Result<ChatOutcome, HiggsError>>,
         ),
         HiggsError,
@@ -1297,18 +1925,42 @@ impl Higgs {
         // resolves at DISPATCH time (the authoritative current meaning) and the worker
         // runs the exact tokenizer [HG005] check, so a stale gate estimate degrades to
         // the worker's own backstop rather than a wrong answer — never a panic.
-        if let Some((worker, raw_model)) = self.local_served().await.remove(&model) {
-            // Admission gate: bound concurrent in-flight inference so the no-auth
-            // server can't be flooded. A full gate is a capacity signal (HTTP 503),
-            // not a failure — the client may retry. The owned permit is moved into
-            // the spawned generation task below so it is held for the WHOLE request
-            // (queue wait + generation) and released on any outcome.
-            let permit = Arc::clone(&self.inference_gate)
-                .try_acquire_owned()
-                .map_err(|_| HiggsError::ServerBusy {
-                    in_flight: MAX_CONCURRENT_INFERENCE,
-                    max: MAX_CONCURRENT_INFERENCE,
-                })?;
+        // PUBLIC traffic SKIPS a benchmark-owned local worker: it is a TRANSIENT
+        // Turbotune candidate (the serve gate routed this request elsewhere — remote/JIT
+        // — because the id was not publicly resident when it resolved), and the bench
+        // unloads it between candidates, so streaming from it would serve the wrong
+        // config or die mid-stream. Closes the gate→dispatch re-resolution race (codex
+        // r9). The bench's OWN measurement (`serve_public == false`) is exempt so it can
+        // time its candidate.
+        let resolved = self
+            .local_served()
+            .await
+            .remove(&model)
+            .filter(|(_, raw_model)| !(serve_public && self.is_benchmarking(raw_model)));
+        if let Some((worker, raw_model)) = resolved {
+            // Admission gate: bound concurrent in-flight PUBLIC inference so the
+            // no-auth server can't be flooded. A full gate is a capacity signal
+            // (HTTP 503), not a failure — the client may retry. The owned permit is
+            // moved into the spawned generation task below so it is held for the
+            // WHOLE request (queue wait + generation) and released on any outcome.
+            // The bench's OWN measurement (`serve_public == false`) does NOT take a
+            // permit: it must not compete with public chats on OTHER models for the
+            // slots — a full gate would misread as an HG065 "candidate failure" and
+            // skew `pick_winner` (Fable r1). It needs no bound of its own: the
+            // benchmark is serialized per model ([HG067]/[HG068]) and measures ONE
+            // candidate at a time.
+            let permit = if serve_public {
+                Some(
+                    Arc::clone(&self.inference_gate)
+                        .try_acquire_owned()
+                        .map_err(|_| HiggsError::ServerBusy {
+                            in_flight: MAX_CONCURRENT_INFERENCE,
+                            max: MAX_CONCURRENT_INFERENCE,
+                        })?,
+                )
+            } else {
+                None
+            };
             // Lease the worker's Supervisor for the whole generation. The lease stamps
             // the worker's last-activity on acquire and (on drop) re-stamps + drops the
             // in-flight reference, so the node's idle reaper never unloads a worker
@@ -1698,7 +2350,7 @@ impl Higgs {
         // 4. Suggest — always a FRESH derive within the budget (a prior saved profile
         //    is reused at the LOAD seam, not here, so a re-tune honors a new budget).
         //    (Benchmark is P2 — treated as Suggest here.)
-        let suggestion = match card {
+        let mut suggestion = match card {
             Some(sampling) => Suggester {
                 derive: crate::tune::derive::HeuristicStrategy,
                 vram: crate::tune::vram::StaticVramEstimator,
@@ -1708,11 +2360,33 @@ impl Higgs {
             .suggest(&meta, &hw, &budget),
             None => Suggester::static_default().suggest(&meta, &hw, &budget),
         };
+        // 5. Benchmark (Turbotune, G6): actually LOAD + MEASURE the candidate configs
+        //    and keep the FASTEST, upgrading the analytical suggestion to a MEASURED
+        //    `Bench` profile. The benchmark is EXCLUSIVE: it refuses to start if the
+        //    model is loaded ([HG067]) or already benchmarking ([HG068]), and while it
+        //    runs every public load/chat/unload for the model is refused ([HG068]), so
+        //    no concurrent op can contaminate the measurement. Every candidate failing
+        //    surfaces [HG063]. Suggest mode skips this entirely.
+        let mut bench_tps = None;
         if req.mode.unwrap_or_default() == TuneMode::Benchmark {
-            tracing::info!(
-                id,
-                "higgs: tune benchmark mode not yet available (P2); used suggest"
-            );
+            let (winner_load, bench) = self
+                .turbotune_bench(&id, &meta, &hw, &budget, &suggestion)
+                .await?;
+            // The measured winner may differ from the analytical seed (e.g. q8_0 KV
+            // after the F16 seed was filtered out), so recompute BOTH fit reports
+            // against the winner — otherwise the response's vram/ram fit numbers and
+            // verdicts describe the seed, not the config actually being saved.
+            suggestion.vram_fit =
+                crate::tune::vram::StaticVramEstimator.estimate(&winner_load, &meta, &hw, &budget);
+            suggestion.ram_fit =
+                crate::tune::vram::StaticRamEstimator.estimate(&winner_load, &meta, &hw, &budget);
+            suggestion.load = LoadParams::llamacpp(winner_load);
+            suggestion.provenance = crate::tune::TuneProvenance::Bench;
+            suggestion.rationale.push(format!(
+                "Turbotune measured {:.1} tok/s (fastest of the benched configs on this hardware)",
+                bench.gen_tps
+            ));
+            bench_tps = Some(bench.gen_tps);
         }
 
         // 6. Persist as the saved profile so the next plain load reuses it. Serialize
@@ -1738,7 +2412,7 @@ impl Higgs {
                     sampling: suggestion.sampling.clone(),
                     budget: suggestion.budget.clone(),
                     provenance: suggestion.provenance,
-                    bench_tps: None,
+                    bench_tps,
                     tuned_at_ms: now_unix_ms(),
                     // Staleness anchors: the hardware + model file this profile
                     // was derived against.

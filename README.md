@@ -2,8 +2,12 @@
 
 **A self-contained local LLM runtime in Rust.** Point it at a folder of GGUF files and it
 serves OpenAI-compatible inference over HTTP — embedded in your Axum app or as a standalone
-binary — with crash-isolated worker processes, a pluggable engine layer, and an optional
-peer-to-peer **remote fleet** that runs models on other machines over an encrypted QUIC link.
+binary — with crash-isolated worker processes, a pluggable engine layer, an optional
+peer-to-peer **remote fleet** over encrypted QUIC, and opt-in API-key auth.
+
+higgs is a **standalone crate**: it imports nothing from any jigglebot crate (`src/lib.rs`).
+The control plane (router + `Higgs` facade) is pure Rust and cannot crash; only the worker
+process links the llama.cpp FFI.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
@@ -12,156 +16,118 @@ peer-to-peer **remote fleet** that runs models on other machines over an encrypt
 └───────────────────────────────┬──────────────────────────────────────┘
                                  │  (pure-Rust router + facade, can't crash)
                           ┌──────▼───────┐
-                          │    Higgs     │  facade: load / chat / status / logs
+                          │    Higgs     │  facade: load / chat / status / logs / tune
                           └──────┬───────┘
             local model          │              remote model
         ┌────────────────────────┴───────────────────────────┐
         ▼                                                      ▼
-   Supervisor ──stdio JSON-RPC──> worker process        HubFleet ──iroh QUIC──> node ──stdio──> worker
-        │                          (llama.cpp engine)                            (another machine)
+  NodeRuntime ──Supervisor──stdio JSON-RPC──> worker    HubFleet ──iroh QUIC──> node ──> worker
+  (multi-worker registry)     (llama.cpp engine)                               (another machine)
         ▼
    GGUF on disk
 ```
 
-## Table of Contents
-- [Features](#features)
-- [Architecture](#architecture)
-- [Quick Start](#quick-start)
-- [Usage](#usage)
-- [HTTP API](#http-api)
-- [Remote Fleet](#remote-fleet)
-- [Adding a New Engine](#adding-a-new-engine)
-- [Diagnostics](#diagnostics)
-- [Testing & Coverage](#testing--coverage)
-- [File Map](#file-map)
+## Scope of this document
+
+This is the **crate-level** README. It covers the crate as a whole plus the **loose top-level
+modules** in `src/*.rs`. The five sub-folders own their own `README.md` + `DESIGN.md` and are
+only named + linked here:
+
+| Sub-folder | What it owns | Docs |
+|---|---|---|
+| `src/api/` | `Higgs` facade internals split out of `api.rs`: `guards.rs` (memory/repo-id/path guards), `types.rs` (`HiggsConfig`, `HiggsServerConfig`, wire status/outcome types) | `src/api/README.md` |
+| `src/node/` | iroh remote fleet: hub, node runtime, transport, fleet routing, identity, CLI | `src/node/README.md`, `DESIGN-remote.md` |
+| `src/serve/` | Axum router: `/v1/*` + `/api/higgs/*` handlers, SSE assembly, hardening layers | `src/serve/README.md` |
+| `src/tune/` | analytical + measured (Turbotune) autotune, per-model `models.json` store | `src/tune/README.md` |
+| `src/worker/` | re-exec'd worker: JSON-RPC dispatch loop, model discovery, `HiggsEngine` trait + llama.cpp engine | `src/worker/README.md` |
+
+The **`higgs-macros`** workspace crate (`higgs-macros/`) provides two proc-macro derives used
+by the ts-rs bindings: `TsConstEnum` (emit a TypeScript const-object for a unit-variant enum,
+usable as a value) and `TsParamHelp` (emit `PARAM_HELP` tooltip text from `#[help]` attrs). It
+is a standalone workspace member because higgs cannot depend on jigglebot's `macros` crate.
 
 ---
 
-## Features
+## Loose top-level modules (`src/*.rs`)
 
-**Inference**
-- OpenAI-compatible `POST /v1/chat/completions` — streaming (SSE) and non-streaming.
-- `GET /v1/models` model listing (local + remotely-routable).
-- Sampling controls: `temperature`, `top_p`, `max_tokens`, `seed`, `stop`, presence/frequency penalties.
-- Tool / function calling: the GGUF-embedded chat template renders the OpenAI `tools` array and the matching tool-call parser is selected automatically (no custom parser invented). Multi-turn tool loops round-trip (`assistant.tool_calls` → `tool` results).
-- Usage accounting (`prompt_tokens` / `completion_tokens`), with `stream_options.include_usage`.
-
-**Model management**
-- Host-side model discovery across **LM Studio**, **HuggingFace cache**, and **Ollama** stores — works even with no worker running.
-- **Spawn-on-load / kill-on-unload**: zero model loaded ⇒ zero worker process ⇒ zero idle RAM.
-- **Just-in-time (JIT) load**: a chat for a scanned-but-unloaded model loads it on demand.
-- **Idle reaper**: auto-unloads a model after a configurable idle TTL.
-- Pre-load **RAM/VRAM headroom guard** so a model that can't fit is rejected before it thrashes the host.
-- Rich load tuning: `ctx_len`, `gpu_layers`, `threads`, mmap/mlock, batch sizes, KV-cache type, flash-attention.
-
-**Reliability & isolation**
-- The inference engine runs in a **separate worker process** (re-exec with `--higgs-worker`); a worker crash can never take down the host.
-- The **supervisor** restarts a crashed worker once and **replays the last load**, so the model self-heals.
-- Pure-Rust control plane (router + facade) — only the worker is native FFI.
-
-**Observability**
-- Unified **Developer Logs**: worker stderr + serve-layer tracing in one `LogBus`.
-- `GET /api/higgs/logs` snapshot tail and `GET /api/higgs/logs/stream` live SSE.
-- `?source=` filter: `serve`, `worker`, or a remote worker `node:<id>:<worker>`.
-- `GET /api/higgs/system` — real CPU/RAM/GPU/VRAM + engine/runtime versions.
-
-**Remote fleet (peer-to-peer)**
-- Run models on **other machines** over an encrypted [iroh](https://iroh.computer) QUIC link — no central server, no open inbound ports required.
-- **Pairing** with one-time tokens + a persistent allowlist; version-negotiated HELLO handshake.
-- The hub routes `/v1` chat to a remote-resident worker transparently (two hops: hub → node → worker).
-- **Durable routes** survive reconnects; a dead worker self-heals or re-routes.
-- Remote worker stderr is **relayed back** into the hub's log console, tagged per node/worker.
-- `GET /api/higgs/nodes` — fleet view: each node's identity, connection state, hardware, and resident workers.
-
-**Extensibility**
-- A single [`HiggsEngine`](src/worker/engine/mod.rs) trait is the only seam between higgs and an inference backend. Adding a new engine (e.g. MLX) is **implement the trait + one registry line** — see [Adding a New Engine](#adding-a-new-engine).
+| File | Responsibility |
+|------|----------------|
+| `lib.rs` | Crate root — module map; re-exports `Higgs`, `HiggsConfig`, `HiggsError`, `HiggsEvent`, `LogBus`/`HiggsLogLayer`/`log_filter`, `run_standalone`/`shutdown_signal`/`StandaloneConfig`; `DEFAULT_PORT` (31415); the crate-internal `LLAMA_CPP_2_VERSION` (`"0.1.151"`, the bundled binding). `#[macro_use] mod ts_export` first so `higgs_ts!` is in scope everywhere. |
+| `api.rs` | The `Higgs` public **facade**. Typed wrapper over a co-located LOCAL `NodeRuntime` (the same multi-worker engine remote nodes run). Owns facade state — live `HiggsConfig`, the load-lifecycle mutex, the two inference admission gates, serve-layer toggles, the readiness/JIT gate, tune/estimate, the OOM retry wiring — and delegates spawn/load/unload/status/chat to the node. |
+| `supervisor.rs` | Manages ONE worker child: spawn by re-exec (`--higgs-worker`), NDJSON JSON-RPC 2.0 over stdio, correlate responses by id, route chat-chunk notifications, restart-once + replay-last-load on unexpected death. Owns `HiggsEvent`, the RPC timeouts (`CONTROL` 120 s, `CHAT_RPC_TIMEOUT` 600 s, `SYSINFO` 15 s). |
+| `actor.rs` | The generic actor runtime (`Actor` trait, `Handle`/`WeakHandle`, `spawn_actor{,_with}`) written once, plus `ReplyDemux` (request-id → response waiter + `request_id` → chat sink). Reused by `Supervisor`, `NodeRuntime`, and the per-node transport. |
+| `delta_queue.rs` | **(G1)** Bounded, MERGING chat-delta channel — the backpressure buffer between a delta producer and its single streaming consumer. Coalesces consecutive same-kind deltas in place (entries bounded by kind-alternations, not token count); `CAP_BYTES` (8 MB) hard cap trips `HG057` on a stalled client instead of unbounded growth. `delta_channel()` → `(DeltaSender, DeltaReceiver)`. |
+| `rpc.rs` | NDJSON JSON-RPC 2.0 codec — the supervisor↔worker AND hub↔node wire. `RpcRequest`/`RpcResponse`/`RpcError`/`RpcNotification`/`RpcFrame`, `encode`/`decode` (`HG008` on bad frame), `method_not_found` (`HG037`). Soft-validates the `jsonrpc` version (warn, not reject). |
+| `diagnostic.rs` | `HiggsError` — every higgs failure, each carrying a stable `HGxxx` code baked into `Display`. Append-only; never renumber. Also documents the **log-only** codes (HG051–HG056, HG061/HG062/HG065) that ride a `tracing` line, not a variant. |
+| `system.rs` | Host hardware + inference-runtime snapshot for `/api/higgs/system`: `SystemInfo`, `HardwareInfo`, `RuntimeInfo`, `GpuDevice`, `DeviceKind`, plus `fits_vram`/`FitAssessment` and `HardwareInfo::{fingerprint, free_vram_bytes, is_unified_memory}`. `hostname()`. |
+| `log_bus.rs` | The single home for Developer-Log lines: `LogBus` (a bounded history ring PER `LogSource` + a live broadcast tap), `HiggsLogLayer` (tracing layer mirroring `higgs`-target events), `log_filter`. `LogSource` = `Serve`/`Worker`/`LocalWorker`/`RemoteWorker`. |
+| `keys.rs` | **(G4)** API-key auth: `ApiKeys`/`ApiKey`/`Scope` (`Chat`/`Models`/`Admin`). Tokens stored only as a SHA-256 hex digest; constant-time compare; empty store ⇒ auth OFF (open). `hash_token`/`mint_token`; `higgs keys <add\|list\|remove>` CLI (`run_keys`); live mutation over HTTP via `/api/higgs/keys` (Admin scope). |
+| `auth.rs` | Remote-fleet **allowlist** (`pairings.json` → `Allowlist`) and one-time **pairing tokens** (`PairingTokens`, mint/validate/burn). Atomic saves; corruption → `HG041`, I/O → `HG040`. |
+| `config.rs` | `~/.higgs/config.json` (`InstanceConfig`): friendly `name`, node-side saved hubs (`SavedHub` + `remember_hub`/`find_hub`/`remove_hub`), per-model load records (`ModelRecord`), extra `cors_origins`. `Role`, `friendly_name`, `name_or_init`. |
+| `home.rs` | `~/.higgs` home dir (`higgs_home`, `ensure_home`); `HIGGS_HOME` override. The single home for all identity/state files. |
+| `hub.rs` | **HuggingFace Hub client — PRIMARY fetch path.** `HubFetcher` (streaming) + `fetch_bytes` (in-memory card/config), honoring `HIGGS_HF_ENDPOINT`. `classify_hf`/`http_status_to_error` map failures to distinct `HG029`–`HG035`. |
+| `download.rs` | Model downloader (`M_PULL`): `Fetcher` trait, `HttpFetcher` (reqwest FALLBACK), `download`/`download_dual` (primary+fallback → `HG036` if both fail), `dest_path` path-traversal guard, atomic `.part`+rename into `~/.higgs/models/`. |
+| `load_robustness.rs` | **(G5)** Pure OOM decision logic wired into the load path: `is_oom_reason`, `oom_ladder` (settle → KV-to-RAM → fewer GPU layers → `HG060`), `LoadRung`, `SETTLE_BEFORE_RETRY` (750 ms VRAM settle). |
+| `remote.rs` | Remote wire vocabulary: `ALPN`, `M_HELLO`, the `higgs/node/*` methods, `HelloParams`/`HelloResult`, `NodeLoadParams`/`NodeChatParams`/`NodeInventory`/`InventoryWorker`, capabilities, `negotiate_version`, `PAIRING_TOKEN_TTL_MS`. |
+| `standalone.rs` | The testable core of the `higgs` binary: `run_standalone` (build `Higgs` → load keys → bind-exposure guards `HG058`/`HG069` → optional hub → serve), `StandaloneConfig`, `shutdown_signal`, `is_loopback_bind`. |
+| `ts_export.rs` | The single ts-rs export path: `higgs_ts!` (wrap a type → export TS to `bindings/higgs/`) and `higgs_const_enum!` (const-object enum via `higgs_macros::TsConstEnum`). |
+| `bin/higgs.rs` | Thin `main()`: detect the `--higgs-worker` re-exec role, route CLI subcommands (`keys`, `link`, `node`), install the tracing subscriber, hand off to `run_standalone`. |
 
 ---
 
-## Architecture
+## Public surface
 
-### Process model (local)
+Everything a host app touches is re-exported from the crate root (`src/lib.rs`):
 
-higgs keeps the control plane and the native engine in **separate processes** so the engine
-can never crash the host:
-
-```
-host process (your app, or the `higgs` binary)
-│
-│  Arc<Higgs>            ← pure Rust: router, facade, model scan, log bus
-│     │
-│     │ load(model)
-│     ▼
-│  Supervisor  ──spawn──>  worker process  ("higgs(<model>)")
-│     │   newline-delimited JSON-RPC 2.0 over stdio       │
-│     │   M_LOAD / M_CHAT / M_STATUS / M_SYSINFO          │  HiggsEngine (llama.cpp FFI)
-│     │<──────── N_CHAT_CHUNK stream + final ────────────┤
-│     ▼                                                    ▼
-│  restart-on-crash + replay last load               GGUF on disk
+```rust
+pub use api::{Higgs, HiggsConfig};
+pub use diagnostic::HiggsError;
+pub use log_bus::{log_filter, HiggsLogLayer, LogBus};
+pub use standalone::{run_standalone, shutdown_signal, StandaloneConfig};
+pub use supervisor::HiggsEvent;
+pub const DEFAULT_PORT: u16 = 31415;   // (pi) — override with HIGGS_PORT
 ```
 
-- **`Higgs`** (`src/api.rs`) is the host-facing facade: `load`, `chat_stream`, `status`, `logs`.
-- **`Supervisor`** (`src/supervisor.rs`) owns one worker child, correlates JSON-RPC requests, routes streamed chat chunks, and restarts + replays on crash.
-- The **worker** (`src/worker/`) is a JSON-RPC dispatch loop over stdio driving a `HiggsEngine`.
-- **Model scanning** is host-side, so `/v1/models` and `/api/higgs/models` work with no worker.
+`Higgs` is the facade the rest of the crate (and the embedder) drives:
 
-### Two surfaces, one router
+| Method | Purpose |
+|---|---|
+| `new(cfg)` / `with_log_bus(cfg, bus)` | Construct (no worker spawned) |
+| `start()` / `stop()` | Spawn the idle reaper (near-no-op otherwise) / tear down |
+| `scan()` → `Vec<HiggsModel>` | Host-side model discovery (no worker needed) |
+| `load(id, params)` / `unload()` / `unload_one(served)` | Load / unload (spawn-on-load, kill-on-unload) |
+| `chat_stream(model, messages, max_tokens, temp, tools)` | Streaming chat → `(DeltaReceiver, JoinHandle<ChatOutcome>)` |
+| `status()` → `HiggsStatus` | Live worker/loaded/on-disk status |
+| `sysinfo()` / `hardware()` | Worker-gathered GPU devices / host hardware snapshot |
+| `tune(req)` / `estimate(req)` | Analytical + measured autotune / footprint estimate |
+| `model_readiness(id)` | Readiness state for the JIT prepare gate |
+| `events()` / `subscribe_logs()` / `subscribe_load_events()` | Broadcast subscriptions |
+| `set_fleet`/`fleet`, `set_hub`/`hub`, `set_api_keys`/`api_keys`/`mutate_api_keys` | Wire in the remote fleet, hub, and keystore |
 
-```
-            ┌───────────────── Axum Router ─────────────────┐
-  /v1/*  ───┤  OpenAI compat:  chat/completions, models      │
-            │                                                 │
-/api/higgs/*┤  control: status, system, nodes, models/*,     │
-            │           logs, logs/stream, settings, worker   │
-            └─────────────────────────────────────────────────┘
-```
-
-Mount it in any Axum host with one call, or run the standalone `higgs` binary.
-
-### Remote fleet (two hops, never one)
-
-```
-   HUB (has the OpenAI clients)                 NODE (has the GPUs)
-   ┌────────────────────────┐                  ┌──────────────────────────┐
-   │ Higgs ── HubFleet       │                  │ NodeRuntime               │
-   │   │       │             │   iroh QUIC      │   │  (N workers)          │
-   │   │   NodeTransport ────┼===(ALPN higgs/   │   ├─ Supervisor ─ worker  │
-   │   │       │             │    remote/1)=====┼──>│   (stdio JSON-RPC)    │
-   │   │   routes:           │  M_NODE_LOAD     │   ├─ Supervisor ─ worker  │
-   │   │   model→(node,wkr)  │  M_CHAT          │   └─ ...                  │
-   │   │   N_LOG_LINE  <─────┼──────────────────┼── relayed worker stderr   │
-   └────────────────────────┘                  └──────────────────────────┘
-```
-
-Invariants: the hub **never** speaks to a remote worker directly; control (`higgs/node/*`) and
-data (`M_CHAT`) are separate dispatchers; the worker stays pure-sync stdio in every topology.
-See `DESIGN-remote.md` for the full spec.
+The router is mounted with `higgs::serve::router(higgs.clone())` (see `src/serve/`). The
+`Higgs` methods are engine-agnostic above the `HiggsEngine` trait (`src/worker/engine/`).
 
 ---
 
 ## Quick Start
 
 ```bash
-# Build
 cargo build --release
 
-# Run the standalone server against a folder of GGUF models
-HIGGS_MODEL_DIR=/path/to/models HIGGS_BIND=127.0.0.1 HIGGS_PORT=11434 \
-  ./target/release/higgs
+# Serve a folder of GGUF models (loopback, port 31415)
+HIGGS_MODEL_DIR=/path/to/models ./target/release/higgs
 
-# Chat (OpenAI-compatible)
-curl localhost:11434/v1/chat/completions -H 'content-type: application/json' -d '{
+curl localhost:31415/v1/chat/completions -H 'content-type: application/json' -d '{
   "model": "your-org/your-model",
   "messages": [{"role":"user","content":"Hello!"}],
   "stream": false
 }'
 ```
 
-Environment knobs: `HIGGS_MODEL_DIR` (extra LM-Studio scan root), `HIGGS_BIND`, `HIGGS_PORT`,
-`HIGGS_HOME` (state dir, default `~/.higgs`), `HIGGS_ENGINE` (engine selector, default
-`llamacpp`), `HIGGS_VERBOSE=1` (keep full engine stderr).
-
-## Usage
+Env knobs: `HIGGS_MODEL_DIR` (extra LM-Studio scan root), `HIGGS_BIND`, `HIGGS_PORT`,
+`HIGGS_HOME` (state dir, default `~/.higgs`), `HIGGS_ENGINE` (default `llamacpp`),
+`HIGGS_HUB=1` (run as a fleet hub), `HIGGS_HF_ENDPOINT` (HuggingFace mirror/proxy),
+`HIGGS_VERBOSE=1`.
 
 ### Embed in an Axum app
 
@@ -171,201 +137,106 @@ use higgs::{Higgs, HiggsConfig};
 
 let higgs = Arc::new(Higgs::new(HiggsConfig::default()));
 let app = axum::Router::new().merge(higgs::serve::router(higgs.clone()));
-// serve `app` on any listener — /v1/* and /api/higgs/* are now live.
+higgs.start().await?;   // spawns the idle reaper; no worker yet
 ```
 
-### Drive the facade directly
-
-```rust
-let (mut deltas, done) = higgs
-    .chat_stream(model, messages_json, /*max_tokens*/ 256, /*temp*/ 0.7, /*tools*/ None)
-    .await?;
-while let Some(delta) = deltas.recv().await { print!("{delta}"); }
-let outcome = done.await??;   // ChatOutcome { content, finish_reason, usage, ... }
-```
+---
 
 ## HTTP API
 
 | Method & path | Purpose |
 |---|---|
-| `POST /v1/chat/completions` | OpenAI chat (stream + non-stream, tools, sampling params) |
-| `GET /v1/models` | List loaded + remotely-routable models |
-| `GET /api/higgs/status` | Live engine + loaded-model status |
-| `GET /api/higgs/system` | Host hardware + engine/runtime versions |
-| `GET /api/higgs/nodes` | Remote fleet view (per-node identity, hardware, workers) |
-| `GET /api/higgs/models` | Scanned model catalog |
-| `GET /api/higgs/models/{org}/{model}` | One model's details |
+| `POST /v1/chat/completions` | OpenAI chat — stream + non-stream, tools, sampling params, `reasoning_content` |
+| `GET /v1/models` | Loaded + remotely-routable models |
+| `GET /api/higgs/status` · `/system` · `/nodes` | Live status · host hardware+runtime · remote fleet view |
+| `GET /api/higgs/models` · `…/models/{*id}` | Scanned catalog · one model's details |
 | `POST /api/higgs/models/load` · `…/unload` | Load / unload a model |
+| `GET·PUT /api/higgs/settings` · `…/logs/settings` | Runtime toggles (JIT, idle reaper, serving) · logging toggles |
+| `GET /api/higgs/logs` · `…/logs/stream` | Developer-Log snapshot / live SSE, `?source=` filter |
 | `POST /api/higgs/worker/stop` | Stop the worker process |
-| `GET /api/higgs/logs` · `…/logs/stream` | Developer-Log tail (snapshot / live SSE), `?source=` filter |
-| `GET·PUT /api/higgs/settings` · `…/logs/settings` | Runtime + logging toggles |
-| `GET /api/higgs/version` · `/health` | Build version · health check |
+| `GET /api/higgs/version` · `/health` | Build version · always-open health check |
+
+See `src/serve/` for the full surface (fleet/hub admin, tune/estimate, keys).
+
+---
 
 ## Securing the API
 
-The HTTP surface is **open by default** (intended for loopback / embedded use). To require
-authentication, add API keys — the gate turns on as soon as the first key exists:
+The HTTP surface is **open by default** (loopback / embedded use). Add API keys to turn on
+auth — the gate turns on the moment the first key exists (`src/keys.rs`):
 
 ```bash
-higgs keys add ci chat,models   # mint a key (scopes: chat | models | admin)
-#   token (shown ONCE …): hgk_…
-higgs keys list
+higgs keys add ci chat,models   # scopes: chat | models | admin (admin = superset)
+higgs keys list                 # shows label + sha256 prefix (never the token)
 higgs keys remove ci
 ```
 
-Clients then send `Authorization: Bearer hgk_…`. Scopes: `chat` (POST `/v1/chat/completions`),
-`models` (model listing), `admin` (everything, incl. management). Tokens are stored only as a
-SHA-256 digest in `~/.higgs/api_keys.json`. The standalone server loads keys at startup and
-**fails closed** if the file is present but unreadable; **restart higgs** for key changes to
-take effect on a running server. Health checks (`/health`) are always open.
+Clients then send `Authorization: Bearer hgk_…`. Tokens are stored **only** as a SHA-256
+digest in `~/.higgs/api_keys.json` and compared in constant time. The standalone server loads
+keys at startup and **fails closed** if the file is present but unreadable; **restart** higgs
+for CLI key changes to apply. Keys can also be minted/listed/revoked LIVE over the Admin-scoped
+HTTP API (`GET·POST /api/higgs/keys`, `DELETE /api/higgs/keys/{label}`) — those apply on the
+very next request, no restart. Health checks stay open.
 
-## Remote Fleet
+**Fail-closed LAN guard:** binding beyond loopback (`HIGGS_BIND` ≠ `127.0.0.1`) with **zero**
+keys is refused at startup (`HG058`), and so is binding with keys of which **none is
+Admin-capable** (`HG069` — the key-management API would be locked out). Revoking the last key
+while LAN-bound is likewise refused (`HG059`), as is revoking the last Admin-capable key while
+other keys remain (`HG066`).
+
+---
+
+## Remote Fleet (peer-to-peer)
+
+Run models on **other machines** over an encrypted [iroh](https://iroh.computer) QUIC link —
+no central server, no open inbound ports. See `src/node/README.md` and `DESIGN-remote.md`.
 
 ```bash
-# Option A — run the SERVER itself as a hub (recommended): one process serves HTTP
-# AND accepts node dials. Mint a join token over the API:
 HIGGS_HUB=1 higgs                                  # server in hub mode
-curl -X POST localhost:11434/api/higgs/pair        # → { ticket, token, node_command }
-
-# Option B — hand-pair from the CLI (separate accept loop):
-higgs link pair        # prints hub id + a single-use token + ticket
-higgs link status      # list pairings
-
-# On the NODE: run the persistent daemon, dialing the hub. Pulled/scanned models load here.
-# First time, pair with the ticket + single-use token; the hub is then saved.
-HIGGS_MODEL_DIR=/path/to/models higgs --node <ticket> <token>
-# After that, the node reconnects to its saved hub by itself — no token, no re-pair:
-higgs --node           # connect to the default saved hub
-higgs --node --list    # list saved hubs (★ = default)
-higgs --node --hub <label|id>   # connect to a specific saved hub (and make it default)
-
-# Self-retire: ask the hub to remove this node, then forget the hub locally.
-higgs node leave                 # leave the default saved hub
-higgs node leave --hub <label|id>  # leave a specific saved hub
-
-# Pull a model onto a node from HuggingFace (lands in the node's ~/.higgs/models/):
-#   issued by the hub over M_NODE_PULL; progress streams as N_PROGRESS.
+curl -X POST localhost:31415/api/higgs/pair        # → { ticket, token, node_command }
+HIGGS_MODEL_DIR=/models higgs --node <ticket> <token>   # pair a node
+higgs --node                                       # reconnect to the saved default hub
+higgs node leave                                   # node self-retires from its hub
 ```
 
-With the server in hub mode (`HIGGS_HUB=1`), `GET /api/higgs/nodes` lists every paired
-node (connected or not) with its hardware + resident workers, and `/v1/chat/completions`
-for a remote-resident model is routed there automatically.
+Invariants: the hub **never** speaks to a remote worker directly (two hops: hub → node →
+worker); control (`higgs/node/*`) and data (`M_CHAT`) are separate dispatchers; the worker
+stays pure-sync stdio in every topology; pairing tokens are single-use and version-negotiated.
 
-Once paired, the hub can load a model on the node (via `HubFleet`/the API) and any
-`/v1/chat/completions` for that model is routed there automatically; `GET /api/higgs/nodes`
-shows the node, its hardware, and its resident workers. See `src/node/DESIGN.md`.
+---
 
 ## Adding a New Engine
 
-higgs talks to inference backends only through the [`HiggsEngine`](src/worker/engine/mod.rs)
-trait and selects one at startup from a registry. Adding an engine is **three steps, no other
-file changes**:
+higgs talks to backends only through the `HiggsEngine` trait (`src/worker/engine/mod.rs`) and
+selects one at startup from a registry. Adding an engine is: **implement the trait in a new
+submodule, add one `REGISTRY` line, select with `HIGGS_ENGINE=<name>`.** Nothing in the worker
+dispatch, supervisor, node runtime, or serve layer changes. See `src/worker/engine/DESIGN.md`.
 
-1. **Implement the trait** in a new submodule, e.g. `src/worker/engine/mlx/mod.rs`:
-   ```rust
-   #[derive(Default)]
-   pub struct MlxEngine { /* backend handle */ }
-   impl higgs::worker::engine::HiggsEngine for MlxEngine {
-       fn load(&mut self, path: &str, p: &LoadParams) -> Result<(), HiggsError> { … }
-       fn unload(&mut self) { … }
-       fn is_loaded(&self) -> bool { … }
-       fn chat(&mut self, messages_json: &str, p: &GenParams,
-               sink: &mut dyn FnMut(&str)) -> Result<ChatResult, HiggsError> { … }
-       fn probe(&self, path: &str) -> (bool, Option<String>) { … }
-       fn devices(&self) -> Vec<GpuDevice> { … }
-   }
-   ```
-   Keep all backend-specific dependencies (FFI, crates) inside that submodule.
-2. **Register it** — one line in `REGISTRY` (`src/worker/engine/mod.rs`):
-   ```rust
-   EngineEntry { name: "mlx", build: || Box::new(mlx::MlxEngine::default()) },
-   ```
-3. **Select it** at runtime: `HIGGS_ENGINE=mlx`. The first registry entry is the default.
-
-Nothing in the worker dispatch, supervisor, node runtime, or serve layer needs to change —
-they are all engine-agnostic above the trait. See `src/worker/engine/DESIGN.md`.
+---
 
 ## Diagnostics
 
-Every failure is a typed `HiggsError` carrying a stable `HGxxx` code (e.g. `HG002` model not
-found, `HG004` engine load failure, `HG007` worker unavailable, `HG017` insufficient RAM,
-`HG022`–`HG028` remote pairing/transport). Codes map to HTTP statuses at the serve boundary
-and ride the JSON-RPC `error.data.code` so the true origin status survives the hub→node hops.
+Every failure is a typed `HiggsError` (`src/diagnostic.rs`) carrying a stable `HGxxx` code
+(e.g. `HG002` model not found, `HG017` insufficient RAM, `HG022`–`HG048` remote/auth,
+`HG057` stream overflow, `HG060` OOM ladder exhausted). Codes map to HTTP statuses at the serve
+boundary and ride the JSON-RPC `error.data.code` so the true origin status survives the
+hub→node hops. See `DESIGN.md` for the full registry.
+
+---
 
 ## Testing & Coverage
 
 ```bash
-scripts/quality.sh               # fast gate: fmt + clippy + test + bindings sync
-cargo test                       # unit + integration only
-scripts/coverage.sh              # both coverage gates with a combined summary
+scripts/quality.sh               # fast gate: fmt + clippy + test + ts-rs bindings sync
+scripts/coverage.sh              # both coverage gates (unit ≥90%, integration ≥80%)
 ```
 
-### Quality gate (`scripts/quality.sh`)
-
-The fast pre-commit gate. Runs, in order:
-1. `cargo fmt --all` (apply, then `--check`) — the style is pinned in `rustfmt.toml`
-   (`edition 2021`, `max_width 100`); keep changes formatted or the gate fails.
-2. `cargo clippy --all-targets -D warnings`.
-3. `cargo test` — the full suite, which also **regenerates** the ts-rs bindings under
-   `bindings/higgs/` (emitted by the `higgs_ts!` macro's `#[ts(export)]` derive tests).
-4. `cargo test macro_run -- --ignored` — a SECOND pass that regenerates the **const-object**
-   enum bindings (`higgs_const_enum!` → `TsConstEnum`, e.g. `FlashAttn`/`HiggsModelSource`).
-   It must run AFTER step 3: ts-rs's transitive export writes a union for each enum as a side
-   effect of exporting a dependent struct, so this pass runs last to win. To regenerate bindings
-   by hand, run `scripts/quality.sh` (or `cargo test && cargo test macro_run -- --ignored`) —
-   plain `cargo test` alone leaves the const enums in ts-rs union form.
-5. **Bindings sync** — fails if `bindings/` drifted after the two regen passes, so a Rust
-   wire-type change can't land without the regenerated TypeScript committed alongside it.
-
-### Coverage gates (`scripts/coverage.sh`)
-
-Two independent gates, run separately:
-- **Unit** (`coverage-unit.sh`): `cargo test --lib`, **≥90% lines** (excludes the daemon `main` + FFI, which only run in a spawned process).
-- **Integration** (`coverage-integration.sh`): the `tests/` targets only, **≥75% lines** (excludes the pure-logic `tool_parser` subtree the unit gate owns).
-
-```bash
-scripts/coverage.sh              # both gates; runs both even if one fails, then a summary
-scripts/coverage.sh -u           # unit gate only          (--unit)
-scripts/coverage.sh -i           # integration gate only   (--integration)
-scripts/coverage.sh -u --open    # unit gate + open its HTML report
-scripts/coverage.sh --html       # write HTML report(s) under target/
-```
-
-Any non-selector flag is forwarded verbatim to `cargo llvm-cov` (`--html`, `--open`, `--json`,
-`--summary-only`, `--output-dir DIR`, …). When both gates run, both execute even if the first
-fails and a combined pass/fail + line-% summary prints at the end; the script exits non-zero if
-any gate failed. Requires `cargo-llvm-cov` (`cargo install cargo-llvm-cov`).
-
-Integration tests spawn the real `higgs` binary and drive it over HTTP + iroh against a real
-~1MB GGUF (`HIGGS_TEST_GGUF` overrides the path; tests **skip** when it's absent), exercising
-spawn → pair → load → chat → unload end to end.
-
-## File Map
-
-| Path | What it does |
-|------|-------------|
-| `src/lib.rs` | Crate root — re-exports `Higgs`, `HiggsConfig`, `HiggsError`, `HiggsEvent` |
-| `src/api.rs` | `Higgs` facade + `HiggsConfig`; status/config/outcome types; idle reaper; fleet hook |
-| `src/log_bus.rs` | `LogBus` (history rings + live broadcast; local + remote-worker sources) and `HiggsLogLayer` |
-| `src/diagnostic.rs` | `HiggsError` enum with diagnostic codes (HG001–HG028) |
-| `src/rpc.rs` | NDJSON JSON-RPC 2.0 encode/decode — the supervisor↔worker wire |
-| `src/supervisor.rs` | Worker process supervisor: spawn, restart+replay, request correlation, chat-chunk routing |
-| `src/system.rs` | Host hardware/runtime snapshot (CPU/RAM/GPU/VRAM, engine versions) |
-| `src/serve/mod.rs` | Axum router: `/v1/*` + `/api/higgs/*` (incl. the no-timeout SSE log stream) |
-| `src/serve/v1.rs` · `stream.rs` | OpenAI `/v1` handlers · SSE chunk assembly |
-| `src/serve/control.rs` | `/api/higgs/*` control handlers (status/system/nodes/logs/settings) |
-| `src/worker/mod.rs` | Worker entry point — JSON-RPC dispatch loop, engine selection |
-| `src/worker/models.rs` | Model discovery (LM Studio, HuggingFace, Ollama); `HiggsModel`, `ModelStore` |
-| `src/worker/engine/mod.rs` | `HiggsEngine` trait + engine **registry** (add an engine here) |
-| `src/worker/engine/llamacpp/` | llama.cpp engine impl: chat templates, fit-check, token streaming, device enum |
-| `src/worker/tool_parser/` | Per-dialect tool-call parsers (selected by the chat template) |
-| `src/remote.rs` | Remote wire vocabulary: ALPN, HELLO, `higgs/node/*` methods, inventory, version negotiation |
-| `src/auth.rs` | Pairing allowlist + one-time tokens |
-| `src/node/mod.rs` | iroh bind / accept-gate / dial; node serve loop; log relay |
-| `src/node/cli.rs` | `link pair/status`, `node connect`, `--node` daemon |
-| `src/node/runtime.rs` | `NodeRuntime`: multi-worker registry, load/unload/sysinfo/inventory |
-| `src/node/transport.rs` | Hub-side per-node iroh client (`NodeTransport`) |
-| `src/node/fleet.rs` | `HubFleet`: routing, durable routes, log relay, inventory/`NodeView` |
-| `src/node/identity.rs` | Persisted iroh `SecretKey` / stable `EndpointId` |
-
-For the remote design rationale and invariants, see `DESIGN-remote.md` and `src/node/DESIGN.md`.
+- **Unit tests** live in a sibling `<name>_tests.rs` wired as a child `#[path] mod tests`
+  (never inline). `mod.rs` files are export barrels only.
+- **Integration tests** live in `tests/` — they spawn the real `higgs` binary and drive it over
+  HTTP + the in-process iroh gate against a tiny GGUF (`HIGGS_TEST_GGUF`; tests **skip** when
+  absent, so set it before measuring coverage).
+- ts-rs bindings regenerate on `cargo test`; the const-object enums need the second pass
+  (`cargo test macro_run -- --ignored`) — both are wired into `scripts/quality.sh`.
+</content>
+</invoke>

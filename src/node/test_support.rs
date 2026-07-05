@@ -173,6 +173,103 @@ pub(crate) fn fake_worker_factory_stateful() -> HalvesFactory {
     })
 }
 
+/// A stateful fake whose first TWO `M_LOAD`s FAIL with an OOM-classified worker error
+/// (`HG004` + "out of memory") and every later load SUCCEEDS. The G5 OOM degrade-retry
+/// ladder therefore walks past attempt-0 (seed) and the plain-retry rung and loads on the
+/// KV rung — exercising the DEGRADE path. `attempts` is SHARED across worker spawns (each
+/// ladder attempt is a fresh spawn), so it counts TOTAL load attempts, not per-worker.
+fn oom_twice_factory(attempts: Arc<std::sync::atomic::AtomicU32>) -> HalvesFactory {
+    Box::new(move |_bus, _model| {
+        let attempts = attempts.clone();
+        let (sup_end, worker_end) = tokio::io::duplex(64 * 1024);
+        let (sup_r, sup_w) = tokio::io::split(sup_end);
+        let (wr, mut ww) = tokio::io::split(worker_end);
+        let loaded: Arc<parking_lot::Mutex<Value>> = Arc::new(parking_lot::Mutex::new(Value::Null));
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(wr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let Ok(RpcFrame::Request(r)) = rpc::decode(&line) else {
+                    continue;
+                };
+                let resp = if r.method == crate::worker::M_LOAD {
+                    let n = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    if n <= 2 {
+                        // OOM-classified failure (worker_code HG004 + "out of memory") →
+                        // the ladder degrades to the next rung.
+                        RpcResponse {
+                            jsonrpc: "2.0".into(),
+                            id: r.id,
+                            result: None,
+                            error: Some(crate::rpc::RpcError {
+                                code: -32000,
+                                message: "ggml_backend cuda error: out of memory".into(),
+                                data: Some(json!({ "code": "HG004" })),
+                            }),
+                        }
+                    } else {
+                        *loaded.lock() = json!({
+                            "id": r.params.get("id").cloned().unwrap_or(Value::Null),
+                            "ctx_len": r.params.get("ctx_len").cloned().unwrap_or(Value::Null),
+                            "gpu_layers": r.params.get("gpu_layers").cloned().unwrap_or(Value::Null),
+                            "threads": r.params.get("threads").cloned().unwrap_or(Value::Null),
+                        });
+                        RpcResponse {
+                            jsonrpc: "2.0".into(),
+                            id: r.id,
+                            result: Some(
+                                json!({ "id": r.params.get("id").cloned().unwrap_or(Value::Null) }),
+                            ),
+                            error: None,
+                        }
+                    }
+                } else {
+                    let result = match r.method.as_str() {
+                        crate::worker::M_STATUS => json!({ "loaded": loaded.lock().clone() }),
+                        crate::worker::M_UNLOAD => {
+                            *loaded.lock() = Value::Null;
+                            json!({})
+                        }
+                        crate::worker::M_SYSINFO => json!({ "gpus": [] }),
+                        crate::worker::M_SHUTDOWN => break,
+                        _ => json!({}),
+                    };
+                    RpcResponse {
+                        jsonrpc: "2.0".into(),
+                        id: r.id,
+                        result: Some(result),
+                        error: None,
+                    }
+                };
+                let line = format!("{}\n", rpc::encode(&RpcFrame::Response(resp)));
+                if ww.write_all(line.as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(WorkerHalves {
+            write: Box::new(sup_w),
+            read: Box::new(sup_r),
+            proc: None,
+        })
+    })
+}
+
+/// A `NodeRuntime` whose loads OOM-then-degrade ([`oom_twice_factory`]) — the shared
+/// attempt counter lives here so it survives across worker spawns AND spawner calls.
+pub(crate) fn fake_runtime_oom_twice(lmstudio_dirs: Vec<PathBuf>) -> NodeRuntime {
+    let attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    NodeRuntime::with_spawner(
+        NodeConfig {
+            bus: Arc::new(LogBus::new()),
+            lmstudio_dirs,
+            hf_dirs: vec![],
+            ollama_dirs: vec![],
+            idle_ttl: crate::node::runtime::DEFAULT_IDLE_TTL,
+        },
+        Arc::new(move |_bus| Supervisor::with_factory(oom_twice_factory(attempts.clone()))),
+    )
+}
+
 /// A `NodeRuntime` whose workers are fakes (no llama.cpp), scanning `dirs` for models. Uses
 /// the default (60-min) idle TTL so fast tests never trip the reaper.
 pub(crate) fn fake_runtime(lmstudio_dirs: Vec<PathBuf>) -> NodeRuntime {

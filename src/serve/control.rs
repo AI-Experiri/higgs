@@ -16,9 +16,10 @@ use tokio::sync::{broadcast, mpsc};
 
 use super::http_status;
 use super::wire::{
-    HiggsErrorResponse, HiggsHubStatus, HiggsLoadRequest, HiggsLoadResponse, HiggsLogsResponse,
-    HiggsModelEntry, HiggsModelsResponse, HiggsOk, HiggsRuntimeSettings, HiggsVersionResponse,
-    LogSettings,
+    HiggsErrorResponse, HiggsHubStatus, HiggsKeyEntry, HiggsKeyRemoved, HiggsKeysList,
+    HiggsLoadRequest, HiggsLoadResponse, HiggsLogsResponse, HiggsMintKeyRequest,
+    HiggsMintKeyResponse, HiggsModelEntry, HiggsModelsResponse, HiggsOk, HiggsRuntimeSettings,
+    HiggsVersionResponse, LogSettings,
 };
 use crate::api::Higgs;
 use crate::diagnostic::HiggsError;
@@ -979,12 +980,19 @@ pub(super) async fn control_events_stream(
 /// [`Higgs::stop`] — `stop` runs the node's TERMINAL `shutdown_all` drain (it marks the
 /// runtime shutting-down, so every later load is rejected until the process restarts),
 /// which is reserved for actual server shutdown ([`crate::serve`] bring-down).
-pub(super) async fn control_worker_stop(State(higgs): State<Arc<Higgs>>) -> Json<HiggsOk> {
+pub(super) async fn control_worker_stop(State(higgs): State<Arc<Higgs>>) -> Response {
     tracing::warn!("higgs: stopping (unloading) all workers");
-    // `unload` is best-effort (it ignores a worker a concurrent idle-reap already took)
-    // and always returns Ok; its post-condition is "no worker resident".
-    let _ = higgs.unload().await;
-    Json(HiggsOk::new())
+    // `unload` ignores a worker a concurrent idle-reap already took, but it is NOT
+    // infallible: it refuses ([HG068] → 503) while a benchmark owns a model, since a
+    // drain would evict the bench candidate mid-measurement. Surface that refusal
+    // instead of reporting a false success — same as `control_unload`.
+    match higgs.unload().await {
+        Ok(()) => Json(HiggsOk::new()).into_response(),
+        Err(err) => {
+            tracing::warn!(error = %err, "higgs: worker stop refused");
+            control_error(&err).into_response()
+        }
+    }
 }
 
 /// `GET /api/higgs/version` — higgs build version and engine info.
@@ -1022,6 +1030,289 @@ pub(super) async fn control_system(State(higgs): State<Arc<Higgs>>) -> Response 
             detail: e.to_string(),
         })
         .into_response(),
+    }
+}
+
+// ── API-key management (G4): mint / list / revoke over the control surface ──
+//
+// All three routes carry `Admin` scope via `required_scope`'s fail-closed
+// default for `/api/higgs/*`. Mutations go through `Higgs::mutate_api_keys`
+// (file read-modify-write under a lock + in-memory HOT-SWAP), so a minted or
+// revoked key gates the very next request — no restart, unlike the CLI.
+
+/// `GET /api/higgs/keys` — list configured keys (labels/scopes/digest prefix).
+/// Never returns plaintext tokens; those exist only in the mint response.
+pub(super) async fn control_keys_list(State(higgs): State<Arc<Higgs>>) -> Json<HiggsKeysList> {
+    let keys = higgs.api_keys();
+    Json(HiggsKeysList {
+        auth_enabled: !keys.is_empty(),
+        keys: keys
+            .iter()
+            .map(|k| HiggsKeyEntry {
+                label: k.label.clone(),
+                scopes: k.scopes.clone(),
+                sha256_prefix: k.sha256_prefix().to_owned(),
+            })
+            .collect(),
+    })
+}
+
+/// `POST /api/higgs/keys` — mint a key: random `hgk_` token, digest persisted,
+/// PLAINTEXT returned this once (never logged, never stored). Minting the
+/// FIRST key flips auth ON for every subsequent request — the caller must
+/// store the token before doing anything else, or it locks itself out.
+/// The outcome of a mint decision, computed against the LOCKED keystore.
+enum Mint {
+    /// Mint with these effective scopes.
+    Ok(Vec<crate::keys::Scope>),
+    /// A key with this label already exists.
+    Duplicate,
+    /// Non-bootstrap mint with no valid Admin bearer for the current store.
+    Unauthorized,
+    /// A BOOTSTRAP mint (first key) whose EXPLICIT scopes omit `admin`: it would
+    /// flip auth on yet be unable to reach the Admin-scoped key-management API,
+    /// with no HTTP path left to recover ([codex r10]).
+    BootstrapNeedsAdmin,
+}
+
+/// Decide a mint against the CURRENT (locked) keystore `ks`. Pure — derives
+/// `bootstrap` from `ks` itself, so the empty-store window can't be raced: a
+/// second unauthenticated mint that reaches the lock after the first key
+/// landed sees a non-empty store, fails the bearer recheck, and is refused.
+/// The bootstrap mint (empty store) is allowed unauthenticated and MUST grant
+/// `Admin` — it defaults to `[admin]` when scopes are omitted, and REJECTS
+/// explicit scopes that omit `admin` ([`Mint::BootstrapNeedsAdmin`]), since a
+/// non-admin first key would flip auth on and lock the HTTP management surface
+/// out of itself with no recovery path. Later omitted-scopes mints default to
+/// `[chat, models]`. Explicit `requested` scopes otherwise win.
+fn decide_mint(
+    ks: &crate::keys::ApiKeys,
+    bearer: Option<&str>,
+    requested: Option<Vec<crate::keys::Scope>>,
+    label: &str,
+) -> Mint {
+    use crate::keys::Scope;
+    let bootstrap = ks.is_empty();
+    if !bootstrap && !bearer.is_some_and(|t| ks.authorizes(t, Scope::Admin)) {
+        return Mint::Unauthorized;
+    }
+    if ks.iter().any(|k| k.label == label) {
+        return Mint::Duplicate;
+    }
+    // The FIRST key must be able to manage keys — reject explicit non-admin
+    // bootstrap scopes rather than mint a self-locking key.
+    if bootstrap {
+        if let Some(scopes) = &requested {
+            if !scopes.contains(&Scope::Admin) {
+                return Mint::BootstrapNeedsAdmin;
+            }
+        }
+    }
+    let scopes = requested.unwrap_or_else(|| {
+        if bootstrap {
+            vec![Scope::Admin]
+        } else {
+            vec![Scope::Chat, Scope::Models]
+        }
+    });
+    Mint::Ok(scopes)
+}
+
+pub(super) async fn control_keys_mint(
+    State(higgs): State<Arc<Higgs>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<HiggsMintKeyRequest>,
+) -> Response {
+    let label = body.label.trim().to_owned();
+    // Labels are addressed by `DELETE /api/higgs/keys/{label}` — a SINGLE path
+    // segment — so anything that can't round-trip through that route (slashes,
+    // whitespace, control chars) must be rejected at mint or the key becomes
+    // unrevokable via the API. Same charset the CLI examples use.
+    // `.` / `..` pass the charset but URL parsers normalize dot-segments away
+    // before Axum captures the label, so such a key could be minted yet never
+    // revoked through `DELETE /api/higgs/keys/{label}` — reject them at mint.
+    let label_ok = !label.is_empty()
+        && label.len() <= 64
+        && label != "."
+        && label != ".."
+        && label
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if !label_ok {
+        return control_error(&HiggsError::InvalidRequest {
+            detail: format!(
+                "invalid key label {label:?}: 1-64 chars from [A-Za-z0-9._-] (it must fit in DELETE /api/higgs/keys/{{label}})"
+            ),
+        })
+        .into_response();
+    }
+    // An EXPLICIT empty scope list is a client error regardless of store state.
+    if body.scopes.as_ref().is_some_and(Vec::is_empty) {
+        return control_error(&HiggsError::InvalidRequest {
+            detail: "at least one scope required (chat, models, admin)".into(),
+        })
+        .into_response();
+    }
+    let token = crate::keys::mint_token(rand::random());
+    let requested = body.scopes.clone();
+    // The bearer is re-checked against the LOCKED live store below, not trusted
+    // from auth_guard's earlier (possibly pre-bootstrap) pass.
+    let bearer = super::bearer_token(&headers);
+
+    // The whole decision + mutation happens INSIDE the keystore lock, closing
+    // the bootstrap RACE: two unauthenticated mints can both pass `auth_guard`
+    // while the store is empty, but `decide_mint` derives `bootstrap` from the
+    // LOCKED store, so only the one that finds it still empty may bootstrap; the
+    // loser re-checks its bearer against the now-non-empty store and is refused.
+    let outcome = match higgs.mutate_api_keys(|ks| {
+        let decision = decide_mint(ks, bearer.as_deref(), requested.clone(), &label);
+        if let Mint::Ok(scopes) = &decision {
+            ks.add(&token, label.clone(), scopes.clone());
+        }
+        decision
+    }) {
+        Ok(o) => o,
+        Err(e) => return control_error(&keystore_io_error(e)).into_response(),
+    };
+    let scopes = match outcome {
+        Mint::Ok(scopes) => scopes,
+        Mint::Duplicate => {
+            return control_error(&HiggsError::InvalidRequest {
+                detail: format!("a key labeled {label:?} already exists — revoke it first"),
+            })
+            .into_response();
+        }
+        Mint::Unauthorized => return super::unauthorized(),
+        Mint::BootstrapNeedsAdmin => {
+            return control_error(&HiggsError::InvalidRequest {
+                detail: "the first API key must include the `admin` scope (it is the only key able to manage keys) — pass scopes: [\"admin\"], or omit scopes to default to admin".into(),
+            })
+            .into_response();
+        }
+    };
+    // Deliberately NOT logging the token — the label + scopes are the audit line.
+    tracing::warn!(%label, ?scopes, "higgs: API key minted; auth now gates the surface");
+    Json(HiggsMintKeyResponse {
+        label,
+        scopes,
+        token,
+    })
+    .into_response()
+}
+
+/// The outcome of a revoke decision, computed against the LOCKED keystore.
+enum Revoke {
+    /// Remove keys with the label; carries the count that will be removed.
+    Removed(usize),
+    /// The store became non-empty (a bootstrap mint won a race) and the request
+    /// carries no Admin bearer — refuse (codex r7, mirrors the mint recheck).
+    Unauthorized,
+    /// Would empty the keystore while LAN-exposed ([HG059]).
+    LastKeyOnLan,
+    /// Would remove the LAST Admin-capable key while OTHER (non-Admin) keys remain
+    /// — auth stays on but the Admin-only management surface becomes unreachable, a
+    /// lockout ([HG066]). Emptying the store entirely (turning auth off) is allowed;
+    /// stranding non-Admin keys is not.
+    LastAdminKey,
+}
+
+/// Decide a revoke against the CURRENT (locked) keystore `ks`. Pure. A non-empty
+/// store REQUIRES a live Admin bearer: `auth_guard` may have admitted this DELETE
+/// while the store was still empty (auth off), but a concurrent bootstrap mint
+/// can commit before the lock is taken — so authorization is re-derived from the
+/// locked store, not trusted from the earlier pass. `lan_exposed` gates the
+/// last-key [HG059] refusal.
+fn decide_revoke(
+    ks: &crate::keys::ApiKeys,
+    bearer: Option<&str>,
+    label: &str,
+    lan_exposed: bool,
+) -> Revoke {
+    if !ks.is_empty() && !bearer.is_some_and(|t| ks.authorizes(t, crate::keys::Scope::Admin)) {
+        return Revoke::Unauthorized;
+    }
+    let total = ks.iter().count();
+    let matching = ks.iter().filter(|k| k.label == label).count();
+    if matching > 0 && lan_exposed && matching == total {
+        return Revoke::LastKeyOnLan;
+    }
+    // Revoking SOME (not all) keys must leave an Admin-capable key behind, else the
+    // Admin-only key-management surface is locked out while auth stays enabled.
+    // Emptying the store entirely (matching == total → auth OFF) is a separate,
+    // allowed operation, gated only by the LAN check above.
+    if matching > 0 && matching < total {
+        let admin_remains = ks
+            .iter()
+            .filter(|k| k.label != label)
+            .any(|k| k.scopes.contains(&crate::keys::Scope::Admin));
+        if !admin_remains {
+            return Revoke::LastAdminKey;
+        }
+    }
+    Revoke::Removed(matching)
+}
+
+/// `DELETE /api/higgs/keys/{label}` — revoke every key with `label`; takes
+/// effect on the next request. Revoking the last key turns auth OFF (loopback
+/// only — a LAN bind refuses, [HG059]).
+pub(super) async fn control_keys_revoke(
+    State(higgs): State<Arc<Higgs>>,
+    Path(label): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    // Re-checked against the LOCKED live store below, NOT trusted from
+    // auth_guard's earlier (possibly pre-bootstrap) pass.
+    let bearer = super::bearer_token(&headers);
+
+    // Auth recheck + last-key check + removal all INSIDE the keystore lock —
+    // atomic with the store state, no TOCTOU with a racing bootstrap mint. The
+    // decision is the pure `decide_revoke` (unit-tested with a fail-on-revert
+    // seam); the closure only applies its verdict.
+    let lan = higgs.lan_exposed();
+    let outcome = match higgs.mutate_api_keys(|ks| {
+        let decision = decide_revoke(ks, bearer.as_deref(), &label, lan);
+        // Match by REFERENCE — `decision` is returned below unmoved.
+        if let Revoke::Removed(_) = &decision {
+            let _ = ks.remove_label(&label);
+        }
+        decision
+    }) {
+        Ok(o) => o,
+        Err(e) => return control_error(&keystore_io_error(e)).into_response(),
+    };
+    let removed = match outcome {
+        Revoke::Removed(n) => n,
+        Revoke::Unauthorized => return super::unauthorized(),
+        Revoke::LastKeyOnLan => {
+            return control_error(&HiggsError::LastKeyOnLan { label }).into_response();
+        }
+        Revoke::LastAdminKey => {
+            return control_error(&HiggsError::LastAdminKey { label }).into_response();
+        }
+    };
+    if removed == 0 {
+        return control_error(&HiggsError::InvalidRequest {
+            detail: format!("no key labeled {label:?}"),
+        })
+        .into_response();
+    }
+    let auth_enabled = !higgs.api_keys().is_empty();
+    tracing::warn!(%label, removed, auth_enabled, "higgs: API key(s) revoked");
+    Json(HiggsKeyRemoved {
+        removed: removed as u64,
+        auth_enabled,
+    })
+    .into_response()
+}
+
+/// Map a keystore file I/O failure onto the coded store error ([HG040]).
+fn keystore_io_error(e: std::io::Error) -> HiggsError {
+    HiggsError::PersistenceFailed {
+        store: "api_keys".into(),
+        path: crate::keys::keys_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "api_keys.json".into()),
+        source: e,
     }
 }
 

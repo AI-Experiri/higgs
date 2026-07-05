@@ -480,10 +480,7 @@ impl Supervisor {
     /// and returns `rx`.  Infallible: concurrent callers each get their own
     /// channel and their own deltas routed independently.  The caller must
     /// call [`remove_chat_sink`](Self::remove_chat_sink) when done.
-    pub(crate) fn register_chat_sink(
-        &self,
-        request_id: u64,
-    ) -> mpsc::UnboundedReceiver<crate::worker::engine::ChatDelta> {
+    pub(crate) fn register_chat_sink(&self, request_id: u64) -> crate::delta_queue::DeltaReceiver {
         self.inner.demux.register_sink(request_id)
     }
 
@@ -524,7 +521,7 @@ impl Supervisor {
         tools_json: Option<String>,
         chat_template_kwargs: Option<String>,
     ) -> (
-        mpsc::UnboundedReceiver<crate::worker::engine::ChatDelta>,
+        crate::delta_queue::DeltaReceiver,
         impl std::future::Future<Output = Result<Value, HiggsError>>,
     ) {
         // One id for both the RPC frame `id` (response correlation) and the

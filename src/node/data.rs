@@ -110,10 +110,23 @@ pub(crate) async fn relay_chat(
     };
 
     // Deliver any chunks buffered before the final resolved.
-    while let Ok(delta) = chunks.try_recv() {
+    while let Some(delta) = chunks.try_recv() {
         if write_chunk(send, params.request_id, &delta).await.is_err() {
             return;
         }
+    }
+
+    // A tripped delta-buffer cap means this hub stalled long enough that its
+    // undelivered backlog was dropped ([HG057]) — the relayed stream is
+    // incomplete, so fail the RPC loudly instead of replying as if the full
+    // stream was delivered (the generation itself finished on the worker).
+    if chunks.overflowed() {
+        let e = HiggsError::ChatStreamOverflow {
+            buffered_bytes: chunks.buffered_bytes(),
+        };
+        tracing::warn!(error = %e, "higgs: relayed chat stream overflowed");
+        reply_err(send, req.id, -32000, e.to_string(), hg_data(&e)).await;
+        return;
     }
 
     match final_res {

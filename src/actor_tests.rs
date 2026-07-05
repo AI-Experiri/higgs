@@ -80,8 +80,9 @@ async fn demux_routes_chunks_by_request_id() {
     demux.route_chunk(3, content_delta("he"));
     demux.route_chunk(3, content_delta("llo"));
     demux.route_chunk(4, content_delta("ignored")); // no sink for 4 ⇒ dropped, no panic
-    assert_eq!(rx.recv().await.unwrap(), content_delta("he"));
-    assert_eq!(rx.recv().await.unwrap(), content_delta("llo"));
+                                                    // The sink is a merging delta queue: both buffered same-kind chunks arrive
+                                                    // as ONE merged run (text preserved in order).
+    assert_eq!(rx.recv().await.unwrap(), content_delta("hello"));
     demux.remove_sink(3);
 }
 

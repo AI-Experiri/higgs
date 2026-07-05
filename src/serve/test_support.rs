@@ -201,6 +201,15 @@ pub(crate) fn get(uri: &str) -> Request<Body> {
 
 /// A `POST` request to `uri` with a JSON body. Carries a loopback `Host` so
 /// it passes the serve-layer DNS-rebinding guard (`host_guard`).
+pub(crate) fn delete(uri: &str) -> Request<Body> {
+    Request::builder()
+        .method("DELETE")
+        .uri(uri)
+        .header("host", "127.0.0.1")
+        .body(Body::empty())
+        .expect("build DELETE request")
+}
+
 pub(crate) fn post_json(uri: &str, body: &serde_json::Value) -> Request<Body> {
     Request::builder()
         .method("POST")
@@ -224,6 +233,20 @@ pub(crate) fn put_json(uri: &str, body: &serde_json::Value) -> Request<Body> {
 }
 
 /// Collect a response body into bytes.
+/// Attach a bearer token to a built request (G4 keys tests).
+pub(crate) fn with_bearer(mut req: Request<Body>, token: &str) -> Request<Body> {
+    req.headers_mut().insert(
+        axum::http::header::AUTHORIZATION,
+        format!("Bearer {token}").parse().expect("bearer header"),
+    );
+    req
+}
+
+/// Read a response body and parse it as JSON (G4 keys tests).
+pub(crate) async fn body_json(resp: Response) -> serde_json::Value {
+    serde_json::from_slice(&body_bytes(resp).await).expect("json body")
+}
+
 pub(crate) async fn body_bytes(resp: Response) -> Vec<u8> {
     resp.into_body()
         .collect()

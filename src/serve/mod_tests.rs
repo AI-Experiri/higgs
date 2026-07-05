@@ -1,7 +1,10 @@
 use super::{
     bearer_token, host_allowed, http_status, is_local_origin, is_loopback_host, required_scope,
+    serve_with_shutdown,
 };
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
+
+use std::sync::Arc;
 
 use crate::diagnostic::HiggsError;
 use crate::keys::Scope;
@@ -41,6 +44,20 @@ fn required_scope_maps_routes() {
     );
     // unknown path → open (routing 404s it)
     assert_eq!(required_scope(&Method::GET, "/random"), None);
+    // G4 key management: Admin via the fail-closed /api/higgs/* default — a
+    // key-management route must never be reachable with a lesser scope.
+    assert_eq!(
+        required_scope(&Method::GET, "/api/higgs/keys"),
+        Some(crate::keys::Scope::Admin)
+    );
+    assert_eq!(
+        required_scope(&Method::POST, "/api/higgs/keys"),
+        Some(crate::keys::Scope::Admin)
+    );
+    assert_eq!(
+        required_scope(&Method::DELETE, "/api/higgs/keys/some-label"),
+        Some(crate::keys::Scope::Admin)
+    );
 }
 
 #[test]
@@ -489,6 +506,39 @@ fn http_status_mapping_table() {
         }),
         StatusCode::SERVICE_UNAVAILABLE
     );
+    // G5: an OOM-exhausted load is a retryable capacity 503 — BOTH the direct
+    // (local) form AND a REMOTE node's, propagated as a worker code (codex r19).
+    // Fail-on-revert: dropping HG060 from the worker-code arm makes the remote
+    // case fall through to 500.
+    assert_eq!(
+        http_status(&HiggsError::LoadOomExhausted {
+            attempts: 4,
+            last: "out of memory".into(),
+        }),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "local OOM-exhausted load → 503"
+    );
+    assert_eq!(
+        http_status(&HiggsError::WorkerRpc {
+            method: "higgs/load".into(),
+            message: "[HG060] load ran out of memory".into(),
+            worker_code: Some("HG060".into()),
+        }),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "remote OOM-exhausted load (worker code HG060) → 503, not 500"
+    );
+    // G6 Turbotune: a benchmark that found no fitting config is a retryable
+    // capacity 503; a benchmark cancelled by a concurrent op is a 409 conflict.
+    assert_eq!(
+        http_status(&HiggsError::BenchExhausted {
+            detail: "no fit".into()
+        }),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        http_status(&HiggsError::BenchCancelled),
+        StatusCode::CONFLICT
+    );
     // Serving disabled is a retryable capacity 503 (re-enable then retry).
     assert_eq!(
         http_status(&HiggsError::ServingDisabled),
@@ -577,4 +627,74 @@ fn worker_rpc_maps_by_worker_code() {
         StatusCode::INTERNAL_SERVER_ERROR
     );
     assert_eq!(http_status(&rpc(None)), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+/// [HG058] is enforced at the PUBLIC serving entrypoint, not only in
+/// `run_standalone`: a library caller handing `serve_with_shutdown` a
+/// non-loopback listener with an empty keystore must get a refusal, never an
+/// open server (auth off + relaxed Host guard). Fail-on-revert: dropping the
+/// entrypoint check serves happily and the Err assertion fails.
+#[tokio::test]
+async fn serve_with_shutdown_refuses_keyless_lan_listener() {
+    // Start a facade with a RESIDENT model (an embedder that `start()`ed +
+    // loaded before handing us its listener), empty keystore.
+    let dir = tempfile::TempDir::new().unwrap();
+    super::test_support::write_gguf_fixture(dir.path(), "org/model");
+    let higgs = super::test_support::make_higgs_with_lmstudio(dir.path().to_path_buf());
+    higgs.load("org/model", None).await.expect("load");
+    assert!(
+        higgs.status().await.unwrap().loaded.is_some(),
+        "model resident before the refused serve"
+    );
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let err = serve_with_shutdown(Arc::clone(&higgs), listener, async {})
+        .await
+        .expect_err("keyless non-loopback listener must be refused");
+    assert!(
+        err.to_string().contains("[HG058]"),
+        "refusal carries the code: {err}"
+    );
+    // The rejected serve must NOT leak the worker: stop() drained it (codex r11).
+    // Fail-on-revert: skipping stop() before the early return leaves it resident.
+    assert!(
+        higgs.status().await.unwrap().loaded.is_none(),
+        "the refused serve tore down the resident worker (no leak)"
+    );
+}
+
+/// [HG069] is ALSO enforced at the public serving entrypoint: a non-loopback
+/// listener whose keystore holds only chat/models keys (NO Admin) locks out the
+/// Admin-only key-management API, so `serve_with_shutdown` must refuse it — mirroring
+/// the guard `run_standalone` applies, so a library caller handing us its own
+/// listener can't bypass it. Fail-on-revert: dropping the entrypoint admin-key check
+/// serves happily and the Err assertion fails.
+#[tokio::test]
+async fn serve_with_shutdown_refuses_lan_listener_without_admin_key() {
+    let dir = tempfile::TempDir::new().unwrap();
+    super::test_support::write_gguf_fixture(dir.path(), "org/model");
+    let higgs = super::test_support::make_higgs_with_lmstudio(dir.path().to_path_buf());
+    higgs.load("org/model", None).await.expect("load");
+    // Keystore has a chat/models key but NO Admin scope (the `keys add` default).
+    let mut keys = crate::keys::ApiKeys::default();
+    keys.add(
+        &crate::keys::mint_token([5u8; 16]),
+        "lan".into(),
+        vec![crate::keys::Scope::Chat, crate::keys::Scope::Models],
+    );
+    higgs.set_api_keys(Arc::new(keys));
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let err = serve_with_shutdown(Arc::clone(&higgs), listener, async {})
+        .await
+        .expect_err("non-loopback listener without an Admin key must be refused");
+    assert!(
+        err.to_string().contains("[HG069]"),
+        "refusal carries the HG069 code: {err}"
+    );
+    // Same no-leak guarantee as the [HG058] path: the resident worker was torn down.
+    assert!(
+        higgs.status().await.unwrap().loaded.is_none(),
+        "the refused serve tore down the resident worker (no leak)"
+    );
 }

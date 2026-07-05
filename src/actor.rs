@@ -9,6 +9,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::delta_queue::{DeltaReceiver, DeltaSender};
 use crate::rpc::RpcResponse;
 use crate::worker::engine::ChatDelta;
 
@@ -125,8 +126,11 @@ pub(crate) struct ReplyDemux {
 struct DemuxInner {
     /// Request id → response waiter (RPC correlation).
     pending: Mutex<HashMap<u64, oneshot::Sender<RpcResponse>>>,
-    /// request_id → chat-chunk sink (streaming delta routing).
-    chat_sinks: Mutex<HashMap<u64, mpsc::UnboundedSender<ChatDelta>>>,
+    /// request_id → chat-chunk sink (streaming delta routing). Each sink is a
+    /// bounded MERGING queue ([`delta_queue`](crate::delta_queue)): a slow SSE
+    /// consumer coalesces same-kind deltas in place instead of growing an
+    /// unbounded per-token backlog.
+    chat_sinks: Mutex<HashMap<u64, DeltaSender>>,
 }
 
 impl ReplyDemux {
@@ -165,8 +169,8 @@ impl ReplyDemux {
     }
 
     /// Register a chat-chunk sink under a `request_id`; deltas arrive on the receiver.
-    pub(crate) fn register_sink(&self, request_id: u64) -> mpsc::UnboundedReceiver<ChatDelta> {
-        let (tx, rx) = mpsc::unbounded_channel();
+    pub(crate) fn register_sink(&self, request_id: u64) -> DeltaReceiver {
+        let (tx, rx) = crate::delta_queue::delta_channel();
         self.inner.chat_sinks.lock().insert(request_id, tx);
         rx
     }
@@ -179,7 +183,7 @@ impl ReplyDemux {
     /// Route a streamed delta to its sink. Unknown request_ids are dropped (no panic).
     pub(crate) fn route_chunk(&self, request_id: u64, delta: ChatDelta) {
         if let Some(tx) = self.inner.chat_sinks.lock().get(&request_id) {
-            let _ = tx.send(delta);
+            tx.send(delta);
         }
     }
 

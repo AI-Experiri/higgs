@@ -150,7 +150,7 @@ pub struct HelloResult {
 /// than silently drop them (e.g. a hub sending `idle_ttl_minutes` to a node with no idle
 /// reaper). Forward-compat for *optional* peer features rides the HELLO capabilities map,
 /// not silently-ignored load fields.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeLoadParams {
     pub id: String,

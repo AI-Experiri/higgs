@@ -12,7 +12,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use iroh::endpoint::Connection;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::mpsc;
 
 use crate::diagnostic::HiggsError;
 use crate::node::write_frame;
@@ -103,13 +102,7 @@ impl NodeTransport {
         temperature: f32,
         tools_json: Option<String>,
         chat_template_kwargs: Option<String>,
-    ) -> Result<
-        (
-            mpsc::UnboundedReceiver<crate::worker::engine::ChatDelta>,
-            ChatDone,
-        ),
-        HiggsError,
-    > {
+    ) -> Result<(crate::delta_queue::DeltaReceiver, ChatDone), HiggsError> {
         let id = self.alloc_id();
         let (mut send, recv) = self.conn.open_bi().await.map_err(transport_dead)?;
         let mut params = json!({
@@ -141,7 +134,10 @@ impl NodeTransport {
             .map_err(transport_dead)?;
         let _ = send.finish();
 
-        let (tx, rx) = mpsc::unbounded_channel();
+        // Bounded MERGING queue (crate::delta_queue): a slow hub-side SSE
+        // consumer coalesces same-kind deltas instead of growing an unbounded
+        // per-token backlog while the node keeps streaming.
+        let (tx, rx) = crate::delta_queue::delta_channel();
         // The per-stream reader IS the demux: chunks → tx, final Response → the result.
         let fut = ChatDone {
             inner: Box::pin(async move {
@@ -158,9 +154,7 @@ impl NodeTransport {
                                     match crate::worker::engine::ChatDelta::decode_chunk_params(
                                         &n.params,
                                     ) {
-                                        Some(d) => {
-                                            let _ = tx.send(d);
-                                        }
+                                        Some(d) => tx.send(d),
                                         None => tracing::warn!(
                                             params = %n.params,
                                             "[HG051] undecodable remote chat chunk dropped"

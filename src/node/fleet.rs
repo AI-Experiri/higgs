@@ -43,7 +43,7 @@ use std::sync::Arc;
 use iroh::endpoint::Connection;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 
 use crate::actor::{spawn_actor, Actor, Handle};
 use crate::diagnostic::HiggsError;
@@ -946,7 +946,7 @@ impl HubFleet {
         chat_template_kwargs: Option<String>,
     ) -> Result<
         (
-            mpsc::UnboundedReceiver<crate::worker::engine::ChatDelta>,
+            crate::delta_queue::DeltaReceiver,
             impl std::future::Future<Output = Result<serde_json::Value, HiggsError>> + Send,
         ),
         HiggsError,

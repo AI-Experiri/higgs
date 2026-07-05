@@ -60,6 +60,21 @@ impl Drop for ServerGuard {
         unsafe {
             libc::kill(self.child.id() as libc::pid_t, libc::SIGTERM);
         }
+        // BOUNDED grace, then SIGKILL: a server wedged mid-load (e.g. stuck in
+        // the llama.cpp FFI) ignores SIGTERM, and an unconditional `wait()`
+        // here has twice hung an entire test binary for HOURS on one flaky
+        // load. The happy path reaps within the first poll or two (profile
+        // flushed as before); only a wedged child is hard-killed, losing that
+        // one process's coverage profile — the right trade against a gate that
+        // never finishes.
+        for _ in 0..100 {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+                Err(_) => break,
+            }
+        }
+        let _ = self.child.kill();
         let _ = self.child.wait();
     }
 }
@@ -262,4 +277,52 @@ pub async fn spawn_with_models(port: u16, gguf: &Path, ids: &[&str]) -> ServerGu
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     panic!("higgs never became ready on {base}");
+}
+
+/// Spawn `higgs` bound to 0.0.0.0 with a PRE-SEEDED admin key (a non-loopback
+/// bind with zero keys refuses to start, [HG058]) — the keyed-LAN mode. Returns
+/// the guard plus the admin bearer token. Requests still connect via 127.0.0.1;
+/// LAN behavior is exercised through the `Host` header.
+#[allow(clippy::zombie_processes)]
+pub async fn spawn_lan_keyed(port: u16, gguf: &Path) -> (ServerGuard, String) {
+    let staged = stage_models(gguf, &[TINY_MODEL_ID]);
+    let home = TempDir::new().expect("create temp HIGGS_HOME");
+    let token = higgs::keys::mint_token([42u8; 16]);
+    let mut keys = higgs::keys::ApiKeys::default();
+    keys.add(&token, "lan-admin".into(), vec![higgs::keys::Scope::Admin]);
+    keys.save(&home.path().join("api_keys.json"))
+        .expect("seed keystore");
+    let child = Command::new(env!("CARGO_BIN_EXE_higgs"))
+        .env("HIGGS_BIND", "0.0.0.0")
+        .env("HIGGS_PORT", port.to_string())
+        .env("HIGGS_MODEL_DIR", staged.path())
+        .env("HIGGS_HOME", home.path())
+        .env("HIGGS_HF_ENDPOINT", "http://127.0.0.1:1")
+        .env("RUST_LOG", "warn")
+        .spawn()
+        .expect("spawn higgs");
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    for _ in 0..150 {
+        if let Ok(r) = client
+            .get(format!("{base}/api/higgs/status"))
+            .bearer_auth(&token)
+            .send()
+            .await
+        {
+            if r.status().is_success() {
+                return (
+                    ServerGuard {
+                        child,
+                        base,
+                        _model_dir: staged,
+                        _home: home,
+                    },
+                    token,
+                );
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    panic!("keyed-LAN higgs never became ready on {base}");
 }

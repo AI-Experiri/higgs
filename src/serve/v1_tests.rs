@@ -201,6 +201,103 @@ async fn chat_serving_disabled_503_hg019() {
     );
 }
 
+// ── Benchmark exclusivity: /v1 chat for a benchmarking model → 503 HG068 ──
+//
+// A Turbotune benchmark owns its model while it measures candidate configs.
+// Even when a candidate is TRANSIENTLY resident, an external /v1 chat for that
+// model must be refused ([HG068]) rather than served from the candidate worker
+// (which would contaminate the measurement and get torn down mid-stream). The
+// gate lives at the TOP of `ensure_loaded`, BEFORE the resident-serve shortcut.
+//
+// Fail-on-revert: drop the `is_benchmarking` check in `ensure_loaded` and the
+// resident model is served (fake worker streams "hello" → 200), failing the 503.
+#[tokio::test]
+async fn chat_refuses_while_model_is_benchmarking() {
+    let dir = tempfile::TempDir::new().unwrap();
+    write_gguf_fixture(dir.path(), "org/model");
+    let higgs = make_higgs_with_lmstudio(dir.path().to_path_buf());
+    // The model is resident (a benchmark candidate is loaded to be measured)…
+    higgs.load("org/model", None).await.expect("load candidate");
+    // …and marked benchmarking: the guard holds the exclusivity flag for the test.
+    let _bench = higgs.begin_benchmark("org/model");
+
+    let app = app_for(higgs.clone());
+    let req = post_json(
+        "/v1/chat/completions",
+        &json!({"model": "org/model", "messages": [{"role": "user", "content": "hi"}]}),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "benchmarking model → 503, not served from the transient candidate worker"
+    );
+    let body = String::from_utf8(body_bytes(resp).await).unwrap();
+    assert!(body.contains("[HG068]"), "carries HG068: {body}");
+}
+
+/// `POST /api/higgs/worker/stop` REFUSES (503 HG068) while a model is being
+/// benchmarked — the drain would evict the bench candidate, so the route must
+/// surface the refusal, not report a false success. Fail-on-revert: restore the
+/// `let _ = higgs.unload().await` swallow and the route 200s while the model stays.
+#[tokio::test]
+async fn worker_stop_refuses_while_model_is_benchmarking() {
+    let dir = tempfile::TempDir::new().unwrap();
+    write_gguf_fixture(dir.path(), "org/model");
+    let higgs = make_higgs_with_lmstudio(dir.path().to_path_buf());
+    higgs.load("org/model", None).await.expect("load candidate");
+    let _bench = higgs.begin_benchmark("org/model");
+
+    let app = app_for(higgs.clone());
+    let resp = app
+        .oneshot(post_json("/api/higgs/worker/stop", &json!({})))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "worker/stop must refuse (503) while a benchmark owns a model"
+    );
+    let body = String::from_utf8(body_bytes(resp).await).unwrap();
+    assert!(body.contains("[HG068]"), "carries HG068: {body}");
+}
+
+/// `GET /v1/models` HIDES a model that is being benchmarked — the listing must
+/// only advertise what chat can actually reach, and chat refuses a benchmarking
+/// model ([HG068]). Fail-on-revert: drop the `is_benchmarking` retain filter and
+/// the resident candidate is advertised, so a client discovers a model that 503s.
+#[tokio::test]
+async fn v1_models_hides_a_benchmarking_model() {
+    let dir = tempfile::TempDir::new().unwrap();
+    write_gguf_fixture(dir.path(), "org/model");
+    let higgs = make_higgs_with_lmstudio(dir.path().to_path_buf());
+    higgs.load("org/model", None).await.expect("load candidate");
+
+    // Listed while resident and NOT benchmarking.
+    let listed = app_for(higgs.clone())
+        .oneshot(get("/v1/models"))
+        .await
+        .unwrap();
+    let listed_body = String::from_utf8(body_bytes(listed).await).unwrap();
+    assert!(
+        listed_body.contains("org/model"),
+        "sanity: resident model is listed when not benchmarking: {listed_body}"
+    );
+
+    // Hidden once a benchmark owns it.
+    let _bench = higgs.begin_benchmark("org/model");
+    let resp = app_for(higgs.clone())
+        .oneshot(get("/v1/models"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = String::from_utf8(body_bytes(resp).await).unwrap();
+    assert!(
+        !body.contains("org/model"),
+        "a benchmarking model must NOT appear in /v1/models: {body}"
+    );
+}
+
 // ── C1: idle (no worker) — /v1/models 200 empty, /v1/chat 404 ────────────
 //
 // higgs is spawn-on-load: the normal idle state has NO worker, so
@@ -378,24 +475,28 @@ async fn chat_stream_sse_framing() {
         .lines()
         .filter_map(|l| l.strip_prefix("data: "))
         .collect();
-    assert_eq!(datas.len(), 5, "role + 2 deltas + finish + [DONE]: {body}");
+    // The merging delta queue makes the content PARTITION timing-dependent
+    // (1 or 2 chunks depending on when assembly drains), so the framing
+    // contract is: role first, ≥1 content delta whose concatenation is the
+    // full text, then finish, then [DONE].
+    assert!(
+        (4..=5).contains(&datas.len()),
+        "role + content delta(s) + finish + [DONE]: {body}"
+    );
 
     let parse =
         |s: &str| -> CreateChatCompletionStreamResponse { serde_json::from_str(s).unwrap() };
     let role = parse(datas[0]);
     assert_eq!(role.choices[0].delta.role, Some(Role::Assistant));
     assert_eq!(role.object, "chat.completion.chunk");
-    assert_eq!(
-        parse(datas[1]).choices[0].delta.content.as_deref(),
-        Some("he")
-    );
-    assert_eq!(
-        parse(datas[2]).choices[0].delta.content.as_deref(),
-        Some("llo")
-    );
-    let finish = parse(datas[3]);
+    let content: String = datas[1..datas.len() - 2]
+        .iter()
+        .filter_map(|d| parse(d).choices[0].delta.content.clone())
+        .collect();
+    assert_eq!(content, "hello");
+    let finish = parse(datas[datas.len() - 2]);
     assert_eq!(finish.choices[0].finish_reason, Some(FinishReason::Stop));
-    assert_eq!(datas[4], "[DONE]");
+    assert_eq!(datas[datas.len() - 1], "[DONE]");
 }
 
 // ── messages_to_pairs: pure role-flattening ──────────────────────────────
@@ -1201,4 +1302,31 @@ fn raw_messages_json_preserves_reasoning_echo_back() {
         !retyped.contains("reasoning_content"),
         "typed re-serialization drops the field (proves the raw path is load-bearing)"
     );
+}
+
+/// BETWEEN candidate loads (benchmark flag set, no worker resident) with JIT OFF,
+/// a chat for the benchmarked model must still refuse with 503 [HG068] — not flap
+/// to the HG003 404 not-loaded branch depending on benchmark phase (codex r18).
+/// Fail-on-revert: gate only on `local_bench_candidate` (resident case) and this
+/// returns 404.
+#[tokio::test]
+async fn chat_refuses_between_candidates_with_jit_off() {
+    let higgs = make_higgs();
+    higgs.set_jit_enabled(false);
+    // Between candidates: benchmarking, but NOTHING resident.
+    let _bench = higgs.begin_benchmark("org/model");
+    let resp = app_for(higgs)
+        .oneshot(post_json(
+            "/v1/chat/completions",
+            &json!({"model": "org/model", "messages": [{"role": "user", "content": "hi"}]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "between-candidates + JIT off → still 503, not a phase-dependent 404"
+    );
+    let body = String::from_utf8(body_bytes(resp).await).unwrap();
+    assert!(body.contains("[HG068]"), "carries HG068: {body}");
 }

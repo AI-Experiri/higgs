@@ -101,39 +101,50 @@ fn store_roundtrips_tuning_and_perf_and_invalidates_meta() {
 }
 
 #[test]
-fn set_profile_updates_profile_preserving_other_fields() {
+fn set_profile_clears_bench_only_when_params_change() {
     let home = tempfile::tempdir().unwrap();
     let s = JsonModelStore::open(home.path()).unwrap();
-    // With an existing record, set_profile changes ONLY the profile + timestamp.
+    let p1 = LoadParams::base(CtxLen::Fixed { n: 1234 }, GpuLayers::Count { n: 0 }, 2);
     let mut rec = tune_record();
+    rec.profile = p1.clone();
     rec.provenance = TuneProvenance::Bench;
     rec.bench_tps = Some(9.0);
     s.put_tuning("org/m", rec);
-    s.set_profile(
-        "org/m",
-        LoadParams::base(CtxLen::Fixed { n: 1234 }, GpuLayers::Count { n: 0 }, 2),
-        "v0r0n0",
-        "123:456",
-        99,
-    );
+
+    // Re-anchoring the SAME params keeps the measured metrics (the benchmarked config is
+    // just re-validated on current hardware) — only the anchors/timestamp move.
+    s.set_profile("org/m", p1.clone(), "vNew", "sigNew", 99);
     let got = s.tuning("org/m").unwrap();
-    assert_eq!(
-        got.profile.ctx_len(),
-        CtxLen::Fixed { n: 1234 },
-        "profile updated"
-    );
-    assert_eq!(
-        got.profile.gpu_layers(),
-        GpuLayers::Count { n: 0 },
-        "CPU-only accepted profile"
-    );
+    assert_eq!(got.tuned_at_ms, 99, "timestamp refreshed");
+    assert_eq!(got.hw_fingerprint, "vNew", "anchor refreshed");
     assert_eq!(
         got.provenance,
         TuneProvenance::Bench,
-        "provenance preserved"
+        "same params → provenance preserved"
     );
-    assert_eq!(got.bench_tps, Some(9.0), "bench_tps preserved");
-    assert_eq!(got.tuned_at_ms, 99);
+    assert_eq!(
+        got.bench_tps,
+        Some(9.0),
+        "same params → bench_tps preserved"
+    );
+
+    // A CHANGED profile (an OOM-degraded fallback OR an edited explicit reload) DROPS the
+    // stale metrics — they described the OLD config (codex r11/r12).
+    let p2 = LoadParams::base(CtxLen::Fixed { n: 2048 }, GpuLayers::All, 8);
+    s.set_profile("org/m", p2, "vNew", "sigNew", 100);
+    let got = s.tuning("org/m").unwrap();
+    assert_eq!(
+        got.profile.ctx_len(),
+        CtxLen::Fixed { n: 2048 },
+        "profile updated"
+    );
+    assert_eq!(
+        got.provenance,
+        TuneProvenance::Heuristic,
+        "changed params → provenance cleared"
+    );
+    assert_eq!(got.bench_tps, None, "changed params → bench_tps cleared");
+
     // With NO prior record, set_profile creates one with defaults.
     s.set_profile(
         "org/new",

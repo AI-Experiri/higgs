@@ -3,7 +3,7 @@
 # fails if any selected gate does:
 #
 #   * unit        (cargo test --lib)        line coverage >= 90%   (coverage-unit.sh)
-#   * integration (the tests/ targets only) line coverage >= 75%   (coverage-integration.sh)
+#   * integration (the tests/ targets only) line coverage >= 80%   (coverage-integration.sh)
 #
 # The two suites are gated separately on purpose: unit tests carry exhaustive
 # branch coverage of the in-crate logic, while the integration tests in tests/
@@ -105,7 +105,7 @@ if $select_unit; then
 fi
 if $select_integration; then
   $select_unit && echo
-  run_gate integration 75 ./coverage-integration.sh "${args[@]+${args[@]}}"
+  run_gate integration 80 ./coverage-integration.sh "${args[@]+${args[@]}}"
 fi
 
 # End-of-run summary: both (or the one selected) gate results together.

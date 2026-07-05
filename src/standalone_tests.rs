@@ -1,5 +1,27 @@
 use super::*;
 
+/// The resolve-based [HG058] exposure check (codex r14): decide on the RESOLVED
+/// address, not the raw string. `0.0.0.0` is exposed; `127.0.0.1` and a name
+/// that RESOLVES to loopback (here `LOCALHOST` — DNS is case-insensitive, but
+/// the old string literal check was case-SENSITIVE) are loopback-only.
+#[test]
+fn bind_exposure_uses_resolved_address() {
+    assert!(
+        bind_resolves_non_loopback("0.0.0.0", 0),
+        "0.0.0.0 is exposed"
+    );
+    assert!(
+        !bind_resolves_non_loopback("127.0.0.1", 0),
+        "127.0.0.1 loopback"
+    );
+    // Resolves to loopback despite not matching the string literals — the
+    // false-positive the old `!is_loopback_bind` check produced.
+    assert!(
+        !bind_resolves_non_loopback("LOCALHOST", 0),
+        "a name resolving to loopback is not exposed"
+    );
+}
+
 #[test]
 fn loopback_bind_detection() {
     for b in ["127.0.0.1", "localhost", "::1", "[::1]", "127.0.0.5"] {
@@ -16,8 +38,10 @@ fn loopback_bind_detection() {
 /// subprocess, so coverage instrumentation sees the serve path the binary's
 /// `main()` otherwise only runs as a spawned (un-instrumented) child.
 ///
-/// A non-loopback bind (`0.0.0.0`) is used so the security-warning branch is
-/// also exercised; binding `0.0.0.0:0` is fine for a localhost test client.
+/// Binds LOOPBACK (`127.0.0.1`) — the normal standalone path. (A non-loopback
+/// bind with an empty keystore now REFUSES to start per [HG058]; that branch is
+/// covered by `lan_bind_with_zero_keys_refuses_to_start` /
+/// `lan_bind_with_non_admin_keys_refuses_to_start` below.)
 // TEST_ENV_LOCK (a std Mutex) is intentionally held across awaits to serialize the whole
 // env-overridden run; this is a #[tokio::test] (current-thread) and the only other holder
 // is a sync test, so there's no deadlock/Send hazard.
@@ -59,9 +83,10 @@ async fn run_standalone_serves_and_shuts_down() {
 
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let config = StandaloneConfig {
-        // 0.0.0.0 exercises the non-loopback security-warning branch; the
-        // client still connects via 127.0.0.1 on the same port.
-        bind: "0.0.0.0".to_string(),
+        // Loopback: the normal standalone path. (A non-loopback bind with an
+        // EMPTY keystore now REFUSES to start — [HG058], covered by
+        // `lan_bind_with_zero_keys_refuses_to_start` below.)
+        bind: "127.0.0.1".to_string(),
         port,
         higgs: HiggsConfig::default(),
         log_bus: Arc::new(LogBus::new()),
@@ -298,4 +323,183 @@ async fn shutdown_signal_parks_until_signalled() {
         timed_out,
         "shutdown_signal must keep waiting when no signal is delivered"
     );
+}
+
+/// G4 fail-closed: a NON-LOOPBACK bind with ZERO configured API keys must
+/// refuse to start with the coded [HG058] error — never serve the open
+/// control + /v1 surface to the network. Fail-on-revert: restoring the old
+/// warn-and-serve behavior makes `run_standalone` return Ok here.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // TEST_ENV_LOCK spans the test (serializes HIGGS_HOME)
+async fn lan_bind_with_zero_keys_refuses_to_start() {
+    let _env = crate::TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let home = tempfile::tempdir().unwrap();
+    let _home = RestoreVar::set("HIGGS_HOME", home.path().as_os_str());
+    // No api_keys.json in the fresh home ⇒ empty keystore.
+
+    let config = StandaloneConfig {
+        bind: "0.0.0.0".to_string(),
+        port: 0, // refusal fires BEFORE any bind, so the port never matters
+        higgs: HiggsConfig::default(),
+        log_bus: Arc::new(LogBus::new()),
+    };
+    let err = run_standalone(config, async {})
+        .await
+        .expect_err("non-loopback bind with zero keys must refuse to start");
+    assert!(
+        err.to_string().contains("[HG058]"),
+        "refusal carries the HG058 code: {err}"
+    );
+    // The remediation must mint a key that SATISFIES the follow-up [HG069] Admin
+    // gate — `keys add <label>` alone defaults to chat,models and would trap the
+    // operator in a second startup failure (codex r19).
+    assert!(
+        err.to_string().contains("keys add <label> admin"),
+        "HG058 remediation points at an Admin-capable key: {err}"
+    );
+}
+
+/// G4 fail-closed: a NON-LOOPBACK bind with keys present but NONE Admin-capable
+/// must refuse to start with the coded [HG069] error — a keyed-but-Adminless LAN
+/// server locks the operator out of the key-management API (every Admin-scoped
+/// route rejected, and minting an Admin key itself needs Admin). `higgs keys add
+/// <label>` defaults to `chat,models`, so this is the common LAN-bootstrap footgun.
+/// Fail-on-revert: dropping the Admin-key check in `run_standalone` lets it START
+/// (return Ok) with only a chat/models key, so `expect_err` fails.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // TEST_ENV_LOCK spans the test (serializes HIGGS_HOME)
+async fn lan_bind_with_non_admin_keys_refuses_to_start() {
+    let _env = crate::TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let home = tempfile::tempdir().unwrap();
+    let _home = RestoreVar::set("HIGGS_HOME", home.path().as_os_str());
+    // Seed a keystore with a chat/models key but NO Admin scope.
+    let token = crate::keys::mint_token([7u8; 16]);
+    let mut keys = crate::keys::ApiKeys::default();
+    keys.add(
+        &token,
+        "lan".into(),
+        vec![crate::keys::Scope::Chat, crate::keys::Scope::Models],
+    );
+    keys.save(&home.path().join("api_keys.json"))
+        .expect("seed keystore");
+
+    let config = StandaloneConfig {
+        bind: "0.0.0.0".to_string(),
+        port: 0, // refusal fires BEFORE any bind, so the port never matters
+        higgs: HiggsConfig::default(),
+        log_bus: Arc::new(LogBus::new()),
+    };
+    let err = run_standalone(config, async {})
+        .await
+        .expect_err("non-loopback bind with no Admin key must refuse to start");
+    assert!(
+        err.to_string().contains("[HG069]"),
+        "refusal carries the HG069 code: {err}"
+    );
+}
+
+/// The counterpart: with a key configured, a non-loopback bind STARTS (the
+/// operator opted in and auth gates every route) — only the warning fires.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // TEST_ENV_LOCK spans the test (serializes HIGGS_HOME)
+async fn lan_bind_with_keys_starts() {
+    let _env = crate::TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let home = tempfile::tempdir().unwrap();
+    let _home = RestoreVar::set("HIGGS_HOME", home.path().as_os_str());
+    let token = crate::keys::mint_token([9u8; 16]);
+    let mut keys = crate::keys::ApiKeys::default();
+    keys.add(&token, "lan".into(), vec![crate::keys::Scope::Admin]);
+    keys.save(&home.path().join("api_keys.json"))
+        .expect("seed keystore");
+
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let config = StandaloneConfig {
+        bind: "0.0.0.0".to_string(),
+        port,
+        higgs: HiggsConfig::default(),
+        log_bus: Arc::new(LogBus::new()),
+    };
+    let server = tokio::spawn(async move {
+        run_standalone(config, async {
+            let _ = rx.await;
+        })
+        .await
+    });
+    // Reachable (with the bearer) — the keyed LAN bind serves.
+    let url = format!("http://127.0.0.1:{port}/api/higgs/status");
+    let client = reqwest::Client::new();
+    let mut ok = false;
+    for _ in 0..50 {
+        match client
+            .get(&url)
+            .header("host", "127.0.0.1")
+            .bearer_auth(&token)
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                ok = true;
+                break;
+            }
+            _ => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+        }
+    }
+    assert!(ok, "keyed non-loopback bind serves (auth-gated)");
+    let _ = tx.send(());
+    server.await.expect("join").expect("clean shutdown");
+}
+
+/// [HG058] fail-on-revert (codex r14): a bind that RESOLVES to loopback but is
+/// not a string literal (`LOCALHOST`) with ZERO keys must START — it only
+/// listens on loopback. Reverting to the raw-string `!is_loopback_bind` check
+/// refuses it, so `run_standalone` returns [HG058] and this serve assertion fails.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // TEST_ENV_LOCK spans the test (serializes HIGGS_HOME)
+async fn loopback_alias_bind_with_zero_keys_starts() {
+    let _env = crate::TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let home = tempfile::tempdir().unwrap();
+    let _home = RestoreVar::set("HIGGS_HOME", home.path().as_os_str());
+    // No api_keys.json ⇒ empty keystore.
+
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let config = StandaloneConfig {
+        bind: "LOCALHOST".to_string(), // resolves to 127.0.0.1 (loopback-only)
+        port,
+        higgs: HiggsConfig::default(),
+        log_bus: Arc::new(LogBus::new()),
+    };
+    let server = tokio::spawn(async move {
+        run_standalone(config, async {
+            let _ = rx.await;
+        })
+        .await
+    });
+    // A refusal returns Err almost immediately (before binding/serving); a
+    // served instance runs until shutdown. Checking task liveness (not an HTTP
+    // round-trip) sidesteps LOCALHOST's IPv4/IPv6 bind ambiguity. On revert to
+    // the raw-string check, run_standalone refuses → the task finishes early →
+    // this assertion fails.
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert!(
+        !server.is_finished(),
+        "loopback-resolving alias bind with zero keys was NOT refused (still serving)"
+    );
+    let _ = tx.send(());
+    server.await.expect("join").expect("clean shutdown");
 }

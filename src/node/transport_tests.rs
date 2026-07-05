@@ -103,6 +103,8 @@ async fn chat_streams_chunks_then_final() {
     });
     let final_res = fut.await.unwrap();
     let got = collector.await.unwrap();
-    assert_eq!(got, vec!["he", "llo"], "streamed chunks");
+    // The delta queue merges same-kind runs the collector hasn't drained yet,
+    // so the PARTITION is timing-dependent — the concatenation is the contract.
+    assert_eq!(got.concat(), "hello", "streamed chunks");
     assert_eq!(final_res["content"], "hello");
 }

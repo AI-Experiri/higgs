@@ -61,27 +61,12 @@ pub async fn run_standalone(
     } = config;
     let addr = format!("{bind}:{port}");
 
-    // SECURITY WARNING on a non-loopback bind (vllm's startup warning). higgs
-    // has NO auth — its control surface (`/api/higgs/*`) and OpenAI `/v1` are
-    // open to anyone who can reach the port. The DNS-rebinding Host guard + CORS
-    // only protect *browser* clients; a non-loopback bind exposes the surface to
-    // any non-browser client on the network. The embedded path always binds
-    // loopback — this only fires for the standalone bin.
-    if !is_loopback_bind(&bind) {
-        tracing::warn!(
-            %bind,
-            "SECURITY WARNING: higgs is binding to a NON-LOOPBACK address. The \
-             no-auth control + /v1 surface is exposed beyond localhost; CORS and \
-             the Host guard do not protect non-browser clients. Bind 127.0.0.1 \
-             unless you intend a LAN-reachable server."
-        );
-    }
-
     let higgs = Arc::new(Higgs::with_log_bus(higgs_config, log_bus.clone()));
-    // Load API keys (P5). A MISSING store leaves the surface open by design (embedded host);
-    // but a present-yet-unreadable/malformed store, or an unusable home dir, FAILS CLOSED —
-    // we abort startup rather than silently serve unauthenticated, since the file's presence
-    // is exactly what enables protection.
+    // Load API keys (P5) BEFORE the bind-exposure check below needs them. A MISSING store
+    // leaves the surface open by design (embedded host); but a present-yet-unreadable/
+    // malformed store, or an unusable home dir, FAILS CLOSED — we abort startup rather than
+    // silently serve unauthenticated, since the file's presence is exactly what enables
+    // protection.
     let keys_path = crate::keys::keys_path()?;
     let keys = crate::keys::ApiKeys::load(&keys_path)?;
     let n = keys.iter().count();
@@ -89,6 +74,46 @@ pub async fn run_standalone(
         tracing::info!(keys = n, "higgs: API-key auth ENABLED");
     }
     higgs.set_api_keys(Arc::new(keys));
+
+    // Non-loopback bind exposure (G4). The Host guard + CORS only protect *browser*
+    // clients; a non-loopback bind exposes the surface to any non-browser client on
+    // the network. With ZERO keys that surface would be wide open — REFUSE to start
+    // ([HG058], fail closed; lmstudio/ollama never gate this — higgs does). With keys
+    // present the bind is intentional: auth gates every route, so only warn.
+    //
+    // Decide on the RESOLVED bind, not the raw string: a hostname / `/etc/hosts`
+    // alias to `127.0.0.1` is loopback-only and must not be refused (codex r14).
+    // Only refuse when the bind DEFINITELY resolves to a non-loopback address;
+    // if resolution is inconclusive, `serve_with_shutdown` still enforces
+    // [HG058] on the REAL bound address (`listener.local_addr()`) as the
+    // authoritative backstop.
+    if bind_resolves_non_loopback(&bind, port) {
+        let keys = higgs.api_keys();
+        if keys.is_empty() {
+            return Err(Box::new(
+                crate::diagnostic::HiggsError::LanBindWithoutKeys { bind },
+            ));
+        }
+        // Keys present but NONE Admin-capable: auth is ON, yet every Admin-scoped
+        // control/key route (mint/revoke) is rejected — the operator can't manage
+        // keys over the API on this running LAN server (mint itself needs Admin).
+        // Fail closed ([HG069]); recovery is to add an Admin key out-of-band and
+        // restart. `higgs keys add <label>` defaults to `chat,models`, so a LAN
+        // bootstrap easily lands here — refuse rather than serve a locked-out surface.
+        if !keys
+            .iter()
+            .any(|k| k.scopes.contains(&crate::keys::Scope::Admin))
+        {
+            return Err(Box::new(
+                crate::diagnostic::HiggsError::LanBindWithoutAdminKey { bind },
+            ));
+        }
+        tracing::warn!(
+            %bind,
+            "higgs is binding beyond localhost; API-key auth is ENABLED and gates \
+             every /v1 + /api/higgs route (health stays open)."
+        );
+    }
 
     // Hub mode (HIGGS_HUB=1, P3): bind the iroh endpoint, install the fleet, and accept node
     // dials. The facade owns the hub Arc (`set_hub`) for the server's lifetime, so the endpoint
@@ -140,6 +165,32 @@ pub fn is_loopback_bind(bind: &str) -> bool {
         || bind == "::1"
         || bind == "[::1]"
         || bind.starts_with("127.")
+}
+
+/// Whether `bind:port` DEFINITELY resolves to a non-loopback address (the G4
+/// [HG058] refusal condition). Resolves the actual socket addresses — so a
+/// hostname / hosts-alias to `127.0.0.1` is correctly treated as loopback — and
+/// returns `true` only when resolution SUCCEEDS and yields at least one
+/// non-loopback address. A resolution failure returns `false` (inconclusive →
+/// don't refuse here; `serve_with_shutdown` checks the real bound address).
+fn bind_resolves_non_loopback(bind: &str, port: u16) -> bool {
+    use std::net::ToSocketAddrs;
+    match (bind, port).to_socket_addrs() {
+        Ok(addrs) => {
+            let mut any = false;
+            for a in addrs {
+                any = true;
+                if !a.ip().is_loopback() {
+                    return true; // definitely exposed
+                }
+            }
+            // Resolved to only loopback addresses (or, if `any` is false, to
+            // none) — not known-exposed.
+            let _ = any;
+            false
+        }
+        Err(_) => false, // inconclusive → defer to serve_with_shutdown
+    }
 }
 
 /// Resolve when the process is asked to terminate — SIGTERM (the standard

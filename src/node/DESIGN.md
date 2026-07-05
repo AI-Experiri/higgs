@@ -1,61 +1,195 @@
 # `src/node/` — Design
 
-Design notes for the iroh remote-worker layer. Full spec: `../../DESIGN-remote.md`.
-Phase roadmap + decisions: `../../docs/superpowers/plans/2026-06-19-iroh-remote-roadmap.md`.
+Design notes for the iroh remote-worker layer. Full spec: `../../docs/DESIGN-remote.md`.
+Roadmap + decisions: `../../docs/superpowers/plans/2026-06-19-iroh-remote-roadmap.md`.
 
 ## Topology — two hops, never collapsed
 
 ```
-   external client          HUB                         NODE                 WORKER
-   POST /v1/chat  ─▶  resolve model→(node,worker)   serve_node loop     llama.cpp child
-   (P5 Bearer)        gate + per-node transport   ── iroh ──▶ control/data ── stdio ──▶ engine
-                  ◀── stream chunks back ◀────────────────────────────────◀── N_CHAT_CHUNK
+   external client        HUB                          NODE               WORKER
+   POST /v1/chat  ─▶  resolve served→(node,worker)  serve_node loop    llama.cpp child
+                     gate + per-node transport  ── iroh ──▶ control/data ── stdio ──▶ engine
+                  ◀── stream chunks back ◀─────────────────────────────◀── N_CHAT_CHUNK
 ```
 
-The hub borrows remote GPUs. It never talks to a remote worker directly: it talks to the
+The hub borrows remote GPUs; it never talks to a remote worker directly. It talks to the
 **node**, which drives its own llama.cpp children over local stdio via the unchanged
-`Supervisor`. Reusing `Supervisor` as the per-worker unit is deliberate — it already
-bridges to the child's synchronous `serve_state`.
+`Supervisor`. Reusing `Supervisor` as the per-worker unit is deliberate — it already bridges
+to the child's synchronous `serve_state`, so the iroh boundary lives only at the node's relay
+(`data::relay_chat`) and the hub's transport (`transport::NodeTransport`), never inside a
+worker.
 
-## Key design decisions
+## Core design decisions
 
-- **Reuse, don't reinvent.** The wire is the existing `RpcFrame` NDJSON; remote adds the
-  additive `higgs/node/*` namespace + a HELLO handshake. `Supervisor` is the per-worker
-  unit, unchanged. The net-new piece is `NodeRuntime` (the multi-worker registry).
-- **The node relays via `Supervisor::chat()`, not `SyncIoBridge` into `serve_state`**
-  (codex-validated correction to the spec). The worker therefore stays pure-sync stdio
-  forever — the iroh boundary lives at the node's relay (and, in P3, the hub's transport),
-  never inside the worker.
+- **Reuse, don't reinvent.** The wire is the existing `RpcFrame` NDJSON; remote just adds the
+  additive `higgs/node/*` control namespace + a HELLO handshake (`crate::remote`). `Supervisor`
+  is the per-worker unit, unchanged. The net-new piece is `NodeRuntime` (the multi-worker
+  registry).
 - **Two dispatchers, never merged.** Control (`higgs/node/*`) → `control::dispatch_node_control`
-  → `NodeRuntime`. Data (`M_CHAT`) → `data::relay_chat` → `Supervisor::chat`. A control RPC
-  never reaches `WorkerState`; chat is never multiplexed onto a control frame.
-- **`WorkerId` is `u32` + `Copy`** so `LogSource::RemoteWorker` (P4) stays `Copy`. Ids are
-  monotonic and never reused, so a stale `(node,worker)` reference can't alias.
+  → `NodeRuntime`. Data (`M_CHAT` / `M_NODE_PULL`) → `data::relay_chat` / `relay_pull`. A control
+  RPC never reaches `WorkerState`; chat is never multiplexed onto a control frame.
+  `mod::handle_node_stream` is the node-side fan-out that routes each inbound method to the right
+  plane.
 - **Identity is cryptographic.** `EndpointId` = the ed25519 public key; QUIC/TLS proves the
-  dialer holds the private key. The HELLO `node_id` MUST equal the TLS `remote_id()`
-  (anti-spoof). Auth surface A = an `EndpointId` allowlist admitted by one-time pairing
-  tokens (`../auth.rs`).
+  dialer holds the private key. Both directions validate self-declaration against the TLS
+  `remote_id()`: hub-side `gate_read_hello` requires `hello.node_id == peer` and `role == "node"`;
+  node-side `validate_hub_hello` requires `role == "hub"`, matching `node_id`, and a version WE
+  support (so a malformed reply can't poison the node's saved-hub state).
+- **Stable ids, never reused.** `WorkerId(u32)`/`NodeId(u32)` are `Copy` so `LogSource::RemoteWorker`
+  stays `Copy`; `WorkerRegistry` and `NodeIdAllocator` are monotonic and never rewind `next`, so a
+  stale `(node, worker)` reference can never alias a different worker/node.
 
-## Lifecycle & safety invariants
+## Concurrency model — actors, not mutexes
 
-- **Post-HELLO gate** (`gate_connection`): the whole pre-HELLO window (including
-  `accept_bi`, which iroh defers until the opener writes) is bounded by a deadline → HG028;
-  version mismatch → typed HG023 *then* close; not-allowlisted/bad-token → HG024/HG022.
-- **Cancellation-safe lifecycle.** A dropped `Supervisor` does NOT reap its child, so
-  `NodeRuntime` guards every uncommitted/dropped worker with `StopOnDrop` (detached stop),
-  drains on `shutdown_all`, and has a `Drop` backstop. Control dispatch and the chat relay
-  are tied to connection + stream liveness so a hub disconnect can't orphan a worker.
-- **Load mirrors `Higgs::load`**: resolve `id`→path off the executor (scan + canonical
-  containment guard), RAM headroom guard, `ctx_train` default, and `record_last_load` so a
-  respawn replays the model.
-- **Honest capabilities & params.** HELLO advertises only implemented capabilities
-  (`chat=true`; `download`/`log_stream` arrive in P4b/P4). `NodeLoadParams` uses
-  `deny_unknown_fields` so a node rejects a param it can't honor rather than silently drop
-  it. Worker-origin diagnostic codes (HG003/HG005/HG018) survive the relay.
+Both stateful pieces are single-owner **actors** (mailbox + one owning task; see
+`crate::actor` and `docs/superpowers/plans/2026-06-19-P0-actor-runtime.md`). A handler does only fast
+synchronous state work; every slow downstream RPC runs OFF the actor thread, so a slow op can
+never head-of-line-block a fast one.
 
-## Phase status
+### `NodeRuntime` (`runtime.rs`)
 
-P1 (pairing/HELLO) and P2 (NodeRuntime + control plane) are complete; the chat relay
-(P3 core) is implemented and covered by the real-process integration test. Remaining P3
-(hub-side per-node transport, `WorkerProc` trait, wedged-worker reap, HG027), P4
-(inventory + `LogSource`), P4b (`M_PULL`), P5 (Bearer auth), P6 (UI) — see the roadmap.
+Private state = a `WorkerRegistry<Arc<Supervisor>>` + activity/in-flight maps behind one
+mailbox — no mutex, so concurrent ops can't interleave across an `.await`.
+
+- **Spawn-and-commit load.** `load` is the one op that mutates state AFTER a slow RPC. `Load`
+  reserves an id synchronously, runs the slow `do_load` (resolve → RAM headroom guard → spawn
+  Supervisor → `M_LOAD`) detached, then applies the registry insert via a `LoadCommit` message.
+  So a slow load never blocks an unload/retire. `LoadCommit` delivers the caller reply FIRST
+  then inserts (no `.await` between), so a cancelled caller reaps the worker instead of
+  wedging a committed-but-unacked one.
+- **Cancellation safety.** A dropped `Supervisor` does NOT reap its child. `do_load` holds a
+  `StopOnDrop` panic-net; every teardown funnels through `reap` (a tracked task bumping
+  `inflight_stops`, posting `ReapDone`); `shutdown_all` blocks until `inflight_loads +
+  inflight_stops == 0`. A strong `keepalive` self-handle is held exactly while work is in
+  flight, so the load→commit→reap→done chain drains in-actor even if every external handle
+  drops mid-op. `ChatLease` (deref to `Supervisor`, held for the whole generation) posts
+  `ChatEnd` on drop so the idle reaper measures idle from the END of a generation and never
+  reaps a worker mid-chat.
+- **Live idle policy.** `IdleConfig` (atomics + a `Notify`) is shared with the reaper task,
+  which sleeps `reap_interval(ttl)` OR wakes immediately on change — so a Server-Settings TTL /
+  on-off toggle takes effect without a restart. The reaper holds a `WeakHandle` so it never
+  keeps an idle actor alive.
+
+### `HubFleet` (`fleet.rs`)
+
+Private state = `nodes` (connected → transport), `routes` (`(node, worker) → raw model`),
+`node_ids`, `inventories`, `epochs`, `admit_gen` — all behind one mailbox. This dissolved the
+old 7-mutex TOCTOU class: compound transitions (`AdmitNode`, `RemoveInstanceIf`,
+`CommitInventory`, `Retire`, `DisconnectAll`) are each ONE message, applied all-or-nothing, and
+the cross-map `nodes_view` snapshot is atomic. Slow iroh RPCs run in the async wrapper methods
+(fast state read → slow RPC off-actor → fast atomic commit message).
+
+Two generation counters, not locks, guard the two races:
+
+- **Per-node `epoch`** — bumped on every load/unload/kill/instance-drop/(re)admission. A slow
+  `refresh_inventory` records `epoch_before`, and `CommitInventory` stores its (possibly stale)
+  result only if the epoch is unchanged — so a slow connect-time fetch can't clobber newer state.
+- **Monotonic `admit_gen`** — each accept loop is bound to the generation current when it
+  started (`bump_admit_gen`). `AdmitNode` admits only while its gen still matches; the kill
+  switch's `DisconnectAll` bumps the gen atomically with draining transports, so an admission
+  task from the now-closing loop that races past disable is REFUSED (and a later re-enable's
+  newer gen means it can never match again).
+
+**Durable routes, transient transports.** The `--node` daemon reuses ONE `NodeRuntime` across
+reconnects, so its workers/ids persist. Instance routes survive a dropped connection; only the
+per-connection transport comes and goes (`drop_transport_if`, Arc-identity guarded so a stale
+close-watcher can't drop a freshly reconnected transport). A genuine node-process restart leaves
+stale routes that self-heal on the first worker-gone error (`route_invalidating`: HG006/HG007/
+HG018 → instance dropped).
+
+### Pairing-lock two-phase gate (`mod.rs`, `hub.rs`)
+
+The one place with real locks is admission (`Arc<Mutex<Allowlist>>` + `Arc<Mutex<PairingTokens>>`),
+split so a slow/malicious peer can't starve other joins or `POST /api/higgs/pair`:
+
+1. **`gate_read_hello`** — lock-FREE. Bounds the whole pre-HELLO window (including `accept_bi`,
+   which iroh defers until the opener writes) by `HELLO_DEADLINE`, caps buffered bytes
+   (`MAX_HELLO_BYTES`), and runs the anti-spoof identity + version checks. A stalled peer is
+   dropped here (HG028) without ever touching the pairing locks.
+2. **`gate_admit`** — locks HELD by the caller. Synchronous in-memory allowlist/token decision
+   (persist-then-burn) + a small post-auth reply. `hub.rs` registers the admitted node into the
+   fleet INSIDE the same allowlist critical section as the admit, closing the admit→register
+   window where a concurrent `Hub::retire` could re-introduce a just-retired node. Rejections
+   write the typed frame under the lock but **grace-close (`close_after_reject`) only AFTER
+   releasing the locks** — a rejected peer can stall the 2s close the full timeout, so holding
+   the locks across it would serialize every other admission.
+
+`gate_connection` is the lock-held convenience wrapper used by `cli.rs`; production `hub.rs`
+uses the split path.
+
+## Served-instance-id scheme (`served.rs`, `fleet.rs`)
+
+Routes are keyed by INSTANCE — `(node, worker) → raw model` — so loads are ADDITIVE: N workers
+serving the same model coexist as N instances (not only-keep-last). Each instance's SERVED id is
+a deterministic, collision-free function of the live set: assigned in sorted `(model, location,
+worker)` order against a global taken-set, the nth instance gets `org/model`, `org/model-1`, …,
+and a candidate that clashes with a literal model name bumps to the next free suffix — so every
+instance is reachable and the result is identical every time. It is derived on demand by
+`served_ids`, **never persisted**, so a disconnect never renumbers survivors.
+
+`served_ids` is generic over the instance LOCATION `L`, so the hub fleet (`L = NodeKey`) and the
+local engine (P4b) share ONE algorithm. On the wire, `/v1` addresses a SERVED id but chat sends
+the RAW model the worker loaded (`fleet::chat` → `transport::chat`), so a served suffix never
+looks like a model mismatch (HG018). `nodes_view` tags each worker with `served_id_for_worker`,
+which returns the served id only while the route's model still matches the worker's reported
+model (a stale post-restart route yields `""` rather than an unreachable label).
+
+## Error codes this module owns
+
+Produced at origin here (relayed worker-origin codes like HG002/003/005/006/007/016/017/018 pass
+through via `worker_origin_code_data`, they are not owned here):
+
+| Code | Where | Meaning |
+|---|---|---|
+| HG022 | `gate_admit` | pairing token expired/used/unknown |
+| HG023 | `gate_read_hello` / `validate_hub_hello` | protocol version mismatch (typed frame, then close) |
+| HG024 | `gate_read_hello` / `gate_admit` | identity/role spoof, or not-allowlisted with no token |
+| HG025 | `data::relay_pull` | GGUF download failure (per-fetcher classified) |
+| HG026 | `control` (`M_NODE_UPDATE`) | node update unsupported (this build ships no updater) |
+| HG027 | `fleet` (`NodeUnreachable`) | node not connected / dead transport |
+| HG028 | `gate_read_hello` | handshake stalled past `HELLO_DEADLINE` |
+| HG036 | `data::relay_pull` | both download fetchers exhausted |
+| HG037 | `control` / `hub`/`node` stream dispatch | unknown method = protocol skew (→501, keeps -32601) |
+| HG038 | `connect_node` / `validate_hub_hello` | protocol violation (unexpected/mismatched hub reply) |
+| HG039 | `hub_rejection` | generic hub-request-rejected fallback (only for an uncoded rejection) |
+| HG040 | `gate_admit` / `hub::serve_node_requests` | pairings-store persistence failure (disk/permissions) |
+| HG051 | `transport::chat` reader | undecodable remote chat chunk dropped |
+| HG057 | `data::relay_chat` | relayed chat stream overflowed (backlog dropped; RPC fails loudly) |
+
+## Invariants
+
+- The HELLO `node_id` equals the TLS `remote_id()` (both directions). A node can only ever
+  retire ITSELF: `serve_node_requests` / `link_pair_post_admit` ignore any `M_NODE_LEAVE`
+  payload and authenticate by the connection's peer id.
+- `Hub::retire` holds the allowlist lock across BOTH the allowlist removal AND `fleet.retire`, so
+  retire is mutually exclusive with admit+register — no concurrent admit can re-add the node in
+  the gap. Node self-leave (`serve_node_requests`) does the DURABLE allowlist removal FIRST and
+  only replies `left` if it persisted (crash-safe: a hub crash before `fleet.retire` still leaves
+  the node gone, since it's no longer seeded from the allowlist on restart).
+- Single writer per data stream (`relay_chat`/`relay_pull`): chunks/progress first, then final —
+  never raced. Both are driven in a detached task holding the `ChatLease` so `Supervisor` cleanup
+  runs even on a mid-chat hub disconnect, and are cancelled on `conn.closed()` / `send.stopped()`.
+- `NodeLoadParams` base fields (ctx_len/gpu_layers/threads) stay authoritative on the node;
+  `worker_load_params` OMITS absent base fields (never serializes `null`, which would fail the
+  worker's required-`u32` deser and drop every rich override).
+
+## Deferred / residual items
+
+- **Cross-worker VRAM fit-check** (`do_load` NOTE): only the local RAM headroom guard runs; the
+  §4.2b VRAM fit-check across workers is pending.
+- **Remote sampling forwarding** (`relay_chat`): the hub→node wire carries only `temperature`; the
+  rest of the sampler set / card-recommended base is not applied on the relay path (DESIGN-autotune
+  §9).
+- **Per-worker generation token** (`RemoveInstanceIf` residual): a node PROCESS restart that reuses
+  the exact same worker id for the SAME model could in principle let a stale invalidation drop the
+  new instance. Not readily reachable (the restart drops the transport first → `WorkerDead`, and
+  unload/kill re-resolve per call); a full fix needs a per-worker gen token on the wire.
+- **`is_remote` breadth**: intentionally counts a served id whose node is currently DISCONNECTED
+  (routes outlive a transport drop) so a chat yields the accurate HG027 (host offline → reconnect)
+  rather than HG002. Accepted residual: a stale route to an offline node shadows a same-named
+  local JIT load — narrow, degrades to a clear diagnostic.
+- **Drop-without-`shutdown_all`**: `Drop` can't be async, so the sole orphan window is a
+  `NodeRuntime` dropped then immediate `process::exit` with no `shutdown_all`. The daemon always
+  calls `shutdown_all` first (fully awaited); `on_stop` is the best-effort awaited backstop; the
+  reap-log-eviction race is bounded to a few in-flight lines.
+</content>

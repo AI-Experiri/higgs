@@ -1,40 +1,70 @@
-# `src/tune/` — autotune suggester
+# `src/tune/` — autotune (analytical suggester + Turbotune bench core)
 
-A **pure advisor**: given typed GGUF metadata + host hardware (+ optional measured
-bench), it computes a nominal llama.cpp load + sampling parameter set with a fit
-verdict and rationale. It **never auto-applies** — the caller (the `tune` route,
-the UI, or the `autotune_on_load` seam) reviews, optionally edits, then loads.
+Two cooperating pieces, both **pure**:
 
-Adopted from TurboLLM's auto-tune brain; the *logic* ports to Rust, the
-spawn-with-flags *mechanism* does not (higgs links llama.cpp in-process). Full
+1. **Analytical `Suggest`** — a *pure advisor*: given typed GGUF metadata + host
+   hardware (+ optional HF-card sampling), it computes a nominal llama.cpp load +
+   sampling parameter set with VRAM/RAM fit verdicts and a rationale. It **never
+   auto-applies** — the caller (the `tune` route, the UI, or the `autotune_on_load`
+   seam) reviews, optionally edits, then loads.
+2. **Turbotune `Benchmark` decision core** (`bench.rs`, G6) — the *pure* candidate
+   generation / headroom gate / winner selection / aggregate-failure diagnosis for
+   the MEASURED autotune. The slow async orchestration that actually loads and
+   measures candidates lives in `api.rs` (`run_benchmark`), **not here** — this
+   module keeps only the deterministic, exhaustively unit-tested decisions.
+
+Adopted from TurboLLM's auto-tune brain: the *logic* ports to Rust, the
+spawn-with-CLI-flags *mechanism* does not (higgs links llama.cpp in-process). Full
 design + the binding-gated parameter inventory: `docs/DESIGN-autotune.md`.
 
 ## Files
 
 | File | Responsibility |
 |------|----------------|
-| `mod.rs` | Types (`ResourceBudget`, `TuneRequest`/`TuneSuggestion`, `FitReport`/`FitVerdict`, `ModelMeta`), the narrow traits (`DeriveStrategy`/`VramEstimator`/`RamEstimator`/`SamplingSource`/`ProfileStore`/…), and the `Suggester` orchestration (derive → sampling → precedence merge → VRAM fit → MoE back-off → RAM fit → rationale). |
-| `derive.rs` | `HeuristicStrategy: DeriveStrategy` — GGUF/hardware → base params (`derive_default`). |
-| `vram.rs` | `StaticVramEstimator`/`StaticRamEstimator` — GQA-correct KV math + tri-state fit over `system::fits_vram`. |
-| `card_sampling.rs` | HF-card recommended sampling: the deterministic parser + the async (fail-open) fetch + the `SamplingSource` impls. |
-| `store.rs` | `JsonModelStore` over per-node `~/.higgs/models.json` (`ModelEntry` = meta cache + tuning + perf); backs `ProfileStore`. |
+| `mod.rs` | **Not a barrel** — owns the wire/data types (`ResourceBudget`, `TuneMode`, `TuneProvenance`, `FitVerdict`/`FitReport`, `TuneRequest`/`TuneSuggestion`, `EstimateRequest`/`EstimateReport`, `ModelMeta`, `BenchResult`), the narrow DI traits (`DeriveStrategy`/`VramEstimator`/`RamEstimator`/`SamplingSource`/`ProfileStore`/`ModelMetaProvider`/`HardwareProvider`/`Benchmarker`), and the `Suggester` orchestration (`suggest`: derive → sampling → VRAM fit → MoE back-off → VRAM-budget back-off → context re-derive → final fits). |
+| `derive.rs` | `HeuristicStrategy: DeriveStrategy` — GGUF/hardware → base params (`derive_default`); `derive_ctx` inverts the estimators for the budget-largest context. |
+| `vram.rs` | `StaticVramEstimator`/`StaticRamEstimator` — GQA-correct KV math + the tri-state fit report over `system::fits_vram`; `gpu_layers_within_budget` (offload back-off); `resolve_estimate_ctx`. |
+| `bench.rs` | Turbotune PURE core: `bench_candidates` (ordered survivors), `passes_headroom` (1 GiB floor), `pick_winner` (earliest-tie), `bench_gen_tps` (decode-only tok/s: `(tokens−1)/(total−ttft)`, empty window ⇒ 0.0), `aggregate_failure` (HG063 text), `Candidate`, `ABS_VRAM_HEADROOM_BYTES`, `MAX_BENCHED_CANDIDATES`. |
+| `card_sampling.rs` | HF-card recommended sampling: deterministic drop-not-clamp parsers (`parse_generation_config`, `parse_card_sampling`) + the async fail-open fetch (`fetch_card_sampling`) + the `SamplingSource` impls (`EmptySamplingSource`, `StaticSamplingSource`). |
+| `store.rs` | `JsonModelStore` over per-node `~/.higgs/models.json` (`ModelEntry` = `{path,size,mtime}`-keyed meta cache + saved `TuneRecord` + observed `ModelPerf`); backs `ProfileStore`. |
+| `context/` | Budget-aware context-length derivation (the inverse estimator). Own `README.md`/`DESIGN.md`; used by `derive::derive_ctx`. |
+
+## Public surface (how the rest of the crate uses it)
+
+- **`Suggester<D,V,R,S>` + `Suggester::static_default()` + `.suggest(meta, hw, budget)`**
+  — `api.rs` runs the analytical `Suggest` path (for `POST /api/higgs/models/tune`),
+  wiring `StaticSamplingSource` when a card fetch succeeded, else the fully-static
+  default. Generic over the traits so tests inject fakes (no worker, no disk, no
+  network).
+- **`bench::{bench_candidates, pick_winner, bench_gen_tps, aggregate_failure}`** —
+  `api.rs` `run_benchmark` (the `Benchmark` mode) uses these to pick and label
+  candidates, score each measurement (`bench_gen_tps`, prefill excluded), and build
+  the `HG063` "no working config" detail.
+- **`StaticVramEstimator`/`StaticRamEstimator` + `EstimateReport`** — `api.rs` reuses
+  the estimators for `POST /api/higgs/models/estimate` (live footprint as the user
+  edits load params); the frontend never reimplements the formula.
+- **`JsonModelStore`** — the per-node model store: `tuning`/`put_tuning`/`all_tuning`
+  (saved profile reuse), `set_profile` (keep the reused profile in sync with the last
+  accepted load, refresh staleness anchors), `record_perf`/`perf` (passive tok/s),
+  `put_meta`/`meta_if_fresh` (GGUF-metadata cache), `flush` (atomic persist).
+- **`TuneSuggestion`/`FitReport`/`FitVerdict`/`ResourceBudget`/…** — ts-rs wire types
+  (`higgs_ts!` / `higgs_const_enum!`) consumed by the jigglebot frontend; `FitVerdict`
+  carries `#[help]` that generates `FitVerdictHelp.ts` for the verdict-chip tooltips.
+
+The HTTP routes are registered in `serve/mod.rs` and handled by thin wrappers in
+`serve/control.rs` (`control_tune`), which delegate to `api.rs`.
 
 ## Design tenets
 
 - **Engine-specific data, abstracted behavior.** Param types stay
-  llama.cpp-concrete (`LlamaCppParams`); only the *behaviors* sit behind traits,
-  so a new recommendation source / derivation heuristic / bench backend / store
-  is a new trait impl, not a param-type change.
-- **Pure & unit-tested** — estimators/derive/parse are pure
-  over their inputs, tested with fakes (no worker, no disk, no network), which is
-  what keeps the unit gate green.
+  llama.cpp-concrete (`LlamaCppParams`); only the *behaviors* sit behind narrow
+  traits, so a new sampling source / derivation heuristic / bench backend / store is
+  a new trait impl, not a param-type change.
+- **Pure & unit-tested.** The estimators, derive, parsers, and the whole Turbotune
+  decision core are pure over their inputs, tested with fakes — which is what keeps
+  the **unit gate (≥90%)** green. The slow async bench/tune orchestration is `api.rs`'
+  job and lands on the integration gate.
 - **Reuse, don't re-port.** The VRAM budget primitive is `system::fits_vram`; the
   tri-state thresholds + the KV term are tune's addition on top.
 - **GQA-correct.** The KV-cache estimate uses `head_count_kv`, never the query
-  `head_count` (which over-estimates KV by the GQA factor).
-
-## Coverage
-
-`tune/*` is the **unit gate's** job (pure logic, ≥90% lines) — it is on the unit
-coverage set. The end-to-end `tune` route + load path lands
-on the integration gate.
+  `head_count` (which over-estimates KV by the 4–8× GQA factor).

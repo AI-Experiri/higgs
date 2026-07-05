@@ -1,23 +1,94 @@
 # higgs-macros
 
-Proc-macro support crate for higgs. A separate crate because proc-macros must
-live in a `proc-macro = true` crate, distinct from the `higgs` crate that uses
-them.
+Proc-macro support crate for higgs. It exists as a separate crate only because
+proc-macros must live in a `proc-macro = true` crate (`Cargo.toml` sets it),
+distinct from the `higgs` crate that consumes them. It has no runtime deps beyond
+`syn` / `quote` / `proc-macro2` and derives no behavior — every macro here runs at
+**compile time** and its job is to emit better TypeScript bindings than ts-rs
+produces on its own.
 
-## `#[derive(TsConstEnum)]`
+## Files
 
-Emits a TypeScript **const-object** + derived type for a Rust unit-variant enum,
-instead of the plain `type X = "a" | "b"` union that `ts_rs::TS` produces. The
-const-object form lets the frontend use the enum as a **value** (`Foo.Bar`), not
-just a type — matching jigglebot's enum bindings (this derive is ported from
-jigglebot's `macros` crate; higgs is standalone and can't depend on it).
+| File | Responsibility |
+|------|----------------|
+| `src/lib.rs` | The entire crate: both derive macros (`TsConstEnum`, `TsParamHelp`), their expanders, the ts-rs/serde attribute parsers, and serde-matching case-conversion helpers. |
+| `src/lib_tests.rs` | Unit tests (wired as `#[path] mod tests;` from `lib.rs`); not documentation-relevant. |
 
-Apply it via the `higgs_const_enum!` wrapper in `higgs/src/ts_export.rs` (which
-pairs it with `ts_rs::TS` + `#[ts(export_to = "higgs/")]` and deliberately omits
-`#[ts(export)]`). Variant-with-fields enums stay on `higgs_ts!` — they need
-ts-rs's discriminated-union output.
+There is no `mod.rs` — the crate is a single flat `lib.rs`.
 
-### Generated TS
+## Public surface
+
+Two `#[proc_macro_derive]`s (the only public items; everything else is a private
+helper `fn` in `lib.rs`):
+
+- **`#[derive(TsConstEnum)]`** (`derive_ts_const_enum` → `expand`) — for a Rust
+  **unit-variant** enum, emits a TypeScript **const-object** binding instead of the
+  plain `type X = "a" | "b"` union that `ts_rs::TS` produces. The const-object form
+  lets the frontend use the enum as a **value** (`Foo.Bar`), not just a type,
+  matching jigglebot's enum bindings. Variants-with-fields are a compile error
+  (they'd need a discriminated union, which a const-object can't represent).
+
+- **`#[derive(TsParamHelp)]`** (`derive_ts_param_help` → `expand_param_help`,
+  helper attribute `#[help = "…"]`) — for a **named-field struct** or a
+  **unit-variant enum**, reads `#[help = "…"]` on each field/variant and emits two
+  things:
+  1. a Rust `impl <Type> { pub const PARAM_HELP: &[(&str, &str)] = …; }` of
+     `(wire_name, help)` pairs (unit-testable in the consuming crate), and
+  2. a `<Type>Help.ts` const-object map the frontend reads at runtime for tooltips
+     (ts-rs JSDoc is compile-time-only and can't be surfaced in the UI).
+  `#[help]` is registered as an inert helper attribute, so it never reaches
+  ts-rs/serde and the wire format is untouched.
+
+## How the rest of the crate uses it
+
+The `higgs` crate never applies these derives by hand — it wraps `TsConstEnum` in
+the `higgs_const_enum!` `macro_rules!` in `src/ts_export.rs`, which stamps every
+enum with the exact combination the derive needs:
+
+```rust
+// src/ts_export.rs
+#[derive(ts_rs::TS, higgs_macros::TsConstEnum)]
+#[ts(export_to = "higgs/")]                 // path for ts-rs AND TsConstEnum
+$vis enum $name { … }                        // note: NO #[ts(export)]
+```
+
+`higgs_const_enum!` is used across `src/keys.rs`, `src/system.rs`,
+`src/api/types.rs`, `src/serve/readiness.rs`, `src/worker/models.rs`,
+`src/worker/engine/mod.rs`, `src/worker/engine/llamacpp/params.rs`, and
+`src/tune/mod.rs`. `TsParamHelp` is derived directly on `LlamaCppParams`
+(`src/worker/engine/llamacpp/params.rs`) and on the `FitVerdict` enum
+(`src/tune/mod.rs`, whose test reads `FitVerdict::PARAM_HELP`).
+
+### The const-object-vs-union ritual
+
+`ts_rs::TS` is the single source of truth for a type's *existence* + *import path*;
+`TsConstEnum` overrides only the emitted body. For an enum we want BOTH: ts-rs to
+KNOW the type (so dependent structs emit `import type { X } from "./X"`) but the
+`X.ts` file to be a const-object. So each `higgs_const_enum!` enum:
+
+- keeps `#[derive(ts_rs::TS)]` + `#[ts(export_to = "higgs/")]` (import path), but
+- deliberately **omits `#[ts(export)]`** — that would make ts-rs write its own
+  `export_bindings_*` union file that races the derive's writer.
+
+### `macro_run_*` regeneration convention
+
+Both derives emit a hidden `#[cfg(test)] #[ignore]` writer test —
+`macro_run_ts_const_enum_<snake>` / `macro_run_ts_param_help_<snake>` — that does
+the actual `fs::write`. These are **not** run by a normal `cargo test`; regenerate
+via a separate `--ignored` pass:
+
+```sh
+cargo test macro_run -- --ignored
+```
+
+This pass MUST run **after** the normal ts-rs pass: ts-rs's transitive export
+re-writes each enum's `.ts` as a union while exporting a dependent struct, so the
+`macro_run` writer has to run last to win. `scripts/quality.sh` runs both in that
+order, then verifies the committed `bindings/higgs/*.ts` are unchanged.
+
+### Generated output
+
+`TsConstEnum` (e.g. `bindings/higgs/FlashAttn.ts`):
 
 ```ts
 // AUTO-GENERATED — do not edit. Regenerated by `cargo test`.
@@ -26,21 +97,18 @@ export const { Auto, Off, On } = FlashAttn;
 export type FlashAttn = (typeof FlashAttn)[keyof typeof FlashAttn];
 ```
 
-`#[serde(rename_all)]` / `#[serde(rename)]` are honored for the wire values.
+`TsParamHelp` (e.g. `bindings/higgs/LlamaCppParamsHelp.ts`,
+`bindings/higgs/FitVerdictHelp.ts`):
 
-## `macro_run_*` regeneration convention
-
-The derive emits a hidden `#[cfg(test)] #[ignore]` test named
-`macro_run_ts_const_enum_<snake>` that writes the `.ts` file. It is **not** run by
-a normal `cargo test`; regenerate via a separate pass:
-
-```sh
-cargo test macro_run -- --ignored
+```ts
+// AUTO-GENERATED — do not edit. Regenerated by `cargo test`.
+export const LlamaCppParamsHelp = {
+    "ctx_len": "How many tokens …",
+    …
+} as const;
+export type LlamaCppParamsHelpKey = keyof typeof LlamaCppParamsHelp;
 ```
 
-This pass MUST run **after** the normal ts-rs pass: ts-rs's transitive export
-writes a union for each enum as a side effect of exporting a dependent struct, so
-the `macro_run` writer has to run last to win. `scripts/quality.sh` runs both in
-that order, then verifies `bindings/` is unchanged.
-
-See `src/lib.rs` for the macro's full documentation and path-anchoring details.
+`#[serde(rename_all)]` / per-field/variant `#[serde(rename)]` are honored for the
+wire values (and, for `TsParamHelp`, for the map keys). See `src/lib.rs` for the
+full doc comments and `DESIGN.md` for the why.

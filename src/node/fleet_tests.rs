@@ -95,7 +95,9 @@ async fn chat_relays_to_routed_worker() {
         got
     });
     let final_res = fut.await.unwrap();
-    assert_eq!(collector.await.unwrap(), vec!["he", "llo"]);
+    // The delta queue merges same-kind runs the collector hasn't drained yet,
+    // so the PARTITION is timing-dependent — the concatenation is the contract.
+    assert_eq!(collector.await.unwrap().concat(), "hello");
     assert_eq!(final_res["content"], "hello");
 }
 

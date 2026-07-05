@@ -212,3 +212,23 @@ fn save_then_load_roundtrips() {
         .unwrap()
         .is_empty());
 }
+
+/// G4 redaction: `{:?}` on a stored key must show only the short digest
+/// prefix — never the full digest (a stable key identifier that has no
+/// business in logs or panic messages).
+#[test]
+fn debug_output_redacts_the_digest() {
+    let mut keys = ApiKeys::default();
+    keys.add("hgk_deadbeef", "ci".into(), vec![Scope::Chat]);
+    let key = keys.iter().next().unwrap();
+    let dbg = format!("{key:?}");
+    assert!(dbg.contains("ci"), "label shown: {dbg}");
+    assert!(
+        !dbg.contains(&key.sha256),
+        "full digest must not appear in Debug: {dbg}"
+    );
+    assert!(
+        dbg.contains(key.sha256_prefix()),
+        "digest prefix identifies the key: {dbg}"
+    );
+}

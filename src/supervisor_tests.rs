@@ -260,10 +260,11 @@ async fn chat_chunks_routed() {
     }
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
 
-    for expected in &deltas {
-        let got = rx.try_recv().expect("delta expected");
-        assert_eq!(got, content_delta(expected));
-    }
+    // Buffered same-kind deltas merge in the keyed sink (merging delta
+    // queue), so all three arrive as ONE run with text in order.
+    let got = rx.try_recv().expect("delta expected");
+    assert_eq!(got, content_delta("hello world!"));
+    assert!(rx.try_recv().is_none(), "single merged run expected");
 
     sup.remove_chat_sink(42);
 }
@@ -288,19 +289,16 @@ async fn two_keyed_sinks_route_independently() {
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    // rx1 must only see deltas tagged request_id=1.
-    let r1_a = rx1.try_recv().expect("rx1 first chunk");
-    let r1_b = rx1.try_recv().expect("rx1 second chunk");
-    assert_eq!(r1_a, content_delta("beta"));
-    assert_eq!(r1_b, content_delta("delta"));
-    assert!(rx1.try_recv().is_err(), "rx1 must have no more chunks");
+    // rx1 must only see deltas tagged request_id=1 — merged into one run
+    // (buffered same-kind deltas coalesce in the keyed sink).
+    let r1 = rx1.try_recv().expect("rx1 merged run");
+    assert_eq!(r1, content_delta("betadelta"));
+    assert!(rx1.try_recv().is_none(), "rx1 must have no more chunks");
 
-    // rx2 must only see deltas tagged request_id=2.
-    let r2_a = rx2.try_recv().expect("rx2 first chunk");
-    let r2_b = rx2.try_recv().expect("rx2 second chunk");
-    assert_eq!(r2_a, content_delta("alpha"));
-    assert_eq!(r2_b, content_delta("gamma"));
-    assert!(rx2.try_recv().is_err(), "rx2 must have no more chunks");
+    // rx2 must only see deltas tagged request_id=2 — merged into one run.
+    let r2 = rx2.try_recv().expect("rx2 merged run");
+    assert_eq!(r2, content_delta("alphagamma"));
+    assert!(rx2.try_recv().is_none(), "rx2 must have no more chunks");
 
     sup.remove_chat_sink(1);
     sup.remove_chat_sink(2);
@@ -692,7 +690,7 @@ async fn route_notification_ignores_malformed() {
 
     // None of the above delivered anything to the sink.
     assert!(
-        rx.try_recv().is_err(),
+        rx.try_recv().is_none(),
         "malformed notifications deliver nothing"
     );
 
