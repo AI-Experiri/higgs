@@ -4,6 +4,7 @@ import type { HiggsModelSource } from "./HiggsModelSource";
 import type { LoadParams } from "./LoadParams";
 import type { ModelFit } from "./ModelFit";
 import type { ModelReadiness } from "./ModelReadiness";
+import type { TuneProvenance } from "./TuneProvenance";
 
 /**
  * Per-model entry in `GET /api/higgs/models`: enriches [`HiggsModel`] with
@@ -57,6 +58,18 @@ readiness: ModelReadiness,
  * the needed-vs-free gap. `None` for the other states.
  */
 fit?: ModelFit, 
+/**
+ * How the saved tune profile was produced — `Heuristic` (analytical),
+ * `Card` (model-card sampling), or `Bench` (turbotune-measured). `None`
+ * when the model has no tune record yet.
+ */
+tune_provenance?: TuneProvenance, 
+/**
+ * Measured decode throughput (tokens/sec) from the winning turbotune
+ * candidate. `Some` only for a `Bench` profile — cleared whenever the
+ * profile's params change.
+ */
+bench_tps?: number, 
 /**
  * HuggingFace repo id, `org/model` — the identity used everywhere.
  * Ollama-sourced models keep their established Ollama name (`ollama/{name}:{tag}`);

@@ -54,6 +54,54 @@ fn gate2_sniffs_tool_call_template() {
     assert!(!super::tool_calls_supported(&model_with_template(None)));
 }
 
+// ── model_entry carries the tune provenance + measured tok/s ─────────────
+
+/// The models list is the frontend's ONE source for the Tuned/Benchmarked
+/// badge: `model_entry` must copy `provenance` + `bench_tps` from the tune
+/// record, and leave both absent when the model has no record.
+#[test]
+fn model_entry_carries_tune_provenance_and_bench_tps() {
+    let model = model_with_template(None);
+    let rec = crate::tune::store::TuneRecord {
+        profile: Default::default(),
+        sampling: Default::default(),
+        budget: Default::default(),
+        provenance: crate::tune::TuneProvenance::Bench,
+        bench_tps: Some(42.5),
+        tuned_at_ms: 1,
+        hw_fingerprint: String::new(),
+        model_file_sig: String::new(),
+    };
+    let entry = super::model_entry(
+        model.clone(),
+        &[],
+        None,
+        crate::serve::readiness::ModelReadiness::Discovered,
+        None,
+        Some(&rec),
+    );
+    assert_eq!(
+        entry.tune_provenance,
+        Some(crate::tune::TuneProvenance::Bench)
+    );
+    assert_eq!(entry.bench_tps, Some(42.5));
+
+    // No record → both fields absent (and absent from the JSON wire).
+    let entry = super::model_entry(
+        model,
+        &[],
+        None,
+        crate::serve::readiness::ModelReadiness::Discovered,
+        None,
+        None,
+    );
+    assert_eq!(entry.tune_provenance, None);
+    assert_eq!(entry.bench_tps, None);
+    let json = serde_json::to_value(&entry).unwrap();
+    assert!(json.get("tune_provenance").is_none());
+    assert!(json.get("bench_tps").is_none());
+}
+
 // ── Test 6: control load + unload roundtrip ──────────────────────────────
 
 #[tokio::test]

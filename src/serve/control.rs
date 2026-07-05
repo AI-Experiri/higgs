@@ -116,6 +116,7 @@ fn model_entry(
     last_load: Option<LoadParams>,
     readiness: crate::serve::readiness::ModelReadiness,
     fit: Option<crate::serve::wire::ModelFit>,
+    tune: Option<&crate::tune::store::TuneRecord>,
 ) -> HiggsModelEntry {
     // Multi-model: this model is "loaded" if it is among the resident ids, not only
     // when it is the primary.
@@ -140,6 +141,8 @@ fn model_entry(
         last_load,
         readiness,
         fit,
+        tune_provenance: tune.map(|t| t.provenance),
+        bench_tps: tune.and_then(|t| t.bench_tps),
         model,
     }
 }
@@ -173,7 +176,8 @@ pub(super) async fn control_models(State(higgs): State<Arc<Higgs>>) -> Response 
     for m in models {
         let last_load = records.get(&m.id).and_then(|r| r.load.clone());
         let (readiness, fit) = higgs.model_readiness(&m, &loaded_set, &hw, &tuning);
-        entries.push(model_entry(m, &loaded_set, last_load, readiness, fit));
+        let tune = tuning.get(&m.id);
+        entries.push(model_entry(m, &loaded_set, last_load, readiness, fit, tune));
     }
     Json(HiggsModelsResponse {
         models: entries,
@@ -206,7 +210,16 @@ pub(super) async fn control_model_by_id(
                 Err(err) => return control_error(&err).into_response(),
             };
             let (readiness, fit) = higgs.model_readiness(&model, &loaded_set, &hw, &tuning);
-            Json(model_entry(model, &loaded_set, last_load, readiness, fit)).into_response()
+            let tune = tuning.get(&model.id);
+            Json(model_entry(
+                model,
+                &loaded_set,
+                last_load,
+                readiness,
+                fit,
+                tune,
+            ))
+            .into_response()
         }
         None => {
             let err = HiggsError::ModelNotFound { id };

@@ -159,6 +159,18 @@ higgs_ts! {
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         pub fit: Option<ModelFit>,
+        /// How the saved tune profile was produced — `Heuristic` (analytical),
+        /// `Card` (model-card sampling), or `Bench` (turbotune-measured). `None`
+        /// when the model has no tune record yet.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub tune_provenance: Option<crate::tune::TuneProvenance>,
+        /// Measured decode throughput (tokens/sec) from the winning turbotune
+        /// candidate. `Some` only for a `Bench` profile — cleared whenever the
+        /// profile's params change.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub bench_tps: Option<f32>,
     }
 }
 
