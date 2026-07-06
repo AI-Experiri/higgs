@@ -1011,6 +1011,7 @@ async fn tune_derives_and_persists_profile() {
             id: id.clone(),
             mode: None, // Suggest (default)
             budget: None,
+            pins: None,
         })
         .await
         .expect("tune suggests");
@@ -1043,6 +1044,7 @@ async fn tune_benchmark_mode_falls_back_to_suggest() {
             id: id.clone(),
             mode: Some(TuneMode::Benchmark),
             budget: None,
+            pins: None,
         })
         .await
         .expect("benchmark tune falls back to suggest");
@@ -1063,6 +1065,7 @@ async fn tune_unknown_model_not_found() {
             id: "org/absent".to_owned(),
             mode: None,
             budget: None,
+            pins: None,
         })
         .await
         .expect_err("unknown model → ModelNotFound");
@@ -1412,7 +1415,7 @@ fn bench(tps: f32) -> crate::tune::BenchResult {
 async fn benchmark_picks_the_fastest_candidate() {
     let cands = vec![cand("a"), cand("b"), cand("c")];
     let tps = std::cell::RefCell::new(vec![10.0f32, 25.0, 18.0].into_iter());
-    let (winner, result) = run_benchmark(
+    let (benchmarked, result) = run_benchmark(
         cands,
         |_c| {
             let v = tps.borrow_mut().next().unwrap();
@@ -1421,8 +1424,8 @@ async fn benchmark_picks_the_fastest_candidate() {
         || false,
     )
     .await
-    .expect("a winner");
-    assert_eq!(winner.label, "b", "b has the highest tps");
+    .expect("a benchmarked config");
+    assert_eq!(benchmarked.label, "b", "b has the highest tps");
     assert_eq!(result.gen_tps, 25.0);
 }
 
@@ -1431,7 +1434,7 @@ async fn benchmark_picks_the_fastest_candidate() {
 async fn benchmark_skips_failed_candidates() {
     let cands = vec![cand("bad"), cand("good")];
     let n = std::cell::Cell::new(0);
-    let (winner, _) = run_benchmark(
+    let (benchmarked, _) = run_benchmark(
         cands,
         |_c| {
             let i = n.get();
@@ -1451,7 +1454,7 @@ async fn benchmark_skips_failed_candidates() {
     )
     .await
     .expect("the good one wins");
-    assert_eq!(winner.label, "good");
+    assert_eq!(benchmarked.label, "good");
 }
 
 /// Every candidate failing yields the aggregate [HG063] with each named.
@@ -1554,6 +1557,7 @@ async fn benchmark_does_not_write_config_load_records() {
             id: id.clone(),
             mode: Some(TuneMode::Benchmark),
             budget: None,
+            pins: None,
         })
         .await
         .expect("benchmark");
@@ -1584,6 +1588,7 @@ async fn benchmark_refuses_a_loaded_model() {
             id: id.clone(),
             mode: Some(TuneMode::Benchmark),
             budget: None,
+            pins: None,
         })
         .await
         .expect_err("benchmark must refuse a loaded model");
@@ -1686,6 +1691,7 @@ async fn benchmark_refuses_while_already_benchmarking() {
             id: id.clone(),
             mode: Some(TuneMode::Benchmark),
             budget: None,
+            pins: None,
         })
         .await
         .expect_err("a second concurrent benchmark must refuse");
@@ -1789,6 +1795,7 @@ async fn benchmark_cancels_on_shutdown() {
             id,
             mode: Some(TuneMode::Benchmark),
             budget: None,
+            pins: None,
         })
         .await
         .expect_err("a benchmark racing shutdown must cancel");
@@ -1821,6 +1828,7 @@ async fn tune_benchmark_measures_and_persists_bench_profile() {
             id: id.clone(),
             mode: Some(TuneMode::Benchmark),
             budget: None,
+            pins: None,
         })
         .await
         .expect("turbotune benchmark measures a config");
@@ -1849,7 +1857,7 @@ async fn tune_benchmark_measures_and_persists_bench_profile() {
     assert_eq!(
         rec.provenance,
         crate::tune::TuneProvenance::Bench,
-        "the saved profile is the measured winner"
+        "the saved profile is the measured benchmarked config"
     );
     let tps = rec
         .bench_tps
@@ -1857,6 +1865,70 @@ async fn tune_benchmark_measures_and_persists_bench_profile() {
     assert!(
         tps > 0.0,
         "measured a positive generation throughput: {tps}"
+    );
+}
+
+/// Request pins actually reach the benchmark: a `ctx_len` pinned on the
+/// `TuneRequest` must be carried by the measured benchmarked config AND the persisted
+/// profile. Fail-on-revert for the request-to-bench plumbing in `tune()`
+/// (`let pins = req.pins...` feeding `turbotune_bench`): reverting it to
+/// `TunePins::default()` (or dropping the arg) makes the persisted ctx fall
+/// back to the analytical suggestion — 4242 is not a value the suggester
+/// derives.
+#[tokio::test]
+async fn tune_benchmark_honors_request_pins_end_to_end() {
+    use crate::worker::engine::CtxLen;
+    let dir = tempfile::TempDir::new().unwrap();
+    let id = stage_ollama_model(dir.path(), "tiny", "1b");
+    let higgs = fake_higgs_ollama(vec![dir.path().to_path_buf()]);
+
+    let suggestion = higgs
+        .tune(TuneRequest {
+            id: id.clone(),
+            mode: Some(TuneMode::Benchmark),
+            budget: None,
+            pins: Some(crate::tune::TunePins {
+                ctx_len: Some(CtxLen::Fixed { n: 4242 }),
+                ..crate::tune::TunePins::default()
+            }),
+        })
+        .await
+        .expect("pinned turbotune benchmark succeeds");
+
+    assert_eq!(
+        suggestion.load.as_llamacpp().ctx_len,
+        CtxLen::Fixed { n: 4242 },
+        "the measured benchmarked config carries the pinned ctx_len"
+    );
+    // The rationale must describe the MEASURED WINNER, not the analytical seed:
+    // no "context N" line may contradict the pinned/saved 4242 (P5). The seed's
+    // analytical context (budget-derived, never 4242) would surface here if the
+    // benchmark still appended to — rather than replaced — the seed's rationale.
+    let ctx_lines: Vec<&String> = suggestion
+        .rationale
+        .iter()
+        .filter(|l| l.starts_with("context "))
+        .collect();
+    assert!(
+        !ctx_lines.is_empty(),
+        "the benchmark rationale narrates the benchmarked's context: {:?}",
+        suggestion.rationale
+    );
+    for l in &ctx_lines {
+        assert!(
+            l.contains("4242"),
+            "no rationale context line may contradict the pinned benchmarked: {l:?}"
+        );
+    }
+    let rec = higgs
+        .models_store()
+        .expect("models store opens")
+        .tuning(&id)
+        .expect("pinned bench profile persisted");
+    assert_eq!(
+        rec.profile.as_llamacpp().ctx_len,
+        CtxLen::Fixed { n: 4242 },
+        "the persisted profile carries the pinned ctx_len"
     );
 }
 
@@ -2216,6 +2288,132 @@ async fn rejected_key_mutation_does_not_write_the_keystore() {
     }
 }
 
+/// `touch_api_key`'s throttle authority is the IN-MEMORY map, not the stored
+/// `last_used_ms`. Fail-on-revert for round-1 finding: pre-seeding the in-memory
+/// throttle with a fresh stamp must suppress the live-store update even though
+/// the stored `last_used_ms` is still `None`. The old code read the stored
+/// value, so a null stamp was never "fresh" and every request re-ran the
+/// update — defeating the throttle exactly in the always-null case.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // TEST_ENV_LOCK spans the test (serializes HIGGS_HOME)
+async fn touch_throttle_is_the_in_memory_map_not_the_persisted_stamp() {
+    let _env = crate::TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let home = tempfile::tempdir().unwrap();
+    let prev = std::env::var_os("HIGGS_HOME");
+    // SAFETY: serialized by TEST_ENV_LOCK; restored below.
+    unsafe { std::env::set_var("HIGGS_HOME", home.path()) };
+
+    let higgs = fake_higgs(vec![]);
+    let mut ks = crate::keys::ApiKeys::default();
+    let sha = ks.add(
+        &crate::keys::mint_token([7u8; 16]),
+        "laptop".into(),
+        vec![crate::keys::Scope::Chat],
+    );
+    higgs.set_api_keys(std::sync::Arc::new(ks));
+    // Never used yet: the persisted stamp is None.
+    assert_eq!(higgs.api_keys().iter().next().unwrap().last_used_ms, None);
+
+    // Pre-seed the in-memory throttle with a FRESH stamp; the persisted
+    // last_used_ms stays None. A touch must be throttled by the map.
+    higgs
+        .key_touch_throttle
+        .lock()
+        .insert(sha.clone(), now_unix_ms());
+    higgs.touch_api_key(&sha);
+
+    assert_eq!(
+        higgs.api_keys().iter().next().unwrap().last_used_ms,
+        None,
+        "a fresh in-memory throttle stamp must suppress the live-store update even with a null last_used_ms"
+    );
+
+    // SAFETY: serialized by TEST_ENV_LOCK.
+    unsafe {
+        match prev {
+            Some(v) => std::env::set_var("HIGGS_HOME", v),
+            None => std::env::remove_var("HIGGS_HOME"),
+        }
+    }
+}
+
+/// `touch_api_key` updates last-used IN MEMORY ONLY and must never rewrite
+/// `api_keys.json`. Fail-on-revert for round-2 finding: the `higgs keys add`
+/// CLI writes the keystore directly (blessing a deferred restart), so a
+/// touch-driven full-file rewrite from the live store — which never learned of
+/// the CLI key — would silently ERASE it from disk before the operator's
+/// restart. Here a key added out-of-band to the file survives a touch; the old
+/// `mutate_api_keys(|ks| ks.touch(...))` persist deletes it.
+///
+/// (Not cleanly reachable over HTTP: the 60s per-key touch throttle means the
+/// only live-store key is already touched during spawn readiness, so no
+/// touch-save fires within a test window without a forbidden test-only knob.
+/// A unit call on a fresh throttle exercises the exact persist decision.)
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // TEST_ENV_LOCK spans the test (serializes HIGGS_HOME)
+async fn touch_never_rewrites_the_keystore_file() {
+    let _env = crate::TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let home = tempfile::tempdir().unwrap();
+    let prev = std::env::var_os("HIGGS_HOME");
+    // SAFETY: serialized by TEST_ENV_LOCK; restored below.
+    unsafe { std::env::set_var("HIGGS_HOME", home.path()) };
+    let keystore = home.path().join("api_keys.json");
+
+    // Live store (as loaded at boot) holds only the admin key; the file matches.
+    let mut live = crate::keys::ApiKeys::default();
+    let sha = live.add(
+        &crate::keys::mint_token([1u8; 16]),
+        "admin".into(),
+        vec![crate::keys::Scope::Admin],
+    );
+    live.save(&keystore).expect("seed keystore");
+    let higgs = fake_higgs(vec![]);
+    higgs.set_api_keys(std::sync::Arc::new(live));
+
+    // Out-of-band: `higgs keys add laptop2` writes the FILE directly — the live
+    // store does NOT know this key.
+    let mut disk = crate::keys::ApiKeys::load(&keystore).unwrap();
+    disk.add(
+        &crate::keys::mint_token([2u8; 16]),
+        "laptop2".into(),
+        vec![crate::keys::Scope::Chat],
+    );
+    disk.save(&keystore).unwrap();
+
+    // A touch on a FRESH throttle fires the persist decision.
+    higgs.touch_api_key(&sha);
+
+    // In-memory: admin's last-used advanced (visible to GET /keys).
+    assert!(
+        higgs
+            .api_keys()
+            .iter()
+            .find(|k| k.sha256 == sha)
+            .and_then(|k| k.last_used_ms)
+            .is_some(),
+        "touch stamps last-used on the live store"
+    );
+    // On disk: laptop2 MUST survive — a touch never rewrites the file.
+    let on_disk = crate::keys::ApiKeys::load(&keystore).unwrap();
+    assert!(
+        on_disk.iter().any(|k| k.label == "laptop2"),
+        "touch must not erase an out-of-band key; on-disk labels: {:?}",
+        on_disk.iter().map(|k| &k.label).collect::<Vec<_>>()
+    );
+
+    // SAFETY: serialized by TEST_ENV_LOCK.
+    unsafe {
+        match prev {
+            Some(v) => std::env::set_var("HIGGS_HOME", v),
+            None => std::env::remove_var("HIGGS_HOME"),
+        }
+    }
+}
+
 /// PUBLIC `chat_stream` must SKIP a locally-resident worker whose model is being
 /// benchmarked — it is a transient Turbotune candidate (the serve gate routed the
 /// request elsewhere), and the bench unloads it between candidates. With no remote
@@ -2321,7 +2519,7 @@ async fn degraded_reuse_load_persists_the_fitting_profile() {
 /// chats for the admission gate: with the gate saturated by chats on OTHER models, a
 /// public chat refuses (ServerBusy) but the measurement still reaches its candidate —
 /// otherwise gate contention masquerades as an HG065 candidate failure and skews
-/// `pick_winner` (Fable r1). Fail-on-revert: acquire the permit unconditionally in
+/// `pick_benchmarked` (Fable r1). Fail-on-revert: acquire the permit unconditionally in
 /// `chat_stream_inner` and the measurement returns ServerBusy, failing the expect.
 #[tokio::test]
 async fn bench_measurement_bypasses_the_public_admission_gate() {
@@ -2438,7 +2636,7 @@ async fn dropped_benchmark_reclaims_the_live_candidate_worker() {
 /// decode window): an all-zero run must surface as [HG063] BenchExhausted naming
 /// every candidate — never crown the first candidate by ordering and persist a
 /// Bench profile claiming a measurement (Fable r8). Fail-on-revert: accept Ok
-/// results unconditionally in `run_benchmark` and this returns Ok(0.0 winner).
+/// results unconditionally in `run_benchmark` and this returns Ok(0.0 benchmarked).
 #[tokio::test]
 async fn all_zero_measurements_exhaust_the_benchmark() {
     let err = run_benchmark(
@@ -2447,7 +2645,7 @@ async fn all_zero_measurements_exhaust_the_benchmark() {
         || false,
     )
     .await
-    .expect_err("all-zero measurements must exhaust, not crown a winner");
+    .expect_err("all-zero measurements must exhaust, not crown a benchmarked config");
     match err {
         HiggsError::BenchExhausted { detail } => {
             assert!(
@@ -2459,7 +2657,7 @@ async fn all_zero_measurements_exhaust_the_benchmark() {
     }
     // A mixed run still works: the positive measurement wins, zeros are failures.
     let vals = std::cell::RefCell::new(vec![0.0f32, 7.5].into_iter());
-    let (winner, result) = run_benchmark(
+    let (benchmarked, result) = run_benchmark(
         vec![cand("a"), cand("b")],
         |_c| {
             let v = vals.borrow_mut().next().unwrap();
@@ -2469,7 +2667,7 @@ async fn all_zero_measurements_exhaust_the_benchmark() {
     )
     .await
     .expect("the positive candidate wins");
-    assert_eq!(winner.label, "b");
+    assert_eq!(benchmarked.label, "b");
     assert!(result.gen_tps > 7.0);
 }
 
@@ -2492,6 +2690,7 @@ async fn benchmark_candidates_respect_the_ram_budget() {
                 max_ram_bytes: Some(1),
                 ..Default::default()
             }),
+            pins: None,
         })
         .await
         .expect_err("a 1-byte RAM cap must exhaust the candidate set");

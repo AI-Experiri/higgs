@@ -55,6 +55,199 @@ fn gate2_sniffs_tool_call_template() {
 }
 
 // ── model_entry carries the tune provenance + measured tok/s ─────────────
+/// `put_tuning` routes each result into its provenance slot while keeping the
+/// ACTIVE record, and `TuneProfileViews::from_triple` grandfathers a
+/// pre-dual-slot store (lone active record serves its own provenance's set).
+/// Fail-on-revert: dropping the history-slot routing in `put_tuning` loses the
+/// "Tuned" set the moment a turbotune becomes active.
+#[test]
+fn dual_profiles_offer_both_tuned_and_benchmarked_sets() {
+    use crate::tune::store::{JsonModelStore, TuneRecord};
+    use crate::worker::engine::CtxLen;
+    let dir = tempfile::tempdir().unwrap();
+    let store = JsonModelStore::open(dir.path()).unwrap();
+    let rec = |ctx: u32, prov: crate::tune::TuneProvenance| TuneRecord {
+        profile: crate::worker::engine::LoadParams::llamacpp(
+            crate::worker::engine::llamacpp::params::LlamaCppParams {
+                ctx_len: CtxLen::Fixed { n: ctx },
+                ..Default::default()
+            },
+        ),
+        sampling: Default::default(),
+        budget: Default::default(),
+        provenance: prov,
+        bench_tps: (prov == crate::tune::TuneProvenance::Bench).then_some(33.0),
+        tuned_at_ms: 1,
+        hw_fingerprint: String::new(),
+        model_file_sig: String::new(),
+    };
+    // Analytical first, then a turbotune becomes ACTIVE — both sets must remain.
+    store.put_tuning("m", rec(1111, crate::tune::TuneProvenance::Heuristic));
+    store.put_tuning("m", rec(2222, crate::tune::TuneProvenance::Bench));
+    let (active, analytical, bench) = store.tuning_profiles("m");
+    assert_eq!(
+        active.as_ref().map(|r| r.provenance),
+        Some(crate::tune::TuneProvenance::Bench),
+        "the last tune is the active profile"
+    );
+    assert_eq!(
+        analytical.map(|r| r.profile.as_llamacpp().ctx_len),
+        Some(CtxLen::Fixed { n: 1111 }),
+        "the analytical set survives a later turbotune"
+    );
+    assert_eq!(
+        bench.map(|r| r.profile.as_llamacpp().ctx_len),
+        Some(CtxLen::Fixed { n: 2222 })
+    );
+
+    // Pre-dual-store fallback: a lone ACTIVE analytical record serves the
+    // Tuned set (and not the Benchmarked one).
+    let lone = (
+        Some(rec(3333, crate::tune::TuneProvenance::Heuristic)),
+        None,
+        None,
+    );
+    let views = super::TuneProfileViews::from_triple(Some(&lone));
+    assert!(views.analytical.is_some() && views.bench.is_none());
+}
+
+/// Regression (dual-profile finding): after a turbotune, a later BARE LOAD with
+/// edited params demotes the ACTIVE record to a bare-load `Heuristic` via
+/// `set_profile` — but that manual record was never an analytical tune. The
+/// `tuned_load` ("last ANALYTICAL tune") set must stay ABSENT, not be fabricated
+/// from the demoted active record; grandfathering runs only for a true pre-dual
+/// store (BOTH history slots empty).
+/// Fail-on-revert: restoring the unconditional `analytical.or(Some(active))`
+/// grandfather surfaces the manual bare-load params as the Tuned set.
+#[test]
+fn bare_load_after_turbotune_does_not_fabricate_a_tuned_set() {
+    use crate::tune::store::{JsonModelStore, TuneRecord};
+    use crate::worker::engine::llamacpp::params::LlamaCppParams;
+    use crate::worker::engine::{CtxLen, LoadParams};
+    let dir = tempfile::tempdir().unwrap();
+    let store = JsonModelStore::open(dir.path()).unwrap();
+    // 1) Turbotune wins → active=Bench, bench slot filled, analytical slot empty.
+    store.put_tuning(
+        "m",
+        TuneRecord {
+            profile: LoadParams::llamacpp(LlamaCppParams {
+                ctx_len: CtxLen::Fixed { n: 2222 },
+                ..Default::default()
+            }),
+            sampling: Default::default(),
+            budget: Default::default(),
+            provenance: crate::tune::TuneProvenance::Bench,
+            bench_tps: Some(41.0),
+            tuned_at_ms: 1,
+            hw_fingerprint: String::new(),
+            model_file_sig: String::new(),
+        },
+    );
+    // 2) A manual reload with DIFFERENT params → set_profile demotes the active
+    //    record to a bare-load Heuristic (provenance + bench_tps dropped); the
+    //    bench history slot is untouched.
+    store.set_profile(
+        "m",
+        LoadParams::llamacpp(LlamaCppParams {
+            ctx_len: CtxLen::Fixed { n: 9999 },
+            ..Default::default()
+        }),
+        "",
+        "",
+        2,
+    );
+
+    let triple = store.tuning_profiles("m");
+    let views = super::TuneProfileViews::from_triple(Some(&triple));
+    // The Benchmarked set survives; the Tuned set is ABSENT (no analytical tune
+    // ever ran — the demoted active record must NOT masquerade as one).
+    assert!(
+        views.bench.is_some(),
+        "the benchmarked set survives the bare load"
+    );
+    assert!(
+        views.analytical.is_none(),
+        "a bare-load-demoted active record must not be served as the Tuned set"
+    );
+    // Guard the scenario's premise: the active record really did become a
+    // bare-load Heuristic carrying the manual params.
+    assert_eq!(
+        views.active.map(|r| r.provenance),
+        Some(crate::tune::TuneProvenance::Heuristic)
+    );
+    assert_eq!(
+        views.active.map(|r| r.profile.as_llamacpp().ctx_len),
+        Some(CtxLen::Fixed { n: 9999 })
+    );
+}
+
+/// The models list derives the ACTIVE-record map (readiness input) from the SAME
+/// `tuning_profiles()` triples that fill the wire's `tuned_load`/`benched_load` —
+/// one `models.json` snapshot, so readiness can't disagree with the profile
+/// fields under a concurrent tune. `active_records` must extract exactly each
+/// triple's active (`.0`) record and skip entries whose active slot is empty.
+/// Fail-on-revert: extracting a history slot (or not skipping a None active)
+/// makes readiness read a record the wire fields never expose.
+#[test]
+fn active_records_extracts_only_the_active_slot_per_model() {
+    use crate::tune::store::TuneRecord;
+    use crate::worker::engine::llamacpp::params::LlamaCppParams;
+    use crate::worker::engine::{CtxLen, LoadParams};
+    let rec = |ctx: u32, prov: crate::tune::TuneProvenance| TuneRecord {
+        profile: LoadParams::llamacpp(LlamaCppParams {
+            ctx_len: CtxLen::Fixed { n: ctx },
+            ..Default::default()
+        }),
+        sampling: Default::default(),
+        budget: Default::default(),
+        provenance: prov,
+        bench_tps: None,
+        tuned_at_ms: 1,
+        hw_fingerprint: String::new(),
+        model_file_sig: String::new(),
+    };
+    let mut profiles = std::collections::BTreeMap::new();
+    // "a": active Bench + a bench history slot → active_records takes the ACTIVE.
+    profiles.insert(
+        "a".to_string(),
+        (
+            Some(rec(2222, crate::tune::TuneProvenance::Bench)),
+            None,
+            Some(rec(2222, crate::tune::TuneProvenance::Bench)),
+        ),
+    );
+    // "b": NO active record (only a history slot) → must be skipped entirely.
+    profiles.insert(
+        "b".to_string(),
+        (
+            None,
+            Some(rec(1111, crate::tune::TuneProvenance::Heuristic)),
+            None,
+        ),
+    );
+    // "c": lone active Heuristic → taken.
+    profiles.insert(
+        "c".to_string(),
+        (
+            Some(rec(3333, crate::tune::TuneProvenance::Heuristic)),
+            None,
+            None,
+        ),
+    );
+
+    let active = super::active_records(&profiles);
+    assert_eq!(active.len(), 2, "only models with an active record appear");
+    assert_eq!(
+        active.get("a").map(|r| r.profile.as_llamacpp().ctx_len),
+        Some(CtxLen::Fixed { n: 2222 }),
+        "the ACTIVE record is taken, not a history slot"
+    );
+    assert!(!active.contains_key("b"), "a None active slot is skipped");
+    assert_eq!(
+        active.get("c").map(|r| r.profile.as_llamacpp().ctx_len),
+        Some(CtxLen::Fixed { n: 3333 })
+    );
+}
 
 /// The models list is the frontend's ONE source for the Tuned/Benchmarked
 /// badge: `model_entry` must copy `provenance` + `bench_tps` from the tune
@@ -72,31 +265,45 @@ fn model_entry_carries_tune_provenance_and_bench_tps() {
         hw_fingerprint: String::new(),
         model_file_sig: String::new(),
     };
+    // Active = the bench record; no separate analytical slot (pre-dual store) —
+    // the views borrow the active record for the bench side.
+    let triple = (Some(rec.clone()), None, Some(rec.clone()));
     let entry = super::model_entry(
         model.clone(),
         &[],
         None,
         crate::serve::readiness::ModelReadiness::Discovered,
         None,
-        Some(&rec),
+        super::TuneProfileViews::from_triple(Some(&triple)),
     );
     assert_eq!(
         entry.tune_provenance,
         Some(crate::tune::TuneProvenance::Bench)
     );
     assert_eq!(entry.bench_tps, Some(42.5));
+    assert_eq!(
+        entry.benched_load.as_ref().map(|p| p.as_llamacpp().clone()),
+        Some(rec.profile.as_llamacpp().clone()),
+        "a Bench record serves the Benchmarked set (both panes seed from the wire)"
+    );
+    assert!(
+        entry.tuned_load.is_none(),
+        "no analytical record → no Tuned set"
+    );
 
-    // No record → both fields absent (and absent from the JSON wire).
+    // No record → all tune fields absent (and absent from the JSON wire).
     let entry = super::model_entry(
         model,
         &[],
         None,
         crate::serve::readiness::ModelReadiness::Discovered,
         None,
-        None,
+        super::TuneProfileViews::from_triple(None),
     );
     assert_eq!(entry.tune_provenance, None);
     assert_eq!(entry.bench_tps, None);
+    assert!(entry.tuned_load.is_none());
+    assert!(entry.benched_load.is_none());
     let json = serde_json::to_value(&entry).unwrap();
     assert!(json.get("tune_provenance").is_none());
     assert!(json.get("bench_tps").is_none());

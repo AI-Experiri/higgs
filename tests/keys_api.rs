@@ -283,3 +283,53 @@ async fn keyed_lan_bind_accepts_lan_host_headers() {
         .expect("revoke rotated-out key");
     assert!(r.status().is_success(), "not-last revoke proceeds on LAN");
 }
+
+/// The auth middleware stamps `last_used_ms` on the key that authorized a
+/// request, and mint stamps `created_at_ms`. Fail-on-revert for the
+/// `auth_guard` → `touch_api_key` wiring: dropping the touch call leaves
+/// `last_used_ms` null forever, even after many authorized requests.
+///
+/// (Every `/api/higgs/keys` GET is itself an authorized request that stamps
+/// last-used before its handler reads the store, so a "never used" state
+/// isn't observable through an authed endpoint — we assert the stamp is
+/// PRESENT after auth, which the wiring provides and reverting it removes.)
+#[tokio::test]
+async fn authorized_request_stamps_created_and_last_used() {
+    let Some(gguf) = tiny_gguf_path() else {
+        eprintln!("SKIP last_used: tiny gguf not found (set HIGGS_TEST_GGUF)");
+        return;
+    };
+    let (srv, token) = spawn_lan_keyed(13470, &gguf).await;
+    let c = reqwest::Client::new();
+    let keys_url = format!("{}/api/higgs/keys", srv.base);
+
+    // A couple of authorized requests to exercise the touch path.
+    for _ in 0..2 {
+        let r = c
+            .get(format!("{}/api/higgs/status", srv.base))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .expect("authorized status");
+        assert!(r.status().is_success());
+    }
+
+    let list: serde_json::Value = c
+        .get(&keys_url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("list")
+        .json()
+        .await
+        .expect("json");
+    let entry = &list["keys"][0];
+    assert!(
+        entry["created_at_ms"].as_u64().unwrap_or(0) > 0,
+        "mint must stamp created_at_ms, got {entry}"
+    );
+    assert!(
+        entry["last_used_ms"].as_u64().unwrap_or(0) > 0,
+        "an authorized request must stamp last_used_ms, got {entry}"
+    );
+}

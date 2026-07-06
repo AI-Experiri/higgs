@@ -73,6 +73,110 @@ fn resolve_estimate_ctx_caps_auto_at_default() {
 }
 
 #[test]
+fn bench_fit_estimates_pinned_auto_ctx_at_the_node_cap_not_full_ctx_train() {
+    // A long-context model: trained window (1M) is far above the node's auto cap.
+    let meta = ModelMeta {
+        id: "org/long".into(),
+        size_bytes: 2u64 << 30,
+        block_count: Some(32),
+        head_count: Some(32),
+        head_count_kv: Some(8),
+        embedding_length: Some(4096),
+        expert_count: Some(0),
+        ctx_train: Some(1_048_576),
+        ..Default::default()
+    };
+    // Pin the context to Auto (representable on the wire) with full GPU offload.
+    let auto = LlamaCppParams {
+        ctx_len: CtxLen::Auto,
+        gpu_layers: GpuLayers::All,
+        type_k: Some(KvCacheKind::F16),
+        type_v: Some(KvCacheKind::F16),
+        ..Default::default()
+    };
+    let hw = hw_gpu(48u64 << 30);
+    // A 12 GiB VRAM cap: it holds the 2 GiB weights + KV at the 32k node cap
+    // (~4 GiB), but NOT KV at the full 1M trained window (~137 GiB).
+    let budget = ResourceBudget {
+        max_vram_bytes: Some(12u64 << 30),
+        ..Default::default()
+    };
+
+    // The benchmark fit must NOT reject the candidate: it is estimated against the
+    // node-capped window it will actually load at, not the full ctx_train.
+    let fit = bench_fit(&auto, &meta, &hw, &budget);
+    assert_ne!(
+        fit.verdict,
+        FitVerdict::Overflow,
+        "pinned Auto ctx judged at the node cap, not full ctx_train: {fit:?}"
+    );
+    // And it matches an EXPLICIT Fixed request at the same node cap — the two
+    // resolve to the identical estimated window.
+    let capped = LlamaCppParams {
+        ctx_len: CtxLen::Fixed {
+            n: crate::api::DEFAULT_CTX_CAP,
+        },
+        ..auto.clone()
+    };
+    assert_eq!(
+        bench_fit(&auto, &meta, &hw, &budget).verdict,
+        bench_fit(&capped, &meta, &hw, &budget).verdict,
+        "Auto and Fixed(cap) are the same fit"
+    );
+}
+
+#[test]
+fn benchmarked_fit_reports_normalize_auto_ctx_like_bench_fit() {
+    // Same long-context setup as the bench_fit filter test: the RESPONSE recompute
+    // of the benchmarked's fit must ALSO cap an Auto ctx at the node window, so a
+    // ctx=Auto benchmarked that passed the filter and loaded isn't reported as Overflow.
+    let meta = ModelMeta {
+        id: "org/long".into(),
+        size_bytes: 2u64 << 30,
+        block_count: Some(32),
+        head_count: Some(32),
+        head_count_kv: Some(8),
+        embedding_length: Some(4096),
+        expert_count: Some(0),
+        ctx_train: Some(1_048_576),
+        ..Default::default()
+    };
+    let auto_benchmarked = LlamaCppParams {
+        ctx_len: CtxLen::Auto,
+        gpu_layers: GpuLayers::All,
+        type_k: Some(KvCacheKind::F16),
+        type_v: Some(KvCacheKind::F16),
+        ..Default::default()
+    };
+    let hw = hw_gpu(48u64 << 30);
+    let budget = ResourceBudget {
+        max_vram_bytes: Some(12u64 << 30),
+        ..Default::default()
+    };
+
+    let (vram, ram) = benchmarked_fit_reports(&auto_benchmarked, &meta, &hw, &budget);
+    assert_ne!(
+        vram.verdict,
+        FitVerdict::Overflow,
+        "benchmarked VRAM fit judged at the node cap, not full ctx_train: {vram:?}"
+    );
+    assert_ne!(
+        ram.verdict,
+        FitVerdict::Overflow,
+        "benchmarked RAM fit: {ram:?}"
+    );
+    // Identical to the explicit Fixed(cap) benchmarked — the two resolve to one window.
+    let capped = LlamaCppParams {
+        ctx_len: CtxLen::Fixed {
+            n: crate::api::DEFAULT_CTX_CAP,
+        },
+        ..auto_benchmarked.clone()
+    };
+    let (vram_c, _) = benchmarked_fit_reports(&capped, &meta, &hw, &budget);
+    assert_eq!(vram.verdict, vram_c.verdict, "Auto and Fixed(cap) same fit");
+}
+
+#[test]
 fn vram_estimate_uses_gqa_kv_and_tiers() {
     let meta = dense_meta_8gb();
     let load = all_gpu_load();

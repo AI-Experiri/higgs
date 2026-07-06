@@ -59,15 +59,37 @@ readiness: ModelReadiness,
  */
 fit?: ModelFit, 
 /**
- * How the saved tune profile was produced — `Heuristic` (analytical),
- * `Card` (model-card sampling), or `Bench` (turbotune-measured). `None`
- * when the model has no tune record yet.
+ * The last ANALYTICAL tune's load params (the engine-tagged umbrella).
+ * Together with `benched_load` these are the two selectable saved
+ * param sets both load surfaces offer; `tune_provenance` says which
+ * one is the ACTIVE profile (the JIT/readiness default). `None` when
+ * no analytical tune has run.
+ */
+tuned_load?: LoadParams, 
+/**
+ * The last TURBOTUNE (measured benchmark) config's load params — the
+ * "Benchmarked" selectable set; `bench_tps` is its measured decode
+ * throughput. `None` when the model was never benchmarked.
+ */
+benched_load?: LoadParams, 
+/**
+ * How the ACTIVE ("latest") saved tune profile — the JIT/readiness
+ * default — was produced: `Heuristic` (analytical), `Card` (model-card
+ * sampling), or `Bench` (turbotune-measured). Informational about the
+ * active record's origin; NOT a guaranteed selector into `tuned_load` /
+ * `benched_load`, because a bare load with edited params demotes the
+ * active record to a `Heuristic` distinct from both saved sets (its
+ * params ride `last_load`). `None` when the model has no tune record yet.
  */
 tune_provenance?: TuneProvenance, 
 /**
- * Measured decode throughput (tokens/sec) from the winning turbotune
- * candidate. `Some` only for a `Bench` profile — cleared whenever the
- * profile's params change.
+ * Measured decode throughput (tokens/sec) of the `benched_load` set —
+ * the winning turbotune candidate's speed, read from the same saved
+ * benchmark record as `benched_load` (NOT from the active profile, so a
+ * later bare load editing the active params does not disturb it).
+ * Present whenever that record carries a measured throughput; a fresh
+ * turbotune replaces it and `benched_load` together. `None` when the
+ * model was never benchmarked.
  */
 bench_tps?: number, 
 /**

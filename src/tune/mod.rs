@@ -162,10 +162,39 @@ higgs_ts! {
         #[serde(default)]
         #[ts(optional)]
         pub budget: Option<ResourceBudget>,
-        // NOTE: per-field `overrides` (pre-applying user pins during the suggest) are
-        // DEFERRED — the user edits the suggestion in the UI and loads with the full
-        // engine-tagged `params` on the load request (explicit, end-to-end). Re-adding
-        // them needs a proper partial type (all fields `Option`), a later phase.
+        /// BENCHMARK-mode pins: hold these load params fixed while turbotune
+        /// searches the rest. A pinned KV cache type suppresses the KV-quant
+        /// candidate rungs; pinned GPU layers suppress the half-layers rung.
+        /// Ignored in `Suggest` mode (the analytical suggestion stays free —
+        /// the user edits it in the UI and loads with explicit params).
+        #[serde(default)]
+        #[ts(optional)]
+        pub pins: Option<TunePins>,
+    }
+}
+
+higgs_ts! {
+    /// User-pinned load params for a turbotune run — each `Some` value is
+    /// applied to the benchmark seed verbatim and EXCLUDED from the candidate
+    /// search (turbotune measures only the unpinned dimensions).
+    #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+    pub struct TunePins {
+        /// Pin the context window (e.g. `Fixed { n: 16384 }`).
+        #[serde(default)]
+        #[ts(optional)]
+        pub ctx_len: Option<CtxLen>,
+        /// Pin the GPU offload — suppresses the half-layers candidate rung.
+        #[serde(default)]
+        #[ts(optional)]
+        pub gpu_layers: Option<GpuLayers>,
+        /// Pin the K-cache type — suppresses the KV-quant candidate rungs.
+        #[serde(default)]
+        #[ts(optional)]
+        pub type_k: Option<KvCacheKind>,
+        /// Pin the V-cache type — suppresses the KV-quant candidate rungs.
+        #[serde(default)]
+        #[ts(optional)]
+        pub type_v: Option<KvCacheKind>,
     }
 }
 
@@ -444,7 +473,7 @@ where
         let sampling = self.sampling.recommend(meta);
         if sampling != LlamaCppSamplingParams::default() {
             provenance = TuneProvenance::Card;
-            rationale.push("sampling refined from the model card".into());
+            rationale.push(SAMPLING_REFINED_NOTE.to_owned());
         }
 
         // 3. VRAM fit.
@@ -549,6 +578,54 @@ where
 }
 
 /// One-line human note for a fit verdict.
+/// The rationale line noting the model card refined sampling — shared by the
+/// analytical suggest and the benchmark's [`benchmarked_rationale`] so the note reads
+/// identically whichever path produced it.
+pub(crate) const SAMPLING_REFINED_NOTE: &str = "sampling refined from the model card";
+
+/// The rationale for a benchmarked config. It REPLACES the analytical seed's
+/// rationale: the seed's context / GPU-layer / fit lines describe the SEED, and
+/// a benchmark can diverge from it on several dimensions (a pinned context or KV
+/// type, the winning KV-quant rung, a half-offload rung), so keeping those lines
+/// would contradict the benchmarked config actually saved. Narrates the measured
+/// throughput, the benchmarked config's context, and its recomputed fit;
+/// `sampling_refined` re-adds the card-sampling note (a load-only benchmark
+/// leaves sampling unchanged).
+pub(crate) fn benchmarked_rationale(
+    benchmarked: &LlamaCppParams,
+    ctx_train: Option<u64>,
+    vram_fit: FitReport,
+    ram_fit: FitReport,
+    gen_tps: f32,
+    sampling_refined: bool,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if sampling_refined {
+        lines.push(SAMPLING_REFINED_NOTE.to_owned());
+    }
+    lines.push(format!(
+        "Turbotune measured {gen_tps:.1} tok/s — fastest of the benched configs on this hardware"
+    ));
+    lines.push(match benchmarked.ctx_len {
+        CtxLen::Auto => "context: engine default (capped at the node context limit)".to_owned(),
+        // A pin can set a context ABOVE `ctx_train` (the analytical path clamps to
+        // it, but pins are applied verbatim), so distinguish exactly-trained from
+        // beyond-trained — only the former is the "full trained window".
+        CtxLen::Fixed { n } => match ctx_train {
+            Some(t) if u64::from(n) > t => {
+                format!("context {n} — pinned beyond the model's trained window ({t})")
+            }
+            Some(t) if u64::from(n) == t => {
+                format!("context {n} — the model's full trained window")
+            }
+            _ => format!("context {n} — the benchmarked configuration"),
+        },
+    });
+    lines.push(verdict_note("GPU VRAM", vram_fit));
+    lines.push(verdict_note("system RAM", ram_fit));
+    lines
+}
+
 fn verdict_note(label: &str, fit: FitReport) -> String {
     let pct = if fit.budget_bytes > 0 {
         (fit.needed_bytes as f64 / fit.budget_bytes as f64 * 100.0).round() as u64
@@ -578,6 +655,49 @@ fn verdict_note(label: &str, fit: FitReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A benchmark pin can set a context ABOVE the model's trained window (pins
+    /// are applied verbatim; only the analytical path clamps to `ctx_train`), so
+    /// the benchmarked rationale must NOT call an over-trained pin "the full
+    /// trained window" — only an exactly-trained context earns that label.
+    /// Fail-on-revert: collapsing the `> t` and `== t` arms back to `>= t`
+    /// mislabels the 8192-over-4096 pin.
+    #[test]
+    fn benchmarked_rationale_labels_an_over_trained_pin_honestly() {
+        let fit = FitReport {
+            verdict: FitVerdict::Fits,
+            needed_bytes: 1,
+            budget_bytes: 10,
+        };
+        let ctx_line = |n: u32, trained: u64| {
+            let load = LlamaCppParams {
+                ctx_len: CtxLen::Fixed { n },
+                ..Default::default()
+            };
+            benchmarked_rationale(&load, Some(trained), fit, fit, 12.0, false)
+                .into_iter()
+                .find(|l| l.starts_with("context "))
+                .expect("a context rationale line")
+        };
+        // Pinned ABOVE the trained window → NOT "full trained window".
+        let over = ctx_line(8192, 4096);
+        assert!(over.contains("8192"), "{over}");
+        assert!(
+            !over.contains("full trained window"),
+            "an over-trained pin must not be called the full trained window: {over}"
+        );
+        assert!(
+            over.contains("beyond"),
+            "it is labelled as beyond-trained: {over}"
+        );
+        // Pinned EXACTLY at the trained window → that IS the full window.
+        assert!(
+            ctx_line(4096, 4096).contains("full trained window"),
+            "an exactly-trained context is the full window"
+        );
+        // Pinned BELOW → the benchmarked configuration.
+        assert!(ctx_line(2048, 4096).contains("benchmarked configuration"));
+    }
 
     #[test]
     fn budget_default_is_uncapped() {

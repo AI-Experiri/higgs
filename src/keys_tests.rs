@@ -232,3 +232,67 @@ fn debug_output_redacts_the_digest() {
         "digest prefix identifies the key: {dbg}"
     );
 }
+
+// ── Key timestamps + last-used tracking (G4b tokens UI) ──────────────────
+
+/// Mint stamps `created_at_ms` (wall-clock, non-zero) and starts with no
+/// last-used; `touch` records a use and reports whether anything changed.
+#[test]
+fn mint_stamps_created_at_and_touch_records_last_used() {
+    let mut ks = ApiKeys::default();
+    ks.add("hgk_t1", "laptop".into(), vec![Scope::Chat]);
+    let k = ks.iter().next().unwrap();
+    assert!(
+        k.created_at_ms.is_some(),
+        "created_at_ms must be stamped at mint"
+    );
+    assert_eq!(k.last_used_ms, None, "never used at mint");
+    let sha = k.sha256.clone();
+
+    assert!(ks.touch(&sha, 1234), "first touch changes the key");
+    assert_eq!(ks.iter().next().unwrap().last_used_ms, Some(1234));
+    assert!(!ks.touch(&sha, 1234), "same-timestamp touch is a no-op");
+    assert!(!ks.touch("no-such-digest", 99), "unknown digest is a no-op");
+}
+
+/// `touch` is MONOTONIC: a stale/reordered timestamp older than the stored
+/// last-used is a no-op — the stamp never moves backward (round-1 finding #2).
+#[test]
+fn touch_never_moves_last_used_backward() {
+    let mut ks = ApiKeys::default();
+    ks.add("hgk_m", "m".into(), vec![Scope::Chat]);
+    let sha = ks.iter().next().unwrap().sha256.clone();
+    assert!(ks.touch(&sha, 5000));
+    assert!(!ks.touch(&sha, 1000), "an older timestamp must be a no-op");
+    assert_eq!(
+        ks.iter().next().unwrap().last_used_ms,
+        Some(5000),
+        "last_used_ms must not regress"
+    );
+    assert!(ks.touch(&sha, 5001), "a newer timestamp still advances");
+    assert_eq!(ks.iter().next().unwrap().last_used_ms, Some(5001));
+}
+
+/// `authorizing_sha` returns the matched key's digest for an authorized
+/// bearer and `None` for a wrong scope — the seam the auth middleware uses
+/// to record last-used without a second lookup.
+#[test]
+fn authorizing_sha_identifies_the_matching_key() {
+    let mut ks = ApiKeys::default();
+    ks.add("hgk_chat", "c".into(), vec![Scope::Chat]);
+    let sha = ks.iter().next().unwrap().sha256.clone();
+    assert_eq!(ks.authorizing_sha("hgk_chat", Scope::Chat), Some(sha));
+    assert_eq!(ks.authorizing_sha("hgk_chat", Scope::Admin), None);
+    assert_eq!(ks.authorizing_sha("hgk_wrong", Scope::Chat), None);
+}
+
+/// A pre-timestamp store (no created_at/last_used fields) still loads — the
+/// serde defaults grandfather old `api_keys.json` files.
+#[test]
+fn pre_timestamp_store_loads_with_defaults() {
+    let json = r#"{"keys":[{"sha256":"abc123","label":"old","scopes":["chat"]}]}"#;
+    let ks: ApiKeys = serde_json::from_str(json).unwrap();
+    let k = ks.iter().next().unwrap();
+    assert_eq!(k.created_at_ms, None);
+    assert_eq!(k.last_used_ms, None);
+}

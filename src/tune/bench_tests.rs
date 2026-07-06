@@ -1,4 +1,14 @@
 use super::*;
+
+/// Existing-behavior call shape: no pins.
+fn bench_candidates_nopins(
+    seed: &LlamaCppParams,
+    layer_count: Option<u32>,
+    estimate_vram: impl Fn(&LlamaCppParams) -> FitReport,
+) -> Vec<Candidate> {
+    bench_candidates(seed, layer_count, &TunePins::default(), estimate_vram)
+}
+
 use crate::tune::BenchResult;
 use crate::worker::engine::llamacpp::params::LlamaCppParams;
 use crate::worker::engine::{CtxLen, GpuLayers, KvCacheKind};
@@ -52,7 +62,7 @@ fn headroom_gate() {
 #[test]
 fn candidates_fastest_first_when_seed_fits() {
     // Everything fits comfortably.
-    let cands = bench_candidates(&seed(GpuLayers::Count { n: 32 }), Some(32), |_| {
+    let cands = bench_candidates_nopins(&seed(GpuLayers::Count { n: 32 }), Some(32), |_| {
         fit(FitVerdict::Fits, 2 * GIB, 8 * GIB)
     });
     assert_eq!(cands.len(), MAX_BENCHED_CANDIDATES, "bounded to the cap");
@@ -68,7 +78,7 @@ fn candidates_fastest_first_when_seed_fits() {
 /// q8_0/q4_0 calibration rungs carry the run (mechanism #3).
 #[test]
 fn kv_quant_rungs_when_f16_overflows() {
-    let cands = bench_candidates(&seed(GpuLayers::All), Some(40), |lc| {
+    let cands = bench_candidates_nopins(&seed(GpuLayers::All), Some(40), |lc| {
         // F16 (no type override) overflows; any quantized KV fits.
         if lc.type_k.is_none() {
             fit(FitVerdict::Overflow, 10 * GIB, 8 * GIB)
@@ -99,12 +109,12 @@ fn half_layers_rung_present_for_count_and_known_all() {
             }
         }
     };
-    let c = bench_candidates(&seed(GpuLayers::Count { n: 40 }), None, only_half(20));
+    let c = bench_candidates_nopins(&seed(GpuLayers::Count { n: 40 }), None, only_half(20));
     assert_eq!(c.len(), 1);
     assert_eq!(c[0].load.gpu_layers, GpuLayers::Count { n: 20 });
     assert_eq!(c[0].label, "half GPU layers on CPU");
 
-    let c = bench_candidates(&seed(GpuLayers::All), Some(48), only_half(24));
+    let c = bench_candidates_nopins(&seed(GpuLayers::All), Some(48), only_half(24));
     assert_eq!(c.len(), 1);
     assert_eq!(c[0].load.gpu_layers, GpuLayers::Count { n: 24 });
 }
@@ -113,15 +123,15 @@ fn half_layers_rung_present_for_count_and_known_all() {
 /// "no candidate fits" diagnosis).
 #[test]
 fn no_candidates_when_all_overflow() {
-    let cands = bench_candidates(&seed(GpuLayers::All), None, |_| {
+    let cands = bench_candidates_nopins(&seed(GpuLayers::All), None, |_| {
         fit(FitVerdict::Overflow, 20 * GIB, 8 * GIB)
     });
     assert!(cands.is_empty());
 }
 
-/// The winner is the highest gen_tps; a tie keeps the earlier candidate.
+/// The benchmarked is the highest gen_tps; a tie keeps the earlier candidate.
 #[test]
-fn winner_is_max_gen_tps() {
+fn benchmarked_is_max_gen_tps() {
     let c = |label: &'static str| Candidate {
         load: LlamaCppParams::default(),
         label,
@@ -132,11 +142,11 @@ fn winner_is_max_gen_tps() {
     };
     let results = vec![(c("a"), r(12.0)), (c("b"), r(30.0)), (c("c"), r(30.0))];
     assert_eq!(
-        pick_winner(&results),
+        pick_benchmarked(&results),
         Some(1),
         "b wins on tps; tie keeps earlier"
     );
-    assert_eq!(pick_winner(&[]), None, "empty → no winner");
+    assert_eq!(pick_benchmarked(&[]), None, "empty → no benchmarked config");
 }
 
 /// The aggregate-failure line names every tried candidate + reason.
@@ -153,7 +163,7 @@ fn aggregate_failure_names_each_candidate() {
 }
 
 /// `bench_gen_tps` is DECODE-ONLY: prefill/TTFT is excluded, so a slow prompt
-/// stage never skews the throughput `pick_winner` ranks on. Fail-on-revert:
+/// stage never skews the throughput `pick_benchmarked` ranks on. Fail-on-revert:
 /// computing `completion_tokens / total` instead (prefill folded in) collapses
 /// the 126 tok/s decode rate to ~42.7 and fails these bounds.
 #[test]
@@ -192,5 +202,110 @@ fn bench_gen_tps_excludes_prompt_prefill() {
         bench_gen_tps(64, Duration::from_millis(1500), Duration::from_millis(1500)),
         0.0,
         "same-tick timestamps score 0"
+    );
+}
+
+// ── Turbotune pins (JD1) ─────────────────────────────────────────────────
+
+/// A pinned KV cache type suppresses BOTH KV-quant rungs; a pinned GPU
+/// offload suppresses the half-layers rung — turbotune must never measure a
+/// candidate that overrides a user pin.
+#[test]
+fn pins_suppress_the_rungs_that_would_override_them() {
+    let fits = |_: &LlamaCppParams| FitReport {
+        verdict: FitVerdict::Fits,
+        needed_bytes: 1,
+        budget_bytes: 100 << 30,
+    };
+    // KV pin (type_k alone is enough): only the seed + half-layers survive.
+    let pins = TunePins {
+        type_k: Some(KvCacheKind::Q8_0),
+        ..TunePins::default()
+    };
+    let c = bench_candidates(&seed(GpuLayers::Count { n: 32 }), Some(32), &pins, fits);
+    assert!(
+        c.iter()
+            .all(|c| !c.label.contains("KV cache") || c.label.contains("seed")),
+        "KV rungs must be suppressed: {:?}",
+        c.iter().map(|c| c.label).collect::<Vec<_>>()
+    );
+    // GPU-layers pin: no half-layers rung.
+    let pins = TunePins {
+        gpu_layers: Some(GpuLayers::Count { n: 32 }),
+        ..TunePins::default()
+    };
+    let c = bench_candidates(&seed(GpuLayers::Count { n: 32 }), Some(32), &pins, fits);
+    assert!(
+        c.iter().all(|c| !c.label.contains("half GPU layers")),
+        "half-layers rung must be suppressed: {:?}",
+        c.iter().map(|c| c.label).collect::<Vec<_>>()
+    );
+}
+
+/// `apply_pins` overwrites exactly the pinned fields and leaves the rest.
+#[test]
+fn apply_pins_overwrites_only_the_pinned_fields() {
+    let mut lc = seed(GpuLayers::All);
+    let before_threads = lc.threads;
+    apply_pins(
+        &mut lc,
+        &TunePins {
+            ctx_len: Some(CtxLen::Fixed { n: 4096 }),
+            gpu_layers: Some(GpuLayers::Count { n: 8 }),
+            type_k: Some(KvCacheKind::Q4_0),
+            type_v: Some(KvCacheKind::Q4_0),
+        },
+    );
+    assert_eq!(lc.ctx_len, CtxLen::Fixed { n: 4096 });
+    assert_eq!(lc.gpu_layers, GpuLayers::Count { n: 8 });
+    assert_eq!(lc.type_k, Some(KvCacheKind::Q4_0));
+    assert_eq!(lc.type_v, Some(KvCacheKind::Q4_0));
+    assert_eq!(lc.threads, before_threads, "unpinned fields untouched");
+
+    // No pins → no changes.
+    let mut lc2 = seed(GpuLayers::All);
+    apply_pins(&mut lc2, &TunePins::default());
+    assert_eq!(lc2, seed(GpuLayers::All));
+}
+
+// ── pinned_bench_candidates seam + label honesty (round-1 findings) ─────
+
+/// The seam api.rs uses: pins must reach BOTH the returned seed and every
+/// candidate. Fail-on-revert guard for the api.rs pins wiring — dropping the
+/// apply_pins step (or the pins arg) makes the pinned ctx/offload not stick.
+#[test]
+fn pinned_bench_candidates_applies_pins_to_every_candidate() {
+    let fits = |_: &LlamaCppParams| fit(FitVerdict::Fits, 1, 100 << 30);
+    let pins = TunePins {
+        ctx_len: Some(CtxLen::Fixed { n: 8192 }),
+        gpu_layers: Some(GpuLayers::Count { n: 20 }),
+        type_k: Some(KvCacheKind::Q8_0),
+        type_v: Some(KvCacheKind::Q8_0),
+    };
+    let cands = pinned_bench_candidates(&seed(GpuLayers::All), Some(40), &pins, fits);
+    // Pinning KV + layers suppresses their rungs, so ONLY the seed candidate
+    // survives — and it carries every pin.
+    assert_eq!(cands.len(), 1);
+    assert_eq!(cands[0].load.ctx_len, CtxLen::Fixed { n: 8192 });
+    assert_eq!(cands[0].load.gpu_layers, GpuLayers::Count { n: 20 });
+    assert_eq!(cands[0].load.type_k, Some(KvCacheKind::Q8_0));
+}
+
+/// The seed candidate's label is honest: "F16 KV cache" only when the seed
+/// really is F16; a pinned KV type relabels it (the seed is not F16 then).
+#[test]
+fn seed_label_reflects_whether_kv_is_pinned() {
+    let fits = |_: &LlamaCppParams| fit(FitVerdict::Fits, 1, 100 << 30);
+    let unpinned = bench_candidates_nopins(&seed(GpuLayers::Count { n: 8 }), Some(8), fits);
+    assert_eq!(unpinned[0].label, "seed (F16 KV cache)");
+
+    let pins = TunePins {
+        type_k: Some(KvCacheKind::Q8_0),
+        ..TunePins::default()
+    };
+    let pinned = bench_candidates(&seed(GpuLayers::Count { n: 8 }), Some(8), &pins, fits);
+    assert_eq!(
+        pinned[0].label, "seed (pinned KV cache)",
+        "a pinned KV type must not be labeled F16"
     );
 }

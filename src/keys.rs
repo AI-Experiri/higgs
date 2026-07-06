@@ -51,6 +51,21 @@ pub struct ApiKey {
     pub label: String,
     /// Scopes this key grants.
     pub scopes: Vec<Scope>,
+    /// Unix-ms when the key was minted. `None` for keys from a pre-timestamp
+    /// store (serde default) — the UI renders that as unknown. (No magic-0
+    /// sentinel: absence is modeled as `None`, per the crate's no-magic-int
+    /// rule.)
+    #[serde(default)]
+    pub created_at_ms: Option<u64>,
+    /// Unix-ms of the last successful authorization with this key, `None` if
+    /// never used. Updated IN MEMORY by the auth middleware (throttled — see
+    /// `Higgs::touch_api_key`); the on-disk copy is refreshed only when an
+    /// explicit mint/revoke persists the live store (carrying whatever stamps
+    /// it holds then). So a restart shows the stamps as of the LAST mint/
+    /// revoke — "never" if none happened since the key was used — key IDENTITY
+    /// is the durable part of the file, usage is best-effort history.
+    #[serde(default)]
+    pub last_used_ms: Option<u64>,
 }
 
 /// Redacted: only a short digest prefix ever reaches `Debug` output (logs,
@@ -96,6 +111,14 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
 /// SHA-256 hex of `token` — the at-rest digest form.
 pub fn hash_token(token: &str) -> String {
     bytes_to_hex(&Sha256::digest(token.as_bytes()))
+}
+
+/// Current wall-clock time in unix-ms (0 if the clock is before the epoch).
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Generate a fresh opaque token (`hgk_` + 32 url-safe-ish hex chars from 16 random bytes).
@@ -144,6 +167,8 @@ impl ApiKeys {
             sha256: sha256.clone(),
             label,
             scopes,
+            created_at_ms: Some(now_unix_ms()),
+            last_used_ms: None,
         });
         sha256
     }
@@ -159,21 +184,42 @@ impl ApiKeys {
     /// across ALL keys (no early return on the first byte mismatch). An empty store always
     /// authorizes (auth disabled).
     pub fn authorizes(&self, token: &str, required: Scope) -> bool {
-        if self.keys.is_empty() {
-            return true;
-        }
+        self.keys.is_empty() || self.authorizing_sha(token, required).is_some()
+    }
+
+    /// The digest of the key that authorizes `token` for `required`, or `None`.
+    /// Same constant-time scan as [`Self::authorizes`] (every key is compared,
+    /// no early return) — the matched digest lets the auth middleware record
+    /// last-used without a second lookup. An empty store returns `None` (the
+    /// caller treats auth as disabled via [`Self::is_empty`]).
+    pub fn authorizing_sha(&self, token: &str, required: Scope) -> Option<String> {
         let presented = hash_token(token);
         let presented = presented.as_bytes();
-        let mut ok = false;
+        let mut found: Option<String> = None;
         for k in &self.keys {
             // Constant-time digest equality; only a hex-length match can be equal.
             let matches =
                 k.sha256.len() == presented.len() && k.sha256.as_bytes().ct_eq(presented).into();
-            if matches && k.grants(required) {
-                ok = true;
+            if matches && k.grants(required) && found.is_none() {
+                found = Some(k.sha256.clone());
             }
         }
-        ok
+        found
+    }
+
+    /// Record a successful authorization on the key with `sha256`. MONOTONIC:
+    /// `last_used_ms` only advances (a stale/reordered `now_ms` ≤ the stored
+    /// value is a no-op), so a request whose clock read was overtaken by a
+    /// concurrent one can't move the stamp backward. Returns whether anything
+    /// changed (false for an unknown digest or a non-advancing timestamp).
+    pub fn touch(&mut self, sha256: &str, now_ms: u64) -> bool {
+        match self.keys.iter_mut().find(|k| k.sha256 == sha256) {
+            Some(k) if k.last_used_ms.is_none_or(|t| now_ms > t) => {
+                k.last_used_ms = Some(now_ms);
+                true
+            }
+            _ => false,
+        }
     }
 }
 

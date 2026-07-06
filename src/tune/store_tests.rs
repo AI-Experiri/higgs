@@ -159,6 +159,67 @@ fn set_profile_clears_bench_only_when_params_change() {
 }
 
 #[test]
+fn put_tuning_never_fabricates_an_analytical_slot_from_a_bare_load_demotion() {
+    // A `Heuristic` active record is ambiguous: it is either a real analytical
+    // tune OR a bare-load reload `set_profile` demoted (identical field-for-field).
+    // `put_tuning` must NEVER backfill that active record into the analytical slot,
+    // or the bare-load params would surface as the analytical "Tuned" set — the
+    // exact masquerade `control.rs::from_triple`'s both-slots-empty grandfather
+    // gate exists to prevent (codex r9 P8). Sequence: Benchmark → bare-load edit →
+    // Benchmark. The analytical slot must stay empty throughout.
+    let home = tempfile::tempdir().unwrap();
+    let s = JsonModelStore::open(home.path()).unwrap();
+
+    // 1) Benchmark: fills the bench slot only.
+    let mut benched = tune_record();
+    benched.profile = LoadParams::base(CtxLen::Fixed { n: 2222 }, GpuLayers::All, 8);
+    benched.provenance = TuneProvenance::Bench;
+    benched.bench_tps = Some(33.0);
+    s.put_tuning("org/m", benched);
+
+    // 2) Bare-load with EDITED params: set_profile demotes the active record to
+    //    Heuristic and touches no history slot.
+    s.set_profile(
+        "org/m",
+        LoadParams::base(CtxLen::Fixed { n: 3333 }, GpuLayers::All, 4),
+        "vEdit",
+        "333:333",
+        20,
+    );
+    let (active, _, _) = s.tuning_profiles("org/m");
+    assert_eq!(
+        active.as_ref().unwrap().provenance,
+        TuneProvenance::Heuristic
+    );
+    assert_eq!(
+        active.unwrap().profile.ctx_len(),
+        CtxLen::Fixed { n: 3333 },
+        "active now carries the bare-load edited params",
+    );
+
+    // 3) Benchmark again.
+    let mut benched2 = tune_record();
+    benched2.profile = LoadParams::base(CtxLen::Fixed { n: 4444 }, GpuLayers::All, 8);
+    benched2.provenance = TuneProvenance::Bench;
+    benched2.bench_tps = Some(44.0);
+    s.put_tuning("org/m", benched2);
+
+    let (active, analytical, bench) = s.tuning_profiles("org/m");
+    // Fail-on-revert: re-adding the backfill migration would populate the
+    // analytical slot with the ctx-3333 bare-load params.
+    assert!(
+        analytical.is_none(),
+        "analytical slot must stay empty — a bare-load demotion is NOT a Tuned set",
+    );
+    assert_eq!(
+        bench.unwrap().profile.ctx_len(),
+        CtxLen::Fixed { n: 4444 },
+        "bench slot holds the latest benchmark",
+    );
+    assert_eq!(active.unwrap().provenance, TuneProvenance::Bench);
+}
+
+#[test]
 fn set_profile_refreshes_anchors_to_current_preserving_future_detection() {
     let home = tempfile::tempdir().unwrap();
     let s = JsonModelStore::open(home.path()).unwrap();

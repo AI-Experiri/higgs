@@ -77,6 +77,52 @@ pub fn resolve_estimate_ctx(ctx_len: CtxLen, ctx_train: Option<u64>) -> CtxLen {
 /// carries no trained-context metadata — the worker's fallback window.
 const WORKER_FALLBACK_CTX: u64 = 4096;
 
+/// The turbotune benchmark's per-candidate fit verdict, used to filter the
+/// candidate set BEFORE any load (§ `pinned_bench_candidates`). RAM-overflow
+/// takes precedence — a half-GPU-layers candidate can pass VRAM yet overflow an
+/// explicit RAM cap — else the VRAM verdict drives the fit + headroom gate.
+///
+/// The candidate's `Auto` context is normalized to the node's load-time cap
+/// FIRST ([`resolve_estimate_ctx`]) so a pinned (or seed) `Auto` on a
+/// long-context model is estimated against the window that will ACTUALLY load
+/// (`DEFAULT_CTX_CAP`), not the full `ctx_train` that [`effective_ctx`] would use
+/// for `Auto` — which would falsely read Overflow and DROP a loadable candidate.
+pub fn bench_fit(
+    lc: &LlamaCppParams,
+    meta: &ModelMeta,
+    hw: &HardwareInfo,
+    budget: &ResourceBudget,
+) -> FitReport {
+    let mut lc = lc.clone();
+    lc.ctx_len = resolve_estimate_ctx(lc.ctx_len, meta.ctx_train);
+    let ram = StaticRamEstimator.estimate(&lc, meta, hw, budget);
+    if ram.verdict == FitVerdict::Overflow {
+        return ram;
+    }
+    StaticVramEstimator.estimate(&lc, meta, hw, budget)
+}
+
+/// The benchmarked config's separate VRAM and RAM fit reports for the tune
+/// RESPONSE (returned as `(vram, ram)`). Like [`bench_fit`], an `Auto` context is
+/// normalized to the node's load-time cap FIRST, so the reported fit describes
+/// the window that will actually load — not the full `ctx_train` that
+/// [`effective_ctx`] uses for `Auto`, which would report a false Overflow for a
+/// benchmarked that passed the filter and loaded fine. The persisted benchmarked keeps its
+/// verbatim `Auto`; only these reported numbers use the normalized window.
+pub fn benchmarked_fit_reports(
+    benchmarked: &LlamaCppParams,
+    meta: &ModelMeta,
+    hw: &HardwareInfo,
+    budget: &ResourceBudget,
+) -> (FitReport, FitReport) {
+    let mut lc = benchmarked.clone();
+    lc.ctx_len = resolve_estimate_ctx(lc.ctx_len, meta.ctx_train);
+    (
+        StaticVramEstimator.estimate(&lc, meta, hw, budget),
+        StaticRamEstimator.estimate(&lc, meta, hw, budget),
+    )
+}
+
 /// Bytes-per-element for a KV-cache element type (block-quant overhead folded in
 /// approximately). Defaults to F16 (2 bytes) for the practical KV set.
 fn kv_type_bytes(kind: KvCacheKind) -> f64 {

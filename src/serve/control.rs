@@ -116,7 +116,7 @@ fn model_entry(
     last_load: Option<LoadParams>,
     readiness: crate::serve::readiness::ModelReadiness,
     fit: Option<crate::serve::wire::ModelFit>,
-    tune: Option<&crate::tune::store::TuneRecord>,
+    tune: TuneProfileViews<'_>,
 ) -> HiggsModelEntry {
     // Multi-model: this model is "loaded" if it is among the resident ids, not only
     // when it is the primary.
@@ -141,9 +141,86 @@ fn model_entry(
         last_load,
         readiness,
         fit,
-        tune_provenance: tune.map(|t| t.provenance),
-        bench_tps: tune.and_then(|t| t.bench_tps),
+        tuned_load: tune.analytical.map(|t| t.profile.clone()),
+        benched_load: tune.bench.map(|t| t.profile.clone()),
+        tune_provenance: tune.active.map(|t| t.provenance),
+        bench_tps: tune.bench.and_then(|t| t.bench_tps),
         model,
+    }
+}
+
+/// The per-model tune views the entry serves: the ACTIVE record (JIT default,
+/// its provenance labels the default set) plus the analytical/bench history
+/// slots. `from_triple` grandfathers a pre-dual-slot store — one whose BOTH
+/// history slots are empty (an old `models.json` predating the slots) — by
+/// serving its lone active record under its own provenance's label. Once
+/// EITHER slot is populated the store is post-dual (`put_tuning` fills a slot
+/// on every real tune/turbotune), so the active record is NOT borrowed: a later
+/// bare load can demote it to a `Heuristic` that was never an analytical tune,
+/// and borrowing that would fabricate a "Tuned" set. (Residual A: on a store
+/// whose only write was a bare load, that lone record is indistinguishable from
+/// a pre-dual analytical tune and is served as Tuned — a real tune supersedes it.
+/// Residual B: on a pre-dual store whose FIRST post-upgrade action is a benchmark,
+/// the bench slot populates and the gate turns off, so the prior analytical tune
+/// stops being grandfathered as "Tuned" until the user re-runs Tune — accepted
+/// because that analytical set is deterministic and re-derivable in one click,
+/// whereas `put_tuning` backfilling the active record to keep it would reintroduce
+/// the bare-load masquerade this gate exists to prevent.)
+#[derive(Clone, Copy, Default)]
+struct TuneProfileViews<'a> {
+    active: Option<&'a crate::tune::store::TuneRecord>,
+    analytical: Option<&'a crate::tune::store::TuneRecord>,
+    bench: Option<&'a crate::tune::store::TuneRecord>,
+}
+
+type TuneTriple = (
+    Option<crate::tune::store::TuneRecord>,
+    Option<crate::tune::store::TuneRecord>,
+    Option<crate::tune::store::TuneRecord>,
+);
+
+/// The ACTIVE ("latest") tuning record per model, extracted from the
+/// `(active, analytical, bench)` triples the models list ALSO reads for its
+/// dual-profile wire fields. Readiness reads THIS map, so readiness and the
+/// `tuned_load`/`benched_load` fields both come from ONE `models.json` snapshot —
+/// a concurrent tune between two separate store reads can no longer make a row's
+/// readiness disagree with its profile fields.
+fn active_records(
+    profiles: &std::collections::BTreeMap<String, TuneTriple>,
+) -> std::collections::BTreeMap<String, crate::tune::store::TuneRecord> {
+    profiles
+        .iter()
+        .filter_map(|(id, (active, _, _))| active.clone().map(|a| (id.clone(), a)))
+        .collect()
+}
+
+impl<'a> TuneProfileViews<'a> {
+    fn from_triple(triple: Option<&'a TuneTriple>) -> Self {
+        let Some((active, analytical, bench)) = triple else {
+            return Self::default();
+        };
+        let active = active.as_ref();
+        let mut analytical = analytical.as_ref();
+        let mut bench = bench.as_ref();
+        // Grandfather ONLY a true pre-dual store (both history slots empty). A
+        // post-dual store always has a slot filled by `put_tuning`, so borrowing
+        // the active record there would surface a bare-load `Heuristic` — a manual
+        // reload that `set_profile` demoted after a turbotune — as the analytical
+        // "Tuned" set it never was.
+        if analytical.is_none() && bench.is_none() {
+            if let Some(a) = active {
+                if a.provenance == crate::tune::TuneProvenance::Bench {
+                    bench = Some(a);
+                } else {
+                    analytical = Some(a);
+                }
+            }
+        }
+        Self {
+            active,
+            analytical,
+            bench,
+        }
     }
 }
 
@@ -161,14 +238,20 @@ pub(super) async fn control_models(State(higgs): State<Arc<Higgs>>) -> Response 
     // Non-consuming lookup — the scan can list multiple rows for one id (e.g. several
     // HF cache revisions), and they should all carry the same persisted `last_load`.
     let records = higgs.model_records();
-    // Load the per-model config records AND tuning profiles ONCE for the whole
-    // list; readiness then does in-memory lookups (no per-model store reopen). A
-    // genuinely unreadable store surfaces HG040 rather than badging every prepared
+    // Load the per-model dual-profile views (active/analytical/bench) ONCE for the
+    // whole list; readiness then does in-memory lookups (no per-model store reopen).
+    // A genuinely unreadable store surfaces HG040 rather than badging every prepared
     // model `discovered` (the JIT path surfaces the same fault as HG040).
-    let tuning = match higgs.tuning_records() {
-        Ok(t) => t,
+    let profiles = match higgs.tuning_profiles() {
+        Ok(p) => p,
         Err(err) => return control_error(&err).into_response(),
     };
+    // The ACTIVE records readiness reads are EXTRACTED from those same triples —
+    // NOT a second `models.json` read. A separate `tuning_records()` pass could
+    // observe a different snapshot if a concurrent tune landed between the two
+    // reads, making a row's readiness disagree with its `tuned_load`/`benched_load`
+    // wire fields; deriving both from one snapshot removes that TOCTOU.
+    let tuning = active_records(&profiles);
     // One hardware snapshot for the whole list — readiness (staleness + fit) is
     // computed against it per model.
     let hw = higgs.hardware().await;
@@ -176,7 +259,7 @@ pub(super) async fn control_models(State(higgs): State<Arc<Higgs>>) -> Response 
     for m in models {
         let last_load = records.get(&m.id).and_then(|r| r.load.clone());
         let (readiness, fit) = higgs.model_readiness(&m, &loaded_set, &hw, &tuning);
-        let tune = tuning.get(&m.id);
+        let tune = TuneProfileViews::from_triple(profiles.get(&m.id));
         entries.push(model_entry(m, &loaded_set, last_load, readiness, fit, tune));
     }
     Json(HiggsModelsResponse {
@@ -205,12 +288,15 @@ pub(super) async fn control_model_by_id(
         Some(model) => {
             let last_load = higgs.model_records().remove(&model.id).and_then(|r| r.load);
             let hw = higgs.hardware().await;
-            let tuning = match higgs.tuning_records() {
-                Ok(t) => t,
+            // One store snapshot: readiness's ACTIVE records and the dual-profile
+            // wire fields are both derived from `profiles` (see `control_models`).
+            let profiles = match higgs.tuning_profiles() {
+                Ok(p) => p,
                 Err(err) => return control_error(&err).into_response(),
             };
+            let tuning = active_records(&profiles);
             let (readiness, fit) = higgs.model_readiness(&model, &loaded_set, &hw, &tuning);
-            let tune = tuning.get(&model.id);
+            let tune = TuneProfileViews::from_triple(profiles.get(&model.id));
             Json(model_entry(
                 model,
                 &loaded_set,
@@ -1065,6 +1151,8 @@ pub(super) async fn control_keys_list(State(higgs): State<Arc<Higgs>>) -> Json<H
                 label: k.label.clone(),
                 scopes: k.scopes.clone(),
                 sha256_prefix: k.sha256_prefix().to_owned(),
+                created_at_ms: k.created_at_ms,
+                last_used_ms: k.last_used_ms,
             })
             .collect(),
     })

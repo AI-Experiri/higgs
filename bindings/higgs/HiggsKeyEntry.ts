@@ -10,4 +10,17 @@ export type HiggsKeyEntry = { label: string, scopes: Array<Scope>,
 /**
  * First 12 hex chars of the stored SHA-256 digest.
  */
-sha256_prefix: string, };
+sha256_prefix: string, 
+/**
+ * Unix-ms the key was minted; `None` for keys from a pre-timestamp
+ * store (render as unknown).
+ */
+created_at_ms?: number, 
+/**
+ * Unix-ms of the last successful authorization, `None` if never used.
+ * Served from the LIVE store (lags at most the ~1-min touch throttle).
+ * Usage is best-effort history: it reaches disk only when a later
+ * mint/revoke persists the store, so a restart shows the stamps as of
+ * that last mutation ("never" if none since).
+ */
+last_used_ms?: number, };

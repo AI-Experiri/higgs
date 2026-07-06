@@ -78,7 +78,7 @@ VERBATIM through the private node `local.load` (`node_params_for` — no OOM-lad
 degrade, no config persist; the candidate set is itself the degrade ladder), runs
 `measure_gen_tps` (a short real 64-token, temp-0 decode; `gen_tps` is DECODE-ONLY via
 `bench::bench_gen_tps` = `(completion_tokens − 1) / (total − ttft)` — prefill excluded
-so `pick_winner` ranks generation rate, not end-to-end latency skewed by prompt costs),
+so `pick_benchmarked` ranks generation rate, not end-to-end latency skewed by prompt costs),
 and tears down. Every candidate failing yields `[HG063]` (`BenchExhausted`); a
 per-candidate failure logs `[HG065]` and moves on.
 
@@ -200,7 +200,7 @@ the node/worker/scan paths this facade delegates to.
 - Worker-process lifecycle, RPC correlation, restart FSM → `supervisor.rs`.
 - Multi-worker orchestration + the node idle reaper → `node/runtime.rs`.
 - Remote fleet routing + served-instance ids → `node/fleet.rs`, `node/served.rs`.
-- The candidate generation / winner-pick / fit math for Turbotune → `tune/bench.rs`,
+- The candidate generation / benchmarked-pick / fit math for Turbotune → `tune/bench.rs`,
   `tune/vram.rs` (this module only orchestrates load→measure→cancel around them).
 
 ## Deferred / residual items

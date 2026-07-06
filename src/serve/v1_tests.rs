@@ -1012,6 +1012,7 @@ async fn v1_chat_jit_load_failure_surfaces_mapped_error() {
             id: "org/model".into(),
             mode: None,
             budget: None,
+            pins: None,
         })
         .await
         .expect("Prepare the test fixture model");

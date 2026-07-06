@@ -8,7 +8,7 @@ Two cooperating pieces, both **pure**:
    auto-applies** — the caller (the `tune` route, the UI, or the `autotune_on_load`
    seam) reviews, optionally edits, then loads.
 2. **Turbotune `Benchmark` decision core** (`bench.rs`, G6) — the *pure* candidate
-   generation / headroom gate / winner selection / aggregate-failure diagnosis for
+   generation / headroom gate / benchmarked selection / aggregate-failure diagnosis for
    the MEASURED autotune. The slow async orchestration that actually loads and
    measures candidates lives in `api.rs` (`run_benchmark`), **not here** — this
    module keeps only the deterministic, exhaustively unit-tested decisions.
@@ -24,7 +24,7 @@ design + the binding-gated parameter inventory: `docs/DESIGN-autotune.md`.
 | `mod.rs` | **Not a barrel** — owns the wire/data types (`ResourceBudget`, `TuneMode`, `TuneProvenance`, `FitVerdict`/`FitReport`, `TuneRequest`/`TuneSuggestion`, `EstimateRequest`/`EstimateReport`, `ModelMeta`, `BenchResult`), the narrow DI traits (`DeriveStrategy`/`VramEstimator`/`RamEstimator`/`SamplingSource`/`ProfileStore`/`ModelMetaProvider`/`HardwareProvider`/`Benchmarker`), and the `Suggester` orchestration (`suggest`: derive → sampling → VRAM fit → MoE back-off → VRAM-budget back-off → context re-derive → final fits). |
 | `derive.rs` | `HeuristicStrategy: DeriveStrategy` — GGUF/hardware → base params (`derive_default`); `derive_ctx` inverts the estimators for the budget-largest context. |
 | `vram.rs` | `StaticVramEstimator`/`StaticRamEstimator` — GQA-correct KV math + the tri-state fit report over `system::fits_vram`; `gpu_layers_within_budget` (offload back-off); `resolve_estimate_ctx`. |
-| `bench.rs` | Turbotune PURE core: `bench_candidates` (ordered survivors), `passes_headroom` (1 GiB floor), `pick_winner` (earliest-tie), `bench_gen_tps` (decode-only tok/s: `(tokens−1)/(total−ttft)`, empty window ⇒ 0.0), `aggregate_failure` (HG063 text), `Candidate`, `ABS_VRAM_HEADROOM_BYTES`, `MAX_BENCHED_CANDIDATES`. |
+| `bench.rs` | Turbotune PURE core: `bench_candidates` (ordered, pin-aware survivors), `apply_pins`/`pinned_bench_candidates` (TuneRequest pins seam), `passes_headroom` (1 GiB floor), `pick_benchmarked` (earliest-tie), `bench_gen_tps` (decode-only tok/s: `(tokens−1)/(total−ttft)`, empty window ⇒ 0.0), `aggregate_failure` (HG063 text), `Candidate`, `ABS_VRAM_HEADROOM_BYTES`, `MAX_BENCHED_CANDIDATES`. |
 | `card_sampling.rs` | HF-card recommended sampling: deterministic drop-not-clamp parsers (`parse_generation_config`, `parse_card_sampling`) + the async fail-open fetch (`fetch_card_sampling`) + the `SamplingSource` impls (`EmptySamplingSource`, `StaticSamplingSource`). |
 | `store.rs` | `JsonModelStore` over per-node `~/.higgs/models.json` (`ModelEntry` = `{path,size,mtime}`-keyed meta cache + saved `TuneRecord` + observed `ModelPerf`); backs `ProfileStore`. |
 | `context/` | Budget-aware context-length derivation (the inverse estimator). Own `README.md`/`DESIGN.md`; used by `derive::derive_ctx`. |
@@ -36,7 +36,7 @@ design + the binding-gated parameter inventory: `docs/DESIGN-autotune.md`.
   wiring `StaticSamplingSource` when a card fetch succeeded, else the fully-static
   default. Generic over the traits so tests inject fakes (no worker, no disk, no
   network).
-- **`bench::{bench_candidates, pick_winner, bench_gen_tps, aggregate_failure}`** —
+- **`bench::{bench_candidates, pinned_bench_candidates, apply_pins, pick_benchmarked, bench_gen_tps, aggregate_failure}`** —
   `api.rs` `run_benchmark` (the `Benchmark` mode) uses these to pick and label
   candidates, score each measurement (`bench_gen_tps`, prefill excluded), and build
   the `HG063` "no working config" detail.

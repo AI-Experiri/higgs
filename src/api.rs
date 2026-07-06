@@ -228,6 +228,14 @@ pub struct Higgs {
     /// other's change. A plain `parking_lot::Mutex` — held only across synchronous
     /// file I/O, never an `.await`. Mirrors [`Self::models_io`]/[`Self::config_io`].
     keys_io: parking_lot::Mutex<()>,
+    /// In-memory last-touch stamp per key digest (unix-ms) — the throttle
+    /// authority for [`Self::touch_api_key`], so the hot auth path does at most
+    /// one live-store update per key per minute instead of one on every
+    /// request. Bounded by the number of distinct key digests seen this process
+    /// (small — a single-user server). A plain `parking_lot::Mutex` — the
+    /// throttle check-and-set is atomic under it (so a concurrent burst at
+    /// window expiry dedupes to ONE update), never held across an `.await`.
+    key_touch_throttle: parking_lot::Mutex<std::collections::HashMap<String, u64>>,
     /// Whether the HTTP listener is bound BEYOND loopback (a LAN/0.0.0.0 bind).
     /// Set once at serve start ([`Self::set_lan_exposed`]); read by the key-revoke
     /// gate so revoking the LAST key while LAN-exposed is refused ([HG059]) — an
@@ -317,7 +325,7 @@ impl Drop for BenchmarkingGuard {
 /// `[HG063]` when every candidate fails.
 ///
 /// This is the orchestration seam kept separate from `Higgs` so the
-/// loop/cancel/winner/aggregate logic is unit-tested without a real FFI load.
+/// loop/cancel/benchmarked/aggregate logic is unit-tested without a real FFI load.
 async fn run_benchmark<M, Fut>(
     candidates: Vec<crate::tune::bench::Candidate>,
     mut measure: M,
@@ -327,7 +335,7 @@ where
     M: FnMut(&crate::tune::bench::Candidate) -> Fut,
     Fut: std::future::Future<Output = Result<crate::tune::BenchResult, HiggsError>>,
 {
-    use crate::tune::bench::{aggregate_failure, pick_winner};
+    use crate::tune::bench::{aggregate_failure, pick_benchmarked};
     let mut results: Vec<(crate::tune::bench::Candidate, crate::tune::BenchResult)> = Vec::new();
     let mut failures: Vec<(&'static str, String)> = Vec::new();
 
@@ -339,7 +347,7 @@ where
         }
         match measure(&cand).await {
             // A 0 tok/s "success" (immediate EOS / empty decode window) measured
-            // NOTHING — treating it as a result would let `pick_winner` crown the
+            // NOTHING — treating it as a result would let `pick_benchmarked` crown the
             // first candidate by ORDERING and persist a Bench profile that claims a
             // measurement (Fable r8). It is a candidate failure like any other.
             Ok(bench) if bench.gen_tps > 0.0 => results.push((cand, bench)),
@@ -362,7 +370,7 @@ where
         }
     }
 
-    match pick_winner(&results) {
+    match pick_benchmarked(&results) {
         Some(i) => Ok(results.swap_remove(i)),
         None => Err(HiggsError::BenchExhausted {
             detail: aggregate_failure(&failures),
@@ -584,6 +592,7 @@ impl Higgs {
             load_events: tokio::sync::broadcast::channel(256).0,
             config_path: parking_lot::Mutex::new(default_config_path_override()),
             keys_io: parking_lot::Mutex::new(()),
+            key_touch_throttle: parking_lot::Mutex::new(std::collections::HashMap::new()),
             lan_exposed: std::sync::atomic::AtomicBool::new(false),
             benchmarking: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
             shutting_down: std::sync::atomic::AtomicBool::new(false),
@@ -667,6 +676,33 @@ impl Higgs {
         Ok(store.all_tuning())
     }
 
+    /// Every model's `(active, analytical, bench)` tuning triple — the models
+    /// list fills the dual "Tuned"/"Benchmarked" wire fields from this. Same
+    /// error posture as [`Self::tuning_records`].
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn tuning_profiles(
+        &self,
+    ) -> Result<
+        std::collections::BTreeMap<
+            String,
+            (
+                Option<crate::tune::store::TuneRecord>,
+                Option<crate::tune::store::TuneRecord>,
+                Option<crate::tune::store::TuneRecord>,
+            ),
+        >,
+        HiggsError,
+    > {
+        let store = self
+            .models_store()
+            .map_err(|e| HiggsError::PersistenceFailed {
+                store: "models".into(),
+                path: "models.json".into(),
+                source: e,
+            })?;
+        Ok(store.all_tuning_profiles())
+    }
+
     /// Install the remote fleet (hub mode) — `/v1` chat for a remote-resident model then
     /// routes through it. Idempotent; replaces any prior fleet.
     pub fn set_fleet(&self, fleet: Arc<crate::node::fleet::HubFleet>) {
@@ -733,6 +769,55 @@ impl Higgs {
         Ok(out)
     }
 
+    /// Record a successful authorization on the key with `sha256` — updates its
+    /// `last_used_ms` on the LIVE store (in memory only), THROTTLED to once per
+    /// key per minute so the hot auth path doesn't turn into a per-request
+    /// update.
+    ///
+    /// The throttle authority is the in-memory [`Self::key_touch_throttle`] map:
+    /// the check-and-set is atomic under that map's lock, so a concurrent burst
+    /// at window expiry dedupes to a single update (only the first request past
+    /// the atomic check proceeds). [`crate::keys::ApiKeys::touch`] is monotonic,
+    /// so even a reordered stale `now` can't move `last_used_ms` backward.
+    ///
+    /// The update is IN-MEMORY ONLY — it never rewrites `api_keys.json`. A
+    /// touch-driven full-file rewrite would clobber keys added out-of-band: the
+    /// `higgs keys add` CLI writes the keystore directly and blesses a deferred
+    /// restart, so passive request traffic rewriting the file from the live
+    /// store (which does not yet know those keys) would silently DESTROY a
+    /// just-minted CLI key before the operator's restart. `GET /api/higgs/keys`
+    /// reads the live store, so the fresh `last_used_ms` is visible this
+    /// session; a touch itself never writes the file. The durable record is
+    /// key IDENTITY; usage stamps reach disk only as a side-effect of the next
+    /// explicit mint/revoke (which persists the live store wholesale) — so a
+    /// restart shows usage as of that last mutation, else "never".
+    pub fn touch_api_key(&self, sha256: &str) {
+        const THROTTLE_MS: u64 = 60_000;
+        let now = now_unix_ms();
+        // Atomic throttle check-and-set: within the window → nothing to do; else
+        // claim this window BEFORE releasing the lock so a racing request sees
+        // the fresh stamp and returns.
+        {
+            let mut throttle = self.key_touch_throttle.lock();
+            if throttle
+                .get(sha256)
+                .is_some_and(|t| now.saturating_sub(*t) < THROTTLE_MS)
+            {
+                return;
+            }
+            throttle.insert(sha256.to_owned(), now);
+        }
+        // Update last-used on the LIVE store in memory only (no file write).
+        // Serialized against mint/revoke by `keys_io` so a concurrent mutation
+        // can't lose this update or vice-versa. A plain lock, no `.await`.
+        let _guard = self.keys_io.lock();
+        let before = self.api_keys();
+        let mut keys = (*before).clone();
+        if keys.touch(sha256, now) {
+            self.set_api_keys(std::sync::Arc::new(keys));
+        }
+    }
+
     /// Record whether the listener is bound beyond loopback (see field docs).
     pub fn set_lan_exposed(&self, exposed: bool) {
         self.lan_exposed
@@ -793,6 +878,7 @@ impl Higgs {
         hw: &crate::system::HardwareInfo,
         budget: &crate::tune::ResourceBudget,
         suggestion: &TuneSuggestion,
+        pins: &crate::tune::TunePins,
     ) -> Result<
         (
             crate::worker::engine::llamacpp::params::LlamaCppParams,
@@ -800,21 +886,28 @@ impl Higgs {
         ),
         HiggsError,
     > {
-        let seed = suggestion.load.as_llamacpp().clone();
-        // Phase 1 (cheap): fit-and-headroom-filtered candidate set, no loads. The
-        // filter must respect BOTH estimators: candidates like the half-GPU-layers
-        // rung SHIFT memory into system RAM, so a VRAM-only check would load,
-        // measure, and persist a config the RAM estimator calls Overflow under an
-        // explicit RAM cap (codex r20). A RAM-overflowing candidate returns the RAM
-        // report (verdict Overflow → filtered by `passes_headroom`); otherwise the
-        // VRAM report drives the fit + absolute-headroom gate as before.
-        let candidates = crate::tune::bench::bench_candidates(&seed, meta.block_count, |lc| {
-            let ram = crate::tune::vram::StaticRamEstimator.estimate(lc, meta, hw, budget);
-            if ram.verdict == crate::tune::FitVerdict::Overflow {
-                return ram;
-            }
-            crate::tune::vram::StaticVramEstimator.estimate(lc, meta, hw, budget)
-        });
+        // Phase 1 (cheap): apply the user's pins onto the analytical seed AND
+        // build the pin-aware, fit-and-headroom-filtered candidate set (no
+        // loads) — one seam so the pins wiring is unit-testable. Pins overwrite
+        // the seed (every candidate derives from it) and suppress the rungs that
+        // would search a pinned dimension. The filter respects BOTH estimators:
+        // candidates like the half-GPU-layers rung SHIFT memory into system RAM,
+        // so a VRAM-only check would load, measure, and persist a config the RAM
+        // estimator calls Overflow under an explicit RAM cap (codex r20). A
+        // RAM-overflowing candidate returns the RAM report (verdict Overflow →
+        // filtered by `passes_headroom`); otherwise the VRAM report drives the
+        // fit + absolute-headroom gate as before.
+        let candidates = crate::tune::bench::pinned_bench_candidates(
+            suggestion.load.as_llamacpp(),
+            meta.block_count,
+            pins,
+            // `bench_fit` normalizes an `Auto` context to the node's load-time cap
+            // BEFORE estimating (RAM-overflow wins over VRAM), so a pinned/seed
+            // `Auto` on a long-context model is judged against the window that
+            // actually loads — not the full `ctx_train` — and a loadable candidate
+            // is not falsely dropped as Overflow.
+            |lc| crate::tune::vram::bench_fit(lc, meta, hw, budget),
+        );
 
         // EXCLUSIVE benchmark contract: refuse if the model is LOADED ([HG067]) — a
         // bench loads/unloads candidate configs and must not disrupt a live worker —
@@ -852,7 +945,7 @@ impl Higgs {
         // registered-but-ungated. On every normal exit the slot is `None` (each
         // candidate is unloaded right after its measurement), so the drop no-ops.
         let live_candidate = Arc::clone(&_bench_guard.live);
-        let winner = run_benchmark(
+        let benchmarked = run_benchmark(
             candidates,
             |cand| {
                 let load = cand.load.clone();
@@ -891,7 +984,7 @@ impl Higgs {
             },
         )
         .await?;
-        Ok((winner.0.load, winner.1))
+        Ok((benchmarked.0.load, benchmarked.1))
     }
 
     /// Unload every worker serving `id` (the bench's own model) via the PRIVATE node
@@ -951,7 +1044,7 @@ impl Higgs {
         let ttft = ttft.unwrap_or(total);
         let ttft_ms = ttft.as_secs_f32() * 1000.0;
         // Generation throughput EXCLUDES prompt prefill (see `bench::bench_gen_tps`),
-        // so `pick_winner` ranks candidates by real decode rate, not end-to-end
+        // so `pick_benchmarked` ranks candidates by real decode rate, not end-to-end
         // latency skewed by differing prompt-processing costs.
         let gen_tps = crate::tune::bench::bench_gen_tps(outcome.completion_tokens, ttft, total);
         // Prompt throughput approximated from prompt tokens over TTFT (the
@@ -1946,7 +2039,7 @@ impl Higgs {
             // The bench's OWN measurement (`serve_public == false`) does NOT take a
             // permit: it must not compete with public chats on OTHER models for the
             // slots — a full gate would misread as an HG065 "candidate failure" and
-            // skew `pick_winner` (Fable r1). It needs no bound of its own: the
+            // skew `pick_benchmarked` (Fable r1). It needs no bound of its own: the
             // benchmark is serialized per model ([HG067]/[HG068]) and measures ONE
             // candidate at a time.
             let permit = if serve_public {
@@ -2344,6 +2437,22 @@ impl Higgs {
         let hw = self.hardware().await;
         let budget = req.budget.clone().unwrap_or_default();
 
+        // Pins only steer the Benchmark search (they hold a dimension fixed while
+        // Turbotune measures the rest); the analytical Suggest derives freely and
+        // the user edits the result in the UI. A Suggest request that carries pins
+        // is contradictory — honor it as Suggest but make the ignore VISIBLE in the
+        // log rather than silently dropping the caller's intent.
+        if req.mode.unwrap_or_default() != TuneMode::Benchmark {
+            if let Some(pins) = &req.pins {
+                if *pins != crate::tune::TunePins::default() {
+                    tracing::warn!(
+                        id = %id,
+                        "higgs: tune pins ignored in Suggest mode (pins steer the Benchmark search only)"
+                    );
+                }
+            }
+        }
+
         // 3. Best-effort HF-card sampling (bounded; fail-open). Skipped for ollama ids.
         let card = fetch_card_bounded(&id).await;
 
@@ -2369,23 +2478,34 @@ impl Higgs {
         //    surfaces [HG063]. Suggest mode skips this entirely.
         let mut bench_tps = None;
         if req.mode.unwrap_or_default() == TuneMode::Benchmark {
-            let (winner_load, bench) = self
-                .turbotune_bench(&id, &meta, &hw, &budget, &suggestion)
+            let pins = req.pins.clone().unwrap_or_default();
+            let (benchmarked_load, bench) = self
+                .turbotune_bench(&id, &meta, &hw, &budget, &suggestion, &pins)
                 .await?;
-            // The measured winner may differ from the analytical seed (e.g. q8_0 KV
-            // after the F16 seed was filtered out), so recompute BOTH fit reports
-            // against the winner — otherwise the response's vram/ram fit numbers and
-            // verdicts describe the seed, not the config actually being saved.
-            suggestion.vram_fit =
-                crate::tune::vram::StaticVramEstimator.estimate(&winner_load, &meta, &hw, &budget);
-            suggestion.ram_fit =
-                crate::tune::vram::StaticRamEstimator.estimate(&winner_load, &meta, &hw, &budget);
-            suggestion.load = LoadParams::llamacpp(winner_load);
+            // The measured benchmarked config may differ from the analytical seed on SEVERAL
+            // dimensions (a pinned context/KV type, the winning KV-quant rung, a
+            // half-offload rung), so recompute the fit AND replace the rationale —
+            // otherwise the response's fit numbers and its narrated context/fit
+            // describe the seed, not the config actually being saved.
+            // `benchmarked_fit_reports` normalizes an `Auto` context to the node cap
+            // (as the Phase-1 `bench_fit` filter does), so a ctx=Auto pin on a
+            // long-context model does not report a false Overflow for a benchmarked
+            // that loaded fine. The persisted `load` keeps the benchmarked config verbatim.
+            let sampling_refined = suggestion.provenance == crate::tune::TuneProvenance::Card;
+            let (vram_fit, ram_fit) =
+                crate::tune::vram::benchmarked_fit_reports(&benchmarked_load, &meta, &hw, &budget);
+            suggestion.vram_fit = vram_fit;
+            suggestion.ram_fit = ram_fit;
+            suggestion.rationale = crate::tune::benchmarked_rationale(
+                &benchmarked_load,
+                meta.ctx_train,
+                vram_fit,
+                ram_fit,
+                bench.gen_tps,
+                sampling_refined,
+            );
+            suggestion.load = LoadParams::llamacpp(benchmarked_load);
             suggestion.provenance = crate::tune::TuneProvenance::Bench;
-            suggestion.rationale.push(format!(
-                "Turbotune measured {:.1} tok/s (fastest of the benched configs on this hardware)",
-                bench.gen_tps
-            ));
             bench_tps = Some(bench.gen_tps);
         }
 

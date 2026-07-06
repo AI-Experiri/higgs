@@ -30,7 +30,7 @@ POST /api/higgs/models/tune {id, mode?, budget?}     serve/mod.rs route
    [Suggest]  best-effort async HF-card fetch (bounded) ── card_sampling::fetch_card_sampling
         ▼
    Suggester{..}.suggest(meta, hw, budget) -> TuneSuggestion       (pure)
-   [Benchmark] bench_candidates → run_benchmark (load+measure) → pick_winner
+   [Benchmark] bench_candidates → run_benchmark (load+measure) → pick_benchmarked
         ▼
    persist TuneRecord to ~/.higgs/models.json (ProfileStore), return the result
 ```
@@ -106,12 +106,24 @@ double-discount): Fits fills to `1.0`, Overflow only beyond it.
 
 ## Turbotune bench core (`bench.rs`, pure)
 
-- **`bench_candidates(seed, layer_count, estimate_vram)`** — Phase-1 candidate set,
-  fastest-likely first: `seed (F16 KV)` → `q8_0 KV` → `q4_0 KV` → `half GPU layers`.
-  KV-quant rungs are the cheap VRAM calibration (a quantized V cache needs flash
-  attention, left at the engine `auto` default). Half-layers via `half_gpu_layers`
-  (unknown `All` with no `layer_count` → skipped). Kept only if `passes_headroom`,
-  capped at `MAX_BENCHED_CANDIDATES = 3` (each bench = a full load + real decode).
+- **`bench_candidates(seed, layer_count, pins, estimate_vram)`** — Phase-1 candidate
+  set, fastest-likely first: `seed` → `q8_0 KV` → `q4_0 KV` → `half GPU layers`.
+  The seed label is honest about its KV cache (`seed (F16 KV cache)`, or
+  `seed (pinned KV cache)` when a KV type is pinned). KV-quant rungs are the cheap
+  VRAM calibration (a quantized V cache needs flash attention, left at the engine
+  `auto` default); they are SUPPRESSED when either cache type is pinned (the rung
+  would override the pin), as is the half-layers rung when `gpu_layers` is pinned.
+  Half-layers via `half_gpu_layers` (unknown `All` with no `layer_count` →
+  skipped). Kept only if `passes_headroom`, capped at
+  `MAX_BENCHED_CANDIDATES = 3` (each bench = a full load + real decode).
+- **`TunePins` + `apply_pins(seed, pins)` + `pinned_bench_candidates(...)`** —
+  user pins (`ctx_len`/`gpu_layers`/`type_k`/`type_v`, all optional on
+  `TuneRequest.pins`) hold a dimension FIXED while Turbotune searches the rest:
+  `apply_pins` overwrites the pinned seed fields, and `pinned_bench_candidates`
+  (the one seam `api.rs` calls) applies the pins then builds the pin-aware
+  candidate set — so every candidate carries the pins and no rung searches a
+  pinned dimension. Pins are BENCHMARK-mode only: a Suggest request with pins
+  logs a `tracing::warn` and derives freely (the UI edits the suggestion).
 - **`passes_headroom(fit, abs_floor)`** — rejects `Overflow`; on a VRAM basis also
   requires an ABSOLUTE `ABS_VRAM_HEADROOM_BYTES = 1 GiB` free (`saturating_sub`), on
   top of the fractional fit — a config that "fits" a large budget can still starve the
@@ -122,7 +134,7 @@ double-discount): Fits fills to `1.0`, Overflow only beyond it.
   the prefill's output; only the decode window counts, so a slow prompt-processing
   stage can't be mis-scored as a slow GENERATOR). An empty decode window or ≤ 1 token
   returns **0.0** — a failed measurement, not an infinitely fast one.
-- **`pick_winner(results)`** — highest `gen_tps`; a manual **strictly-greater** fold
+- **`pick_benchmarked(results)`** — highest `gen_tps`; a manual **strictly-greater** fold
   so a tie keeps the EARLIER (higher-KV-quality / faster-ordered) candidate
   (`max_by` would keep the last).
 - **`aggregate_failure(attempts)`** — the single human line naming each tried

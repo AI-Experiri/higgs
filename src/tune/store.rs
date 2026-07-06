@@ -35,9 +35,19 @@ pub struct ModelEntry {
     /// Cached GGUF facts + the `{path,size,mtime}` cache key (a cache, not truth).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<ModelMetaCache>,
-    /// The saved autotune profile, reused on the next load ("tune once").
+    /// The ACTIVE saved autotune profile, reused on the next load ("tune
+    /// once") — whatever tune ran last, analytical or measured; its
+    /// `provenance` says which. Readiness/JIT read THIS record only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tuning: Option<TuneRecord>,
+    /// The last ANALYTICAL (Suggest) result, kept alongside the active record
+    /// so the UI can offer "Tuned" and "Benchmarked" as separate selectable
+    /// param sets even after a later turbotune became the active profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tuning_analytical: Option<TuneRecord>,
+    /// The last MEASURED (Turbotune) result — see `tuning_analytical`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tuning_bench: Option<TuneRecord>,
     /// Observed passive perf (last/avg tok/s).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub perf: Option<ModelPerf>,
@@ -178,6 +188,32 @@ impl JsonModelStore {
         self.inner.lock().models.get(id)?.tuning.clone()
     }
 
+    /// Every model's `(active, analytical, bench)` tuning triple, keyed by id —
+    /// one lock pass for the models-list endpoint (per-row store reopens are
+    /// what the single-pass `all_tuning` exists to avoid; same rule here).
+    pub fn all_tuning_profiles(
+        &self,
+    ) -> BTreeMap<String, (Option<TuneRecord>, Option<TuneRecord>, Option<TuneRecord>)> {
+        self.inner
+            .lock()
+            .models
+            .iter()
+            .filter(|(_, e)| {
+                e.tuning.is_some() || e.tuning_analytical.is_some() || e.tuning_bench.is_some()
+            })
+            .map(|(id, e)| {
+                (
+                    id.clone(),
+                    (
+                        e.tuning.clone(),
+                        e.tuning_analytical.clone(),
+                        e.tuning_bench.clone(),
+                    ),
+                )
+            })
+            .collect()
+    }
+
     /// Every saved tuning record, keyed by model id — for callers that need the
     /// whole set at once (e.g. the `/api/higgs/models` readiness pass) so they
     /// open + parse `models.json` ONCE rather than per-model.
@@ -190,14 +226,48 @@ impl JsonModelStore {
             .collect()
     }
 
-    /// Persist (in memory) a tuning record for `id`.
+    /// Persist (in memory) a tuning record for `id`: it becomes the ACTIVE
+    /// profile AND lands in its provenance-keyed history slot (`Bench` →
+    /// `tuning_bench`, else `tuning_analytical`), so both the "Tuned" and
+    /// "Benchmarked" param sets stay offerable after either kind of re-tune.
+    ///
+    /// It writes ONLY the slot matching the NEW record's provenance — it does NOT
+    /// backfill the record it is overwriting into the opposite slot. A tempting
+    /// "migrate the active record into its slot first" step would fabricate a
+    /// "Tuned" set from a bare-load-demoted `Heuristic` active (`set_profile`
+    /// demotes an edited reload to `Heuristic`, indistinguishable field-for-field
+    /// from a real analytical tune), so `control.rs::from_triple` — which owns the
+    /// pre-dual-store ambiguity via its both-slots-empty grandfather gate — would
+    /// then borrow those manual params as the analytical set they never were.
+    /// Keeping this write slot-scoped leaves that gate the single source of truth.
     pub fn put_tuning(&self, id: &str, record: TuneRecord) {
-        self.inner
-            .lock()
-            .models
-            .entry(id.to_string())
-            .or_default()
-            .tuning = Some(record);
+        let mut inner = self.inner.lock();
+        let entry = inner.models.entry(id.to_string()).or_default();
+        if record.provenance == TuneProvenance::Bench {
+            entry.tuning_bench = Some(record.clone());
+        } else {
+            entry.tuning_analytical = Some(record.clone());
+        }
+        entry.tuning = Some(record);
+    }
+
+    /// The saved tuning records for `id` as the UI-facing triple:
+    /// `(active, analytical, bench)`. Pre-dual-slot stores have only the
+    /// active record — the caller derives the matching history view from its
+    /// provenance.
+    pub fn tuning_profiles(
+        &self,
+        id: &str,
+    ) -> (Option<TuneRecord>, Option<TuneRecord>, Option<TuneRecord>) {
+        let inner = self.inner.lock();
+        match inner.models.get(id) {
+            Some(e) => (
+                e.tuning.clone(),
+                e.tuning_analytical.clone(),
+                e.tuning_bench.clone(),
+            ),
+            None => (None, None, None),
+        }
     }
 
     /// Update ONLY the saved load `profile` for `id` (e.g. a successful load with

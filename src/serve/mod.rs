@@ -393,9 +393,13 @@ async fn auth_guard(
     let Some(required) = required_scope(req.method(), req.uri().path()) else {
         return next.run(req).await; // health / unmatched → open (routing handles it)
     };
-    match bearer_token(req.headers()) {
-        Some(tok) if keys.authorizes(&tok, required) => next.run(req).await,
-        _ => unauthorized(),
+    match bearer_token(req.headers()).and_then(|tok| keys.authorizing_sha(&tok, required)) {
+        Some(sha) => {
+            // Record last-used on the matched key (throttled, best-effort).
+            higgs.touch_api_key(&sha);
+            next.run(req).await
+        }
+        None => unauthorized(),
     }
 }
 
