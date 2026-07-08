@@ -21,23 +21,36 @@ where a suggestion's numbers came from; `Bench` was added with G6.
 
 ## Boundary
 
+higgs serves **no** HTTP tune/estimate route (`serve::v1_router` is `/v1`-only). Both
+paths are crate-API facade methods on `Higgs` (`src/api.rs`) that an embedder calls
+in-process.
+
 ```
-POST /api/higgs/models/tune {id, mode?, budget?}     serve/mod.rs route
-        │  serve/control.rs::control_tune  (thin) → api.rs (async)
-        ▼
-   look up ModelMeta (scan + models.json meta cache)   ── ModelMetaProvider
-   read HardwareInfo (cached; a worker round-trip)      ── HardwareProvider
-   [Suggest]  best-effort async HF-card fetch (bounded) ── card_sampling::fetch_card_sampling
-        ▼
-   Suggester{..}.suggest(meta, hw, budget) -> TuneSuggestion       (pure)
-   [Benchmark] bench_candidates → run_benchmark (load+measure) → pick_benchmarked
-        ▼
-   persist TuneRecord to ~/.higgs/models.json (ProfileStore), return the result
+embedder ─ Higgs::tune(TuneRequest{id, mode?, budget?, pins?})   src/api.rs (async facade)
+                 │
+                 ▼
+   scan() → ModelMeta::from_model      typed GGUF facts (+ models.json meta cache)
+   hardware() → HardwareInfo           cached; a worker round-trip on a miss
+   [Suggest]  fetch_card_bounded (≤10 s, fail-open) ── card_sampling::fetch_card_sampling
+                 │
+                 ▼
+   Suggester{..}.suggest(meta, hw, budget) ─→ TuneSuggestion       (pure, tune/mod.rs)
+   [Benchmark] turbotune_bench ─ pinned_bench_candidates ─ run_benchmark (load+measure)
+                              └─ pick_benchmarked ─ benchmarked_rationale
+                 │
+                 ▼
+   store.put_tuning(id, TuneRecord) ─→ ~/.higgs/models.json (JsonModelStore)
+                 │
+                 ▼
+             return TuneSuggestion
+
+embedder ─ Higgs::estimate(EstimateRequest) ─ estimate_footprint
+                 └─ StaticVramEstimator / StaticRamEstimator ─→ EstimateReport
 ```
 
 `suggest` is **pure**: it takes the providers' outputs as plain values, so it is
-unit-tested with fakes. The host (`api.rs`) wires the concrete impls; the suggester
-core depends only on the traits. `POST /api/higgs/models/estimate` reuses the same
+unit-tested with fakes. The facade (`src/api.rs`) wires the concrete impls; the
+suggester core depends only on the traits. `Higgs::estimate` reuses the same
 estimators for a live per-edit footprint (`EstimateRequest`/`EstimateReport`).
 
 ## `Suggester::suggest` (analytical, pure)
@@ -65,9 +78,10 @@ prior saved profile is deliberately NOT reused here (that is a load-seam concern
 6. **Final VRAM + RAM fit** against the final load, plus human `rationale` notes.
 
 > The old DESIGN's "saved-profile-replaces + user-`overrides`-field-merge" precedence
-> is **gone**: `suggest` no longer reuses a saved profile, and `TuneRequest.overrides`
-> is DEFERRED (see the `TuneRequest` doc-comment) — the user edits the suggestion in
-> the UI and loads with the full engine-tagged params. Precedence now lives entirely
+> is **gone**: `suggest` no longer reuses a saved profile, and a per-field
+> `TuneRequest.overrides` was never added (it stays in the Deferred list below;
+> `TuneRequest` today is `{id, mode?, budget?, pins?}`) — the user edits the suggestion
+> in the UI and loads with the full engine-tagged params. Precedence now lives entirely
 > in the load seam (`docs/DESIGN-autotune.md` §3.1).
 
 ## Heuristics (`derive_default`)
@@ -147,8 +161,13 @@ Per-node `~/.higgs/models.json` (separate from the lean `config.json`). One
 
 - a `{path,size,mtime}`-keyed **meta cache** (`meta_if_fresh` — the GGUFs are the
   source of truth),
-- a durable **`TuneRecord`** (`profile` + `sampling` + `budget` + `provenance` +
-  optional `bench_tps`), reused on the next load ("tune once"),
+- the **active** durable **`TuneRecord`** (`tuning`: `profile` + `sampling` + `budget`
+  + `provenance` + optional `bench_tps`), reused on the next load ("tune once") — PLUS
+  its two provenance-keyed history slots (`tuning_analytical`, `tuning_bench`), so the
+  UI offers "Tuned" and "Benchmarked" as separate selectable param sets after either
+  kind of re-tune. `put_tuning` writes the active record AND the slot matching the new
+  record's provenance (`Bench` → `tuning_bench`, else `tuning_analytical`) — never
+  backfilling the opposite slot; readiness/JIT read ONLY the active `tuning`,
 - durable observed **`ModelPerf`** (passive tok/s, rolling average via `record`).
 
 **Staleness anchors** on `TuneRecord`: `hw_fingerprint` + `model_file_sig`

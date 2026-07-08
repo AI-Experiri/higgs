@@ -80,10 +80,15 @@ See [DESIGN.md](DESIGN.md) for why the boundary sits exactly here.
 - `worker/mod.rs` — `build_engine(HIGGS_ENGINE)`, then `.load` / `.chat` / `.devices`.
 - `supervisor.rs`, `actor.rs`, `delta_queue.rs` — `ChatDelta` / `ChatDeltaKind` (demux, bounded
   merge, RPC decode).
-- `api.rs` — `LoadParams`, `SamplingParams`, `CtxLen`, `GpuLayers`, `KvCacheKind` (request/serve
-  mapping; `CtxLen::Auto` is capped at `DEFAULT_CTX_CAP` there, not here).
-- `config.rs`, `remote.rs`, `tune/*`, `load_robustness.rs` — persist/derive `LoadParams` /
-  `SamplingParams` and the base enums.
+- `api.rs` / `api/embed.rs` — the `Higgs` facade builds/reads `LoadParams`, `SamplingParams`,
+  `CtxLen`, `GpuLayers`, `KvCacheKind` for load + status. `CtxLen::Auto` is resolved to the
+  model's trained context capped at `crate::api::DEFAULT_CTX_CAP` at load time in
+  `node/runtime.rs` (`do_load`, via the pure `worker_load_params` helper), mirrored
+  for reporting in `api.rs` — not here.
+- `serve/v1.rs`, `serve/wire.rs`, `serve/control.rs` — `/v1` request → `SamplingParams` /
+  `GenParams` mapping and the per-model `last_load` / `tuned_load` / `benched_load` rows.
+- `config.rs`, `remote.rs`, `tune/*`, `load_robustness.rs`, `node/{runtime,control,data}.rs` —
+  persist/derive `LoadParams` / `SamplingParams` and the base enums.
 
 ## Files
 

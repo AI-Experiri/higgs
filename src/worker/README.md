@@ -56,11 +56,18 @@ JSON-RPC error `code`s: `-32700` parse, `-32602` invalid params, `-32601` unknow
 
 ## How the rest of the crate uses it
 
-- `api.rs` (`Higgs::scan`) and `node/runtime.rs` build a `ModelStore::default()`, scan the
-  configured roots, and enrich `M_STATUS` with the matching `HiggsModel`.
-- `serve/wire.rs` + `serve/control.rs` wrap `HiggsModel` in `HiggsModelEntry` for
-  `GET /api/higgs/models`.
-- `tune/mod.rs` (`ModelFacts::from_model`) projects a `HiggsModel` into the autotune suggester.
+- `Higgs::scan` (`src/api.rs`) builds a `ModelStore::default()`, scans the configured roots off
+  the executor (`spawn_blocking`), and returns the `Vec<HiggsModel>` catalog. `node/runtime.rs`
+  (`resolve_model`, `do_scan`) does the same to resolve a repo id to its on-disk GGUF path
+  (passed into `M_LOAD`, path-guarded to stay within a scan root) and to serve the node's model
+  catalog.
+- `Higgs::model_entries` (`src/api/embed.rs`) folds each scanned `HiggsModel` — plus its load
+  state, Gate-2 tool-call verdict, last-load params, readiness/fit, and the dual tune profiles —
+  into a `HiggsModelEntry` row via `serve::control::model_entry` (`serve/wire.rs` defines the
+  wire type). This is the enriched models-list view the crate API exposes (control runs
+  in-process; there is **no** `/api/higgs/*` HTTP surface — that route was retired).
+- `tune/mod.rs` (`ModelMeta::from_model`) projects a `HiggsModel` into the autotune suggester's
+  typed input.
 - `worker_main()` is called from the host binary's `main()` for the `--higgs-worker` role.
 
 See `DESIGN.md` for the run-loop invariants and the host↔worker contract.

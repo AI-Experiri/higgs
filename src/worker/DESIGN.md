@@ -9,6 +9,38 @@ the host (`supervisor.rs`) sees the non-zero exit, reports it, and can spawn a f
 replay the last load. This crash-isolation split is **non-negotiable** (see the repo's
 out-of-scope list) and is why the engine never runs in the host.
 
+## The picture — host-side catalog, worker-side engine
+
+```
+  HOST process                                          WORKER process  (higgs --higgs-worker)
+  ============                                          =====================================
+
+  Higgs facade  (api/embed.rs, api.rs)
+    scan()          ─▶ ModelStore::scan (models.rs)  ── pure Rust: ggus + memmap2 + std::fs,
+        LM Studio / HF cache / Ollama roots              NO FFI, so the catalog is HOST-side
+        ─▶ Vec<HiggsModel>  (+ GGUF enrichment)
+    model_entries() ─▶ HiggsModelEntry rows
+         │ resolved GGUF path
+         ▼
+  supervisor.rs  (spawn · restart · RPC correlation)
+         │
+         │   M_LOAD {id, path, ctx_len, gpu_layers…}       serve_state() run loop
+   stdin │   M_CHAT · M_STATUS · M_UNLOAD · M_SYSINFO ─▶      one line in ─▶ one response out
+         │                                                    (single-threaded, no locks)
+  stdout │ ◀── {result}  +  N_CHAT_CHUNK deltas                    │
+  stderr │ ◀── engine logs                                         ▼
+         ▼                                                    WorkerState
+   (host matches each response/chunk to the                    ├─ engine:  Box<dyn HiggsEngine>
+    in-flight request by JSON-RPC `id`)                         └─ loaded:  Option<(id, LoadParams)>
+                                                                     │
+                       NDJSON JSON-RPC over stdio                    ▼  llama.cpp FFI (engine/llamacpp)
+```
+
+The worker holds **no** model catalog: the host scans (`models.rs`, pure Rust) and passes the
+resolved GGUF `path` in `M_LOAD`. There is no `/api/higgs/*` HTTP surface anywhere in this
+picture — control is the in-process `Higgs` crate API; the supervisor is the worker's *only*
+client.
+
 ## The run loop is strictly sequential
 
 `serve_state()` reads stdin line-by-line and processes one frame at a time:

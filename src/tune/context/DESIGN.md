@@ -8,6 +8,42 @@ and the memory available. A 128 GB-VRAM machine got the same 8192 as a laptop; a
 **the largest context that fits the budget**, so context scales with hardware and
 with any user-set memory cap.
 
+## Shape (data flow)
+
+The inverse (`context/`) and the forward footprint share ONE pair of estimators —
+that shared reuse is the whole point of the module, so the diagram shows both paths
+converging on `StaticVramEstimator` / `StaticRamEstimator` (`tune/vram.rs`):
+
+```
+  embedder (crate API)
+      │
+      ├─ Higgs::tune ─────────► Suggester::suggest            (tune/mod.rs)
+      │                              │
+      │                              ▼  derive::derive_ctx     (tune/derive.rs)
+      │                   budget_basis(explicit ×1.0 | detected ×0.8)
+      │                              │  → vram_budget, ram_budget
+      │                              ▼
+      │        AverageStrategy::analytical_only().derive_ctx   (context/average.rs)
+      │                              │  average per-method n_ctx → CtxDerivation
+      │                              ▼
+      │        Analytical::max_ctx_for_budget                  (context/analytical.rs)
+      │           probe forward footprint at n=0 and n=1, per pool:
+      │              base  = need(0)                                 ▲
+      │              slope = need(1) − need(0)                       │ SAME estimators
+      │              max   = (budget − base) / slope   ── invert     │ (single source
+      │           n_ctx = min(max_vram, max_ram)                     │  of truth)
+      │                              │                               │
+      │        clamp → MIN_CTX(4096) .. ctx_train                    │
+      │                                                              │
+      └─ Higgs::estimate ─► StaticVramEstimator / StaticRamEstimator (tune/vram.rs)
+         (live UI footprint,   .estimate(load, meta, hw, budget).needed_bytes
+          src/api.rs)
+```
+
+Because `Higgs::estimate` (the live footprint) and `Analytical` (the inverse) both
+call the same `StaticVramEstimator` / `StaticRamEstimator`, a derived context can
+never disagree with the footprint the UI shows for it.
+
 ## The memory model (analytical) — invert the forward estimator
 
 The forward footprint of EACH pool (VRAM, RAM) is linear in the context length:
@@ -87,7 +123,7 @@ methods }`. The sum is accumulated in `u128` so a `u32::MAX` method (degenerate 
 can't overflow, and the average is re-clamped to `u32::MAX`. An empty ensemble
 returns all-zero (the caller clamps up). Today the ensemble is `[Analytical]`, so
 `min == max == ctx` and the rationale reads "(analytical)". The mechanism exists so
-later methods slot in without touching `derive.rs` or the route:
+later methods slot in without touching `derive.rs` or the `Higgs::tune` caller:
 
 - **Empirical** — a regression fit to observed `(model, ctx) → bytes` (oobabooga-style).
 - **EngineReport** — llama.cpp's own KV/compute-buffer sizing, queried at probe time.
@@ -111,7 +147,8 @@ under-use big GPUs) or the most optimistic (max, which risks OOM). The clamp to
   not because anything here runs concurrently.
 - **No `HGxxx` codes:** this module never fails — inversion is total (saturating
   arithmetic, `u32::MAX` / `0` sentinels for the degenerate cases). Error codes and
-  fit verdicts belong to the forward path (`tune/vram.rs`, the estimate route).
+  fit verdicts belong to the forward path (`tune/vram.rs`, the `Higgs::estimate`
+  footprint).
 
 ## Residual / deferred
 

@@ -41,8 +41,9 @@ is unsupported (a build feature of the binding, not a runtime gate). The engine 
   `Option<LoadedModel>`). Constructed via the `engine::REGISTRY` entry named `"llamacpp"`; the
   worker only ever talks to it through the `HiggsEngine` trait.
 - `engine_version() -> String` (`mod.rs`) — the vendored ggml/llama.cpp runtime version
-  (`ggml_version()`), reported by the worker in HELLO/status. Distinct from the `llama-cpp-2`
-  binding version.
+  (`ggml_version()`), surfaced by the `Higgs` facade `version()` (`HiggsVersionResponse` in
+  `api/embed.rs`) and the system-info runtime block (`system.rs`). Distinct from the `llama-cpp-2`
+  binding version (`LLAMA_CPP_2_VERSION`).
 - `device_info() -> Vec<GpuDevice>` (`mod.rs`) — device enumeration used by `devices()` and by
   worker/tune paths that need VRAM before a model is loaded.
 - `params::LlamaCppParams` / `params::LlamaCppSamplingParams` and their helper structs/enums — the

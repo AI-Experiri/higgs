@@ -16,6 +16,21 @@ API — `apply_chat_template_oaicompat` / `parse_response_oaicompat` / the strea
 own `common_chat` both renders the GGUF chat template and parses the model's raw output back into
 OpenAI content / tool-calls / reasoning. higgs never hand-parses chat markup.
 
+```text
+  rest of higgs (NO FFI)              this dir  =  the FFI boundary            vendored C/C++
+  ─────────────────────────      ─────────────────────────────────────    ───────────────────
+                            HiggsEngine trait
+  worker/mod.rs RPC loop  ───────────────────▶   LlamaCppEngine (mod.rs)
+  engine::REGISTRY["llamacpp"]   load/unload/     { Option<LoadedModel> }
+                                 is_loaded/chat/          │
+                                 devices                  │  llama_cpp_2 /
+                                                          ├──────────────────▶  ggml + llama.cpp
+                                                          │  llama_cpp_sys_2     (Metal on macOS,
+  logging.rs  ──────────────────────────────────────────┘  (Rust binding)       CPU elsewhere)
+    installs the FFI log hook (route_engine_logs_to_tracing) — the only other
+    file allowed to name llama_cpp_2; everything else is trait-only.
+```
+
 ## Process-wide backend
 
 `LlamaBackend::init()` is a once-per-process global (the FFI global init). It is held in a
@@ -24,6 +39,26 @@ OpenAI content / tool-calls / reasoning. higgs never hand-parses chat markup.
 first so device registration has happened even on a cold, model-less worker.
 
 ## The chat pipeline (`chat` → helpers)
+
+```text
+  chat(messages_json, params, &mut sink)  runs its helpers in sequence, left to right:
+
+  load_template ─▶ apply_template ─▶ fit_check ─▶ run_decode ────────▶ parse_output ─▶ ChatResult
+  (GGUF tmpl /     (oaicompat:       (tokenize;   (fresh LlamaContext;   (parse_response_   { content,
+   "chatml"         prompt + PEG      HG005 if     sample→accept→EOG       oaicompat →        tool_calls,
+   fallback)        parser +          prompt≥ctx   loop; re-batch→        content /          reasoning,
+                    chat_format;      else CLAMP    decode)               tool_calls /       token counts }
+                    HG050 on fail)    max_tokens)       │                 reasoning)
+                                                        │  each raw piece
+                                                        ▼
+                                              route_parsed_deltas
+                                              (ChatParseStateOaicompat; HG052 → raw remainder)
+                                                        │
+                                          EngineDelta::{Content, Reasoning, ToolCall}
+                                                        │
+                                                        ▼
+                                              &mut sink  (serve layer fans out to /v1 SSE chunks)
+```
 
 1. **Template apply** (`load_template` + `apply_template`). Load the GGUF's embedded chat template
    (falling back to the built-in `"chatml"` when the model embeds none), then
@@ -168,9 +203,9 @@ only place allowed to touch the binding's log hook.
 ## Concurrency / locking
 
 The engine holds one model and is driven by the single-threaded worker RPC loop — no per-engine
-lock. The only shared mutable state is in `logging.rs`: `BACKEND` (`OnceLock`, init-once),
-`ENGINE_VERBOSE` (`OnceLock<Arc<AtomicBool>>`, `Relaxed` load/store), and `ENGINE_DIAGNOSTICS`
-(`Mutex<Vec<String>>`). The diagnostic buffer is cleared → written (by the log layer during load) →
+lock. The shared process-wide state is `BACKEND` (`mod.rs`, `OnceLock<LlamaBackend>`, init-once via
+`backend()`) plus, in `logging.rs`, `ENGINE_VERBOSE` (`OnceLock<Arc<AtomicBool>>`, `Relaxed`
+load/store) and `ENGINE_DIAGNOSTICS` (`Mutex<Vec<String>>`). The diagnostic buffer is cleared → written (by the log layer during load) →
 drained on failure within a single `load` call; because the worker serves loads one at a time,
 there is no interleaving of two load windows over the buffer.
 

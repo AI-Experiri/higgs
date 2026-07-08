@@ -9,6 +9,7 @@ modules — including the recent additions **delta_queue** (G1), **keys** (G4), 
 ## Table of Contents
 - [Crate Boundary](#crate-boundary)
 - [Worker Lifecycle](#worker-lifecycle)
+- [Load-Event Push (ModelLoadPhase)](#load-event-push-modelloadphase)
 - [Chat Request Sequence](#chat-request-sequence)
 - [Delta Backpressure (G1)](#delta-backpressure-g1)
 - [Model Scan Flow](#model-scan-flow)
@@ -29,21 +30,26 @@ modules — including the recent additions **delta_queue** (G1), **keys** (G4), 
 │                         host app                            │
 │  production: jigglebot server launcher; or any Axum host    │
 │  HiggsConfig { lmstudio_dirs, hf_dirs, ollama_dirs,         │
-│                default_load }                               │
+│                default_load, worker_exe }                   │
 │  let h = Arc::new(Higgs::new(cfg)); h.start().await;        │
-│  serve(higgs::serve::router(h), addr)                       │
+│  CONTROL: h.load(), h.chat_stream(), h.status(), … (Rust)   │
+│  HTTP /v1: serve_v1(h, listener, shutdown_signal())         │
 └──────────────────────────┬──────────────────────────────────┘
-                           │ Rust API (facade) + HTTP (/v1, /api/higgs)
+              in-process    │    /v1 chat+models
+              Rust facade   │    over a socket
                            ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                       higgs crate                           │
 │  (standalone — zero dep edges to jigglebot)                 │
-│  serve + control = PURE RUST (cannot crash the host)        │
+│  facade + control = PURE RUST (cannot crash the host)       │
 │                                                             │
 │  api.rs        Higgs facade → co-located LOCAL NodeRuntime   │
+│  api/embed.rs  in-process control methods (model_entries,   │
+│                mint_key, hub_enable, pair, …)               │
+│  serve/control.rs  PURE control helpers the facade shares   │
 │  supervisor.rs Worker process manager + RPC correlator      │
 │  actor.rs      generic mailbox runtime + ReplyDemux         │
-│  serve/        Axum router (/v1 + /api/higgs/*)             │
+│  serve/        Axum /v1-ONLY router (chat + models + health) │
 │  node/         iroh remote fleet (hub / node / transport)   │
 │  rpc.rs        NDJSON JSON-RPC 2.0 codec                    │
 │  diagnostic.rs HiggsError HG001–HG069                      │
@@ -59,9 +65,27 @@ modules — including the recent additions **delta_queue** (G1), **keys** (G4), 
                └───────────────────────┘
 ```
 
+**Control-plane flow (no HTTP for control):**
+
+```
+  embedder (jigglebot)                        external OpenAI client
+        │ Rust call                                  │ HTTP
+        ▼                                            ▼
+  Higgs facade  ──────────────────────────►  serve::v1  (POST /v1/chat/completions,
+  (api.rs + api/embed.rs)                              GET /v1/models, GET /health)
+        │ delegates to                               │  (uses the SAME facade)
+        ▼                                            │
+  serve::control PURE helpers  ◄──────────────────────┘
+  (model_entry row · hub_status · decide_mint/revoke · TuneProfileViews)
+        │
+        ▼
+  NodeRuntime → Supervisor → worker  (local)   |   HubFleet → node → worker  (remote)
+```
+
 **Why a separate worker process:** the llama.cpp FFI is native and can segfault or leak; a
-worker crash must never take down the host. The control plane (router + `Higgs`) is pure Rust,
-so `/v1` and `/api/higgs/*` stay up even with no worker. `Higgs::new` spawns nothing — the
+worker crash must never take down the host. The control plane (`Higgs` facade + the `/v1`
+router) is pure Rust, so `/v1` and the crate control API stay up even with no worker.
+`Higgs::new` spawns nothing — the
 first `load()` spawns the worker, `unload()` kills it (zero idle RAM). Since v-fork the
 `llama-cpp-2` binding resolves to the AI-Experiri fork (restored OpenAI-compat chat API);
 `LLAMA_CPP_2_VERSION` = `"0.1.151"` is baked from the lock file as the reported binding version.
@@ -116,6 +140,35 @@ does NOT time `/v1/chat/completions` — a long SSE stream must outlive any per-
 
 ---
 
+## Load-Event Push (ModelLoadPhase)
+
+Model-load progress is **pushed**, not polled. `Higgs::load` emits a `ModelLoadEvent` at every real
+seam in `load_inner` over a `tokio::sync::broadcast` channel; an embedder taps it with
+`Higgs::subscribe_load_events()` and relays it on its own plane (higgs itself exposes no HTTP event
+route). Each event carries the model `id`, the `phase`, an `at_ms` stamp, and — on `Failed` — the
+`HGxxx` `code`.
+
+```
+  subscribe_load_events()  (broadcast<ModelLoadEvent>)
+        ▲                        one event per transition
+        │
+  Higgs::load(id, params) ── load_inner ──►
+        │
+        ▼   (state machine — every phase maps to an observed transition; none faked)
+
+     Queued ──► Preparing ──► LoadingWeights ──► Finalizing ──► Ready   (terminal)
+        │           │              │                 │
+        └───────────┴──────────────┴─────────────────┴──────────► Failed (terminal, carries code)
+
+     Queued          waiting behind another in-flight load (per-facade load lock held)
+     Preparing       validate id/profile, resolve params, capture tune anchors
+     LoadingWeights  the multi-second worker load: mmap weights → GPU upload → KV alloc
+     Finalizing      load ok; persist the load record + sync the tuning profile
+     Ready/Failed    terminal (Failed's ModelLoadEvent.code carries the HGxxx)
+```
+
+---
+
 ## Chat Request Sequence
 
 ```
@@ -140,8 +193,8 @@ does NOT time `/v1/chat/completions` — a long SSE stream must outlive any per-
 ```
 
 `/v1` **never** returns a worker-down 503: spawn-on-load means "no worker" == "nothing loaded",
-so (JIT off) a crashed worker presents as an empty `/v1/models` + 404 chat. `GET
-/api/higgs/status` is where `worker_alive` is exposed.
+so (JIT off) a crashed worker presents as an empty `/v1/models` + 404 chat. `Higgs::status()`
+(the in-process facade method) is where `worker_alive` is exposed.
 
 ---
 
@@ -211,10 +264,11 @@ request never approaches it.
   metadata lines) must not evict the serve history. Each `?source=` console keeps its own
   `RING_CAP` (2000) of history. Rings for dead workers are reclaimed (`evict_local` /
   `evict_remote` / `evict_node`).
-- **Sinks:** `GET /api/higgs/logs` snapshots the ring tail; `GET /api/higgs/logs/stream`
-  subscribes first, replays the ring, then streams live (one line = one `data:` frame; a
-  `Lagged` subscriber skips the gap and keeps streaming). `snapshot(None)` re-interleaves rings
-  by a monotonic `seq`.
+- **Sinks (in-process crate API):** `Higgs::logs(n, source)` snapshots the ring tail;
+  `Higgs::subscribe_logs()` returns a `broadcast::Receiver<LogLine>` — subscribe first, replay
+  the ring, then stream live (a `Lagged` subscriber skips the gap and keeps streaming). The
+  embedder relays these lines on its own plane (there is no higgs HTTP log route). `snapshot(None)`
+  re-interleaves rings by a monotonic `seq`.
 - **Concurrency invariant:** the `seq` stamp is assigned WHILE holding the destination ring's
   lock, so the stamp and the `push_back` are atomic per ring — otherwise two concurrent pushes
   could stamp N/N+1 but insert in the opposite order, and `snapshot` (sorts by seq) would
@@ -231,12 +285,13 @@ request never approaches it.
 `keys.rs` gates the HTTP surface. Design points:
 - **Opt-in / fail-open for embedded, fail-closed for LAN.** An empty keystore means the surface
   is OPEN — the embedded in-process host wants no gate. Auth turns on the moment the first key
-  exists. But `standalone.rs` refuses to start on a non-loopback bind with zero keys (`HG058`)
-  — and, as a backstop, with keys of which NONE is Admin-capable (`HG069`, which would lock out
-  the key-management API on that bind) — and refuses to revoke the last key while LAN-bound
-  (`HG059`), because the Host guard + CORS only protect *browser* clients. Revoking the last
-  Admin-capable key while OTHER keys remain is likewise refused (`HG066` → 409): the
-  key-management surface itself would lock out.
+  exists. But `serve_v1` refuses to serve a non-loopback listener with zero keys (`HG058`) — and,
+  as a backstop, with keys of which NONE is Admin-capable (`HG069`, which would lock out the
+  key-management surface on that bind) — and refuses to revoke the last key while LAN-exposed
+  (`HG059`), because the Host guard + CORS only protect *browser* clients. Both refusals run on
+  the REAL bound address, so a library/embedded caller handing higgs its own listener can't bypass
+  them. Revoking the last Admin-capable key while OTHER keys remain is likewise refused (`HG066` →
+  409): the key-management surface itself would lock out.
 - **At-rest = digest only.** Tokens are `hgk_<hex>`; only their SHA-256 hex digest is persisted
   in `api_keys.json`. Plaintext is shown once at mint time. `authorizes()` hashes the presented
   token and compares against ALL stored digests in **constant time** (`subtle::ConstantTimeEq`,
@@ -244,11 +299,12 @@ request never approaches it.
 - **Scopes.** `Chat` (`POST /v1/chat/completions`), `Models` (listing), `Admin` (everything,
   incl. management). `Admin` is a superset. `Scope` is a `higgs_const_enum!` so the frontend
   gets the const-object form.
-- **Two mutation paths.** The CLI (`higgs keys add/list/remove`) edits `api_keys.json` offline
-  and prints a restart notice (the server snapshots keys at startup). The Admin-scoped HTTP API
-  (`GET·POST /api/higgs/keys`, `DELETE /api/higgs/keys/{label}`) mutates the LIVE keystore via
-  `Higgs::mutate_api_keys` — a minted or revoked key gates the very next request, no restart.
-  Saves are atomic (temp + rename).
+- **Two mutation paths.** The CLI (`higgs keys add/list/remove`, `run_keys`) edits `api_keys.json`
+  offline and prints a restart notice (a served instance snapshots keys at serve time). The
+  in-process crate API (`Higgs::mint_key` / `revoke_key`, over `mutate_api_keys`, Admin scope)
+  mutates the LIVE keystore — a minted or revoked key gates the very next request, no restart. An
+  embedder can also register an in-memory-only internal token (`register_internal_token`) to
+  authenticate itself. Saves are atomic (temp + rename).
 
 ---
 
@@ -326,13 +382,15 @@ EOF/death cancels every pending waiter and drops every sink, ending in-flight st
 ## Endpoint Surface & Error Mapping
 
 ```
-  Serve-layer hardening (first reject wins; src/serve/):
+  /v1 serve-layer hardening (outer layers run first; src/serve/mod.rs):
     local_cors      → browser cross-origin: loopback/tauri + configured origins only
     host_guard      → DNS-rebind: Host must be loopback → 403 HG012
-    api-key gate    → missing/insufficient key → 401 HG048  (when keys configured)
+                      (relaxed on a keyed non-loopback bind — LAN clients' own Host)
+    auth_guard      → missing/insufficient key → 401 HG048  (when keys configured)
     CatchPanicLayer → handler panic → structured 500
     DefaultBodyLimit→ body > MAX_BODY_BYTES → 413
-    split by route  → /api/higgs/* + /v1/models: TimeoutLayer; SSE routes: NO timeout
+    split by route  → GET /v1/models: TimeoutLayer (CONTROL_TIMEOUT);
+                      POST /v1/chat/completions (SSE): NO whole-request timeout
 
   Inference-path guards (handler/facade, not tower layers):
     serving toggle  → HG019 503     validate_sampling → HG013 400
@@ -340,8 +398,10 @@ EOF/death cancels every pending waiter and drops every sink, ending in-flight st
     CHAT_RPC_TIMEOUT → HG016 504     validate_repo_id/path_within_roots → HG015 400
 ```
 
-Error mapping (same table for `/v1` and `/api/higgs/*`; the true origin status survives the
-hub→node hops via `error.data.code`):
+Only `/v1` (chat + models) and `/health` are served; there is no `/api/higgs/*` HTTP surface. The
+in-process crate control methods return `HiggsError` directly to the embedder, which maps it as it
+sees fit. Error mapping for the `/v1` path (the true origin status survives the hub→node hops via
+`error.data.code`):
 
 | HiggsError | HTTP | | HiggsError | HTTP |
 |---|---|---|---|---|
@@ -357,9 +417,10 @@ hub→node hops via `error.data.code`):
 | HG059 LastKeyOnLan | 409 | | HG068 BenchInProgress | 503 |
 | | | | anything else | 500 |
 
-`/v1` errors: `{"error":{"message":"…","type":"…","code":"…"}}`; control errors:
-`{"error":"[HGxxx] …"}`. `/v1` messages are path/host-redacted; `/api/higgs/*` (our surface)
-returns the full `Display`.
+`/v1` errors serialize as `{"error":{"message":"…","type":"…","code":"…"}}` and are
+path/host-redacted (`serve::v1::redact_paths`). The in-process crate control methods instead return
+the typed `HiggsError` with its full `Display` (`[HGxxx] …`) — the embedder decides how to surface
+it.
 
 ---
 
@@ -377,7 +438,7 @@ being reused.
 | HG037–HG039 | `rpc.rs`, `node/` | control-plane RPC + peer-protocol + hub-rejection |
 | HG040–HG045 | `config.rs`/`auth.rs`/`keys.rs`, serve | on-disk store I/O + corruption + internal + control-surface-down |
 | HG046–HG050 | `api.rs`, `serve/`, worker | readiness gate + auth + invalid request + template render |
-| HG057–HG069 | `delta_queue.rs`, `standalone.rs`, `keys.rs`, `api.rs`, `tune/`, `serve/` | stream overflow + LAN-bind guards (HG058/HG059/HG069) + OOM ladder + Turbotune (HG063/HG064/HG067/HG068) + last-Admin-key lockout (HG066) |
+| HG057–HG069 | `delta_queue.rs`, `serve/mod.rs`, `keys.rs`, `api.rs`, `tune/` | stream overflow + LAN-bind guards (HG058/HG069 refused in `serve_v1`, HG059) + OOM ladder + Turbotune (HG063/HG064/HG067/HG068) + last-Admin-key lockout (HG066) |
 
 **Log-only codes** (no variant — they ride a `tracing` line so a debugging agent can grep the
 Developer Logs, and the request still succeeds): HG051 (undecodable `N_CHAT_CHUNK` dropped),

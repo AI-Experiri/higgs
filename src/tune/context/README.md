@@ -55,9 +55,11 @@ back-offs so the final context reflects the final offload config, and folds the
 
 `Analytical` derives a context by INVERTING the same forward estimators
 (`vram::StaticVramEstimator` / `StaticRamEstimator`) that the live footprint
-endpoint (`POST /api/higgs/models/estimate`) uses, so a derived context never
-disagrees with the verdict the UI displays for it — partial GPU offload, `cpu_moe`,
-and `offload_kqv` are priced identically on both sides.
+estimator `Higgs::estimate` (`src/api.rs`, via the pure `estimate_footprint`) uses,
+so a derived context never disagrees with the verdict the UI displays for it —
+partial GPU offload, `cpu_moe`, and `offload_kqv` are priced identically on both
+sides. `Higgs::estimate` is a crate-API facade method (embedders call it directly);
+there is no HTTP control route for it.
 
 ## Extending (the "mechanism for later")
 

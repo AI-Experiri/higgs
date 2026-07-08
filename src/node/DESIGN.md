@@ -19,6 +19,31 @@ to the child's synchronous `serve_state`, so the iroh boundary lives only at the
 (`data::relay_chat`) and the hub's transport (`transport::NodeTransport`), never inside a
 worker.
 
+## Control plane — the embedder drives the crate API, not HTTP
+
+There is **no `/api/higgs/*` HTTP control surface**. Fleet control is the in-process `Higgs`
+facade (`../api/embed.rs`); the only HTTP the hub serves is the strict OpenAI `/v1`. So every
+hub/fleet primitive in this folder is reached from a facade method, and node control rides the
+iroh transport — `dispatch_node_control` — never an HTTP route:
+
+```
+  embedder                 Higgs facade (api/embed.rs)     this folder's primitives
+  ─────────                ───────────────────────────     ────────────────────────
+  .hub_enable() ──────────▶ start_hub(bus, fleet)  ───────▶ hub::start_hub → Hub + accept loop
+  .hub_disable() ─────────▶ hub.shutdown()+fleet.disconnect_all
+  .pair() ────────────────▶ hub.mint_pairing()  (ticket + one-time token)
+  .node_retire()/.node_label()/.nodes() ─▶ hub.retire()/set_label()/labels(), fleet.nodes_view()
+  .node_load()/.node_unload()/.node_scan() ─▶ fleet.load()/unload()/scan_node()
+  POST /v1/chat (serve::v1) ─▶ Higgs::chat_stream ─▶ fleet.is_remote()/resolve()/chat()
+                                                        │
+                                       transport::NodeTransport (one iroh bidi stream per RPC)
+                                                        │  higgs/node/*  |  M_CHAT / M_NODE_PULL
+                                                        ▼
+  on the NODE: mod::handle_node_stream fans each inbound method to the right plane:
+        control ─▶ control::dispatch_node_control ─▶ NodeRuntime op
+        data    ─▶ data::relay_chat / relay_pull   ─▶ Supervisor (via ChatLease) / GGUF download
+```
+
 ## Core design decisions
 
 - **Reuse, don't reinvent.** The wire is the existing `RpcFrame` NDJSON; remote just adds the
@@ -100,7 +125,8 @@ HG018 → instance dropped).
 ### Pairing-lock two-phase gate (`mod.rs`, `hub.rs`)
 
 The one place with real locks is admission (`Arc<Mutex<Allowlist>>` + `Arc<Mutex<PairingTokens>>`),
-split so a slow/malicious peer can't starve other joins or `POST /api/higgs/pair`:
+split so a slow/malicious peer can't starve other joins or a concurrent pairing mint
+(`Higgs::pair()` → `Hub::mint_pairing`):
 
 1. **`gate_read_hello`** — lock-FREE. Bounds the whole pre-HELLO window (including `accept_bi`,
    which iroh defers until the opener writes) by `HELLO_DEADLINE`, caps buffered bytes

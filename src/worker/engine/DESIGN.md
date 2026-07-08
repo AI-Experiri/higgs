@@ -16,6 +16,28 @@ narrow trait, `HiggsEngine`, placed at the lowest layer that still hides every b
 That is what makes "add an engine" a local change: a new submodule + one `REGISTRY` line
 (`build_engine` in `mod.rs`, consumed by `worker/mod.rs`).
 
+```
+        the whole crate above the trait (engine-agnostic)
+  worker loop · supervisor · node runtime · serve/v1 · api::Higgs facade
+                              |
+                engine-neutral types (this mod.rs):
+       LoadParams · SamplingParams · GenParams · CtxLen · GpuLayers
+       FlashAttn · KvCacheKind · ChatResult · EngineDelta / ChatDelta
+                              |
+                   +----------v-----------+
+                   |  trait HiggsEngine   |  load · unload · is_loaded
+                   |  Box<dyn HiggsEngine>|  chat · devices
+                   +----------+-----------+
+             build_engine(HIGGS_ENGINE) picks one from REGISTRY
+                   (first entry = default = "llamacpp")
+                              |
+                   +----------v-----------+
+                   | llamacpp::           |  <- the ONLY place a backend
+                   | LlamaCppEngine       |     crate / raw FFI int appears
+                   +----------+-----------+
+                        llama.cpp FFI
+```
+
 ## The boundary is OpenAI JSON, not rendered prompts
 
 `chat()` takes `messages_json` — the OpenAI `messages` array (with `tools`, `tool_calls`, `tool`
@@ -36,7 +58,20 @@ token counts for OpenAI `usage`.
 Generation is a three-way stream — assistant answer, model thinking, tool-call fragments — and
 that distinction must survive every hop (worker RPC → supervisor demux → serve SSE / fleet
 relay) so `/v1` can emit `delta.content`, `delta.reasoning_content`, and `delta.tool_calls`
-separately. Two representations, deliberately split by ownership:
+separately.
+
+```
+ engine decode loop      worker/mod.rs      supervisor.rs      serve/stream.rs
+ (common_chat parse)         RPC              demux             -> /v1 SSE
+   sink(EngineDelta)  --encode_chunk_params-->  decode_ -->  ChatDelta{kind,text}
+   Content / Reasoning /    N_CHAT_CHUNK        chunk_        -> delta.content
+   ToolCall  (borrowed)    "higgs/chat/chunk"  params           delta.reasoning_content
+                            (additive wire)    (owned)          delta.tool_calls
+                                  |
+                    remote: node/data.rs encode --> node/transport.rs decode (fleet relay)
+```
+
+Two representations, deliberately split by ownership:
 
 - `EngineDelta<'a>` — **borrowed**, what the engine writes into the `sink` callback. Zero-copy;
   the worker serializes it straight onto the RPC wire.

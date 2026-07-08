@@ -34,13 +34,19 @@ rule in `../../CLAUDE.md`).
 
 ## Public surface (what the rest of the crate uses)
 
-- **`hub::{start_hub, Hub}`** — the server calls `start_hub(bus, existing_fleet)` in hub mode
-  and keeps the `Hub` alive: `mint_pairing()` for `POST /api/higgs/pair`, `retire`/`set_label`/
-  `labels` for `/api/higgs/nodes*`, `shutdown()` for the kill switch.
-- **`fleet::{HubFleet, NodeView, NodeKey}`** — the serve layer routes `/v1` through the fleet:
-  `is_remote(served)` / `resolve` (routing), `chat(...)` (relay), `routed_models()` (`/v1/models`),
-  `nodes_view()` (Fleet UI, merged with allowlist labels + the local node), `load`/`unload`/`kill`,
-  `disconnect_all()` (kill switch). `NodeView` derives ts-rs bindings.
+- **`hub::{start_hub, Hub}`** — there is **no `/api/higgs/*` HTTP control surface**; the embedder's
+  `Higgs` facade (`../api/embed.rs`) drives the hub via the crate API. `Higgs::hub_enable()` calls
+  `start_hub(bus, existing_fleet)` and holds the `Hub` alive; the rest of `Hub`'s methods back
+  facade calls, not routes: `mint_pairing()`/`hub_id()` ← `Higgs::pair()`, `retire()` ←
+  `node_retire()`, `set_label()` ← `node_label()`, `labels()` ← `nodes()`, `shutdown()` ←
+  `hub_disable()` (the kill switch), and `serve_node_requests` accepts a node's self-`leave` on its
+  own connection.
+- **`fleet::{HubFleet, NodeView, NodeKey}`** — the `Higgs` facade routes `/v1` chat through the
+  fleet (`api.rs`): `is_remote(served)` (remote-vs-local decision) + `resolve` / `chat(...)`
+  (relay); `routed_models()` is folded into `Higgs::chat_model_ids()` for `GET /v1/models`;
+  `nodes_view()` ← `Higgs::nodes()` (Fleet view, merged with allowlist labels + the local node);
+  `load`/`unload` ← `node_load`/`node_unload` (`kill` is the force-unload variant);
+  `disconnect_all()` ← `hub_disable()` (kill switch). `NodeView` derives ts-rs bindings.
 - **`runtime::{NodeRuntime, NodeConfig, IdleConfig, DEFAULT_IDLE_TTL}`** — the node daemon owns a
   `NodeRuntime`; the local single-machine engine also uses it as its own multi-worker orchestrator
   (`instances()` feeds served-id derivation, `events()`/`subscribe_logs()`/`bus()` feed the SSE +

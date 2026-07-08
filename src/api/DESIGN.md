@@ -2,11 +2,38 @@
 
 ## Why this module exists
 
-`Higgs` is the single host-facing seam over the runtime. Everything a host or the serve
-layer can do — load/unload a model, run a chat, read status/logs/events, toggle runtime
-settings, tune/estimate, query hardware — goes through one `Higgs` value. That one entry
-point is deliberate: hosts depend on a small, stable surface, and the wire types
-(`higgs_ts!`/`higgs_const_enum!`) are generated into `bindings/` from `api/types.rs`.
+`Higgs` is the single host-facing seam over the runtime, and — since the `/api/higgs/*`
+HTTP handlers were removed — it is also higgs's **only control plane**. Everything a
+host can do (load/unload a model, run a chat, read status/logs/events, toggle runtime
+settings, tune/estimate, mint/revoke keys, drive hub/fleet, query hardware) goes through
+one `Higgs` value as a typed, in-process method returning `Result<_, HiggsError>` — no
+HTTP required. The only HTTP surface higgs still serves is the strict OpenAI `/v1`
+(`serve::v1_router` → `serve::serve_v1`); the embedder maps a `HiggsError` however it
+wishes. That one entry point is deliberate: hosts depend on a small, stable surface, and
+the wire types (`higgs_ts!`/`higgs_const_enum!`) are generated into `bindings/` from
+`api/types.rs`.
+
+```
+   embedder                     ┌──────────────────  Higgs  (Arc)  ──────────────────┐
+   (jigglebot) ────────────────▶│  api.rs    struct + core lifecycle impl            │
+                       crate    │  embed.rs  in-process control-plane impl           │
+   serve::v1_router ───────────▶│  types.rs  wire types + consts                     │
+   (POST /v1/chat, GET /v1/     │  guards.rs pure load guards (also used by node)    │
+    models, GET /health)        └────────┬───────────────────────────┬──────────────┘
+   Arc<Higgs>                            │                            │
+                            delegates to │                            │ delegates to
+                                         ▼                            ▼
+                           serve::control (PURE helpers)      node::runtime  (LOCAL)
+                           model_entry / hub_status           workers, RPC correlation,
+                           decide_mint / decide_revoke        idle reaper, load-replay
+                           validate_key_label                        │
+                           TuneProfileViews / active_records         │  remote-resident id?
+                                                                     ▼
+                                                            node::fleet (REMOTE nodes)
+```
+
+There is NO `/api/higgs/*` HTTP surface, NO standalone control server, and NO
+jigglebot reverse-proxy: an embedder calls the facade methods directly.
 
 ## Why it is split (and how)
 
@@ -15,15 +42,23 @@ by layer, and is **behavior-preserving** (`api.rs` re-exports the submodules, so
 `crate::api::X` paths are unchanged):
 
 - **`types.rs`** — the data vocabulary (wire types + constants + the `ChatOutcome`
-  decoder). These change for protocol reasons and carry no behavior; isolating them keeps
-  the impl file about logic.
+  decoder + `PreparedChat`/`PairInfo`). These change for protocol reasons and carry no
+  behavior; isolating them keeps the impl files about logic.
 - **`guards.rs`** — pure validation/containment/headroom functions with no `Higgs` state.
   `pub(crate)` because `node::runtime` reuses `guard_memory_headroom` and
   `path_within_roots` (one guard implementation, two callers). Being state-free makes them
   unit-testable without provisioning multi-gigabyte fixtures (`fits_in_memory` is the pure
   arithmetic seam).
-- **`api.rs`** keeps the `Higgs` struct + its core lifecycle `impl`, because those are
-  tightly coupled to the struct's private fields and to each other.
+- **`embed.rs`** — the in-process control plane: a second `impl Higgs` holding the
+  behavior the deleted `/api/higgs/*` handlers used to carry (models list, load/unload
+  shaping, hub/fleet ops, trusted key mint/revoke, the chat gate, the `/v1/models`
+  union). It stays THIN by delegating the row-formatting / mint-revoke-decision /
+  hub-status / tune-view logic to the pure `serve::control` sub-primitives — the same
+  helpers the (now removed) HTTP handlers shared — so the in-process and any future
+  surface cannot diverge.
+- **`api.rs`** keeps the `Higgs` struct + its core lifecycle `impl` (construction,
+  load/unload/status/chat, the tune/estimate/Turbotune engine, the runtime toggles),
+  because those are tightly coupled to the struct's private fields and to each other.
 
 (An earlier `reaper.rs` held the engine-level idle auto-unload loop; P4b moved idle
 auto-unload INTO the node — per-worker, uniform local+remote — so that file was removed.)
@@ -41,32 +76,51 @@ routing all prefer a locally-resident model over a remote one of the same served
 - **`chat_stream`** resolves a SERVED id → `(worker, raw model)` via `local_served`,
   leases an `inference_gate` permit, and sends the RAW model on the wire; a non-local id
   falls through to the fleet (bounded by the SEPARATE `remote_gate`).
-- **`local_served_ids`** feeds `/v1/models` (∪ the fleet's routed models).
+- **`resolve_loaded`** (in `embed.rs`, behind `prepare_chat`) is the chat gate: already
+  served locally → its `LoadedInfo`; remote-resident → a permissive placeholder (the
+  fleet routes it); benchmark-owned and not remote → `[HG068]`; not loaded + JIT off →
+  `[HG003]`; not loaded + JIT on → a scanned (`[HG002]` else) + Prepared
+  (`[HG046]`/`[HG047]` else) model is loaded with its VALIDATED profile.
+- **`chat_model_ids`** feeds `/v1/models`: `local_served_ids()` ∪ (JIT-on)
+  `servable_model_ids()` ∪ `fleet().routed_models()`, minus a model whose only local
+  candidate is transiently benchmarking (unless a remote node also serves it).
 
 Worker-process lifecycle, RPC correlation, idle auto-unload, and the Developer-Log bus all
 live in the node, not the facade.
 
-### Load lifecycle & SSE phases
+### Load lifecycle & load-phase events
 
-`load` → `load_inner` → `load_inner_impl`. `load_inner` brackets the load with the
-terminal `ModelLoadPhase` events pushed over `GET /api/higgs/events`: it emits `Queued`
-FIRST (before the possibly-contended `lifecycle` lock, so the UI bar appears instantly),
-and a `TerminalGuard`+drop guarantees a terminal `Ready`/`Failed` fires even on client
+`load` → `load_inner` → `load_inner_impl`. `load_inner` brackets the load with terminal
+`ModelLoadPhase` events pushed over the `load_events` broadcast (subscribed with
+`subscribe_load_events()` — a PUSH channel of `ModelLoadEvent`, NOT an HTTP endpoint;
+the embedder fans it out to its own UI transport). It emits `Queued` FIRST (before the
+possibly-contended `lifecycle` lock, so the UI bar appears instantly), and a
+`TerminalGuard`+drop guarantees a terminal `Ready`/`Failed` fires even on client
 cancellation. `load_inner_impl` emits the mid-load phases at their real seams
 (`Preparing` after the resident no-op check → `LoadingWeights` around the multi-second
 worker load → `Finalizing` for the bookkeeping). Failure carries the diagnostic code on
-the event. A `LoadingGuard` publishes/clears the `loading` snapshot so a concurrent
-`status` can show a progress indicator; the load itself walks the G5 OOM degrade ladder
-(`run_oom_ladder`: plain retry → KV to system memory → fewer GPU layers, HG061 per rung,
-HG060 on exhaustion) and syncs the saved tuning profile — for an ACCEPTED explicit load
-(anchored to a hardware fingerprint + file signature captured BEFORE the slow load), AND
-for a REUSE load the ladder had to DEGRADE (`loaded_np != requested_np`), so the next
-reload uses the fitting config instead of re-walking the ladder. `set_profile` drops the
-record's stale `provenance`/`bench_tps` whenever the written params differ from the saved
-profile — a degraded fallback or an edited explicit reload was never the benchmarked
-config, so the store must not claim its throughput.
+the event.
 
-## G6 Turbotune — measured autotune, EXCLUSIVE benchmark (RECENT)
+```
+   subscribe_load_events()  ──▶  broadcast::Receiver<ModelLoadEvent>
+
+   Queued ─▶ Preparing ─▶ LoadingWeights ─▶ Finalizing ─▶ Ready   (terminal)
+     │           │              │                             ▲
+     └───────────┴──────────────┴───────────────────────────▶ Failed  (terminal, carries HGxxx)
+```
+
+A `LoadingGuard` publishes/clears the `loading` snapshot so a concurrent `status` can show
+a progress indicator; the load itself walks the G5 OOM degrade ladder (`run_oom_ladder`:
+plain retry → KV to system memory → fewer GPU layers, HG061 per rung, HG060 on
+exhaustion) and syncs the saved tuning profile — for an ACCEPTED explicit load (anchored
+to a hardware fingerprint + file signature captured BEFORE the slow load), AND for a REUSE
+load the ladder had to DEGRADE (`loaded_np != requested_np`), so the next reload uses the
+fitting config instead of re-walking the ladder. `set_profile` drops the record's stale
+`provenance`/`bench_tps` whenever the written params differ from the saved profile — a
+degraded fallback or an edited explicit reload was never the benchmarked config, so the
+store must not claim its throughput.
+
+## G6 Turbotune — measured autotune, EXCLUSIVE benchmark
 
 `tune(req)` normally returns an analytical `Suggest`. When `req.mode == Benchmark` it
 runs **Turbotune**: `turbotune_bench` seeds candidate configs from the analytical
@@ -92,9 +146,9 @@ set by `begin_benchmark(id)` UNDER the `lifecycle` lock and cleared by the RAII
   a racing public load can't slip between the check and the flag-set.
 - While a benchmark runs, every public path for that model refuses with `[HG068]`
   (`BenchInProgress`, retry ~5 min): `load_inner_impl` (explicit + JIT load, checked
-  under `lifecycle` BEFORE the resident no-op), the serve layer's `ensure_loaded`
+  under `lifecycle` BEFORE the resident no-op), the chat gate's `resolve_loaded`
   (checked AFTER the awaited resident lookup — a pre-check would go stale across the
-  await), `unload`/`unload_one`/`worker-stop` (a drain would evict the candidate
+  await), `unload`/`unload_one`/`worker_stop` (a drain would evict the candidate
   mid-measure), and the public `chat_stream` local resolution, which SKIPS a
   benchmark-owned worker (`serve_public` flag) — with a fleet installed the chat can
   still route to a REMOTE copy of the same id. The bench's OWN loads / teardown /
@@ -104,20 +158,22 @@ set by `begin_benchmark(id)` UNDER the `lifecycle` lock and cleared by the RAII
   `shutting_down: AtomicBool` BEFORE draining, and `run_benchmark`'s per-candidate
   cancel hook polls it — the bench aborts cleanly with `[HG064]` (`BenchCancelled`)
   instead of iterating candidates against a draining node. (Normally the in-flight
-  benchmark request drains before `stop` runs; this is defense-in-depth.)
+  benchmark drains before `stop` runs; this is defense-in-depth.)
 
-CANCELLATION SAFETY: if the benchmark future is dropped mid-candidate (long-op route
-timeout / client disconnect), the OWNING `BenchmarkingGuard` — which tracks the LIVE
+CANCELLATION SAFETY: if the benchmark future is dropped mid-candidate (client disconnect
+/ a caller-imposed deadline), the OWNING `BenchmarkingGuard` — which tracks the LIVE
 candidate's `WorkerId` in its `live` slot — spawns a task that unloads exactly that
 worker and only THEN clears the [HG068] flag (clearing first would open a window where
 a public chat/load could adopt the doomed candidate before the unload kills it). The
 leftover candidate is thus auto-reclaimed instead of being served publicly with an
 unchosen config. Worker-id-scoped (never id-scoped), so it cannot stomp a worker a user
 loads after the flag clears; on every normal exit the slot is `None` and the flag is
-cleared synchronously. `/api/higgs/models/tune`
-and `/models/load` sit in the serve layer's `LONG_OP_TIMEOUT` (20 min) router group so a
-multi-candidate benchmark / multi-rung OOM ladder is not 408-cancelled by the 120 s
-control timeout.
+cleared synchronously.
+
+Because control is IN-PROCESS, a multi-candidate benchmark / multi-rung OOM ladder is
+bounded only by the caller's own await — there is no HTTP request timeout to 408-cancel
+it (the removed `/api/higgs/*` control routes once needed a 20-minute long-op group; the
+`/v1` chat path is separately un-timed at the HTTP layer).
 
 ## Concurrency / locking model
 
@@ -130,7 +186,7 @@ discipline. Summary:
 - **`hub_lifecycle: tokio::sync::Mutex<()>`** — separate serialization of the hub kill
   switch enable/disable across its whole check→start→publish / shutdown→clear sequence;
   SEPARATE from `lifecycle` so model ops and hub ops never cross-couple. Held across
-  `.await`.
+  `.await`. (`hub_enable`/`hub_disable`/`pair`/`node_label` in `embed.rs` all take it.)
 - **`inference_gate` / `remote_gate: Arc<Semaphore>`** — bound in-flight local vs remote
   chats at `MAX_CONCURRENT_INFERENCE` each. `try_acquire_owned` failure on the chat path
   → `ServerBusy` (503); the owned permit rides the spawned generation task and releases on
@@ -146,9 +202,9 @@ discipline. Summary:
   w.r.t. the others (the whole file is atomically temp+renamed, so last-writer-wins would
   otherwise clobber); the Turbotune `benchmarking` id set (set/cleared under `lifecycle`,
   read lock-free by the HG068 gates); the caches `device_cache`, `estimate_meta_cache`;
-  the swappable installers `fleet`, `api_keys`, `hub`; the `loading` snapshot; and
-  `config_path`.
-- **`load_events: broadcast::Sender<ModelLoadEvent>`** — live SSE fan-out; a `send` with
+  the swappable installers `fleet`, `api_keys`, `hub`; the `loading` snapshot;
+  `key_touch_throttle`; and `config_path`.
+- **`load_events: broadcast::Sender<ModelLoadEvent>`** — live PUSH fan-out; a `send` with
   no subscribers is a harmless no-op, and there is no replay ring (the bar is transient).
 
 ## Invariants
@@ -168,40 +224,53 @@ discipline. Summary:
    model refuses ([HG068]) rather than racing it; only a terminal shutdown cancels it
    ([HG064]). The bench's own loads/teardown/measurement are on private, ungated paths
    so it never refuses itself.
-5. **Loopback-only.** `BIND_HOST` is `127.0.0.1`; the `lan_exposed` flag gates the
-   last-key-revoke refusal (HG059) so a LAN-exposed server can't flip auth off at runtime.
+5. **Trusted control keeps the auth invariants.** `mint_key`/`revoke_key` skip ONLY the
+   bearer check; they still enforce label validation, `Duplicate`, `BootstrapNeedsAdmin`
+   ([HG066] last-admin), and the last-key-on-LAN refusal ([HG059], gated by the
+   `lan_exposed` flag) via the shared `serve::control` decisions — so an in-process
+   caller cannot flip auth off in a way the HTTP path forbade.
+6. **Loopback-only by default.** `BIND_HOST` is `127.0.0.1`; `lan_exposed` records a
+   deliberate non-loopback bind so the key-revoke gate can refuse dropping the last key
+   while LAN-exposed.
 
 ## Error codes this module owns / raises
 
-Raised directly in this folder:
+Raised directly in this folder (`api.rs`, `embed.rs`, `guards.rs`):
 
 | Code | Variant | Where / meaning |
 |------|---------|-----------------|
 | HG014 | `ServerBusy` | `chat_stream` admission gate full → 503 (retryable). |
 | HG015 | `InvalidModelId` | `guards::validate_repo_id` — bad charset / `..` traversal → 400. |
 | HG017 | `InsufficientMemory` | `guards::guard_memory_headroom` — load exceeds `MEMORY_HEADROOM_FRACTION` of available RAM → 503. |
-| HG040 | `PersistenceFailed` | `tune` / `sync_saved_profile` — `models.json` open/flush failed. |
+| HG040 | `PersistenceFailed` | `tune` / `sync_saved_profile` / `node_label` — `models.json`/`config.json` open/flush failed. |
 | HG044 | `ChatTaskFailed` | `measure_gen_tps` — the spawned generation task join failed. |
-| HG047 | `ProfileStale` | `load_inner_impl` reuse of a stale saved profile (hardware/file changed since Prepare) — re-tune or load with explicit params. |
+| HG046 | `NotPrepared` | `resolve_loaded` JIT gate — the model was never Prepared (no saved profile). |
+| HG047 | `ProfileStale` | `resolve_loaded` / `load_inner_impl` reuse of a stale saved profile (hardware/file changed since Prepare) — re-tune or load with explicit params. |
 | HG060 | `LoadOomExhausted` | `run_oom_ladder` exhausted the OOM degrade ladder. |
 | HG063 | `BenchExhausted` | `run_benchmark` found no working config. |
 | HG064 | `BenchCancelled` | Turbotune bench aborted by a terminal shutdown (`stop` sets `shutting_down`; the per-candidate cancel hook trips). |
 | HG067 | `BenchModelLoaded` | `turbotune_bench` — the model is loaded; unload it first to benchmark → 409. |
-| HG068 | `BenchInProgress` | `load_inner_impl` / `unload` / `unload_one` / a second `turbotune_bench` — a benchmark owns the model; retry ~5 min → 503. (Also raised by the serve layer's `ensure_loaded`.) |
-| HG002 | `ModelNotFound` | `tune` scan miss for the requested id. |
-| HG019 | `ServingDisabled` | The `serving_enabled` toggle (surfaced by the serve layer when off). |
+| HG068 | `BenchInProgress` | `load_inner_impl` / `resolve_loaded` / `unload` / `unload_one` / a second `turbotune_bench` — a benchmark owns the model; retry ~5 min → 503. |
+| HG002 | `ModelNotFound` | `tune`/`estimate`/`model_by_id`/`resolve_loaded` scan miss for the requested id. |
+| HG003 | `ModelNotLoaded` | `resolve_loaded` — the model is not resident and JIT is off. |
+| — | `HubControlFailed` | `hub_enable`/`pair`/`node_*` — the server is not a hub, or an iroh op failed → 409/500. |
 
 `[HG061]` (degrade-rung retry) and `[HG065]` (a failed bench candidate) are structured
-LOG lines, not error variants. Codes like HG001/HG002/HG005/HG016/HG004/HG006 originate in
-the node/worker/scan paths this facade delegates to.
+LOG lines, not error variants. `[HG019]` `ServingDisabled` is raised by the SERVE layer
+(`serve::v1`) when the facade's `serving_enabled` toggle is off. Codes like
+HG001/HG005/HG016/HG018 originate in the node/worker/scan paths this facade delegates to.
 
 ## Boundaries / what does NOT belong here
 
 - Worker-process lifecycle, RPC correlation, restart FSM → `supervisor.rs`.
 - Multi-worker orchestration + the node idle reaper → `node/runtime.rs`.
 - Remote fleet routing + served-instance ids → `node/fleet.rs`, `node/served.rs`.
+- The row-formatting / mint-revoke decision / hub-status / tune-view PURE helpers that
+  `embed.rs` delegates to → `serve/control.rs`.
 - The candidate generation / benchmarked-pick / fit math for Turbotune → `tune/bench.rs`,
   `tune/vram.rs` (this module only orchestrates load→measure→cancel around them).
+- Router assembly, the auth/host/CORS layers, and HTTP status mapping → `serve/mod.rs`,
+  `serve/v1.rs`.
 
 ## Deferred / residual items
 
@@ -210,10 +279,9 @@ the node/worker/scan paths this facade delegates to.
   Self-healing (the cancelled load's `LoadCommit` reaps its worker) and RAM-bounded; a
   fully cancellation-safe dedup would change the node's additive contract — deferred.
   The SAME window exists when a Turbotune benchmark is cancelled while its candidate
-  `local.load` is still pending (codex r19): `live` is unset, so the guard clears the
-  [HG068] flag and a racing public load can start before the doomed candidate load
-  commits-and-reaps. Identical mechanism, identical self-healing bound — covered by
-  this deferral, not a new class.
+  `local.load` is still pending: `live` is unset, so the guard clears the [HG068] flag
+  and a racing public load can start before the doomed candidate load commits-and-reaps.
+  Identical mechanism, identical self-healing bound — covered by this deferral.
 - **Served-id stability** (`unload_one`/`chat_stream`): suffixed ids (`org/model-1`)
   renumber when a sibling is reaped, so a request from a stale snapshot can hit a different
   instance. A property of the served-id SCHEME; the stable worker-id/generation selector is
@@ -222,3 +290,4 @@ the node/worker/scan paths this facade delegates to.
   per-node TTL, so it is currently always absent.
 - Prompt-throughput in `measure_gen_tps` is approximated from prompt tokens over TTFT;
   exact prefill timing is a worker-side refinement.
+</content>
