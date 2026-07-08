@@ -14,6 +14,7 @@ fn fake_higgs(dirs: Vec<PathBuf>) -> Higgs {
         hf_dirs: vec![],
         ollama_dirs: vec![],
         default_load: HiggsConfig::default().default_load,
+        worker_exe: None,
     };
     Higgs::with_local(Arc::new(node), cfg)
 }
@@ -706,6 +707,7 @@ async fn local_loaded_info_busy_worker_returns_permissive_stub() {
         hf_dirs: vec![],
         ollama_dirs: vec![],
         default_load: HiggsConfig::default().default_load,
+        worker_exe: None,
     };
     let higgs = Higgs::with_local(Arc::new(node), cfg);
 
@@ -1199,6 +1201,7 @@ fn fake_higgs_ollama(ollama_dirs: Vec<PathBuf>) -> Higgs {
         hf_dirs: vec![],
         ollama_dirs,
         default_load: HiggsConfig::default().default_load,
+        worker_exe: None,
     };
     Higgs::with_local(Arc::new(node), cfg)
 }
@@ -1700,81 +1703,6 @@ async fn benchmark_refuses_while_already_benchmarking() {
         "expected HG068 BenchInProgress, got {err:?}"
     );
     drop(bench);
-}
-
-/// A Turbotune benchmark deliberately outlives the tight control timeout: it loads
-/// + measures several candidates back-to-back (each preceded by a 750ms settle), so
-/// on a real model it runs for minutes. The `/api/higgs/models/tune` route lives in
-/// its own longer-timeout group, so it must NOT be aborted by the control timeout.
-/// Here the REAL router is built with a 200ms control timeout — shorter than a
-/// single settle — yet the benchmark completes (200), because tune uses the 30s
-/// bound. Fail-on-revert: put the tune route back under the control timeout and the
-/// benchmark is cancelled (408) instead.
-#[tokio::test]
-async fn benchmark_tune_outlives_the_control_timeout() {
-    use tower::ServiceExt as _;
-    let dir = tempfile::TempDir::new().unwrap();
-    let id = stage_ollama_model(dir.path(), "tiny", "1b");
-    let higgs = Arc::new(fake_higgs_ollama(vec![dir.path().to_path_buf()]));
-    // The REAL router, but with a control timeout FAR shorter than the benchmark's
-    // own settle pauses and a generous tune timeout.
-    let app = crate::serve::router_with_host_policy(
-        higgs,
-        true,
-        std::time::Duration::from_millis(200), // control surface
-        std::time::Duration::from_secs(30),    // tune surface
-    );
-    let req = axum::http::Request::builder()
-        .method("POST")
-        .uri("/api/higgs/models/tune")
-        .header("host", "127.0.0.1")
-        .header("content-type", "application/json")
-        .body(axum::body::Body::from(
-            serde_json::json!({ "id": id, "mode": "benchmark" }).to_string(),
-        ))
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(
-        resp.status(),
-        axum::http::StatusCode::OK,
-        "benchmark tune (multi-candidate, >200ms) must survive the control timeout — \
-         it is in the longer long-op timeout group, not the control group"
-    );
-}
-
-/// A model LOAD also escapes the tight control timeout: it can walk the OOM
-/// degrade-retry ladder (several worker loads + settle sleeps), so it lives in the
-/// long-op timeout group beside tune. Here the REAL router is built with a 1ms
-/// control timeout — which would 408 any real control op — yet the load completes
-/// (200) via the 30s long-op bound. Fail-on-revert: move the load route back under
-/// the control timeout and the load is cancelled (408) instead.
-#[tokio::test]
-async fn model_load_outlives_the_control_timeout() {
-    use tower::ServiceExt as _;
-    let dir = tempfile::TempDir::new().unwrap();
-    crate::serve::test_support::write_gguf_fixture(dir.path(), "org/model");
-    let higgs = Arc::new(fake_higgs(vec![dir.path().to_path_buf()]));
-    let app = crate::serve::router_with_host_policy(
-        higgs,
-        true,
-        std::time::Duration::from_millis(1), // control surface — trips on any real op
-        std::time::Duration::from_secs(30),  // long-op surface
-    );
-    let req = axum::http::Request::builder()
-        .method("POST")
-        .uri("/api/higgs/models/load")
-        .header("host", "127.0.0.1")
-        .header("content-type", "application/json")
-        .body(axum::body::Body::from(
-            serde_json::json!({ "id": "org/model" }).to_string(),
-        ))
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(
-        resp.status(),
-        axum::http::StatusCode::OK,
-        "model load must survive the control timeout — it is in the long-op group"
-    );
 }
 
 /// A terminal `stop` (shutdown) aborts an in-flight Turbotune benchmark with
@@ -2456,6 +2384,7 @@ fn fake_higgs_oom_twice(dirs: Vec<PathBuf>) -> Higgs {
         hf_dirs: vec![],
         ollama_dirs: vec![],
         default_load: HiggsConfig::default().default_load,
+        worker_exe: None,
     };
     Higgs::with_local(Arc::new(node), cfg)
 }

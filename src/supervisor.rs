@@ -4,10 +4,10 @@
 //! worker on death (one attempt per death), and re-loads the last model
 //! after restart.
 //!
-//! ## Transport shape — mirroring `mcp/registry.rs add_local`
+//! ## Transport shape — child-process stdio
 //!
-//! The reference implementation uses `tokio::process::Command` with owned
-//! stdio halves.  Higgs mirrors this directly:
+//! The worker is spawned with `tokio::process::Command` over owned
+//! stdio halves:
 //!
 //! ```text
 //!  production factory                  test factory
@@ -26,8 +26,7 @@
 //! ```
 //!
 //! No transport trait.  No mutex between writer and reader.  The mpsc channel
-//! serialises concurrent callers onto the single writer task — same pattern as
-//! rmcp's `TokioChildProcess` / LSP client writers.
+//! serialises concurrent callers onto the single writer task.
 
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -83,7 +82,7 @@ pub(crate) const CHAT_RPC_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// Bound on the single M_SYSINFO round-trip in [`Supervisor::sysinfo`]. Device
 /// enumeration is a cheap FFI registry read with no model load, so it completes
 /// near-instantly; the bound exists only so a wedged transient worker can never
-/// hang the `GET /api/higgs/system` handler. On expiry the device list is empty.
+/// hang the `system` control-op (`SystemInfo`) query. On expiry the device list is empty.
 const SYSINFO_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 higgs_ts! {
@@ -290,6 +289,26 @@ impl Supervisor {
     /// [`HiggsLogLayer`], so worker stderr and request-event lines land in one
     /// place.
     pub(crate) fn spawn(bus: Arc<LogBus>) -> Self {
+        // `None` exe ⇒ the factory re-execs `current_exe()` at each (re)spawn —
+        // the production default, byte-identical to the pre-seam behavior.
+        Self::from_factory(bus, Box::new(production_factory))
+    }
+
+    /// Create a supervisor whose worker role is hosted by `exe` (the DI seam):
+    /// each (re)spawn re-execs `exe --higgs-worker` instead of `current_exe()`.
+    ///
+    /// Used by an embedder whose current executable cannot host the worker role
+    /// (e.g. an integration-test binary — libtest ignores `--higgs-worker`) — it
+    /// points at the real, worker-capable `higgs` binary. `spawn` (the `None`
+    /// [`HiggsConfig::worker_exe`] default) stays exactly as before.
+    pub(crate) fn spawn_with_exe(bus: Arc<LogBus>, exe: std::path::PathBuf) -> Self {
+        Self::from_factory(bus, worker_factory(exe))
+    }
+
+    /// Shared constructor: build the supervisor around `bus` + an injected
+    /// `factory`. Single home for the `Inner` field initialization so `spawn`,
+    /// `spawn_with_exe`, and the test `with_factory` all agree.
+    fn from_factory(bus: Arc<LogBus>, factory: HalvesFactory) -> Self {
         let (events_tx, _) = broadcast::channel(64);
         let inner = Arc::new(Inner {
             demux: crate::actor::ReplyDemux::new(),
@@ -303,7 +322,7 @@ impl Supervisor {
             running: AtomicBool::new(false),
             write_tx: Mutex::new(None),
             proc: tokio::sync::Mutex::new(None),
-            factory: Box::new(production_factory),
+            factory,
         });
         Self { inner }
     }
@@ -314,22 +333,7 @@ impl Supervisor {
     /// EOF-then-factory-failure returns `Err(WorkerSpawnFailed)` on the second call.
     #[cfg(test)]
     pub(crate) fn with_factory(factory: HalvesFactory) -> Self {
-        let (events_tx, _) = broadcast::channel(64);
-        let inner = Arc::new(Inner {
-            demux: crate::actor::ReplyDemux::new(),
-            next_id: AtomicU64::new(1),
-            generation: AtomicU64::new(0),
-            load_epoch: AtomicU64::new(0),
-            events_tx,
-            bus: Arc::new(LogBus::new()),
-            last_load: Mutex::new(None),
-            stopped: AtomicBool::new(false),
-            running: AtomicBool::new(false),
-            write_tx: Mutex::new(None),
-            proc: tokio::sync::Mutex::new(None),
-            factory,
-        });
-        Self { inner }
+        Self::from_factory(Arc::new(LogBus::new()), factory)
     }
 
     // ── Per-supervisor log/event/verbose accessors ─────────────────────────────
@@ -1312,14 +1316,35 @@ async fn replay_load_await(inner: &Arc<Inner>, params: Value) -> Result<(), Higg
     replay_rpc_await(inner, M_LOAD, params).await.map(|_| ())
 }
 
-/// Production factory: re-exec current binary with `--higgs-worker`.
+/// Production factory: re-exec the CURRENT binary with `--higgs-worker`.
 ///
-/// Spawns via `tokio::process::Command` with `stdin` + `stdout` piped.
-/// Takes owned `ChildStdin` and `ChildStdout` halves — independently owned
-/// by construction, no mutex between reader and writer.
-/// Wires a blocking stderr drain task to fill the ring.
+/// The `None` [`HiggsConfig::worker_exe`](crate::api::HiggsConfig) default. Resolves
+/// `current_exe()` at each (re)spawn and delegates to [`spawn_worker_process`], so
+/// this stays byte-identical to the pre-seam behavior.
 fn production_factory(bus: Arc<LogBus>, model: &str) -> Result<WorkerHalves, HiggsError> {
     let exe = std::env::current_exe().map_err(|e| HiggsError::WorkerSpawnFailed { source: e })?;
+    spawn_worker_process(exe, bus, model)
+}
+
+/// Build a [`HalvesFactory`] that hosts the worker role in `exe` (the DI seam):
+/// each (re)spawn re-execs `exe --higgs-worker` via [`spawn_worker_process`],
+/// identical to [`production_factory`] except the executable is fixed rather than
+/// re-resolved from `current_exe()`. Used by [`Supervisor::spawn_with_exe`].
+fn worker_factory(exe: std::path::PathBuf) -> HalvesFactory {
+    Box::new(move |bus, model| spawn_worker_process(exe.clone(), bus, model))
+}
+
+/// Spawn one worker process from `exe`: `tokio::process::Command` with `stdin` +
+/// `stdout` piped, owned `ChildStdin`/`ChildStdout` halves (independently owned —
+/// no mutex between reader and writer), the argv0 `higgs(<model>)` stamp, the
+/// `HIGGS_WORKER_VERBOSE` seed, and a blocking stderr drain task that fills the
+/// ring. Shared by [`production_factory`] (`current_exe()`) and [`worker_factory`]
+/// (a fixed exe) so both spawn IDENTICALLY apart from which executable is launched.
+fn spawn_worker_process(
+    exe: std::path::PathBuf,
+    bus: Arc<LogBus>,
+    model: &str,
+) -> Result<WorkerHalves, HiggsError> {
     let mut cmd = Command::new(exe);
     // Stamp argv0 as `higgs(<model>)` so the worker is identifiable in `ps`.
     // Cosmetic only — the model still loads via the M_LOAD RPC. `tokio::process::

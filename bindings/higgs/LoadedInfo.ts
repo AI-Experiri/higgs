@@ -57,7 +57,7 @@ has_chat_template?: boolean,
  * Per-load idle-TTL override in minutes. RESERVED: per-load idle-TTL
  * enforcement is a deferred follow-up (the node reaper applies one per-node
  * TTL to every worker), so this is currently ALWAYS absent — every loaded
- * model uses the global idle TTL (`/api/higgs/settings`). It becomes
+ * model uses the global idle TTL (`HiggsRuntimeSettings`). It becomes
  * populated only once the reaper honors per-worker overrides.
  */
 idle_ttl_minutes?: number, };

@@ -2,7 +2,8 @@
 import type { Scope } from "./Scope";
 
 /**
- * `POST /api/higgs/keys` request: mint a key. Omitted `scopes` defaults to
+ * The key-mint control-op request (`Higgs::mint_key`, formerly
+ * `POST /api/higgs/keys`): mint a key. Omitted `scopes` defaults to
  * `[chat, models]` (the CLI's default) — pass `["admin"]` explicitly for a
  * management key.
  */

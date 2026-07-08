@@ -2,7 +2,8 @@
 import type { FitReport } from "./FitReport";
 
 /**
- * Response for `POST /api/higgs/models/estimate`: the VRAM + RAM footprint of the
+ * Response for the `estimate` control-op (`Higgs::estimate`, formerly
+ * `POST /api/higgs/models/estimate`): the VRAM + RAM footprint of the
  * candidate load against the detected machine (verdict + needed/basis bytes).
  */
 export type EstimateReport = { 

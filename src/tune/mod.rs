@@ -147,8 +147,9 @@ higgs_ts! {
 }
 
 higgs_ts! {
-    /// Request body for `POST /api/higgs/models/tune` (the model id is in the body,
-    /// not the path — higgs ids are slashed/colon'd).
+    /// Request body for the `tune` control-op (`Higgs::tune`, formerly
+    /// `POST /api/higgs/models/tune`; the model id is in the body, not the path —
+    /// higgs ids are slashed/colon'd).
     #[derive(Debug, Clone, Deserialize)]
     pub struct TuneRequest {
         /// HuggingFace repo id (or `ollama/name:tag`) of the model to tune.
@@ -199,7 +200,8 @@ higgs_ts! {
 }
 
 higgs_ts! {
-    /// Request for `POST /api/higgs/models/estimate`: the memory footprint of a
+    /// Request for the `estimate` control-op (`Higgs::estimate`, formerly
+    /// `POST /api/higgs/models/estimate`): the memory footprint of a
     /// CANDIDATE load (the user's current context window / KV types / GPU offload),
     /// so the UI shows "≈ X GiB VRAM · Fits/Tight/Overflow" live as they edit. Pure +
     /// cheap (no model load) — higgs OWNS the formula (reuses the suggester's VRAM/RAM
@@ -244,7 +246,8 @@ higgs_ts! {
 }
 
 higgs_ts! {
-    /// Response for `POST /api/higgs/models/estimate`: the VRAM + RAM footprint of the
+    /// Response for the `estimate` control-op (`Higgs::estimate`, formerly
+    /// `POST /api/higgs/models/estimate`): the VRAM + RAM footprint of the
     /// candidate load against the detected machine (verdict + needed/basis bytes).
     #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
     pub struct EstimateReport {

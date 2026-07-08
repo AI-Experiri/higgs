@@ -1,69 +1,35 @@
-//! Black-box auth (P5): spawn the real `higgs` with an `api_keys.json` and verify the bearer
-//! middleware over HTTP — unauthenticated requests are 401, scoped keys reach only their
-//! routes, admin reaches everything, and health is always open.
+//! Black-box auth (P5): mint API keys via the in-process facade, then drive the REAL `/v1`
+//! HTTP surface (`serve_v1_local`) to verify the bearer middleware — unauthenticated requests
+//! are 401 (with a `WWW-Authenticate` challenge + the HG048 diagnostic), scoped keys reach only
+//! their routes, admin reaches everything, and `/health` is always open.
 
 mod common;
 
-use std::process::{Child, Command};
-use std::time::Duration;
+use higgs::keys::Scope;
 
-use higgs::keys::{ApiKeys, Scope};
-
-use common::{stage_tiny_model, tiny_gguf_path};
-
-struct Server(Child);
-impl Drop for Server {
-    fn drop(&mut self) {
-        unsafe { libc::kill(self.0.id() as libc::pid_t, libc::SIGTERM) };
-        let _ = self.0.wait();
-    }
-}
+use common::{higgs_local, serve_v1_local, TINY_MODEL_ID};
 
 #[tokio::test]
 async fn api_keys_gate_the_http_surface() {
-    let Some(gguf) = tiny_gguf_path() else {
+    let Some(higgs) = higgs_local(&[TINY_MODEL_ID]).await else {
         eprintln!("SKIP api_keys_gate_the_http_surface: tiny gguf not found");
         return;
     };
-    let scan_root = stage_tiny_model(&gguf);
-    let home = tempfile::tempdir().expect("home");
 
-    // Write an api_keys.json with a chat-only key and an admin key (known plaintext tokens).
-    let mut keys = ApiKeys::default();
-    keys.add("hgk_chatkey", "chat".into(), vec![Scope::Chat]);
-    keys.add("hgk_adminkey", "admin".into(), vec![Scope::Admin]);
-    keys.save(&home.path().join("api_keys.json"))
-        .expect("write keys");
+    // Mint keys through the trusted in-process facade. The FIRST key must include `admin`
+    // (bootstrap invariant), so mint the admin key first, then a chat-only key. Minting makes
+    // the keystore non-empty, which turns the bearer middleware ON for the served `/v1` surface.
+    let admin_token = higgs
+        .mint_key("admin", Some(vec![Scope::Admin]))
+        .expect("mint admin key")
+        .token;
+    let chat_token = higgs
+        .mint_key("chat", Some(vec![Scope::Chat]))
+        .expect("mint chat key")
+        .token;
 
-    // Grab an ephemeral free port (bind :0, read it, release) to avoid a fixed-port clash.
-    let port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-        l.local_addr().unwrap().port()
-    };
-    let child = Command::new(env!("CARGO_BIN_EXE_higgs"))
-        .env("HIGGS_BIND", "127.0.0.1")
-        .env("HIGGS_PORT", port.to_string())
-        .env("HIGGS_HOME", home.path())
-        .env("HIGGS_MODEL_DIR", scan_root.path())
-        .env("RUST_LOG", "warn")
-        .spawn()
-        .expect("spawn higgs");
-    let _server = Server(child);
-    let base = format!("http://127.0.0.1:{port}");
+    let (base, guard) = serve_v1_local(higgs.handle()).await;
     let c = reqwest::Client::new();
-
-    // Wait for readiness (health is open, no auth needed).
-    let mut ready = false;
-    for _ in 0..150 {
-        if let Ok(r) = c.get(format!("{base}/health")).send().await {
-            if r.status().is_success() {
-                ready = true;
-                break;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    assert!(ready, "server became ready");
 
     // Health is always open (no key).
     assert!(c
@@ -93,7 +59,7 @@ async fn api_keys_gate_the_http_surface() {
     // Chat-scoped key can't list models (needs Models) → 401.
     let chat_on_models = c
         .get(format!("{base}/v1/models"))
-        .bearer_auth("hgk_chatkey")
+        .bearer_auth(&chat_token)
         .send()
         .await
         .unwrap();
@@ -102,7 +68,7 @@ async fn api_keys_gate_the_http_surface() {
     // Admin key can list models → 200.
     let admin_models = c
         .get(format!("{base}/v1/models"))
-        .bearer_auth("hgk_adminkey")
+        .bearer_auth(&admin_token)
         .send()
         .await
         .unwrap();
@@ -112,14 +78,19 @@ async fn api_keys_gate_the_http_surface() {
         admin_models.status()
     );
 
-    // Admin gates management: load without a key → 401; with admin → not 401.
-    let load_no_key = c
-        .post(format!("{base}/api/higgs/models/load"))
-        .json(&serde_json::json!({ "id": "x/y" }))
+    // The gated chat route also requires a key: no key → 401 (auth runs before the handler, so
+    // this is a pure auth check independent of any model being loaded). This preserves the
+    // original "a gated route with no key is 401" intent — the old assertion pointed at the
+    // now-deleted `/api/higgs/models/load` management route; management moved to the crate API
+    // and is no longer part of the HTTP surface, so we re-target the check at the served `/v1`
+    // chat route.
+    let chat_no_key = c
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({ "model": TINY_MODEL_ID, "messages": [] }))
         .send()
         .await
         .unwrap();
-    assert_eq!(load_no_key.status(), 401, "management requires a key");
+    assert_eq!(chat_no_key.status(), 401, "gated chat route requires a key");
 
     // A bogus token is rejected too.
     let bogus = c
@@ -129,4 +100,7 @@ async fn api_keys_gate_the_http_surface() {
         .await
         .unwrap();
     assert_eq!(bogus.status(), 401, "unknown token is 401");
+
+    guard.shutdown().await;
+    higgs.shutdown().await;
 }

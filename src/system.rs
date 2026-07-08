@@ -1,4 +1,5 @@
-//! Host hardware + inference-runtime info for `GET /api/higgs/system`.
+//! Host hardware + inference-runtime info for the `system` control-op (formerly
+//! `GET /api/higgs/system`).
 //!
 //! Mirrors the panels LM Studio shows (Hardware, Runtime): CPU/RAM/usage from
 //! the `sysinfo` crate, and the engine/backend higgs runs on. All values are
@@ -98,7 +99,8 @@ higgs_ts! {
 }
 
 higgs_ts! {
-    /// Response for `GET /api/higgs/system`: hardware + runtime + server config.
+    /// The `system` control-op response (formerly `GET /api/higgs/system`):
+    /// hardware + runtime + server config.
     #[derive(Debug, Clone, Serialize)]
     pub struct SystemInfo {
         /// Host hardware (CPU, RAM, live load).
@@ -232,7 +234,7 @@ impl SystemInfo {
             // Report the backend llama.cpp was actually COMPILED with. macOS links
             // Metal; a Linux release built `--features cuda` (→ `llama-cpp-2/cuda`)
             // links CUDA; everything else is a CPU build. A plain `target_os` check
-            // mislabelled CUDA builds as "CPU", misleading `/api/higgs/system` + node
+            // mislabelled CUDA builds as "CPU", misleading the `system` control-op + node
             // inventory (and any remote scheduling/diagnostics keyed on this field).
             backend: if cfg!(target_os = "macos") {
                 "Metal".to_string()

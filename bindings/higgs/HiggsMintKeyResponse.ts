@@ -2,7 +2,8 @@
 import type { Scope } from "./Scope";
 
 /**
- * `POST /api/higgs/keys` response. `token` is the plaintext — shown THIS
+ * The key-mint control-op response (`Higgs::mint_key`, formerly
+ * `POST /api/higgs/keys`). `token` is the plaintext — shown THIS
  * ONCE, never persisted, never logged; the caller must store it now.
  */
 export type HiggsMintKeyResponse = { label: string, scopes: Array<Scope>, token: string, };

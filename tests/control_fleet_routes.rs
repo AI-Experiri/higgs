@@ -1,302 +1,175 @@
-//! Black-box HUB control routes that need a LIVE fleet — the ERROR/edge HTTP branches of the
-//! node-mutation handlers in `src/serve/control.rs` that only fire when a hub IS enabled and a
-//! node IS paired (so the `not_a_hub` 409 guard is passed and we reach `fleet`/`hub` ops).
+//! Hub control ops that need a LIVE fleet — the ERROR/edge arms of the node-mutation facade
+//! methods (`Higgs::node_load` / `node_scan` / `node_unload` / `node_retire` / `node_label`)
+//! that only fire when a hub IS enabled and a node IS paired (so the fleet/hub is present and
+//! the op itself reaches the remote link).
 //!
-//! `hub_server.rs` already drives the HAPPY paths of these routes (pair → nodes → load → models →
-//! retire/label/leave) end-to-end. This file deliberately targets the lines those don't reach:
-//! the `Err(...)` arms of `control_nodes_load`, `control_node_models`, and `control_nodes_unload`
-//! when the hub+fleet is present but the operation itself fails (unknown node → HG027 503,
-//! unknown model → 4xx, unknown served id → HG002 404), plus the unknown-node retire/relabel
-//! flows against a real (single-node) fleet.
+//! `remote_hub_e2e.rs` drives the HAPPY paths of the fleet seam (pair → load → chat → retire)
+//! end-to-end. This file deliberately targets the `Err(...)` arms those don't reach: an unknown
+//! node → HG027 `NodeUnreachable`; an unknown served id → HG002 `ModelNotFound`; an unknown model
+//! on a REAL node → a relayed load failure; plus the unknown-node retire/relabel flows against a
+//! real (single-node) fleet.
 //!
-//! Pattern is copied verbatim from `hub_server.rs`: spawn a real `higgs` in HUB mode with hermetic
-//! iroh, mint a pairing token over `POST /api/higgs/pair`, dial it with a real `higgs --node`, and
-//! wait until the remote node shows connected in `GET /api/higgs/nodes`. Then exercise the error
-//! arms over HTTP. Pairing needs no GGUF, so the node/fleet always stands up; the load-a-real-model
-//! happy assertion runs only when a tiny GGUF is available.
+//! higgs is now library-first: control is the in-process `Higgs` crate API, not the deleted
+//! `/api/higgs/*` HTTP surface. So instead of spawning a hub `higgs` server + minting a pairing
+//! token over `POST /api/higgs/pair`, we run the hub IN-PROCESS (`Higgs::hub_enable`), mint the
+//! token over `Higgs::pair`, dial it with a real `higgs --node` child, and wait until the remote
+//! node shows connected in `Higgs::nodes()`. Then exercise the error arms on the facade. Pairing
+//! needs no GGUF for the node to CONNECT, but this harness stages the tiny model so the node can
+//! also load it (the happy fleet-load assertion). The test SKIPs when no tiny GGUF is present.
 
 mod common;
 
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use common::{stage_tiny_model, tiny_gguf_path, TINY_MODEL_ID};
+use higgs::diagnostic::HiggsError;
 
-/// A spawned `higgs` (hub or node). SIGTERM on drop so coverage profiles flush.
+use common::{higgs_local, serve_v1_local, stage_tiny_model, tiny_gguf_path, TINY_MODEL_ID};
+
+/// A spawned `higgs --node`. SIGTERM on drop so its coverage profile flushes.
 struct Proc(Child);
 impl Drop for Proc {
     fn drop(&mut self) {
+        // SAFETY: a plain kill(2) on our own child's pid.
         unsafe { libc::kill(self.0.id() as libc::pid_t, libc::SIGTERM) };
         let _ = self.0.wait();
     }
 }
 
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
-}
+/// With a LIVE in-process hub + a connected node, the node-mutation facade methods reach the
+/// fleet/hub ops — so their `Err(...)` arms fire on bad arguments:
+///
+/// - `node_load` with an UNKNOWN node id → the fleet's `transport()` can't find a live link →
+///   HG027 `NodeUnreachable`.
+/// - `node_scan` of an UNKNOWN node → same HG027.
+/// - `node_unload` of an UNKNOWN served id → `require_served` → HG002 `ModelNotFound`.
+/// - `node_load` on the REAL node but an UNKNOWN model → the node relays a load failure back
+///   through the fleet → `Err`.
+/// - `node_label` / `node_retire` of an UNKNOWN node against the LIVE hub → relabel is the
+///   `Ok(false)` unknown-node arm; retire is an idempotent no-op `Ok(())`.
+///
+/// Then the happy fleet-load lands (proving the error arms didn't wedge the link), the model is
+/// routable over the real `/v1/models` surface, and retiring the real node drops it from the fleet.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hub_node_mutation_error_arms_fire_with_a_live_fleet() {
+    // In-process hub Higgs with the tiny model staged; skips cleanly when no tiny GGUF.
+    let Some(higgs) = higgs_local(&[TINY_MODEL_ID]).await else {
+        eprintln!("skipping control_fleet_routes: no tiny GGUF (set HIGGS_TEST_GGUF)");
+        return;
+    };
 
-/// Spawn a hub `higgs` (HUB mode, hermetic iroh) on `port`, returning the guard + base URL once
-/// `/health` answers. Copied from `hub_server.rs`.
-async fn spawn_hub(port: u16, home: &std::path::Path) -> (Proc, String, reqwest::Client) {
-    let hub = Command::new(env!("CARGO_BIN_EXE_higgs"))
-        .env("HIGGS_BIND", "127.0.0.1")
-        .env("HIGGS_PORT", port.to_string())
-        .env("HIGGS_HOME", home)
-        .env("HIGGS_HUB", "1")
-        .env("HIGGS_IROH_LOCAL", "1")
-        .env("RUST_LOG", "warn")
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn hub");
-    let guard = Proc(hub);
-    let base = format!("http://127.0.0.1:{port}");
-    let c = reqwest::Client::new();
-    let mut ready = false;
-    for _ in 0..150 {
-        if let Ok(r) = c.get(format!("{base}/health")).send().await {
-            if r.status().is_success() {
-                ready = true;
-                break;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    assert!(ready, "hub server ready on {base}");
-    (guard, base, c)
-}
+    // Turn the hub network ON in-process (installs a fresh HubFleet + accept loop), then mint a
+    // one-time pairing credential — exactly what `POST /api/higgs/hub/enable` + `/pair` used to do.
+    higgs.hub_enable().await.expect("hub enable");
+    let pair = higgs.pair().await.expect("mint pairing credential");
 
-/// Mint a pairing ticket+token over the hub API, spawn a real `higgs --node` dialing it (with the
-/// staged model dir if `model_dir` is Some), and return the node guard once it shows connected,
-/// along with its remote EndpointId.
-async fn pair_node(
-    base: &str,
-    c: &reqwest::Client,
-    node_home: &std::path::Path,
-    model_dir: Option<&std::path::Path>,
-) -> (Proc, String) {
-    let pair: serde_json::Value = c
-        .post(format!("{base}/api/higgs/pair"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let ticket = pair["ticket"].as_str().expect("ticket").to_string();
-    let token = pair["token"].as_str().expect("token").to_string();
+    // Stage the tiny model into the node's OWN read-only model dir so the happy "load a real model
+    // on the node" assertion can run. `tiny_gguf_path()` is Some (higgs_local returned Some).
+    let gguf = tiny_gguf_path().expect("tiny gguf present (higgs_local returned Some)");
+    let node_scan = stage_tiny_model(&gguf);
+    let node_home = tempfile::tempdir().unwrap();
 
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_higgs"));
-    cmd.arg("--node")
-        .arg(&ticket)
-        .arg(&token)
-        .env("HIGGS_HOME", node_home)
-        .env("HIGGS_IROH_LOCAL", "1")
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit());
-    if let Some(dir) = model_dir {
-        cmd.env("HIGGS_MODEL_DIR", dir);
-    }
-    let node = Proc(cmd.spawn().expect("spawn node"));
+    // Spawn a real `higgs --node <ticket> <token>` dialing the in-process hub over hermetic iroh.
+    let _node = Proc(
+        Command::new(env!("CARGO_BIN_EXE_higgs"))
+            .arg("--node")
+            .arg(&pair.ticket)
+            .arg(&pair.token)
+            .env("HIGGS_HOME", node_home.path())
+            .env("HIGGS_MODEL_DIR", node_scan.path())
+            .env("HIGGS_IROH_LOCAL", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn higgs --node"),
+    );
 
+    // Wait until the remote node shows connected in the unified fleet view.
     let mut node_id = String::new();
     for _ in 0..150 {
-        let nodes: serde_json::Value = c
-            .get(format!("{base}/api/higgs/nodes"))
-            .send()
+        if let Some(n) = higgs
+            .nodes()
             .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        if let Some(n) = nodes.as_array().and_then(|a| {
-            a.iter()
-                .find(|n| n["connected"] == true && n["is_local"] != true)
-        }) {
-            node_id = n["endpoint_id"].as_str().unwrap().to_string();
+            .into_iter()
+            .find(|n| n.connected && !n.is_local)
+        {
+            node_id = n.endpoint_id.clone();
             break;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     assert!(!node_id.is_empty(), "remote node paired + connected");
-    (node, node_id)
-}
 
-/// With a LIVE hub + a connected node, the node-mutation routes pass the `not_a_hub` 409 guard and
-/// reach the fleet/hub ops — so their `Err(...)` arms fire on bad arguments:
-///
-/// - `POST /api/higgs/nodes/load` with an UNKNOWN node id → the fleet's `transport()` can't find a
-///   live link → HG027 `NodeUnreachable` → 503 (`control_error` → `http_status`).
-/// - `GET  /api/higgs/nodes/{unknown}/models` → same HG027 → 503.
-/// - `POST /api/higgs/nodes/unload` with an UNKNOWN served id → `require_served` → HG002
-///   `ModelNotFound` → 404.
-/// - `POST /api/higgs/nodes/load` with a real node but an UNKNOWN model → the node relays a load
-///   failure (HG002) back through the fleet → a non-2xx client error.
-/// - `POST /api/higgs/nodes/retire` / `nodes/label` with an UNKNOWN node id against the real hub →
-///   retire is a hub-side no-op success; relabel is the 404 unknown-node arm.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn hub_node_mutation_error_arms_fire_with_a_live_fleet() {
-    let hub_home = tempfile::tempdir().unwrap();
-    let node_home = tempfile::tempdir().unwrap();
-    let port = free_port();
-
-    let (_hub, base, c) = spawn_hub(port, hub_home.path()).await;
-
-    // Stage the tiny model into the node's read-only model dir if available, so the
-    // happy "load a real model on the node" assertion can run; otherwise pairing-only.
-    let staged = tiny_gguf_path().map(|g| stage_tiny_model(&g));
-    let (_node, node_id) = pair_node(
-        &base,
-        &c,
-        node_home.path(),
-        staged.as_ref().map(tempfile::TempDir::path),
-    )
-    .await;
-
-    // ── load on an UNKNOWN node → HG027 NodeUnreachable → 503 (fleet present, so past the 409). ──
     let bad_node = "0000000000000000000000000000000000000000000000000000000000000000";
-    let load_bad_node = c
-        .post(format!("{base}/api/higgs/nodes/load"))
-        .json(&serde_json::json!({ "node": bad_node, "model": TINY_MODEL_ID }))
-        .send()
+
+    // ── load on an UNKNOWN node → HG027 NodeUnreachable (fleet present, so past the not-a-hub guard). ──
+    let err = higgs
+        .node_load(bad_node, TINY_MODEL_ID)
         .await
-        .unwrap();
-    assert_eq!(
-        load_bad_node.status().as_u16(),
-        503,
-        "load on an unknown node → HG027 503 (not the 409 not-a-hub guard)"
-    );
-    let body: serde_json::Value = load_bad_node.json().await.unwrap();
+        .expect_err("load on an unknown node fails");
     assert!(
-        body["error"].as_str().is_some_and(|e| e.contains("HG027")),
-        "503 carries the HG027 node-unreachable code: {body}"
+        matches!(err, HiggsError::NodeUnreachable { .. }),
+        "load on an unknown node → HG027 NodeUnreachable, got {err:?}"
     );
 
-    // ── GET /api/higgs/nodes/{unknown}/models → HG027 503 (same unreachable path). ──
-    let scan_bad = c
-        .get(format!("{base}/api/higgs/nodes/{bad_node}/models"))
-        .send()
+    // ── scan an UNKNOWN node → HG027 NodeUnreachable (same unreachable path). ──
+    let err = higgs
+        .node_scan(bad_node)
         .await
-        .unwrap();
-    assert_eq!(
-        scan_bad.status().as_u16(),
-        503,
-        "scanning an unknown node → HG027 503"
-    );
-    let scan_body: serde_json::Value = scan_bad.json().await.unwrap();
+        .expect_err("scanning an unknown node fails");
     assert!(
-        scan_body["error"]
-            .as_str()
-            .is_some_and(|e| e.contains("HG027")),
-        "scan 503 carries HG027: {scan_body}"
+        matches!(err, HiggsError::NodeUnreachable { .. }),
+        "scanning an unknown node → HG027 NodeUnreachable, got {err:?}"
     );
 
-    // ── unload an UNKNOWN served id → HG002 ModelNotFound → 404 (require_served fails). ──
-    let unload_unknown = c
-        .post(format!("{base}/api/higgs/nodes/unload"))
-        .json(&serde_json::json!({ "model": "no-such/served-id" }))
-        .send()
+    // ── unload an UNKNOWN served id → HG002 ModelNotFound (require_served fails). ──
+    let err = higgs
+        .node_unload("no-such/served-id")
         .await
-        .unwrap();
-    assert_eq!(
-        unload_unknown.status().as_u16(),
-        404,
-        "unloading an unknown served id → HG002 404"
-    );
-    let unload_body: serde_json::Value = unload_unknown.json().await.unwrap();
+        .expect_err("unloading an unknown served id fails");
     assert!(
-        unload_body["error"]
-            .as_str()
-            .is_some_and(|e| e.contains("HG002")),
-        "unload 404 carries HG002: {unload_body}"
+        matches!(err, HiggsError::ModelNotFound { .. }),
+        "unloading an unknown served id → HG002 ModelNotFound, got {err:?}"
     );
 
     // ── load an UNKNOWN model on the REAL connected node → the node relays a load failure back
-    // through the fleet; the hub surfaces it as a non-2xx client error (not a hang, not a 200). ──
-    let load_bad_model = c
-        .post(format!("{base}/api/higgs/nodes/load"))
-        .json(&serde_json::json!({ "node": node_id, "model": "definitely/not-a-real-model" }))
-        .send()
-        .await
-        .unwrap();
-    let status = load_bad_model.status();
+    // through the fleet; the hub surfaces it as an `Err` (not a hang, not an Ok). ──
     assert!(
-        status.is_client_error() || status.is_server_error(),
-        "loading an unknown model on a real node fails (not 2xx): got {status}"
-    );
-    assert!(
-        !status.is_success(),
-        "unknown-model load is never a success"
+        higgs
+            .node_load(&node_id, "definitely/not-a-real-model")
+            .await
+            .is_err(),
+        "loading an unknown model on a real node fails (never Ok)"
     );
 
-    // ── relabel an UNKNOWN remote node against the LIVE hub → the `Ok(false)` arm → 404. ──
-    let relabel_unknown = c
-        .post(format!("{base}/api/higgs/nodes/label"))
-        .json(&serde_json::json!({ "node": bad_node, "label": "ghost" }))
-        .send()
+    // ── relabel an UNKNOWN remote node against the LIVE hub → the `Ok(false)` unknown-node arm
+    // (the serve layer used to map this to a 404). ──
+    let renamed = higgs
+        .node_label(bad_node, "ghost")
         .await
-        .unwrap();
-    assert_eq!(
-        relabel_unknown.status().as_u16(),
-        404,
-        "relabel of an unknown node (hub enabled) → 404 unknown-node arm"
-    );
-
-    // ── The REAL node still loads a model (happy fleet-load over HTTP), proving the error arms
-    // above didn't wedge the live link — only runs with a staged GGUF. ──
-    if staged.is_some() {
-        let load_ok = c
-            .post(format!("{base}/api/higgs/nodes/load"))
-            .json(&serde_json::json!({ "node": node_id, "model": TINY_MODEL_ID }))
-            .send()
-            .await
-            .unwrap();
-        assert!(
-            load_ok.status().is_success(),
-            "real model loads on the live node after the error arms: {}",
-            load_ok.status()
-        );
-        let ok_body: serde_json::Value = load_ok.json().await.unwrap();
-        assert_eq!(ok_body["status"], "ok", "load ok body: {ok_body}");
-        assert!(
-            ok_body["worker_id"].as_u64().is_some(),
-            "load reply carries a worker_id: {ok_body}"
-        );
-
-        // The freshly-loaded model is now remotely routable in the OpenAI catalog.
-        let models: serde_json::Value = c
-            .get(format!("{base}/v1/models"))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        assert!(
-            models["data"]
-                .as_array()
-                .is_some_and(|d| d.iter().any(|m| m["id"] == TINY_MODEL_ID)),
-            "the remote-loaded model is routable in /v1/models: {models}"
-        );
-    }
-
-    // ── retire the UNKNOWN node against the live hub: the hub's allowlist-removal is a no-op for
-    // an id it never admitted, but the route still answers 2xx (idempotent retire). The real node
-    // is untouched and still listed. ──
-    let retire_unknown = c
-        .post(format!("{base}/api/higgs/nodes/retire"))
-        .json(&serde_json::json!({ "node": bad_node }))
-        .send()
-        .await
-        .unwrap();
+        .expect("relabel call itself succeeds (hub enabled)");
     assert!(
-        retire_unknown.status().is_success(),
-        "retiring an unknown node is an idempotent no-op 2xx: {}",
-        retire_unknown.status()
+        !renamed,
+        "relabel of an unknown node (hub enabled) → Ok(false) unknown-node arm"
     );
-    let nodes: serde_json::Value = c
-        .get(format!("{base}/api/higgs/nodes"))
+
+    // ── The REAL node loads a model (happy fleet-load), proving the error arms above didn't wedge
+    // the live link. Returns the new remote worker's id. ──
+    let worker = higgs
+        .node_load(&node_id, TINY_MODEL_ID)
+        .await
+        .expect("real model loads on the live node after the error arms");
+    assert!(
+        worker.0 >= 1,
+        "load reply carries a worker id: {}",
+        worker.0
+    );
+
+    // ── The freshly-loaded remote model is now routable in the OpenAI catalog over the REAL /v1
+    // HTTP surface (the old `GET /v1/models` assertion). ──
+    let (base, serve) = serve_v1_local(higgs.handle()).await;
+    let models: serde_json::Value = reqwest::Client::new()
+        .get(format!("{base}/v1/models"))
         .send()
         .await
         .unwrap()
@@ -304,42 +177,38 @@ async fn hub_node_mutation_error_arms_fire_with_a_live_fleet() {
         .await
         .unwrap();
     assert!(
-        nodes
+        models["data"]
             .as_array()
-            .is_some_and(|a| a.iter().any(|n| n["endpoint_id"] == node_id.as_str())),
-        "the real node is still listed after the unknown-node retire: {nodes}"
+            .is_some_and(|d| d.iter().any(|m| m["id"] == TINY_MODEL_ID)),
+        "the remote-loaded model is routable in /v1/models: {models}"
+    );
+    serve.shutdown().await;
+
+    // ── retire the UNKNOWN node against the live hub: the allowlist-removal is a no-op for an id it
+    // never admitted, but retire is idempotent → `Ok(())`. The real node is untouched + still listed. ──
+    higgs
+        .node_retire(bad_node)
+        .await
+        .expect("retiring an unknown node is an idempotent no-op Ok(())");
+    assert!(
+        higgs.nodes().await.iter().any(|n| n.endpoint_id == node_id),
+        "the real node is still listed after the unknown-node retire"
     );
 
-    // ── retire the REAL node → it leaves the fleet entirely (drops from /api/higgs/nodes). ──
-    let retire_real = c
-        .post(format!("{base}/api/higgs/nodes/retire"))
-        .json(&serde_json::json!({ "node": node_id }))
-        .send()
+    // ── retire the REAL node → it leaves the fleet entirely (drops from the node view). ──
+    higgs
+        .node_retire(&node_id)
         .await
-        .unwrap();
-    assert!(
-        retire_real.status().is_success(),
-        "retire of the real node ok: {}",
-        retire_real.status()
-    );
+        .expect("retire of the real node ok");
     let mut gone = false;
     for _ in 0..50 {
-        let nodes: serde_json::Value = c
-            .get(format!("{base}/api/higgs/nodes"))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        if nodes
-            .as_array()
-            .is_some_and(|a| !a.iter().any(|n| n["endpoint_id"] == node_id.as_str()))
-        {
+        if !higgs.nodes().await.iter().any(|n| n.endpoint_id == node_id) {
             gone = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(gone, "the retired real node is removed from the fleet");
+
+    higgs.shutdown().await;
 }

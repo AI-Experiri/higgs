@@ -16,14 +16,14 @@ use subtle::ConstantTimeEq;
 
 higgs_const_enum! {
     /// What a key is allowed to do. `Admin` implies every other scope. Wire
-    /// type for the key-management surface (`/api/higgs/keys`), so the
-    /// frontend gets the const-object form.
+    /// type for the key-management control surface (the `keys` list/mint/revoke
+    /// ops; formerly `/api/higgs/keys`), so the frontend gets the const-object form.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(rename_all = "lowercase")]
     pub enum Scope {
         /// `POST /v1/chat/completions`.
         Chat,
-        /// Model listing/details (`GET /v1/models`, `GET /api/higgs/models*`).
+        /// Model listing/details (`GET /v1/models`, and the `models` control-op).
         Models,
         /// Everything, including management (load/unload/settings/worker/nodes/keys).
         Admin,
@@ -66,6 +66,28 @@ pub struct ApiKey {
     /// is the durable part of the file, usage is best-effort history.
     #[serde(default)]
     pub last_used_ms: Option<u64>,
+    /// Internal, in-memory-only key: minted at runtime by an in-process embedder
+    /// (jigglebot) to authenticate ITSELF to the embedded higgs over the normal
+    /// bearer path. `true` ⇒ this key is NEVER persisted to `api_keys.json`
+    /// ([`ApiKeys::save`] filters it) and NEVER shown in the key-management list
+    /// ([`ApiKeys::visible`]) — it is not a user credential. It authorizes exactly
+    /// like any other key. Absent/`false` for every user-created key.
+    ///
+    /// `skip_deserializing`: this flag is set SOLELY by [`ApiKeys::add_internal`]
+    /// at runtime — it is an in-memory-only concept and must NEVER be honored from
+    /// disk. Without this, a hand-edited/tampered `api_keys.json` carrying
+    /// `"hidden": true` on an Admin key would load a credential that `authorizes()`
+    /// (counts all keys) accepts but `visible()` hides from the management list and
+    /// `remove_label()` refuses to delete — a stealth backdoor the owner cannot
+    /// see or revoke. Ignoring `hidden` on load makes every persisted key visible
+    /// and manageable. Safe because `save()` never writes a hidden key, so no
+    /// legitimate on-disk store ever carries `hidden: true` to round-trip.
+    #[serde(
+        default,
+        skip_serializing_if = "std::ops::Not::not",
+        skip_deserializing
+    )]
+    pub hidden: bool,
 }
 
 /// Redacted: only a short digest prefix ever reaches `Debug` output (logs,
@@ -142,10 +164,17 @@ impl ApiKeys {
     /// the existing file. (higgs targets Unix/macOS — the llama.cpp FFI build isn't
     /// Windows-portable — so the non-atomic-rename-replace platform is out of scope.)
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        // Persist only user-created keys — an internal in-memory key
+        // ([`Self::add_internal`]) must never touch disk (it's regenerated each
+        // boot by the embedder). `skip_serializing_if` on `hidden` also elides the
+        // flag from the persisted user keys.
+        let persistable = ApiKeys {
+            keys: self.keys.iter().filter(|k| !k.hidden).cloned().collect(),
+        };
         let tmp = path.with_extension("json.tmp");
         std::fs::write(
             &tmp,
-            serde_json::to_vec_pretty(self).expect("api keys serialize"),
+            serde_json::to_vec_pretty(&persistable).expect("api keys serialize"),
         )?;
         std::fs::rename(&tmp, path)
     }
@@ -169,14 +198,72 @@ impl ApiKeys {
             scopes,
             created_at_ms: Some(now_unix_ms()),
             last_used_ms: None,
+            hidden: false,
         });
         sha256
     }
 
-    /// Remove a key by label; returns how many were removed.
+    /// Register an INTERNAL, in-memory-only key for a caller-provided plaintext
+    /// `token` (stored only as its digest).
+    ///
+    /// For an in-process embedder (jigglebot) to authenticate itself to the
+    /// embedded higgs over the normal bearer path — no special auth branch. The
+    /// embedder OWNS the token value (a fixed dev token shared with the browser
+    /// proxy, or a fresh random one in production) and presents it as a bearer.
+    /// The key is flagged [`ApiKey::hidden`], so it is never written to disk
+    /// ([`Self::save`]) and never listed ([`Self::visible`]).
+    pub fn add_internal(&mut self, token: &str, label: String, scopes: Vec<Scope>) {
+        // [codex r1] An empty/whitespace token is NEVER a credential. Registering one
+        // would arm auth with a trivially-guessable key whose digest is `hash_token("")`,
+        // so any caller whose presented bearer trims to "" would authorize. A caller that
+        // fumbles its token value (empty env/config) must not create one; refuse it so a
+        // bad token leaves auth OFF rather than trivially-open. (Not reachable over the
+        // `/v1` bearer path — header normalization keeps a client from presenting an empty
+        // bearer — so this is defense-in-depth, proved at the keys layer in keys_tests.rs.)
+        if token.trim().is_empty() {
+            tracing::warn!(
+                "higgs: ignoring an internal-token registration with an empty token (no credential armed)"
+            );
+            return;
+        }
+        let sha256 = hash_token(token);
+        // Replace any prior registration: an identical digest (idempotent re-add)
+        // OR a previous HIDDEN key under the same logical label (rotation). Without
+        // the label drop, re-registering a NEW internal token would leave the OLD
+        // hidden key authorized too — it's not persisted, not listed, and not
+        // removable via `remove_label`, so the stale bearer would live forever.
+        // Only hidden keys are dropped by label, never a user's visible key that
+        // happens to share it.
+        self.keys
+            .retain(|k| k.sha256 != sha256 && !(k.hidden && k.label == label));
+        self.keys.push(ApiKey {
+            sha256,
+            label,
+            scopes,
+            created_at_ms: Some(now_unix_ms()),
+            last_used_ms: None,
+            hidden: true,
+        });
+    }
+
+    /// Iterate only the VISIBLE (user-created, persisted) keys — the set the
+    /// key-management API lists. Hidden internal keys ([`Self::add_internal`]) are
+    /// excluded. Auth and the LAN guards use [`Self::iter`] (ALL keys) instead.
+    pub fn visible(&self) -> impl Iterator<Item = &ApiKey> {
+        self.keys.iter().filter(|k| !k.hidden)
+    }
+
+    /// Remove VISIBLE keys by label; returns how many were removed. HIDDEN
+    /// internal keys ([`Self::add_internal`]) are NEVER removed by label — the
+    /// embedder's in-memory token is not part of the user-facing key-management
+    /// surface, so a key revoke (`Higgs::revoke_key`, formerly
+    /// `DELETE /api/higgs/keys/{label}`) that happens to name it
+    /// (e.g. `jigglebot (internal)`) is a no-op rather than a way to strand the
+    /// embedder's own auth. Disk-loaded stores hold no hidden keys, so the CLI
+    /// `keys remove` path is unaffected.
     pub fn remove_label(&mut self, label: &str) -> usize {
         let before = self.keys.len();
-        self.keys.retain(|k| k.label != label);
+        self.keys.retain(|k| k.hidden || k.label != label);
         before - self.keys.len()
     }
 

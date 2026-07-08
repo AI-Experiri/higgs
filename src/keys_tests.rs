@@ -296,3 +296,234 @@ fn pre_timestamp_store_loads_with_defaults() {
     assert_eq!(k.created_at_ms, None);
     assert_eq!(k.last_used_ms, None);
 }
+
+/// A tampered/hand-edited store carrying `"hidden": true` must NOT yield a
+/// stealth backdoor: `hidden` is an in-memory-only flag (set solely by
+/// `add_internal`) and is `skip_deserializing`, so a disk value is ignored. The
+/// Admin key loads as a VISIBLE, manageable key — it shows in the key list and
+/// is revocable — not a credential that `authorizes()` accepts while `visible()`
+/// hides it and `remove_label()` refuses to delete.
+///
+/// Fail-on-revert: drop `skip_deserializing` from `ApiKey::hidden` and the key
+/// deserializes as hidden → `visible().count()` is 0 here.
+#[test]
+fn a_hidden_flag_on_disk_is_ignored_no_stealth_backdoor() {
+    let json =
+        r#"{"keys":[{"sha256":"deadbeef","label":"backdoor","scopes":["admin"],"hidden":true}]}"#;
+    let mut ks: ApiKeys = serde_json::from_str(json).unwrap();
+    assert_eq!(ks.iter().count(), 1, "the key still loads");
+    assert_eq!(
+        ks.visible().count(),
+        1,
+        "a disk 'hidden:true' must not make the key invisible to management"
+    );
+    assert!(
+        ks.iter().all(|k| !k.hidden),
+        "no key loaded from disk may be flagged hidden"
+    );
+    // It is on the visible/removable surface — not a stealth key.
+    assert_eq!(ks.remove_label("backdoor"), 1, "and it is revocable");
+}
+
+// ── Internal, in-memory-only embedder token (hidden keys) ───────────────────
+
+#[test]
+fn add_internal_registers_a_working_hidden_token() {
+    let mut ks = ApiKeys::default();
+    ks.add_internal(
+        "hgk_internal",
+        "jigglebot (internal)".into(),
+        vec![Scope::Chat],
+    );
+    // The provided plaintext authorizes its scope like any bearer…
+    assert!(ks.authorizes("hgk_internal", Scope::Chat));
+    assert!(
+        !ks.authorizes("hgk_internal", Scope::Admin),
+        "scoped to Chat only"
+    );
+    // …and the store is no longer "open" — auth is now ON.
+    assert!(!ks.is_empty());
+    // The key is flagged hidden.
+    assert!(
+        ks.iter().all(|k| k.hidden),
+        "the only key is the hidden one"
+    );
+}
+
+#[test]
+fn add_internal_rotation_revokes_the_previous_token() {
+    // Re-registering the internal token under the same label must REVOKE the old
+    // bearer — otherwise the stale hidden key lives forever (never persisted,
+    // never listed, not removable via remove_label).
+    let mut ks = ApiKeys::default();
+    ks.add_internal("hgk_old", "jigglebot (internal)".into(), vec![Scope::Admin]);
+    ks.add_internal("hgk_new", "jigglebot (internal)".into(), vec![Scope::Admin]);
+    assert!(
+        !ks.authorizes("hgk_old", Scope::Chat),
+        "the old internal token must not authorize after rotation"
+    );
+    assert!(ks.authorizes("hgk_new", Scope::Admin));
+    assert_eq!(
+        ks.iter().count(),
+        1,
+        "only the current internal token remains"
+    );
+}
+
+#[test]
+fn add_internal_does_not_drop_a_visible_key_sharing_the_label() {
+    // The label-drop is guarded by `k.hidden`, so a user's VISIBLE key that happens
+    // to share the internal label survives an internal-token registration.
+    let mut ks = ApiKeys::default();
+    ks.add("hgk_user", "jigglebot (internal)".into(), vec![Scope::Chat]);
+    ks.add_internal("hgk_int", "jigglebot (internal)".into(), vec![Scope::Admin]);
+    assert!(
+        ks.authorizes("hgk_user", Scope::Chat),
+        "a visible key sharing the label must survive"
+    );
+    assert!(ks.authorizes("hgk_int", Scope::Admin));
+    assert_eq!(ks.visible().count(), 1);
+    assert_eq!(ks.iter().count(), 2);
+}
+
+#[test]
+fn visible_excludes_hidden_internal_keys() {
+    let mut ks = ApiKeys::default();
+    ks.add("hgk_user", "laptop".into(), vec![Scope::Chat]);
+    ks.add_internal(
+        "hgk_internal",
+        "jigglebot (internal)".into(),
+        vec![Scope::Chat],
+    );
+    let visible: Vec<_> = ks.visible().map(|k| k.label.clone()).collect();
+    assert_eq!(
+        visible,
+        vec!["laptop".to_string()],
+        "only the user key is visible"
+    );
+    // But auth still sees BOTH (iter is unfiltered).
+    assert_eq!(ks.iter().count(), 2);
+}
+
+/// A revoke that names the hidden internal key's label must be a NO-OP — the
+/// embedder's in-memory token is immune to the public key-management surface, so
+/// `DELETE /api/higgs/keys/jigglebot (internal)` can't strand the embedder's own
+/// auth. Fail-on-revert: drop the `k.hidden ||` guard in `remove_label` and this
+/// removes 1 (the hidden key), after which `authorizes` returns false.
+#[test]
+fn remove_label_never_removes_a_hidden_internal_key() {
+    let mut ks = ApiKeys::default();
+    ks.add("hgk_user", "laptop".into(), vec![Scope::Chat]);
+    ks.add_internal(
+        "hgk_internal",
+        "jigglebot (internal)".into(),
+        vec![Scope::Chat, Scope::Models, Scope::Admin],
+    );
+
+    let removed = ks.remove_label("jigglebot (internal)");
+    assert_eq!(
+        removed, 0,
+        "the hidden internal key must not be revocable by label"
+    );
+    assert!(
+        ks.authorizes("hgk_internal", Scope::Admin),
+        "the hidden internal token still authorizes after a same-label revoke attempt"
+    );
+    // A visible label still revokes normally.
+    assert_eq!(
+        ks.remove_label("laptop"),
+        1,
+        "visible keys revoke by label as before"
+    );
+}
+
+#[test]
+fn save_never_persists_a_hidden_internal_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("api_keys.json");
+    let mut ks = ApiKeys::default();
+    ks.add("hgk_user", "laptop".into(), vec![Scope::Chat]);
+    let internal = "hgk_internal";
+    ks.add_internal(internal, "jigglebot (internal)".into(), vec![Scope::Chat]);
+    ks.save(&path).unwrap();
+
+    // Reload from disk: the user key survives, the internal token is GONE.
+    let reloaded = ApiKeys::load(&path).unwrap();
+    assert_eq!(reloaded.iter().count(), 1, "only the user key persisted");
+    assert!(reloaded.authorizes("hgk_user", Scope::Chat));
+    assert!(
+        !reloaded.authorizes(internal, Scope::Chat),
+        "the hidden internal token must never reach disk"
+    );
+    // And the raw file must not contain the internal digest.
+    let raw = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !raw.contains(&hash_token(internal)),
+        "internal digest leaked to disk"
+    );
+    assert!(
+        !raw.contains("hidden"),
+        "hidden flag elided from persisted keys"
+    );
+}
+
+/// [codex r1] `add_internal` must REFUSE an empty/whitespace token so it never becomes a
+/// credential. An empty registration would push a hidden key whose digest is
+/// `hash_token("")`; with auth on, `authorizes("")` would then match it — a trivially-open
+/// admin bypass for a caller (embedder) that fumbles its token value. Not reachable over the
+/// `/v1` bearer path (header normalization keeps a client from presenting an empty bearer),
+/// so this is proved at the keys layer.
+///
+/// Fail-on-revert: remove the empty-token guard in `add_internal` and the empty key is
+/// pushed, so `authorizes("", Admin)` returns true and the count is 2 — both asserts flip.
+#[test]
+fn empty_internal_token_is_refused_not_a_credential() {
+    // A real Admin key arms auth (store non-empty ⇒ the bearer path is enforced).
+    let mut ks = ApiKeys::default();
+    ks.add("hgk_real_admin", "admin".into(), vec![Scope::Admin]);
+    assert!(!ks.is_empty(), "a real key armed auth");
+
+    // An EMPTY internal-token registration is a no-op (no credential armed).
+    ks.add_internal("", "jigglebot (internal)".into(), vec![Scope::Admin]);
+    assert!(
+        ks.authorizes("hgk_real_admin", Scope::Admin),
+        "the real admin token still authorizes"
+    );
+    assert!(
+        !ks.authorizes("", Scope::Admin),
+        "an empty token must NOT authorize — no empty-digest credential was armed"
+    );
+    assert_eq!(
+        ks.iter().count(),
+        1,
+        "the empty internal token was not added"
+    );
+
+    // Whitespace-only is likewise refused.
+    ks.add_internal("   ", "ws".into(), vec![Scope::Admin]);
+    assert!(
+        !ks.authorizes("   ", Scope::Admin),
+        "a whitespace token is not a credential"
+    );
+    assert_eq!(
+        ks.iter().count(),
+        1,
+        "the whitespace internal token was not added"
+    );
+
+    // A real internal token IS still registered (the guard only rejects empty/whitespace).
+    ks.add_internal(
+        "secret-internal-token",
+        "jigglebot (internal)".into(),
+        vec![Scope::Admin],
+    );
+    assert!(
+        ks.authorizes("secret-internal-token", Scope::Admin),
+        "a non-empty internal token authorizes"
+    );
+    assert_eq!(
+        ks.iter().count(),
+        2,
+        "the non-empty internal token was added"
+    );
+}

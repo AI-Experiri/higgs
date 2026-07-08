@@ -44,6 +44,14 @@ exec cargo llvm-cov \
   --test control_api \
   --test control_errors \
   --test control_fleet_routes \
+  --test cov_facade \
+  --test cov_fleet2 \
+  --test cov_infra \
+  --test cov_nodecli \
+  --test cov_paths2 \
+  --test cov_remote \
+  --test cov_serve \
+  --test cov_worker \
   --test download_errors \
   --test engine_variety \
   --test higgs_events \

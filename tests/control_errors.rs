@@ -1,453 +1,350 @@
-//! Black-box integration tests for the `/api/higgs/*` control ERROR + edge paths
-//! in `src/serve/control.rs`.
+//! In-process integration tests for the CONTROL error + edge paths — now the
+//! `Higgs` crate API (the old `/api/higgs/*` HTTP control surface is GONE).
 //!
-//! These spawn the real `higgs` binary and drive the control surface over HTTP,
-//! focusing on the failure/edge branches the happy-path lifecycle test
+//! These focus on the failure/edge branches the happy-path lifecycle test
 //! (`control_api.rs`) does not exercise: invalid/unknown model ids on
-//! load/unload/tune/by-id, the `/system` snapshot shape, the no-op
-//! `worker/stop` with nothing loaded, `version`, `nodes` (local node present),
-//! relabeling the LOCAL instance, and the `hub` status shape with no hub.
+//! load/unload/tune/by-id, the `/system` snapshot shape (hardware + runtime +
+//! config), the no-op `worker_stop` with nothing loaded, `version`, `nodes`
+//! (local node present), relabeling the LOCAL instance, and the hub status shape
+//! with no hub. Error asserts compare the TYPED `HiggsError` variant/code rather
+//! than an HTTP envelope.
 //!
-//! Each test stages the tiny `stories260K.gguf` model (see `common`) and picks a
-//! UNIQUE port from base 12200. Every test SKIPs cleanly when the GGUF is absent.
-//! No SSE stream is opened (those block graceful shutdown).
+//! Each test stages the tiny `stories260K.gguf` model (see `common`) and drives
+//! the facade in-process. Every test SKIPs cleanly when the GGUF is absent.
 
 mod common;
 
-use common::{spawn_with_tiny_model, tiny_gguf_path, TINY_MODEL_ID};
+use common::{higgs_local, TINY_MODEL_ID};
+use higgs::tune::TuneRequest;
+use higgs::HiggsError;
 
-/// `POST /api/higgs/models/load` with a path-traversal / structurally-invalid id
-/// is rejected by the host-side `validate_repo_id` guard → 400 with the HG015
-/// `InvalidModelId` code in the error envelope (it never reaches the worker).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// A Suggest-mode `TuneRequest` (prepare) for `id`.
+fn tune_req(id: &str) -> TuneRequest {
+    TuneRequest {
+        id: id.to_owned(),
+        mode: None,
+        budget: None,
+        pins: None,
+    }
+}
+
+/// `Higgs::load` with a path-traversal / structurally-invalid id is rejected by
+/// the host-side `validate_repo_id` guard → `InvalidModelId` (HG015); it never
+/// reaches the worker.
+#[tokio::test]
 async fn load_invalid_id_is_hg015_bad_request() {
-    let Some(gguf) = tiny_gguf_path() else {
+    let Some(higgs) = higgs_local(&[TINY_MODEL_ID]).await else {
         eprintln!("SKIP load_invalid_id_is_hg015_bad_request: tiny gguf not found");
         return;
     };
-    let srv = spawn_with_tiny_model(12200, &gguf).await;
-    let c = reqwest::Client::new();
 
     // Every one of these trips a DISTINCT branch of `validate_repo_id`:
     // a `..` traversal component, an absolute path, and an illegal character.
     for bad in ["../etc/passwd", "/abs/path", "bad id with spaces"] {
-        let resp = c
-            .post(format!("{}/api/higgs/models/load", srv.base))
-            .json(&serde_json::json!({ "id": bad }))
-            .send()
+        let err = higgs
+            .load(bad, None)
             .await
-            .unwrap();
-        assert_eq!(
-            resp.status(),
-            400,
-            "invalid id {bad:?} → 400 (id-validation guard)"
-        );
-        let body: serde_json::Value = resp.json().await.unwrap();
+            .expect_err("invalid id is rejected by the id-validation guard");
         assert!(
-            body["error"]
-                .as_str()
-                .is_some_and(|e| e.contains("[HG015]")),
-            "invalid id {bad:?} carries the HG015 code: {body}"
+            matches!(err, HiggsError::InvalidModelId { .. }),
+            "invalid id {bad:?} is InvalidModelId: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("[HG015]"),
+            "invalid id {bad:?} carries the HG015 code: {err}"
         );
     }
+
+    higgs.shutdown().await;
 }
 
-/// `POST /api/higgs/models/load` with a well-formed but UNKNOWN id passes the
-/// validation guard, then fails the host-side scan resolve → 404 with the HG002
-/// `ModelNotFound` code.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// `Higgs::load` with a well-formed but UNKNOWN id passes the validation guard,
+/// then fails the host-side scan resolve → `ModelNotFound` (HG002).
+#[tokio::test]
 async fn load_unknown_id_is_hg002_not_found() {
-    let Some(gguf) = tiny_gguf_path() else {
+    let Some(higgs) = higgs_local(&[TINY_MODEL_ID]).await else {
         eprintln!("SKIP load_unknown_id_is_hg002_not_found: tiny gguf not found");
         return;
     };
-    let srv = spawn_with_tiny_model(12201, &gguf).await;
-    let c = reqwest::Client::new();
 
-    let resp = c
-        .post(format!("{}/api/higgs/models/load", srv.base))
-        .json(&serde_json::json!({ "id": "no-such-org/no-such-model" }))
-        .send()
+    let err = higgs
+        .load("no-such-org/no-such-model", None)
         .await
-        .unwrap();
-    assert_eq!(resp.status(), 404, "unknown id → 404 (not found on disk)");
-    let body: serde_json::Value = resp.json().await.unwrap();
+        .expect_err("unknown id is not found on disk");
     assert!(
-        body["error"]
-            .as_str()
-            .is_some_and(|e| e.contains("[HG002]")),
-        "unknown id carries the HG002 ModelNotFound code: {body}"
+        matches!(err, HiggsError::ModelNotFound { .. }),
+        "unknown id is ModelNotFound: {err:?}"
     );
+    assert!(
+        err.to_string().contains("[HG002]"),
+        "unknown id carries the HG002 code: {err}"
+    );
+
+    higgs.shutdown().await;
 }
 
-/// `POST /api/higgs/models/unload {"id": ...}` for a model that is NOT loaded is
-/// an idempotent no-op: `Higgs::unload_one` resolves the served id, finds no
-/// resident worker, and returns `{"status":"ok"}` (200) — it must NOT error.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// `Higgs::unload_one` for a model that is NOT loaded is an idempotent no-op: it
+/// resolves the served id, finds no resident worker, and returns Ok — it must NOT
+/// error.
+#[tokio::test]
 async fn unload_not_loaded_model_is_ok_noop() {
-    let Some(gguf) = tiny_gguf_path() else {
+    let Some(higgs) = higgs_local(&[TINY_MODEL_ID]).await else {
         eprintln!("SKIP unload_not_loaded_model_is_ok_noop: tiny gguf not found");
         return;
     };
-    let srv = spawn_with_tiny_model(12202, &gguf).await;
-    let c = reqwest::Client::new();
 
     // The tiny model is staged + scannable but NOT loaded — unloading it by id is
-    // a clean no-op (idempotent), distinct from the destructive `{}` drain-all.
-    let resp = c
-        .post(format!("{}/api/higgs/models/unload", srv.base))
-        .json(&serde_json::json!({ "id": TINY_MODEL_ID }))
-        .send()
+    // a clean no-op (idempotent), distinct from the destructive drain-all.
+    higgs
+        .unload_one(TINY_MODEL_ID)
         .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        200,
-        "unload of a not-loaded model is a 200 no-op"
-    );
-    let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["status"], "ok", "no-op unload returns ok: {body}");
+        .expect("unload of a not-loaded model is a no-op");
 
     // A never-existed id is also a clean no-op (resolve finds nothing → Ok).
-    let resp = c
-        .post(format!("{}/api/higgs/models/unload", srv.base))
-        .json(&serde_json::json!({ "id": "ghost-org/ghost-model" }))
-        .send()
+    higgs
+        .unload_one("ghost-org/ghost-model")
         .await
-        .unwrap();
-    assert_eq!(resp.status(), 200, "unload of an unknown id is a 200 no-op");
-    let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["status"], "ok");
+        .expect("unload of an unknown id is a no-op");
+
+    higgs.shutdown().await;
 }
 
-/// `GET /api/higgs/models/{id}` — the by-id wildcard route on both branches:
-/// an UNKNOWN slashed id → 404 HG002, and the STAGED tiny id → 200 with the
-/// enriched (`not-loaded`, `gguf`, llama-arch) entry.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// `Higgs::model_by_id` on both branches: an UNKNOWN slashed id → `ModelNotFound`
+/// (HG002), and the STAGED tiny id → the enriched (`not-loaded`, `gguf`,
+/// llama-arch) entry.
+#[tokio::test]
 async fn model_by_id_unknown_404_and_staged_ok() {
-    let Some(gguf) = tiny_gguf_path() else {
+    let Some(higgs) = higgs_local(&[TINY_MODEL_ID]).await else {
         eprintln!("SKIP model_by_id_unknown_404_and_staged_ok: tiny gguf not found");
         return;
     };
-    let srv = spawn_with_tiny_model(12203, &gguf).await;
-    let c = reqwest::Client::new();
 
-    // Unknown slashed id → 404 with the HG002 code (the not-found branch).
-    let missing = c
-        .get(format!(
-            "{}/api/higgs/models/ghost-org/ghost-model",
-            srv.base
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(missing.status(), 404, "unknown id → 404");
-    let body: serde_json::Value = missing.json().await.unwrap();
+    // Unknown slashed id → ModelNotFound with the HG002 code (the not-found branch).
+    let missing = higgs.model_by_id("ghost-org/ghost-model").await;
+    let err = missing.expect_err("unknown id is not found");
     assert!(
-        body["error"]
-            .as_str()
-            .is_some_and(|e| e.contains("[HG002]")),
-        "by-id 404 carries the HG002 code: {body}"
+        matches!(err, HiggsError::ModelNotFound { .. }),
+        "by-id unknown is ModelNotFound: {err:?}"
+    );
+    assert!(
+        err.to_string().contains("[HG002]"),
+        "by-id not-found carries the HG002 code: {err}"
     );
 
-    // Staged id → 200 with the enriched entry (the found branch; nothing loaded,
-    // so the load state reads `not-loaded`).
-    let found = c
-        .get(format!("{}/api/higgs/models/{}", srv.base, TINY_MODEL_ID))
-        .send()
+    // Staged id → the enriched entry (the found branch; nothing loaded, so the
+    // load state reads `not-loaded`).
+    let entry = higgs
+        .model_by_id(TINY_MODEL_ID)
         .await
-        .unwrap();
-    assert_eq!(found.status(), 200, "staged id is found");
-    let entry: serde_json::Value = found.json().await.unwrap();
+        .expect("staged id is found");
+    assert_eq!(entry.model.id, TINY_MODEL_ID, "by-id returns the entry");
+    assert_eq!(entry.state, "not-loaded", "scanned-not-loaded entry");
+    assert_eq!(entry.format, "gguf", "gguf format");
     assert_eq!(
-        entry["id"], TINY_MODEL_ID,
-        "by-id returns the entry: {entry}"
+        entry.model.arch.as_deref(),
+        Some("llama"),
+        "stories260K is a llama-arch GGUF"
     );
-    assert_eq!(entry["state"], "not-loaded", "scanned-not-loaded entry");
-    assert_eq!(entry["format"], "gguf", "gguf format");
-    assert_eq!(entry["arch"], "llama", "stories260K is a llama-arch GGUF");
+
+    higgs.shutdown().await;
 }
 
-/// `POST /api/higgs/models/tune` with a non-existent id fails the scan resolve in
-/// `Higgs::tune` → 404 with the HG002 `ModelNotFound` code (the tune error
-/// branch in `control_tune`). The id is in the BODY, matching `/models/load`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// `Higgs::tune` with a non-existent id fails the scan resolve → `ModelNotFound`
+/// (HG002).
+#[tokio::test]
 async fn tune_bad_id_is_hg002_not_found() {
-    let Some(gguf) = tiny_gguf_path() else {
+    let Some(higgs) = higgs_local(&[TINY_MODEL_ID]).await else {
         eprintln!("SKIP tune_bad_id_is_hg002_not_found: tiny gguf not found");
         return;
     };
-    let srv = spawn_with_tiny_model(12204, &gguf).await;
-    let c = reqwest::Client::new();
 
-    let resp = c
-        .post(format!("{}/api/higgs/models/tune", srv.base))
-        .json(&serde_json::json!({ "id": "no-such-org/no-such-model" }))
-        .send()
+    let err = higgs
+        .tune(tune_req("no-such-org/no-such-model"))
         .await
-        .unwrap();
-    assert_eq!(resp.status(), 404, "tune of an unknown id → 404");
-    let body: serde_json::Value = resp.json().await.unwrap();
+        .expect_err("tune of an unknown id fails the scan resolve");
     assert!(
-        body["error"]
-            .as_str()
-            .is_some_and(|e| e.contains("[HG002]")),
-        "tune not-found carries the HG002 code: {body}"
+        matches!(err, HiggsError::ModelNotFound { .. }),
+        "tune not-found is ModelNotFound: {err:?}"
     );
+    assert!(
+        err.to_string().contains("[HG002]"),
+        "tune not-found carries the HG002 code: {err}"
+    );
+
+    higgs.shutdown().await;
 }
 
-/// `GET /api/higgs/system` — assert the hardware/runtime/config three-panel shape
-/// of the `SystemInfo` snapshot (CPU/RAM under `hardware`, the engine identity
-/// under `runtime`, and the effective server config + limits under `config`).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// `hardware()` + `version()` + `server_config()` — the hardware/runtime/config
+/// three-panel shape of the old `/system` snapshot (CPU/RAM under hardware, the
+/// engine identity under runtime, and the effective server config + limits under
+/// config).
+#[tokio::test]
 async fn system_reports_hardware_runtime_config_shape() {
-    let Some(gguf) = tiny_gguf_path() else {
+    let Some(higgs) = higgs_local(&[TINY_MODEL_ID]).await else {
         eprintln!("SKIP system_reports_hardware_runtime_config_shape: tiny gguf not found");
         return;
     };
-    let srv = spawn_with_tiny_model(12205, &gguf).await;
-    let c = reqwest::Client::new();
 
-    let sys: serde_json::Value = c
-        .get(format!("{}/api/higgs/system", srv.base))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-
-    // hardware panel: a non-empty CPU name and a positive total RAM.
+    // hardware panel: a non-empty CPU name, a positive total RAM, and cores.
+    let hw = higgs.hardware().await;
     assert!(
-        sys["hardware"]["cpu_name"]
-            .as_str()
-            .is_some_and(|s| !s.is_empty()),
-        "hardware.cpu_name is a non-empty string: {sys}"
+        !hw.cpu_name.is_empty(),
+        "hardware.cpu_name is a non-empty string: {hw:?}"
     );
     assert!(
-        sys["hardware"]["ram_total_bytes"]
-            .as_u64()
-            .is_some_and(|n| n > 0),
-        "hardware.ram_total_bytes > 0: {sys}"
+        hw.ram_total_bytes > 0,
+        "hardware.ram_total_bytes > 0: {hw:?}"
     );
+    assert!(hw.cpu_cores > 0, "hardware.cpu_cores > 0: {hw:?}");
+
+    // runtime panel: the llama.cpp engine identity + a live engine version.
+    let version = higgs.version();
+    assert_eq!(version.engine, "llama.cpp", "runtime.engine is llama.cpp");
     assert!(
-        sys["hardware"]["cpu_cores"].as_u64().is_some_and(|n| n > 0),
-        "hardware.cpu_cores > 0: {sys}"
+        !version.engine_version.is_empty(),
+        "runtime.version is the live ggml version: {version:?}"
     );
 
-    // runtime panel: the llama.cpp engine identity.
+    // config panel: the effective server config carries the limits, including the
+    // live idle-unload TTL (default 60min × 60 = 3600s).
     assert_eq!(
-        sys["runtime"]["engine"], "llama.cpp",
-        "runtime.engine is llama.cpp: {sys}"
-    );
-    assert!(
-        sys["runtime"]["version"]
-            .as_str()
-            .is_some_and(|s| !s.is_empty()),
-        "runtime.version is the live ggml version: {sys}"
-    );
-
-    // config panel: the effective server config carries the limits sub-object,
-    // including the live idle-unload TTL (default 60min × 60 = 3600s).
-    assert!(sys["config"].is_object(), "config panel present: {sys}");
-    assert_eq!(
-        sys["config"]["limits"]["idle_unload_ttl_secs"]
-            .as_u64()
-            .expect("config.limits.idle_unload_ttl_secs present"),
+        higgs.server_config().limits.idle_unload_ttl_secs,
         3600,
-        "config.limits.idle_unload_ttl_secs is the live 60min×60: {sys}"
+        "config.limits.idle_unload_ttl_secs is the live 60min×60"
     );
+
+    higgs.shutdown().await;
 }
 
-/// `POST /api/higgs/worker/stop` with NOTHING loaded is a graceful no-op: it
-/// unconditionally returns `{"status":"ok"}` (the bulk-unload is best-effort and
-/// always Ok), and the server stays up + reports no live worker afterwards.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// `worker_stop` with NOTHING loaded is a graceful no-op: the bulk-unload is
+/// best-effort and always Ok, and afterwards `status` reports no live worker.
+#[tokio::test]
 async fn worker_stop_with_nothing_loaded_is_ok() {
-    let Some(gguf) = tiny_gguf_path() else {
+    let Some(higgs) = higgs_local(&[TINY_MODEL_ID]).await else {
         eprintln!("SKIP worker_stop_with_nothing_loaded_is_ok: tiny gguf not found");
         return;
     };
-    let srv = spawn_with_tiny_model(12206, &gguf).await;
-    let c = reqwest::Client::new();
 
-    let stop: serde_json::Value = c
-        .post(format!("{}/api/higgs/worker/stop", srv.base))
-        .json(&serde_json::json!({}))
-        .send()
+    higgs
+        .worker_stop()
         .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(
-        stop["status"], "ok",
-        "worker/stop with nothing loaded is ok"
+        .expect("worker_stop with nothing loaded is ok");
+
+    // The facade is still usable and reports no live worker (spawn-on-load).
+    let status = higgs.status().await.expect("status");
+    assert!(
+        !status.worker_alive,
+        "no worker after a no-op worker_stop: {status:?}"
     );
 
-    // The server is still up and reports no live worker (spawn-on-load).
-    let status: serde_json::Value = c
-        .get(format!("{}/api/higgs/status", srv.base))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(
-        status["worker_alive"], false,
-        "no worker after a no-op worker/stop: {status}"
-    );
+    higgs.shutdown().await;
 }
 
-/// `GET /api/higgs/version` — the build/engine identity envelope: a higgs
-/// version, the llama.cpp engine, a non-empty engine + binding version, and
-/// `gguf` among the supported formats.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// `version()` — the build/engine identity: a higgs version, the llama.cpp
+/// engine, a non-empty engine + binding version, and `gguf` among the supported
+/// formats.
+#[tokio::test]
 async fn version_reports_build_and_engine() {
-    let Some(gguf) = tiny_gguf_path() else {
+    let Some(higgs) = higgs_local(&[TINY_MODEL_ID]).await else {
         eprintln!("SKIP version_reports_build_and_engine: tiny gguf not found");
         return;
     };
-    let srv = spawn_with_tiny_model(12207, &gguf).await;
-    let c = reqwest::Client::new();
 
-    let v: serde_json::Value = c
-        .get(format!("{}/api/higgs/version", srv.base))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let v = higgs.version();
+    assert!(!v.higgs.is_empty(), "higgs version present: {v:?}");
+    assert_eq!(v.engine, "llama.cpp", "engine reported: {v:?}");
     assert!(
-        v["higgs"].as_str().is_some_and(|s| !s.is_empty()),
-        "higgs version present: {v}"
+        !v.engine_version.is_empty(),
+        "engine_version present: {v:?}"
     );
-    assert_eq!(v["engine"], "llama.cpp", "engine reported: {v}");
+    assert!(!v.binding.is_empty(), "binding version present: {v:?}");
     assert!(
-        v["engine_version"].as_str().is_some_and(|s| !s.is_empty()),
-        "engine_version present: {v}"
+        v.supported_formats.contains(&"gguf".to_owned()),
+        "gguf is a supported format: {v:?}"
     );
-    assert!(
-        v["binding"].as_str().is_some_and(|s| !s.is_empty()),
-        "binding version present: {v}"
-    );
-    let fmts = v["supported_formats"].as_array().expect("formats array");
-    assert!(
-        fmts.contains(&serde_json::Value::String("gguf".to_owned())),
-        "gguf is a supported format: {v}"
-    );
+
+    higgs.shutdown().await;
 }
 
-/// `GET /api/higgs/nodes` — the local node is a first-class node and appears
-/// FIRST even with no fleet/hub installed (`endpoint_id == "local"`, `is_local`,
-/// always connected, with a label + inventory).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// `nodes()` — the local node is a first-class node and appears FIRST even with
+/// no fleet/hub installed (`endpoint_id == "local"`, `is_local`, always
+/// connected, with a label + inventory).
+#[tokio::test]
 async fn nodes_lists_local_node_first() {
-    let Some(gguf) = tiny_gguf_path() else {
+    let Some(higgs) = higgs_local(&[TINY_MODEL_ID]).await else {
         eprintln!("SKIP nodes_lists_local_node_first: tiny gguf not found");
         return;
     };
-    let srv = spawn_with_tiny_model(12208, &gguf).await;
-    let c = reqwest::Client::new();
 
-    let nodes: Vec<serde_json::Value> = c
-        .get(format!("{}/api/higgs/nodes", srv.base))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let nodes = higgs.nodes().await;
     assert_eq!(
         nodes.len(),
         1,
         "only the local node with no fleet: {nodes:?}"
     );
     let local = &nodes[0];
-    assert_eq!(local["endpoint_id"], "local", "local sentinel id: {local}");
-    assert_eq!(local["is_local"], true, "flagged local: {local}");
-    assert_eq!(
-        local["connected"], true,
-        "local is always connected: {local}"
-    );
+    assert_eq!(local.endpoint_id, "local", "local sentinel id: {local:?}");
+    assert!(local.is_local, "flagged local: {local:?}");
+    assert!(local.connected, "local is always connected: {local:?}");
+    assert!(!local.label.is_empty(), "local node has a label: {local:?}");
     assert!(
-        local["label"].as_str().is_some_and(|s| !s.is_empty()),
-        "local node has a label: {local}"
+        local.inventory.is_some(),
+        "local inventory present: {local:?}"
     );
-    assert!(
-        local["inventory"].is_object(),
-        "local inventory present: {local}"
-    );
+
+    higgs.shutdown().await;
 }
 
-/// `POST /api/higgs/nodes/label {"node":"local", ...}` renames THIS instance:
-/// it writes the new name into the isolated `config.json` (under the temp
-/// `HIGGS_HOME`) and the next `GET /api/higgs/nodes` shows the local node's new
-/// label. (`node:"local"` is the one relabel branch that needs no hub.)
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// `node_label("local", ...)` renames THIS instance: it writes the new name into
+/// the isolated `config.json` (under the temp `HIGGS_HOME`) and the next `nodes()`
+/// shows the local node's new label. (`node == "local"` is the one relabel branch
+/// that needs no hub.)
+#[tokio::test]
 async fn nodes_label_renames_local_instance() {
-    let Some(gguf) = tiny_gguf_path() else {
+    let Some(higgs) = higgs_local(&[TINY_MODEL_ID]).await else {
         eprintln!("SKIP nodes_label_renames_local_instance: tiny gguf not found");
         return;
     };
-    let srv = spawn_with_tiny_model(12209, &gguf).await;
-    let c = reqwest::Client::new();
 
     let new_name = "renamed-local-box";
-    let resp = c
-        .post(format!("{}/api/higgs/nodes/label", srv.base))
-        .json(&serde_json::json!({ "node": "local", "label": new_name }))
-        .send()
+    let renamed = higgs
+        .node_label("local", new_name)
         .await
-        .unwrap();
-    assert_eq!(resp.status(), 200, "local relabel succeeds (no hub needed)");
-    let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["status"], "ok", "relabel returns ok: {body}");
+        .expect("local relabel succeeds (no hub needed)");
+    assert!(renamed, "relabel of the local node reports renamed");
 
     // The local node now reports the new label.
-    let nodes: Vec<serde_json::Value> = c
-        .get(format!("{}/api/higgs/nodes", srv.base))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let nodes = higgs.nodes().await;
     let local = nodes
         .iter()
-        .find(|n| n["endpoint_id"] == "local")
+        .find(|n| n.endpoint_id == "local")
         .expect("local node present");
     assert_eq!(
-        local["label"], new_name,
-        "the local node shows the new name: {local}"
+        local.label, new_name,
+        "the local node shows the new name: {local:?}"
     );
+
+    higgs.shutdown().await;
 }
 
-/// `GET /api/higgs/hub` — with no hub installed the status reports disabled,
-/// no hub id, and zero nodes (lets the Fleet tab show an explicit "hub off"
-/// state rather than inferring it from a `/pair` 409).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// The hub status with no hub installed reports disabled, no hub id, and zero
+/// nodes (lets the Fleet tab show an explicit "hub off" state). `hub_disable` is
+/// idempotent — a no-op returning the current (disabled) status when no hub is
+/// installed.
+#[tokio::test]
 async fn hub_status_without_hub_is_disabled() {
-    let Some(gguf) = tiny_gguf_path() else {
+    let Some(higgs) = higgs_local(&[TINY_MODEL_ID]).await else {
         eprintln!("SKIP hub_status_without_hub_is_disabled: tiny gguf not found");
         return;
     };
-    let srv = spawn_with_tiny_model(12210, &gguf).await;
-    let c = reqwest::Client::new();
 
-    let resp = c
-        .get(format!("{}/api/higgs/hub", srv.base))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200, "hub status answers 200");
-    let v: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(v["enabled"], false, "no hub installed → disabled: {v}");
-    assert_eq!(v["node_count"], 0, "no nodes when disabled: {v}");
+    let status = higgs.hub_disable().await;
+    assert!(!status.enabled, "no hub installed → disabled: {status:?}");
+    assert_eq!(status.node_count, 0, "no nodes when disabled: {status:?}");
     assert!(
-        v["hub_id"].is_null(),
-        "hub_id omitted/null when disabled: {v}"
+        status.hub_id.is_none(),
+        "hub_id omitted/null when disabled: {status:?}"
     );
+
+    higgs.shutdown().await;
 }

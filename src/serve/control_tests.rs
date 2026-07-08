@@ -1,8 +1,8 @@
-use super::super::test_support::*;
-use crate::log_bus::LogSource;
-use axum::http::StatusCode;
-use serde_json::json;
-use tower::ServiceExt;
+// Unit tests for the surviving control HELPERS — the pure sub-primitives the
+// `Higgs` facade delegates to (`api/embed.rs`). The `/api/higgs/*` HTTP handlers
+// these once accompanied were deleted with the standalone control surface; their
+// end-to-end behavior is now covered at the facade level (`api/embed_tests.rs`,
+// `api/tests.rs`).
 
 // ── Gate 2: host-side tool-call-parser sniff ─────────────────────────────
 
@@ -26,6 +26,7 @@ fn model_with_template(template: Option<&str>) -> crate::worker::models::HiggsMo
         supports_tools: false,
         supports_reasoning: false,
         gguf_components: Vec::new(),
+        enrich_error: None,
         chat_template: template.map(ToOwned::to_owned),
     }
 }
@@ -309,1605 +310,6 @@ fn model_entry_carries_tune_provenance_and_bench_tps() {
     assert!(json.get("bench_tps").is_none());
 }
 
-// ── Test 6: control load + unload roundtrip ──────────────────────────────
-
-#[tokio::test]
-async fn control_load_unload_roundtrip() {
-    // `load` resolves the GGUF path host-side, so the id must be discoverable.
-    // The stateful fake worker auto-responds to M_LOAD/M_STATUS/M_UNLOAD, so
-    // the load → unload round-trip runs through the real node path.
-    let dir = tempfile::TempDir::new().unwrap();
-    write_gguf_fixture(dir.path(), "org/model");
-    let app = make_app_with_lmstudio(dir.path().to_path_buf());
-
-    let resp = app
-        .clone()
-        .oneshot(post_json(
-            "/api/higgs/models/load",
-            &json!({"id": "org/model"}),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert_eq!(v["status"], "ok");
-    assert_eq!(v["id"], "org/model");
-
-    let resp = app
-        .oneshot(post_json("/api/higgs/models/unload", &json!({})))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert_eq!(v["status"], "ok");
-}
-
-#[tokio::test]
-async fn control_unload_one_by_id_targets_just_that_model() {
-    // Per-model unload happy path: load a model, then unload it by `{id}` — this
-    // drives `Higgs::unload_one` (served-id resolve → that worker only), distinct
-    // from the `{}` drain-all path. Afterwards the model is gone.
-    let dir = tempfile::TempDir::new().unwrap();
-    write_gguf_fixture(dir.path(), "org/model");
-    let app = make_app_with_lmstudio(dir.path().to_path_buf());
-
-    let resp = app
-        .clone()
-        .oneshot(post_json(
-            "/api/higgs/models/load",
-            &json!({"id": "org/model"}),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let resp = app
-        .clone()
-        .oneshot(post_json(
-            "/api/higgs/models/unload",
-            &json!({"id": "org/model"}),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert_eq!(v["status"], "ok");
-
-    // Unloading the same id again is an idempotent no-op (now not resident).
-    let resp = app
-        .oneshot(post_json(
-            "/api/higgs/models/unload",
-            &json!({"id": "org/model"}),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-}
-
-#[tokio::test]
-async fn unload_rejects_present_but_unusable_id() {
-    // Per-model unload safety: a PRESENT but unusable id (`null` / empty) or an
-    // unknown field must 400 — it must NEVER fall through to the destructive
-    // drain-all. Only a TRULY absent id (`{}` / empty body, covered by
-    // `control_load_unload_roundtrip`) drains all. These bodies are rejected
-    // before higgs is touched, so a bare app (no loaded model) is enough.
-    let dir = tempfile::TempDir::new().unwrap();
-    let app = make_app_with_lmstudio(dir.path().to_path_buf());
-    for bad in [
-        json!({"id": null}),
-        json!({"id": ""}),
-        json!({"model": "org/m"}),
-    ] {
-        let resp = app
-            .clone()
-            .oneshot(post_json("/api/higgs/models/unload", &bad))
-            .await
-            .unwrap();
-        assert_eq!(
-            resp.status(),
-            StatusCode::BAD_REQUEST,
-            "unload body {bad} must be rejected, not silently drain all models"
-        );
-    }
-}
-
-// ── Test 7: control_model_by_id with a slashed HF repo id ───────────────
-//
-// This is the regression test for the wildcard-route bug: with the old
-// single-segment `{id}` route, a request to `/api/higgs/models/org/model`
-// (literal slash in the path, as real curl sends) never matched — axum
-// treated `org` and `model` as separate segments. The test previously used
-// `org%2Fmodel` (percent-encoded) which happened to work against the broken
-// route because `%2F` is a single segment. Using a literal slash here
-// ensures the wildcard `{*id}` route is exercised as real callers do.
-
-#[tokio::test]
-async fn control_model_by_id_found_slashed() {
-    // Scan runs host-side: discover the slashed id from a real GGUF fixture.
-    // Nothing is loaded (no worker), so the status enrichment reports
-    // `not-loaded` — the fake worker need not be driven.
-    let dir = tempfile::TempDir::new().unwrap();
-    write_gguf_fixture(
-        dir.path(),
-        "lmstudio-community/NVIDIA-Nemotron-3-Nano-4B-GGUF",
-    );
-    let app = make_app_with_lmstudio(dir.path().to_path_buf());
-
-    // Literal slash in the URL — this is what real curl sends and what
-    // the old `{id}` route could never match.
-    let resp = app
-        .oneshot(get(
-            "/api/higgs/models/lmstudio-community/NVIDIA-Nemotron-3-Nano-4B-GGUF",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert_eq!(v["id"], "lmstudio-community/NVIDIA-Nemotron-3-Nano-4B-GGUF");
-    assert_eq!(v["state"], "not-loaded");
-    assert_eq!(v["format"], "gguf");
-    assert_eq!(v["arch"], "llama");
-}
-
-// ── Test 8: control_model_by_id not found (slashed id) ───────────────────
-
-#[tokio::test]
-async fn control_model_by_id_not_found() {
-    // Empty temp dir → host-side scan finds nothing → the id is absent.
-    let dir = tempfile::TempDir::new().unwrap();
-    let app = make_app_with_lmstudio(dir.path().to_path_buf());
-
-    // Slashed id that does not exist in the catalog → 404 HG002.
-    let resp = app
-        .oneshot(get("/api/higgs/models/org/nope"))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert!(v["error"].as_str().unwrap().contains("[HG002]"));
-}
-
-#[tokio::test]
-async fn pair_without_hub_mode_is_conflict() {
-    let app = make_app();
-    // No hub installed → pairing is a 409 with an explanatory error.
-    let resp = app
-        .oneshot(post_json("/api/higgs/pair", &json!({})))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
-    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert!(
-        v["error"].as_str().unwrap().contains("hub mode"),
-        "explains hub mode: {v}"
-    );
-}
-
-#[tokio::test]
-async fn nodes_load_unload_without_fleet_is_conflict() {
-    let load = make_app()
-        .oneshot(post_json(
-            "/api/higgs/nodes/load",
-            &json!({ "node": "n", "model": "m" }),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(load.status(), StatusCode::CONFLICT, "no fleet → 409");
-    let unload = make_app()
-        .oneshot(post_json(
-            "/api/higgs/nodes/unload",
-            &json!({ "model": "m" }),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(unload.status(), StatusCode::CONFLICT, "no fleet → 409");
-}
-
-#[tokio::test]
-async fn relabel_remote_without_hub_is_conflict() {
-    // Renaming a REMOTE node requires the hub enabled (it owns the allowlist) → 409 when off,
-    // like the other node-mutation routes. (The local rename + remote-success + unknown-id 404
-    // paths run in the hub_server e2e under a temp HIGGS_HOME, so this doesn't touch ~/.higgs.)
-    let resp = make_app()
-        .oneshot(post_json(
-            "/api/higgs/nodes/label",
-            &json!({ "node": "some-remote-endpoint-id", "label": "x" }),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        StatusCode::CONFLICT,
-        "remote relabel needs a hub → 409"
-    );
-}
-
-#[tokio::test]
-async fn nodes_lists_the_local_node_first_even_without_a_fleet() {
-    // Even with the hub role off (no fleet), GET /api/higgs/nodes returns the LOCAL machine
-    // as a first-class node, so the Fleet view always shows "this machine".
-    let resp = make_app().oneshot(get("/api/higgs/nodes")).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v: Vec<serde_json::Value> = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert_eq!(v.len(), 1, "only the local node when no fleet: {v:?}");
-    assert_eq!(v[0]["endpoint_id"], "local", "local sentinel id");
-    assert_eq!(v[0]["is_local"], true, "flagged local");
-    assert_eq!(v[0]["connected"], true, "local node is always connected");
-    assert!(
-        v[0]["label"].as_str().is_some_and(|s| !s.is_empty()),
-        "local node has a label: {v:?}"
-    );
-    assert!(
-        v[0]["inventory"].is_object(),
-        "local inventory present: {v:?}"
-    );
-}
-
-#[tokio::test]
-async fn hub_status_without_hub_reports_disabled() {
-    // No hub installed → GET /api/higgs/hub answers 200 with enabled:false, no id, 0 nodes.
-    let resp = make_app().oneshot(get("/api/higgs/hub")).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert_eq!(v["enabled"], false, "no hub installed → disabled: {v}");
-    assert_eq!(v["node_count"], 0, "no nodes when disabled: {v}");
-    assert!(
-        v.get("hub_id").is_none(),
-        "hub_id omitted when disabled: {v}"
-    );
-}
-
-#[tokio::test]
-async fn hub_disable_without_hub_is_a_noop() {
-    // The kill switch is idempotent: disabling when no hub is installed just reports disabled.
-    let resp = make_app()
-        .oneshot(post_json("/api/higgs/hub/disable", &json!({})))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert_eq!(v["enabled"], false, "still disabled: {v}");
-}
-
-// ── Test 9: version endpoint ──────────────────────────────────────────────
-
-#[tokio::test]
-async fn version_endpoint() {
-    let app = make_app();
-
-    let resp = app.oneshot(get("/api/higgs/version")).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert!(v["higgs"].as_str().is_some(), "higgs version present");
-    assert_eq!(v["engine"], "llama.cpp");
-    // engine_version is the real engine (ggml) version from ggml_version();
-    // binding is the llama-cpp-2 wrapper version — distinct fields.
-    assert!(v["engine_version"].as_str().is_some_and(|s| !s.is_empty()));
-    assert!(v["binding"].as_str().is_some_and(|s| !s.is_empty()));
-    let fmts = v["supported_formats"].as_array().expect("array");
-    assert!(fmts.contains(&serde_json::Value::String("gguf".to_owned())));
-}
-
-// ── (original Test 7, now test 10): logs endpoint shape and tail semantics ─
-
-#[tokio::test]
-async fn logs_endpoint_shapes() {
-    let (higgs, bus) = make_higgs_with_bus();
-    bus.push(LogSource::Serve, "line one".to_owned());
-    bus.push(LogSource::Serve, "line two".to_owned());
-    bus.push(LogSource::Serve, "line three".to_owned());
-    let app = app_for(higgs);
-
-    let resp = app.oneshot(get("/api/higgs/logs?n=2")).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert_eq!(
-        v["lines"],
-        json!(["line two", "line three"]),
-        "tail of n, oldest first"
-    );
-}
-
-/// `?source=serve|worker` routes the two log origins to separate consoles —
-/// end-to-end through the HTTP snapshot handler.
-#[tokio::test]
-async fn logs_endpoint_filters_by_source() {
-    let (higgs, bus) = make_higgs_with_bus();
-    bus.push(LogSource::Serve, "higgs: GET /v1/models".to_owned());
-    bus.push(LogSource::Worker, "ggml_metal_init: loaded".to_owned());
-    bus.push(LogSource::Serve, "higgs: loading model".to_owned());
-    let app = app_for(higgs);
-
-    // ?source=worker → only the worker stderr line.
-    let resp = app
-        .clone()
-        .oneshot(get("/api/higgs/logs?source=worker"))
-        .await
-        .unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert_eq!(
-        v["lines"],
-        json!(["ggml_metal_init: loaded"]),
-        "worker only"
-    );
-
-    // ?source=serve → only the higgs control-plane lines, in push order.
-    let resp = app
-        .clone()
-        .oneshot(get("/api/higgs/logs?source=serve"))
-        .await
-        .unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert_eq!(
-        v["lines"],
-        json!(["higgs: GET /v1/models", "higgs: loading model"]),
-        "serve only"
-    );
-
-    // No filter → all three, merged in push order.
-    let resp = app.oneshot(get("/api/higgs/logs")).await.unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert_eq!(
-        v["lines"].as_array().map(Vec::len),
-        Some(3),
-        "no filter = all sources merged"
-    );
-}
-
-// ── logs SSE stream: replay-then-live ordering ───────────────────────────
-
-#[tokio::test]
-async fn logs_stream_replays_then_streams_live() {
-    use super::{control_logs_stream, LogsQuery};
-    use axum::extract::{Query, State};
-    use axum::response::IntoResponse;
-    use futures::StreamExt;
-    use std::time::Duration;
-
-    let (higgs, bus) = make_higgs_with_bus();
-    // Seed history BEFORE the request — this is the replay prefix.
-    bus.push(LogSource::Serve, "hist-1".to_owned());
-    bus.push(LogSource::Serve, "hist-2".to_owned());
-
-    let resp = control_logs_stream(
-        State(higgs.clone()),
-        Query(LogsQuery {
-            n: Some(10),
-            source: None,
-        }),
-    )
-    .await
-    .into_response();
-    assert_eq!(
-        resp.headers()
-            .get(axum::http::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok()),
-        Some("text/event-stream"),
-        "SSE content-type"
-    );
-
-    let mut body = resp.into_body().into_data_stream();
-
-    // The replay prefix arrives first; collect frames until both history
-    // lines have been seen.
-    let mut seen = String::new();
-    while !(seen.contains("hist-1") && seen.contains("hist-2")) {
-        let frame = tokio::time::timeout(Duration::from_secs(2), body.next())
-            .await
-            .expect("replay frame within timeout")
-            .expect("body not ended")
-            .expect("frame ok");
-        seen.push_str(&String::from_utf8_lossy(&frame));
-    }
-    assert!(
-        seen.contains("hist-1") && seen.contains("hist-2"),
-        "replay: {seen}"
-    );
-
-    // After replay the stream is parked on the live receiver. Push a new line
-    // and it must arrive as a frame — proving live delivery, not closure.
-    bus.push(LogSource::Serve, "live-1".to_owned());
-    let mut live_seen = String::new();
-    while !live_seen.contains("live-1") {
-        let frame = tokio::time::timeout(Duration::from_secs(2), body.next())
-            .await
-            .expect("live frame within timeout")
-            .expect("body not ended")
-            .expect("frame ok");
-        live_seen.push_str(&String::from_utf8_lossy(&frame));
-    }
-    assert!(live_seen.contains("live-1"), "live: {live_seen}");
-
-    // The replay source itself is ordered oldest-first ahead of the live line.
-    assert_eq!(
-        higgs.logs(10, None),
-        vec![
-            "hist-1".to_owned(),
-            "hist-2".to_owned(),
-            "live-1".to_owned()
-        ]
-    );
-}
-
-// ── control_models: scan + status enrichment ─────────────────────────────
-
-#[tokio::test]
-async fn control_models_lists_with_loaded_flag() {
-    // Multi-model: load TWO distinct models — the models list must flag BOTH as
-    // `loaded` (not just the primary), and `loaded_id` reports the primary.
-    let dir = tempfile::TempDir::new().unwrap();
-    write_gguf_fixture(dir.path(), "org/model");
-    write_gguf_fixture(dir.path(), "org/other");
-    let higgs = make_higgs_with_lmstudio(dir.path().to_path_buf());
-    higgs.load("org/model", None).await.expect("load model");
-    higgs.load("org/other", None).await.expect("load other");
-    let app = app_for(higgs);
-
-    let resp = app.oneshot(get("/api/higgs/models")).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    // Primary (lowest worker = first loaded) is org/model.
-    assert_eq!(v["loaded_id"], "org/model");
-    let models = v["models"].as_array().expect("models array");
-    assert_eq!(models.len(), 2, "both models listed");
-    // BOTH resident models are flagged loaded — the multi-model fix.
-    for m in models {
-        assert_eq!(
-            m["state"], "loaded",
-            "every resident model is flagged loaded: {m}"
-        );
-        assert_eq!(m["format"], "gguf");
-    }
-}
-
-// ── control_status passthrough ───────────────────────────────────────────
-
-#[tokio::test]
-async fn control_status_returns_snapshot() {
-    // Load a fixture model so the status snapshot reports it resident (the
-    // stateful fake worker echoes the loaded model in M_STATUS).
-    let dir = tempfile::TempDir::new().unwrap();
-    write_gguf_fixture(dir.path(), "org/model");
-    let higgs = make_higgs_with_lmstudio(dir.path().to_path_buf());
-    higgs.load("org/model", None).await.expect("load");
-    let app = app_for(higgs);
-
-    let resp = app.oneshot(get("/api/higgs/status")).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert_eq!(v["loaded"]["id"], "org/model");
-}
-
-// ── control_load with explicit params (non-default branch) ───────────────
-
-#[tokio::test]
-async fn control_load_with_explicit_params() {
-    // `load` resolves the GGUF path host-side, so the id must be discoverable.
-    let dir = tempfile::TempDir::new().unwrap();
-    write_gguf_fixture(dir.path(), "org/model");
-    let app = make_app_with_lmstudio(dir.path().to_path_buf());
-
-    // Providing ctx_len takes the param-merge branch (Some(LoadParams)).
-    let resp = app
-        .oneshot(post_json(
-            "/api/higgs/models/load",
-            &json!({"id": "org/model", "ctx_len": 2048}),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert_eq!(v["status"], "ok");
-    assert_eq!(v["id"], "org/model");
-}
-
-// ── control_system: real host snapshot ───────────────────────────────────
-
-#[tokio::test]
-async fn control_system_returns_host_info() {
-    let app = make_app();
-
-    let resp = app.oneshot(get("/api/higgs/system")).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    // SystemInfo always reports a positive total RAM on a real host.
-    assert!(
-        v.get("ram").is_some() || v.get("cpu").is_some() || v.is_object(),
-        "system info is a populated object: {v}"
-    );
-}
-
-// ── logs settings: GET reflects default; PUT toggles verbose ─────────────
-
-#[tokio::test]
-async fn logs_settings_get_default_and_put_toggles() {
-    let app = make_app();
-
-    // GET defaults to verbose:false.
-    let resp = app
-        .clone()
-        .oneshot(get("/api/higgs/logs/settings"))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert_eq!(v["verbose"], false, "verbose defaults to false");
-    assert_eq!(
-        v["log_incoming_tokens"], false,
-        "log_incoming_tokens defaults to false"
-    );
-    assert_eq!(
-        v["show_log_fields"], false,
-        "show_log_fields defaults to false (redact)"
-    );
-
-    // PUT all flags true returns {"status":"ok"}.
-    let resp = app
-        .clone()
-        .oneshot(put_json(
-            "/api/higgs/logs/settings",
-            &json!({"verbose": true, "log_incoming_tokens": true, "show_log_fields": true}),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert_eq!(v["status"], "ok");
-
-    // GET now reflects the new state for all flags.
-    let resp = app.oneshot(get("/api/higgs/logs/settings")).await.unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert_eq!(v["verbose"], true, "PUT toggled verbose on");
-    assert_eq!(
-        v["log_incoming_tokens"], true,
-        "PUT toggled log_incoming_tokens on"
-    );
-    assert_eq!(v["show_log_fields"], true, "PUT toggled show_log_fields on");
-}
-
-// ── runtime settings: GET reflects default (JIT on); PUT toggles JIT ─────
-
-#[tokio::test]
-async fn settings_get_default_and_put_toggles_jit() {
-    let app = make_app();
-
-    // GET defaults: JIT on, auto-unload on, TTL 60 minutes (the node default).
-    let resp = app
-        .clone()
-        .oneshot(get("/api/higgs/settings"))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert_eq!(v["jit_enabled"], true, "JIT defaults to on");
-    assert_eq!(v["auto_unload_idle"], true, "auto-unload defaults to on");
-    assert_eq!(v["idle_ttl_minutes"], 60, "TTL defaults to 60 minutes");
-    assert_eq!(v["serving_enabled"], true, "serving defaults to on");
-
-    // PUT all four (JIT off, auto-unload off, TTL 30, serving off) returns ok.
-    let resp = app
-        .clone()
-        .oneshot(put_json(
-            "/api/higgs/settings",
-            &json!({
-                "jit_enabled": false,
-                "auto_unload_idle": false,
-                "idle_ttl_minutes": 30,
-                "serving_enabled": false,
-            }),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert_eq!(v["status"], "ok");
-
-    // GET now reflects all three new values.
-    let resp = app.oneshot(get("/api/higgs/settings")).await.unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert_eq!(v["jit_enabled"], false, "PUT toggled JIT off");
-    assert_eq!(v["auto_unload_idle"], false, "PUT toggled auto-unload off");
-    assert_eq!(v["idle_ttl_minutes"], 30, "PUT set TTL to 30 minutes");
-    assert_eq!(v["serving_enabled"], false, "PUT toggled serving off");
-}
-
-// ── settings handlers: round-trip through the typed GET/PUT pair ──────────
-
-#[tokio::test]
-async fn settings_handlers_round_trip() {
-    use super::{control_set_settings, control_settings};
-    use axum::extract::State;
-
-    let higgs = make_higgs();
-
-    // GET handler reflects the default-on state.
-    assert!(
-        control_settings(State(higgs.clone())).await.0.jit_enabled,
-        "JIT on by default"
-    );
-
-    // PUT handler flips it off; the chat path's gate (`higgs.jit_enabled()`)
-    // now returns false, so an unloaded model is a 404 (explicit-load).
-    let ok = control_set_settings(
-        State(higgs.clone()),
-        axum::Json(crate::serve::HiggsRuntimeSettings {
-            jit_enabled: false,
-            auto_unload_idle: false,
-            idle_ttl_minutes: 30,
-            serving_enabled: false,
-        }),
-    )
-    .await;
-    assert_eq!(ok.0.status, "ok");
-    assert!(!higgs.jit_enabled(), "PUT disabled the JIT gate");
-    assert!(!higgs.auto_unload_idle(), "PUT disabled idle auto-unload");
-    assert_eq!(higgs.idle_ttl_minutes(), 30, "PUT set the idle TTL");
-    assert!(!higgs.serving_enabled(), "PUT disabled serving");
-    let got = control_settings(State(higgs.clone())).await.0;
-    assert!(!got.jit_enabled, "GET reflects JIT off");
-    assert!(!got.auto_unload_idle, "GET reflects auto-unload off");
-    assert_eq!(got.idle_ttl_minutes, 30, "GET reflects the new TTL");
-    assert!(!got.serving_enabled, "GET reflects serving off");
-}
-
-// ── verbose gate: served line appears only when verbose is on ─────────────
-
-#[tokio::test]
-async fn verbose_gate_round_trips_through_handlers() {
-    use super::{control_logs_settings, control_set_logs_settings};
-    use axum::extract::State;
-
-    let higgs = make_higgs();
-
-    // GET handler reflects the default-off state.
-    assert!(
-        !control_logs_settings(State(higgs.clone())).await.0.verbose,
-        "verbose off by default"
-    );
-
-    // PUT handler flips it on; the chat path's gate (`higgs.verbose()`) now
-    // returns true, so the served line would be emitted (format asserted in
-    // v1's `served_message_format`).
-    let ok = control_set_logs_settings(
-        State(higgs.clone()),
-        axum::Json(crate::serve::LogSettings {
-            verbose: true,
-            log_incoming_tokens: true,
-            show_log_fields: false,
-        }),
-    )
-    .await;
-    assert_eq!(ok.0.status, "ok");
-    assert!(higgs.verbose(), "PUT enabled the chat verbose gate");
-    assert!(
-        higgs.log_incoming_tokens(),
-        "PUT enabled the incoming-tokens gate"
-    );
-    let got = control_logs_settings(State(higgs.clone())).await.0;
-    assert!(got.verbose, "GET reflects verbose on");
-    assert!(
-        got.log_incoming_tokens,
-        "GET reflects log_incoming_tokens on"
-    );
-}
-
-// ── control_worker_stop: graceful, always ok ─────────────────────────────
-
-#[tokio::test]
-async fn control_worker_stop_ok() {
-    let app = make_app();
-
-    let resp = app
-        .oneshot(post_json("/api/higgs/worker/stop", &json!({})))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert_eq!(v["status"], "ok");
-}
-
-/// REGRESSION: `worker/stop` is NON-terminal — the server stays loadable after it.
-/// (The endpoint must do a bulk UNLOAD, not the node's terminal `shutdown_all` drain,
-/// which marks the runtime shutting-down and would brick every later load until the
-/// process restarts.)
-#[tokio::test]
-async fn worker_stop_is_non_terminal_loads_still_work() {
-    let dir = tempfile::TempDir::new().unwrap();
-    write_gguf_fixture(dir.path(), "org/model");
-    let app = make_app_with_lmstudio(dir.path().to_path_buf());
-
-    // Load a model, then stop (unload) all workers via the endpoint.
-    let resp = app
-        .clone()
-        .oneshot(post_json(
-            "/api/higgs/models/load",
-            &json!({"id": "org/model"}),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "initial load ok");
-    let resp = app
-        .clone()
-        .oneshot(post_json("/api/higgs/worker/stop", &json!({})))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "worker/stop ok");
-
-    // A SUBSEQUENT load must still succeed — the node is not terminally shut down.
-    let resp = app
-        .oneshot(post_json(
-            "/api/higgs/models/load",
-            &json!({"id": "org/model"}),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        StatusCode::OK,
-        "load after worker/stop must still work (the node must not be bricked)"
-    );
-    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert_eq!(v["status"], "ok", "reload succeeds post-stop");
-}
-
-// ── nodes/{node}/models + nodes/retire: hub-only routes ──────────────────
-
-/// Both new fleet routes require hub mode: with no fleet/hub installed they
-/// answer `409 CONFLICT` (the `not_a_hub` guard), exercising the handler
-/// wiring + route registration without a live iroh hub.
-#[tokio::test]
-async fn node_models_and_retire_require_hub_mode() {
-    let app = make_app();
-
-    let resp = app
-        .clone()
-        .oneshot(get("/api/higgs/nodes/somenode/models"))
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        StatusCode::CONFLICT,
-        "node catalog needs a hub"
-    );
-
-    let resp = app
-        .oneshot(post_json(
-            "/api/higgs/nodes/retire",
-            &json!({ "node": "somenode" }),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::CONFLICT, "retire needs a hub");
-}
-
-// ── scan_with_loaded: HG001 scan-failure propagation ─────────────────────
-//
-// A configured scan root that is a regular FILE (not a directory) makes
-// `read_dir` return an ENOTDIR error (NOT `NotFound`), so `Higgs::scan` returns
-// `Err([HG001])`. Both `control_models` and `control_model_by_id` funnel that
-// failure through `scan_with_loaded`, which maps it to a control error response
-// (the `Err(resp) => return resp` arms). No worker is touched — the scan fails
-// host-side before any load.
-
-/// Configure a scan dir that is actually a FILE so the host-side scan errors with
-/// HG001 — `GET /api/higgs/models` then returns that mapped control error.
-#[tokio::test]
-async fn control_models_propagates_scan_failure() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let file = dir.path().join("not-a-dir");
-    std::fs::write(&file, b"x").unwrap();
-    let app = make_app_with_lmstudio(file);
-
-    let resp = app.oneshot(get("/api/higgs/models")).await.unwrap();
-    // HG001 (model dir unreadable) maps to a 500 (the `_ =>` catch-all in
-    // `http_status`), carrying the typed code in the body.
-    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert!(
-        v["error"].as_str().unwrap().contains("[HG001]"),
-        "scan failure carries HG001: {v}"
-    );
-}
-
-/// `GET /api/higgs/models/{*id}` also funnels through `scan_with_loaded`; a
-/// file-as-dir scan root errors with HG001 before the id lookup.
-#[tokio::test]
-async fn control_model_by_id_propagates_scan_failure() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let file = dir.path().join("not-a-dir");
-    std::fs::write(&file, b"x").unwrap();
-    let app = make_app_with_lmstudio(file);
-
-    let resp = app
-        .oneshot(get("/api/higgs/models/org/model"))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert!(
-        v["error"].as_str().unwrap().contains("[HG001]"),
-        "scan failure carries HG001: {v}"
-    );
-}
-
-// ── control_load: full engine-tagged `params` branch + error paths ───────
-
-/// A load request carrying a complete engine-tagged `params` object takes the
-/// `Some(full)` branch (the full params supersede the flat fields and are used
-/// as-is). The stateful fake worker accepts the load.
-#[tokio::test]
-async fn control_load_with_full_engine_params_object() {
-    let dir = tempfile::TempDir::new().unwrap();
-    write_gguf_fixture(dir.path(), "org/model");
-    let app = make_app_with_lmstudio(dir.path().to_path_buf());
-
-    // The umbrella `params` is the engine-tagged LoadParams shape: `{engine, ...}`
-    // — here the llamacpp variant with a pinned context. Its presence routes
-    // through the `Some(full)` arm, NOT the flat-field merge.
-    let resp = app
-        .oneshot(post_json(
-            "/api/higgs/models/load",
-            &json!({
-                "id": "org/model",
-                "params": { "engine": "LlamaCpp", "ctx_len": 2048, "gpu_layers": 0, "threads": 2 }
-            }),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert_eq!(v["status"], "ok");
-    assert_eq!(v["id"], "org/model");
-}
-
-/// Loading an id absent from the scanned catalog fails at the node resolve step
-/// with `ModelNotFound` (HG002 → 404) — the `Err(err)` arm of `control_load`.
-#[tokio::test]
-async fn control_load_unknown_model_is_404() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let app = make_app_with_lmstudio(dir.path().to_path_buf());
-
-    let resp = app
-        .oneshot(post_json(
-            "/api/higgs/models/load",
-            &json!({"id": "org/does-not-exist"}),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert!(
-        v["error"].as_str().unwrap().contains("[HG002]"),
-        "unknown model load is HG002: {v}"
-    );
-}
-
-/// An id failing the host-side charset guard (`validate_repo_id`) fails the load
-/// with `InvalidModelId` (HG015 → 400) before any filesystem access.
-#[tokio::test]
-async fn control_load_invalid_id_is_400() {
-    let app = make_app();
-
-    // A `..` path component is the traversal vector → HG015.
-    let resp = app
-        .oneshot(post_json(
-            "/api/higgs/models/load",
-            &json!({"id": "org/../escape"}),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert!(
-        v["error"].as_str().unwrap().contains("[HG015]"),
-        "invalid id is HG015: {v}"
-    );
-}
-
-// ── control_tune: success + unknown-model error ──────────────────────────
-
-/// `POST /api/higgs/models/tune` for an id absent from the catalog fails with
-/// `ModelNotFound` (HG002 → 404) at the scan-find step, BEFORE any card fetch —
-/// the `Err(err)` arm of `control_tune`. No network is touched.
-#[tokio::test]
-async fn control_tune_unknown_model_is_404() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let app = make_app_with_lmstudio(dir.path().to_path_buf());
-
-    let resp = app
-        .oneshot(post_json(
-            "/api/higgs/models/tune",
-            &json!({"id": "org/nope"}),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert!(
-        v["error"].as_str().unwrap().contains("[HG002]"),
-        "tune of unknown model is HG002: {v}"
-    );
-}
-
-/// `POST /api/higgs/models/tune` (Suggest) for a discoverable fixture model
-/// returns a suggestion echoing the requested id. The pure heuristic suggester
-/// runs in-process; the best-effort HF-card fetch is bounded and fail-open, so
-/// the success shape does not depend on network reachability.
-#[tokio::test]
-async fn control_tune_success_returns_suggestion() {
-    let dir = tempfile::TempDir::new().unwrap();
-    write_gguf_fixture(dir.path(), "org/model");
-    let app = make_app_with_lmstudio(dir.path().to_path_buf());
-
-    let resp = app
-        .oneshot(post_json(
-            "/api/higgs/models/tune",
-            &json!({"id": "org/model"}),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert_eq!(v["id"], "org/model", "suggestion echoes the requested id");
-    assert!(v["load"].is_object(), "carries a suggested load: {v}");
-    assert!(v["sampling"].is_object(), "carries suggested sampling: {v}");
-    assert!(v["rationale"].is_array(), "carries a rationale list: {v}");
-}
-
-// ── control_unload: malformed-body 400 branches ──────────────────────────
-
-/// A non-JSON unload body is rejected with `400` (the `Err(e)` parse arm) — it
-/// must never fall through to the destructive drain-all.
-#[tokio::test]
-async fn unload_rejects_malformed_json() {
-    let app = make_app();
-    let req = axum::http::Request::builder()
-        .method("POST")
-        .uri("/api/higgs/models/unload")
-        .header("host", "127.0.0.1")
-        .header("content-type", "application/json")
-        .body(axum::body::Body::from("{not valid json"))
-        .unwrap();
-
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert!(
-        v["error"].as_str().unwrap().contains("invalid unload body"),
-        "malformed JSON is rejected: {v}"
-    );
-}
-
-/// A JSON body that is not an object (here a bare array) is rejected with `400`
-/// (the `value.as_object()` guard).
-#[tokio::test]
-async fn unload_rejects_non_object_body() {
-    let app = make_app();
-
-    let resp = app
-        .oneshot(post_json("/api/higgs/models/unload", &json!(["a", "b"])))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert!(
-        v["error"]
-            .as_str()
-            .unwrap()
-            .contains("must be a JSON object"),
-        "a non-object body is rejected: {v}"
-    );
-}
-
-// ── fleet routes WITH an (empty) fleet installed: error paths ─────────────
-//
-// Installing a fresh `HubFleet` (no live iroh, no admitted nodes) flips the
-// hub-only routes past their `not_a_hub` 409 guard and into the fleet op, which
-// then errors because the target node is not connected (HG027) or the served id
-// is unrouted (HG002). This exercises the handlers' fleet-present arms without a
-// live hub.
-
-/// `GET /api/higgs/nodes` WITH a fleet that has a pre-seeded (disconnected) node:
-/// the local node is first, then the remote node is merged in with a label
-/// derived from its short endpoint id (no allowlist/hostname available).
-#[tokio::test]
-async fn control_nodes_merges_seeded_remote_node() {
-    let (higgs, bus) = make_higgs_with_bus();
-    let fleet = std::sync::Arc::new(crate::node::fleet::HubFleet::new(bus));
-    // Pre-register a remote node so it shows DISCONNECTED in the fleet view; the
-    // merge loop then fills its label from the short endpoint id.
-    fleet.seed_node("remote-endpoint-id-1234567890").await;
-    higgs.set_fleet(fleet);
-    let app = app_for(higgs);
-
-    let resp = app.oneshot(get("/api/higgs/nodes")).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v: Vec<serde_json::Value> = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert_eq!(v.len(), 2, "local node + the seeded remote: {v:?}");
-    assert_eq!(v[0]["endpoint_id"], "local", "local node is first");
-    assert_eq!(
-        v[1]["endpoint_id"], "remote-endpoint-id-1234567890",
-        "seeded remote second: {v:?}"
-    );
-    assert_eq!(v[1]["connected"], false, "seeded node is disconnected");
-    // No allowlist/hostname → label falls back to the first 8 chars of the id.
-    assert_eq!(
-        v[1]["label"], "remote-e",
-        "label = short endpoint id: {v:?}"
-    );
-}
-
-/// `POST /api/higgs/nodes/load` WITH a fleet but an unconnected target node →
-/// the fleet's `load` errors HG027 (node unreachable → 503), exercising the
-/// handler's `Err(err)` arm (past the `not_a_hub` guard).
-#[tokio::test]
-async fn nodes_load_with_fleet_unconnected_node_errors() {
-    let (higgs, bus) = make_higgs_with_bus();
-    higgs.set_fleet(std::sync::Arc::new(crate::node::fleet::HubFleet::new(bus)));
-    let app = app_for(higgs);
-
-    let resp = app
-        .oneshot(post_json(
-            "/api/higgs/nodes/load",
-            &json!({ "node": "unconnected-node", "model": "org/model" }),
-        ))
-        .await
-        .unwrap();
-    // HG027 (NodeUnreachable) maps to 503 SERVICE_UNAVAILABLE.
-    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert!(
-        v["error"].as_str().unwrap().contains("[HG027]"),
-        "node-load to an offline node is HG027: {v}"
-    );
-}
-
-/// `POST /api/higgs/nodes/unload` WITH a fleet but no route for the id → the
-/// fleet's `unload` errors HG002 (the served id resolves to no instance), the
-/// handler's `Err(err)` arm.
-#[tokio::test]
-async fn nodes_unload_with_fleet_unrouted_model_errors() {
-    let (higgs, bus) = make_higgs_with_bus();
-    higgs.set_fleet(std::sync::Arc::new(crate::node::fleet::HubFleet::new(bus)));
-    let app = app_for(higgs);
-
-    let resp = app
-        .oneshot(post_json(
-            "/api/higgs/nodes/unload",
-            &json!({ "model": "org/unrouted" }),
-        ))
-        .await
-        .unwrap();
-    // An unrouted served id resolves to nothing → ModelNotFound (HG002 → 404).
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert!(
-        v["error"].as_str().unwrap().contains("[HG002]"),
-        "unload of an unrouted model is HG002: {v}"
-    );
-}
-
-/// `GET /api/higgs/nodes/{node}/models` WITH a fleet but an unconnected node →
-/// the fleet's `scan_node` errors HG027, the handler's `Err(err)` arm.
-#[tokio::test]
-async fn node_models_with_fleet_disconnected_node_errors() {
-    let (higgs, bus) = make_higgs_with_bus();
-    higgs.set_fleet(std::sync::Arc::new(crate::node::fleet::HubFleet::new(bus)));
-    let app = app_for(higgs);
-
-    let resp = app
-        .oneshot(get("/api/higgs/nodes/offline-node/models"))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert!(
-        v["error"].as_str().unwrap().contains("[HG027]"),
-        "node catalog of an offline node is HG027: {v}"
-    );
-}
-
-// ── control_nodes_label: the LOCAL rename branch ─────────────────────────
-
-/// `POST /api/higgs/nodes/label` with `node:"local"` renames THIS instance via
-/// `with_config_mut` (the per-instance config path; under `cfg(test)` it is a
-/// hermetic temp `config.json`, never `~/.higgs`). It returns `{"status":"ok"}`
-/// and the new name surfaces in the subsequent `GET /api/higgs/nodes`.
-#[tokio::test]
-async fn nodes_label_local_renames_this_instance() {
-    let higgs = make_higgs();
-    let app = app_for(higgs);
-
-    let resp = app
-        .clone()
-        .oneshot(post_json(
-            "/api/higgs/nodes/label",
-            &json!({ "node": "local", "label": "my-workstation" }),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert_eq!(v["status"], "ok");
-
-    // The rename persisted to the (hermetic) config; the nodes view now shows it.
-    let resp = app.oneshot(get("/api/higgs/nodes")).await.unwrap();
-    let v: Vec<serde_json::Value> = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert_eq!(
-        v[0]["label"], "my-workstation",
-        "local node shows the renamed label: {v:?}"
-    );
-}
-
-// ── logs SSE stream: `?source=` filter drops other-source live lines ─────
-
-/// `GET /api/higgs/logs/stream?source=serve` drops live WORKER lines and keeps
-/// SERVE lines — the per-line `?source=` filter in the live loop.
-#[tokio::test]
-async fn logs_stream_source_filter_drops_other_sources() {
-    use super::{control_logs_stream, LogsQuery};
-    use axum::extract::{Query, State};
-    use axum::response::IntoResponse;
-    use futures::StreamExt;
-    use std::time::Duration;
-
-    let (higgs, bus) = make_higgs_with_bus();
-
-    // n=0 → no replay prefix, so the stream parks straight on the live receiver.
-    let resp = control_logs_stream(
-        State(higgs.clone()),
-        Query(LogsQuery {
-            n: Some(0),
-            source: Some("serve".to_owned()),
-        }),
-    )
-    .await
-    .into_response();
-    let mut body = resp.into_body().into_data_stream();
-
-    // A WORKER line is dropped by the filter; the following SERVE line passes —
-    // so the first frame we ever see is the serve line, never the worker one.
-    bus.push(LogSource::Worker, "WORKER-should-be-dropped".to_owned());
-    bus.push(LogSource::Serve, "SERVE-should-pass".to_owned());
-
-    let frame = tokio::time::timeout(Duration::from_secs(2), body.next())
-        .await
-        .expect("frame within timeout")
-        .expect("body not ended")
-        .expect("frame ok");
-    let text = String::from_utf8_lossy(&frame);
-    assert!(
-        text.contains("SERVE-should-pass"),
-        "the serve line passes the filter: {text}"
-    );
-    assert!(
-        !text.contains("WORKER-should-be-dropped"),
-        "the worker line was filtered out: {text}"
-    );
-}
-
-// ── G4: key-management handlers over the real router ────────────────────────
-
-/// Serialize HIGGS_HOME mutation (keys_path reads it) and give this test its
-/// own empty keystore. Runs the WHOLE lifecycle through the router, so the
-/// auth_guard's authorized path is exercised too (after the first mint, every
-/// request must carry the bearer).
-#[tokio::test]
-#[allow(clippy::await_holding_lock)] // TEST_ENV_LOCK spans the test (serializes HIGGS_HOME)
-async fn keys_handlers_mint_list_revoke_and_validation() {
-    let _env = crate::TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let home = tempfile::tempdir().unwrap();
-    let prev = std::env::var_os("HIGGS_HOME");
-    // SAFETY: under TEST_ENV_LOCK.
-    unsafe { std::env::set_var("HIGGS_HOME", home.path()) };
-    struct Restore(Option<std::ffi::OsString>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            // SAFETY: still under TEST_ENV_LOCK.
-            unsafe {
-                match self.0.take() {
-                    Some(v) => std::env::set_var("HIGGS_HOME", v),
-                    None => std::env::remove_var("HIGGS_HOME"),
-                }
-            }
-        }
-    }
-    let _restore = Restore(prev);
-
-    let app = make_app();
-
-    // Validation: empty / unroutable labels and empty scope lists are coded 400s.
-    let r = app
-        .clone()
-        .oneshot(post_json("/api/higgs/keys", &json!({ "label": "a/b" })))
-        .await
-        .unwrap();
-    assert_eq!(
-        r.status(),
-        StatusCode::BAD_REQUEST,
-        "a slash label could never be revoked via DELETE /{{label}}"
-    );
-    let r = app
-        .clone()
-        .oneshot(post_json("/api/higgs/keys", &json!({ "label": "  " })))
-        .await
-        .unwrap();
-    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
-    let r = app
-        .clone()
-        .oneshot(post_json(
-            "/api/higgs/keys",
-            &json!({ "label": "x", "scopes": [] }),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
-
-    // Mint an admin key; the response carries the plaintext ONCE.
-    let r = app
-        .clone()
-        .oneshot(post_json(
-            "/api/higgs/keys",
-            &json!({ "label": "boss", "scopes": ["admin"] }),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(r.status(), StatusCode::OK);
-    let minted: serde_json::Value = body_json(r).await;
-    let token = minted["token"].as_str().unwrap().to_owned();
-    assert!(token.starts_with("hgk_"));
-
-    // Auth flipped ON in-memory (hot swap): unkeyed list 401s, keyed lists.
-    let r = app.clone().oneshot(get("/api/higgs/keys")).await.unwrap();
-    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
-    let r = app
-        .clone()
-        .oneshot(with_bearer(get("/api/higgs/keys"), &token))
-        .await
-        .unwrap();
-    assert_eq!(r.status(), StatusCode::OK);
-    let list: serde_json::Value = body_json(r).await;
-    assert_eq!(list["auth_enabled"], true);
-    assert_eq!(list["keys"][0]["label"], "boss");
-    assert!(
-        !serde_json::to_string(&list).unwrap().contains(&token),
-        "plaintext never appears in the list"
-    );
-
-    // Default scopes (chat+models) when omitted; duplicate label is a 400.
-    let r = app
-        .clone()
-        .oneshot(with_bearer(
-            post_json("/api/higgs/keys", &json!({ "label": "dev" })),
-            &token,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(r.status(), StatusCode::OK);
-    let dev: serde_json::Value = body_json(r).await;
-    assert_eq!(dev["scopes"], json!(["chat", "models"]));
-    let r = app
-        .clone()
-        .oneshot(with_bearer(
-            post_json("/api/higgs/keys", &json!({ "label": "dev" })),
-            &token,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
-
-    // Revoke: unknown label 400; real label removes and reports auth state.
-    let r = app
-        .clone()
-        .oneshot(with_bearer(delete("/api/higgs/keys/ghost"), &token))
-        .await
-        .unwrap();
-    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
-    let r = app
-        .clone()
-        .oneshot(with_bearer(delete("/api/higgs/keys/dev"), &token))
-        .await
-        .unwrap();
-    assert_eq!(r.status(), StatusCode::OK);
-    let removed: serde_json::Value = body_json(r).await;
-    assert_eq!(removed["removed"], 1);
-    assert_eq!(removed["auth_enabled"], true);
-
-    // Keystore I/O failure surfaces as the coded [HG040] store error: occupy
-    // the api_keys.json path with a DIRECTORY so the save's rename fails.
-    std::fs::remove_file(home.path().join("api_keys.json")).unwrap();
-    std::fs::create_dir(home.path().join("api_keys.json")).unwrap();
-    let r = app
-        .clone()
-        .oneshot(with_bearer(
-            post_json("/api/higgs/keys", &json!({ "label": "io" })),
-            &token,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    let err: serde_json::Value = body_json(r).await;
-    assert!(err["error"].as_str().unwrap().contains("[HG040]"));
-}
-
-/// G4 CORS allowlist: an origin listed in `config.json`'s `cors_origins` is
-/// allowed (echoed on preflight) alongside the built-in loopback set; an
-/// unlisted non-local origin gets no allow-origin header. Also pins that
-/// preflight needs NO key while auth is irrelevant here (empty keystore).
-#[tokio::test]
-async fn configured_cors_origin_is_allowed_on_preflight() {
-    let higgs = make_higgs();
-    higgs
-        .with_config_mut(|c| c.cors_origins = vec!["https://tools.example".into()])
-        .expect("write cors_origins");
-    let app = app_for(higgs);
-
-    let preflight = |origin: &str| {
-        axum::http::Request::builder()
-            .method("OPTIONS")
-            .uri("/v1/chat/completions")
-            .header("host", "127.0.0.1")
-            .header("origin", origin)
-            .header("access-control-request-method", "POST")
-            .body(axum::body::Body::empty())
-            .unwrap()
-    };
-
-    let r = app
-        .clone()
-        .oneshot(preflight("https://tools.example"))
-        .await
-        .unwrap();
-    assert_eq!(
-        r.headers()
-            .get("access-control-allow-origin")
-            .and_then(|v| v.to_str().ok()),
-        Some("https://tools.example"),
-        "configured origin allowed"
-    );
-
-    let r = app
-        .clone()
-        .oneshot(preflight("https://evil.example"))
-        .await
-        .unwrap();
-    assert!(
-        r.headers().get("access-control-allow-origin").is_none(),
-        "unlisted origin gets no CORS allowance"
-    );
-}
-
-/// G4 [HG059]: while LAN-exposed, revoking the LAST key is refused (409) — an
-/// empty keystore would reopen the whole surface at runtime, bypassing the
-/// [HG058] startup guarantee. Not-last revokes still work, and a loopback
-/// server may still revoke to empty.
-#[tokio::test]
-#[allow(clippy::await_holding_lock)] // TEST_ENV_LOCK spans the test (serializes HIGGS_HOME)
-async fn last_key_revoke_is_refused_while_lan_exposed() {
-    let _env = crate::TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let home = tempfile::tempdir().unwrap();
-    let prev = std::env::var_os("HIGGS_HOME");
-    // SAFETY: under TEST_ENV_LOCK.
-    unsafe { std::env::set_var("HIGGS_HOME", home.path()) };
-    struct Restore(Option<std::ffi::OsString>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            // SAFETY: still under TEST_ENV_LOCK.
-            unsafe {
-                match self.0.take() {
-                    Some(v) => std::env::set_var("HIGGS_HOME", v),
-                    None => std::env::remove_var("HIGGS_HOME"),
-                }
-            }
-        }
-    }
-    let _restore = Restore(prev);
-
-    let higgs = make_higgs();
-    higgs.set_lan_exposed(true);
-    let app = app_for(higgs.clone());
-
-    // Mint the only key.
-    let r = app
-        .clone()
-        .oneshot(post_json(
-            "/api/higgs/keys",
-            &json!({ "label": "only", "scopes": ["admin"] }),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(r.status(), StatusCode::OK);
-    let token = body_json(r).await["token"].as_str().unwrap().to_owned();
-
-    // Refused: it is the last key and the server is LAN-exposed.
-    let r = app
-        .clone()
-        .oneshot(with_bearer(delete("/api/higgs/keys/only"), &token))
-        .await
-        .unwrap();
-    assert_eq!(r.status(), StatusCode::CONFLICT);
-    let err = body_json(r).await;
-    assert!(err["error"].as_str().unwrap().contains("[HG059]"));
-
-    // With a second key present, revoking the first is fine (not last).
-    let r = app
-        .clone()
-        .oneshot(with_bearer(
-            post_json(
-                "/api/higgs/keys",
-                &json!({ "label": "spare", "scopes": ["admin"] }),
-            ),
-            &token,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(r.status(), StatusCode::OK);
-    let spare_token = body_json(r).await["token"].as_str().unwrap().to_owned();
-    let r = app
-        .clone()
-        .oneshot(with_bearer(delete("/api/higgs/keys/only"), &token))
-        .await
-        .unwrap();
-    assert_eq!(r.status(), StatusCode::OK, "not-last revoke proceeds");
-
-    // "spare" is now the last key — refused again while still LAN-exposed.
-    let r = app
-        .clone()
-        .oneshot(with_bearer(delete("/api/higgs/keys/spare"), &spare_token))
-        .await
-        .unwrap();
-    assert_eq!(
-        r.status(),
-        StatusCode::CONFLICT,
-        "the invariant follows the live set"
-    );
-
-    // Back on loopback, revoke-to-empty is allowed (auth intentionally off).
-    higgs.set_lan_exposed(false);
-    let r = app
-        .clone()
-        .oneshot(with_bearer(delete("/api/higgs/keys/spare"), &spare_token))
-        .await
-        .unwrap();
-    assert_eq!(r.status(), StatusCode::OK, "loopback may revoke to empty");
-    assert_eq!(body_json(r).await["auth_enabled"], false);
-}
-
-/// G4 embedded boundary: a STALE `api_keys.json` on disk (standalone/CLI
-/// leftovers) must NOT be resurrected by a runtime mutation on a host whose
-/// live keystore started empty — mutations act on the LIVE store and the file
-/// is synced to it. Fail-on-revert: reload-from-file in `mutate_api_keys`
-/// re-arms the stale key and the old-token assertion fails.
-#[tokio::test]
-#[allow(clippy::await_holding_lock)] // TEST_ENV_LOCK spans the test (serializes HIGGS_HOME)
-async fn stale_disk_keys_are_not_resurrected_by_runtime_mutations() {
-    let _env = crate::TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let home = tempfile::tempdir().unwrap();
-    let prev = std::env::var_os("HIGGS_HOME");
-    // SAFETY: under TEST_ENV_LOCK.
-    unsafe { std::env::set_var("HIGGS_HOME", home.path()) };
-    struct Restore(Option<std::ffi::OsString>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            // SAFETY: still under TEST_ENV_LOCK.
-            unsafe {
-                match self.0.take() {
-                    Some(v) => std::env::set_var("HIGGS_HOME", v),
-                    None => std::env::remove_var("HIGGS_HOME"),
-                }
-            }
-        }
-    }
-    let _restore = Restore(prev);
-
-    // A stale on-disk keystore from some earlier standalone/CLI session.
-    let stale_token = crate::keys::mint_token([7u8; 16]);
-    let mut stale = crate::keys::ApiKeys::default();
-    stale.add(
-        &stale_token,
-        "stale".into(),
-        vec![crate::keys::Scope::Admin],
-    );
-    stale
-        .save(&home.path().join("api_keys.json"))
-        .expect("seed stale keystore");
-
-    // Embedded-style host: live keystore starts EMPTY (file not loaded).
-    let higgs = make_higgs();
-    let app = app_for(higgs.clone());
-
-    // Runtime mint on the empty live store.
-    let r = app
-        .clone()
-        .oneshot(post_json(
-            "/api/higgs/keys",
-            &json!({ "label": "fresh", "scopes": ["admin"] }),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(r.status(), StatusCode::OK);
-    let fresh_token = body_json(r).await["token"].as_str().unwrap().to_owned();
-
-    // The stale key must NOT have been resurrected: only "fresh" authorizes.
-    let live = higgs.api_keys();
-    assert!(!live.authorizes(&stale_token, crate::keys::Scope::Admin));
-    assert!(live.authorizes(&fresh_token, crate::keys::Scope::Admin));
-    assert_eq!(
-        live.iter().count(),
-        1,
-        "live store holds only the fresh key"
-    );
-
-    // And the file was synced TO the live state (stale entry gone).
-    let disk = crate::keys::ApiKeys::load(&home.path().join("api_keys.json")).unwrap();
-    assert_eq!(disk.iter().count(), 1);
-    assert_eq!(disk.iter().next().unwrap().label, "fresh");
-}
-
-/// G4 bootstrap default: the FIRST mint with omitted scopes gets [admin] — a
-/// [chat, models] default would flip auth on and lock the Admin-scoped key
-/// management API out of itself. Later omitted-scopes mints keep the
-/// [chat, models] default (asserted in the lifecycle test above).
-/// Fail-on-revert: an unconditional [chat, models] default fails the scope
-/// assertion AND the follow-up authorized list call.
-#[tokio::test]
-#[allow(clippy::await_holding_lock)] // TEST_ENV_LOCK spans the test (serializes HIGGS_HOME)
-async fn bootstrap_mint_defaults_to_admin() {
-    let _env = crate::TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let home = tempfile::tempdir().unwrap();
-    let prev = std::env::var_os("HIGGS_HOME");
-    // SAFETY: under TEST_ENV_LOCK.
-    unsafe { std::env::set_var("HIGGS_HOME", home.path()) };
-    struct Restore(Option<std::ffi::OsString>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            // SAFETY: still under TEST_ENV_LOCK.
-            unsafe {
-                match self.0.take() {
-                    Some(v) => std::env::set_var("HIGGS_HOME", v),
-                    None => std::env::remove_var("HIGGS_HOME"),
-                }
-            }
-        }
-    }
-    let _restore = Restore(prev);
-
-    let app = make_app();
-    let r = app
-        .clone()
-        .oneshot(post_json("/api/higgs/keys", &json!({ "label": "first" })))
-        .await
-        .unwrap();
-    assert_eq!(r.status(), StatusCode::OK);
-    let minted = body_json(r).await;
-    assert_eq!(
-        minted["scopes"],
-        json!(["admin"]),
-        "bootstrap default is admin"
-    );
-    let token = minted["token"].as_str().unwrap().to_owned();
-
-    // The bootstrap key can manage keys — no self-lockout.
-    let r = app
-        .clone()
-        .oneshot(with_bearer(get("/api/higgs/keys"), &token))
-        .await
-        .unwrap();
-    assert_eq!(
-        r.status(),
-        StatusCode::OK,
-        "first key reaches key management"
-    );
-}
-
 /// G4 bootstrap-race defense at the SEAM ([codex r9]): `decide_mint` derives
 /// `bootstrap` from the LOCKED store it is handed, so the empty-store window
 /// cannot be raced — a second unauthenticated mint that reaches the lock after
@@ -1922,14 +324,20 @@ fn decide_mint_derives_bootstrap_from_the_locked_store() {
     // Empty store: the bootstrap mint is allowed UNAUTHENTICATED and defaults
     // to Admin (so it isn't locked out of key management it just enabled).
     let empty = ApiKeys::default();
-    match super::decide_mint(&empty, None, None, "first") {
+    match super::decide_mint(&empty, false, None, None, "first") {
         super::Mint::Ok(scopes) => {
             assert_eq!(scopes, vec![Scope::Admin], "bootstrap defaults admin")
         }
         _ => panic!("empty store must allow the unauthenticated bootstrap mint"),
     }
     // Explicit ADMIN-inclusive bootstrap scopes are honored.
-    match super::decide_mint(&empty, None, Some(vec![Scope::Admin, Scope::Chat]), "first") {
+    match super::decide_mint(
+        &empty,
+        false,
+        None,
+        Some(vec![Scope::Admin, Scope::Chat]),
+        "first",
+    ) {
         super::Mint::Ok(scopes) => assert_eq!(scopes, vec![Scope::Admin, Scope::Chat]),
         _ => panic!("explicit admin-inclusive bootstrap scopes honored"),
     }
@@ -1938,7 +346,7 @@ fn decide_mint_derives_bootstrap_from_the_locked_store() {
     // out of itself. Fail-on-revert: honoring them makes this Mint::Ok.
     assert!(
         matches!(
-            super::decide_mint(&empty, None, Some(vec![Scope::Chat]), "first"),
+            super::decide_mint(&empty, false, None, Some(vec![Scope::Chat]), "first"),
             super::Mint::BootstrapNeedsAdmin
         ),
         "a non-admin first key is refused"
@@ -1951,7 +359,7 @@ fn decide_mint_derives_bootstrap_from_the_locked_store() {
     seeded.add(&admin_tok, "boss".into(), vec![Scope::Admin]);
     assert!(
         matches!(
-            super::decide_mint(&seeded, None, None, "second"),
+            super::decide_mint(&seeded, false, None, None, "second"),
             super::Mint::Unauthorized
         ),
         "non-empty store + no bearer must be refused"
@@ -1962,20 +370,20 @@ fn decide_mint_derives_bootstrap_from_the_locked_store() {
     chat_only.add(&chat_tok, "reader".into(), vec![Scope::Chat]);
     assert!(
         matches!(
-            super::decide_mint(&chat_only, Some(&chat_tok), None, "x"),
+            super::decide_mint(&chat_only, false, Some(&chat_tok), None, "x"),
             super::Mint::Unauthorized
         ),
         "a non-admin bearer cannot mint"
     );
     // A valid Admin bearer mints, defaulting to [chat, models] (non-bootstrap).
-    match super::decide_mint(&seeded, Some(&admin_tok), None, "svc") {
+    match super::decide_mint(&seeded, false, Some(&admin_tok), None, "svc") {
         super::Mint::Ok(scopes) => assert_eq!(scopes, vec![Scope::Chat, Scope::Models]),
         _ => panic!("admin bearer mints with the non-bootstrap default"),
     }
     // Duplicate label is caught regardless.
     assert!(
         matches!(
-            super::decide_mint(&seeded, Some(&admin_tok), None, "boss"),
+            super::decide_mint(&seeded, false, Some(&admin_tok), None, "boss"),
             super::Mint::Duplicate
         ),
         "duplicate label rejected"
@@ -1996,7 +404,7 @@ fn decide_revoke_rechecks_auth_against_the_locked_store() {
     let empty = ApiKeys::default();
     assert!(
         matches!(
-            super::decide_revoke(&empty, None, "x", false),
+            super::decide_revoke(&empty, false, None, "x", false),
             super::Revoke::Removed(0)
         ),
         "empty store: 0 removed, not an auth failure"
@@ -2008,7 +416,7 @@ fn decide_revoke_rechecks_auth_against_the_locked_store() {
     seeded.add(&admin, "boss".into(), vec![Scope::Admin]);
     assert!(
         matches!(
-            super::decide_revoke(&seeded, None, "boss", false),
+            super::decide_revoke(&seeded, false, None, "boss", false),
             super::Revoke::Unauthorized
         ),
         "non-empty store + no bearer must be refused"
@@ -2019,7 +427,7 @@ fn decide_revoke_rechecks_auth_against_the_locked_store() {
     chat.add(&ct, "reader".into(), vec![Scope::Chat]);
     assert!(
         matches!(
-            super::decide_revoke(&chat, Some(&ct), "reader", false),
+            super::decide_revoke(&chat, false, Some(&ct), "reader", false),
             super::Revoke::Unauthorized
         ),
         "non-admin bearer cannot revoke"
@@ -2027,7 +435,7 @@ fn decide_revoke_rechecks_auth_against_the_locked_store() {
     // Valid admin bearer → removes (1 match).
     assert!(
         matches!(
-            super::decide_revoke(&seeded, Some(&admin), "boss", false),
+            super::decide_revoke(&seeded, false, Some(&admin), "boss", false),
             super::Revoke::Removed(1)
         ),
         "admin bearer revokes"
@@ -2035,7 +443,7 @@ fn decide_revoke_rechecks_auth_against_the_locked_store() {
     // Last key on a LAN-exposed server → refused ([HG059]) even WITH the bearer.
     assert!(
         matches!(
-            super::decide_revoke(&seeded, Some(&admin), "boss", true),
+            super::decide_revoke(&seeded, false, Some(&admin), "boss", true),
             super::Revoke::LastKeyOnLan
         ),
         "last-key revoke refused while LAN-exposed"
@@ -2058,14 +466,14 @@ fn decide_revoke_preserves_the_last_admin_key() {
 
     assert!(
         matches!(
-            super::decide_revoke(&ks, Some(&admin), "boss", false),
+            super::decide_revoke(&ks, false, Some(&admin), "boss", false),
             super::Revoke::LastAdminKey
         ),
         "revoking the last Admin key while a non-Admin key remains must be refused"
     );
     assert!(
         matches!(
-            super::decide_revoke(&ks, Some(&admin), "reader", false),
+            super::decide_revoke(&ks, false, Some(&admin), "reader", false),
             super::Revoke::Removed(1)
         ),
         "revoking a non-Admin key leaves Admin access intact"
@@ -2077,137 +485,161 @@ fn decide_revoke_preserves_the_last_admin_key() {
     solo.add(&only, "boss".into(), vec![Scope::Admin]);
     assert!(
         matches!(
-            super::decide_revoke(&solo, Some(&only), "boss", false),
+            super::decide_revoke(&solo, false, Some(&only), "boss", false),
             super::Revoke::Removed(1)
         ),
         "revoking the entire store (turns auth off) is allowed, not a lockout"
     );
 }
 
-// ── control_estimate: live candidate-load footprint ──────────────────────────
-
-/// `POST /api/higgs/models/estimate` returns the VRAM+RAM footprint of a candidate
-/// load for a discoverable fixture, computed host-side (no worker) by reusing the
-/// suggester's own estimators. Fail-on-revert: a broken route/handler drops the
-/// typed `vram`/`ram` report; an absent id funnels through the scan-find miss to a
-/// 404 HG002 (the `Err(err)` arm of `control_estimate`).
-#[tokio::test]
-async fn control_estimate_returns_footprint_and_404s_unknown() {
-    let dir = tempfile::TempDir::new().unwrap();
-    write_gguf_fixture(dir.path(), "org/model");
-    let app = make_app_with_lmstudio(dir.path().to_path_buf());
-
-    let resp = app
-        .clone()
-        .oneshot(post_json(
-            "/api/higgs/models/estimate",
-            // `ctx_len` accepts the lenient bare-int form (2048 → a fixed window).
-            &json!({ "id": "org/model", "ctx_len": 2048 }),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert!(v["vram"].is_object(), "carries a vram fit report: {v}");
-    assert!(
-        v["ram"]["needed_bytes"].as_u64().is_some(),
-        "carries the RAM needed bytes: {v}"
+/// A HIDDEN internal admin key (the embedder's in-memory token) must NOT satisfy
+/// the last-visible-admin guard: revoking the last VISIBLE admin WHILE OTHER
+/// VISIBLE keys remain would strand the persisted management surface (only the
+/// unlistable hidden admin would be left). Fail-on-revert: change the
+/// `admin_remains` scan in `decide_revoke` back to `iter()` (counts the hidden
+/// admin) and this returns `Removed(1)` instead of `LastAdminKey`.
+#[test]
+fn decide_revoke_ignores_a_hidden_internal_admin() {
+    use crate::keys::{ApiKeys, Scope};
+    let mut ks = ApiKeys::default();
+    let admin = crate::keys::mint_token([11u8; 16]);
+    let reader = crate::keys::mint_token([12u8; 16]);
+    ks.add(&admin, "boss".into(), vec![Scope::Admin]);
+    ks.add(&reader, "reader".into(), vec![Scope::Chat, Scope::Models]);
+    // The embedder's hidden internal admin (jigglebot's proxy token): Admin-scoped,
+    // but hidden — never written to disk, never listed to the key-management UI.
+    ks.add_internal(
+        "jigglebot-internal-token",
+        "jigglebot (internal)".into(),
+        vec![Scope::Chat, Scope::Models, Scope::Admin],
     );
 
-    // An id absent from the catalog → 404 HG002 at the scan-find step.
-    let resp = app
-        .oneshot(post_json(
-            "/api/higgs/models/estimate",
-            &json!({ "id": "org/nope", "ctx_len": 0 }),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    // Revoking the last VISIBLE admin while a visible reader remains is a lockout:
+    // the hidden admin can't manage keys for an external/LAN operator.
     assert!(
-        v["error"].as_str().unwrap().contains("[HG002]"),
-        "estimate of an unknown model is HG002: {v}"
+        matches!(
+            super::decide_revoke(&ks, false, Some(&admin), "boss", false),
+            super::Revoke::LastAdminKey
+        ),
+        "a hidden internal admin must NOT count toward the last-visible-admin guard"
+    );
+    // Sanity: the hidden admin still AUTHORIZES the request (auth is on) — the
+    // guard refuses on management grounds, not on a missing bearer.
+    assert!(
+        ks.authorizes("jigglebot-internal-token", Scope::Admin),
+        "the hidden internal token authorizes Admin even though it can't be the last visible admin"
     );
 }
 
-// ── control_events_stream: model-load lifecycle over SSE ─────────────────────
-
-/// `GET /api/higgs/events` streams the model-load lifecycle as SSE `data:` frames.
-/// Subscribing (the handler call) BEFORE a load, then driving a real load through
-/// the fake worker, delivers the ordered phase events ending in the terminal
-/// `ready`, each carrying the model id. Fail-on-revert: stop pushing load events
-/// (or unfold over the wrong receiver) and no `ready` frame ever arrives (the read
-/// times out). The stream is drained to the terminal and dropped — never left open.
-#[tokio::test]
-async fn events_stream_pushes_load_lifecycle_phases() {
-    use super::control_events_stream;
-    use axum::extract::State;
-    use axum::response::IntoResponse;
-    use futures::StreamExt;
-    use std::time::Duration;
-
-    let dir = tempfile::TempDir::new().unwrap();
-    write_gguf_fixture(dir.path(), "org/model");
-    let higgs = make_higgs_with_lmstudio(dir.path().to_path_buf());
-
-    // The handler subscribes on call, so subscribe BEFORE the load (no phase missed).
-    let resp = control_events_stream(State(higgs.clone()))
-        .await
-        .into_response();
-    assert_eq!(
-        resp.headers()
-            .get(axum::http::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok()),
-        Some("text/event-stream"),
-        "SSE content-type"
+/// Deleting the LAST VISIBLE key when it is NON-admin (a hidden admin is present)
+/// must be ALLOWED on loopback — it empties the VISIBLE store (auth stays on via
+/// the hidden token), it is not a `[HG066]` last-admin lockout. Fail-on-revert:
+/// with `total`/`matching` computed over `iter()` (counting the hidden key),
+/// `matching (1) < total (2)` enters the admin guard and wrongly returns
+/// `LastAdminKey`.
+#[test]
+fn decide_revoke_allows_deleting_the_last_visible_nonadmin_key() {
+    use crate::keys::{ApiKeys, Scope};
+    let mut ks = ApiKeys::default();
+    let reader = crate::keys::mint_token([13u8; 16]);
+    ks.add(&reader, "reader".into(), vec![Scope::Chat, Scope::Models]);
+    ks.add_internal(
+        "jigglebot-internal-token",
+        "jigglebot (internal)".into(),
+        vec![Scope::Chat, Scope::Models, Scope::Admin],
     );
-    let mut body = resp.into_body().into_data_stream();
 
-    // A real load emits queued → preparing → loading_weights → finalizing → ready.
-    higgs
-        .load("org/model", None)
-        .await
-        .expect("load emits lifecycle events");
-
-    // Read frames until the terminal `ready` phase arrives.
-    let mut seen = String::new();
-    while !seen.contains("\"ready\"") {
-        let frame = tokio::time::timeout(Duration::from_secs(2), body.next())
-            .await
-            .expect("load-event frame within timeout")
-            .expect("body not ended")
-            .expect("frame ok");
-        seen.push_str(&String::from_utf8_lossy(&frame));
-    }
+    // Bearer is the hidden admin (authorizes the DELETE); the only visible key is
+    // a non-admin reader. Loopback (not LAN) → removing it is allowed.
     assert!(
-        seen.contains("\"queued\""),
-        "the ordered phase sequence streamed ahead of ready: {seen}"
+        matches!(
+            super::decide_revoke(
+                &ks,
+                false,
+                Some("jigglebot-internal-token"),
+                "reader",
+                false
+            ),
+            super::Revoke::Removed(1)
+        ),
+        "deleting the last visible non-admin key (hidden admin present) must be allowed, not HG066"
     );
+}
+
+/// Naming the HIDDEN internal key's label in a revoke decision matches NOTHING
+/// (visible-only counting) → `Removed(0)`, a no-op. Combined with
+/// `ApiKeys::remove_label` refusing to drop hidden keys, the embedder's token is
+/// immune to the public key-management surface. Fail-on-revert: revert the
+/// visible() counting and `matching` becomes 1 → `Removed(1)`.
+#[test]
+fn decide_revoke_treats_the_hidden_label_as_absent() {
+    use crate::keys::{ApiKeys, Scope};
+    let mut ks = ApiKeys::default();
+    let admin = crate::keys::mint_token([14u8; 16]);
+    ks.add(&admin, "boss".into(), vec![Scope::Admin]);
+    ks.add_internal(
+        "jigglebot-internal-token",
+        "jigglebot (internal)".into(),
+        vec![Scope::Chat, Scope::Models, Scope::Admin],
+    );
+
     assert!(
-        seen.contains("org/model"),
-        "each load event carries the model id: {seen}"
+        matches!(
+            super::decide_revoke(&ks, false, Some(&admin), "jigglebot (internal)", false),
+            super::Revoke::Removed(0)
+        ),
+        "revoking the hidden internal label must be a no-op (Removed(0)), not touch it"
+    );
+}
+
+/// A store of ONLY VISIBLE NON-admin keys (plus a hidden admin) has no visible
+/// Admin to strand, so revoking one such key must be ALLOWED even though another
+/// visible key remains. This state is reachable when an embedder mints scoped
+/// (non-admin) keys under its hidden Admin. Fail-on-revert: drop the
+/// `removing_an_admin` gate and `admin_remains` is false → this wrongly returns
+/// `LastAdminKey`.
+#[test]
+fn decide_revoke_allows_revoking_a_nonadmin_when_no_visible_admin_exists() {
+    use crate::keys::{ApiKeys, Scope};
+    let mut ks = ApiKeys::default();
+    let r1 = crate::keys::mint_token([15u8; 16]);
+    let r2 = crate::keys::mint_token([16u8; 16]);
+    ks.add(&r1, "reader1".into(), vec![Scope::Chat, Scope::Models]);
+    ks.add(&r2, "reader2".into(), vec![Scope::Chat, Scope::Models]);
+    ks.add_internal(
+        "jigglebot-internal-token",
+        "jigglebot (internal)".into(),
+        vec![Scope::Admin],
+    );
+
+    assert!(
+        matches!(
+            super::decide_revoke(
+                &ks,
+                false,
+                Some("jigglebot-internal-token"),
+                "reader1",
+                false
+            ),
+            super::Revoke::Removed(1)
+        ),
+        "revoking a non-admin key must be allowed when there is no visible admin to strand"
     );
 }
 
 /// Dot-segment labels (`.` / `..`) pass the charset check but URL parsers normalize
-/// them out of `DELETE /api/higgs/keys/{label}` before Axum captures the segment —
-/// such a key could be minted but never revoked through the API (codex r16).
-/// Fail-on-revert: drop the dot-label rejection and both mints return 200.
-#[tokio::test]
-async fn mint_rejects_dot_segment_labels() {
+/// them out of a single path segment, so a key so labelled could be minted but never
+/// revoked (codex r16). `validate_key_label` rejects them at the source — the shared
+/// helper the facade's `mint_key` calls. Fail-on-revert: drop the dot-label rejection
+/// and both `validate_key_label` calls return `Ok`.
+#[test]
+fn validate_key_label_rejects_dot_segments() {
     for label in [".", ".."] {
-        let app = make_app();
-        let resp = app
-            .oneshot(post_json(
-                "/api/higgs/keys",
-                &serde_json::json!({ "label": label }),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(
-            resp.status(),
-            StatusCode::BAD_REQUEST,
-            "label {label:?} must be rejected at mint"
+        assert!(
+            super::validate_key_label(label).is_err(),
+            "label {label:?} must be rejected"
         );
     }
+    // A normal label passes.
+    assert!(super::validate_key_label("laptop").is_ok());
 }

@@ -195,7 +195,7 @@ pub enum HiggsError {
 
     /// The `/v1` inference surface is disabled (server "serving" toggled off).
     /// Rejected at the chat boundary (HTTP 503) before the loaded-model gate, so
-    /// no inference runs while serving is off. The `/api/higgs/*` control surface
+    /// no inference runs while serving is off. The in-process control surface
     /// stays reachable so the user can re-enable serving. Non-fatal and
     /// retryable: a retry after re-enabling succeeds.
     #[snafu(display("[HG019] serving is disabled — enable the server to accept requests"))]
@@ -215,7 +215,7 @@ pub enum HiggsError {
     /// The transient sysinfo worker could not enumerate devices: it failed to
     /// spawn, its stdio closed before replying, or the M_SYSINFO RPC timed out.
     /// A device-enumeration infrastructure failure — surfaced as an empty device
-    /// list so `GET /api/higgs/system` still returns hardware/runtime rather than
+    /// list so the `system` control-op still returns hardware/runtime rather than
     /// failing; `context` names the stage that failed.
     #[snafu(display("[HG021] sysinfo worker failed: {context}"))]
     #[diagnostic(code(HG021))]
@@ -626,6 +626,18 @@ pub enum HiggsError {
     ))]
     #[diagnostic(code(HG069), severity(Error))]
     LanBindWithoutAdminKey { bind: String },
+
+    /// GGUF header enrichment FAILED for a scanned model — the file could not be
+    /// opened/mmapped, its header was malformed, or the `ggus` parse panicked (a
+    /// truncated file mid-download, an unsupported quant block size, or a header
+    /// missing `general.architecture`). The model is still cataloged with whatever
+    /// partial fields were read before the failure; this code is stamped onto the
+    /// model entry (`HiggsModel::enrich_error`) so the UI can explain the blank
+    /// header fields instead of showing the model as genuinely sparse. Non-fatal —
+    /// a corrupt or mid-download GGUF never aborts the scan.
+    #[snafu(display("[HG070] GGUF enrichment failed for {path}: {reason}"))]
+    #[diagnostic(code(HG070))]
+    GgufEnrichFailed { path: String, reason: String },
 }
 
 #[cfg(test)]

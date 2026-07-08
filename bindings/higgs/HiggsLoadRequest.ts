@@ -6,7 +6,8 @@ import type { KvCacheKind } from "./KvCacheKind";
 import type { LoadParams } from "./LoadParams";
 
 /**
- * Request body for `POST /api/higgs/models/load`.
+ * Request body for the `load` control-op (`Higgs::load_flat`, formerly
+ * `POST /api/higgs/models/load`).
  *
  * Absent load parameters fall back to the host-configured defaults.
  */
@@ -75,7 +76,7 @@ seed?: number,
  * Per-load idle-TTL override in minutes. RESERVED / forward-compat: per-load
  * idle-TTL enforcement is a deferred follow-up, so this is currently ACCEPTED
  * but NOT enforced — the node reaper applies one per-node TTL to every worker
- * (the global TTL, `/api/higgs/settings`), and the host neither stores nor
+ * (the global TTL, `HiggsRuntimeSettings`), and the host neither stores nor
  * surfaces this value. It will take effect once the reaper honors per-worker
  * overrides (host-side only either way — never forwarded to the worker/engine).
  */

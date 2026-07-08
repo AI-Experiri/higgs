@@ -4,7 +4,8 @@ import type { HiggsServerConfig } from "./HiggsServerConfig";
 import type { RuntimeInfo } from "./RuntimeInfo";
 
 /**
- * Response for `GET /api/higgs/system`: hardware + runtime + server config.
+ * The `system` control-op response (formerly `GET /api/higgs/system`):
+ * hardware + runtime + server config.
  */
 export type SystemInfo = { 
 /**

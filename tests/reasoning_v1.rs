@@ -1,6 +1,11 @@
 //! `reasoning_content` on `/v1/chat/completions` — final AND streaming — with
 //! a REAL thinking model (Qwen3-0.6B, whose template has `<think>` markers).
 //!
+//! Library-first: control is the in-process `Higgs` crate API (build a fleet-
+//! rooted `Higgs`, `load` the model through the facade), and the `/v1` HTTP
+//! surface is driven through `serve_v1_local` — exactly how an external client
+//! hits chat/completions. No spawned standalone server, no `/api/higgs/*`.
+//!
 //! Fail-on-revert: with `reasoning_format: None` / `enable_thinking: false` at
 //! template-apply (the pre-feature state), no `reasoning_content` key exists
 //! anywhere and think text leaks inline into `content` — every assertion here
@@ -8,27 +13,127 @@
 
 mod common;
 
-use common::{fleet_dir, spawn_with_model_root};
+use std::sync::Arc;
+
+use common::{fleet_dir, serve_v1_local};
+use higgs::worker::engine::{CtxLen, GpuLayers, LoadParams};
+use higgs::{Higgs, HiggsConfig};
 use serde_json::{json, Value};
+use tempfile::TempDir;
 
 /// The fleet's thinking model (template contains `<think>` markers).
 const QWEN3: &str = "qwen/Qwen3-0.6B";
 
+/// An in-process `Higgs` rooted at the REAL fleet scan dir (so the thinking model
+/// is discoverable + loadable through the facade), with a REAL local llama.cpp
+/// worker via the `worker_exe` seam and an isolated `HIGGS_HOME`. Drop restores
+/// the process env; `shutdown` drains the worker.
+struct FleetLocal {
+    higgs: Arc<Higgs>,
+    _home: TempDir,
+    prev_home: Option<std::ffi::OsString>,
+    prev_hf: Option<std::ffi::OsString>,
+}
+
+impl std::ops::Deref for FleetLocal {
+    type Target = Arc<Higgs>;
+    fn deref(&self) -> &Arc<Higgs> {
+        &self.higgs
+    }
+}
+
+impl FleetLocal {
+    /// An owned handle for `serve_v1_local`.
+    fn handle(&self) -> Arc<Higgs> {
+        self.higgs.clone()
+    }
+
+    /// Graceful teardown: drain the resident worker before the runtime unwinds.
+    async fn shutdown(self) {
+        self.higgs.stop().await;
+    }
+}
+
+impl Drop for FleetLocal {
+    fn drop(&mut self) {
+        // SAFETY: this binary runs `--test-threads=1`, so no other harness thread
+        // touches the process env concurrently while we restore it.
+        unsafe {
+            match &self.prev_home {
+                Some(v) => std::env::set_var("HIGGS_HOME", v),
+                None => std::env::remove_var("HIGGS_HOME"),
+            }
+            match &self.prev_hf {
+                Some(v) => std::env::set_var("HIGGS_HF_ENDPOINT", v),
+                None => std::env::remove_var("HIGGS_HF_ENDPOINT"),
+            }
+        }
+    }
+}
+
+/// Build the fleet-rooted in-process `Higgs`, or `None` when the fleet is absent
+/// (the test SKIPs). The fleet GGUFs are hundreds of MB, so the scan root points
+/// at the existing cache dir directly (no per-test copy).
+async fn fleet_local() -> Option<FleetLocal> {
+    let root = fleet_dir()?;
+    let home = TempDir::new().expect("create temp HIGGS_HOME");
+    let prev_home = std::env::var_os("HIGGS_HOME");
+    let prev_hf = std::env::var_os("HIGGS_HF_ENDPOINT");
+    // SAFETY: serialized by `--test-threads=1`; restored on drop.
+    unsafe {
+        std::env::set_var("HIGGS_HOME", home.path());
+        // Dead loopback hub endpoint so any best-effort card fetch fails fast.
+        std::env::set_var("HIGGS_HF_ENDPOINT", "http://127.0.0.1:1");
+    }
+    let config = HiggsConfig {
+        lmstudio_dirs: vec![root],
+        hf_dirs: vec![],
+        ollama_dirs: vec![],
+        default_load: HiggsConfig::default().default_load,
+        // DI seam: real worker-capable `higgs` binary spawns the llama.cpp worker.
+        worker_exe: Some(env!("CARGO_BIN_EXE_higgs").into()),
+    };
+    let higgs = Arc::new(Higgs::new(config));
+    higgs.start().await.expect("higgs start");
+    Some(FleetLocal {
+        higgs,
+        _home: home,
+        prev_home,
+        prev_hf,
+    })
+}
+
+/// Explicitly load a fleet model through the facade (bypasses the JIT readiness
+/// gate) with a pinned 2048 context, before chatting over `/v1`.
+async fn load(higgs: &Arc<Higgs>, id: &str) {
+    higgs
+        .load(
+            id,
+            Some(LoadParams::base(
+                CtxLen::Fixed { n: 2048 },
+                GpuLayers::All,
+                4,
+            )),
+        )
+        .await
+        .expect("model load succeeds");
+}
+
 /// Non-stream: the final message separates thinking from the answer.
 #[tokio::test]
 async fn reasoning_content_on_final_message() {
-    let Some(root) = fleet_dir() else {
+    let Some(higgs) = fleet_local().await else {
         eprintln!("SKIP reasoning_content_on_final_message: fleet absent");
         return;
     };
-    let srv = spawn_with_model_root(13500, &root).await;
+    load(&higgs, QWEN3).await;
+    let (base, guard) = serve_v1_local(higgs.handle()).await;
     let c = reqwest::Client::new();
-    load(&c, &srv.base, QWEN3).await;
 
     // Deterministic, and small enough that generation may truncate mid-think —
     // the lenient parse must STILL yield reasoning_content (content may be "").
     let resp: Value = c
-        .post(format!("{}/v1/chat/completions", srv.base))
+        .post(format!("{base}/v1/chat/completions"))
         .json(&json!({
             "model": QWEN3, "stream": false, "max_tokens": 96, "temperature": 0.0,
             "messages": [{ "role": "user", "content": "What is 2+2?" }]
@@ -57,22 +162,25 @@ async fn reasoning_content_on_final_message() {
         resp["usage"]["completion_tokens"].as_u64().unwrap_or(0) > 0,
         "usage intact: {resp}"
     );
+
+    guard.shutdown().await;
+    higgs.shutdown().await;
 }
 
 /// Streaming: reasoning arrives as `delta.reasoning_content` chunks BEFORE the
 /// first content chunk, and think markup never rides `delta.content`.
 #[tokio::test]
 async fn reasoning_content_streams_as_deltas() {
-    let Some(root) = fleet_dir() else {
+    let Some(higgs) = fleet_local().await else {
         eprintln!("SKIP reasoning_content_streams_as_deltas: fleet absent");
         return;
     };
-    let srv = spawn_with_model_root(13501, &root).await;
+    load(&higgs, QWEN3).await;
+    let (base, guard) = serve_v1_local(higgs.handle()).await;
     let c = reqwest::Client::new();
-    load(&c, &srv.base, QWEN3).await;
 
     let resp = c
-        .post(format!("{}/v1/chat/completions", srv.base))
+        .post(format!("{base}/v1/chat/completions"))
         .json(&json!({
             "model": QWEN3, "stream": true, "max_tokens": 96, "temperature": 0.0,
             "messages": [{ "role": "user", "content": "What is 2+2?" }]
@@ -121,7 +229,7 @@ async fn reasoning_content_streams_as_deltas() {
     // reasoning deltas concatenated (both come from the same PEG parse; a
     // divergence means one path re-shapes text the other doesn't).
     let non_stream: Value = c
-        .post(format!("{}/v1/chat/completions", srv.base))
+        .post(format!("{base}/v1/chat/completions"))
         .json(&json!({
             "model": QWEN3, "stream": false, "max_tokens": 96, "temperature": 0.0,
             "messages": [{ "role": "user", "content": "What is 2+2?" }]
@@ -140,17 +248,9 @@ async fn reasoning_content_streams_as_deltas() {
         reasoning.trim(),
         "final reasoning_content equals concatenated stream deltas"
     );
-}
 
-/// Load a fleet model (JIT-ready) before chatting.
-async fn load(c: &reqwest::Client, base: &str, id: &str) {
-    let r = c
-        .post(format!("{base}/api/higgs/models/load"))
-        .json(&json!({ "id": id, "ctx_len": 2048 }))
-        .send()
-        .await
-        .expect("load request");
-    assert!(r.status().is_success(), "model load succeeds");
+    guard.shutdown().await;
+    higgs.shutdown().await;
 }
 
 /// Drain one SSE body into its `data:` payload strings (stops at `[DONE]`, so
@@ -182,16 +282,16 @@ async fn collect_sse_payloads(resp: reqwest::Response) -> Vec<String> {
 /// reaching the template apply, thinking happens and this fails.
 #[tokio::test]
 async fn thinking_off_via_chat_template_kwargs() {
-    let Some(root) = fleet_dir() else {
+    let Some(higgs) = fleet_local().await else {
         eprintln!("SKIP thinking_off_via_chat_template_kwargs: fleet absent");
         return;
     };
-    let srv = spawn_with_model_root(13502, &root).await;
+    load(&higgs, QWEN3).await;
+    let (base, guard) = serve_v1_local(higgs.handle()).await;
     let c = reqwest::Client::new();
-    load(&c, &srv.base, QWEN3).await;
 
     let resp: Value = c
-        .post(format!("{}/v1/chat/completions", srv.base))
+        .post(format!("{base}/v1/chat/completions"))
         .json(&json!({
             "model": QWEN3, "stream": false, "max_tokens": 48, "temperature": 0.0,
             "chat_template_kwargs": { "enable_thinking": false },
@@ -215,6 +315,9 @@ async fn thinking_off_via_chat_template_kwargs() {
             .is_some_and(|s| !s.trim().is_empty()),
         "non-thinking turn still answers: {resp}"
     );
+
+    guard.shutdown().await;
+    higgs.shutdown().await;
 }
 
 /// Truncation mid-think (tiny max_tokens): the lenient parse keeps the partial
@@ -223,16 +326,16 @@ async fn thinking_off_via_chat_template_kwargs() {
 /// unclosed block back into content — is explicitly NOT higgs's policy.)
 #[tokio::test]
 async fn truncation_mid_think_keeps_reasoning() {
-    let Some(root) = fleet_dir() else {
+    let Some(higgs) = fleet_local().await else {
         eprintln!("SKIP truncation_mid_think_keeps_reasoning: fleet absent");
         return;
     };
-    let srv = spawn_with_model_root(13503, &root).await;
+    load(&higgs, QWEN3).await;
+    let (base, guard) = serve_v1_local(higgs.handle()).await;
     let c = reqwest::Client::new();
-    load(&c, &srv.base, QWEN3).await;
 
     let resp: Value = c
-        .post(format!("{}/v1/chat/completions", srv.base))
+        .post(format!("{base}/v1/chat/completions"))
         .json(&json!({
             "model": QWEN3, "stream": false, "max_tokens": 8, "temperature": 0.0,
             "messages": [{ "role": "user", "content": "What is 2+2?" }]
@@ -252,6 +355,9 @@ async fn truncation_mid_think_keeps_reasoning() {
             .is_some_and(|s| !s.trim().is_empty()),
         "partial thinking survives truncation as reasoning_content: {resp}"
     );
+
+    guard.shutdown().await;
+    higgs.shutdown().await;
 }
 
 /// Multi-turn echo-back: an assistant message carrying `reasoning_content`
@@ -260,16 +366,16 @@ async fn truncation_mid_think_keeps_reasoning() {
 /// turn must complete.
 #[tokio::test]
 async fn multi_turn_reasoning_echo_back_accepted() {
-    let Some(root) = fleet_dir() else {
+    let Some(higgs) = fleet_local().await else {
         eprintln!("SKIP multi_turn_reasoning_echo_back_accepted: fleet absent");
         return;
     };
-    let srv = spawn_with_model_root(13504, &root).await;
+    load(&higgs, QWEN3).await;
+    let (base, guard) = serve_v1_local(higgs.handle()).await;
     let c = reqwest::Client::new();
-    load(&c, &srv.base, QWEN3).await;
 
     let resp = c
-        .post(format!("{}/v1/chat/completions", srv.base))
+        .post(format!("{base}/v1/chat/completions"))
         .json(&json!({
             "model": QWEN3, "stream": false, "max_tokens": 48, "temperature": 0.0,
             "messages": [
@@ -288,4 +394,7 @@ async fn multi_turn_reasoning_echo_back_accepted() {
     );
     let body: Value = resp.json().await.expect("chat json");
     assert_eq!(body["object"], "chat.completion", "valid reply: {body}");
+
+    guard.shutdown().await;
+    higgs.shutdown().await;
 }

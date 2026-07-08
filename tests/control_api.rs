@@ -1,536 +1,327 @@
-//! Black-box integration test for higgs's `/api/higgs/*` control surface.
+//! In-process integration test for higgs's CONTROL surface — now the crate API.
 //!
-//! Spawns the real `higgs` binary and drives the full control lifecycle
-//! over HTTP against a tiny on-disk model: scan → load → status/models →
-//! version/logs/by-id/system → unload → worker/stop. The model is `ggml-org`'s
-//! ~1MB `stories260K.gguf` (see `common`), staged into a temp scan root, so the
-//! test exercises the real engine load/unload path in CI without a multi-GB GGUF.
+//! higgs is a library: the old `/api/higgs/*` HTTP control surface is GONE, so
+//! control runs through the in-process `Higgs` facade (`status`, `model_entries`,
+//! `load`, `version`, `hardware`, `estimate`, `tune`, key/idle/log settings). A
+//! REAL local llama.cpp worker still runs via the `worker_exe` DI seam (see
+//! `common::higgs_local`), so the full load → status → unload engine path is
+//! exercised in-process against the tiny on-disk `stories260K.gguf`.
 
 mod common;
 
-use common::{spawn_with_models, spawn_with_tiny_model, tiny_gguf_path, TINY_MODEL_ID};
+use std::collections::HashSet;
+
+use common::{higgs_local, TINY_MODEL_ID};
+use higgs::serve::readiness::ModelReadiness;
+use higgs::system::DeviceKind;
+use higgs::tune::{FitVerdict, ResourceBudget};
+use higgs::worker::engine::{CtxLen, GpuLayers};
+use higgs::{EstimateRequest, HiggsError, LoadParams, TuneRequest};
 
 #[tokio::test]
 async fn control_api_lifecycle() {
-    let Some(gguf) = tiny_gguf_path() else {
+    let Some(higgs) = higgs_local(&[TINY_MODEL_ID]).await else {
         eprintln!("SKIP control_api_lifecycle: tiny gguf not found (set HIGGS_TEST_GGUF)");
         return;
     };
-    let srv = spawn_with_tiny_model(11500, &gguf).await;
-    let c = reqwest::Client::new();
-    let get = |path: String| c.get(format!("{}{path}", srv.base)).send();
+    let id = TINY_MODEL_ID;
 
     // status at boot: spawn-on-load means NO worker until a model is loaded.
-    let status: serde_json::Value = get("/api/higgs/status".into())
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(
-        status["worker_alive"], false,
+    let status = higgs.status().await.expect("status");
+    assert!(
+        !status.worker_alive,
         "no worker before first load (spawn-on-load)"
     );
-    assert!(status["loaded"].is_null(), "nothing loaded at start");
+    assert!(status.loaded.is_none(), "nothing loaded at start");
 
     // models: a live scan of the configured dirs — the staged tiny model is here.
-    let models: serde_json::Value = get("/api/higgs/models".into())
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let id = TINY_MODEL_ID;
-    let arr = models["models"].as_array().unwrap();
-    assert!(!arr.is_empty(), "scan found models");
-    let scanned = arr
+    let models = higgs.model_entries().await.expect("model_entries");
+    assert!(!models.is_empty(), "scan found models");
+    let scanned = models
         .iter()
-        .find(|m| m["id"] == serde_json::json!(id))
+        .find(|m| m.model.id == id)
         .expect("scan lists the staged tiny model");
-    // The scan no longer probes (no load-to-test at open): there is NO `loadable`
-    // field — loadability is learned only at actual load time, below.
-    assert!(
-        scanned.get("loadable").is_none(),
-        "scan must not probe-judge loadability: {scanned}"
-    );
+    // The scan no longer probes loadability (no `loadable` field on the typed
+    // entry) — it is learned only at actual load time, below.
+    assert_eq!(scanned.state, "not-loaded", "scanned-but-unloaded entry");
 
     // load the model.
-    let load: serde_json::Value = c
-        .post(format!("{}/api/higgs/models/load", srv.base))
-        .json(&serde_json::json!({ "id": id }))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(load["status"], "ok", "load returns ok");
+    higgs.load(id, None).await.expect("load returns ok");
 
     // status now reports the loaded model.
-    let status: serde_json::Value = get("/api/higgs/status".into())
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(status["loaded"]["id"], id, "status shows loaded id");
-    assert!(
-        status["loaded"]["ctx_len"]["n"].as_u64().unwrap() > 0,
-        "loaded ctx_len > 0"
-    );
+    let status = higgs.status().await.expect("status");
+    let loaded = status.loaded.as_ref().expect("status shows loaded id");
+    assert_eq!(loaded.id, id, "status shows loaded id");
+    match loaded.ctx_len {
+        Some(CtxLen::Fixed { n }) => assert!(n > 0, "loaded ctx_len > 0"),
+        other => panic!("expected a fixed loaded ctx_len, got {other:?}"),
+    }
 
     // models list marks that entry "loaded".
-    let models: serde_json::Value = get("/api/higgs/models".into())
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let entry = models["models"]
-        .as_array()
-        .unwrap()
+    let models = higgs.model_entries().await.expect("model_entries");
+    let entry = models
         .iter()
-        .find(|m| m["id"] == serde_json::json!(id))
+        .find(|m| m.model.id == id)
         .expect("loaded model in list");
-    assert_eq!(entry["state"], "loaded", "entry state is loaded");
-    assert_eq!(entry["format"], "gguf");
-    assert_eq!(entry["arch"], "llama", "stories260K is a llama-arch GGUF");
-    // The tiny model embeds NO chat template (the engine falls back to chatml),
-    // so the template-derived capability flags are false.
+    assert_eq!(entry.state, "loaded", "entry state is loaded");
+    assert_eq!(entry.format, "gguf");
     assert_eq!(
-        entry["supports_tools"], false,
+        entry.model.arch.as_deref(),
+        Some("llama"),
+        "stories260K is a llama-arch GGUF"
+    );
+    // The tiny model embeds NO chat template (engine falls back to chatml), so the
+    // template-derived capability flags are false.
+    assert!(
+        !entry.model.supports_tools,
         "no embedded template → no tools"
     );
-    assert_eq!(
-        entry["supports_reasoning"], false,
+    assert!(
+        !entry.model.supports_reasoning,
         "no embedded template → no reasoning"
     );
-    // P2: the load persisted a per-model record — the entry now carries `last_load`
-    // (the params the model was loaded with), surviving in config.json for display
-    // + future autoload. Loaded with no pinned params → the effective default_load
-    // is recorded (ctx_len 0 = "auto", capped to the trained context at load).
+    // P2: the load persisted a per-model record — the entry carries `last_load`.
     assert!(
-        entry["last_load"].is_object(),
-        "loaded model carries a persisted last_load record: {entry}"
+        entry.last_load.is_some(),
+        "loaded model carries a persisted last_load record: {entry:?}"
     );
+
+    // model-by-id returns the entry.
+    let by_id = higgs.model_by_id(id).await.expect("model_by_id");
+    assert_eq!(by_id.model.id, id, "model_by_id returns the entry");
+
+    // model-by-id for a NON-existent id → ModelNotFound (was a 404 HG envelope).
+    let missing = higgs.model_by_id("no-such-org/no-such-model").await;
     assert!(
-        entry["last_load"]["ctx_len"]["kind"].is_string()
-            && entry["last_load"]["gpu_layers"]["kind"].is_string(),
-        "persisted last_load carries the load params (gpu_layers is the GpuLayers union): {entry}"
+        matches!(missing, Err(HiggsError::ModelNotFound { .. })),
+        "unknown model id is ModelNotFound: {missing:?}"
     );
 
-    // model-by-id (the wildcard route handles the slashed HF repo id).
-    let by_id: serde_json::Value = get(format!("/api/higgs/models/{id}"))
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(by_id["id"], id, "models/{{id}} returns the entry");
+    // version reports the engine.
+    let version = higgs.version();
+    assert_eq!(version.engine, "llama.cpp", "version reports the engine");
 
-    // model-by-id for a NON-existent id → 404 with a HG-coded error envelope.
-    let missing = get("/api/higgs/models/no-such-org/no-such-model".into())
-        .await
-        .unwrap();
-    assert_eq!(missing.status(), 404, "unknown model id is 404");
-    let missing_body: serde_json::Value = missing.json().await.unwrap();
-    assert!(
-        missing_body["error"]
-            .as_str()
-            .is_some_and(|e| e.contains("HG")),
-        "404 carries a HG-coded error: {missing_body:?}"
-    );
+    // logs: a lines vec; n=0 returns none.
+    let _lines = higgs.logs(50, None);
+    assert_eq!(higgs.logs(0, None).len(), 0, "n=0 returns no lines");
 
-    // version + logs respond with their shapes.
-    let version: serde_json::Value = get("/api/higgs/version".into())
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert!(version.is_object(), "version is an object");
-    assert_eq!(version["engine"], "llama.cpp", "version reports the engine");
-
-    let logs: serde_json::Value = get("/api/higgs/logs?n=50".into())
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert!(logs["lines"].is_array(), "logs has a lines array");
-
-    // logs with n=0 and the default (no n) both answer with a lines array.
-    for q in ["/api/higgs/logs?n=0", "/api/higgs/logs"] {
-        let l: serde_json::Value = get(q.into()).await.unwrap().json().await.unwrap();
-        assert!(l["lines"].is_array(), "{q} has a lines array");
-    }
-    let zero: serde_json::Value = get("/api/higgs/logs?n=0".into())
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(
-        zero["lines"].as_array().unwrap().len(),
-        0,
-        "n=0 returns no lines"
-    );
-
-    // system: hardware + runtime panels (the LM-Studio-style info).
-    let system: serde_json::Value = get("/api/higgs/system".into())
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert!(
-        !system["hardware"]["cpu_name"].as_str().unwrap().is_empty(),
-        "system reports a CPU name"
-    );
-    assert!(
-        system["hardware"]["ram_total_bytes"].as_u64().unwrap() > 0,
-        "system reports total RAM"
-    );
-    assert_eq!(system["runtime"]["engine"], "llama.cpp", "runtime engine");
+    // system: hardware panels + runtime engine.
+    let hw = higgs.hardware().await;
+    assert!(!hw.cpu_name.is_empty(), "system reports a CPU name");
+    assert!(hw.ram_total_bytes > 0, "system reports total RAM");
+    assert_eq!(higgs.version().engine, "llama.cpp", "runtime engine");
 
     // unload → status clears.
-    let unload: serde_json::Value = c
-        .post(format!("{}/api/higgs/models/unload", srv.base))
-        .json(&serde_json::json!({}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(unload["status"], "ok", "unload returns ok");
+    higgs.unload().await.expect("unload");
+    let status = higgs.status().await.expect("status");
+    assert!(status.loaded.is_none(), "nothing loaded after unload");
 
-    let status: serde_json::Value = get("/api/higgs/status".into())
+    // unload again with nothing loaded — idempotent.
+    higgs
+        .unload()
         .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert!(status["loaded"].is_null(), "nothing loaded after unload");
+        .expect("unload with nothing loaded is ok");
 
-    // unload again with nothing loaded — idempotent, still {"status":"ok"}.
-    let unload2: serde_json::Value = c
-        .post(format!("{}/api/higgs/models/unload", srv.base))
-        .json(&serde_json::json!({}))
-        .send()
+    // Re-load with EXPLICIT load params (ctx 2048, gpu_layers 0, threads 2) —
+    // exercises the non-default LoadParams branch. ctx_len is echoed back.
+    higgs
+        .load(
+            id,
+            Some(LoadParams::base(
+                CtxLen::Fixed { n: 2048 },
+                GpuLayers::Count { n: 0 },
+                2,
+            )),
+        )
         .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(unload2["status"], "ok", "unload with nothing loaded is ok");
-
-    // Re-load with EXPLICIT load params (ctx_len/gpu_layers/threads) — exercises
-    // the non-default LoadParams branch in control_load. ctx_len is echoed back.
-    // ALSO send a per-load `idle_ttl_minutes`: it is accepted on the wire for
-    // forward-compat, but the reaper applies ONE per-node TTL, so the host must NOT
-    // record/surface it — status must never advertise an override it ignores.
-    let load2: serde_json::Value = c
-        .post(format!("{}/api/higgs/models/load", srv.base))
-        .json(&serde_json::json!({
-            "id": id, "ctx_len": 2048, "gpu_layers": 0, "threads": 2,
-            "idle_ttl_minutes": 30
-        }))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(load2["status"], "ok", "explicit-params load returns ok");
-    let status: serde_json::Value = get("/api/higgs/status".into())
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+        .expect("explicit-params load returns ok");
+    let status = higgs.status().await.expect("status");
+    let loaded = status.loaded.as_ref().expect("loaded");
     assert_eq!(
-        status["loaded"]["ctx_len"]["n"].as_u64().unwrap(),
-        2048,
+        loaded.ctx_len,
+        Some(CtxLen::Fixed { n: 2048 }),
         "explicit ctx_len honored"
     );
-    // Per-load idle_ttl_minutes is a no-op today: it must be ABSENT from the surfaced
-    // LoadedInfo (`skip_serializing_if = Option::is_none` → a missing key reads as JSON
-    // null). On revert (the handler records the override and `loaded_info_from` surfaces
-    // it), this would report `30` — lying about an enforced per-load TTL.
+    // Per-load idle_ttl_minutes is a no-op: the facade `load` API has no per-load
+    // idle-TTL field, so status can never advertise an override it ignores. (The
+    // reaper applies one per-node TTL; this stays structurally guaranteed.)
     assert!(
-        status["loaded"]["idle_ttl_minutes"].is_null(),
-        "per-load idle_ttl_minutes must NOT be surfaced (reaper ignores it): {status}"
+        loaded.idle_ttl_minutes.is_none(),
+        "per-load idle_ttl_minutes must NOT be surfaced (reaper ignores it): {loaded:?}"
     );
 
-    // ── Worker stop is NON-TERMINAL: the server stays loadable after it ───────
-    // worker/stop must be a bulk UNLOAD, not the node's terminal `shutdown_all` drain.
-    // A reverted fix (calling `Higgs::stop`) marks the runtime shutting-down, so the
-    // RELOAD below would be rejected and brick the node until process restart.
-    let stop: serde_json::Value = c
-        .post(format!("{}/api/higgs/worker/stop", srv.base))
-        .json(&serde_json::json!({}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(stop["status"], "ok", "worker/stop returns ok");
-    let status: serde_json::Value = get("/api/higgs/status".into())
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(
-        status["worker_alive"], false,
-        "worker_alive is false after stop"
+    // ── worker/stop is NON-TERMINAL: the node stays loadable after it ─────────
+    // `worker_stop` is a bulk UNLOAD, not the terminal `stop` drain. If it marked
+    // the runtime shutting-down, the RELOAD below would be rejected and brick the
+    // node until process restart.
+    higgs.worker_stop().await.expect("worker_stop returns ok");
+    let status = higgs.status().await.expect("status");
+    assert!(
+        !status.worker_alive,
+        "worker_alive is false after worker_stop"
     );
 
-    // REGRESSION: a load AFTER worker/stop must still succeed — the node must NOT be
-    // terminally shut down. With the bug (Higgs::stop → shutdown_all), this reload is
-    // rejected and the server is bricked until process restart.
-    let reload: serde_json::Value = c
-        .post(format!("{}/api/higgs/models/load", srv.base))
-        .json(&serde_json::json!({ "id": id }))
-        .send()
+    // REGRESSION: a load AFTER worker_stop must still succeed — non-terminal.
+    higgs
+        .load(id, None)
         .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+        .expect("load after worker_stop must still work — worker_stop is non-terminal");
+    let status = higgs.status().await.expect("status");
     assert_eq!(
-        reload["status"], "ok",
-        "load after worker/stop must still work — worker/stop is non-terminal"
-    );
-    let status: serde_json::Value = get("/api/higgs/status".into())
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(
-        status["loaded"]["id"], id,
-        "reloaded model is resident again after the non-terminal worker/stop"
+        status.loaded.as_ref().unwrap().id,
+        id,
+        "reloaded model is resident again after the non-terminal worker_stop"
     );
 
-    // Final cleanup so graceful shutdown is clean (no SSE stream is open here).
-    let _ = c
-        .post(format!("{}/api/higgs/worker/stop", srv.base))
-        .json(&serde_json::json!({}))
-        .send()
-        .await
-        .unwrap();
+    // Graceful drain so the worker child is reaped deterministically.
+    higgs.shutdown().await;
 }
 
-/// Multi-model: the local node is multi-worker (one worker per loaded model), so `/api/higgs/status`
-/// must report EVERY resident model in `loaded_all` (each tagged with its `worker_id`) — not just
-/// the primary `loaded`. This is what the UI's "Loaded Models" section renders one card per.
+/// Multi-model: the local node is multi-worker (one worker per loaded model), so
+/// `status().loaded_all` must report EVERY resident model (each tagged with its
+/// `worker_id`) — not just the primary `loaded`.
 #[tokio::test]
 async fn status_loaded_all_lists_every_worker() {
-    let Some(gguf) = tiny_gguf_path() else {
+    let Some(higgs) = higgs_local(&["org-a/m", "org-b/m"]).await else {
         eprintln!("SKIP status_loaded_all_lists_every_worker: tiny gguf not found");
         return;
     };
-    let srv = spawn_with_models(11512, &gguf, &["org-a/m", "org-b/m"]).await;
-    let c = reqwest::Client::new();
 
     for id in ["org-a/m", "org-b/m"] {
-        let load = c
-            .post(format!("{}/api/higgs/models/load", srv.base))
-            .json(&serde_json::json!({ "id": id }))
-            .send()
+        higgs
+            .load(id, None)
             .await
-            .unwrap();
-        assert!(load.status().is_success(), "load {id} ok");
+            .unwrap_or_else(|e| panic!("load {id}: {e:?}"));
     }
 
-    let status: serde_json::Value = c
-        .get(format!("{}/api/higgs/status", srv.base))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let all = status["loaded_all"]
-        .as_array()
-        .expect("loaded_all is an array");
-    assert_eq!(all.len(), 2, "every loaded worker reported: {status}");
-    let mut ids: Vec<&str> = all.iter().map(|e| e["id"].as_str().unwrap()).collect();
+    let status = higgs.status().await.expect("status");
+    assert_eq!(
+        status.loaded_all.len(),
+        2,
+        "every loaded worker reported: {status:?}"
+    );
+    let mut ids: Vec<&str> = status.loaded_all.iter().map(|e| e.id.as_str()).collect();
     ids.sort_unstable();
-    assert_eq!(ids, ["org-a/m", "org-b/m"], "both models present: {status}");
-    let workers: std::collections::HashSet<u64> = all
-        .iter()
-        .map(|e| e["worker_id"].as_u64().unwrap())
-        .collect();
+    assert_eq!(
+        ids,
+        ["org-a/m", "org-b/m"],
+        "both models present: {status:?}"
+    );
+    let workers: HashSet<u32> = status.loaded_all.iter().map(|e| e.worker_id).collect();
     assert_eq!(
         workers.len(),
         2,
-        "each entry has a distinct worker_id: {status}"
+        "each entry has a distinct worker_id: {status:?}"
     );
     // `loaded` (back-compat primary) is one of the resident models.
     assert!(
-        ["org-a/m", "org-b/m"].contains(&status["loaded"]["id"].as_str().unwrap()),
-        "primary loaded is one of the resident models: {status}"
+        ["org-a/m", "org-b/m"].contains(&status.loaded.as_ref().unwrap().id.as_str()),
+        "primary loaded is one of the resident models: {status:?}"
     );
+
+    higgs.shutdown().await;
 }
 
-/// The settings + health + SSE-logs control surface (no model needed): GET/PUT the two
-/// settings endpoints round-trip a toggle, the health endpoints answer, and the logs SSE
-/// stream opens and emits at least the replay prefix.
+/// Settings + log toggles round-trip through the facade, and the id-validation +
+/// model-by-id branches answer as before. (The old HTTP `/health` +
+/// `/api/higgs/health` probes are HTTP-only and covered by `serve_v1_local`'s
+/// readiness poll in `tests/inference.rs`; the settings-schema JSON round-trip is
+/// likewise HTTP-only — the typed getters/setters are exercised directly here.)
 #[tokio::test]
-async fn control_settings_health_and_log_stream() {
-    let Some(gguf) = tiny_gguf_path() else {
-        eprintln!("SKIP control_settings_health_and_log_stream: tiny gguf not found");
+async fn control_settings_and_validation() {
+    let Some(higgs) = higgs_local(&[TINY_MODEL_ID]).await else {
+        eprintln!("SKIP control_settings_and_validation: tiny gguf not found");
         return;
     };
-    let srv = spawn_with_tiny_model(11507, &gguf).await;
-    let c = reqwest::Client::new();
 
-    // ── Health endpoints answer 200 ──────────────────────────────────────────
-    for path in ["/health", "/api/higgs/health"] {
-        let r = c.get(format!("{}{path}", srv.base)).send().await.unwrap();
-        assert!(r.status().is_success(), "{path} is healthy");
-    }
-
-    // ── logs/settings: GET current, PUT a flip, GET reflects it ──────────────
-    let before: serde_json::Value = c
-        .get(format!("{}/api/higgs/logs/settings", srv.base))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let verbose0 = before["verbose"].as_bool().expect("verbose flag present");
-    let mut put_body = before.clone();
-    put_body["verbose"] = serde_json::Value::Bool(!verbose0);
-    let put = c
-        .put(format!("{}/api/higgs/logs/settings", srv.base))
-        .json(&put_body)
-        .send()
-        .await
-        .unwrap();
-    assert!(put.status().is_success(), "PUT logs/settings ok");
-    let after: serde_json::Value = c
-        .get(format!("{}/api/higgs/logs/settings", srv.base))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(after["verbose"], !verbose0, "verbose toggle persisted");
-
-    // ── settings: GET then PUT the same payload back (round-trips the schema) ──
-    let settings: serde_json::Value = c
-        .get(format!("{}/api/higgs/settings", srv.base))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let put = c
-        .put(format!("{}/api/higgs/settings", srv.base))
-        .json(&settings)
-        .send()
-        .await
-        .unwrap();
-    assert!(
-        put.status().is_success(),
-        "PUT settings round-trips: {settings:?}"
-    );
-
-    // ── Invalid model ids are rejected with a typed 4xx (id-validation branch) ──
-    for bad in ["bad id with spaces", "../escape", ""] {
-        let r = c
-            .post(format!("{}/api/higgs/models/load", srv.base))
-            .json(&serde_json::json!({ "id": bad }))
-            .send()
-            .await
-            .unwrap();
-        assert!(
-            r.status().is_client_error(),
-            "invalid id {bad:?} → 4xx, got {}",
-            r.status()
-        );
-    }
-
-    // ── model-by-id for a SCANNED-but-unloaded model reads its on-disk metadata ──
-    let by_id = c
-        .get(format!("{}/api/higgs/models/{}", srv.base, TINY_MODEL_ID))
-        .send()
-        .await
-        .unwrap();
-    assert!(by_id.status().is_success(), "by-id for a scanned model ok");
-    let detail: serde_json::Value = by_id.json().await.unwrap();
+    // ── log settings: read current, flip verbose, read reflects it ───────────
+    let before = higgs.logs_settings();
+    higgs.set_logs_settings(&higgs::LogSettings {
+        verbose: !before.verbose,
+        ..before.clone()
+    });
     assert_eq!(
-        detail["id"], TINY_MODEL_ID,
-        "by-id returns the model: {detail:?}"
+        higgs.logs_settings().verbose,
+        !before.verbose,
+        "verbose toggle persisted"
     );
 
-    // by-id for an UNKNOWN model is a 404 (the not-found branch).
-    let missing = c
-        .get(format!(
-            "{}/api/higgs/models/ghost-org/ghost-model",
-            srv.base
-        ))
-        .send()
+    // ── runtime settings: flip JIT and read it back (schema round-trip) ──────
+    let jit0 = higgs.jit_enabled();
+    higgs.set_jit_enabled(!jit0);
+    assert_eq!(higgs.jit_enabled(), !jit0, "jit toggle persisted");
+    higgs.set_jit_enabled(jit0);
+
+    // ── Invalid model ids are rejected with a typed error (id-validation) ────
+    for bad in ["bad id with spaces", "../escape", ""] {
+        let r = higgs.load(bad, None).await;
+        assert!(r.is_err(), "invalid id {bad:?} → error, got {r:?}");
+    }
+
+    // ── model-by-id for a SCANNED-but-unloaded model reads on-disk metadata ──
+    let detail = higgs
+        .model_by_id(TINY_MODEL_ID)
         .await
-        .unwrap();
-    assert_eq!(missing.status(), 404, "by-id for an unknown model is 404");
+        .expect("by-id for a scanned model ok");
+    assert_eq!(detail.model.id, TINY_MODEL_ID, "by-id returns the model");
+
+    // by-id for an UNKNOWN model → ModelNotFound (the not-found branch).
+    let missing = higgs.model_by_id("ghost-org/ghost-model").await;
+    assert!(
+        matches!(missing, Err(HiggsError::ModelNotFound { .. })),
+        "by-id for an unknown model is ModelNotFound: {missing:?}"
+    );
+
+    higgs.shutdown().await;
 }
 
-/// The supervisor's auto-restart FSM: when the worker child dies unexpectedly, the next
-/// request respawns it and REPLAYS the recorded load, so the model is back without a manual
-/// reload. We load a model, hard-kill the worker child (the server's grandchild), then chat
-/// again — it must succeed against a freshly restarted + reloaded worker.
+/// The supervisor's auto-restart FSM: when a worker child dies unexpectedly, the
+/// next request respawns it and REPLAYS the recorded load. We load a model,
+/// hard-kill the worker child (now a child of THIS test process — the seam spawns
+/// it from the real higgs binary), then chat again — it must succeed against a
+/// freshly restarted + reloaded worker.
 #[tokio::test]
 async fn worker_crash_triggers_restart_and_replay() {
-    let Some(gguf) = tiny_gguf_path() else {
+    let Some(higgs) = higgs_local(&[TINY_MODEL_ID]).await else {
         eprintln!("SKIP worker_crash_triggers_restart_and_replay: tiny gguf not found");
         return;
     };
-    let srv = spawn_with_tiny_model(11509, &gguf).await;
-    let c = reqwest::Client::new();
 
-    // Load the model (spawns the worker child).
-    let load = c
-        .post(format!("{}/api/higgs/models/load", srv.base))
-        .json(&serde_json::json!({ "id": TINY_MODEL_ID }))
-        .send()
+    higgs
+        .load(TINY_MODEL_ID, None)
         .await
-        .unwrap();
-    assert!(load.status().is_success(), "initial load ok");
+        .expect("initial load ok");
 
-    // Find and HARD-kill the worker child (a `--higgs-worker` grandchild of the server).
-    let pids = worker_child_pids(srv.pid());
+    // Find and HARD-kill the worker child (a `--higgs-worker` child of THIS process).
+    let pids = worker_child_pids(std::process::id());
     assert!(!pids.is_empty(), "found the worker child process");
     for pid in &pids {
+        // SAFETY: SIGKILL to a pid we just enumerated as our own child.
         unsafe {
             libc::kill(*pid as libc::pid_t, libc::SIGKILL);
         }
     }
 
-    // The next chat must succeed: the supervisor detects the dead child, restarts it, and
-    // replays the recorded load before serving — possibly after a transient error, so retry.
+    // The next chat must succeed: the supervisor detects the dead child, restarts
+    // it, replays the recorded load, then serves — possibly after a transient error.
     let mut ok = false;
     for _ in 0..40 {
-        let resp = c
-            .post(format!("{}/v1/chat/completions", srv.base))
-            .json(&serde_json::json!({
-                "model": TINY_MODEL_ID, "stream": false, "max_tokens": 4,
-                "messages": [{ "role": "user", "content": "hi" }]
-            }))
-            .send()
-            .await
-            .unwrap();
-        if resp.status().is_success() {
-            ok = true;
-            break;
+        let attempt = higgs
+            .chat_stream(
+                TINY_MODEL_ID.to_owned(),
+                r#"[{"role":"user","content":"hi"}]"#.to_owned(),
+                4,
+                higgs::SamplingParams::default(),
+                None,
+                None,
+            )
+            .await;
+        if let Ok((mut deltas, handle)) = attempt {
+            while deltas.recv().await.is_some() {}
+            if matches!(handle.await, Ok(Ok(_))) {
+                ok = true;
+                break;
+            }
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
@@ -538,250 +329,128 @@ async fn worker_crash_triggers_restart_and_replay() {
         ok,
         "chat succeeds after the worker was restarted + the load replayed"
     );
+
+    higgs.shutdown().await;
 }
 
-/// The idle reaper auto-unloads a model after its idle TTL elapses: with `auto_unload_idle`
-/// on and `idle_ttl_minutes = 0`, a loaded-but-unused worker is reaped on the next reaper
-/// tick (~30s) without any client action.
+/// The idle reaper auto-unloads a model after its idle TTL elapses: with
+/// `auto_unload_idle` on and `idle_ttl_minutes = 0`, a loaded-but-unused worker is
+/// reaped on the next reaper tick (fast cadence at TTL 0) without any client action.
 #[tokio::test]
 async fn idle_reaper_auto_unloads_a_model() {
-    let Some(gguf) = tiny_gguf_path() else {
+    let Some(higgs) = higgs_local(&[TINY_MODEL_ID]).await else {
         eprintln!("SKIP idle_reaper_auto_unloads_a_model: tiny gguf not found");
         return;
     };
-    let srv = spawn_with_tiny_model(11510, &gguf).await;
-    let c = reqwest::Client::new();
 
-    // Enable aggressive idle auto-unload (TTL 0 ⇒ idle immediately) BEFORE loading.
-    let mut settings: serde_json::Value = c
-        .get(format!("{}/api/higgs/settings", srv.base))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    settings["auto_unload_idle"] = serde_json::json!(true);
-    settings["idle_ttl_minutes"] = serde_json::json!(0);
-    let put = c
-        .put(format!("{}/api/higgs/settings", srv.base))
-        .json(&settings)
-        .send()
-        .await
-        .unwrap();
-    assert!(put.status().is_success(), "enable idle auto-unload");
+    // Aggressive idle auto-unload (TTL 0 ⇒ idle immediately) BEFORE loading.
+    higgs.set_auto_unload_idle(true);
+    higgs.set_idle_ttl_minutes(0);
 
-    let load = c
-        .post(format!("{}/api/higgs/models/load", srv.base))
-        .json(&serde_json::json!({ "id": TINY_MODEL_ID }))
-        .send()
-        .await
-        .unwrap();
-    assert!(load.status().is_success(), "load ok");
+    higgs.load(TINY_MODEL_ID, None).await.expect("load ok");
 
-    // Within ~2 reaper ticks the idle worker is auto-unloaded (no chat keeps it alive).
+    // Within a few reaper ticks the idle worker is auto-unloaded.
     let mut unloaded = false;
-    for _ in 0..35 {
-        let status: serde_json::Value = c
-            .get(format!("{}/api/higgs/status", srv.base))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        if status["worker_alive"] == false || status["loaded"].is_null() {
+    for _ in 0..100 {
+        let status = higgs.status().await.expect("status");
+        if !status.worker_alive || status.loaded.is_none() {
             unloaded = true;
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     assert!(
         unloaded,
         "idle reaper auto-unloaded the model within the timeout"
     );
+
+    higgs.shutdown().await;
 }
 
-/// PIDs of the `--higgs-worker` children of `server_pid` (the spawned worker processes).
-fn worker_child_pids(server_pid: u32) -> Vec<u32> {
-    let out = std::process::Command::new("pgrep")
-        .args(["-P", &server_pid.to_string()])
-        .output()
-        .expect("run pgrep");
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| l.trim().parse::<u32>().ok())
-        .collect()
-}
-
-/// `/api/higgs/system` reports the EFFECTIVE (live, runtime-mutable) idle TTL, and a huge
-/// `idle_ttl_minutes` on `PUT /api/higgs/settings` is clamped before the ×60 (no overflow).
-/// Reverting either fix breaks this: a stale fixed 300s would disagree with the 60-min default,
+/// `server_config()` reports the EFFECTIVE (live, runtime-mutable) idle TTL, and a
+/// huge `idle_ttl_minutes` is clamped before the ×60 (no overflow). Reverting
+/// either breaks this: a stale fixed value would disagree with the 60-min default,
 /// and `u64::MAX * 60` would overflow (debug panic / release wrap) instead of clamping.
 #[tokio::test]
 async fn idle_ttl_effective_report_and_overflow_clamp() {
-    let Some(gguf) = tiny_gguf_path() else {
+    let Some(higgs) = higgs_local(&[TINY_MODEL_ID]).await else {
         eprintln!("SKIP idle_ttl_effective_report_and_overflow_clamp: tiny gguf not found");
         return;
     };
-    let srv = spawn_with_tiny_model(11508, &gguf).await;
-    let c = reqwest::Client::new();
 
-    // Helper closures over the two endpoints we cross-check.
-    let get_settings_ttl = || async {
-        let s: serde_json::Value = c
-            .get(format!("{}/api/higgs/settings", srv.base))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        s["idle_ttl_minutes"]
-            .as_u64()
-            .expect("idle_ttl_minutes present")
-    };
-    let get_system_ttl_secs = || async {
-        let sys: serde_json::Value = c
-            .get(format!("{}/api/higgs/system", srv.base))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        sys["config"]["limits"]["idle_unload_ttl_secs"]
-            .as_u64()
-            .expect("config.limits.idle_unload_ttl_secs present")
-    };
-
-    // ── Default: /system reports the LIVE 60-min default (3600s), not a stale 300s ──
-    let default_min = get_settings_ttl().await;
-    assert_eq!(default_min, 60, "settings default idle TTL is 60 minutes");
-    let default_secs = get_system_ttl_secs().await;
+    // ── Default: the live 60-min default (3600s), not a stale value ──
+    assert_eq!(
+        higgs.idle_ttl_minutes(),
+        60,
+        "settings default idle TTL is 60 minutes"
+    );
+    let default_secs = higgs.server_config().limits.idle_unload_ttl_secs;
     assert_eq!(
         default_secs, 3600,
-        "/system idle_unload_ttl_secs is the live 60min×60 (NOT a stale fixed 300s)"
+        "idle_unload_ttl_secs is the live 60min×60"
     );
     assert_eq!(
         default_secs,
-        default_min * 60,
-        "/system and /settings agree at the default"
+        higgs.idle_ttl_minutes() * 60,
+        "system and settings agree"
     );
 
-    // ── Change it: PUT a new TTL, /system tracks it without a restart ──
-    let mut settings: serde_json::Value = c
-        .get(format!("{}/api/higgs/settings", srv.base))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    settings["idle_ttl_minutes"] = serde_json::json!(45);
-    let put = c
-        .put(format!("{}/api/higgs/settings", srv.base))
-        .json(&settings)
-        .send()
-        .await
-        .unwrap();
-    assert!(put.status().is_success(), "PUT idle_ttl_minutes=45 ok");
+    // ── Change it: set a new TTL, /system tracks it without a restart ──
+    higgs.set_idle_ttl_minutes(45);
     assert_eq!(
-        get_settings_ttl().await,
+        higgs.idle_ttl_minutes(),
         45,
         "settings reflects the new TTL"
     );
     assert_eq!(
-        get_system_ttl_secs().await,
+        higgs.server_config().limits.idle_unload_ttl_secs,
         45 * 60,
-        "/system idle_unload_ttl_secs tracks the runtime change (45×60=2700)"
+        "idle_unload_ttl_secs tracks the runtime change (45×60=2700)"
     );
 
-    // ── Overflow clamp: a huge minutes count must NOT overflow ×60 ──
-    // u64::MAX * 60 would panic (debug) / wrap (release) without the clamp.
-    settings["idle_ttl_minutes"] = serde_json::json!(u64::MAX);
-    let put = c
-        .put(format!("{}/api/higgs/settings", srv.base))
-        .json(&settings)
-        .send()
-        .await
-        .unwrap();
-    assert!(
-        put.status().is_success(),
-        "PUT idle_ttl_minutes=u64::MAX is accepted + clamped (not a 500)"
-    );
-    let clamped_min = get_settings_ttl().await;
+    // ── Overflow clamp: u64::MAX minutes must NOT overflow ×60 ──
+    higgs.set_idle_ttl_minutes(u64::MAX);
+    let clamped_min = higgs.idle_ttl_minutes();
     assert!(
         clamped_min < u64::MAX,
-        "huge idle_ttl_minutes is clamped at the setter, got {clamped_min}"
+        "huge idle_ttl_minutes is clamped, got {clamped_min}"
     );
-    // The reported seconds must be the clamped minutes ×60 — finite and consistent,
-    // and crucially NOT a wrapped/overflowed value.
-    let clamped_secs = get_system_ttl_secs().await;
+    let clamped_secs = higgs.server_config().limits.idle_unload_ttl_secs;
     assert_eq!(
         clamped_secs,
         clamped_min.saturating_mul(60),
-        "/system seconds == clamped minutes ×60 (overflow-free, settings ↔ system agree)"
+        "system seconds == clamped minutes ×60 (overflow-free, settings ↔ system agree)"
     );
     assert!(
         clamped_secs >= clamped_min,
         "seconds did not wrap below minutes (no overflow), {clamped_secs} vs {clamped_min}"
     );
+
+    higgs.shutdown().await;
 }
 
-/// `POST …/estimate` returns the VRAM/RAM footprint of a CANDIDATE load, and the
-/// footprint grows with context (KV cache is linear in n_ctx) — the math the live
-/// UI estimate reads. A missing model is a 404.
+/// `estimate` returns the VRAM/RAM footprint of a CANDIDATE load, and the footprint
+/// grows with context (KV cache is linear in n_ctx). A missing model is ModelNotFound.
 #[tokio::test]
 async fn estimate_returns_footprint_growing_with_context() {
-    let Some(gguf) = tiny_gguf_path() else {
+    let Some(higgs) = higgs_local(&[TINY_MODEL_ID]).await else {
         eprintln!("SKIP estimate: no tiny GGUF (set HIGGS_TEST_GGUF)");
         return;
     };
-    let srv = spawn_with_tiny_model(11513, &gguf).await;
-    let c = reqwest::Client::new();
 
-    let small: serde_json::Value = c
-        .post(format!("{}/api/higgs/models/estimate", srv.base))
-        .json(
-            &serde_json::json!({ "id": TINY_MODEL_ID, "ctx_len": { "kind": "fixed", "n": 2048 } }),
-        )
-        .send()
+    let small = higgs
+        .estimate(estimate_req(TINY_MODEL_ID, 2048, None))
         .await
-        .expect("estimate request")
-        .json()
-        .await
-        .unwrap();
-    // RAM is always charged (weights + overhead) on any host; a CPU-only host reports
-    // vram == 0, so assert on RAM to confirm a real footprint was computed everywhere.
-    assert!(
-        small["ram"]["needed_bytes"].as_u64().unwrap() > 0,
-        "footprint present: {small}"
-    );
-    assert!(
-        small["vram"]["verdict"].is_string(),
-        "vram verdict: {small}"
-    );
-    assert!(small["ram"]["verdict"].is_string(), "ram verdict: {small}");
+        .expect("estimate request");
+    // RAM is always charged (weights + overhead); a CPU-only host reports vram == 0.
+    assert!(small.ram.needed_bytes > 0, "footprint present: {small:?}");
 
-    let large: serde_json::Value = c
-        .post(format!("{}/api/higgs/models/estimate", srv.base))
-        .json(
-            &serde_json::json!({ "id": TINY_MODEL_ID, "ctx_len": { "kind": "fixed", "n": 16384 } }),
-        )
-        .send()
+    let large = higgs
+        .estimate(estimate_req(TINY_MODEL_ID, 16384, None))
         .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+        .expect("estimate request");
     // KV cache is linear in n_ctx → a bigger context needs strictly more memory.
-    // Assert on the TOTAL (VRAM + RAM): the KV lives in VRAM on a GPU host and in RAM
-    // on a CPU-only host, so the combined footprint grows on EITHER (a VRAM-only
-    // assertion would be 0 vs 0 on a CPU-only box).
-    let total = |v: &serde_json::Value| {
-        v["vram"]["needed_bytes"].as_u64().unwrap() + v["ram"]["needed_bytes"].as_u64().unwrap()
-    };
+    let total = |r: &higgs::EstimateReport| r.vram.needed_bytes + r.ram.needed_bytes;
     assert!(
         total(&large) > total(&small),
         "bigger context → bigger total footprint (small {} vs large {})",
@@ -789,221 +458,218 @@ async fn estimate_returns_footprint_growing_with_context() {
         total(&large)
     );
 
-    // A missing model → 404 (not a 500 or a silent 0).
-    let missing = c
-        .post(format!("{}/api/higgs/models/estimate", srv.base))
-        .json(
-            &serde_json::json!({ "id": "nope/missing", "ctx_len": { "kind": "fixed", "n": 2048 } }),
-        )
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(missing.status(), 404, "missing model → 404");
+    // A missing model → ModelNotFound (not a 500 or a silent 0).
+    let missing = higgs
+        .estimate(estimate_req("nope/missing", 2048, None))
+        .await;
+    assert!(
+        matches!(missing, Err(HiggsError::ModelNotFound { .. })),
+        "missing model → ModelNotFound: {missing:?}"
+    );
+
+    higgs.shutdown().await;
 }
 
-/// `POST …/estimate` measures the verdict against the supplied resource budget, not
-/// just the detected machine — so the live UI footprint agrees with the budget-aware
-/// tune. A 1 MiB RAM cap (which no real model fits) flips RAM Fits → Overflow. Uses
-/// the RAM budget so the assertion holds on GPU AND CPU-only hosts (a CPU-only host
-/// charges no VRAM, but always charges RAM).
+/// `estimate` measures the verdict against the supplied resource budget: a 1 MiB
+/// RAM cap (which no real model fits) flips RAM Fits → Overflow.
 #[tokio::test]
 async fn estimate_honors_resource_budget() {
-    let Some(gguf) = tiny_gguf_path() else {
+    let Some(higgs) = higgs_local(&[TINY_MODEL_ID]).await else {
         eprintln!("SKIP estimate_budget: no tiny GGUF (set HIGGS_TEST_GGUF)");
         return;
     };
-    let srv = spawn_with_tiny_model(11514, &gguf).await;
-    let c = reqwest::Client::new();
 
     // Baseline: no budget → RAM comfortably fits the machine.
-    let base: serde_json::Value = c
-        .post(format!("{}/api/higgs/models/estimate", srv.base))
-        .json(
-            &serde_json::json!({ "id": TINY_MODEL_ID, "ctx_len": { "kind": "fixed", "n": 2048 } }),
-        )
-        .send()
+    let base = higgs
+        .estimate(estimate_req(TINY_MODEL_ID, 2048, None))
         .await
-        .expect("estimate request")
-        .json()
-        .await
-        .unwrap();
+        .expect("estimate request");
     assert_eq!(
-        base["ram"]["verdict"], "Fits",
-        "no budget → RAM fits machine: {base}"
+        base.ram.verdict,
+        FitVerdict::Fits,
+        "no budget → RAM fits: {base:?}"
     );
 
-    // A 1 MiB RAM budget can't hold the model+overhead → Overflow. Proves the verdict
-    // is measured against the budget, not the detected machine.
-    let capped: serde_json::Value = c
-        .post(format!("{}/api/higgs/models/estimate", srv.base))
-        .json(&serde_json::json!({
-            "id": TINY_MODEL_ID,
-            "ctx_len": { "kind": "fixed", "n": 2048 },
-            "budget": { "max_ram_bytes": 1u64 << 20 }
-        }))
-        .send()
+    // A 1 MiB RAM budget can't hold the model+overhead → Overflow.
+    let capped = higgs
+        .estimate(estimate_req(
+            TINY_MODEL_ID,
+            2048,
+            Some(ResourceBudget {
+                max_ram_bytes: Some(1u64 << 20),
+                ..Default::default()
+            }),
+        ))
         .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+        .expect("estimate request");
     assert_eq!(
-        capped["ram"]["verdict"], "Overflow",
-        "a 1 MiB RAM budget overflows → the estimate honors the budget: {capped}"
+        capped.ram.verdict,
+        FitVerdict::Overflow,
+        "a 1 MiB RAM budget overflows → the estimate honors the budget: {capped:?}"
     );
+
+    higgs.shutdown().await;
 }
 
-/// `POST …/estimate` honors `offload_kqv`: disabling KV offload moves the KV cache
-/// off the GPU, so the VRAM footprint drops (and the param is threaded, not dropped).
-/// GPU-gated — on a CPU-only host nothing lives in VRAM either way. (`cpu_moe` is
-/// MoE-only; the tiny test model is dense, so its estimator math is unit-tested.)
+/// `estimate` honors `offload_kqv`: disabling KV offload moves the KV cache off the
+/// GPU, so the VRAM footprint drops (the param is threaded, not dropped). GPU-gated.
 #[tokio::test]
 async fn estimate_honors_offload_kqv() {
-    let Some(gguf) = tiny_gguf_path() else {
+    let Some(higgs) = higgs_local(&[TINY_MODEL_ID]).await else {
         eprintln!("SKIP estimate_offload_kqv: no tiny GGUF (set HIGGS_TEST_GGUF)");
         return;
     };
-    let srv = spawn_with_tiny_model(11515, &gguf).await;
-    let c = reqwest::Client::new();
-    let body = |kqv: bool| {
-        serde_json::json!({
-            "id": TINY_MODEL_ID,
-            "ctx_len": { "kind": "fixed", "n": 16384 },
-            "offload_kqv": kqv
-        })
-    };
-    let on: serde_json::Value = c
-        .post(format!("{}/api/higgs/models/estimate", srv.base))
-        .json(&body(true))
-        .send()
-        .await
-        .expect("estimate request")
-        .json()
-        .await
-        .unwrap();
-    let off: serde_json::Value = c
-        .post(format!("{}/api/higgs/models/estimate", srv.base))
-        .json(&body(false))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
 
-    let sys: serde_json::Value = c
-        .get(format!("{}/api/higgs/system", srv.base))
-        .send()
+    let req = |kqv: bool| EstimateRequest {
+        id: TINY_MODEL_ID.to_owned(),
+        ctx_len: CtxLen::Fixed { n: 16384 },
+        gpu_layers: None,
+        type_k: None,
+        type_v: None,
+        offload_kqv: Some(kqv),
+        cpu_moe: None,
+        budget: None,
+    };
+    let on = higgs.estimate(req(true)).await.expect("estimate request");
+    let off = higgs.estimate(req(false)).await.expect("estimate request");
+
+    let has_gpu = higgs
+        .hardware()
         .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let has_gpu = sys["hardware"]["gpus"]
-        .as_array()
-        .is_some_and(|a| a.iter().any(|g| g["kind"] == "Gpu"));
+        .gpus
+        .iter()
+        .any(|g| matches!(g.kind, DeviceKind::Gpu));
     if has_gpu {
         // KV leaves the GPU when offload_kqv=false → strictly less VRAM than on.
         assert!(
-            off["vram"]["needed_bytes"].as_u64().unwrap()
-                < on["vram"]["needed_bytes"].as_u64().unwrap(),
+            off.vram.needed_bytes < on.vram.needed_bytes,
             "offload_kqv=false drops KV off the GPU (off {} vs on {})",
-            off["vram"]["needed_bytes"],
-            on["vram"]["needed_bytes"]
+            off.vram.needed_bytes,
+            on.vram.needed_bytes
         );
     }
-    // RAM is always charged (weights + overhead) regardless of GPU presence — so this
-    // confirms the request was accepted + estimated on ANY host (a CPU-only host
-    // reports vram == 0, so asserting vram > 0 would falsely fail there).
+    // RAM is always charged regardless of GPU presence — confirms the request was
+    // accepted + estimated (and offload_kqv threaded) on ANY host.
     assert!(
-        on["ram"]["needed_bytes"].as_u64().unwrap() > 0,
-        "estimate accepted + threaded offload_kqv: {on}"
+        on.ram.needed_bytes > 0,
+        "estimate accepted + threaded offload_kqv: {on:?}"
     );
+
+    higgs.shutdown().await;
 }
 
-/// A Prepared, fitting model surfaces its readiness `servable` AND the `fit`
-/// detail (the needed-vs-free numbers behind the badge) on `GET /api/higgs/models`.
-/// Fails-on-revert: drop the `fit` field on `HiggsModelEntry` and the entry has
-/// no `fit` object, so the `is_object()` assertion fails.
+/// A Prepared, fitting model surfaces `Servable` readiness AND the `fit` detail (the
+/// needed-vs-free numbers behind the badge) on `model_entries`. Fails-on-revert:
+/// drop the `fit` field on `HiggsModelEntry` and the entry has no fit.
 #[tokio::test]
 async fn servable_model_entry_carries_fit_numbers() {
-    let Some(gguf) = tiny_gguf_path() else {
+    let Some(higgs) = higgs_local(&[TINY_MODEL_ID]).await else {
         eprintln!("SKIP servable_model_entry_carries_fit_numbers: tiny gguf not found");
         return;
     };
-    let srv = spawn_with_tiny_model(11517, &gguf).await;
+
     // Prepare → the tiny model gets a profile; serving is on by default and it
-    // easily fits, so it reads back `servable` with the fit numbers attached.
-    common::prepare_tiny(&srv.base).await;
-    let c = reqwest::Client::new();
-    let models: serde_json::Value = c
-        .get(format!("{}/api/higgs/models", srv.base))
-        .send()
+    // easily fits, so it reads back `Servable` with the fit numbers attached.
+    higgs
+        .tune(tune_req(TINY_MODEL_ID))
         .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let entry = models["models"]
-        .as_array()
-        .unwrap()
+        .expect("prepare (tune)");
+    let models = higgs.model_entries().await.expect("model_entries");
+    let entry = models
         .iter()
-        .find(|m| m["id"] == serde_json::json!(TINY_MODEL_ID))
+        .find(|m| m.model.id == TINY_MODEL_ID)
         .expect("tiny model listed");
     assert_eq!(
-        entry["readiness"],
-        serde_json::json!("servable"),
-        "prepared tiny model is servable: {entry}"
+        entry.readiness,
+        ModelReadiness::Servable,
+        "prepared tiny model is servable: {entry:?}"
     );
-    let fit = &entry["fit"];
+    let fit = entry
+        .fit
+        .as_ref()
+        .expect("servable entry carries the fit detail");
     assert!(
-        fit.is_object(),
-        "servable entry carries the fit detail: {entry}"
+        fit.needed_ram_bytes > 0,
+        "fit reports the RAM the profile needs: {fit:?}"
     );
-    assert!(
-        fit["needed_ram_bytes"].as_u64().unwrap_or(0) > 0,
-        "fit reports the RAM the profile needs: {fit}"
-    );
-    assert!(
-        fit.get("free_ram_bytes").is_some(),
-        "fit reports current free RAM: {fit}"
-    );
+    // free_ram_bytes is a `u64` on the struct — present by construction.
+    let _ = fit.free_ram_bytes;
+
+    higgs.shutdown().await;
 }
 
-/// `GET /api/higgs/models` surfaces a store-read failure as HG040 instead of
-/// badging a prepared model `discovered` (the misleading state in exactly the
-/// persistence-failure scenario). Fails-on-revert: collapse `tuning_records()` to
-/// an empty map on error and the list 200s with `readiness:"discovered"`.
+/// `model_entries` surfaces a store-read failure as HG040 instead of badging a
+/// prepared model `Discovered` (the misleading state in exactly the persistence-
+/// failure scenario). Fails-on-revert: collapse `tuning_profiles()` to empty-on-error
+/// and the list returns Ok with `readiness: Discovered`.
 #[tokio::test]
 async fn models_list_with_unreadable_store_is_hg040() {
     use std::os::unix::fs::PermissionsExt;
-    let Some(gguf) = tiny_gguf_path() else {
+    let Some(higgs) = higgs_local(&[TINY_MODEL_ID]).await else {
         eprintln!("SKIP models_list_with_unreadable_store_is_hg040: tiny gguf not found");
         return;
     };
-    let srv = spawn_with_tiny_model(11518, &gguf).await;
-    common::prepare_tiny(&srv.base).await;
-    let mj = srv.home().join("models.json");
+
+    higgs
+        .tune(tune_req(TINY_MODEL_ID))
+        .await
+        .expect("prepare (tune)");
+    let mj = higgs.home().join("models.json");
     std::fs::set_permissions(&mj, std::fs::Permissions::from_mode(0o000))
         .expect("chmod models.json unreadable");
-    let c = reqwest::Client::new();
-    let resp = c
-        .get(format!("{}/api/higgs/models", srv.base))
-        .send()
-        .await
-        .unwrap();
+
+    let result = higgs.model_entries().await;
+    // Restore perms so the temp dir cleans up regardless of the assertion outcome.
+    let _ = std::fs::set_permissions(&mj, std::fs::Permissions::from_mode(0o644));
+
+    let err = result.expect_err("model_entries fails when the store is unreadable");
     assert!(
-        !resp.status().is_success(),
-        "models list fails when the store is unreadable, got {}",
-        resp.status()
-    );
-    let body = resp.text().await.unwrap();
-    assert!(
-        body.contains("[HG040]"),
-        "surfaces the persistence error: {body}"
+        matches!(err, HiggsError::PersistenceFailed { .. }),
+        "surfaces a persistence error, got {err:?}"
     );
     assert!(
-        !body.contains("\"discovered\""),
-        "prepared model NOT mislabeled discovered: {body}"
+        err.to_string().contains("[HG040]"),
+        "the persistence error is HG040-coded: {err}"
     );
+
+    higgs.shutdown().await;
+}
+
+// ── helpers ─────────────────────────────────────────────────────────────────
+
+/// An `EstimateRequest` for `id` at a fixed context, with an optional budget.
+fn estimate_req(id: &str, ctx_n: u32, budget: Option<ResourceBudget>) -> EstimateRequest {
+    EstimateRequest {
+        id: id.to_owned(),
+        ctx_len: CtxLen::Fixed { n: ctx_n },
+        gpu_layers: None,
+        type_k: None,
+        type_v: None,
+        offload_kqv: None,
+        cpu_moe: None,
+        budget,
+    }
+}
+
+/// A Suggest-mode `TuneRequest` (prepare) for `id`.
+fn tune_req(id: &str) -> TuneRequest {
+    TuneRequest {
+        id: id.to_owned(),
+        mode: None,
+        budget: None,
+        pins: None,
+    }
+}
+
+/// PIDs of the `--higgs-worker` children of `parent_pid` (the spawned worker
+/// processes). In-process, the parent is THIS test process.
+fn worker_child_pids(parent_pid: u32) -> Vec<u32> {
+    let out = std::process::Command::new("pgrep")
+        .args(["-P", &parent_pid.to_string()])
+        .output()
+        .expect("run pgrep");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.trim().parse::<u32>().ok())
+        .collect()
 }

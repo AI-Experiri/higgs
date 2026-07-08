@@ -2,7 +2,8 @@
 import type { HiggsModelEntry } from "./HiggsModelEntry";
 
 /**
- * Response for `GET /api/higgs/models`: live scan results plus the loaded id.
+ * The `models` control-op response (`Higgs::model_entries`, formerly
+ * `GET /api/higgs/models`): live scan results plus the loaded id.
  */
 export type HiggsModelsResponse = { 
 /**

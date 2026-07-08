@@ -19,7 +19,7 @@ use axum::Router;
 use ggus::{GGufFileHeader, GGufFileWriter, GGufMetaDataValueType};
 use http_body_util::BodyExt;
 
-use super::router;
+use super::v1_router;
 use crate::api::{Higgs, HiggsConfig};
 use crate::log_bus::LogBus;
 use crate::node::runtime::{NodeConfig, NodeRuntime, DEFAULT_IDLE_TTL};
@@ -51,6 +51,7 @@ fn node_higgs(dirs: Vec<PathBuf>) -> (Arc<Higgs>, Arc<LogBus>) {
         hf_dirs: vec![],
         ollama_dirs: vec![],
         default_load: HiggsConfig::default().default_load,
+        worker_exe: None,
     };
     (Arc::new(Higgs::with_local(Arc::new(node), cfg)), bus)
 }
@@ -66,25 +67,19 @@ pub(crate) fn make_higgs_with_lmstudio(dir: PathBuf) -> Arc<Higgs> {
     node_higgs(vec![dir]).0
 }
 
-/// A `Higgs` facade plus its node's Developer-Log bus — for the logs tests, which
-/// seed history before hitting the endpoint.
-pub(crate) fn make_higgs_with_bus() -> (Arc<Higgs>, Arc<LogBus>) {
-    node_higgs(vec![])
-}
-
 /// Wrap a `Higgs` (typically after a `load`) in the serve router.
 pub(crate) fn app_for(higgs: Arc<Higgs>) -> Router {
-    router(higgs)
+    v1_router(higgs)
 }
 
 /// The serve router over a fresh idle facade (nothing loaded, JIT on, serving on).
 pub(crate) fn make_app() -> Router {
-    router(make_higgs())
+    v1_router(make_higgs())
 }
 
 /// The serve router over a facade whose `scan()` reads `dir` (LM Studio fixture).
 pub(crate) fn make_app_with_lmstudio(dir: PathBuf) -> Router {
-    router(make_higgs_with_lmstudio(dir))
+    v1_router(make_higgs_with_lmstudio(dir))
 }
 
 /// Like [`make_app_with_lmstudio`] but Prepares (autotunes) `id` first, so the
@@ -135,7 +130,7 @@ async fn seed_prepared_profile(higgs: &Higgs, id: &str) {
 pub(crate) fn make_app_jit_off() -> Router {
     let higgs = make_higgs();
     higgs.set_jit_enabled(false);
-    router(higgs)
+    v1_router(higgs)
 }
 
 /// The serve router with serving turned OFF — for the test that asserts the
@@ -143,7 +138,7 @@ pub(crate) fn make_app_jit_off() -> Router {
 pub(crate) fn make_app_serving_off() -> Router {
     let higgs = make_higgs();
     higgs.set_serving_enabled(false);
-    router(higgs)
+    v1_router(higgs)
 }
 
 /// Write a minimal valid GGUF file (arch=llama, ctx=4096, chat template) at
@@ -199,17 +194,6 @@ pub(crate) fn get(uri: &str) -> Request<Body> {
         .unwrap()
 }
 
-/// A `POST` request to `uri` with a JSON body. Carries a loopback `Host` so
-/// it passes the serve-layer DNS-rebinding guard (`host_guard`).
-pub(crate) fn delete(uri: &str) -> Request<Body> {
-    Request::builder()
-        .method("DELETE")
-        .uri(uri)
-        .header("host", "127.0.0.1")
-        .body(Body::empty())
-        .expect("build DELETE request")
-}
-
 pub(crate) fn post_json(uri: &str, body: &serde_json::Value) -> Request<Body> {
     Request::builder()
         .method("POST")
@@ -220,19 +204,6 @@ pub(crate) fn post_json(uri: &str, body: &serde_json::Value) -> Request<Body> {
         .unwrap()
 }
 
-/// A `PUT` request to `uri` with a JSON body. Carries a loopback `Host` so it
-/// passes the serve-layer DNS-rebinding guard (`host_guard`).
-pub(crate) fn put_json(uri: &str, body: &serde_json::Value) -> Request<Body> {
-    Request::builder()
-        .method("PUT")
-        .uri(uri)
-        .header("host", "127.0.0.1")
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap()
-}
-
-/// Collect a response body into bytes.
 /// Attach a bearer token to a built request (G4 keys tests).
 pub(crate) fn with_bearer(mut req: Request<Body>, token: &str) -> Request<Body> {
     req.headers_mut().insert(
@@ -242,11 +213,7 @@ pub(crate) fn with_bearer(mut req: Request<Body>, token: &str) -> Request<Body> 
     req
 }
 
-/// Read a response body and parse it as JSON (G4 keys tests).
-pub(crate) async fn body_json(resp: Response) -> serde_json::Value {
-    serde_json::from_slice(&body_bytes(resp).await).expect("json body")
-}
-
+/// Collect a response body into bytes.
 pub(crate) async fn body_bytes(resp: Response) -> Vec<u8> {
     resp.into_body()
         .collect()

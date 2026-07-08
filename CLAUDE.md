@@ -15,6 +15,22 @@ Every non-trivial change is reviewed with `codex` in a loop until it **converges
    it). Never apply a change you can't independently justify.
 3. Re-run. Repeat.
 
+**Reviews MUST be neutral — never bias the reviewer.** The codex prompt gives it
+**facts only**: what the code does and the design/security model it operates in.
+It **NEVER** pre-loads the reviewer to agree with you. Do **not** write "do not
+re-flag X", "already fixed", "ASSESSED — NOT A BUG", "known false positive", or
+any phrasing that tells codex what conclusion to reach or shields a judgment call
+of yours from scrutiny. If anything, **explicitly invite codex to CHALLENGE the
+exact decisions you are least sure of** (e.g. "argue whether this bootstrap
+default is a lockout bug or correct", "is this Host allowlist a meaningful control
+or security theater?"). A review told what not to find is not a review — it
+launders your own opinion back to you. The ONLY steering allowed is scoping (which
+files/change to look at) and the mechanical `Do NOT flag:` list of **proven**
+tooling false positives below (AsyncWriteExt, Windows, `route.1.0`) — those are
+facts about the language/platform, not verdicts about this change. You do the
+validation and dismissal in step 2, from the code, on your own authority — the
+reviewer's job is to find, not to ratify.
+
 **Converged =** results are **stable across 3 consecutive rounds** — i.e. either
 three clean rounds, or three rounds that surface only the same already-assessed
 items (known false positives / explicitly-deferred wont-fixes). A round that

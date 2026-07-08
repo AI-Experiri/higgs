@@ -103,6 +103,17 @@ higgs_ts! {
     /// so older scan payloads without the field deserialize as empty.
     #[serde(default)]
     pub gguf_components: Vec<GgufComponent>,
+    /// A coded diagnostic set when GGUF-header enrichment FAILED — the file was
+    /// unreadable/un-mmappable, its header was malformed, or the `ggus` parse
+    /// panicked (a truncated file mid-download, an unsupported quant, or a header
+    /// missing `general.architecture`). Carries the rendered `[HG070]` message so
+    /// the UI can explain why this model's header fields are blank instead of
+    /// treating it as a genuinely sparse model. `None` when enrichment succeeded;
+    /// `serde(default)` so older scan payloads without the field deserialize as
+    /// `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub enrich_error: Option<String>,
     /// The embedded chat-template string, captured transiently for the host-side
     /// Gate-2 tool-call-parser sniff. NOT on the wire (`serde(skip)`): it never
     /// leaves the host, and stamping it into every model payload would bloat the
@@ -142,6 +153,7 @@ impl HiggsModel {
             supports_tools: false,
             supports_reasoning: false,
             gguf_components: Vec::new(),
+            enrich_error: None,
             chat_template: None,
         }
     }
@@ -202,18 +214,35 @@ impl ModelStore {
 // GGUF header enrichment
 // ---------------------------------------------------------------------------
 
+/// Render the `[HG070]` enrichment diagnostic stamped onto a model whose GGUF
+/// header could not be fully read (see [`HiggsError::GgufEnrichFailed`]).
+fn enrich_err(path: &str, reason: impl Into<String>) -> String {
+    HiggsError::GgufEnrichFailed {
+        path: path.to_string(),
+        reason: reason.into(),
+    }
+    .to_string()
+}
+
 /// Read GGUF header metadata from `path` and fill in the enrichment fields of
 /// `model`. A corrupt or unreadable header leaves the fields at `None`/`false`
-/// — the model stays cataloged. No new error codes are raised here.
+/// — the model stays cataloged, with a coded `[HG070]` diagnostic on
+/// `model.enrich_error` explaining the failure (see [`enrich_err`]).
 fn enrich_gguf_metadata(model: &mut HiggsModel) {
     let file = match std::fs::File::open(&model.path) {
         Ok(f) => f,
-        Err(_) => return,
+        Err(e) => {
+            model.enrich_error = Some(enrich_err(&model.path, format!("unreadable: {e}")));
+            return;
+        }
     };
     // SAFETY: standard read-only mmap; we do not mutate the mapping.
     let mmap = match unsafe { MmapOptions::new().map(&file) } {
         Ok(m) => m,
-        Err(_) => return,
+        Err(e) => {
+            model.enrich_error = Some(enrich_err(&model.path, format!("mmap failed: {e}")));
+            return;
+        }
     };
     // ggus 0.5.1 PANICS (not errors) on inputs it dislikes: `GGuf::new` slices
     // out of range on a TRUNCATED file (a model mid-download in a watched
@@ -229,6 +258,10 @@ fn enrich_gguf_metadata(model: &mut HiggsModel) {
         enrich_from_gguf(model, &mmap);
     }));
     if outcome.is_err() {
+        model.enrich_error = Some(enrich_err(
+            &model.path,
+            "header parse panicked (truncated file, unsupported quant, or missing keys)",
+        ));
         tracing::warn!(
             path = %model.path,
             "GGUF header parse panicked (truncated file, unsupported quant, or missing keys); model cataloged with partial enrichment"
@@ -240,6 +273,7 @@ fn enrich_gguf_metadata(model: &mut HiggsModel) {
 /// inside the caller's `catch_unwind`.
 fn enrich_from_gguf(model: &mut HiggsModel, mmap: &memmap2::Mmap) {
     let Ok(gguf) = GGuf::new(mmap) else {
+        model.enrich_error = Some(enrich_err(&model.path, "malformed GGUF header"));
         return;
     };
     let arch = gguf.general_architecture().ok().map(ToString::to_string);

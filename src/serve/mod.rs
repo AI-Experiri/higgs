@@ -1,23 +1,18 @@
-//! HTTP surfaces for higgs, split by concern:
+//! The higgs HTTP surface. higgs is library-first, so the ONLY thing served over
+//! a socket is the strict OpenAI `/v1` (chat + models):
 //!
-//! - [`v1`]      — strict OpenAI `/v1` (chat + models), `async-openai` types verbatim
-//! - [`control`] — higgs's own `/api/higgs/*` surface (load/unload/status/…)
-//! - [`wire`]    — the control request/response structs (ts-rs exported)
-//! - [`stream`]  — SSE assembly for streaming chat
+//! - [`v1`] — strict OpenAI `/v1` (chat + models), `async-openai` types verbatim.
+//! - [`wire`] — higgs's own ts-rs-exported control request/response structs (still
+//!   the crate-API return shapes the facade builds).
+//! - [`stream`] — SSE assembly for streaming chat.
+//! - [`control`] — the SHARED control helpers the [`Higgs`] facade delegates to
+//!   (row formatting, mint/revoke decisions, hub-status snapshot). There is no
+//!   longer a `/api/higgs/*` HTTP surface — control runs in-process via the crate API.
 //!
-//! This module owns only the cross-cutting pieces: the [`router`], graceful
-//! [`serve_with_shutdown`], CORS, and the shared [`http_status`] mapping.
-//!
-//! ## Adding a control endpoint
-//!
-//! 1. Add the response struct to `wire.rs` wrapped in `higgs_ts! { … }` (the
-//!    macro injects the `ts_rs::TS` derive + export into
-//!    `frontend/src/lib/generated/higgs/`) and re-export it from
-//!    `frontend/src/lib/types.ts` via `./generated/higgs/<Name>`.
-//! 2. Add `async fn control_<name>` to `control.rs`.
-//! 3. Register it in [`router`] under `/api/higgs/<name>`.
+//! This module owns the cross-cutting pieces: the `/v1` [`v1_router`], graceful
+//! [`serve_v1`], CORS, and the shared [`http_status`] mapping.
 
-mod control;
+pub(crate) mod control;
 // `pub` (not `pub(crate)`) because `ModelReadiness` is a field type on the
 // publicly re-exported `wire::HiggsModelEntry` (`pub use wire::*`), matching the
 // other wire field types' modules (`pub mod engine` / `pub mod models`). Keeps
@@ -110,8 +105,8 @@ pub const PROMPT_BYTES_PER_TOKEN: usize = 4;
 // ts-rs export path), so re-export them at `crate::serve::*`.
 pub use wire::*;
 
-/// Map a `HiggsError` to its HTTP status — the single status table shared by
-/// both surfaces and the SSE path: HG002/HG003 → 404, HG005/HG013/HG015 → 400,
+/// Map a `HiggsError` to its HTTP status — the single status table shared by the
+/// `/v1` surface and the SSE path: HG002/HG003 → 404, HG005/HG013/HG015 → 400,
 /// HG006/HG007/HG014/HG017/HG018/HG019 → 503, HG016 → 504, HG037 → 501,
 /// HG038/HG039 → 502, and the internal/persistence/admin/chat-task faults
 /// (HG040–HG044) → 500 (the default).
@@ -208,140 +203,54 @@ pub(crate) fn http_status(err: &HiggsError) -> StatusCode {
 
 /// Cheap readiness probe: returns `200 OK` as soon as the HTTP server is up,
 /// without any worker RPC. "Server is reachable" — not "a model is loaded".
-/// Mirrors vllm's `/health`. Served at both `/health` and `/api/higgs/health`.
+/// Mirrors vllm's `/health`. Served at `/health`.
 async fn health() -> StatusCode {
     StatusCode::OK
 }
 
-/// Build the higgs router: OpenAI-compatible `/v1` + `/api/higgs/*` control.
+/// Build the `/v1`-ONLY router: the OpenAI-compatible chat + models surface,
+/// with NO `/api/higgs/*` control routes at all. This is the surface an external
+/// app (a non-embedding client) reaches over HTTP; control lives on the
+/// in-process crate API, not on any socket.
 ///
-/// The host serves this on its own listener; all state flows through the shared
-/// [`Higgs`] facade. Hardening (established ollama/vllm practice) layered here:
+/// Routes: `POST /v1/chat/completions` (streaming — no whole-request timeout),
+/// `GET /v1/models`, and the cheap `GET /health` probe. There is deliberately no
+/// `/api/higgs/health` here — this router never carried the `/api/higgs/*`
+/// namespace, so every such path 404s by construction (not by deletion).
 ///
-/// - **DNS-rebinding host guard** ([`host_guard`]) on every request — rejects a
-///   `Host` header that isn't loopback, so a malicious page can't rebind a
-///   hostname to `127.0.0.1` and reach this no-auth server.
-/// - **Body-size limit** ([`MAX_BODY_BYTES`]) → `413` on oversized bodies.
-/// - **Panic recovery** ([`CatchPanicLayer`]) → a handler panic becomes a `500`
-///   instead of dropping the connection.
-/// - **Control timeout** ([`CONTROL_TIMEOUT`]) on `/api/higgs/*` only — the
-///   streaming `/v1/chat/completions` is left un-timed at the HTTP layer so a
-///   long SSE stream is never aborted mid-flight.
-pub fn router(higgs: Arc<Higgs>) -> Router {
-    // Embedded hosts bind loopback, so the DNS-rebinding Host guard is on.
-    router_with_host_policy(higgs, true, CONTROL_TIMEOUT, LONG_OP_TIMEOUT)
+/// The layer stack is `DefaultBodyLimit` → `CatchPanicLayer` → [`auth_guard`] →
+/// [`host_guard`] → [`local_cors`] → `with_state`. Embedded hosts bind loopback,
+/// so the DNS-rebinding Host guard is on.
+pub fn v1_router(higgs: Arc<Higgs>) -> Router {
+    v1_router_with_host_policy(higgs, true)
 }
 
-/// [`router`] with the Host-guard policy made explicit. `enforce_loopback_host`
-/// is true for a loopback bind (the no-auth surface needs the DNS-rebinding
-/// defense) and false for a DELIBERATE non-loopback bind — which [HG058]
-/// guarantees is key-gated, so a rebound page gains nothing (401) and LAN
-/// clients' natural `Host: <lan-ip>:<port>` must not 403 ([HG012]) before auth.
+/// [`v1_router`] with the Host-guard policy made explicit. `enforce_loopback_host`
+/// is `true` for a loopback bind (keep the DNS-rebinding defense) and `false` for
+/// a deliberate non-loopback bind (which [HG058] guarantees is key-gated, so LAN
+/// clients' natural `Host: <lan-ip>:<port>` must not 403 before auth).
 ///
-/// `control_timeout` / `tune_timeout` are injected (not read straight from the
-/// consts) so a test can build the REAL router with tiny timeouts and prove the
-/// tune route is exempt from the tighter control bound. Production callers pass
-/// [`CONTROL_TIMEOUT`] / [`LONG_OP_TIMEOUT`].
-///
-/// `pub(crate)` — NOT `pub` (codex r5): the relaxed (`false`) host policy must be
-/// reachable ONLY through [`serve_with_shutdown`] (which runs the [HG058] keyless-LAN
-/// and [HG069] no-Admin refusals and records `lan_exposed` BEFORE building it) or the
-/// loopback-guarded [`router`]. A `pub` constructor would let an out-of-crate embedder
-/// merge a relaxed-host router into its own Axum app with an empty keystore and no
-/// exposure state — serving unauthenticated on a LAN with the Host guard off.
-/// `pub(crate)` keeps it crate-internal (embedders can't reach it), exposing it only to
-/// the in-crate timeout test.
-pub(crate) fn router_with_host_policy(
-    higgs: Arc<Higgs>,
-    enforce_loopback_host: bool,
-    control_timeout: Duration,
-    long_op_timeout: Duration,
-) -> Router {
-    // Streaming surface: NO whole-request timeout (an SSE stream must outlive
-    // any per-request bound). The chat duration is bounded separately by the
-    // worker chat-RPC timeout; the live log stream is unbounded by design.
-    let streaming = Router::new()
-        .route("/v1/chat/completions", post(v1::v1_chat_completions))
-        .route("/api/higgs/logs/stream", get(control::control_logs_stream))
-        .route("/api/higgs/events", get(control::control_events_stream));
+/// `pub(crate)` — NOT `pub`: the relaxed (`false`) policy must be reachable ONLY
+/// through [`serve_v1`], which runs the [HG058] keyless-LAN and [HG069] no-Admin
+/// refusals and records `lan_exposed` BEFORE building it. A `pub` relaxed
+/// constructor would let an out-of-crate embedder serve unauthenticated on a LAN
+/// with the Host guard off.
+pub(crate) fn v1_router_with_host_policy(higgs: Arc<Higgs>, enforce_loopback_host: bool) -> Router {
+    // Streaming surface: NO whole-request timeout (an SSE stream must outlive any
+    // per-request bound). The chat duration is bounded separately by the worker
+    // chat-RPC timeout.
+    let streaming = Router::new().route("/v1/chat/completions", post(v1::v1_chat_completions));
 
-    // Control + non-streaming surface: a generous whole-request timeout is safe
-    // and prevents a wedged request pinning a connection.
-    let control = Router::new()
-        .route("/v1/models", get(v1::v1_models))
-        .route("/api/higgs/models", get(control::control_models))
-        .route(
-            "/api/higgs/models/estimate",
-            post(control::control_estimate),
-        )
-        .route("/api/higgs/models/unload", post(control::control_unload))
-        .route("/api/higgs/models/{*id}", get(control::control_model_by_id))
-        .route("/api/higgs/status", get(control::control_status))
-        .route("/api/higgs/system", get(control::control_system))
-        .route("/api/higgs/nodes", get(control::control_nodes))
-        .route("/api/higgs/nodes/load", post(control::control_nodes_load))
-        .route(
-            "/api/higgs/nodes/unload",
-            post(control::control_nodes_unload),
-        )
-        .route(
-            "/api/higgs/nodes/retire",
-            post(control::control_nodes_retire),
-        )
-        .route("/api/higgs/nodes/label", post(control::control_nodes_label))
-        .route(
-            "/api/higgs/nodes/{node}/models",
-            get(control::control_node_models),
-        )
-        .route("/api/higgs/pair", post(control::control_pair))
-        .route("/api/higgs/hub", get(control::control_hub))
-        .route("/api/higgs/hub/enable", post(control::control_hub_enable))
-        .route("/api/higgs/hub/disable", post(control::control_hub_disable))
-        .route("/api/higgs/logs", get(control::control_logs))
-        .route(
-            "/api/higgs/logs/settings",
-            get(control::control_logs_settings).put(control::control_set_logs_settings),
-        )
-        .route(
-            "/api/higgs/settings",
-            get(control::control_settings).put(control::control_set_settings),
-        )
-        .route(
-            "/api/higgs/keys",
-            get(control::control_keys_list).post(control::control_keys_mint),
-        )
-        .route(
-            "/api/higgs/keys/{label}",
-            axum::routing::delete(control::control_keys_revoke),
-        )
-        .route("/api/higgs/worker/stop", post(control::control_worker_stop))
-        .route("/api/higgs/version", get(control::control_version))
-        .layer(TimeoutLayer::with_status_code(
-            StatusCode::REQUEST_TIMEOUT,
-            control_timeout,
-        ));
-
-    // Long model-op surface: `/api/higgs/models/load` and `/api/higgs/models/tune`
-    // get their OWN, much longer timeout ([`LONG_OP_TIMEOUT`]). A load walks the G5
-    // OOM degrade-retry ladder (several worker loads + settle sleeps) and a Turbotune
-    // benchmark loads + measures several candidate configs — both routinely outlive
-    // the tighter control bound, so under `control_timeout` a big model would be
-    // cancelled (408) before the ladder finishes / a profile is saved. Split into a
-    // separate group so only these two routes are exempted; the rest of the control
-    // surface keeps the tight cap.
-    let long_ops = Router::new()
-        .route("/api/higgs/models/load", post(control::control_load))
-        .route("/api/higgs/models/tune", post(control::control_tune))
-        .layer(TimeoutLayer::with_status_code(
-            StatusCode::REQUEST_TIMEOUT,
-            long_op_timeout,
-        ));
+    // `/v1/models` is a cheap non-streaming call; a generous whole-request
+    // timeout ([`CONTROL_TIMEOUT`]) keeps a wedged request from pinning a
+    // connection.
+    let models = Router::new().route("/v1/models", get(v1::v1_models)).layer(
+        TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, CONTROL_TIMEOUT),
+    );
 
     streaming
-        .merge(control)
-        .merge(long_ops)
+        .merge(models)
         .route("/health", get(health))
-        .route("/api/higgs/health", get(health))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(CatchPanicLayer::new())
         // Auth runs AFTER the host guard (outer layers run first): reject a non-loopback
@@ -386,13 +295,20 @@ async fn auth_guard(
     req: Request,
     next: Next,
 ) -> Response {
-    let keys = higgs.api_keys();
-    if keys.is_empty() {
-        return next.run(req).await; // auth disabled
-    }
-    let Some(required) = required_scope(req.method(), req.uri().path()) else {
+    let Some(required) = required_scope(req.uri().path()) else {
         return next.run(req).await; // health / unmatched → open (routing handles it)
     };
+    let keys = higgs.api_keys();
+    if keys.is_empty() {
+        // No keys configured ⇒ auth OFF (keyless-loopback-open). This is the
+        // local-dev default: an empty keystore means the surface is open, which is
+        // safe only because a keyless bind is loopback-only (the non-loopback [HG058]
+        // refusal in `serve_v1` guarantees it). An embedder that wants auth mints
+        // real keys (`Higgs::mint_key` / `register_internal_token`); once ANY key
+        // exists the store is non-empty and every request — embedder and external
+        // app alike — goes through the bearer check below on equal footing.
+        return next.run(req).await;
+    }
     match bearer_token(req.headers()).and_then(|tok| keys.authorizing_sha(&tok, required)) {
         Some(sha) => {
             // Record last-used on the matched key (throttled, best-effort).
@@ -403,20 +319,22 @@ async fn auth_guard(
     }
 }
 
-/// The scope a request needs, or `None` for an always-open path (health). Reads: chat →
-/// `Chat`, model listing → `Models`, everything else under `/v1` or `/api/higgs` → `Admin`.
-fn required_scope(method: &Method, path: &str) -> Option<crate::keys::Scope> {
+/// The scope a request needs, or `None` for an always-open path (health). Reads:
+/// chat → `Chat`, model listing → `Models`, everything else under `/v1` → `Admin`.
+/// Only the `/v1` surface is served now, so there are no `/api/higgs/*` arms (and
+/// the method no longer disambiguates a scope, so it is not read).
+fn required_scope(path: &str) -> Option<crate::keys::Scope> {
     use crate::keys::Scope;
-    if path == "/health" || path == "/api/higgs/health" {
+    if path == "/health" {
         return None;
     }
     if path == "/v1/chat/completions" {
         return Some(Scope::Chat);
     }
-    if path == "/v1/models" || (method == Method::GET && path.starts_with("/api/higgs/models")) {
+    if path == "/v1/models" {
         return Some(Scope::Models);
     }
-    if path.starts_with("/v1/") || path.starts_with("/api/higgs/") {
+    if path.starts_with("/v1/") {
         return Some(Scope::Admin);
     }
     None
@@ -473,9 +391,9 @@ fn host_allowed(headers: &HeaderMap) -> Result<(), String> {
 /// Whether a `Host`-header value (`host` or `host:port`) names a loopback host:
 /// `localhost`, any IPv4 in `127.0.0.0/8`, or IPv6 `::1` / `[::1]`. The host
 /// portion is the part before the final `:port`, with IPv6 brackets handled
-/// (`[::1]:11434`). The `127.0.0.0/8` acceptance matches `is_loopback_bind` in
-/// the `higgs` binary, so any loopback bind the binary permits without a
-/// warning is also reachable through the Host guard.
+/// (`[::1]:11434`). The `127.0.0.0/8` acceptance matches the loopback-bind rule
+/// [`serve_v1`] enforces on the REAL bound address, so any loopback listener the
+/// server permits is also reachable through the Host guard.
 fn is_loopback_host(host_port: &str) -> bool {
     // Bracketed IPv6: `[::1]` or `[::1]:port`.
     let host = if let Some(rest) = host_port.strip_prefix('[') {
@@ -501,12 +419,20 @@ fn is_loopback_host(host_port: &str) -> bool {
     false
 }
 
-/// Serve the higgs router on `listener`, shutting down **gracefully** when
-/// `shutdown` resolves: in-flight requests drain, then the worker is stopped
-/// via [`Higgs::stop`]. The single graceful-shutdown entry point for any host —
-/// the `higgs` binary wires it to SIGTERM/Ctrl-C; tests pass their own
-/// future. Returns the serve I/O error, if any.
-pub async fn serve_with_shutdown(
+/// Serve the `/v1`-ONLY router ([`v1_router`]) on `listener`, shutting down
+/// **gracefully** when `shutdown` resolves: in-flight requests drain, then the
+/// worker is stopped via [`Higgs::stop`]. The single graceful-serve entry point —
+/// the only HTTP surface higgs exposes. Control no longer lives on any socket; an
+/// external app reaches chat + models here, and an embedder drives control through
+/// the in-process crate API.
+///
+/// The [HG058] keyless-LAN and [HG069] no-Admin refusals below are the surface's
+/// last line of defense: a non-loopback listener with an empty keystore, or one
+/// whose keys are all non-Admin, is refused before it can serve — because on such
+/// a bind auth would be off AND the Host guard relaxed, exposing the whole surface
+/// to the network. This runs on the REAL bound address, so a library/embedded
+/// caller handing us its own listener can't bypass it.
+pub async fn serve_v1(
     higgs: Arc<Higgs>,
     listener: tokio::net::TcpListener,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
@@ -520,8 +446,7 @@ pub async fn serve_with_shutdown(
         .unwrap_or(true); // unknowable ⇒ fail CLOSED (strictest policy)
                           // [HG058] AT THE ENFORCEMENT POINT: a non-loopback listener with zero keys
                           // must never serve — auth would be off AND the Host guard below would be
-                          // relaxed, exposing the whole surface. `run_standalone` refuses earlier
-                          // (before even binding — nicer failure), but THIS is the last line for
+                          // relaxed, exposing the whole surface. THIS is the last line for
                           // library/embedded callers who hand us their own listener.
     if !enforce_loopback_host && higgs.api_keys().is_empty() {
         let bind = listener
@@ -538,10 +463,10 @@ pub async fn serve_with_shutdown(
         ));
     }
     // [HG069] AT THE ENFORCEMENT POINT: a non-loopback listener whose keys are ALL
-    // non-Admin locks out the Admin-only key-management API (mint/revoke) — mirror
-    // `run_standalone`'s guard so a library/embedded caller handing us its own
-    // listener can't bypass it. Zero-keys is already refused above, so at least one
-    // key exists here; refuse if none is Admin-capable.
+    // non-Admin locks out the Admin-only key-management API (mint/revoke), so a
+    // library/embedded caller handing us its own listener is refused here. Zero-keys
+    // is already refused above, so at least one key exists here; refuse if none is
+    // Admin-capable.
     if !enforce_loopback_host
         && !higgs
             .api_keys()
@@ -562,12 +487,7 @@ pub async fn serve_with_shutdown(
     // LAST key while LAN-exposed ([HG059]) — revoke-to-empty would reopen the
     // whole surface at runtime, bypassing the [HG058] startup guarantee.
     higgs.set_lan_exposed(!enforce_loopback_host);
-    let app = router_with_host_policy(
-        Arc::clone(&higgs),
-        enforce_loopback_host,
-        CONTROL_TIMEOUT,
-        LONG_OP_TIMEOUT,
-    );
+    let app = v1_router_with_host_policy(Arc::clone(&higgs), enforce_loopback_host);
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
         .await?;

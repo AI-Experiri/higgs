@@ -7,8 +7,9 @@ import type { ModelReadiness } from "./ModelReadiness";
 import type { TuneProvenance } from "./TuneProvenance";
 
 /**
- * Per-model entry in `GET /api/higgs/models`: enriches [`HiggsModel`] with
- * request-derived fields computed by the control handler.
+ * Per-model entry in the `models` control-op response (`Higgs::model_entries`,
+ * formerly `GET /api/higgs/models`): enriches [`HiggsModel`] with
+ * request-derived fields computed by the control helper.
  */
 export type HiggsModelEntry = { 
 /**
@@ -174,4 +175,15 @@ supports_reasoning: boolean,
  * specific component. Empty when the header could not be read. `serde(default)`
  * so older scan payloads without the field deserialize as empty.
  */
-gguf_components: Array<GgufComponent>, };
+gguf_components: Array<GgufComponent>, 
+/**
+ * A coded diagnostic set when GGUF-header enrichment FAILED — the file was
+ * unreadable/un-mmappable, its header was malformed, or the `ggus` parse
+ * panicked (a truncated file mid-download, an unsupported quant, or a header
+ * missing `general.architecture`). Carries the rendered `[HG070]` message so
+ * the UI can explain why this model's header fields are blank instead of
+ * treating it as a genuinely sparse model. `None` when enrichment succeeded;
+ * `serde(default)` so older scan payloads without the field deserialize as
+ * `None`.
+ */
+enrich_error?: string, };

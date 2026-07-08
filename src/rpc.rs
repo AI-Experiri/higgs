@@ -1,4 +1,4 @@
-//! Newline-delimited JSON-RPC 2.0 frames for supervisor↔worker stdio (MCP wire).
+//! Newline-delimited JSON-RPC 2.0 frames for supervisor↔worker stdio.
 //! One JSON object per line; requests carry ids, notifications do not.
 //!
 //! Public for the worker round-trip integration test; internal wire detail, not a stability surface.

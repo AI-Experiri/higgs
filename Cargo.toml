@@ -95,6 +95,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 # API-key auth (P5): SHA-256 hashing of bearer tokens at rest + constant-time
 # compare so a stored key digest never leaks via timing.
 sha2 = "0.10"
+# Constant-time digest comparison for API-token auth (keys.rs).
 subtle = "2"
 # Streaming HTTP client for the model downloader (P4b, M_PULL) and the FALLBACK
 # path of the HF client (`src/hub.rs`): pulls a GGUF / card file from the

@@ -1,7 +1,10 @@
 //! Black-box integration tests for the llama.cpp engine's generation paths
 //! (`src/worker/engine/llamacpp/mod.rs` + `src/worker/mod.rs`), driven through
-//! the real `higgs` HTTP surface with VARIED but VALID OpenAI sampling.
+//! the real `/v1` HTTP surface with VARIED but VALID OpenAI sampling.
 //!
+//! higgs is a library: `/v1` is the ONLY HTTP surface it serves. These tests bind
+//! the real `serve_v1` router on an ephemeral loopback port (`serve_v1_local`) over
+//! an in-process `Higgs` whose worker runs REAL llama.cpp via the `worker_exe` seam.
 //! The tiny model is `ggml-org`'s ~1MB `stories260K.gguf` (see `common`): a real
 //! llama-arch toy GGUF that loads and generates, so each request walks the full
 //! template → tokenize → fit-check → sampler-chain → decode → detokenize → parse
@@ -19,16 +22,31 @@
 //! - `temperature <= 0` ⇒ greedy/deterministic in `run_decode`; `> 0` builds the
 //!   penalties → top_k → … → top_p → min_p → temp → dist chain.
 //! - Context overflow is reachable cheaply: the model loads at the default
-//!   `ctx_len = 4096`, and `max_tokens > 4096` (still <= MAX_OUTPUT_TOKENS) makes
-//!   `prompt_est + max_gen > n_ctx`, so the serve layer rejects with 400 [HG005]
-//!   (`invalid_request_error`, `code` null — only 404 carries `model_not_found`).
+//!   `ctx_len = 4096`, and a prompt that ALONE exceeds the window makes
+//!   `prompt_est > n_ctx`, so the serve layer rejects with 400 [HG005]
+//!   (`invalid_request_error`, `code` = `context_length_exceeded`).
 
 mod common;
 
-use common::{spawn_with_tiny_model, tiny_gguf_path, TINY_MODEL_ID};
+use common::{higgs_local, serve_v1_local, TINY_MODEL_ID};
+use higgs::TuneRequest;
 use serde_json::{json, Value};
 
-/// POST a chat body to the running server and return the parsed JSON response.
+/// Prepare (autotune) the tiny model so a subsequent JIT chat is allowed by the
+/// readiness gate — JIT refuses an un-profiled model. Runs through the in-process
+/// control facade (the `/api/higgs/*` HTTP surface is gone).
+async fn prepare(h: &higgs::Higgs) {
+    h.tune(TuneRequest {
+        id: TINY_MODEL_ID.to_owned(),
+        mode: None,
+        budget: None,
+        pins: None,
+    })
+    .await
+    .expect("prepare (tune) the tiny model");
+}
+
+/// POST a chat body to the running `/v1` server and return the parsed JSON response.
 /// Drops the `reqwest::Response` after reading the body, so no stream is left open.
 async fn chat_json(base: &str, body: Value) -> Value {
     reqwest::Client::new()
@@ -64,14 +82,14 @@ fn assert_well_formed(resp: &Value) {
 /// HTTP layer (no deny_unknown_fields) and must not break the request.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn high_temperature_top_p_top_k() {
-    let Some(gguf) = tiny_gguf_path() else {
+    let Some(higgs) = higgs_local(&[TINY_MODEL_ID]).await else {
         eprintln!("SKIP high_temperature_top_p_top_k: tiny gguf not found (set HIGGS_TEST_GGUF)");
         return;
     };
-    let srv = spawn_with_tiny_model(12600, &gguf).await;
-    common::prepare_tiny(&srv.base).await;
+    prepare(&higgs).await;
+    let (base, guard) = serve_v1_local(higgs.handle()).await;
     let resp = chat_json(
-        &srv.base,
+        &base,
         json!({
             "model": TINY_MODEL_ID, "stream": false, "max_tokens": 12,
             "temperature": 1.4, "top_p": 0.92, "top_k": 40,
@@ -80,20 +98,22 @@ async fn high_temperature_top_p_top_k() {
     )
     .await;
     assert_well_formed(&resp);
+    guard.shutdown().await;
+    higgs.shutdown().await;
 }
 
 /// Low temperature (still > 0, so a real distribution sampler, not greedy) with a
 /// small max_tokens cap → a short, well-formed completion.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn low_temperature_min_p() {
-    let Some(gguf) = tiny_gguf_path() else {
+    let Some(higgs) = higgs_local(&[TINY_MODEL_ID]).await else {
         eprintln!("SKIP low_temperature_min_p: tiny gguf not found (set HIGGS_TEST_GGUF)");
         return;
     };
-    let srv = spawn_with_tiny_model(12601, &gguf).await;
-    common::prepare_tiny(&srv.base).await;
+    prepare(&higgs).await;
+    let (base, guard) = serve_v1_local(higgs.handle()).await;
     let resp = chat_json(
-        &srv.base,
+        &base,
         json!({
             "model": TINY_MODEL_ID, "stream": false, "max_tokens": 8,
             "temperature": 0.1, "top_p": 0.5, "min_p": 0.05,
@@ -102,6 +122,8 @@ async fn low_temperature_min_p() {
     )
     .await;
     assert_well_formed(&resp);
+    guard.shutdown().await;
+    higgs.shutdown().await;
 }
 
 /// `temperature: 0` ⇒ greedy (argmax) in run_decode: deterministic across runs.
@@ -109,26 +131,28 @@ async fn low_temperature_min_p() {
 /// `temp <= 0 ⇒ LlamaSampler::greedy()` branch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn greedy_temperature_is_deterministic() {
-    let Some(gguf) = tiny_gguf_path() else {
+    let Some(higgs) = higgs_local(&[TINY_MODEL_ID]).await else {
         eprintln!(
             "SKIP greedy_temperature_is_deterministic: tiny gguf not found (set HIGGS_TEST_GGUF)"
         );
         return;
     };
-    let srv = spawn_with_tiny_model(12602, &gguf).await;
-    common::prepare_tiny(&srv.base).await;
+    prepare(&higgs).await;
+    let (base, guard) = serve_v1_local(higgs.handle()).await;
     let body = json!({
         "model": TINY_MODEL_ID, "stream": false, "max_tokens": 12, "temperature": 0.0,
         "messages": [{ "role": "user", "content": "Say a fixed greeting." }]
     });
-    let a = chat_json(&srv.base, body.clone()).await;
-    let b = chat_json(&srv.base, body).await;
+    let a = chat_json(&base, body.clone()).await;
+    let b = chat_json(&base, body).await;
     assert_well_formed(&a);
     assert_well_formed(&b);
     assert_eq!(
         a["choices"][0]["message"]["content"], b["choices"][0]["message"]["content"],
         "greedy (temperature=0) generation is deterministic across two requests"
     );
+    guard.shutdown().await;
+    higgs.shutdown().await;
 }
 
 /// A per-request `seed` is accepted by the OpenAI parse path; the request must
@@ -136,14 +160,14 @@ async fn greedy_temperature_is_deterministic() {
 /// consume the OpenAI `seed`, so we don't assert it changes the toy output.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn seeded_request_is_well_formed() {
-    let Some(gguf) = tiny_gguf_path() else {
+    let Some(higgs) = higgs_local(&[TINY_MODEL_ID]).await else {
         eprintln!("SKIP seeded_request_is_well_formed: tiny gguf not found (set HIGGS_TEST_GGUF)");
         return;
     };
-    let srv = spawn_with_tiny_model(12603, &gguf).await;
-    common::prepare_tiny(&srv.base).await;
+    prepare(&higgs).await;
+    let (base, guard) = serve_v1_local(higgs.handle()).await;
     let resp = chat_json(
-        &srv.base,
+        &base,
         json!({
             "model": TINY_MODEL_ID, "stream": false, "max_tokens": 10,
             "temperature": 0.7, "seed": 12345,
@@ -152,6 +176,8 @@ async fn seeded_request_is_well_formed() {
     )
     .await;
     assert_well_formed(&resp);
+    guard.shutdown().await;
+    higgs.shutdown().await;
 }
 
 /// `max_tokens: 1` exercises the smallest budget: the decode loop emits exactly
@@ -159,14 +185,14 @@ async fn seeded_request_is_well_formed() {
 /// token, which yields "stop"). usage.completion_tokens must be <= 1.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn max_tokens_one_caps_completion() {
-    let Some(gguf) = tiny_gguf_path() else {
+    let Some(higgs) = higgs_local(&[TINY_MODEL_ID]).await else {
         eprintln!("SKIP max_tokens_one_caps_completion: tiny gguf not found (set HIGGS_TEST_GGUF)");
         return;
     };
-    let srv = spawn_with_tiny_model(12604, &gguf).await;
-    common::prepare_tiny(&srv.base).await;
+    prepare(&higgs).await;
+    let (base, guard) = serve_v1_local(higgs.handle()).await;
     let resp = chat_json(
-        &srv.base,
+        &base,
         json!({
             "model": TINY_MODEL_ID, "stream": false, "max_tokens": 1,
             "messages": [{ "role": "user", "content": "Hello?" }]
@@ -178,20 +204,22 @@ async fn max_tokens_one_caps_completion() {
         resp["usage"]["completion_tokens"].as_u64().unwrap() <= 1,
         "max_tokens=1 caps the completion to at most one token: {resp:?}"
     );
+    guard.shutdown().await;
+    higgs.shutdown().await;
 }
 
 /// A larger `max_completion_tokens` (which wins over `max_tokens`) drives a longer
 /// decode; the result is still a well-formed completion with non-zero usage.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn larger_max_completion_tokens() {
-    let Some(gguf) = tiny_gguf_path() else {
+    let Some(higgs) = higgs_local(&[TINY_MODEL_ID]).await else {
         eprintln!("SKIP larger_max_completion_tokens: tiny gguf not found (set HIGGS_TEST_GGUF)");
         return;
     };
-    let srv = spawn_with_tiny_model(12605, &gguf).await;
-    common::prepare_tiny(&srv.base).await;
+    prepare(&higgs).await;
+    let (base, guard) = serve_v1_local(higgs.handle()).await;
     let resp = chat_json(
-        &srv.base,
+        &base,
         json!({
             "model": TINY_MODEL_ID, "stream": false,
             "max_tokens": 4, "max_completion_tokens": 24,
@@ -209,6 +237,8 @@ async fn larger_max_completion_tokens() {
         resp["usage"]["completion_tokens"].as_u64().unwrap() <= 24,
         "max_completion_tokens (24) wins over max_tokens (4): {resp:?}"
     );
+    guard.shutdown().await;
+    higgs.shutdown().await;
 }
 
 /// A `stop` sequence is accepted (a real OpenAI field); the request must succeed
@@ -216,14 +246,14 @@ async fn larger_max_completion_tokens() {
 /// are a documented latent limitation), so we don't require finish_reason "stop".
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stop_sequence_is_accepted() {
-    let Some(gguf) = tiny_gguf_path() else {
+    let Some(higgs) = higgs_local(&[TINY_MODEL_ID]).await else {
         eprintln!("SKIP stop_sequence_is_accepted: tiny gguf not found (set HIGGS_TEST_GGUF)");
         return;
     };
-    let srv = spawn_with_tiny_model(12606, &gguf).await;
-    common::prepare_tiny(&srv.base).await;
+    prepare(&higgs).await;
+    let (base, guard) = serve_v1_local(higgs.handle()).await;
     let resp = chat_json(
-        &srv.base,
+        &base,
         json!({
             "model": TINY_MODEL_ID, "stream": false, "max_tokens": 16,
             "temperature": 0.5, "stop": ["\n\n", "END"],
@@ -232,6 +262,8 @@ async fn stop_sequence_is_accepted() {
     )
     .await;
     assert_well_formed(&resp);
+    guard.shutdown().await;
+    higgs.shutdown().await;
 }
 
 /// presence + frequency penalties are the penalty samplers the `/v1` request
@@ -240,14 +272,14 @@ async fn stop_sequence_is_accepted() {
 /// chain link in run_decode. In-range bounds [-2, 2] must be accepted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn presence_frequency_penalties() {
-    let Some(gguf) = tiny_gguf_path() else {
+    let Some(higgs) = higgs_local(&[TINY_MODEL_ID]).await else {
         eprintln!("SKIP presence_frequency_penalties: tiny gguf not found (set HIGGS_TEST_GGUF)");
         return;
     };
-    let srv = spawn_with_tiny_model(12607, &gguf).await;
-    common::prepare_tiny(&srv.base).await;
+    prepare(&higgs).await;
+    let (base, guard) = serve_v1_local(higgs.handle()).await;
     let resp = chat_json(
-        &srv.base,
+        &base,
         json!({
             "model": TINY_MODEL_ID, "stream": false, "max_tokens": 12,
             "temperature": 0.8, "presence_penalty": 1.5, "frequency_penalty": -0.5,
@@ -256,6 +288,8 @@ async fn presence_frequency_penalties() {
     )
     .await;
     assert_well_formed(&resp);
+    guard.shutdown().await;
+    higgs.shutdown().await;
 }
 
 /// A multi-message conversation (system + user + assistant + user) renders the
@@ -263,14 +297,14 @@ async fn presence_frequency_penalties() {
 /// apply + tokenize path with a non-trivial prompt.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn multi_message_conversation() {
-    let Some(gguf) = tiny_gguf_path() else {
+    let Some(higgs) = higgs_local(&[TINY_MODEL_ID]).await else {
         eprintln!("SKIP multi_message_conversation: tiny gguf not found (set HIGGS_TEST_GGUF)");
         return;
     };
-    let srv = spawn_with_tiny_model(12608, &gguf).await;
-    common::prepare_tiny(&srv.base).await;
+    prepare(&higgs).await;
+    let (base, guard) = serve_v1_local(higgs.handle()).await;
     let resp = chat_json(
-        &srv.base,
+        &base,
         json!({
             "model": TINY_MODEL_ID, "stream": false, "max_tokens": 12,
             "messages": [
@@ -287,6 +321,8 @@ async fn multi_message_conversation() {
         resp["usage"]["prompt_tokens"].as_u64().unwrap() > 0,
         "multi-turn prompt tokenizes to a non-zero count: {resp:?}"
     );
+    guard.shutdown().await;
+    higgs.shutdown().await;
 }
 
 /// HG005 ContextOverflow, post-Step-5: a `max_tokens` beyond the window is now
@@ -297,18 +333,18 @@ async fn multi_message_conversation() {
 /// reports the real 4096 window rather than the remote/permissive placeholder.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn context_overflow_is_hg005() {
-    let Some(gguf) = tiny_gguf_path() else {
+    let Some(higgs) = higgs_local(&[TINY_MODEL_ID]).await else {
         eprintln!("SKIP context_overflow_is_hg005: tiny gguf not found (set HIGGS_TEST_GGUF)");
         return;
     };
-    let srv = spawn_with_tiny_model(12609, &gguf).await;
-    common::prepare_tiny(&srv.base).await;
+    prepare(&higgs).await;
+    let (base, guard) = serve_v1_local(higgs.handle()).await;
     let c = reqwest::Client::new();
 
     // Load the model on demand with a tiny, in-window request first, so the
     // local ctx_len (4096) is what the overflow check sees.
     let warm = chat_json(
-        &srv.base,
+        &base,
         json!({
             "model": TINY_MODEL_ID, "stream": false, "max_tokens": 4,
             "messages": [{ "role": "user", "content": "hi" }]
@@ -320,7 +356,7 @@ async fn context_overflow_is_hg005() {
     // A prompt that ALONE exceeds 4096 tokens (~6000 est tokens at 4 bytes) has no
     // room to generate ⇒ genuine 400 overflow with the standard code.
     let over = c
-        .post(format!("{}/v1/chat/completions", srv.base))
+        .post(format!("{base}/v1/chat/completions"))
         .json(&json!({
             "model": TINY_MODEL_ID, "stream": false, "max_tokens": 16,
             "messages": [{ "role": "user", "content": "x".repeat(24000) }]
@@ -348,6 +384,8 @@ async fn context_overflow_is_hg005() {
             .is_some_and(|m| m.contains("[HG005]")),
         "context-overflow message carries the HG005 code: {env:?}"
     );
+    guard.shutdown().await;
+    higgs.shutdown().await;
 }
 
 /// Streaming with varied sampling + a small cap: the SSE path runs the same
@@ -355,14 +393,14 @@ async fn context_overflow_is_hg005() {
 /// drop it (never leave the stream open), asserting the well-formed terminators.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn streaming_with_sampling_params() {
-    let Some(gguf) = tiny_gguf_path() else {
+    let Some(higgs) = higgs_local(&[TINY_MODEL_ID]).await else {
         eprintln!("SKIP streaming_with_sampling_params: tiny gguf not found (set HIGGS_TEST_GGUF)");
         return;
     };
-    let srv = spawn_with_tiny_model(12610, &gguf).await;
-    common::prepare_tiny(&srv.base).await;
+    prepare(&higgs).await;
+    let (base, guard) = serve_v1_local(higgs.handle()).await;
     let body = reqwest::Client::new()
-        .post(format!("{}/v1/chat/completions", srv.base))
+        .post(format!("{base}/v1/chat/completions"))
         .json(&json!({
             "model": TINY_MODEL_ID, "stream": true, "max_tokens": 8,
             "temperature": 0.9, "top_p": 0.9, "presence_penalty": 0.2,
@@ -383,4 +421,6 @@ async fn streaming_with_sampling_params() {
         body.contains("chat.completion.chunk"),
         "stream chunks carry the chunk object type: {body}"
     );
+    guard.shutdown().await;
+    higgs.shutdown().await;
 }

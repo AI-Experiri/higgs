@@ -24,6 +24,18 @@ higgs_ts! {
         pub ollama_dirs: Vec<PathBuf>,
         /// Load parameters used when none are supplied by the caller.
         pub default_load: LoadParams,
+        /// Executable that hosts the llama.cpp WORKER role — the binary re-exec'd
+        /// with `--higgs-worker` to run a model. `None` (the default) ⇒
+        /// `std::env::current_exe()`, which is correct for the `higgs` binary and
+        /// for an embedder whose own binary answers `--higgs-worker` (jigglebot).
+        /// `Some(path)` lets a host whose current executable CANNOT host the worker
+        /// role point at one that can — e.g. an integration test binary (libtest,
+        /// which ignores `--higgs-worker`) pointing at `env!("CARGO_BIN_EXE_higgs")`.
+        /// A runtime/embedder concern, not a persisted setting: `#[serde(skip)]` +
+        /// `#[ts(skip)]` keep it off the wire and out of the TS bindings.
+        #[serde(skip)]
+        #[ts(skip)]
+        pub worker_exe: Option<PathBuf>,
     }
 }
 
@@ -74,6 +86,9 @@ impl Default for HiggsConfig {
             hf_dirs,
             ollama_dirs,
             default_load: LoadParams::base(CtxLen::Fixed { n: 4096 }, GpuLayers::All, threads),
+            // Default: workers re-exec `current_exe()` (correct for the higgs
+            // binary and for jigglebot, whose binary answers `--higgs-worker`).
+            worker_exe: None,
         }
     }
 }
@@ -89,8 +104,9 @@ higgs_ts! {
         /// Max request-body bytes before a `413` (`serve::MAX_BODY_BYTES`).
         #[ts(type = "number")]
         pub max_body_bytes: u64,
-        /// Whole-request timeout for the `/api/higgs/*` control surface, in
-        /// seconds (`serve::CONTROL_TIMEOUT`). The streaming `/v1` chat path is
+        /// Whole-request timeout for the non-streaming control surface, in
+        /// seconds (`serve::CONTROL_TIMEOUT`; formerly the `/api/higgs/*` HTTP
+        /// routes). The streaming `/v1` chat path is
         /// deliberately un-timed at the HTTP layer.
         #[ts(type = "number")]
         pub control_timeout_secs: u64,
@@ -111,16 +127,16 @@ higgs_ts! {
         /// Effective idle seconds after which an idle worker is auto-unloaded — the
         /// live value the node reaper enforces (default
         /// [`DEFAULT_IDLE_TTL`](crate::node::runtime::DEFAULT_IDLE_TTL), 60 min;
-        /// runtime-mutable via `/api/higgs/settings`). Always equals the settings
-        /// endpoint's `idle_ttl_minutes × 60`.
+        /// runtime-mutable via the `settings` control-op). Always equals the runtime
+        /// settings' `idle_ttl_minutes × 60`.
         #[ts(type = "number")]
         pub idle_unload_ttl_secs: u64,
     }
 }
 
 higgs_ts! {
-    /// Read-only snapshot of the server's effective configuration, surfaced at
-    /// `GET /api/higgs/system` so the UI can show the real scan dirs, load
+    /// Read-only snapshot of the server's effective configuration, surfaced by the
+    /// `system` control-op so the UI can show the real scan dirs, load
     /// defaults, bind host, and safety limits without inventing anything. Derived
     /// entirely from [`HiggsConfig`] plus the fixed invariants ([`BIND_HOST`],
     /// [`DEFAULT_CTX_CAP`]) and the documented serve-layer limit consts; carries
@@ -203,7 +219,7 @@ higgs_ts! {
         /// Per-load idle-TTL override in minutes. RESERVED: per-load idle-TTL
         /// enforcement is a deferred follow-up (the node reaper applies one per-node
         /// TTL to every worker), so this is currently ALWAYS absent — every loaded
-        /// model uses the global idle TTL (`/api/higgs/settings`). It becomes
+        /// model uses the global idle TTL (`HiggsRuntimeSettings`). It becomes
         /// populated only once the reaper honors per-worker overrides.
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(type = "number")]
@@ -230,7 +246,9 @@ higgs_ts! {
 
 higgs_const_enum! {
     /// Lifecycle phase of an in-flight model load, pushed as a live
-    /// [`ModelLoadEvent`] over `GET /api/higgs/events` (SSE) at each real seam in
+    /// [`ModelLoadEvent`] over the load-event subscription
+    /// ([`Higgs::subscribe_load_events`](crate::api::Higgs::subscribe_load_events),
+    /// formerly the `GET /api/higgs/events` SSE stream) at each real seam in
     /// [`Higgs::load`](crate::api::Higgs::load) so the UI can show WHAT the load is
     /// doing — not just a spinner. Every variant maps to an observable transition in
     /// `load_inner`; no phase is faked. `Queued`/`Preparing`/`LoadingWeights`/
@@ -254,8 +272,10 @@ higgs_const_enum! {
 }
 
 higgs_ts! {
-    /// A live model-load lifecycle event, streamed over `GET /api/higgs/events`
-    /// (SSE). One is pushed at every [`ModelLoadPhase`] transition of a load, so the
+    /// A live model-load lifecycle event, delivered over the load-event subscription
+    /// ([`Higgs::subscribe_load_events`](crate::api::Higgs::subscribe_load_events);
+    /// formerly the `GET /api/higgs/events` SSE stream). One is pushed at every
+    /// [`ModelLoadPhase`] transition of a load, so the
     /// UI shows/updates/hides the loading indicator from PUSH events instead of
     /// polling `status`. Terminal phases (`Ready`/`Failed`) close out the bar;
     /// `Failed` carries the diagnostic `code`.
@@ -335,6 +355,47 @@ pub(crate) fn chat_outcome_from_value(result: &serde_json::Value) -> ChatOutcome
     }
 }
 
+/// The resolved pre-dispatch gate for a chat request, produced by
+/// [`Higgs::prepare_chat`](crate::api::Higgs::prepare_chat).
+///
+/// It is the SHARED result of the `/v1` chat gate lifted onto the facade so the
+/// HTTP `/v1` path and the in-process embedder cannot diverge: JIT-load the
+/// requested model, resolve the now-resident served id, and clamp the generation
+/// budget to what fits the loaded context window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedChat {
+    /// The now-resident served id (`org/model`, `org/model-1`, …) that binds the
+    /// chat dispatch — the worker rejects (`[HG018]`) if a concurrent JIT load
+    /// swaps it out before generation, so a swap errors instead of serving the
+    /// wrong model. For a remote-resident model this is the requested id (the
+    /// fleet routes it).
+    pub resolved_model: String,
+    /// The context-clamped generation budget: `min(requested or inferred,
+    /// n_ctx − prompt, MAX_OUTPUT_TOKENS)`. An over-budget request truncates
+    /// (`finish_reason: "length"`) rather than erroring; a prompt that ALONE
+    /// overflows the window surfaces `context_length_exceeded` instead.
+    pub max_gen: usize,
+}
+
+/// A minted node-pairing credential, returned by [`Higgs::pair`](crate::api::Higgs::pair).
+///
+/// The operator runs `node_command` on the target node (`higgs --node <ticket>
+/// <token>`); the hub's accept loop admits it. Serializes to the same
+/// `{hub_id, ticket, token, node_command}` shape the pairing op
+/// ([`Higgs::pair`](crate::api::Higgs::pair), formerly `POST /api/higgs/pair`)
+/// has always returned.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PairInfo {
+    /// The hub's stable id (iroh endpoint id).
+    pub hub_id: String,
+    /// The dialable iroh ticket the node connects with.
+    pub ticket: String,
+    /// The one-time pairing token the hub's accept loop checks.
+    pub token: String,
+    /// The ready-to-run node command: `higgs --node <ticket> <token>`.
+    pub node_command: String,
+}
+
 /// Final outcome of a completed chat request.
 #[derive(Debug, Clone)]
 pub struct ChatOutcome {
@@ -404,13 +465,14 @@ pub const MAX_CONCURRENT_INFERENCE: usize = 8;
 /// memory as threshold to leave headroom").
 pub const MEMORY_HEADROOM_FRACTION: f64 = 0.8;
 
-/// Upper bound on the runtime-settable idle auto-unload TTL, in minutes. `PUT
-/// /api/higgs/settings` takes an unbounded `u64` straight from the request body, so
-/// [`Higgs::set_idle_ttl_minutes`] clamps to this before the `× 60` seconds conversion —
+/// Upper bound on the runtime-settable idle auto-unload TTL, in minutes. The
+/// `settings` control-op ([`Higgs::set_idle_ttl_minutes`], formerly `PUT
+/// /api/higgs/settings`) takes an unbounded `u64` straight from the caller, so it
+/// clamps to this before the `× 60` seconds conversion —
 /// otherwise a huge value would overflow `minutes * 60` (a debug-build panic, a release
 /// wrap). 100 years is "effectively never unload" (the canonical never-unload control is
 /// the `auto_unload_idle` toggle), so the clamp restricts no real use while keeping every
-/// `× 60` conversion (the reaper TTL, `/api/higgs/system`) overflow-safe and consistent.
+/// `× 60` conversion (the reaper TTL, the `system` control-op) overflow-safe and consistent.
 pub const MAX_IDLE_TTL_MINUTES: u64 = 100 * 365 * 24 * 60;
 
 // NOTE: the idle auto-unload TTL + reaper cadence live with the node reaper now

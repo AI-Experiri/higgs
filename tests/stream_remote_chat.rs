@@ -1,6 +1,8 @@
 //! Black-box integration coverage for the STREAMING SSE assembly (`serve/stream.rs`)
 //! and the REMOTE-routed streaming chat (`serve/v1.rs` `ensure_loaded` remote branch +
-//! `node/data.rs` `relay_chat`), driven entirely over real HTTP/iroh.
+//! `node/data.rs` `relay_chat`), driven over the REAL `/v1` HTTP surface — now served by
+//! `serve_v1_local` on an in-process, library-first `Higgs` (the standalone `higgs`
+//! server + `/api/higgs/*` control plane are gone).
 //!
 //! What this file targets that the existing suite does NOT:
 //!   (a) Incrementally reading the SSE byte stream (not buffered `.text()`) and parsing
@@ -10,13 +12,14 @@
 //!       `include_usage` terminal chunk ORDER relative to the finish chunk.
 //!   (b) A streaming client that DROPS the response mid-stream (cancellation): the SSE
 //!       body's spawned `assemble` keeps running to its outcome while its `tx.send`s
-//!       discard silently (`stream.rs` `send` closure) — the suite must not hang.
-//!   (c) A full `/v1/chat/completions` POST on a real HUB process that routes the chat
-//!       to a paired remote `higgs --node`, STREAMED — exercising v1's remote-resident
-//!       `ensure_loaded` branch + the node-side `relay_chat` chunk relay end-to-end.
+//!       discard silently (`stream.rs` `send` closure); the surface must not hang.
+//!   (c) A full `/v1/chat/completions` POST on a real HUB `Higgs` (with a `HubFleet`
+//!       installed) that routes the chat to a paired remote `higgs --node`, STREAMED —
+//!       exercising v1's remote-resident `ensure_loaded` branch + the node-side
+//!       `relay_chat` chunk relay end-to-end over `/v1` HTTP + iroh.
 //!
 //! Every SSE stream is fully drained or explicitly cancelled; tests skip when no tiny
-//! GGUF is available. Port base 13100.
+//! GGUF is available.
 //!
 //! NOTE ON `finish_reason`: the tiny `stories260K` toy model does not reach an EOG token
 //! within its small context budget (verified empirically — even a 2000-token budget
@@ -29,11 +32,22 @@
 mod common;
 
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use common::{spawn_with_tiny_model, stage_tiny_model, tiny_gguf_path, TINY_MODEL_ID};
 use futures::StreamExt;
+use iroh_tickets::endpoint::EndpointTicket;
 use serde_json::{json, Value};
+
+use higgs::auth::{Allowlist, PairingTokens};
+use higgs::log_bus::LogBus;
+use higgs::node::fleet::HubFleet;
+use higgs::node::transport::NodeTransport;
+use higgs::node::{gate_connection, GateOutcome, HubIdentity, HELLO_DEADLINE};
+use higgs::remote::ALPN;
+use higgs::{Higgs, HiggsConfig};
+
+use common::{higgs_local, serve_v1_local, stage_tiny_model, tiny_gguf_path, TINY_MODEL_ID};
 
 /// Collect the `data:`-payload strings from a streamed SSE response, reading the body
 /// INCREMENTALLY (byte chunks) rather than buffering with `.text()`, so the real
@@ -80,44 +94,39 @@ fn finish_reason_of(payloads: &[String]) -> Option<String> {
 
 /// (a) Stream `/v1/chat/completions` with a tiny `max_tokens` and assert the SSE finish
 /// chunk's `finish_reason` is exactly `"length"` (the engine breaks on the token budget).
-/// Also turns VERBOSE on first, so the streaming `log_served` line fires inside the SSE
-/// assembly (`stream::assemble` verbose arm) — a path `inference.rs` never enables. Then a
-/// second stream with `stream_options.include_usage` asserts the terminal usage chunk comes
-/// AFTER the finish chunk and carries real token counts (chunk ORDER, not just presence).
+/// Also turns VERBOSE on first (via the in-process `set_logs_settings` facade), so the
+/// streaming `log_served` line fires inside the SSE assembly (`stream::assemble` verbose
+/// arm) — a path `inference.rs` never enables. Then a second stream with
+/// `stream_options.include_usage` asserts the terminal usage chunk comes AFTER the finish
+/// chunk and carries real token counts (chunk ORDER, not just presence).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stream_finish_reason_length_verbose_and_usage_order() {
-    let Some(gguf) = tiny_gguf_path() else {
+    let Some(higgs) = higgs_local(&[TINY_MODEL_ID]).await else {
         eprintln!("SKIP stream_finish_reason_length_verbose_and_usage_order: no tiny GGUF");
         return;
     };
-    let srv = spawn_with_tiny_model(13100, &gguf).await;
-    common::prepare_tiny(&srv.base).await;
-    let c = reqwest::Client::new();
 
-    // Turn VERBOSE on via the runtime settings endpoint so the streamed-completion
-    // `log_served` line fires inside `stream::assemble` (the verbose Ok(Ok) arm).
-    let cur: Value = c
-        .get(format!("{}/api/higgs/logs/settings", srv.base))
-        .send()
+    // Turn VERBOSE on so the streamed-completion `log_served` line fires inside
+    // `stream::assemble` (the verbose Ok(Ok) arm) — the same effect the old
+    // `PUT /api/higgs/logs/settings` had, now via the in-process facade.
+    let mut settings = higgs.logs_settings();
+    settings.verbose = true;
+    higgs.set_logs_settings(&settings);
+
+    // Explicit load resolves the model resident (bypassing the JIT readiness gate),
+    // so the streamed `/v1` chat serves it locally.
+    higgs
+        .load(TINY_MODEL_ID, None)
         .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let mut on = cur.clone();
-    on["verbose"] = json!(true);
-    let put = c
-        .put(format!("{}/api/higgs/logs/settings", srv.base))
-        .json(&on)
-        .send()
-        .await
-        .unwrap();
-    assert!(put.status().is_success(), "enable verbose");
+        .expect("load tiny model");
+
+    let (base, guard) = serve_v1_local(higgs.handle()).await;
+    let c = reqwest::Client::new();
 
     // A tiny budget guarantees the generation breaks on `n_generated >= max_tokens` →
     // finish_reason "length" (EOG is never reached by this toy model in 4 tokens).
     let resp = c
-        .post(format!("{}/v1/chat/completions", srv.base))
+        .post(format!("{base}/v1/chat/completions"))
         .json(&json!({
             "model": TINY_MODEL_ID, "stream": true, "max_tokens": 4, "temperature": 0.0,
             "messages": [{ "role": "user", "content": "Once upon a time" }]
@@ -150,7 +159,7 @@ async fn stream_finish_reason_length_verbose_and_usage_order() {
     // ── include_usage: the terminal usage chunk must come AFTER the finish chunk and
     // before [DONE], carrying real token counts with no choices (OpenAI convention).
     let resp = c
-        .post(format!("{}/v1/chat/completions", srv.base))
+        .post(format!("{base}/v1/chat/completions"))
         .json(&json!({
             "model": TINY_MODEL_ID, "stream": true, "max_tokens": 4, "temperature": 0.0,
             "messages": [{ "role": "user", "content": "Hello there" }],
@@ -197,28 +206,34 @@ async fn stream_finish_reason_length_verbose_and_usage_order() {
         Some("[DONE]"),
         "usage stream still ends with [DONE]"
     );
+
+    guard.shutdown().await;
+    higgs.shutdown().await;
 }
 
 /// (b) Client DROPS the stream mid-flight (cancellation). After reading a couple of byte
 /// chunks we drop the response, closing the receiver side; the SSE body's spawned
 /// `assemble` keeps running to its outcome while its `tx.send`s discard silently
-/// (`stream.rs` `send` closure: "client disconnected — sends discard"). The suite must
+/// (`stream.rs` `send` closure: "client disconnected — sends discard"). The surface must
 /// not hang, and the SAME server must keep serving a subsequent full stream afterward —
 /// proving the abandoned request released cleanly (worker not pinned).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stream_client_drops_midstream_then_server_keeps_serving() {
-    let Some(gguf) = tiny_gguf_path() else {
+    let Some(higgs) = higgs_local(&[TINY_MODEL_ID]).await else {
         eprintln!("SKIP stream_client_drops_midstream_then_server_keeps_serving: no tiny GGUF");
         return;
     };
-    let srv = spawn_with_tiny_model(13101, &gguf).await;
-    common::prepare_tiny(&srv.base).await;
+    higgs
+        .load(TINY_MODEL_ID, None)
+        .await
+        .expect("load tiny model");
+    let (base, guard) = serve_v1_local(higgs.handle()).await;
     let c = reqwest::Client::new();
 
     // Open a streaming chat with a generous budget so there is plenty of stream left to
-    // abandon, then drop the response after the first byte chunk (early cancellation).
+    // abandon, then drop the response after the first byte chunks (early cancellation).
     let resp = c
-        .post(format!("{}/v1/chat/completions", srv.base))
+        .post(format!("{base}/v1/chat/completions"))
         .json(&json!({
             "model": TINY_MODEL_ID, "stream": true, "max_tokens": 256, "temperature": 0.0,
             "messages": [{ "role": "user", "content": "Tell a long story please." }]
@@ -239,7 +254,7 @@ async fn stream_client_drops_midstream_then_server_keeps_serving() {
     // still serves a fresh, fully-drained stream (worker not pinned by the dropped one).
     tokio::time::sleep(Duration::from_millis(300)).await;
     let resp = c
-        .post(format!("{}/v1/chat/completions", srv.base))
+        .post(format!("{base}/v1/chat/completions"))
         .json(&json!({
             "model": TINY_MODEL_ID, "stream": true, "max_tokens": 4, "temperature": 0.0,
             "messages": [{ "role": "user", "content": "Hi again" }]
@@ -263,134 +278,123 @@ async fn stream_client_drops_midstream_then_server_keeps_serving() {
         Some("length"),
         "follow-up stream still reports a finish reason: {payloads:?}"
     );
+
+    guard.shutdown().await;
+    higgs.shutdown().await;
 }
 
 // ── (c) Hub HTTP streaming chat routed to a remote node ──────────────────────────────
 
-struct Proc(Child);
-impl Drop for Proc {
+/// A spawned `higgs --node` child, SIGTERM'd (graceful) on drop so its coverage profile
+/// flushes.
+struct NodeProc(Child);
+impl Drop for NodeProc {
     fn drop(&mut self) {
-        // SIGTERM (graceful) so the coverage profile flushes.
         unsafe { libc::kill(self.0.id() as libc::pid_t, libc::SIGTERM) };
         let _ = self.0.wait();
     }
 }
 
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
-/// (c) A `/v1/chat/completions` POST on a REAL hub process (`HIGGS_HUB=1`), with
+async fn hub_endpoint() -> iroh::Endpoint {
+    iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .alpns(vec![ALPN.to_vec()])
+        .relay_mode(iroh::RelayMode::Disabled)
+        .bind()
+        .await
+        .expect("bind hub endpoint")
+}
+
+/// (c) A `/v1/chat/completions` POST on a REAL hub `Higgs` (a `HubFleet` installed), with
 /// `stream: true`, routed to a paired remote `higgs --node` that has the tiny model
-/// loaded. This drives the full remote streaming path over HTTP + iroh: v1's
-/// `ensure_loaded` remote-resident branch (returns the permissive `LoadedInfo`, no
-/// local worker), `chat_stream` fleet routing, the node-side `relay_chat` chunk relay
-/// (`N_CHAT_CHUNK` → hub delta sink → SSE), and the SSE assembly's finish chunk. Asserts
-/// the streamed SSE is well-formed and ends with `[DONE]`.
+/// loaded — driven over the REAL `/v1` HTTP surface via `serve_v1_local`. This drives the
+/// full remote streaming path over HTTP + iroh: v1's `ensure_loaded` remote-resident
+/// branch (returns the permissive `LoadedInfo`, no local worker), `chat_stream` fleet
+/// routing, the node-side `relay_chat` chunk relay (`N_CHAT_CHUNK` → hub delta sink →
+/// SSE), and the SSE assembly's finish chunk. Asserts the streamed SSE is well-formed,
+/// carries a content delta, and ends with `[DONE]`. Built in-process via the proven
+/// `remote_hub_e2e` fleet pattern (hermetic iroh, `RelayMode::Disabled`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hub_http_streaming_chat_routes_to_remote_node() {
     let Some(gguf) = tiny_gguf_path() else {
         eprintln!("SKIP hub_http_streaming_chat_routes_to_remote_node: no tiny GGUF");
         return;
     };
-    let hub_home = tempfile::tempdir().unwrap();
-    let node_home = tempfile::tempdir().unwrap();
-    let staged = stage_tiny_model(&gguf);
-    let port = free_port();
+    let scan_root = stage_tiny_model(&gguf);
+    let node_home = tempfile::tempdir().expect("node home");
 
-    // Hub: a real higgs server in HUB mode (hermetic iroh), NO local models — so any
-    // model it can serve is necessarily remote-routed through the fleet.
-    let _hub = Proc(
-        Command::new(env!("CARGO_BIN_EXE_higgs"))
-            .env("HIGGS_BIND", "127.0.0.1")
-            .env("HIGGS_PORT", port.to_string())
-            .env("HIGGS_HOME", hub_home.path())
-            .env("HIGGS_HUB", "1")
-            .env("HIGGS_IROH_LOCAL", "1")
-            .env("RUST_LOG", "warn")
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .expect("spawn hub"),
+    // Hub: a local Higgs (no local models) with a HubFleet installed — so any model it can
+    // serve is necessarily remote-routed through the fleet.
+    let bus = Arc::new(LogBus::new());
+    let higgs = Arc::new(Higgs::with_log_bus(HiggsConfig::default(), bus.clone()));
+    let fleet = Arc::new(HubFleet::new(bus.clone()));
+    higgs.set_fleet(fleet.clone());
+
+    // Hub iroh endpoint + a pairing ticket/token.
+    let hub = hub_endpoint().await;
+    let hub_id = hub.id().to_string();
+    let ticket = EndpointTicket::new(hub.addr()).to_string();
+    let mut allow = Allowlist::load(&node_home.path().join("hub-pairings.json")).unwrap();
+    let mut tokens = PairingTokens::new();
+    let token = tokens.mint(now_ms(), 600_000);
+
+    // Spawn the real node process (hermetic iroh, real model dir).
+    let child = Command::new(env!("CARGO_BIN_EXE_higgs"))
+        .arg("--node")
+        .arg(&ticket)
+        .arg(&token)
+        .env("HIGGS_HOME", node_home.path())
+        .env("HIGGS_MODEL_DIR", scan_root.path())
+        .env("HIGGS_IROH_LOCAL", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn higgs --node");
+    let _node = NodeProc(child);
+
+    // Accept the node's dial, gate it, and register it in the fleet.
+    let incoming = tokio::time::timeout(Duration::from_secs(30), hub.accept())
+        .await
+        .expect("node dialed within 30s")
+        .expect("incoming");
+    let conn = incoming.await.expect("connection");
+    let peer = conn.remote_id().to_string();
+    let outcome = gate_connection(
+        &conn,
+        &mut allow,
+        &mut tokens,
+        now_ms(),
+        &HubIdentity::new(hub_id),
+        Some("test".into()),
+        HELLO_DEADLINE,
+    )
+    .await;
+    assert!(
+        matches!(outcome, GateOutcome::Admitted { .. }),
+        "node admitted: {outcome:?}"
     );
-    let base = format!("http://127.0.0.1:{port}");
+    fleet
+        .add_node(peer.clone(), Arc::new(NodeTransport::new(conn)), None)
+        .await;
+
+    // Load the tiny model on the remote node via the fleet → records the route.
+    fleet.load(&peer, TINY_MODEL_ID).await.expect("remote load");
+    assert!(
+        fleet.is_remote(TINY_MODEL_ID).await,
+        "model is now remote-routable"
+    );
+
+    // Serve the REAL `/v1` HTTP surface on the hub Higgs.
+    let (base, guard) = serve_v1_local(higgs.clone()).await;
     let c = reqwest::Client::new();
 
-    // Wait for the hub HTTP listener.
-    let mut ready = false;
-    for _ in 0..150 {
-        if let Ok(r) = c.get(format!("{base}/health")).send().await {
-            if r.status().is_success() {
-                ready = true;
-                break;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    assert!(ready, "hub server ready");
-
-    // Mint a pairing token + ticket and dial it with a real node that has the model staged.
-    let pair: Value = c
-        .post(format!("{base}/api/higgs/pair"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let ticket = pair["ticket"].as_str().expect("ticket").to_string();
-    let token = pair["token"].as_str().expect("token").to_string();
-    let _node = Proc(
-        Command::new(env!("CARGO_BIN_EXE_higgs"))
-            .arg("--node")
-            .arg(&ticket)
-            .arg(&token)
-            .env("HIGGS_HOME", node_home.path())
-            .env("HIGGS_MODEL_DIR", staged.path())
-            .env("HIGGS_IROH_LOCAL", "1")
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .expect("spawn node"),
-    );
-
-    // Wait for the remote node to show connected.
-    let mut node_id = String::new();
-    for _ in 0..150 {
-        let nodes: Value = c
-            .get(format!("{base}/api/higgs/nodes"))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        if let Some(n) = nodes.as_array().and_then(|a| {
-            a.iter()
-                .find(|n| n["connected"] == true && n["is_local"] != true)
-        }) {
-            node_id = n["endpoint_id"].as_str().unwrap().to_string();
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    assert!(!node_id.is_empty(), "remote node connected");
-
-    // Load the tiny model on the remote node via the hub's HTTP API.
-    let load = c
-        .post(format!("{base}/api/higgs/nodes/load"))
-        .json(&json!({ "node": node_id, "model": TINY_MODEL_ID }))
-        .send()
-        .await
-        .unwrap();
-    assert!(
-        load.status().is_success(),
-        "remote load ok: {}",
-        load.status()
-    );
-
-    // It is now advertised as a remote-routable model in /v1/models.
+    // It is advertised as a remote-routable model in /v1/models.
     let models: Value = c
         .get(format!("{base}/v1/models"))
         .send()
@@ -453,4 +457,8 @@ async fn hub_http_streaming_chat_routes_to_remote_node() {
         had_content,
         "remote relay streamed at least one content delta: {payloads:?}"
     );
+
+    // Tear the /v1 server down BEFORE the fleet/node so no SSE stream is open across
+    // shutdown (all streams above are fully drained).
+    guard.shutdown().await;
 }

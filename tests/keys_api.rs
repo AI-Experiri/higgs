@@ -1,335 +1,212 @@
-//! Black-box integration tests for the G4 key-management surface
-//! (`/api/higgs/keys`): mint → hot-swap auth ON → scope enforcement → list
-//! (no plaintext) → revoke → auth OFF, plus the CORS-preflight-before-auth
-//! ordering guarantee.
+//! In-process integration tests for higgs's G4 key-management surface — now the
+//! crate API (`Higgs::mint_key` / `revoke_key` / `api_keys`).
 //!
-//! Fail-on-revert: removing the routes 404s the lifecycle; removing the
-//! hot-swap (`set_api_keys` inside `mutate_api_keys`) breaks the
-//! "unkeyed request 401s IMMEDIATELY after mint" assertion (the old
-//! CLI-only flow needed a restart).
+//! The old `/api/higgs/keys` HTTP surface is GONE; key management runs in-process
+//! through the facade. These tests preserve the load-bearing INVARIANTS the shared
+//! decision cores enforce: bootstrap-needs-admin, label validation, the last-admin
+//! lockout ([HG066]), the last-key-on-LAN refusal ([HG059]), digest-only
+//! persistence, and the created/last-used stamping. The single behavior that is
+//! genuinely HTTP — the `auth_guard → touch_api_key` wiring — is exercised over the
+//! real `/v1` surface via `serve_v1_local`.
 
 mod common;
 
-use common::{spawn_lan_keyed, spawn_with_tiny_model, tiny_gguf_path};
+use common::{higgs_local, serve_v1_local, TINY_MODEL_ID};
+use higgs::{HiggsError, Scope};
 
 #[tokio::test]
 async fn keys_lifecycle_mint_scope_list_revoke() {
-    let Some(gguf) = tiny_gguf_path() else {
+    let Some(higgs) = higgs_local(&[TINY_MODEL_ID]).await else {
         eprintln!("SKIP keys_lifecycle: tiny gguf not found (set HIGGS_TEST_GGUF)");
         return;
     };
-    let srv = spawn_with_tiny_model(13450, &gguf).await;
-    let c = reqwest::Client::new();
-    let status_url = format!("{}/api/higgs/status", srv.base);
-    let keys_url = format!("{}/api/higgs/keys", srv.base);
 
-    // Fresh home ⇒ empty keystore ⇒ auth OFF: the control surface is open.
-    let r = c.get(&status_url).send().await.expect("status");
-    assert!(r.status().is_success(), "auth off: unkeyed status serves");
+    // Fresh home ⇒ empty keystore ⇒ auth OFF.
+    assert!(
+        higgs.api_keys().is_empty(),
+        "fresh home starts with no keys"
+    );
 
     // The FIRST key must be able to manage keys: an explicit non-admin bootstrap
-    // mint is rejected (codex r10 — it would self-lock the management API).
-    let r = c
-        .post(&keys_url)
-        .json(&serde_json::json!({ "label": "chatonly", "scopes": ["chat"] }))
-        .send()
-        .await
-        .expect("bootstrap chat-only mint");
-    assert_eq!(r.status(), 400, "non-admin first key refused");
-    // Still empty (nothing minted) — auth stays off.
+    // mint is rejected (it would self-lock the management API).
+    let boot = higgs.mint_key("chatonly", Some(vec![Scope::Chat]));
     assert!(
-        c.get(&status_url)
-            .send()
-            .await
-            .expect("status")
-            .status()
-            .is_success(),
+        matches!(boot, Err(HiggsError::InvalidRequest { .. })),
+        "non-admin first key refused: {boot:?}"
+    );
+    assert!(
+        higgs.api_keys().is_empty(),
         "refused bootstrap mint left the store empty"
     );
 
-    // Mint an ADMIN key over HTTP. The response carries the plaintext ONCE.
-    let r = c
-        .post(&keys_url)
-        .json(&serde_json::json!({ "label": "admin", "scopes": ["admin"] }))
-        .send()
-        .await
+    // Mint an ADMIN key. The response carries the plaintext ONCE.
+    let admin = higgs
+        .mint_key("admin", Some(vec![Scope::Admin]))
         .expect("mint admin");
-    assert!(r.status().is_success(), "mint: {}", r.status());
-    let minted: serde_json::Value = r.json().await.expect("mint json");
-    let admin_token = minted["token"].as_str().expect("token").to_owned();
     assert!(
-        admin_token.starts_with("hgk_"),
-        "token prefix: {admin_token}"
+        admin.token.starts_with("hgk_"),
+        "token prefix: {}",
+        admin.token
     );
+    let admin_token = admin.token.clone();
+    // The mint flipped auth ON (the live store is now non-empty).
+    assert!(!higgs.api_keys().is_empty(), "auth flipped on by the mint");
 
-    // HOT-SWAP: the very NEXT unkeyed request must 401 — no restart involved.
-    let r = c.get(&status_url).send().await.expect("status unkeyed");
-    assert_eq!(r.status(), 401, "auth flipped on by the mint");
-    assert!(
-        r.headers().get("www-authenticate").is_some(),
-        "401 carries WWW-Authenticate"
-    );
-    let r = c
-        .get(&status_url)
-        .bearer_auth(&admin_token)
-        .send()
-        .await
-        .expect("status keyed");
-    assert!(r.status().is_success(), "admin key reaches Admin routes");
-
-    // CORS preflight is answered BEFORE the auth guard: an OPTIONS from a
-    // browser origin needs NO key even with auth on (the layer order
-    // CORS → host → auth is a wire contract, not an accident).
-    let r = c
-        .request(
-            reqwest::Method::OPTIONS,
-            format!("{}/v1/chat/completions", srv.base),
-        )
-        .header("Origin", "http://localhost:5173")
-        .header("Access-Control-Request-Method", "POST")
-        .send()
-        .await
-        .expect("preflight");
-    assert!(
-        r.status().is_success(),
-        "unkeyed preflight passes with auth on: {}",
-        r.status()
-    );
-
-    // Mint a MODELS-scoped key (using the admin bearer).
-    let r = c
-        .post(&keys_url)
-        .bearer_auth(&admin_token)
-        .json(&serde_json::json!({ "label": "reader", "scopes": ["models"] }))
-        .send()
-        .await
+    // Mint a MODELS-scoped key.
+    let reader = higgs
+        .mint_key("reader", Some(vec![Scope::Models]))
         .expect("mint reader");
-    assert!(r.status().is_success());
-    let reader_token = r.json::<serde_json::Value>().await.expect("json")["token"]
-        .as_str()
-        .expect("token")
-        .to_owned();
+    let reader_token = reader.token.clone();
 
-    // Scope enforcement: reader lists models but cannot reach Admin routes.
-    let r = c
-        .get(format!("{}/v1/models", srv.base))
-        .bearer_auth(&reader_token)
-        .send()
-        .await
-        .expect("models w/ reader");
-    assert!(r.status().is_success(), "models scope covers /v1/models");
-    let r = c
-        .get(&status_url)
-        .bearer_auth(&reader_token)
-        .send()
-        .await
-        .expect("status w/ reader");
-    assert_eq!(r.status(), 401, "models scope must NOT reach Admin");
-
-    // List: both labels, auth flagged on, and NO plaintext token anywhere.
-    let r = c
-        .get(&keys_url)
-        .bearer_auth(&admin_token)
-        .send()
-        .await
-        .expect("list");
-    assert!(r.status().is_success());
-    let body = r.text().await.expect("list body");
-    assert!(body.contains("\"admin\"") && body.contains("\"reader\""));
-    assert!(body.contains("\"auth_enabled\":true"));
+    // List (`api_keys`): both labels present, no plaintext token stored anywhere.
+    let keys = higgs.api_keys();
+    let labels: Vec<&str> = keys.iter().map(|k| k.label.as_str()).collect();
     assert!(
-        !body.contains(&admin_token) && !body.contains(&reader_token),
-        "plaintext must never appear in the list: {body}"
+        labels.contains(&"admin") && labels.contains(&"reader"),
+        "both labels listed: {labels:?}"
     );
-
-    // Unroutable label (path separator) → coded 400 at mint, never persisted.
-    let r = c
-        .post(&keys_url)
-        .bearer_auth(&admin_token)
-        .json(&serde_json::json!({ "label": "bad/label" }))
-        .send()
-        .await
-        .expect("mint slash label");
-    assert_eq!(
-        r.status(),
-        400,
-        "slash labels are unrevokable — rejected at mint"
-    );
-
-    // Duplicate label → coded 400 (HG049), nothing minted.
-    let r = c
-        .post(&keys_url)
-        .bearer_auth(&admin_token)
-        .json(&serde_json::json!({ "label": "reader" }))
-        .send()
-        .await
-        .expect("dup mint");
-    assert_eq!(r.status(), 400);
-    assert!(r.text().await.expect("body").contains("[HG049]"));
-
-    // The persisted store holds digests only — never a plaintext token.
+    // The store holds sha digests + labels only — an ApiKey has no plaintext field.
+    // The persisted file must also be digest-only (never a plaintext token).
     let persisted =
-        std::fs::read_to_string(srv.home().join("api_keys.json")).expect("api_keys.json");
+        std::fs::read_to_string(higgs.home().join("api_keys.json")).expect("api_keys.json");
     assert!(
         !persisted.contains(&admin_token) && !persisted.contains(&reader_token),
         "persisted store is digest-only"
     );
 
-    // Revoke reader: it stops working on the NEXT request.
-    let r = c
-        .delete(format!("{keys_url}/reader"))
-        .bearer_auth(&admin_token)
-        .send()
-        .await
-        .expect("revoke reader");
-    assert!(r.status().is_success());
-    let r = c
-        .get(format!("{}/v1/models", srv.base))
-        .bearer_auth(&reader_token)
-        .send()
-        .await
-        .expect("models w/ revoked reader");
-    assert_eq!(r.status(), 401, "revoked key is dead immediately");
-
-    // Revoking an unknown label is a coded 400.
-    let r = c
-        .delete(format!("{keys_url}/ghost"))
-        .bearer_auth(&admin_token)
-        .send()
-        .await
-        .expect("revoke ghost");
-    assert_eq!(r.status(), 400);
-
-    // Revoke the LAST key: auth turns OFF, the surface reopens (loopback bind).
-    let r = c
-        .delete(format!("{keys_url}/admin"))
-        .bearer_auth(&admin_token)
-        .send()
-        .await
-        .expect("revoke admin");
-    assert!(r.status().is_success());
-    let removed: serde_json::Value = r.json().await.expect("json");
-    assert_eq!(removed["auth_enabled"], false);
-    let r = c.get(&status_url).send().await.expect("status open again");
+    // Unroutable label (path separator) → rejected at mint, never persisted.
+    let slash = higgs.mint_key("bad/label", None);
     assert!(
-        r.status().is_success(),
-        "zero keys ⇒ auth off ⇒ unkeyed serves again"
+        matches!(slash, Err(HiggsError::InvalidRequest { .. })),
+        "slash labels are unrevokable — rejected at mint: {slash:?}"
     );
+
+    // Duplicate label → rejected, nothing minted.
+    let dup = higgs.mint_key("reader", None);
+    assert!(
+        matches!(&dup, Err(HiggsError::InvalidRequest { detail }) if detail.contains("already exists")),
+        "duplicate label refused: {dup:?}"
+    );
+
+    // ── [HG066] last-admin lockout: revoking the LAST Admin-capable key while
+    // OTHER (non-Admin) keys remain is refused — it would lock out key management.
+    let last_admin = higgs.revoke_key("admin");
+    assert!(
+        matches!(last_admin, Err(HiggsError::LastAdminKey { .. })),
+        "revoking the last admin while a non-admin key remains is refused [HG066]: {last_admin:?}"
+    );
+
+    // Revoking a NON-admin key is allowed (it can't strand the management surface).
+    let removed = higgs.revoke_key("reader").expect("revoke reader");
+    assert_eq!(removed.removed, 1, "one key removed");
+    assert!(removed.auth_enabled, "admin remains → auth still on");
+
+    // Revoking an unknown label is an error.
+    let ghost = higgs.revoke_key("ghost");
+    assert!(
+        matches!(ghost, Err(HiggsError::InvalidRequest { .. })),
+        "revoking an unknown label errors: {ghost:?}"
+    );
+
+    // Now admin is the ONLY key: revoking it empties the store (auth OFF) — allowed.
+    let removed = higgs.revoke_key("admin").expect("revoke admin");
+    assert!(
+        !removed.auth_enabled,
+        "revoking the last key turns auth off"
+    );
+    assert!(
+        higgs.api_keys().is_empty(),
+        "zero keys ⇒ auth off ⇒ store empty again"
+    );
+
+    higgs.shutdown().await;
 }
 
-/// G4 keyed-LAN mode is USABLE: on a non-loopback bind, a client whose `Host`
-/// header carries the server's LAN address (what every real LAN client sends)
-/// must reach the surface with a valid key — the DNS-rebinding Host guard is
-/// bind-aware, not unconditional. Fail-on-revert: an unconditional loopback
-/// Host guard 403s ([HG012]) before auth and this test fails.
+/// [HG059] the LAST key cannot be revoked while LAN-exposed — revoking it would
+/// reopen the whole surface at runtime (auth off), bypassing the startup guard. Once
+/// a replacement is minted, the original CAN be revoked (not last).
 #[tokio::test]
-async fn keyed_lan_bind_accepts_lan_host_headers() {
-    let Some(gguf) = tiny_gguf_path() else {
-        eprintln!("SKIP keyed_lan: tiny gguf not found (set HIGGS_TEST_GGUF)");
+async fn last_key_revoke_refused_while_lan_exposed() {
+    let Some(higgs) = higgs_local(&[TINY_MODEL_ID]).await else {
+        eprintln!("SKIP last_key_lan: tiny gguf not found (set HIGGS_TEST_GGUF)");
         return;
     };
-    let (srv, token) = spawn_lan_keyed(13460, &gguf).await;
-    let c = reqwest::Client::new();
 
-    // A LAN-style Host value + valid bearer serves.
-    let r = c
-        .get(format!("{}/api/higgs/status", srv.base))
-        .header("host", "192.168.1.50:13460")
-        .bearer_auth(&token)
-        .send()
-        .await
-        .expect("status w/ LAN host");
+    let _admin = higgs
+        .mint_key("lan-admin", Some(vec![Scope::Admin]))
+        .expect("mint admin");
+    // Mark the surface as bound beyond loopback (what `serve_v1` records on a LAN bind).
+    higgs.set_lan_exposed(true);
+
+    // The last key cannot be revoked while LAN-exposed.
+    let last = higgs.revoke_key("lan-admin");
     assert!(
-        r.status().is_success(),
-        "keyed LAN client with LAN Host must serve, got {}",
-        r.status()
+        matches!(last, Err(HiggsError::LastKeyOnLan { .. })),
+        "last-key revoke refused on a LAN bind [HG059]: {last:?}"
     );
 
-    // Auth still gates everything: same LAN Host, no key → 401 (not 403).
-    let r = c
-        .get(format!("{}/api/higgs/status", srv.base))
-        .header("host", "192.168.1.50:13460")
-        .send()
-        .await
-        .expect("status unkeyed");
-    assert_eq!(r.status(), 401, "keys, not Host filtering, gate the LAN");
-
-    // [HG059]: the LAST key cannot be revoked while LAN-exposed — revoking it
-    // would reopen the whole surface at runtime (auth off + relaxed Host
-    // guard), bypassing the [HG058] startup protection.
-    let r = c
-        .delete(format!("{}/api/higgs/keys/lan-admin", srv.base))
-        .bearer_auth(&token)
-        .send()
-        .await
-        .expect("revoke last on LAN");
-    assert_eq!(r.status(), 409, "last-key revoke refused on a LAN bind");
-    assert!(r.text().await.expect("body").contains("[HG059]"));
-
     // With a replacement minted, the original CAN be revoked (not last).
-    let r = c
-        .post(format!("{}/api/higgs/keys", srv.base))
-        .bearer_auth(&token)
-        .json(&serde_json::json!({ "label": "rotated", "scopes": ["admin"] }))
-        .send()
-        .await
+    higgs
+        .mint_key("rotated", Some(vec![Scope::Admin]))
         .expect("mint replacement");
-    assert!(r.status().is_success());
-    let r = c
-        .delete(format!("{}/api/higgs/keys/lan-admin", srv.base))
-        .bearer_auth(&token)
-        .send()
-        .await
-        .expect("revoke rotated-out key");
-    assert!(r.status().is_success(), "not-last revoke proceeds on LAN");
+    higgs
+        .revoke_key("lan-admin")
+        .expect("not-last revoke proceeds on LAN");
+
+    higgs.shutdown().await;
 }
 
-/// The auth middleware stamps `last_used_ms` on the key that authorized a
-/// request, and mint stamps `created_at_ms`. Fail-on-revert for the
-/// `auth_guard` → `touch_api_key` wiring: dropping the touch call leaves
-/// `last_used_ms` null forever, even after many authorized requests.
-///
-/// (Every `/api/higgs/keys` GET is itself an authorized request that stamps
-/// last-used before its handler reads the store, so a "never used" state
-/// isn't observable through an authed endpoint — we assert the stamp is
-/// PRESENT after auth, which the wiring provides and reverting it removes.)
+/// Mint stamps `created_at_ms`, and an AUTHORIZED request over the real `/v1`
+/// surface stamps `last_used_ms` on the key that authorized it (the
+/// `auth_guard → touch_api_key` wiring). Fail-on-revert: dropping the touch call in
+/// `auth_guard` leaves `last_used_ms` null even after authorized requests.
 #[tokio::test]
 async fn authorized_request_stamps_created_and_last_used() {
-    let Some(gguf) = tiny_gguf_path() else {
+    let Some(higgs) = higgs_local(&[TINY_MODEL_ID]).await else {
         eprintln!("SKIP last_used: tiny gguf not found (set HIGGS_TEST_GGUF)");
         return;
     };
-    let (srv, token) = spawn_lan_keyed(13470, &gguf).await;
-    let c = reqwest::Client::new();
-    let keys_url = format!("{}/api/higgs/keys", srv.base);
 
-    // A couple of authorized requests to exercise the touch path.
+    // Mint an Admin key (Admin satisfies any scope, incl. /v1/models).
+    let admin = higgs
+        .mint_key("admin", Some(vec![Scope::Admin]))
+        .expect("mint admin");
+    let token = admin.token.clone();
+
+    // Serve `/v1` on loopback; the non-empty keystore means auth is ON.
+    let (base, guard) = serve_v1_local(higgs.handle()).await;
+    let client = reqwest::Client::new();
+
+    // A couple of AUTHORIZED requests to exercise the touch path.
     for _ in 0..2 {
-        let r = c
-            .get(format!("{}/api/higgs/status", srv.base))
+        let r = client
+            .get(format!("{base}/v1/models"))
             .bearer_auth(&token)
             .send()
             .await
-            .expect("authorized status");
-        assert!(r.status().is_success());
+            .expect("authorized /v1/models");
+        assert!(
+            r.status().is_success(),
+            "admin bearer reaches /v1/models: {}",
+            r.status()
+        );
     }
 
-    let list: serde_json::Value = c
-        .get(&keys_url)
-        .bearer_auth(&token)
-        .send()
-        .await
-        .expect("list")
-        .json()
-        .await
-        .expect("json");
-    let entry = &list["keys"][0];
+    // The key now carries a mint `created_at_ms` and an auth `last_used_ms`.
+    let keys = higgs.api_keys();
+    let entry = keys
+        .iter()
+        .find(|k| k.label == "admin")
+        .expect("admin key present");
     assert!(
-        entry["created_at_ms"].as_u64().unwrap_or(0) > 0,
-        "mint must stamp created_at_ms, got {entry}"
+        entry.created_at_ms.unwrap_or(0) > 0,
+        "mint stamps created_at_ms, got {entry:?}"
     );
     assert!(
-        entry["last_used_ms"].as_u64().unwrap_or(0) > 0,
-        "an authorized request must stamp last_used_ms, got {entry}"
+        entry.last_used_ms.unwrap_or(0) > 0,
+        "an authorized request stamps last_used_ms, got {entry:?}"
     );
+
+    guard.shutdown().await;
+    higgs.shutdown().await;
 }

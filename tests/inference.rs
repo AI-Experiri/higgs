@@ -1,20 +1,17 @@
-//! Black-box integration test for higgs's OpenAI `/v1/*` inference surface.
+//! In-process integration test for higgs's OpenAI `/v1/*` inference surface.
 //!
-//! Spawns the real `higgs`, loads a tiny on-disk model, and exercises chat
-//! (non-streaming + streaming) plus `/v1/models` and the request-validation
-//! paths. The model is `ggml-org`'s ~1MB `stories260K.gguf` (see `common`): a
-//! real llama-arch toy GGUF that loads and generates, so the full template →
-//! tokenize → decode → detokenize engine path is covered in CI.
-//!
-//! The tiny model embeds NO chat template (the engine falls back to chatml) and
-//! has no tool-call training, so tool calling is covered at the REQUEST-path
-//! level — tools are offered and accepted, the response is well-formed, and no
-//! tool-call markup leaks into the stream — without asserting the toy model
-//! emits a real structured call (which only a tool-trained model would).
+//! higgs is a library: `/v1` is the ONLY HTTP surface it serves. This test binds
+//! the real `serve_v1` router on an ephemeral loopback port (`serve_v1_local`) over
+//! an in-process `Higgs` whose worker runs REAL llama.cpp via the `worker_exe` seam,
+//! then drives chat (non-streaming + streaming), `/v1/models`, and the
+//! request-validation paths exactly as an external client would. The three CONTROL
+//! steps (prepare, explicit reload, token-logging toggle) run through the in-process
+//! facade — the `/api/higgs/*` HTTP surface is gone.
 
 mod common;
 
-use common::{spawn_with_tiny_model, tiny_gguf_path, TINY_MODEL_ID};
+use common::{higgs_local, serve_v1_local, TINY_MODEL_ID};
+use higgs::{LogSettings, TuneRequest};
 use serde_json::{json, Value};
 
 /// The get_weather tool used by the tool-path assertions.
@@ -35,40 +32,37 @@ fn weather_tool() -> Value {
 
 #[tokio::test]
 async fn inference_and_tools() {
-    let Some(gguf) = tiny_gguf_path() else {
+    let Some(higgs) = higgs_local(&[TINY_MODEL_ID]).await else {
         eprintln!("SKIP inference_and_tools: tiny gguf not found (set HIGGS_TEST_GGUF)");
         return;
     };
-    let srv = spawn_with_tiny_model(11501, &gguf).await;
-    common::prepare_tiny(&srv.base).await;
-    let c = reqwest::Client::new();
     let id = TINY_MODEL_ID;
 
-    // The staged tiny model is discoverable via the live scan.
-    let models: Value = c
-        .get(format!("{}/api/higgs/models", srv.base))
-        .send()
+    // Prepare (tune) so a subsequent JIT chat is allowed by the readiness gate.
+    higgs
+        .tune(TuneRequest {
+            id: id.to_owned(),
+            mode: None,
+            budget: None,
+            pins: None,
+        })
         .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+        .expect("prepare (tune) the tiny model");
+
+    // The staged tiny model is discoverable via the live scan (control facade).
+    let entries = higgs.model_entries().await.expect("model_entries");
     assert!(
-        models["models"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|m| m["id"] == json!(id)),
+        entries.iter().any(|m| m.model.id == id),
         "scan lists the staged tiny model"
     );
 
+    // Serve the real `/v1` router on an ephemeral loopback port.
+    let (base, guard) = serve_v1_local(higgs.handle()).await;
+    let c = reqwest::Client::new();
+
     // ── /v1/models lists the SERVABLE (prepared, unloaded) tiny model ─────────
-    // JIT truth: a chat against a servable model succeeds (the gate loads it on
-    // demand), so it is advertised BEFORE any load. The dedicated fail-on-revert
-    // coverage lives in tests/v1_models_servable.rs; this pins the same contract
-    // on the inference path (prepare_tiny ran above).
     let listed: Value = c
-        .get(format!("{}/v1/models", srv.base))
+        .get(format!("{base}/v1/models"))
         .send()
         .await
         .unwrap()
@@ -86,10 +80,8 @@ async fn inference_and_tools() {
     );
 
     // ── Chat for an UNKNOWN model id → 404 OpenAI error envelope ──────────────
-    // JIT is on by default, but JIT only loads a SCANNED id; an unknown id is a
-    // 404 `model_not_found`, never a load attempt.
     let unknown = c
-        .post(format!("{}/v1/chat/completions", srv.base))
+        .post(format!("{base}/v1/chat/completions"))
         .json(&json!({
             "model": "no-such-org/no-such-model", "stream": false,
             "messages": [{ "role": "user", "content": "hi" }]
@@ -109,10 +101,8 @@ async fn inference_and_tools() {
     );
 
     // ── JIT auto-load: chat for a SCANNED-but-unloaded model loads it on demand.
-    // This exercises the v1 JIT path (scan → load → serve) end-to-end against the
-    // real engine, distinct from the explicit `/api/higgs/models/load` below.
     let jit: Value = c
-        .post(format!("{}/v1/chat/completions", srv.base))
+        .post(format!("{base}/v1/chat/completions"))
         .json(&json!({
             "model": id, "stream": false,
             "messages": [{ "role": "user", "content": "hi" }]
@@ -128,19 +118,13 @@ async fn inference_and_tools() {
         "JIT-loaded chat returns content: {jit:?}"
     );
 
-    // Explicitly (re)load via the control surface — idempotent when already
+    // Explicitly (re)load via the CONTROL facade — idempotent when already
     // resident; keeps the rest of the test on the explicit-load contract.
-    let load = c
-        .post(format!("{}/api/higgs/models/load", srv.base))
-        .json(&json!({ "id": id }))
-        .send()
-        .await
-        .unwrap();
-    assert!(load.status().is_success(), "model load succeeded");
+    higgs.load(id, None).await.expect("model load succeeded");
 
     // /v1/models lists the loaded model.
     let v1models: Value = c
-        .get(format!("{}/v1/models", srv.base))
+        .get(format!("{base}/v1/models"))
         .send()
         .await
         .unwrap()
@@ -157,7 +141,7 @@ async fn inference_and_tools() {
     );
 
     let chat = |body: Value| {
-        c.post(format!("{}/v1/chat/completions", srv.base))
+        c.post(format!("{base}/v1/chat/completions"))
             .json(&body)
             .send()
     };
@@ -193,7 +177,6 @@ async fn inference_and_tools() {
     );
 
     // ── Multi-turn messages + BOTH max_tokens and max_completion_tokens ───────
-    // max_completion_tokens wins when both are set; a small cap → finish "length".
     let resp: Value = chat(json!({
         "model": id, "stream": false,
         "max_tokens": 200, "max_completion_tokens": 8,
@@ -223,8 +206,6 @@ async fn inference_and_tools() {
     );
 
     // ── Diverse message roles + array content parts (messages_to_pairs) ───────
-    // developer + system + array-of-text user + assistant + tool roles all map
-    // to (role, text) pairs without rejection.
     let resp: Value = chat(json!({
         "model": id, "stream": false,
         "max_completion_tokens": 8,
@@ -249,7 +230,7 @@ async fn inference_and_tools() {
 
     // ── A non-text content part (image_url) → 400 invalid_request_error ───────
     let img = c
-        .post(format!("{}/v1/chat/completions", srv.base))
+        .post(format!("{base}/v1/chat/completions"))
         .json(&json!({
             "model": id, "stream": false,
             "messages": [{
@@ -272,7 +253,7 @@ async fn inference_and_tools() {
 
     // ── Malformed request: missing `model` field → 4xx (no 5xx, no panic) ─────
     let bad = c
-        .post(format!("{}/v1/chat/completions", srv.base))
+        .post(format!("{base}/v1/chat/completions"))
         .json(&json!({
             "messages": [{ "role": "user", "content": "hi" }]
         }))
@@ -286,9 +267,6 @@ async fn inference_and_tools() {
     );
 
     // ── Tool REQUEST path (non-streaming) ─────────────────────────────────────
-    // The tiny model has no tool training, so we don't require a structured call;
-    // we require the tools-bearing request to succeed and return a well-formed
-    // choice (either plain content or a tool_calls array — never both empty).
     let resp = chat(json!({
         "model": id, "stream": false,
         "messages": [{ "role": "user", "content": "What is the weather in Paris? Use the get_weather tool." }],
@@ -341,9 +319,6 @@ async fn inference_and_tools() {
     );
 
     // ── Streaming tool request (SSE) ──────────────────────────────────────────
-    // The structured tool call depends on tool training the toy model lacks, so
-    // we assert the stream is well-formed and never leaks raw tool-call markup
-    // into the content deltas — the invariant that must hold for ANY model.
     let body = chat(json!({
         "model": id, "stream": true,
         "messages": [{ "role": "user", "content": "What is the weather in Paris? Use the get_weather tool." }],
@@ -365,8 +340,6 @@ async fn inference_and_tools() {
     );
 
     // ── Sampling-parameter passthrough (non-streaming) ────────────────────────
-    // A request carrying the full OpenAI sampling surface must parse and succeed —
-    // exercises the param-extraction branches in the /v1 handler.
     let resp: Value = chat(json!({
         "model": id, "stream": false,
         "messages": [{ "role": "user", "content": "Tell a very short story." }],
@@ -404,9 +377,6 @@ async fn inference_and_tools() {
         body.contains("[DONE]"),
         "usage stream terminates with [DONE]"
     );
-    // Find the terminal usage chunk: a `data:` line whose `usage` is a NON-null object with
-    // real token counts (not the per-chunk `"usage":null`). This is the OpenAI include_usage
-    // contract the genai client relies on for streamed token accounting.
     let usage_chunk = body
         .lines()
         .filter_map(|l| l.strip_prefix("data: "))
@@ -426,7 +396,7 @@ async fn inference_and_tools() {
 
     // ── Streaming request for an UNKNOWN model → error before any stream opens ──
     let unknown_stream = c
-        .post(format!("{}/v1/chat/completions", srv.base))
+        .post(format!("{base}/v1/chat/completions"))
         .json(&json!({
             "model": "no-such-org/no-such-model", "stream": true,
             "messages": [{ "role": "user", "content": "hi" }]
@@ -442,7 +412,7 @@ async fn inference_and_tools() {
 
     // ── Zero max_tokens exercises the boundary branch (clamped or rejected, never 5xx) ──
     let zero = c
-        .post(format!("{}/v1/chat/completions", srv.base))
+        .post(format!("{base}/v1/chat/completions"))
         .json(&json!({
             "model": id, "stream": false, "max_tokens": 0,
             "messages": [{ "role": "user", "content": "hi" }]
@@ -457,26 +427,12 @@ async fn inference_and_tools() {
     );
 
     // ── Token logging ON + a tool-result conversation ─────────────────────────
-    // Turning on "Log Incoming Tokens" exercises the prompt/response logging path; the
-    // multi-turn history (assistant tool_call → tool result) exercises message + tool
-    // (de)serialization in the /v1 handler.
-    let cur: Value = c
-        .get(format!("{}/api/higgs/logs/settings", srv.base))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let mut on = cur.clone();
-    on["log_incoming_tokens"] = json!(true);
-    let put = c
-        .put(format!("{}/api/higgs/logs/settings", srv.base))
-        .json(&on)
-        .send()
-        .await
-        .unwrap();
-    assert!(put.status().is_success(), "enable token logging");
+    // Enable "Log Incoming Tokens" via the CONTROL facade, then exercise the
+    // prompt/response logging path with a multi-turn tool-result history.
+    higgs.set_logs_settings(&LogSettings {
+        log_incoming_tokens: true,
+        ..higgs.logs_settings()
+    });
 
     let resp = chat(json!({
         "model": id, "stream": false, "max_tokens": 8,
@@ -500,8 +456,8 @@ async fn inference_and_tools() {
         resp.status()
     );
 
-    // A STREAMING chat with token logging still on — exercises the streamed response
-    // logging path (log_served on the SSE branch).
+    // A STREAMING chat with token logging still on — exercises the streamed
+    // response logging path (log_served on the SSE branch).
     let body = chat(json!({
         "model": id, "stream": true, "max_tokens": 8,
         "messages": [{ "role": "user", "content": "One more line please." }]
@@ -516,8 +472,7 @@ async fn inference_and_tools() {
         "logged streaming chat still terminates"
     );
 
-    // A stop-sequence request exercises the stop-handling branch; the result must still be
-    // a well-formed completion with a known finish_reason.
+    // A stop-sequence request exercises the stop-handling branch.
     let resp: Value = chat(json!({
         "model": id, "stream": false, "max_tokens": 16,
         "messages": [{ "role": "user", "content": "Say: one two three four five." }],
@@ -535,4 +490,9 @@ async fn inference_and_tools() {
         ),
         "stop-sequence chat has a known finish_reason: {resp:?}"
     );
+
+    // Graceful teardown: drain the server (never leave an SSE stream open), then
+    // stop the facade's worker.
+    guard.shutdown().await;
+    higgs.shutdown().await;
 }

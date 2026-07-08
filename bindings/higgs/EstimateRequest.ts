@@ -5,7 +5,8 @@ import type { KvCacheKind } from "./KvCacheKind";
 import type { ResourceBudget } from "./ResourceBudget";
 
 /**
- * Request for `POST /api/higgs/models/estimate`: the memory footprint of a
+ * Request for the `estimate` control-op (`Higgs::estimate`, formerly
+ * `POST /api/higgs/models/estimate`): the memory footprint of a
  * CANDIDATE load (the user's current context window / KV types / GPU offload),
  * so the UI shows "≈ X GiB VRAM · Fits/Tight/Overflow" live as they edit. Pure +
  * cheap (no model load) — higgs OWNS the formula (reuses the suggester's VRAM/RAM

@@ -1,8 +1,8 @@
 use super::{
     bearer_token, host_allowed, http_status, is_local_origin, is_loopback_host, required_scope,
-    serve_with_shutdown,
+    serve_v1, v1_router,
 };
-use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 
 use std::sync::Arc;
 
@@ -11,53 +11,18 @@ use crate::keys::Scope;
 
 #[test]
 fn required_scope_maps_routes() {
-    assert_eq!(required_scope(&Method::GET, "/health"), None);
-    assert_eq!(required_scope(&Method::GET, "/api/higgs/health"), None);
-    assert_eq!(
-        required_scope(&Method::POST, "/v1/chat/completions"),
-        Some(Scope::Chat)
-    );
-    assert_eq!(
-        required_scope(&Method::GET, "/v1/models"),
-        Some(Scope::Models)
-    );
-    assert_eq!(
-        required_scope(&Method::GET, "/api/higgs/models"),
-        Some(Scope::Models)
-    );
-    assert_eq!(
-        required_scope(&Method::GET, "/api/higgs/models/org/m"),
-        Some(Scope::Models)
-    );
-    // mutations + management → Admin
-    assert_eq!(
-        required_scope(&Method::POST, "/api/higgs/models/load"),
-        Some(Scope::Admin)
-    );
-    assert_eq!(
-        required_scope(&Method::GET, "/api/higgs/nodes"),
-        Some(Scope::Admin)
-    );
-    assert_eq!(
-        required_scope(&Method::POST, "/api/higgs/models"),
-        Some(Scope::Admin)
-    );
+    // Only the `/v1` surface is served now: health is open, chat → Chat, models
+    // listing → Models, and any other `/v1/*` path is Admin (fail-closed default).
+    assert_eq!(required_scope("/health"), None);
+    assert_eq!(required_scope("/v1/chat/completions"), Some(Scope::Chat));
+    assert_eq!(required_scope("/v1/models"), Some(Scope::Models));
+    // Any other `/v1/*` path → Admin (fail-closed).
+    assert_eq!(required_scope("/v1/anything-else"), Some(Scope::Admin));
     // unknown path → open (routing 404s it)
-    assert_eq!(required_scope(&Method::GET, "/random"), None);
-    // G4 key management: Admin via the fail-closed /api/higgs/* default — a
-    // key-management route must never be reachable with a lesser scope.
-    assert_eq!(
-        required_scope(&Method::GET, "/api/higgs/keys"),
-        Some(crate::keys::Scope::Admin)
-    );
-    assert_eq!(
-        required_scope(&Method::POST, "/api/higgs/keys"),
-        Some(crate::keys::Scope::Admin)
-    );
-    assert_eq!(
-        required_scope(&Method::DELETE, "/api/higgs/keys/some-label"),
-        Some(crate::keys::Scope::Admin)
-    );
+    assert_eq!(required_scope("/random"), None);
+    // The `/api/higgs/*` control surface is gone — such a path matches no `/v1`
+    // arm, so it falls through to `None` (routing then 404s it).
+    assert_eq!(required_scope("/api/higgs/status"), None);
 }
 
 #[test]
@@ -86,7 +51,7 @@ fn loopback_host_matcher() {
     for h in [
         "127.0.0.1",
         "127.0.0.1:11434",
-        "127.0.0.5", // 127.0.0.0/8 — matches is_loopback_bind acceptance
+        "127.0.0.5", // 127.0.0.0/8 acceptance
         "127.0.0.5:11434",
         "localhost",
         "localhost:5173",
@@ -148,8 +113,10 @@ fn host_allowed_rejects_non_utf8_value() {
     assert_eq!(host_allowed(&h), Err("<non-utf8>".to_string()));
 }
 
-/// End-to-end through the real router: a foreign `Host` → 403, an oversized
-/// body → 413, and a loopback `Host` with a small body passes the guard.
+/// End-to-end through the real `/v1` router: a foreign `Host` → 403 (the guard
+/// runs before routing), and an oversized body → 413. Both hardening layers are
+/// shared by `v1_router`, so a `/v1` path exercises them just as the combined
+/// router once did.
 #[tokio::test]
 async fn router_host_guard_and_body_limit() {
     use super::test_support::make_app;
@@ -164,7 +131,7 @@ async fn router_host_guard_and_body_limit() {
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/api/higgs/status")
+                .uri("/v1/models")
                 .header("host", "evil.example.com")
                 .body(Body::empty())
                 .unwrap(),
@@ -179,7 +146,7 @@ async fn router_host_guard_and_body_limit() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/higgs/models/load")
+                .uri("/v1/chat/completions")
                 .header("host", "127.0.0.1:11434")
                 .header("content-type", "application/json")
                 .body(Body::from(big))
@@ -199,20 +166,17 @@ async fn health_is_cheap_200() {
     use tower::ServiceExt;
 
     let app = make_app();
-    for uri in ["/health", "/api/higgs/health"] {
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri(uri)
-                    .header("host", "127.0.0.1")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
-    }
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .header("host", "127.0.0.1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 #[test]
@@ -324,12 +288,12 @@ async fn auth_guard_rejects_missing_key_with_401_envelope() {
 
     let higgs = make_higgs();
     let mut keys = ApiKeys::default();
-    keys.add("hgk_secret", "test".into(), vec![Scope::Admin]);
+    keys.add("hgk_secret", "test".into(), vec![Scope::Models]);
     higgs.set_api_keys(Arc::new(keys));
-    let app = super::router(higgs);
+    let app = v1_router(higgs);
 
     let resp = app
-        .oneshot(super::test_support::get("/api/higgs/status"))
+        .oneshot(super::test_support::get("/v1/models"))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -359,17 +323,17 @@ async fn auth_guard_admits_authorized_key() {
 
     let higgs = make_higgs();
     let mut keys = ApiKeys::default();
-    keys.add("hgk_admin", "admin".into(), vec![Scope::Admin]);
+    keys.add("hgk_models", "models".into(), vec![Scope::Models]);
     higgs.set_api_keys(Arc::new(keys));
-    let app = super::router(higgs);
+    let app = v1_router(higgs);
 
-    // `/api/higgs/status` needs Admin; the Admin key authorizes it.
+    // `/v1/models` needs Models; the Models key authorizes it.
     let resp = app
         .oneshot(
             axum::http::Request::builder()
-                .uri("/api/higgs/status")
+                .uri("/v1/models")
                 .header("host", "127.0.0.1")
-                .header(axum::http::header::AUTHORIZATION, "Bearer hgk_admin")
+                .header(axum::http::header::AUTHORIZATION, "Bearer hgk_models")
                 .body(axum::body::Body::empty())
                 .unwrap(),
         )
@@ -392,13 +356,13 @@ async fn auth_guard_rejects_insufficient_scope() {
     let mut keys = ApiKeys::default();
     keys.add("hgk_chat", "chat".into(), vec![Scope::Chat]);
     higgs.set_api_keys(Arc::new(keys));
-    let app = super::router(higgs);
+    let app = v1_router(higgs);
 
-    // `/api/higgs/status` needs Admin; a Chat-only key does NOT authorize it.
+    // `/v1/models` needs Models; a Chat-only key does NOT authorize it.
     let resp = app
         .oneshot(
             axum::http::Request::builder()
-                .uri("/api/higgs/status")
+                .uri("/v1/models")
                 .header("host", "127.0.0.1")
                 .header(axum::http::header::AUTHORIZATION, "Bearer hgk_chat")
                 .body(axum::body::Body::empty())
@@ -423,7 +387,7 @@ async fn auth_guard_leaves_health_open() {
     let mut keys = ApiKeys::default();
     keys.add("hgk_admin", "admin".into(), vec![Scope::Admin]);
     higgs.set_api_keys(Arc::new(keys));
-    let app = super::router(higgs);
+    let app = v1_router(higgs);
 
     let resp = app
         .oneshot(super::test_support::get("/health"))
@@ -629,48 +593,14 @@ fn worker_rpc_maps_by_worker_code() {
     assert_eq!(http_status(&rpc(None)), StatusCode::INTERNAL_SERVER_ERROR);
 }
 
-/// [HG058] is enforced at the PUBLIC serving entrypoint, not only in
-/// `run_standalone`: a library caller handing `serve_with_shutdown` a
-/// non-loopback listener with an empty keystore must get a refusal, never an
-/// open server (auth off + relaxed Host guard). Fail-on-revert: dropping the
-/// entrypoint check serves happily and the Err assertion fails.
+/// [HG069] is enforced at the PUBLIC serving entrypoint ([`serve_v1`]): a
+/// non-loopback listener whose keystore holds only chat/models keys (NO Admin)
+/// locks out the Admin-only key-management API, so `serve_v1` must refuse it — a
+/// library caller handing us its own listener can't bypass it. Fail-on-revert:
+/// dropping the entrypoint admin-key check serves happily and the Err assertion
+/// fails. (The [HG058] keyless-LAN twin is `serve_v1_refuses_keyless_lan_listener`.)
 #[tokio::test]
-async fn serve_with_shutdown_refuses_keyless_lan_listener() {
-    // Start a facade with a RESIDENT model (an embedder that `start()`ed +
-    // loaded before handing us its listener), empty keystore.
-    let dir = tempfile::TempDir::new().unwrap();
-    super::test_support::write_gguf_fixture(dir.path(), "org/model");
-    let higgs = super::test_support::make_higgs_with_lmstudio(dir.path().to_path_buf());
-    higgs.load("org/model", None).await.expect("load");
-    assert!(
-        higgs.status().await.unwrap().loaded.is_some(),
-        "model resident before the refused serve"
-    );
-
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
-    let err = serve_with_shutdown(Arc::clone(&higgs), listener, async {})
-        .await
-        .expect_err("keyless non-loopback listener must be refused");
-    assert!(
-        err.to_string().contains("[HG058]"),
-        "refusal carries the code: {err}"
-    );
-    // The rejected serve must NOT leak the worker: stop() drained it (codex r11).
-    // Fail-on-revert: skipping stop() before the early return leaves it resident.
-    assert!(
-        higgs.status().await.unwrap().loaded.is_none(),
-        "the refused serve tore down the resident worker (no leak)"
-    );
-}
-
-/// [HG069] is ALSO enforced at the public serving entrypoint: a non-loopback
-/// listener whose keystore holds only chat/models keys (NO Admin) locks out the
-/// Admin-only key-management API, so `serve_with_shutdown` must refuse it — mirroring
-/// the guard `run_standalone` applies, so a library caller handing us its own
-/// listener can't bypass it. Fail-on-revert: dropping the entrypoint admin-key check
-/// serves happily and the Err assertion fails.
-#[tokio::test]
-async fn serve_with_shutdown_refuses_lan_listener_without_admin_key() {
+async fn serve_v1_refuses_lan_listener_without_admin_key() {
     let dir = tempfile::TempDir::new().unwrap();
     super::test_support::write_gguf_fixture(dir.path(), "org/model");
     let higgs = super::test_support::make_higgs_with_lmstudio(dir.path().to_path_buf());
@@ -685,7 +615,7 @@ async fn serve_with_shutdown_refuses_lan_listener_without_admin_key() {
     higgs.set_api_keys(Arc::new(keys));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
-    let err = serve_with_shutdown(Arc::clone(&higgs), listener, async {})
+    let err = serve_v1(Arc::clone(&higgs), listener, async {})
         .await
         .expect_err("non-loopback listener without an Admin key must be refused");
     assert!(
@@ -693,6 +623,154 @@ async fn serve_with_shutdown_refuses_lan_listener_without_admin_key() {
         "refusal carries the HG069 code: {err}"
     );
     // Same no-leak guarantee as the [HG058] path: the resident worker was torn down.
+    assert!(
+        higgs.status().await.unwrap().loaded.is_none(),
+        "the refused serve tore down the resident worker (no leak)"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Internal embedder token: jigglebot registers a hidden in-memory token via
+// `register_internal_token`; it authenticates over the NORMAL bearer path (no
+// special branch) and is invisible to the key-management list. Fail-on-revert:
+// reverting the internal-token wiring makes these fail.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn internal_token_authenticates_like_any_bearer() {
+    use super::test_support::{app_for, get, make_higgs, with_bearer};
+    use tower::ServiceExt;
+
+    let higgs = make_higgs();
+    higgs.register_internal_token("hgk_embedder", vec![crate::keys::Scope::Models]);
+
+    // With the internal token → a gated route (models list = Models scope) is allowed.
+    let app = app_for(higgs.clone());
+    let ok = app
+        .oneshot(with_bearer(get("/v1/models"), "hgk_embedder"))
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), axum::http::StatusCode::OK);
+
+    // A caller WITHOUT the token is refused now that auth is on.
+    let app = app_for(higgs);
+    let denied = app.oneshot(get("/v1/models")).await.unwrap();
+    assert_eq!(denied.status(), axum::http::StatusCode::UNAUTHORIZED);
+}
+
+/// The hidden internal token authenticates (auth is on) but is INVISIBLE to the
+/// key list — the key-management view (now a facade concern, `Higgs::api_keys()`)
+/// counts only `visible()` keys, so the embedder's in-memory token never appears.
+/// Fail-on-revert: reverting the internal-token `visible()` filter surfaces it in
+/// the count. (This was `GET /api/higgs/keys` before control moved in-process.)
+#[tokio::test]
+async fn internal_token_is_hidden_from_the_key_list() {
+    use super::test_support::make_higgs;
+
+    let higgs = make_higgs();
+    higgs.register_internal_token("hgk_embedder", vec![crate::keys::Scope::Admin]);
+
+    let keys = higgs.api_keys();
+    // Auth is ON (the store is non-empty), yet no VISIBLE key is listed.
+    assert!(!keys.is_empty(), "the internal token enables auth");
+    assert_eq!(
+        keys.visible().count(),
+        0,
+        "the hidden internal token must not appear in the visible key list"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// `/v1`-only router + serve entry (Task A2.1, ADDITIVE): `v1_router`/`serve_v1`
+// carry the OpenAI chat+models surface with NO `/api/higgs/*` control routes.
+// The control surface is ABSENT by construction (this router never had it), not
+// by deletion — and the HG058/HG069 keyless-LAN refusals survive the extraction.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `v1_router` serves `/v1/chat/completions` + `/v1/models` (401 without a
+/// bearer when the keystore is non-empty), and `/api/higgs/status` is genuinely
+/// ABSENT: even a valid Admin bearer 404s it (the route never existed on this
+/// router — it was never registered, not deleted). Fail-on-revert: if
+/// `v1_router` ever merged the `/api/higgs/*` group, the Admin-bearer status
+/// request would 200 instead of 404.
+#[tokio::test]
+async fn v1_router_serves_v1_and_omits_control_surface() {
+    use super::test_support::{get, make_higgs, post_json, with_bearer};
+    use crate::keys::ApiKeys;
+    use tower::ServiceExt;
+
+    let higgs = make_higgs();
+    let mut keys = ApiKeys::default();
+    keys.add(
+        "hgk_admin",
+        "admin".into(),
+        vec![Scope::Admin, Scope::Chat, Scope::Models],
+    );
+    higgs.set_api_keys(Arc::new(keys));
+    let app = v1_router(higgs);
+
+    // `/v1/models` needs Models; no bearer + non-empty keystore → 401.
+    let resp = app.clone().oneshot(get("/v1/models")).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "/v1/models no-bearer"
+    );
+
+    // `/v1/chat/completions` needs Chat; no bearer → 401 (auth runs before the
+    // handler, so the body need not be a valid chat request).
+    let resp = app
+        .clone()
+        .oneshot(post_json(
+            "/v1/chat/completions",
+            &serde_json::json!({"model": "org/model", "messages": []}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "/v1/chat/completions no-bearer"
+    );
+
+    // `/api/higgs/status` is ABSENT from `v1_router`: a VALID Admin bearer passes
+    // auth, then routing 404s it — proving the control surface isn't here.
+    let resp = app
+        .oneshot(with_bearer(get("/api/higgs/status"), "hgk_admin"))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "/api/higgs/status must 404 on v1_router even for an authorized admin"
+    );
+}
+
+/// [HG058] is enforced at the `serve_v1` entrypoint: a non-loopback (`0.0.0.0`)
+/// bind with an EMPTY keystore must be refused before serving (auth would be off
+/// AND the Host guard relaxed). Fail-on-revert: dropping the HG058 check from
+/// `serve_v1` serves happily and the `expect_err` fails.
+#[tokio::test]
+async fn serve_v1_refuses_keyless_lan_listener() {
+    let dir = tempfile::TempDir::new().unwrap();
+    super::test_support::write_gguf_fixture(dir.path(), "org/model");
+    let higgs = super::test_support::make_higgs_with_lmstudio(dir.path().to_path_buf());
+    higgs.load("org/model", None).await.expect("load");
+    assert!(
+        higgs.status().await.unwrap().loaded.is_some(),
+        "model resident before the refused serve"
+    );
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let err = serve_v1(Arc::clone(&higgs), listener, async {})
+        .await
+        .expect_err("keyless non-loopback listener must be refused");
+    assert!(
+        err.to_string().contains("[HG058]"),
+        "refusal carries the code: {err}"
+    );
+    // The refused serve tore the resident worker down (codex r11) rather than
+    // leaking it.
     assert!(
         higgs.status().await.unwrap().loaded.is_none(),
         "the refused serve tore down the resident worker (no leak)"

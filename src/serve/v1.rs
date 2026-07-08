@@ -33,13 +33,12 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
-use crate::api::{ChatOutcome, Higgs, LoadedInfo};
+use crate::api::{ChatOutcome, Higgs};
 use crate::diagnostic::HiggsError;
-use crate::worker::engine::CtxLen;
 
 use super::http_status;
 use super::stream;
-use super::{MAX_OUTPUT_TOKENS, PROMPT_BYTES_PER_TOKEN};
+use super::MAX_OUTPUT_TOKENS;
 
 /// Build the OpenAI error envelope `{"error":{message,type,code}}` for `/v1`.
 ///
@@ -50,7 +49,7 @@ use super::{MAX_OUTPUT_TOKENS, PROMPT_BYTES_PER_TOKEN};
 /// OpenAI-interop boundary, so host filesystem paths and bind addresses are
 /// stripped from the client-facing string. The full unredacted Display (with
 /// paths) is still logged server-side at the origin (four-pillar pillar 1) and
-/// returned verbatim on the `/api/higgs/*` control surface, which is ours.
+/// returned verbatim on the in-process control surface, which is ours.
 fn v1_envelope(status: StatusCode, message: &str) -> WrappedError {
     let kind = if status.is_client_error() {
         "invalid_request_error"
@@ -282,12 +281,17 @@ fn chatcmpl_id() -> String {
 /// The local node may host several models at once (additive load); each resident
 /// instance is one served id (`org/model`, `org/model-1`, …). Nothing loaded
 /// means an empty list — the correct OpenAI answer for "no models can serve chat
-/// right now" — so this never gates on liveness. `GET /api/higgs/status` still
+/// right now" — so this never gates on liveness. The `status` control-op still
 /// exposes `worker_alive` truthfully for diagnostics.
 pub(super) async fn v1_models(State(higgs): State<Arc<Higgs>>) -> Response {
     tracing::info!("higgs: GET /v1/models");
-    let mut data: Vec<Model> = higgs
-        .local_served_ids()
+    // The reachable-id UNION (local-served ∪ JIT-servable ∪ fleet-routed, minus a
+    // transiently-benchmarking local candidate) lives on the facade
+    // (`Higgs::chat_model_ids`); this handler is a thin caller mapping each id to
+    // the OpenAI `Model` envelope so the in-process embedder's model list and this
+    // endpoint cannot diverge.
+    let data: Vec<Model> = higgs
+        .chat_model_ids()
         .await
         .into_iter()
         .map(|id| Model {
@@ -297,48 +301,6 @@ pub(super) async fn v1_models(State(higgs): State<Arc<Higgs>>) -> Response {
             owned_by: "higgs".to_owned(),
         })
         .collect();
-    // Advertise SERVABLE catalog models too: JIT is on by default, so a chat
-    // against a prepared-and-fitting unloaded model succeeds (higgs loads it on
-    // demand) — the list must match what chat can actually reach. Unservable /
-    // unprepared / stale-profile models stay hidden (the JIT gate refuses them).
-    // …but ONLY while the JIT gate is ON: with JIT disabled, an unloaded
-    // servable model is NOT reachable (`ensure_loaded` refuses instead of
-    // loading), so advertising it would break this endpoint's contract.
-    if higgs.jit_enabled() {
-        for id in higgs.servable_model_ids().await {
-            if !data.iter().any(|m| m.id == id) {
-                data.push(Model {
-                    id,
-                    object: "model".to_owned(),
-                    created: now_secs(),
-                    owned_by: "higgs".to_owned(),
-                });
-            }
-        }
-    }
-    // Also advertise remote-resident models — they are valid chat targets routed
-    // through the fleet (skip any already listed by a local worker). Collect the
-    // remote-served ids so the benchmark filter below can spare them.
-    let remote_ids: std::collections::HashSet<String> = match higgs.fleet() {
-        Some(fleet) => fleet.routed_models().await.into_iter().collect(),
-        None => std::collections::HashSet::new(),
-    };
-    for id in &remote_ids {
-        if !data.iter().any(|m| &m.id == id) {
-            data.push(Model {
-                id: id.clone(),
-                object: "model".to_owned(),
-                created: now_secs(),
-                owned_by: "higgs".to_owned(),
-            });
-        }
-    }
-    // A model being BENCHMARKED (Turbotune) can't be served from its transiently-resident
-    // LOCAL candidate — `ensure_loaded` refuses ([HG068]) so `/v1/models` shouldn't
-    // advertise it. BUT if a connected remote node ALSO serves the id, chat routes there
-    // (dispatch skips the local candidate and falls through to the fleet — codex r10), so
-    // it stays reachable: keep it in the listing (codex r12).
-    data.retain(|m| !higgs.is_benchmarking(&m.id) || remote_ids.contains(&m.id));
     Json(ListModelResponse {
         object: "list".to_owned(),
         data,
@@ -375,7 +337,7 @@ pub(super) async fn v1_chat_completions(
 
     // Serving gate: when serving is toggled off, the /v1 inference surface
     // refuses with [HG019] → 503 (rendered the same way as every other chat-
-    // boundary HiggsError). The /api/higgs/* control surface stays reachable so
+    // boundary HiggsError). The in-process control surface stays reachable so
     // the user can re-enable. Checked before the loaded-model gate so no JIT
     // load or worker RPC runs while serving is off.
     if !higgs.serving_enabled() {
@@ -384,12 +346,19 @@ pub(super) async fn v1_chat_completions(
         return v1_error(&err).into_response();
     }
 
+    // The RAW `messages` array rides to the chat template verbatim (typed
+    // validation already passed above), so extension fields the typed structs
+    // would drop — assistant `reasoning_content` — reach the template render. It
+    // is computed BEFORE the gate so the shared facade gate (`prepare_chat`) can
+    // estimate the prompt from the same bytes.
+    let messages_json = raw_messages_json(&raw);
+
     // Gate + validation: the named model must be loaded, and sampling / prompt /
     // content checks pass — each maps to its own status. Any failure short-circuits.
     // Returns the resolved (now-resident) model id, which binds the chat dispatch:
     // the worker rejects (HG018) if a concurrent JIT load swaps it out before
     // generation, so a swap errors instead of serving the wrong model.
-    let (resolved_model, max_tokens) = match gate_and_validate(&higgs, &req).await {
+    let (resolved_model, max_tokens) = match gate_and_validate(&higgs, &req, &messages_json).await {
         Ok(pair) => pair,
         Err(resp) => return resp,
     };
@@ -402,10 +371,6 @@ pub(super) async fn v1_chat_completions(
         log_incoming(&req.model, &req.messages);
     }
 
-    // The RAW `messages` array rides to the chat template verbatim (typed
-    // validation already passed above), so extension fields the typed structs
-    // would drop — assistant `reasoning_content` — reach the template render.
-    let messages_json = raw_messages_json(&raw);
     let tools_json = match serialize_tools(&req) {
         Ok(t) => t,
         Err(resp) => return *resp,
@@ -501,175 +466,6 @@ pub(super) async fn v1_chat_completions(
     }
 }
 
-/// Resolve the model that will serve this chat, loading it on demand when JIT
-/// is on. Returns the [`LoadedInfo`] of the now-resident requested model, or an
-/// `Err(response)` carrying the mapped failure.
-///
-/// - Requested model already loaded LOCALLY → returns its [`LoadedInfo`] (no load).
-/// - Else remote-resident → permissive [`LoadedInfo`] (the fleet routes it).
-/// - Not loaded and JIT OFF → 404 `[HG003]` `ModelNotLoaded` (explicit-load).
-/// - Not loaded and JIT ON → JIT path: the id must be a scanned model
-///   (`[HG002]` `ModelNotFound` → 404 otherwise — never attempt to load an
-///   unknown id), then [`Higgs::load`] loads it with host defaults. The local node
-///   is multi-model, so the load is ADDITIVE (a fresh worker, idempotent per model)
-///   — it does not swap out other models. `load()` takes the lifecycle mutex,
-///   serializing concurrent JIT loads. A load failure (insufficient memory
-///   `[HG017]` → 503, bad GGUF, worker spawn failure, …) surfaces as its mapped
-///   error — NOT a silent 404.
-///
-/// LOCAL-first: a locally-served id wins over a remote one of the same name, so a
-/// model the user explicitly loaded locally is preferred (and stays consistent with
-/// `chat_stream` + `/v1/models`, which are also local-first).
-async fn ensure_loaded(higgs: &Arc<Higgs>, model: &str) -> Result<LoadedInfo, Response> {
-    // Already locally served (by served id) — serve it, no load. The local node is
-    // multi-model: this resolves the SPECIFIC resident instance (`org/model`,
-    // `org/model-1`, …), so a chat for an already-loaded model never re-loads.
-    // Benchmark exclusivity ([HG068]): a model being BENCHMARKED (Turbotune) is owned
-    // by the bench, which loads/unloads candidate configs to measure them. The check is
-    // AFTER the awaited resident lookup — not before it: a benchmark could start and make
-    // its candidate TRANSIENTLY resident during that await, so a pre-check would go stale
-    // (codex r7). `begin_benchmark` sets the flag BEFORE loading any candidate, so a
-    // resident benchmark worker always trips this.
-    let local_bench_candidate = if let Some(loaded) = higgs.local_loaded_info(model).await {
-        if !higgs.is_benchmarking(model) {
-            return Ok(loaded);
-        }
-        // The resident worker is a benchmark candidate — do NOT serve from it (the bench
-        // unloads it between candidates). But don't refuse outright yet: a REMOTE node may
-        // still serve this id (the dispatch path skips bench-owned local workers and falls
-        // through to the fleet). Fall through to the remote check below; refuse ([HG068])
-        // only if nothing else can serve it (codex r10). The bench's OWN measurement calls
-        // `chat_stream` directly (not this serve path), so it is unaffected.
-        true
-    } else {
-        false
-    };
-
-    // Remote-resident model: the fleet routes the chat to its node, so skip the LOCAL
-    // scan/JIT gate (which would 404 it as HG003/HG002). The remote worker enforces the
-    // exact prompt-vs-context check (HG005), so we report a permissive `ctx_len` here and
-    // defer prompt-fit to it.
-    let is_remote = match higgs.fleet() {
-        Some(f) => f.is_remote(model).await,
-        None => false,
-    };
-    if is_remote {
-        return Ok(LoadedInfo {
-            id: model.to_owned(),
-            worker_id: 0, // remote-resident placeholder — the fleet routes it, no local worker
-            // Remote-resident: the fleet routes it; we have no local probe, so the LIVE
-            // params are unknown. `None` keeps the local prompt-fit gate permissive (the
-            // remote worker's [HG005] is the backstop).
-            ctx_len: None,
-            gpu_layers: None,
-            threads: None,
-            arch: None,
-            quant: None,
-            max_context_length: None,
-            size_bytes: None,
-            has_chat_template: None,
-            idle_ttl_minutes: None,
-        });
-    }
-
-    // A benchmark owns this model AND no remote node serves the id: NOW refuse
-    // ([HG068]) rather than fall through. The re-check on the raw flag covers the
-    // BETWEEN-CANDIDATES phase (flag set, no worker resident — `local_bench_candidate`
-    // is false then): without it a JIT-off chat would flap to the HG003 404 there,
-    // making the public error depend on the benchmark phase (codex r18). With JIT on
-    // the load path's own gate refuses identically, so the code is consistent either
-    // way. Retry once the benchmark finishes.
-    if local_bench_candidate || higgs.is_benchmarking(model) {
-        return Err(v1_error(&HiggsError::BenchInProgress {
-            id: model.to_owned(),
-        })
-        .into_response());
-    }
-
-    // Not loaded. With JIT off, keep the explicit-load behavior: 404 [HG003].
-    if !higgs.jit_enabled() {
-        let err = HiggsError::ModelNotLoaded {
-            id: model.to_owned(),
-        };
-        tracing::warn!(model = %model, "higgs: chat for unloaded model (JIT off)");
-        return Err(v1_error(&err).into_response());
-    }
-
-    // JIT path. The requested id must be a scanned model — never try to load an
-    // unknown id (that is a [HG002] 404, not a load attempt). A suffixed served id
-    // (`org/model-1`) is never a scanned id, so it can't be JIT-loaded — only an
-    // already-resident extra instance is addressable by its suffix.
-    let scanned = match higgs.scan().await {
-        Ok(models) => models,
-        Err(err) => {
-            tracing::warn!(error = %err, "higgs: JIT scan failed");
-            return Err(v1_error(&err).into_response());
-        }
-    };
-    if !scanned.iter().any(|m| m.id == model) {
-        let err = HiggsError::ModelNotFound {
-            id: model.to_owned(),
-        };
-        tracing::warn!(model = %model, "higgs: JIT chat for unknown model");
-        return Err(v1_error(&err).into_response());
-    }
-
-    // Readiness gate: JIT only loads a model that has been Prepared (a fresh,
-    // canonical tuning profile). An un-profiled or stale model is REFUSED with a
-    // coded error — never a silent load with dumb defaults (the old behaviour that
-    // produced a wrong context window). See `crate::serve::readiness`.
-    // Capture the VALIDATED profile from the readiness check so the load below uses
-    // exactly what was gated — no second `models.json` read that a concurrent
-    // unlink/chmod/retune could turn into a silent default load (gate bypass).
-    let profile = match higgs.profile_state(model).await {
-        Ok(crate::api::ProfileState::Ready(p)) => p,
-        Ok(crate::api::ProfileState::Missing) => {
-            let err = HiggsError::NotPrepared {
-                id: model.to_owned(),
-            };
-            tracing::warn!(model = %model, "higgs: JIT chat for un-prepared model");
-            return Err(v1_error(&err).into_response());
-        }
-        Ok(crate::api::ProfileState::Stale) => {
-            let err = HiggsError::ProfileStale {
-                id: model.to_owned(),
-            };
-            tracing::warn!(model = %model, "higgs: JIT chat for stale profile");
-            return Err(v1_error(&err).into_response());
-        }
-        // A store-read failure (models.json unreadable) is surfaced as HG040, not
-        // masked as `model_not_prepared`.
-        Err(e) => {
-            tracing::warn!(model = %model, error = %e, "higgs: JIT readiness check failed");
-            return Err(v1_error(&e).into_response());
-        }
-    };
-
-    // Load on demand with the VALIDATED profile, as a no-resync REUSE
-    // (`from_request = false`). One always-on INFO line so the load is visible in
-    // the Developer Logs. The local load is ADDITIVE — it spawns a new worker
-    // alongside any others (and is idempotent per model), no swap.
-    tracing::info!("higgs: JIT loading {model}");
-    if let Err(err) = higgs.load_inner(model, Some(profile), false).await {
-        tracing::warn!(model = %model, error = %err, "higgs: JIT load failed");
-        return Err(v1_error(&err).into_response());
-    }
-
-    // Re-resolve: the requested model must now be served.
-    match higgs.local_loaded_info(model).await {
-        Some(loaded) => Ok(loaded),
-        None => {
-            // Load reported success but the model isn't resident — surface the
-            // real not-loaded condition rather than a spurious success.
-            let err = HiggsError::ModelNotLoaded {
-                id: model.to_owned(),
-            };
-            tracing::warn!(model = %model, "higgs: JIT load succeeded but model not resident");
-            Err(v1_error(&err).into_response())
-        }
-    }
-}
-
 /// Run the pre-dispatch gate and request validation for a chat request:
 /// loaded-model check, sampling-param ranges, prompt-vs-context fit, and the
 /// v1 text-only content check. Returns `Err(response)` with the first failing
@@ -682,46 +478,59 @@ async fn ensure_loaded(higgs: &Arc<Higgs>, model: &str) -> Result<LoadedInfo, Re
 /// to the HG003 404 `ModelNotLoaded` gate. With JIT on (the default), a
 /// scanned-but-unloaded model is loaded on demand here (see [`ensure_loaded`])
 /// before validation. There is no separate worker-down 503 on this surface;
-/// `GET /api/higgs/status` exposes `worker_alive` for diagnostics instead.
+/// the `status` control-op exposes `worker_alive` for diagnostics instead.
 async fn gate_and_validate(
     higgs: &Arc<Higgs>,
     req: &CreateChatCompletionRequest,
+    messages_json: &str,
 ) -> Result<(String, usize), Response> {
-    // Loaded-model gate (JIT-aware): resolve the model that will serve this
-    // request, loading it on demand when JIT is on. Returns the LoadedInfo for
-    // the now-resident requested model, or the mapped error response.
-    let loaded = ensure_loaded(higgs, &req.model).await?;
+    // Shared gate (facade): JIT-load the model, resolve the now-resident served id,
+    // and clamp the generation budget to the loaded window. This is the SINGLE
+    // source of the load+resolve+clamp logic — the in-process embedder calls the
+    // same `Higgs::prepare_chat`, so the two callers cannot diverge. Its
+    // `HiggsError` maps through the standard `/v1` error envelope.
+    let requested = requested_max_tokens(req);
+    let prepared = match higgs
+        .prepare_chat(&req.model, requested, messages_json)
+        .await
+    {
+        Ok(prepared) => prepared,
+        Err(err) => {
+            tracing::warn!(error = %err, "higgs: chat gate failed");
+            return Err(v1_error(&err).into_response());
+        }
+    };
 
     // Validate sampling params (temperature/top_p/n/penalties/max_tokens) BEFORE
     // dispatching to the worker — out-of-range → 400 [HG013]. Ranges mirror vllm.
+    // Kept at the `/v1` boundary: it is v1-wire-shaped (reads the OpenAI request).
     if let Err(err) = validate_sampling(req) {
         tracing::warn!(error = %err, "higgs: chat sampling param rejected");
         return Err(v1_error(&err).into_response());
     }
 
-    // Resolve the generation budget against the loaded window: CLAMP `max_tokens` to
-    // what fits after the prompt (so a large budget truncates rather than erroring),
-    // rejecting (400 `context_length_exceeded`) ONLY when the prompt alone overflows.
-    // The worker's tokenizer-exact [HG005] check remains the authoritative backstop.
-    let max_gen = match fit_generation_budget(req, loaded.ctx_len) {
-        Ok(budget) => budget,
-        Err(err) => {
-            tracing::warn!(error = %err, "higgs: chat prompt exceeds context window");
-            return Err(v1_error(&err).into_response());
-        }
-    };
-
-    // v1 is text-only: reject image/audio/file/refusal content parts → 400.
-    // (Validation only — the flattened pairs are discarded; the engine receives
-    // the verbatim OpenAI messages JSON below so tool_calls / tool_call_id are
-    // preserved for multi-turn tool loops.)
+    // v1 is text-only: reject image/audio/file/refusal content parts → 400. Kept at
+    // the boundary: it is a v1-wire content check. (Validation only — the flattened
+    // pairs are discarded; the engine receives the verbatim OpenAI messages JSON so
+    // tool_calls / tool_call_id are preserved for multi-turn tool loops.)
     if let Err(reject) = messages_to_pairs(&req.messages) {
         tracing::warn!(detail = %reject, "higgs: chat request rejected");
         return Err(v1_bad_request(&reject).into_response());
     }
     // The resolved model id (the gate proved it resident) + the context-clamped
     // generation budget, so the caller dispatches with a budget that always fits.
-    Ok((loaded.id, max_gen))
+    Ok((prepared.resolved_model, prepared.max_gen))
+}
+
+/// The client's requested generation budget as an `Option<usize>` for the shared
+/// facade gate ([`Higgs::prepare_chat`]): `max_completion_tokens` wins over the
+/// deprecated `max_tokens`; `None` (neither set) lets the facade infer the budget
+/// (fill the fixed window, else the 1024 default) rather than a magic sentinel.
+#[allow(deprecated)]
+fn requested_max_tokens(req: &CreateChatCompletionRequest) -> Option<usize> {
+    req.max_completion_tokens
+        .or(req.max_tokens)
+        .map(|t| t as usize)
 }
 
 /// The RAW `messages` array from the request body, serialized verbatim for the
@@ -910,60 +719,6 @@ fn build_sampling(req: &CreateChatCompletionRequest) -> crate::worker::engine::S
         penalty_freq: req.frequency_penalty,
         ..Default::default()
     })
-}
-
-/// Resolve the GENERATION budget for a request against the loaded context window —
-/// the largest `max_tokens` that fits after the prompt, INFERRED when the client
-/// didn't ask. Returns `Err(ContextOverflow)` (→ 400 `context_length_exceeded`) ONLY
-/// when the prompt ALONE cannot fit the window (no room left to generate) — the
-/// genuine overflow. When the prompt fits, the budget is CLAMPED to
-/// `min(requested or available, available, MAX_OUTPUT_TOKENS)` rather than rejected,
-/// so an oversized `max_tokens` truncates (`finish_reason: "length"`) instead of
-/// failing the request.
-///
-/// The serve layer has no tokenizer, so the prompt count is a conservative LOWER
-/// bound (`prompt_bytes / PROMPT_BYTES_PER_TOKEN`) — the worker runs the exact
-/// tokenizer check. An AUTO/unknown window can't be bounded here, so the requested
-/// budget (or the 1024 default) stands, capped at the absolute limit; the worker's
-/// `[HG005]` is the backstop.
-#[allow(deprecated)]
-fn fit_generation_budget(
-    req: &CreateChatCompletionRequest,
-    ctx_len: Option<CtxLen>,
-) -> Result<usize, HiggsError> {
-    // Sum the byte length of every message's textual content (the same pairs the
-    // worker sees). Serializing the messages would add role/JSON-structure/escape
-    // bytes and push the estimate ABOVE the true token count; counting only the
-    // content keeps `bytes / PROMPT_BYTES_PER_TOKEN` a conservative LOWER bound.
-    let prompt_bytes: usize = messages_to_pairs(&req.messages)
-        .map(|pairs| pairs.iter().map(|(_, content)| content.len()).sum())
-        .unwrap_or(0);
-    let prompt_tokens_est = prompt_bytes / PROMPT_BYTES_PER_TOKEN;
-    let requested = req
-        .max_completion_tokens
-        .or(req.max_tokens)
-        .map(|t| t as usize);
-    match ctx_len {
-        // Not probed (None) or AUTO → can't bound by context here; honor the request
-        // (or the 1024 default), capped at the absolute limit. Worker [HG005] backstops.
-        None | Some(CtxLen::Auto) => Ok(requested.unwrap_or(1024).min(MAX_OUTPUT_TOKENS as usize)),
-        Some(CtxLen::Fixed { n }) => {
-            let n_ctx = n as usize;
-            // The prompt ALONE doesn't fit → no room to generate → genuine overflow.
-            if prompt_tokens_est >= n_ctx {
-                return Err(HiggsError::ContextOverflow {
-                    prompt_tokens: prompt_tokens_est,
-                    max_gen: requested.unwrap_or(0),
-                    n_ctx,
-                });
-            }
-            // Room left after the prompt. Infer the budget when omitted; otherwise
-            // honor the request but CLAMP to what fits + the absolute cap (≥ 1).
-            let available = n_ctx - prompt_tokens_est;
-            let budget = requested.unwrap_or(available);
-            Ok(budget.min(available).min(MAX_OUTPUT_TOKENS as usize).max(1))
-        }
-    }
 }
 
 /// Flatten OpenAI request messages into the worker's `(role, content)` pairs.

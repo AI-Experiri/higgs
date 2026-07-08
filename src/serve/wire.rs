@@ -1,4 +1,5 @@
-//! Request/response wire structs for higgs's `/api/higgs/*` control surface.
+//! Request/response wire structs for higgs's control surface — the in-process
+//! `Higgs` facade methods (formerly the `/api/higgs/*` HTTP routes).
 //!
 //! Each type is ts-rs exported to `frontend/src/lib/generated/higgs/` and
 //! re-exported from `frontend/src/lib/types.ts`. The `/v1` surface uses
@@ -39,7 +40,8 @@ impl Default for HiggsOk {
 mod tests;
 
 higgs_ts! {
-    /// Response for `GET /api/higgs/hub`: whether this server is a fleet hub right now.
+    /// The `hub` control-op status response (formerly `GET /api/higgs/hub`): whether
+    /// this server is a fleet hub right now.
     ///
     /// `enabled` is false when hub mode is off (no hub installed) — the Fleet tab shows a
     /// "hub mode off" panel instead of inferring it from a `/pair` 409. When enabled, `hub_id`
@@ -74,7 +76,8 @@ higgs_ts! {
 }
 
 higgs_ts! {
-    /// Response for `GET /api/higgs/models`: live scan results plus the loaded id.
+    /// The `models` control-op response (`Higgs::model_entries`, formerly
+    /// `GET /api/higgs/models`): live scan results plus the loaded id.
     #[derive(Debug, serde::Serialize)]
     pub struct HiggsModelsResponse {
         /// Models discovered by a live scan of the configured directories.
@@ -113,8 +116,9 @@ higgs_ts! {
 }
 
 higgs_ts! {
-    /// Per-model entry in `GET /api/higgs/models`: enriches [`HiggsModel`] with
-    /// request-derived fields computed by the control handler.
+    /// Per-model entry in the `models` control-op response (`Higgs::model_entries`,
+    /// formerly `GET /api/higgs/models`): enriches [`HiggsModel`] with
+    /// request-derived fields computed by the control helper.
     #[derive(Debug, serde::Serialize)]
     pub struct HiggsModelEntry {
         /// All canonical model fields (id, path, size_bytes, quant, source, arch, ctx_train, has_chat_template).
@@ -197,7 +201,8 @@ higgs_ts! {
 }
 
 higgs_ts! {
-    /// Request body for `POST /api/higgs/models/load`.
+    /// Request body for the `load` control-op (`Higgs::load_flat`, formerly
+    /// `POST /api/higgs/models/load`).
     ///
     /// Absent load parameters fall back to the host-configured defaults.
     #[derive(Debug, serde::Deserialize)]
@@ -266,7 +271,7 @@ higgs_ts! {
         /// Per-load idle-TTL override in minutes. RESERVED / forward-compat: per-load
         /// idle-TTL enforcement is a deferred follow-up, so this is currently ACCEPTED
         /// but NOT enforced — the node reaper applies one per-node TTL to every worker
-        /// (the global TTL, `/api/higgs/settings`), and the host neither stores nor
+        /// (the global TTL, `HiggsRuntimeSettings`), and the host neither stores nor
         /// surfaces this value. It will take effect once the reaper honors per-worker
         /// overrides (host-side only either way — never forwarded to the worker/engine).
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -287,7 +292,8 @@ higgs_ts! {
 }
 
 higgs_ts! {
-    /// Response for `POST /api/higgs/models/load`: `{"status":"ok","id":…}`.
+    /// Response for the `load` control-op (formerly `POST /api/higgs/models/load`):
+    /// `{"status":"ok","id":…}`.
     #[derive(Debug, serde::Serialize)]
     pub struct HiggsLoadResponse {
         /// Confirmation status; always `{"status":"ok"}` on success.
@@ -299,7 +305,9 @@ higgs_ts! {
 }
 
 higgs_ts! {
-    /// Response for `GET /api/higgs/logs`: `{"lines":[…]}`.
+    /// The `logs` control-op response — the worker log tail (formerly
+    /// `GET /api/higgs/logs`): `{"lines":[…]}`. The live stream now rides the
+    /// `/ws` watch_logs subscription, not this batched tail.
     #[derive(Debug, serde::Serialize)]
     pub struct HiggsLogsResponse {
         /// Worker stderr tail, oldest first.
@@ -308,9 +316,10 @@ higgs_ts! {
 }
 
 higgs_ts! {
-    /// Body for `GET`/`PUT /api/higgs/logs/settings`: the runtime Developer-Log
-    /// toggles. `GET` returns the current state of both; `PUT` carries both and
-    /// sets both. The log settings higgs actually backs.
+    /// Body for the log-settings control-ops (`Higgs::logs_settings` reads,
+    /// `Higgs::set_logs_settings` writes; formerly `GET`/`PUT /api/higgs/logs/settings`):
+    /// the runtime Developer-Log toggles. The read returns the current state of both;
+    /// the write carries both and sets both. The log settings higgs actually backs.
     #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
     pub struct LogSettings {
         /// Whether the serve-layer verbose serving line is enabled — when `true`,
@@ -332,9 +341,10 @@ higgs_ts! {
 }
 
 higgs_ts! {
-    /// Body for `GET`/`PUT /api/higgs/settings`: the runtime server-behavior
-    /// flags higgs actually backs. `GET` returns the current state; `PUT` carries
-    /// it and sets it. Distinct from [`LogSettings`] (Developer-Log toggles) —
+    /// Body for the `settings` control-op (the runtime-settings read/write facade;
+    /// formerly `GET`/`PUT /api/higgs/settings`): the runtime server-behavior
+    /// flags higgs actually backs. The read returns the current state; the write
+    /// carries it and sets it. Distinct from [`LogSettings`] (Developer-Log toggles) —
     /// this is the server-behavior namespace, designed to grow as more runtime
     /// flags (e.g. a server on/off) are added.
     #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -357,7 +367,7 @@ higgs_ts! {
         pub idle_ttl_minutes: u64,
         /// Whether the `/v1` inference surface is serving (default `true`). When
         /// `false`, the `/v1` inference endpoints return `[HG019]` → 503 while the
-        /// `/api/higgs/*` control surface stays reachable so the server can be
+        /// in-process control surface stays reachable so the server can be
         /// re-enabled. Read by the chat boundary on each request, so a change
         /// takes effect without a restart.
         pub serving_enabled: bool,
@@ -375,7 +385,8 @@ higgs_ts! {
 }
 
 higgs_ts! {
-    /// Response for `GET /api/higgs/version`.
+    /// Response for the `version` control-op (`Higgs::version`, formerly
+    /// `GET /api/higgs/version`).
     #[derive(Debug, serde::Serialize)]
     pub struct HiggsVersionResponse {
         /// Higgs crate version from Cargo.toml (`CARGO_PKG_VERSION`).
@@ -419,8 +430,9 @@ higgs_ts! {
 }
 
 higgs_ts! {
-    /// `GET /api/higgs/keys` — the configured keys plus whether auth is
-    /// currently gating the surface (false ⇔ zero keys ⇔ open).
+    /// The `keys` list control-op response (formerly `GET /api/higgs/keys`) — the
+    /// configured keys plus whether auth is currently gating the surface (false ⇔
+    /// zero keys ⇔ open).
     #[derive(Debug, Clone, serde::Serialize)]
     pub struct HiggsKeysList {
         pub auth_enabled: bool,
@@ -429,7 +441,8 @@ higgs_ts! {
 }
 
 higgs_ts! {
-    /// `POST /api/higgs/keys` request: mint a key. Omitted `scopes` defaults to
+    /// The key-mint control-op request (`Higgs::mint_key`, formerly
+    /// `POST /api/higgs/keys`): mint a key. Omitted `scopes` defaults to
     /// `[chat, models]` (the CLI's default) — pass `["admin"]` explicitly for a
     /// management key.
     #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -441,7 +454,8 @@ higgs_ts! {
 }
 
 higgs_ts! {
-    /// `POST /api/higgs/keys` response. `token` is the plaintext — shown THIS
+    /// The key-mint control-op response (`Higgs::mint_key`, formerly
+    /// `POST /api/higgs/keys`). `token` is the plaintext — shown THIS
     /// ONCE, never persisted, never logged; the caller must store it now.
     #[derive(Debug, Clone, serde::Serialize)]
     pub struct HiggsMintKeyResponse {
@@ -452,7 +466,8 @@ higgs_ts! {
 }
 
 higgs_ts! {
-    /// `DELETE /api/higgs/keys/{label}` response: how many keys the label matched.
+    /// The key-revoke control-op response (`Higgs::revoke_key`, formerly
+    /// `DELETE /api/higgs/keys/{label}`): how many keys the label matched.
     /// Revoking the last key turns auth OFF on a LOOPBACK bind only; a
     /// LAN-exposed server REFUSES last-key revocation outright ([HG059], 409) —
     /// the runtime counterpart of the [HG058] startup guarantee.

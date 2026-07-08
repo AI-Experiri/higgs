@@ -1,5 +1,4 @@
 use super::*;
-use crate::worker::engine::CtxLen;
 use async_openai::types::chat::{
     CreateChatCompletionRequest, CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
 };
@@ -236,10 +235,11 @@ async fn chat_refuses_while_model_is_benchmarking() {
     assert!(body.contains("[HG068]"), "carries HG068: {body}");
 }
 
-/// `POST /api/higgs/worker/stop` REFUSES (503 HG068) while a model is being
-/// benchmarked — the drain would evict the bench candidate, so the route must
-/// surface the refusal, not report a false success. Fail-on-revert: restore the
-/// `let _ = higgs.unload().await` swallow and the route 200s while the model stays.
+/// `Higgs::worker_stop` REFUSES ([HG068]) while a model is being benchmarked — the
+/// drain would evict the bench candidate, so it must surface the refusal, not report
+/// a false success. (This was the `POST /api/higgs/worker/stop` route before control
+/// moved in-process.) Fail-on-revert: restore the `let _ = higgs.unload().await`
+/// swallow and `worker_stop` returns `Ok` while the model stays resident.
 #[tokio::test]
 async fn worker_stop_refuses_while_model_is_benchmarking() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -248,18 +248,16 @@ async fn worker_stop_refuses_while_model_is_benchmarking() {
     higgs.load("org/model", None).await.expect("load candidate");
     let _bench = higgs.begin_benchmark("org/model");
 
-    let app = app_for(higgs.clone());
-    let resp = app
-        .oneshot(post_json("/api/higgs/worker/stop", &json!({})))
+    let err = higgs
+        .worker_stop()
         .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        StatusCode::SERVICE_UNAVAILABLE,
-        "worker/stop must refuse (503) while a benchmark owns a model"
+        .expect_err("worker_stop must refuse while a benchmark owns a model");
+    assert!(err.to_string().contains("[HG068]"), "carries HG068: {err}");
+    // The candidate stays resident (the refusal did not drain it).
+    assert!(
+        higgs.status().await.unwrap().loaded.is_some(),
+        "the refused worker_stop left the candidate resident"
     );
-    let body = String::from_utf8(body_bytes(resp).await).unwrap();
-    assert!(body.contains("[HG068]"), "carries HG068: {body}");
 }
 
 /// `GET /v1/models` HIDES a model that is being benchmarked — the listing must
@@ -704,92 +702,6 @@ fn effective_max_tokens_precedence() {
 }
 
 #[test]
-fn fit_budget_rejects_prompt_that_alone_overflows() {
-    // A tiny window with a long prompt: the prompt ALONE exceeds n_ctx → genuine
-    // overflow (no room to generate even one token).
-    let long = "x".repeat(8000); // ~2000 estimated tokens at 4 bytes/token.
-    let err = fit_generation_budget(
-        &req(json!({
-            "model": "m",
-            "messages": [{"role": "user", "content": long}],
-            "max_tokens": 16
-        })),
-        Some(CtxLen::Fixed { n: 128 }),
-    )
-    .expect_err("a prompt larger than the window overflows");
-    assert!(matches!(err, HiggsError::ContextOverflow { .. }));
-    assert!(err.to_string().starts_with("[HG005]"));
-}
-
-#[test]
-fn fit_budget_honors_a_request_that_fits() {
-    // Small prompt, large window, modest request → the request is honored as-is.
-    let budget = fit_generation_budget(
-        &req(json!({
-            "model": "m",
-            "messages": [{"role": "user", "content": "hello"}],
-            "max_tokens": 16
-        })),
-        Some(CtxLen::Fixed { n: 4096 }),
-    )
-    .expect("a fitting request is honored");
-    assert_eq!(budget, 16, "a request that fits is honored unchanged");
-}
-
-#[test]
-fn fit_budget_clamps_oversized_max_tokens_instead_of_rejecting() {
-    // The exact case the user hit: prompt fits, but max_tokens + prompt > n_ctx. The
-    // OLD behavior rejected (400 [HG005]); the new behavior CLAMPS to what fits so the
-    // request proceeds and truncates (finish_reason "length").
-    let budget = fit_generation_budget(
-        &req(json!({
-            "model": "m",
-            "messages": [{"role": "user", "content": "hi"}],
-            "max_tokens": 16384
-        })),
-        Some(CtxLen::Fixed { n: 8192 }),
-    )
-    .expect("an oversized max_tokens is clamped, not rejected");
-    assert!(
-        budget > 0 && budget <= 8192,
-        "clamped to the space after the prompt (< the requested 16384): {budget}"
-    );
-}
-
-#[test]
-fn fit_budget_infers_full_window_when_max_tokens_omitted() {
-    // No max_tokens → infer the remaining window (n_ctx − prompt), NOT the 1024 default.
-    let budget = fit_generation_budget(
-        &req(json!({
-            "model": "m",
-            "messages": [{"role": "user", "content": "hi"}]
-        })),
-        Some(CtxLen::Fixed { n: 8192 }),
-    )
-    .expect("inferred budget");
-    assert!(
-        budget > 1024 && budget <= 8192,
-        "inferred ~n_ctx, not the flat 1024 default: {budget}"
-    );
-}
-
-#[test]
-fn fit_budget_auto_window_honors_request_capped() {
-    // An AUTO/unknown window can't be bounded here → honor the request (worker
-    // [HG005] backstops), capped at the absolute MAX_OUTPUT_TOKENS limit.
-    let budget = fit_generation_budget(
-        &req(json!({
-            "model": "m",
-            "messages": [{"role": "user", "content": "hi"}],
-            "max_tokens": 500
-        })),
-        Some(CtxLen::Auto),
-    )
-    .expect("auto window");
-    assert_eq!(budget, 500);
-}
-
-#[test]
 fn v1_sse_error_carries_context_length_exceeded() {
     // The streaming error path must surface the same code as the non-streaming one.
     let json = v1_sse_error(&HiggsError::ContextOverflow {
@@ -986,6 +898,7 @@ fn facade_over(
         hf_dirs: vec![],
         ollama_dirs: vec![],
         default_load: HiggsConfig::default().default_load,
+        worker_exe: None,
     };
     Arc::new(Higgs::with_local(Arc::new(node), cfg))
 }

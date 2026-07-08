@@ -2,7 +2,8 @@
 import type { HiggsKeyEntry } from "./HiggsKeyEntry";
 
 /**
- * `GET /api/higgs/keys` — the configured keys plus whether auth is
- * currently gating the surface (false ⇔ zero keys ⇔ open).
+ * The `keys` list control-op response (formerly `GET /api/higgs/keys`) — the
+ * configured keys plus whether auth is currently gating the surface (false ⇔
+ * zero keys ⇔ open).
  */
 export type HiggsKeysList = { auth_enabled: boolean, keys: Array<HiggsKeyEntry>, };

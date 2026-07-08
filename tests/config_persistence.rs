@@ -1,260 +1,177 @@
-//! Black-box integration coverage for the per-instance `config.json` store
-//! ([`higgs::config::InstanceConfig`]) reached through the HTTP control surface
-//! of a PLAIN (non-hub) server.
+//! In-process coverage for the per-instance `config.json` store
+//! ([`higgs::config::InstanceConfig`]) and the runtime settings flags, reached
+//! through the library-first `Higgs` crate API (the `/api/higgs/*` HTTP control
+//! surface is deleted).
 //!
 //! The hub-mode local/remote relabel is already exercised by
-//! `hub_server::hub_server_relabel_local_and_remote`; this file targets the
-//! SAME `config.rs` save/load/merge code on a bare server (no fleet installed),
-//! plus the settings read-back paths that drive the in-memory runtime flags.
-//! Each test renames the local instance and/or flips a setting and reads it
-//! straight back over HTTP — proving the value round-tripped through
-//! `InstanceConfig::{load,save}` (the rename) or the runtime setters (settings).
+//! `hub_server`; this file targets the SAME `config.rs` save/load/merge code on a
+//! bare in-process instance (no fleet installed), plus the settings read-back
+//! paths that drive the in-memory runtime flags. Each test renames the local
+//! instance and/or flips a setting and reads it straight back — proving the value
+//! round-tripped through `InstanceConfig::{load,save}` (the rename) or the runtime
+//! setters (settings).
 //!
-//! Ports: 13000 base. Each test spawns the real `higgs` binary with a temp
-//! `HIGGS_HOME` (so the config.json under test is the harness's, never the
-//! developer's `~/.higgs`) and SIGTERMs it on drop. No SSE stream is opened.
+//! Each test builds an in-process `Higgs` with the tiny model staged into an
+//! isolated `HIGGS_HOME` (so the config.json under test is the harness's, never
+//! the developer's `~/.higgs`) via `higgs_local`.
 
 mod common;
 
-use common::{spawn_with_tiny_model, tiny_gguf_path};
+use common::higgs_local;
 
-/// The local node's label in `GET /api/higgs/nodes`, loaded from `config.json`.
-async fn local_label(c: &reqwest::Client, base: &str) -> String {
-    let nodes: serde_json::Value = c
-        .get(format!("{base}/api/higgs/nodes"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+/// The local node's label in `Higgs::nodes()`, loaded from `config.json`.
+async fn local_label(higgs: &higgs::Higgs) -> String {
+    let nodes = higgs.nodes().await;
     nodes
-        .as_array()
-        .and_then(|a| a.iter().find(|n| n["is_local"] == true))
-        .and_then(|n| n["label"].as_str())
+        .iter()
+        .find(|n| n.is_local)
+        .map(|n| n.label.clone())
         .expect("local node has a label")
-        .to_string()
 }
 
-/// Renaming the LOCAL instance on a PLAIN (no-hub) server persists to `config.json`
-/// (`control_nodes_label("local")` → `with_config_mut` → `InstanceConfig::save`) and
-/// the next `GET /api/higgs/nodes` reads it back (→ `InstanceConfig::load`). This is the
-/// non-hub branch of the local-label path — the hub e2e covers it only with a fleet up.
+/// Renaming the LOCAL instance on a PLAIN (no-hub) instance persists to `config.json`
+/// (`node_label("local")` → `with_config_mut` → `InstanceConfig::save`) and the next
+/// `nodes()` reads it back (→ `InstanceConfig::load`). This is the non-hub branch of the
+/// local-label path — the hub e2e covers it only with a fleet up.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_rename_persists_and_round_trips_without_a_hub() {
-    let Some(gguf) = tiny_gguf_path() else {
+    let Some(higgs) = higgs_local(&[common::TINY_MODEL_ID]).await else {
         eprintln!("SKIP local_rename_persists_and_round_trips_without_a_hub: tiny gguf not found");
         return;
     };
-    let srv = spawn_with_tiny_model(13000, &gguf).await;
-    let c = reqwest::Client::new();
 
-    // The server generated a non-empty friendly name at boot (`name_or_init` →
-    // `config.json`). It always begins with the role prefix.
-    let booted = local_label(&c, &srv.base).await;
-    assert!(!booted.is_empty(), "boot generated a name: {booted:?}");
+    // A fresh in-process instance has no config.json name yet, so the nodes view
+    // falls back to the non-empty "this machine" sentinel.
+    let booted = local_label(&higgs).await;
+    assert!(!booted.is_empty(), "boot label non-empty: {booted:?}");
 
     // Rename "local" — drives with_config_mut → InstanceConfig::{load,save}.
-    let resp = c
-        .post(format!("{}/api/higgs/nodes/label", srv.base))
-        .json(&serde_json::json!({ "node": "local", "label": "studio-alpha" }))
-        .send()
-        .await
-        .unwrap();
     assert!(
-        resp.status().is_success(),
-        "local relabel ok: {}",
-        resp.status()
+        higgs.node_label("local", "studio-alpha").await.unwrap(),
+        "local relabel returns Ok(true)"
     );
-    let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["status"], "ok", "relabel returns ok: {body}");
 
     // The next nodes read loads config.json fresh → reflects the new name.
     assert_eq!(
-        local_label(&c, &srv.base).await,
+        local_label(&higgs).await,
         "studio-alpha",
         "renamed local instance persisted + read back from config.json"
     );
 
     // A SECOND rename overwrites the first (load-modify-save replaces `name`), not
     // appends — the round-trip is idempotent and last-write-wins.
-    let resp = c
-        .post(format!("{}/api/higgs/nodes/label", srv.base))
-        .json(&serde_json::json!({ "node": "local", "label": "studio-beta" }))
-        .send()
-        .await
-        .unwrap();
-    assert!(resp.status().is_success(), "second relabel ok");
+    assert!(
+        higgs.node_label("local", "studio-beta").await.unwrap(),
+        "second relabel ok"
+    );
     assert_eq!(
-        local_label(&c, &srv.base).await,
+        local_label(&higgs).await,
         "studio-beta",
         "second rename replaced the first in config.json"
     );
 
     // An EMPTY local label is written verbatim (the empty-label clear is a REMOTE-only
     // behavior; for "local" it just sets `name = ""`). The view then falls back to the
-    // "this machine" sentinel because `control_nodes` filters out an empty config name.
-    let resp = c
-        .post(format!("{}/api/higgs/nodes/label", srv.base))
-        .json(&serde_json::json!({ "node": "local", "label": "" }))
-        .send()
-        .await
-        .unwrap();
-    assert!(resp.status().is_success(), "empty local label accepted");
+    // "this machine" sentinel because `instance_name` filters out an empty config name.
+    assert!(
+        higgs.node_label("local", "").await.unwrap(),
+        "empty local label accepted"
+    );
     assert_eq!(
-        local_label(&c, &srv.base).await,
+        local_label(&higgs).await,
         "this machine",
         "empty config name → 'this machine' fallback in the nodes view"
     );
+
+    higgs.shutdown().await;
 }
 
-/// `logs/settings` round-trips ALL THREE Developer-Log toggles — crucially
-/// `show_log_fields` (the `#[serde(default)]` field the existing log-settings test
-/// never flips) and `log_incoming_tokens` — so a PUT that sets every flag is read back
-/// by a following GET. Exercises the full LogSettings get/set wire path on a plain server.
+/// `logs_settings`/`set_logs_settings` round-trips ALL THREE Developer-Log toggles —
+/// crucially `show_log_fields` (the `#[serde(default)]` field the existing log-settings
+/// test never flips) and `log_incoming_tokens` — so a set of every flag is read back.
+/// Exercises the full LogSettings get/set path on a plain instance.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn log_settings_round_trip_every_toggle() {
-    let Some(gguf) = tiny_gguf_path() else {
+    let Some(higgs) = higgs_local(&[common::TINY_MODEL_ID]).await else {
         eprintln!("SKIP log_settings_round_trip_every_toggle: tiny gguf not found");
         return;
     };
-    let srv = spawn_with_tiny_model(13001, &gguf).await;
-    let c = reqwest::Client::new();
 
-    let before: serde_json::Value = c
-        .get(format!("{}/api/higgs/logs/settings", srv.base))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    // All three toggle fields are present in the GET shape.
-    for k in ["verbose", "log_incoming_tokens", "show_log_fields"] {
-        assert!(before[k].is_boolean(), "{k} present as a bool: {before}");
-    }
+    let before = higgs.logs_settings();
 
-    // Flip EVERY toggle to the negation of its current value, then PUT.
-    let mut put_body = before.clone();
-    for k in ["verbose", "log_incoming_tokens", "show_log_fields"] {
-        put_body[k] = serde_json::Value::Bool(!before[k].as_bool().unwrap());
-    }
-    let put = c
-        .put(format!("{}/api/higgs/logs/settings", srv.base))
-        .json(&put_body)
-        .send()
-        .await
-        .unwrap();
-    assert!(put.status().is_success(), "PUT logs/settings ok");
+    // Flip EVERY toggle to the negation of its current value, then set.
+    let flipped = higgs::LogSettings {
+        verbose: !before.verbose,
+        log_incoming_tokens: !before.log_incoming_tokens,
+        show_log_fields: !before.show_log_fields,
+    };
+    higgs.set_logs_settings(&flipped);
 
-    // GET reflects every flipped toggle (the setters took effect).
-    let after: serde_json::Value = c
-        .get(format!("{}/api/higgs/logs/settings", srv.base))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    for k in ["verbose", "log_incoming_tokens", "show_log_fields"] {
-        assert_eq!(
-            after[k], put_body[k],
-            "{k} toggle persisted across GET: {after}"
-        );
-    }
-
-    // A PUT body that OMITS show_log_fields still deserializes (it's #[serde(default)])
-    // and is accepted, clearing that flag back to false.
-    let put = c
-        .put(format!("{}/api/higgs/logs/settings", srv.base))
-        .json(&serde_json::json!({ "verbose": false, "log_incoming_tokens": false }))
-        .send()
-        .await
-        .unwrap();
-    assert!(
-        put.status().is_success(),
-        "PUT omitting show_log_fields defaults it: {}",
-        put.status()
-    );
-    let after: serde_json::Value = c
-        .get(format!("{}/api/higgs/logs/settings", srv.base))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    // Read reflects every flipped toggle (the setters took effect).
+    let after = higgs.logs_settings();
+    assert_eq!(after.verbose, flipped.verbose, "verbose toggle persisted");
     assert_eq!(
-        after["show_log_fields"], false,
-        "omitted show_log_fields defaulted to false: {after}"
+        after.log_incoming_tokens, flipped.log_incoming_tokens,
+        "log_incoming_tokens toggle persisted"
     );
+    assert_eq!(
+        after.show_log_fields, flipped.show_log_fields,
+        "show_log_fields toggle persisted"
+    );
+
+    // Setting show_log_fields back to false clears that flag (the original test drove this
+    // via a PUT body that OMITTED the #[serde(default)] field; the wire default is gone, so
+    // the typed equivalent is an explicit false — same observable end state).
+    let cleared = higgs::LogSettings {
+        verbose: false,
+        log_incoming_tokens: false,
+        show_log_fields: false,
+    };
+    higgs.set_logs_settings(&cleared);
+    assert!(
+        !higgs.logs_settings().show_log_fields,
+        "show_log_fields cleared to false"
+    );
+
+    higgs.shutdown().await;
 }
 
-/// `GET`/`PUT /api/higgs/settings` round-trips the runtime server-behavior flags
-/// (jit/auto-unload/serving) — flipping the booleans and confirming each is read back.
-/// (The idle-TTL number path is covered elsewhere; this nails the three boolean setters.)
+/// The runtime server-behavior flags (jit/auto-unload/serving) round-trip — flipping the
+/// booleans and confirming each is read back. (The idle-TTL number path is covered
+/// elsewhere; this nails the three boolean setters and that the TTL stays untouched.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_settings_boolean_flags_round_trip() {
-    let Some(gguf) = tiny_gguf_path() else {
+    let Some(higgs) = higgs_local(&[common::TINY_MODEL_ID]).await else {
         eprintln!("SKIP runtime_settings_boolean_flags_round_trip: tiny gguf not found");
         return;
     };
-    let srv = spawn_with_tiny_model(13002, &gguf).await;
-    let c = reqwest::Client::new();
 
-    let before: serde_json::Value = c
-        .get(format!("{}/api/higgs/settings", srv.base))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    for k in ["jit_enabled", "auto_unload_idle", "serving_enabled"] {
-        assert!(before[k].is_boolean(), "{k} present as a bool: {before}");
-    }
-    assert!(
-        before["idle_ttl_minutes"].is_number(),
-        "idle_ttl_minutes present: {before}"
-    );
+    let jit0 = higgs.jit_enabled();
+    let auto0 = higgs.auto_unload_idle();
+    let serve0 = higgs.serving_enabled();
+    let ttl0 = higgs.idle_ttl_minutes();
 
-    // Negate every boolean flag (keep the TTL number unchanged), PUT, read back.
-    let mut put_body = before.clone();
-    for k in ["jit_enabled", "auto_unload_idle", "serving_enabled"] {
-        put_body[k] = serde_json::Value::Bool(!before[k].as_bool().unwrap());
-    }
-    let put = c
-        .put(format!("{}/api/higgs/settings", srv.base))
-        .json(&put_body)
-        .send()
-        .await
-        .unwrap();
-    assert!(put.status().is_success(), "PUT settings ok");
+    // Negate every boolean flag (keep the TTL number unchanged), set, read back.
+    higgs.set_jit_enabled(!jit0);
+    higgs.set_auto_unload_idle(!auto0);
+    higgs.set_serving_enabled(!serve0);
 
-    let after: serde_json::Value = c
-        .get(format!("{}/api/higgs/settings", srv.base))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    for k in ["jit_enabled", "auto_unload_idle", "serving_enabled"] {
-        assert_eq!(after[k], put_body[k], "{k} flag persisted: {after}");
-    }
+    assert_eq!(higgs.jit_enabled(), !jit0, "jit_enabled flag persisted");
     assert_eq!(
-        after["idle_ttl_minutes"], before["idle_ttl_minutes"],
-        "untouched TTL unchanged: {after}"
+        higgs.auto_unload_idle(),
+        !auto0,
+        "auto_unload_idle flag persisted"
     );
+    assert_eq!(
+        higgs.serving_enabled(),
+        !serve0,
+        "serving_enabled flag persisted"
+    );
+    assert_eq!(higgs.idle_ttl_minutes(), ttl0, "untouched TTL unchanged");
 
-    // Restore serving_enabled to true so graceful shutdown stays clean and no /v1
-    // surface is left disabled (defensive; no SSE stream is open here).
-    let mut restore = after.clone();
-    restore["serving_enabled"] = serde_json::Value::Bool(true);
-    let _ = c
-        .put(format!("{}/api/higgs/settings", srv.base))
-        .json(&restore)
-        .send()
-        .await
-        .unwrap();
+    // Restore serving_enabled to true so teardown stays clean and no /v1 surface is left
+    // disabled (defensive).
+    higgs.set_serving_enabled(true);
+
+    higgs.shutdown().await;
 }

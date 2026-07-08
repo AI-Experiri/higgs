@@ -215,7 +215,7 @@ impl JsonModelStore {
     }
 
     /// Every saved tuning record, keyed by model id — for callers that need the
-    /// whole set at once (e.g. the `/api/higgs/models` readiness pass) so they
+    /// whole set at once (e.g. the `models` control-op readiness pass) so they
     /// open + parse `models.json` ONCE rather than per-model.
     pub fn all_tuning(&self) -> BTreeMap<String, TuneRecord> {
         self.inner

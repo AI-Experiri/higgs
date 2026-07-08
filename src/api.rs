@@ -31,6 +31,7 @@ use crate::worker::models::HiggsModel;
 
 // Submodules split out of this file (see api/README.md, api/DESIGN.md). `pub use`
 // keeps every existing `crate::api::*` path resolving unchanged.
+mod embed;
 mod guards;
 mod types;
 
@@ -145,7 +146,7 @@ pub struct Higgs {
     idle_ttl_minutes: std::sync::atomic::AtomicU64,
     /// Runtime "serving on/off" gate for the `/v1` inference surface. When `false`,
     /// the `/v1` inference endpoints return `[HG019]` → 503 while the
-    /// `/api/higgs/*` control surface stays reachable so the user can re-enable.
+    /// in-process control surface stays reachable so the user can re-enable.
     /// Defaults to `true` (serving on). A plain atomic — set/read in isolation,
     /// never across `.await`.
     serving_enabled: std::sync::atomic::AtomicBool,
@@ -556,7 +557,21 @@ impl Higgs {
             ollama_dirs: config.ollama_dirs.clone(),
             idle_ttl: DEFAULT_IDLE_TTL,
         };
-        Self::with_local(Arc::new(NodeRuntime::new(node_config)), config)
+        // Thread the worker-exe DI seam ([`HiggsConfig::worker_exe`]) into the node's
+        // Supervisor spawner. `None` ⇒ `Arc::new(Supervisor::spawn)` — EXACTLY what
+        // `NodeRuntime::new` installs, so the production path is byte-identical when the
+        // seam is unused. `Some(exe)` ⇒ each worker (re)spawns from `exe` instead of
+        // `current_exe()`, for a host whose own binary can't answer `--higgs-worker`.
+        let spawner: crate::node::runtime::SupervisorSpawner = match config.worker_exe.clone() {
+            Some(exe) => {
+                Arc::new(move |bus| crate::supervisor::Supervisor::spawn_with_exe(bus, exe.clone()))
+            }
+            None => Arc::new(crate::supervisor::Supervisor::spawn),
+        };
+        Self::with_local(
+            Arc::new(NodeRuntime::with_spawner(node_config, spawner)),
+            config,
+        )
     }
 
     /// Construct the facade around an already-built local [`NodeRuntime`] — the single home for
@@ -827,6 +842,26 @@ impl Higgs {
     /// Whether the listener is bound beyond loopback ([HG059] revoke gate).
     pub(crate) fn lan_exposed(&self) -> bool {
         self.lan_exposed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Register an INTERNAL, in-memory-only bearer `token` for an in-process
+    /// embedder (jigglebot) so it can authenticate ITSELF to the embedded higgs
+    /// over the normal bearer path — no special auth branch.
+    ///
+    /// The embedder owns the token value (a fixed dev token shared with the
+    /// browser proxy, or a fresh random one in production) and calls this at boot.
+    /// The key is [`crate::keys::ApiKey::hidden`]: added to the LIVE keystore but
+    /// NEVER persisted to `api_keys.json` and NEVER shown in the key-management
+    /// list. Because it lands in the live store, auth is now ON for the embedded
+    /// surface — the embedder presents this token, external apps present their own
+    /// user tokens, and an unauthenticated caller is refused. In-memory only —
+    /// deliberately does NOT persist (unlike [`Self::mutate_api_keys`]).
+    pub fn register_internal_token(&self, token: &str, scopes: Vec<crate::keys::Scope>) {
+        let _guard = self.keys_io.lock();
+        let before = self.api_keys();
+        let mut keys = (*before).clone();
+        keys.add_internal(token, "jigglebot (internal)".to_string(), scopes);
+        self.set_api_keys(std::sync::Arc::new(keys));
     }
 
     /// Whether `id` is currently being benchmarked — a public load / JIT chat must
@@ -1188,7 +1223,7 @@ impl Higgs {
 
     /// Whether the `/v1` inference surface is currently serving (default `true`).
     /// When `false`, the `/v1` inference endpoints return `[HG019]` → 503 while
-    /// the `/api/higgs/*` control surface stays reachable.
+    /// the in-process control surface stays reachable.
     pub fn serving_enabled(&self) -> bool {
         self.serving_enabled
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -2364,8 +2399,8 @@ impl Higgs {
     /// sysinfo worker and cached. Hardware is static-ish, so a cache hit returns
     /// immediately; a miss spawns a crash-isolated transient worker, runs
     /// M_SYSINFO, caches the result, and returns it. A gather failure returns an
-    /// empty `Vec` and leaves the cache empty so a later call retries — `GET
-    /// /api/higgs/system` still returns hardware/runtime without devices.
+    /// empty `Vec` and leaves the cache empty so a later call retries — the
+    /// `system` control-op still returns hardware/runtime without devices.
     ///
     /// This is the canonical home for the gathered device list; the
     /// `SystemInfo::gather` path takes it as input rather than reading FFI itself

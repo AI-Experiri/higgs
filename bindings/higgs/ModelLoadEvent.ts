@@ -2,8 +2,10 @@
 import type { ModelLoadPhase } from "./ModelLoadPhase";
 
 /**
- * A live model-load lifecycle event, streamed over `GET /api/higgs/events`
- * (SSE). One is pushed at every [`ModelLoadPhase`] transition of a load, so the
+ * A live model-load lifecycle event, delivered over the load-event subscription
+ * ([`Higgs::subscribe_load_events`](crate::api::Higgs::subscribe_load_events);
+ * formerly the `GET /api/higgs/events` SSE stream). One is pushed at every
+ * [`ModelLoadPhase`] transition of a load, so the
  * UI shows/updates/hides the loading indicator from PUSH events instead of
  * polling `status`. Terminal phases (`Ready`/`Failed`) close out the bar;
  * `Failed` carries the diagnostic `code`.

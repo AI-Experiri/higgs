@@ -4,8 +4,9 @@ import type { TuneMode } from "./TuneMode";
 import type { TunePins } from "./TunePins";
 
 /**
- * Request body for `POST /api/higgs/models/tune` (the model id is in the body,
- * not the path — higgs ids are slashed/colon'd).
+ * Request body for the `tune` control-op (`Higgs::tune`, formerly
+ * `POST /api/higgs/models/tune`; the model id is in the body, not the path —
+ * higgs ids are slashed/colon'd).
  */
 export type TuneRequest = { 
 /**
