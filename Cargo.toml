@@ -77,6 +77,11 @@ llama-cpp-2 = { git = "https://github.com/AI-Experiri/llama-cpp-rs.git", rev = "
 llama-cpp-sys-2 = { git = "https://github.com/AI-Experiri/llama-cpp-rs.git", rev = "fab021552fabeb464a34aaa8ac229071bd5eecf7" }
 # token_to_piece (the crate's non-deprecated detokenizer) takes &mut encoding_rs::Decoder
 encoding_rs = "0.8"
+# WHATWG URL parser — canonicalizes the extra CORS-origins allowlist to the exact
+# ASCII string a browser puts in the `Origin` header (lowercased host, default
+# port stripped, IPv6/port validation), so the exact-match allowlist can match.
+# Already in the tree transitively via iroh; a direct dep here pins the API we use.
+url = "2.5.8"
 # Header-only GGUF metadata reading (memory-maps the file; weights are never loaded)
 ggus = "0.5.1"
 memmap2 = "0.9"

@@ -222,7 +222,16 @@ async fn health() -> StatusCode {
 /// [`host_guard`] → [`local_cors`] → `with_state`. Embedded hosts bind loopback,
 /// so the DNS-rebinding Host guard is on.
 pub fn v1_router(higgs: Arc<Higgs>) -> Router {
-    v1_router_with_host_policy(higgs, true)
+    // NOTE: building a router does NOT record `applied_cors_origins` — only
+    // [`serve_v1`] (the entrypoint that actually puts a listener behind the
+    // layer) captures what went live, so a built-but-never-served router (or a
+    // second router built while another serves) can't clobber the running
+    // listener's applied list and flip `restart_required` to a false `false`.
+    // An embedder that mounts this router itself gets pre-serve semantics from
+    // `Higgs::cors_settings` (`applied_origins` empty, `restart_required`
+    // false): higgs cannot know when a mounted router goes live.
+    let extra_origins = higgs.extra_cors_origins();
+    v1_router_with_host_policy(higgs, true, extra_origins)
 }
 
 /// [`v1_router`] with the Host-guard policy made explicit. `enforce_loopback_host`
@@ -232,10 +241,17 @@ pub fn v1_router(higgs: Arc<Higgs>) -> Router {
 ///
 /// `pub(crate)` — NOT `pub`: the relaxed (`false`) policy must be reachable ONLY
 /// through [`serve_v1`], which runs the [HG058] keyless-LAN and [HG069] no-Admin
-/// refusals and records `lan_exposed` BEFORE building it. A `pub` relaxed
+/// refusals and arms `lan_exposed` BEFORE building it. A `pub` relaxed
 /// constructor would let an out-of-crate embedder serve unauthenticated on a LAN
 /// with the Host guard off.
-pub(crate) fn v1_router_with_host_policy(higgs: Arc<Higgs>, enforce_loopback_host: bool) -> Router {
+/// `extra_origins` is the extra CORS allowlist the layer is built with — passed
+/// in (not read here) so the caller that records it as APPLIED ([`serve_v1`])
+/// hands the layer the exact same snapshot it recorded (no double-read skew).
+pub(crate) fn v1_router_with_host_policy(
+    higgs: Arc<Higgs>,
+    enforce_loopback_host: bool,
+    extra_origins: Vec<String>,
+) -> Router {
     // Streaming surface: NO whole-request timeout (an SSE stream must outlive any
     // per-request bound). The chat duration is bounded separately by the worker
     // chat-RPC timeout.
@@ -259,7 +275,7 @@ pub(crate) fn v1_router_with_host_policy(higgs: Arc<Higgs>, enforce_loopback_hos
         .layer(middleware::from_fn(move |req, next| {
             host_guard(enforce_loopback_host, req, next)
         }))
-        .layer(local_cors(higgs.extra_cors_origins()))
+        .layer(local_cors(extra_origins))
         .with_state(higgs)
 }
 
@@ -444,54 +460,95 @@ pub async fn serve_v1(
         .local_addr()
         .map(|a| a.ip().is_loopback())
         .unwrap_or(true); // unknowable ⇒ fail CLOSED (strictest policy)
-                          // [HG058] AT THE ENFORCEMENT POINT: a non-loopback listener with zero keys
-                          // must never serve — auth would be off AND the Host guard below would be
-                          // relaxed, exposing the whole surface. THIS is the last line for
-                          // library/embedded callers who hand us their own listener.
-    if !enforce_loopback_host && higgs.api_keys().is_empty() {
+                          // Register BEFORE the startup guards, UNARMED, under the serve-lifecycle lock.
+                          //
+                          // BEFORE the guards: a refusal must decide "was I the ONLY serve on this facade?"
+                          // to know whether tearing it down would strand a sibling, and
+                          // `ServeGuard::release()` answers that atomically under the registry lock.
+                          //
+                          // Under the LIFECYCLE lock: a concurrent last-listener exit does `release()` then
+                          // `stop()` as two steps, and `stop()` is TERMINAL (`shutting_down` never resets).
+                          // Registering in that gap would leave this listener serving a facade the departing
+                          // one is about to drain for good.
+    let serve_guard = {
+        let _lifecycle = higgs.serve_lifecycle().await;
+        higgs.register_serve(false, listener.local_addr().ok(), Vec::new())
+    };
+    // Refusing to serve, but an embedded caller may have already `start()`ed this
+    // facade (spawning a worker). Tear it down before the early return so the
+    // rejected serve doesn't LEAK the worker/runtime (codex r11) — but ONLY when
+    // this was the sole serve; a sibling owns the facade and its workers. The
+    // lifecycle lock makes release-then-stop atomic against a registration.
+    macro_rules! refuse {
+        ($err:expr) => {{
+            let _lifecycle = higgs.serve_lifecycle().await;
+            if serve_guard.release() {
+                higgs.stop().await;
+            }
+            return Err(std::io::Error::other($err.to_string()));
+        }};
+    }
+    // THE non-loopback enforcement point. [HG058] (a LAN listener needs at least one
+    // key — else auth is off AND the Host guard below is relaxed, exposing the whole
+    // surface) and [HG069] (…at least one ADMIN key, else the key-management API is
+    // locked out) are checked, and this listener's LAN exposure is ARMED, together
+    // under the keystore lock. They MUST be atomic with a key revoke: otherwise a
+    // concurrent `revoke_key` reads `lan_exposed() == false`, this serve passes its
+    // key check against the not-yet-published store, and the revoke then empties it —
+    // a KEYLESS listener on a LAN. Serialized, one always loses. This is the last
+    // line for library/embedded callers who hand us their own listener.
+    if !enforce_loopback_host {
         let bind = listener
             .local_addr()
             .map(|a| a.to_string())
             .unwrap_or_else(|_| "<unknown>".into());
-        // Refusing to serve, but an embedded caller may have already
-        // `start()`ed this facade (spawning a worker). Tear it down before the
-        // early return so the rejected serve attempt doesn't LEAK the worker /
-        // runtime (codex r11) — same cleanup the normal exit path runs.
-        higgs.stop().await;
-        return Err(std::io::Error::other(
-            HiggsError::LanBindWithoutKeys { bind }.to_string(),
-        ));
+        if let Err(e) = higgs.arm_lan_serve(&serve_guard, &bind) {
+            refuse!(e);
+        }
     }
-    // [HG069] AT THE ENFORCEMENT POINT: a non-loopback listener whose keys are ALL
-    // non-Admin locks out the Admin-only key-management API (mint/revoke), so a
-    // library/embedded caller handing us its own listener is refused here. Zero-keys
-    // is already refused above, so at least one key exists here; refuse if none is
-    // Admin-capable.
-    if !enforce_loopback_host
-        && !higgs
-            .api_keys()
-            .iter()
-            .any(|k| k.scopes.contains(&crate::keys::Scope::Admin))
-    {
-        let bind = listener
-            .local_addr()
-            .map(|a| a.to_string())
-            .unwrap_or_else(|_| "<unknown>".into());
-        // Same worker-teardown-before-refuse as the [HG058] path (no leak).
-        higgs.stop().await;
-        return Err(std::io::Error::other(
-            HiggsError::LanBindWithoutAdminKey { bind }.to_string(),
-        ));
-    }
-    // Record the exposure on the facade: key management refuses to revoke the
-    // LAST key while LAN-exposed ([HG059]) — revoke-to-empty would reopen the
-    // whole surface at runtime, bypassing the [HG058] startup guarantee.
-    higgs.set_lan_exposed(!enforce_loopback_host);
-    let app = v1_router_with_host_policy(Arc::clone(&higgs), enforce_loopback_host);
-    axum::serve(listener, app)
+    // The EXACT extra CORS origins THIS listener's layer is built with — read once
+    // and handed BOTH to the layer and to the registration, so the disclosed
+    // "applied" list is byte-identical to what is actually enforced (no double-read
+    // skew). Captured HERE (not in the router builder) so only a router that really
+    // goes live behind a listener claims "applied"; see the note on [`v1_router`].
+    // Residual race (accepted, self-correcting): a `set_cors_origins` landing
+    // between this read and the record below can get a response computed against
+    // pre-record state; the next `cors_settings` read is correct.
+    let extra_origins = higgs.extra_cors_origins();
+    // Record the CORS list this listener enforces (the LAN flag was armed at
+    // registration — see there). Per-listener state, so a sibling serve starting or
+    // exiting can't rewrite this one's disclosures. `serve_guard` deregisters on
+    // DROP — covering task CANCELLATION (an aborted future runs destructors but no
+    // code past its await) — and on the explicit `release()` below.
+    serve_guard.set_cors_origins(extra_origins.clone());
+    let app = v1_router_with_host_policy(Arc::clone(&higgs), enforce_loopback_host, extra_origins);
+    let served = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
-        .await?;
-    higgs.stop().await;
+        .await;
+    // Deregister IMMEDIATELY — before the terminal worker drain below, which can take
+    // seconds. A listener that has stopped accepting must not keep disclosing itself
+    // (`server_config`/`cors_settings` reporting a dead `ip:port` or a stale applied
+    // snapshot) nor keep forcing the [HG059] last-key-revoke refusal while workers
+    // shut down. (On CANCELLATION this line never runs and the guard's `Drop` does it.)
+    //
+    // Only the LAST listener owns the facade teardown. `serve_v1` is public and an
+    // embedder may run several listeners on one `Arc<Higgs>` (e.g. loopback + LAN);
+    // draining the shared local node when just ONE of them stops would strand the
+    // siblings still accepting requests on a facade whose workers are gone and whose
+    // next load hits the node-runtime shutdown path.
+    //
+    // The lifecycle lock spans release-and-stop so an incoming `serve_v1` cannot
+    // register in between and inherit the terminal `stop()` a departing last
+    // listener is about to run. Teardown runs on BOTH exits (graceful shutdown and
+    // a fatal `axum::serve` error) — the listener is equally gone either way, so
+    // `served?` must not skip the drain and leak workers.
+    {
+        let _lifecycle = higgs.serve_lifecycle().await;
+        if serve_guard.release() {
+            higgs.stop().await;
+        }
+    }
+    served?;
     Ok(())
 }
 

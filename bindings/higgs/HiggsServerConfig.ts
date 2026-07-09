@@ -12,7 +12,10 @@ import type { LoadParams } from "./LoadParams";
  */
 export type HiggsServerConfig = { 
 /**
- * Loopback host the listener binds to — always [`BIND_HOST`] (localhost).
+ * The `/v1` listener's bound address. Once serving this is the RECORDED
+ * live address (`ip:port` — the embedder owns the listener and may bind
+ * loopback or `0.0.0.0` for LAN mode); before any serve it is the
+ * built-in loopback default [`BIND_HOST`] (host only).
  */
 bind_host: string, 
 /**

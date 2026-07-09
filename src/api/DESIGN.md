@@ -194,8 +194,12 @@ discipline. Summary:
   it doesn't entangle the idle reaper's "acquire all LOCAL permits to unload" logic.
 - **Atomics** (`AtomicBool`/`AtomicU64`, always set/read in isolation, never across an
   `.await`): the serve-layer toggles `log_incoming_tokens`, `jit_enabled`,
-  `auto_unload_idle`, `idle_ttl_minutes`, `serving_enabled`, `lan_exposed`, plus
-  `shutting_down` (set once by `stop`; polled by the Turbotune cancel hook).
+  `auto_unload_idle`, `idle_ttl_minutes`, `serving_enabled`, plus `shutting_down`
+  (set once by `stop`; polled by the Turbotune cancel hook), `lan_override` (the
+  manual LAN-exposure override for an embedder serving through its own stack) and
+  `next_serve_id` (the monotonic id source for the serve registry).
+  `lan_exposed` is NOT an atomic — it is computed: `lan_override` OR any live
+  non-loopback listener in the `serves` registry below.
 - **`parking_lot::Mutex<…>`** — held only across synchronous work, NEVER across an
   `.await`: `config`; the `*_io` RMW serializers (`config_io`, `models_io`, `keys_io`)
   that make each read-modify-write of `config.json`/`models.json`/`api_keys.json` atomic
@@ -203,7 +207,17 @@ discipline. Summary:
   otherwise clobber); the Turbotune `benchmarking` id set (set/cleared under `lifecycle`,
   read lock-free by the HG068 gates); the caches `device_cache`, `estimate_meta_cache`;
   the swappable installers `fleet`, `api_keys`, `hub`; the `loading` snapshot;
-  `key_touch_throttle`; and `config_path`.
+  `key_touch_throttle`; `config_path`; and the **serve registry** `serves`
+  (`Vec<ServeSlot>` — one entry per LIVE `/v1` listener, holding its bound address,
+  LAN flag, and the extra CORS origins its layer enforces). Lock order is
+  `keys_io` → `serves`, never the reverse: `arm_lan_serve` and `revoke_key` both
+  take `keys_io` first, which is what makes the LAN-arm and the last-key-revoke
+  decision atomic w.r.t. each other.
+- **`tokio::sync::Mutex<()>`** (async, MAY be held across an `.await`):
+  `serve_lifecycle`, held by `serve_v1` across a listener's registration and across
+  `ServeGuard::release()` + the `Higgs::stop()` that may follow. `stop()` is TERMINAL
+  (`shutting_down` never resets), so a listener registering between a departing last
+  listener's release and its stop would inherit a permanently dead facade.
 - **`load_events: broadcast::Sender<ModelLoadEvent>`** — live PUSH fan-out; a `send` with
   no subscribers is a harmless no-op, and there is no replay ring (the bar is transient).
 
@@ -227,11 +241,12 @@ discipline. Summary:
 5. **Trusted control keeps the auth invariants.** `mint_key`/`revoke_key` skip ONLY the
    bearer check; they still enforce label validation, `Duplicate`, `BootstrapNeedsAdmin`
    ([HG066] last-admin), and the last-key-on-LAN refusal ([HG059], gated by the
-   `lan_exposed` flag) via the shared `serve::control` decisions — so an in-process
+   `lan_exposed()` state) via the shared `serve::control` decisions — so an in-process
    caller cannot flip auth off in a way the HTTP path forbade.
-6. **Loopback-only by default.** `BIND_HOST` is `127.0.0.1`; `lan_exposed` records a
-   deliberate non-loopback bind so the key-revoke gate can refuse dropping the last key
-   while LAN-exposed.
+6. **Loopback-only by default.** `BIND_HOST` is `127.0.0.1`; `lan_exposed()` is COMPUTED
+   from the live-listener registry (any deliberate non-loopback bind, or the manual
+   `lan_override`), so the key-revoke gate can refuse dropping the last key while
+   LAN-exposed — and the refusal lifts the moment the last such listener goes away.
 
 ## Error codes this module owns / raises
 

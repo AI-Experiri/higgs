@@ -375,6 +375,50 @@ higgs_ts! {
 }
 
 higgs_ts! {
+    /// Body for the `cors_settings` control-op — the extra CORS-origins allowlist
+    /// beyond the built-in loopback/tauri set (exact-match against the request
+    /// `Origin`). CORS only protects BROWSER clients; non-browser access is gated
+    /// by API keys, not this list.
+    ///
+    /// The extra origins are read ONCE when the server builds its CORS layer at
+    /// serve start, so a change to the persisted list takes effect only on the
+    /// next restart (a live rebind of the running CORS layer is a separate,
+    /// deferred feature). This type makes that honest: [`origins`](Self::origins)
+    /// is what's persisted in `config.json` right now, [`applied_origins`](Self::applied_origins)
+    /// is what the RUNNING server was booted with, and
+    /// [`restart_required`](Self::restart_required) is `true` exactly when they
+    /// differ (a restart is needed to apply the persisted change).
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    pub struct HiggsCorsSettings {
+        /// The extra allowed origins persisted in `config.json` (`cors_origins`)
+        /// right now — validated, exact-match `scheme://host[:port]` values. This
+        /// is the desired state; it becomes live on the next restart.
+        pub origins: Vec<String>,
+        /// The extra allowed origins the RUNNING server's CORS layer was actually
+        /// built with at serve start. Empty before the server has been served.
+        ///
+        /// An embedder may run SEVERAL `/v1` listeners on one instance; this
+        /// discloses the PRIMARY (first-registered) one's list — a single field
+        /// cannot describe more, and one listener is the common case. See
+        /// [`restart_required`](Self::restart_required), which considers them all.
+        pub applied_origins: Vec<String>,
+        /// `true` when the persisted [`origins`](Self::origins) differ from the list
+        /// ANY live listener's CORS layer was actually built with — the persisted
+        /// list has changed and a restart is required for it to take effect.
+        /// Compared as SETS: order is meaningless to an exact-match allowlist, so a
+        /// reordered save is not a change.
+        ///
+        /// With several listeners this can be `true` while `origins ==
+        /// applied_origins`: a NON-primary listener is the one running the stale
+        /// list. That asymmetry is deliberate — the flag must never under-report a
+        /// pending restart. Always `false` before any listener has served: there is
+        /// nothing live to diverge from, and the first serve start applies the
+        /// persisted list.
+        pub restart_required: bool,
+    }
+}
+
+higgs_ts! {
     /// Error body for control routes: the rendered `HiggsError` display
     /// (diagnostic code included), as `{"error":"<display>"}`.
     #[derive(Debug, serde::Serialize)]

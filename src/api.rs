@@ -237,11 +237,38 @@ pub struct Higgs {
     /// throttle check-and-set is atomic under it (so a concurrent burst at
     /// window expiry dedupes to ONE update), never held across an `.await`.
     key_touch_throttle: parking_lot::Mutex<std::collections::HashMap<String, u64>>,
-    /// Whether the HTTP listener is bound BEYOND loopback (a LAN/0.0.0.0 bind).
-    /// Set once at serve start ([`Self::set_lan_exposed`]); read by the key-revoke
-    /// gate so revoking the LAST key while LAN-exposed is refused ([HG059]) — an
-    /// open LAN surface must never fall back to no-auth.
-    lan_exposed: std::sync::atomic::AtomicBool,
+    /// Every CURRENTLY-LIVE `/v1` listener, in registration order. `serve_v1` is
+    /// public and an embedder may run SEVERAL listeners on one facade, so this is
+    /// a per-listener registry, not a set of flat slots that overlapping serves
+    /// would clobber: each entry owns the address it bound and the exact extra CORS
+    /// origins ITS layer was built with.
+    ///
+    /// Entries are added by [`Higgs::register_serve`] and removed when the returned
+    /// [`ServeGuard`] drops — which happens on graceful shutdown, on a serve error,
+    /// AND on task cancellation (an aborted serve future), so an aborted listener
+    /// can never strand its registration.
+    ///
+    /// Reads: [`Self::lan_exposed`] (any live LAN listener → the [HG059] revoke
+    /// gate), [`Self::bound_addr`] and [`Self::applied_cors_origins`] (the PRIMARY —
+    /// first-registered — live listener's disclosures), and
+    /// [`Self::any_live_serve_cors_differs`] (does ANY live listener run a CORS list
+    /// other than the persisted one → `restart_required`).
+    serves: parking_lot::Mutex<Vec<ServeSlot>>,
+    /// Monotonic id source for [`ServeSlot`] — a slot is removed by id, never by
+    /// index, so a sibling deregistration can't shift another's identity.
+    next_serve_id: std::sync::atomic::AtomicU64,
+    /// Serializes a listener's REGISTRATION against another listener's
+    /// DEREGISTRATION-and-teardown. `ServeGuard::release` and the `Higgs::stop`
+    /// that may follow it are two steps: without this an incoming `serve_v1` could
+    /// register in the gap, and the departing "last" listener would then drain the
+    /// shared node under it — `stop()` sets a TERMINAL `shutting_down` flag, so the
+    /// newcomer would serve a permanently dead facade. An ASYNC mutex: a
+    /// `parking_lot` one cannot be held across `stop().await`.
+    serve_lifecycle: tokio::sync::Mutex<()>,
+    /// A manual LAN-exposure override for an embedder that serves `/v1` through
+    /// its OWN stack rather than [`crate::serve::serve_v1`] (which registers its
+    /// listeners above). ORed into [`Self::lan_exposed`].
+    lan_override: std::sync::atomic::AtomicBool,
     /// Model ids currently being BENCHMARKED (Turbotune). A benchmark refuses to
     /// start if the model is loaded ([HG067]); while it runs, its id sits here so a
     /// concurrent public load/JIT-chat is refused ([HG068]) rather than racing the
@@ -277,6 +304,93 @@ fn overlay_sampling(
             base.as_llamacpp().overlaid_with(request.as_llamacpp()),
         ),
         None => request,
+    }
+}
+
+/// One CURRENTLY-LIVE `/v1` listener's serve-scoped state (see [`Higgs::serves`]).
+/// Per-listener, not a flat facade slot: overlapping `serve_v1` calls each own their
+/// bound address and the exact extra CORS origins THEIR layer was built with, so one
+/// serve's start or exit can never rewrite another's disclosures.
+pub(crate) struct ServeSlot {
+    /// Identity for removal — a sibling deregistration must not shift it.
+    id: u64,
+    /// This listener is bound BEYOND loopback (LAN/`0.0.0.0`) → it contributes the
+    /// [HG059] last-key-revoke refusal for as long as it lives.
+    lan: bool,
+    /// The address this listener actually bound (`None` if unknowable).
+    addr: Option<std::net::SocketAddr>,
+    /// The extra CORS origins THIS listener's layer was built with.
+    cors_origins: Vec<String>,
+}
+
+/// RAII registration for a live `/v1` listener, from [`Higgs::register_serve`].
+///
+/// Dropping it deregisters the listener. Drop — not an explicit call after the
+/// serve `.await` — because a serve future may be CANCELLED (an embedder aborting
+/// the task): cancelled futures never run code past their await point, but they DO
+/// run destructors. An explicit deregistration would leak the registration on abort,
+/// stranding `lan_exposed` at `true` and permanently refusing a legitimate last-key
+/// revoke with [HG059].
+pub(crate) struct ServeGuard {
+    higgs: Arc<Higgs>,
+    id: u64,
+    /// Already deregistered by [`Self::release`] — `Drop` must not do it twice.
+    released: bool,
+}
+
+impl ServeGuard {
+    /// Arm this listener's LAN exposure (see [`Higgs::arm_lan_serve`], the only
+    /// caller — it does so under the keystore lock).
+    fn set_lan(&self) {
+        if let Some(slot) = self
+            .higgs
+            .serves
+            .lock()
+            .iter_mut()
+            .find(|s| s.id == self.id)
+        {
+            slot.lan = true;
+        }
+    }
+
+    /// Record the extra CORS origins this listener's layer is being built with,
+    /// once `serve_v1`'s startup guards have passed and the list has been read.
+    pub(crate) fn set_cors_origins(&self, cors_origins: Vec<String>) {
+        if let Some(slot) = self
+            .higgs
+            .serves
+            .lock()
+            .iter_mut()
+            .find(|s| s.id == self.id)
+        {
+            slot.cors_origins = cors_origins;
+        }
+    }
+
+    /// Deregister this listener NOW, returning whether it was the LAST live one.
+    ///
+    /// `serve_v1` calls this the moment its listener stops accepting — BEFORE the
+    /// terminal worker drain — so a dead listener never keeps disclosing itself
+    /// (`bind_host`, applied CORS) or forcing the [HG059] revoke refusal while
+    /// workers take seconds to shut down. The returned flag is what tells `serve_v1`
+    /// whether it owns the facade teardown: with SIBLING listeners still live,
+    /// draining the shared node would strand them serving a stopped facade.
+    ///
+    /// Computed under the registry lock, so exactly one of several concurrently
+    /// exiting listeners can observe itself as last.
+    pub(crate) fn release(mut self) -> bool {
+        self.released = true;
+        self.higgs.deregister_serve(self.id)
+    }
+}
+
+impl Drop for ServeGuard {
+    fn drop(&mut self) {
+        // The CANCELLATION path (an aborted serve future): `release` never ran, so
+        // the registration must still be dropped here.
+        if !self.released {
+            self.higgs.deregister_serve(self.id);
+        }
     }
 }
 
@@ -608,7 +722,10 @@ impl Higgs {
             config_path: parking_lot::Mutex::new(default_config_path_override()),
             keys_io: parking_lot::Mutex::new(()),
             key_touch_throttle: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            lan_exposed: std::sync::atomic::AtomicBool::new(false),
+            serves: parking_lot::Mutex::new(Vec::new()),
+            next_serve_id: std::sync::atomic::AtomicU64::new(0),
+            serve_lifecycle: tokio::sync::Mutex::new(()),
+            lan_override: std::sync::atomic::AtomicBool::new(false),
             benchmarking: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
             shutting_down: std::sync::atomic::AtomicBool::new(false),
         }
@@ -833,15 +950,141 @@ impl Higgs {
         }
     }
 
-    /// Record whether the listener is bound beyond loopback (see field docs).
+    /// Force the LAN-exposure override (see the `lan_override` field docs) — for an
+    /// embedder that serves `/v1` through its OWN stack rather than
+    /// [`crate::serve::serve_v1`], which registers its listeners itself. ORed with
+    /// the live-listener registry, so it can only ADD exposure, never mask a live
+    /// LAN listener's [HG059] protection.
     pub fn set_lan_exposed(&self, exposed: bool) {
-        self.lan_exposed
+        self.lan_override
             .store(exposed, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Whether the listener is bound beyond loopback ([HG059] revoke gate).
+    /// Whether ANY live listener is bound beyond loopback (or the override is set)
+    /// — the [HG059] revoke gate.
     pub(crate) fn lan_exposed(&self) -> bool {
-        self.lan_exposed.load(std::sync::atomic::Ordering::Relaxed)
+        self.lan_override.load(std::sync::atomic::Ordering::Relaxed)
+            || self.serves.lock().iter().any(|s| s.lan)
+    }
+
+    /// Register a `/v1` listener, UNARMED — called by [`crate::serve::serve_v1`]
+    /// BEFORE its [HG058]/[HG069] guards run, so a refusal can decide "was I the sole
+    /// serve on this facade?" atomically (via [`ServeGuard::release`], under the
+    /// registry lock) instead of racing a sibling registering in the gap.
+    ///
+    /// Only `addr` is final here. `lan` is armed afterwards by [`Higgs::arm_lan_serve`]
+    /// — which does it under the KEYSTORE lock, together with those guards, so a
+    /// concurrent revoke can never interleave into a keyless LAN surface — and the
+    /// enforced CORS list is recorded by [`ServeGuard::set_cors_origins`] once it has
+    /// been read. A caller that knows both up front (a test) may pass them directly.
+    ///
+    /// The returned [`ServeGuard`] deregisters on drop, so the listener's state is
+    /// released on graceful shutdown, on a serve error, and on task CANCELLATION
+    /// (an aborted serve future never runs code after its `.await`, but it does run
+    /// destructors). Once no LAN listener remains, the [HG059] last-key-revoke
+    /// refusal lifts; safety rests on the START-side guards, which re-check the
+    /// keystore on every serve ([HG058] refuses a keyless non-loopback bind, [HG069]
+    /// one whose keys are all non-Admin).
+    pub(crate) fn register_serve(
+        self: &std::sync::Arc<Self>,
+        lan: bool,
+        addr: Option<std::net::SocketAddr>,
+        cors_origins: Vec<String>,
+    ) -> ServeGuard {
+        let id = self
+            .next_serve_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.serves.lock().push(ServeSlot {
+            id,
+            lan,
+            addr,
+            cors_origins,
+        });
+        ServeGuard {
+            higgs: std::sync::Arc::clone(self),
+            id,
+            released: false,
+        }
+    }
+
+    /// Serialize a listener registration against another listener's
+    /// deregistration-and-teardown (see the `serve_lifecycle` field docs). Held by
+    /// `serve_v1` across `register_serve`, and across `release()` + `stop()`.
+    pub(crate) async fn serve_lifecycle(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.serve_lifecycle.lock().await
+    }
+
+    /// Run the non-loopback startup key checks and ARM the listener's LAN exposure
+    /// **atomically**, under the same `keys_io` lock that guards a key revoke.
+    ///
+    /// The two must not interleave. `revoke_key` decides [HG059] (refuse emptying
+    /// the store while LAN-exposed) and commits the removal under `keys_io`; this
+    /// checks [HG058] (a non-loopback listener needs at least one key) and [HG069]
+    /// (…at least one Admin key) and then arms the exposure. Without a shared lock a
+    /// revoke could observe `lan_exposed() == false`, a serve could pass its key
+    /// check against the not-yet-published store, and the revoke would then empty it
+    /// — leaving a listener KEYLESS on a LAN. Serialized, one always loses: either
+    /// the revoke sees the armed listener and refuses, or this sees the emptied
+    /// store and refuses.
+    ///
+    /// Lock order is `keys_io` → `serves`; nothing takes them the other way round.
+    pub(crate) fn arm_lan_serve(&self, guard: &ServeGuard, bind: &str) -> Result<(), HiggsError> {
+        let _keys = self.keys_io.lock();
+        let keys = self.api_keys();
+        // [HG058]: zero keys ⇒ auth is off AND the Host guard is relaxed for this
+        // bind — the whole surface would be exposed.
+        if keys.is_empty() {
+            return Err(HiggsError::LanBindWithoutKeys {
+                bind: bind.to_owned(),
+            });
+        }
+        // [HG069]: keys exist but none is Admin ⇒ the Admin-only key-management API
+        // (mint/revoke) is locked out on the exposed surface.
+        if !keys
+            .iter()
+            .any(|k| k.scopes.contains(&crate::keys::Scope::Admin))
+        {
+            return Err(HiggsError::LanBindWithoutAdminKey {
+                bind: bind.to_owned(),
+            });
+        }
+        guard.set_lan();
+        Ok(())
+    }
+
+    /// Drop a listener's registration BY ID (never by index — a sibling
+    /// deregistration must not shift another's identity).
+    fn deregister_serve(&self, id: u64) -> bool {
+        let mut serves = self.serves.lock();
+        serves.retain(|s| s.id != id);
+        serves.is_empty()
+    }
+
+    /// The PRIMARY (first-registered) live listener's bound address, or `None`
+    /// pre-serve. With several listeners the primary is disclosed — the single
+    /// `bind_host` wire field can't describe more, and the common case is one.
+    pub(crate) fn bound_addr(&self) -> Option<std::net::SocketAddr> {
+        self.serves.lock().first().and_then(|s| s.addr)
+    }
+
+    /// The PRIMARY live listener's applied extra CORS origins, or `None` pre-serve
+    /// (which [`Higgs::cors_settings`] distinguishes from an applied-but-empty list).
+    pub(crate) fn applied_cors_origins(&self) -> Option<Vec<String>> {
+        self.serves.lock().first().map(|s| s.cors_origins.clone())
+    }
+
+    /// Does ANY live listener run a CORS allowlist other than `persisted`? That —
+    /// not just the primary's — is what "a restart is required to apply the
+    /// persisted list" means when several listeners are up. Compared as SETS (the
+    /// allowlist is exact-match membership; order is meaningless to the layer).
+    /// `false` when nothing is live: the first serve start applies `persisted`.
+    pub(crate) fn any_live_serve_cors_differs(&self, persisted: &[String]) -> bool {
+        use std::collections::HashSet;
+        let want: HashSet<&String> = persisted.iter().collect();
+        self.serves
+            .lock()
+            .iter()
+            .any(|s| s.cors_origins.iter().collect::<HashSet<_>>() != want)
     }
 
     /// Register an INTERNAL, in-memory-only bearer `token` for an in-process
@@ -888,14 +1131,39 @@ impl Higgs {
 
     /// Extra CORS origins from `config.json` (`cors_origins`), matched exactly
     /// against the request `Origin` in addition to the built-in loopback/tauri
-    /// set. Read once at router build — a change needs a restart (G7 owns live
+    /// set. Read once at serve start — a change needs a restart (G7 owns live
     /// rebind). Errors read as empty (the built-in set still applies).
+    ///
+    /// Every entry is CANONICALIZED on read (and an invalid one dropped with a
+    /// warning), exactly as [`Higgs::set_cors_origins`] canonicalizes on write.
+    /// `config.json` is a plain file an operator can hand-edit, and it predates
+    /// that validation — a legacy `https://EXAMPLE.com:443` entry would otherwise
+    /// be built into the layer verbatim and never match a browser's
+    /// `Origin: https://example.com`, while being disclosed as applied-and-in-sync.
+    /// Normalizing here keeps what we ENFORCE, what we DISCLOSE, and what a browser
+    /// SENDS the same string.
     pub(crate) fn extra_cors_origins(&self) -> Vec<String> {
-        self.config_file_path()
+        let raw: Vec<String> = self
+            .config_file_path()
             .ok()
             .and_then(|p| crate::config::InstanceConfig::load(&p).ok())
             .map(|c| c.cors_origins)
-            .unwrap_or_default()
+            .unwrap_or_default();
+        let mut seen = std::collections::HashSet::with_capacity(raw.len());
+        let mut out = Vec::with_capacity(raw.len());
+        for origin in raw {
+            match crate::api::embed::validate_cors_origin(&origin) {
+                Ok(canonical) => {
+                    if seen.insert(canonical.clone()) {
+                        out.push(canonical);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("higgs: ignoring invalid cors_origins entry in config.json: {e}")
+                }
+            }
+        }
+        out
     }
 
     /// Run the Turbotune (G6) benchmark: generate an ordered, fit-and-headroom
@@ -2362,15 +2630,21 @@ impl Higgs {
         self.config.lock().default_load.clone()
     }
 
-    /// Read-only snapshot of the effective server config for `GET
-    /// /api/higgs/system`. Clones the scan dirs and load defaults from the live
-    /// [`HiggsConfig`] and pairs them with the two fixed invariants ([`BIND_HOST`],
-    /// [`DEFAULT_CTX_CAP`]). Pure read — no worker RPC, no mutation.
+    /// Read-only snapshot of the effective server config for the `system`
+    /// control-op. Clones the scan dirs and load defaults from the live
+    /// [`HiggsConfig`]; `bind_host` is the RECORDED live listener address
+    /// (`ip:port`, captured by `serve_v1`) when serving, else the built-in
+    /// loopback default [`BIND_HOST`]. Pure read — no worker RPC, no mutation.
     pub fn server_config(&self) -> HiggsServerConfig {
         let cfg = self.config.lock();
         let to_strings = |dirs: &[PathBuf]| dirs.iter().map(|p| p.display().to_string()).collect();
         HiggsServerConfig {
-            bind_host: BIND_HOST.to_owned(),
+            // The embedder owns the listener (loopback or 0.0.0.0 for LAN), so
+            // disclose what's ACTUALLY bound once serving — not a loopback claim.
+            bind_host: self
+                .bound_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|| BIND_HOST.to_owned()),
             lmstudio_dirs: to_strings(&cfg.lmstudio_dirs),
             hf_dirs: to_strings(&cfg.hf_dirs),
             ollama_dirs: to_strings(&cfg.ollama_dirs),

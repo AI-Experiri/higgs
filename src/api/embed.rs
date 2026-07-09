@@ -15,8 +15,8 @@ use crate::diagnostic::HiggsError;
 use crate::keys::Scope;
 use crate::node::worker_id::WorkerId;
 use crate::serve::wire::{
-    HiggsHubStatus, HiggsKeyRemoved, HiggsLoadRequest, HiggsMintKeyResponse, HiggsModelEntry,
-    HiggsVersionResponse, LogSettings,
+    HiggsCorsSettings, HiggsHubStatus, HiggsKeyRemoved, HiggsLoadRequest, HiggsMintKeyResponse,
+    HiggsModelEntry, HiggsVersionResponse, LogSettings,
 };
 use crate::worker::engine::llamacpp::params::LlamaCppParams;
 use crate::worker::engine::{CtxLen, LoadParams};
@@ -510,9 +510,32 @@ impl Higgs {
     /// [`decide_revoke`](crate::serve::control::decide_revoke).
     pub fn revoke_key(&self, label: &str) -> Result<HiggsKeyRemoved, HiggsError> {
         use crate::serve::control::{decide_revoke, keystore_io_error, Revoke};
-        let lan = self.lan_exposed();
         let outcome = self
             .mutate_api_keys(|ks| {
+                // Read the LAN exposure INSIDE the keystore critical section, not as
+                // a snapshot taken before it. `mutate_api_keys` holds `keys_io`
+                // across decide-and-commit; a `lan_exposed()` sampled outside that
+                // window can go stale between the sample and the commit, and this
+                // one degrades UNSAFELY: a `serve_v1` arming a LAN listener in that
+                // gap would pass its own [HG058] key check (the key is still there),
+                // while this revoke commits against `lan = false` and empties the
+                // store — leaving a KEYLESS LAN surface. Reading here makes the
+                // exposure test and the removal atomic with respect to each other,
+                // so one of the two operations always loses: either this revoke sees
+                // the armed listener and refuses ([HG059]), or the listener's key
+                // check sees the emptied store and refuses ([HG058]).
+                //
+                // Lock order is `keys_io` → `serves` (via `lan_exposed`); nothing
+                // takes them the other way round, so this cannot deadlock.
+                //
+                // NOT PINNED BY A TEST — same class as `arm_lan_serve`'s scope note:
+                // hoisting this read back out of the closure breaks no test, because
+                // every test sets the exposure statically with no concurrent arm. The
+                // property is a lock SCOPE, and proving it would need a test-only
+                // injection point in production code, which this crate forbids. It is
+                // held by construction: this read and the commit share one `keys_io`
+                // critical section, and `Higgs::arm_lan_serve` arms under the same lock.
+                let lan = self.lan_exposed();
                 let decision = decide_revoke(ks, true, None, label, lan);
                 if let Revoke::Removed(_) = &decision {
                     let _ = ks.remove_label(label);
@@ -567,6 +590,59 @@ impl Higgs {
         self.set_verbose(settings.verbose);
         self.set_log_incoming_tokens(settings.log_incoming_tokens);
         self.set_log_show_fields(settings.show_log_fields);
+    }
+
+    /// The extra CORS-origins allowlist state: what's persisted in `config.json`
+    /// now (`origins`), what the RUNNING server booted with (`applied_origins`), and
+    /// whether they differ (`restart_required`).
+    ///
+    /// The extra origins are read ONCE at serve start when the CORS layer is built,
+    /// so a persisted change applies only on the next restart — `restart_required`
+    /// surfaces that honestly (a live rebind of the running layer is a separate,
+    /// deferred feature). CORS only protects BROWSER clients; non-browser access is
+    /// gated by API keys, not this list.
+    pub fn cors_settings(&self) -> HiggsCorsSettings {
+        let origins = self.extra_cors_origins();
+        // `applied` is `None` until a CORS layer has actually been built (pre-serve).
+        // Pre-serve there is nothing to diverge from — the first serve start applies
+        // the persisted list — so `restart_required` is `false`, NOT a comparison
+        // against a flattened-empty applied list (which would falsely flag a restart
+        // for origins set before the server ever served).
+        let applied = self.applied_cors_origins();
+        // ANY live listener running a different allowlist means a restart is needed
+        // — not just the primary one whose list `applied_origins` discloses. The
+        // comparison is by SET (the allowlist is exact-match membership, so order is
+        // meaningless to the layer): a reordered save of the same origins must not
+        // claim a restart. `false` when nothing is live (the first serve applies the
+        // persisted list, so nothing is pending).
+        let restart_required = self.any_live_serve_cors_differs(&origins);
+        HiggsCorsSettings {
+            origins,
+            applied_origins: applied.unwrap_or_default(),
+            restart_required,
+        }
+    }
+
+    /// Replace the persisted extra CORS-origins allowlist. Each entry must be a
+    /// bare `http(s)://host[:port]` origin (no userinfo/path/query/fragment) — an
+    /// invalid entry is rejected with `[HG071]` BEFORE anything is persisted. Every
+    /// accepted entry is CANONICALIZED to the exact string a browser sends in the
+    /// `Origin` header (lowercased host, default port stripped) so the exact-match
+    /// allowlist can match; the STORED value is that canonical form, not the raw
+    /// input. Repeated origins (after canonicalization) are deduped (first-seen
+    /// order preserved) rather than erroring. The normalized list is written to
+    /// `config.json` via [`Higgs::with_config_mut`]; the returned
+    /// [`HiggsCorsSettings`] reflects the new persisted state (so `restart_required`
+    /// flips `true` when it diverges from the running server's boot-applied list).
+    pub fn set_cors_origins(&self, origins: Vec<String>) -> Result<HiggsCorsSettings, HiggsError> {
+        let normalized = validate_and_dedup_cors_origins(origins)?;
+        self.with_config_mut(|c| c.cors_origins = normalized.clone())
+            .map_err(|e| HiggsError::PersistenceFailed {
+                store: "config".into(),
+                path: "config.json".into(),
+                source: e,
+            })?;
+        Ok(self.cors_settings())
     }
 
     /// Unload every resident worker, freeing their memory — `POST
@@ -636,6 +712,86 @@ fn not_a_hub_error(op: &str) -> HiggsError {
         op: op.to_owned(),
         detail: "server is not running in hub mode (set HIGGS_HUB=1)".into(),
     }
+}
+
+/// Validate + CANONICALIZE every extra CORS origin, then DEDUP repeated entries
+/// preserving first-seen order. Each entry is normalized by [`validate_cors_origin`]
+/// to the exact string a browser sends in the `Origin` header; the first invalid
+/// entry short-circuits with its `[HG071]` error (nothing is persisted). Dedup
+/// operates on the CANONICAL forms, so two inputs that browsers serialize
+/// identically (`https://EXAMPLE.com` and `https://example.com`) collapse to one.
+fn validate_and_dedup_cors_origins(origins: Vec<String>) -> Result<Vec<String>, HiggsError> {
+    let mut seen = HashSet::with_capacity(origins.len());
+    let mut out = Vec::with_capacity(origins.len());
+    for origin in origins {
+        let canonical = validate_cors_origin(&origin)?;
+        if seen.insert(canonical.clone()) {
+            out.push(canonical);
+        }
+    }
+    Ok(out)
+}
+
+/// Validate + CANONICALIZE ONE extra CORS origin, returning the exact ASCII string
+/// a browser puts in the `Origin` header (which the allowlist matches verbatim).
+/// The input is parsed with the WHATWG `url` crate — this is normalization, not
+/// mere validation: the returned value is `url.origin().ascii_serialization()`,
+/// i.e. lowercased host and default port (80/443) stripped, so `https://EXAMPLE.com`
+/// becomes `https://example.com` and `http://example.com:80` becomes
+/// `http://example.com`. `Url::parse` itself rejects the shapes a browser never
+/// emits (unbracketed IPv6, unbalanced brackets, out-of-range ports). Anything that
+/// is not a bare `http`/`https` origin — a non-http scheme, any userinfo
+/// (username/password), a path beyond a single trailing `/` (checked on the RAW
+/// input too, since the parser normalizes dot-segments like `/app/..` away), any
+/// query or fragment, or a missing host — is `[HG071] InvalidCorsOrigin` with the
+/// specific reason.
+pub(crate) fn validate_cors_origin(origin: &str) -> Result<String, HiggsError> {
+    let reject = |reason: &str| HiggsError::InvalidCorsOrigin {
+        origin: origin.to_owned(),
+        reason: reason.to_owned(),
+    };
+    let url = url::Url::parse(origin).map_err(|e| reject(&e.to_string()))?;
+    match url.scheme() {
+        "http" | "https" => {}
+        _ => return Err(reject("must start with http:// or https://")),
+    }
+    // The parser NORMALIZES dot-segments and backslashes (`/app/..`, `/%2e%2e`,
+    // `\app` all collapse into the parsed path — possibly to a bare `/`) BEFORE
+    // the `url.path()` check below runs, so a pasted URL that VISIBLY carries a
+    // path could otherwise slip through as its origin. Enforce "bare origin" on
+    // the RAW input too: after the `://`, the only separator allowed is a single
+    // trailing `/`. (A scheme-relative shorthand like `https:example.com` — which
+    // the parser tolerates but a browser never emits — has no `://` and is
+    // rejected here.)
+    let rest = origin
+        .find("://")
+        .map(|sep| &origin[sep + 3..])
+        .ok_or_else(|| reject("must start with http:// or https://"))?;
+    if let Some(i) = rest.find(['/', '\\']) {
+        if !(i == rest.len() - 1 && rest.as_bytes()[i] == b'/') {
+            return Err(reject(
+                "must not contain a path (a single trailing '/' is allowed)",
+            ));
+        }
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(reject("must not contain a username or password"));
+    }
+    if !matches!(url.path(), "" | "/") {
+        return Err(reject(
+            "must not contain a path (a single trailing '/' is allowed)",
+        ));
+    }
+    if url.query().is_some() {
+        return Err(reject("must not contain a query string"));
+    }
+    if url.fragment().is_some() {
+        return Err(reject("must not contain a fragment"));
+    }
+    if url.host().is_none() {
+        return Err(reject("missing host"));
+    }
+    Ok(url.origin().ascii_serialization())
 }
 
 /// Conservative lower-bound prompt-token pre-check: sum the byte length of each

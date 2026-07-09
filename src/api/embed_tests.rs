@@ -446,3 +446,551 @@ async fn mint_and_revoke_key_trusted_keep_invariants() {
         }
     }
 }
+
+// ── CORS origins allowlist (validate + persist + applied/restart state) ──────
+
+#[test]
+fn validate_cors_origin_accepts_and_canonicalizes() {
+    // (input, expected canonical form a browser sends in the Origin header)
+    for (input, expected) in [
+        ("http://tools.example", "http://tools.example"),
+        ("https://tools.example", "https://tools.example"),
+        ("http://localhost:5173", "http://localhost:5173"),
+        (
+            "https://app.example.com:8443",
+            "https://app.example.com:8443",
+        ),
+        ("http://127.0.0.1:31415", "http://127.0.0.1:31415"),
+        ("http://[::1]", "http://[::1]"),
+        ("http://[::1]:8080", "http://[::1]:8080"),
+        // Bracketed IPv6 with a port is accepted verbatim.
+        ("https://[::1]:8080", "https://[::1]:8080"),
+        // Browsers lowercase the host — canonicalize to match.
+        ("https://EXAMPLE.com", "https://example.com"),
+        // Browsers omit the default port — strip 80 (http) / 443 (https).
+        ("http://example.com:80", "http://example.com"),
+        ("https://example.com:443", "https://example.com"),
+        // A lone trailing slash is the empty path — normalized away, not rejected.
+        ("https://tools.example/", "https://tools.example"),
+    ] {
+        let canonical = super::validate_cors_origin(input)
+            .unwrap_or_else(|e| panic!("expected {input:?} to validate, got {e:?}"));
+        assert_eq!(
+            canonical, expected,
+            "expected {input:?} to canonicalize to {expected:?}"
+        );
+    }
+}
+
+#[test]
+fn validate_cors_origin_rejects_malformed() {
+    for bad in [
+        "",                             // empty
+        "tools.example",                // no scheme
+        "ftp://tools.example",          // wrong scheme
+        "https://tools.example/app",    // path
+        "https://tools.example?x=1",    // query
+        "https://tools.example#top",    // fragment
+        "http://user:pass@example.com", // userinfo (username + password)
+        "http://user@example.com",      // userinfo (username only)
+        "http://",                      // missing host
+        "http://:8080",                 // missing host, has port
+        "http://host:abc",              // non-numeric port
+        "http://::1",                   // unbracketed IPv6 — never a browser Origin
+        "http://[::1",                  // unbalanced bracket
+        "http://[::1]:8080:9090",       // malformed / double port
+        "https://example.com:65536",    // port out of range (> 65535)
+        // Dot-segment / escaped / backslash paths NORMALIZE to "/" inside the
+        // parser, so only the raw-input check catches them — a pasted URL with a
+        // visible path must not silently become its origin.
+        "https://tools.example/app/..", // dot-segments collapse to "/"
+        "https://tools.example/%2e%2e", // escaped dot-segments collapse to "/"
+        "https://tools.example\\app",   // backslash is a path separator to the parser
+        "https:tools.example",          // scheme-relative shorthand — no "://"
+        // A BARE delimiter: `url` reports `query`/`fragment` as `Some("")`, which
+        // is still not a bare origin (JS `URL` reads these back as `''`, so the
+        // frontend mirror needs its own raw scan to agree with this).
+        "https://tools.example?", // empty query delimiter
+        "https://tools.example#", // empty fragment delimiter
+    ] {
+        assert!(
+            matches!(
+                super::validate_cors_origin(bad),
+                Err(HiggsError::InvalidCorsOrigin { .. })
+            ),
+            "expected {bad:?} to be rejected as HG071"
+        );
+    }
+}
+
+#[test]
+fn validate_and_dedup_preserves_first_seen_order() {
+    let deduped = super::validate_and_dedup_cors_origins(vec![
+        "https://a.example".to_string(),
+        "https://b.example".to_string(),
+        "https://a.example".to_string(),
+    ])
+    .expect("all valid");
+    assert_eq!(
+        deduped,
+        vec![
+            "https://a.example".to_string(),
+            "https://b.example".to_string()
+        ],
+        "repeated origin dropped, first-seen order kept"
+    );
+}
+
+#[test]
+fn validate_and_dedup_collapses_canonically_equal_origins() {
+    // Two inputs a browser serializes identically collapse to one canonical entry.
+    let deduped = super::validate_and_dedup_cors_origins(vec![
+        "https://EXAMPLE.com".to_string(),
+        "https://example.com:443".to_string(),
+        "http://b.example:80".to_string(),
+    ])
+    .expect("all valid");
+    assert_eq!(
+        deduped,
+        vec![
+            "https://example.com".to_string(),
+            "http://b.example".to_string()
+        ],
+        "canonically-equal origins deduped; each stored in canonical form"
+    );
+}
+
+#[tokio::test]
+async fn cors_settings_persists_and_flags_restart_required() {
+    let higgs = fake_higgs(vec![]);
+
+    // Fresh instance: nothing persisted, nothing applied → no restart pending.
+    let initial = higgs.cors_settings();
+    assert!(initial.origins.is_empty());
+    assert!(initial.applied_origins.is_empty());
+    assert!(!initial.restart_required);
+
+    // Persist a (deduped) list. No CORS layer has been built yet (no serve), so
+    // there is nothing live to diverge from — the first serve start will apply
+    // this list — hence NO restart is pending (applied stays `None`, not empty).
+    let updated = higgs
+        .set_cors_origins(vec![
+            "https://tools.example".to_string(),
+            "http://localhost:5173".to_string(),
+            "https://tools.example".to_string(), // dup dropped
+        ])
+        .expect("valid origins persist");
+    assert_eq!(
+        updated.origins,
+        vec![
+            "https://tools.example".to_string(),
+            "http://localhost:5173".to_string()
+        ]
+    );
+    assert!(updated.applied_origins.is_empty());
+    assert!(
+        !updated.restart_required,
+        "pre-serve set: no CORS layer built yet → no restart pending"
+    );
+
+    // A fresh read reflects the persisted config.json.
+    let read_back = higgs.cors_settings();
+    assert_eq!(read_back.origins, updated.origins);
+
+    // Once a listener IS live with a DIFFERENT list, the persisted change diverges
+    // from what's enforced → restart_required flips true.
+    let higgs = Arc::new(higgs);
+    {
+        let _live = higgs.register_serve(false, None, vec!["https://old.example".to_string()]);
+        assert!(
+            higgs.cors_settings().restart_required,
+            "persisted list differs from the live listener's list → restart required"
+        );
+    }
+
+    // A listener live with EXACTLY the persisted list → nothing pending.
+    let _synced_live = higgs.register_serve(false, None, read_back.origins.clone());
+    assert!(
+        !higgs.cors_settings().restart_required,
+        "applied == persisted → no restart pending"
+    );
+}
+
+#[tokio::test]
+async fn cors_settings_pre_serve_never_flags_restart() {
+    // No listener is live (no CORS layer exists), so however many origins are
+    // persisted before the first serve, `restart_required` stays false — the first
+    // serve start applies them, so nothing is pending.
+    let higgs = fake_higgs(vec![]);
+    higgs
+        .set_cors_origins(vec!["https://tools.example".to_string()])
+        .expect("valid origin persists");
+    let settings = higgs.cors_settings();
+    assert_eq!(settings.origins, vec!["https://tools.example".to_string()]);
+    assert!(
+        settings.applied_origins.is_empty(),
+        "nothing applied pre-serve"
+    );
+    assert!(
+        !settings.restart_required,
+        "pre-serve set must not report a restart"
+    );
+}
+
+#[tokio::test]
+async fn cors_restart_flag_ignores_origin_order() {
+    // The allowlist is exact-match MEMBERSHIP — order is meaningless to the
+    // running CORS layer, so persisting the SAME origins reordered must not
+    // claim a restart is needed. A genuinely different set still must.
+    let higgs = Arc::new(fake_higgs(vec![]));
+    let _live = higgs.register_serve(
+        false,
+        None,
+        vec![
+            "https://a.example".to_string(),
+            "https://b.example".to_string(),
+        ],
+    );
+    let reordered = higgs
+        .set_cors_origins(vec![
+            "https://b.example".to_string(),
+            "https://a.example".to_string(),
+        ])
+        .expect("valid origins persist");
+    assert_eq!(
+        reordered.origins,
+        vec![
+            "https://b.example".to_string(),
+            "https://a.example".to_string()
+        ],
+        "display keeps the persisted order"
+    );
+    assert!(
+        !reordered.restart_required,
+        "same origins, different order → everything is already live"
+    );
+    let changed = higgs
+        .set_cors_origins(vec!["https://b.example".to_string()])
+        .expect("valid origin persists");
+    assert!(
+        changed.restart_required,
+        "a genuinely different set still requires a restart"
+    );
+}
+
+#[tokio::test]
+async fn set_cors_origins_canonicalizes_persisted_value() {
+    // A mixed-case host with an explicit default port is stored as the exact
+    // string a browser sends in the Origin header.
+    let higgs = fake_higgs(vec![]);
+    let settings = higgs
+        .set_cors_origins(vec!["https://EXAMPLE.com:443".to_string()])
+        .expect("valid origin persists");
+    assert_eq!(
+        settings.origins,
+        vec!["https://example.com".to_string()],
+        "host lowercased + default port stripped on persist"
+    );
+}
+
+#[tokio::test]
+async fn set_cors_origins_rejects_invalid_without_persisting() {
+    let higgs = fake_higgs(vec![]);
+    let err = higgs
+        .set_cors_origins(vec![
+            "https://ok.example".to_string(),
+            "notaurl".to_string(),
+        ])
+        .expect_err("invalid entry rejected");
+    assert!(
+        matches!(err, HiggsError::InvalidCorsOrigin { .. }),
+        "HG071 InvalidCorsOrigin, got {err:?}"
+    );
+    // Nothing was persisted — the config.json still lists no extra origins.
+    assert!(
+        higgs.cors_settings().origins.is_empty(),
+        "rejected write leaves the allowlist untouched"
+    );
+}
+
+/// `serve_v1` is public and an embedder may run SEVERAL listeners on one facade,
+/// so LAN exposure comes from the live-listener REGISTRY, not a single bool: a
+/// loopback serve starting — or any sibling serve exiting — must not clear the
+/// exposure a still-live LAN listener depends on for its [HG059] last-key-revoke
+/// refusal. The exposure lifts only when the LAST LAN listener leaves.
+#[tokio::test]
+async fn lan_exposure_tracks_every_live_serve() {
+    let higgs = Arc::new(fake_higgs(vec![]));
+    assert!(!higgs.lan_exposed(), "no listener → not exposed");
+
+    // A LAN listener goes live, then a LOOPBACK one joins it. The loopback serve
+    // must NOT clear the LAN exposure (the old bool `set_lan_exposed(!loopback)`
+    // wrote `false` here and dropped the guard out from under a live LAN listener).
+    let lan = higgs.register_serve(true, None, vec![]);
+    let loopback = higgs.register_serve(false, None, vec![]);
+    assert!(higgs.lan_exposed(), "LAN listener still live");
+
+    // The loopback listener exits: a SIBLING serve ending must not lift exposure.
+    drop(loopback);
+    assert!(
+        higgs.lan_exposed(),
+        "sibling exit must not lift LAN exposure"
+    );
+
+    // The LAN listener exits — nothing is exposed any more.
+    drop(lan);
+    assert!(!higgs.lan_exposed(), "last LAN listener gone → not exposed");
+
+    // Two overlapping LAN listeners: exposure survives until BOTH are gone.
+    let a = higgs.register_serve(true, None, vec![]);
+    let b = higgs.register_serve(true, None, vec![]);
+    drop(a);
+    assert!(higgs.lan_exposed(), "one LAN listener remains");
+    drop(b);
+    assert!(!higgs.lan_exposed(), "both gone → not exposed");
+
+    // The manual override ORs in — it can ADD exposure for an embedder serving
+    // through its own stack, but can never mask a live LAN listener.
+    higgs.set_lan_exposed(true);
+    assert!(higgs.lan_exposed(), "override exposes");
+    higgs.set_lan_exposed(false);
+    assert!(!higgs.lan_exposed(), "override lifts");
+    let live_lan = higgs.register_serve(true, None, vec![]);
+    higgs.set_lan_exposed(false);
+    assert!(
+        higgs.lan_exposed(),
+        "clearing the override must not mask a LIVE LAN listener"
+    );
+    drop(live_lan);
+}
+
+/// `arm_lan_serve` is the non-loopback startup gate: it runs the [HG058] (needs a
+/// key) / [HG069] (needs an Admin key) checks and arms `lan_exposed`, both under the
+/// SAME `keys_io` lock a revoke commits under, so a revoke and a LAN serve start can
+/// never interleave into a keyless LAN surface — one of them always loses.
+///
+/// SCOPE OF THIS TEST — read before trusting it. It pins the OBSERVABLE gate
+/// behavior (a refused serve arms nothing; a passing serve arms, and thereby makes
+/// the store-emptying revoke fail with [HG059]). It does NOT pin the lock SCOPE:
+/// moving `guard.set_lan()` outside the `keys_io` critical section still passes
+/// here, because the interleaving that opens is a nanosecond race between two
+/// threads. That property is argued from the code — `Higgs::arm_lan_serve` holds
+/// `keys_io` across check-and-arm, and `revoke_key` reads `lan_exposed()` INSIDE
+/// `mutate_api_keys`, which holds the same lock — plus the documented lock order
+/// `keys_io` → `serves`. Pinning it in a test would need a test-only injection
+/// point in production code, which this crate forbids.
+///
+/// ([HG069]'s own refusal is covered end-to-end by
+/// `tests/cov_serve.rs::serve_v1_refuses_lan_without_admin_key`; a keys-but-no-Admin
+/// store isn't reachable through `mint_key`, which enforces the
+/// first-key-must-be-Admin bootstrap rule.)
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // TEST_ENV_LOCK serializes HIGGS_HOME for the test
+async fn arm_lan_serve_gates_and_arms_atomically() {
+    // Minting persists `api_keys.json` under `HIGGS_HOME`; isolate it so this never
+    // touches the real keystore (nor races a sibling test's temp home away).
+    let _env = crate::TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let home = tempfile::tempdir().unwrap();
+    let prev = std::env::var_os("HIGGS_HOME");
+    // SAFETY: serialized by TEST_ENV_LOCK; restored below.
+    unsafe { std::env::set_var("HIGGS_HOME", home.path()) };
+
+    let higgs = Arc::new(fake_higgs(vec![]));
+    let guard = higgs.register_serve(false, None, vec![]);
+    assert!(!higgs.lan_exposed(), "registration alone does not arm");
+
+    // Empty keystore → [HG058], and NOTHING is armed: a refused serve must leave no
+    // phantom exposure that would strand a later revoke.
+    let err = higgs
+        .arm_lan_serve(&guard, "0.0.0.0:1")
+        .expect_err("keyless LAN bind refused");
+    assert!(
+        matches!(err, HiggsError::LanBindWithoutKeys { .. }),
+        "{err}"
+    );
+    assert!(!higgs.lan_exposed(), "a refused LAN serve arms nothing");
+
+    // With an Admin key the gate passes AND arms in the same critical section.
+    higgs
+        .mint_key("admin", Some(vec![Scope::Admin]))
+        .expect("first key is admin (bootstrap rule)");
+    higgs.arm_lan_serve(&guard, "0.0.0.0:1").expect("armed");
+    assert!(higgs.lan_exposed(), "a passing LAN serve is armed");
+
+    // Armed ⇒ the revoke that would EMPTY the store is refused ([HG059]) — the exact
+    // invariant the shared-lock atomicity exists to protect.
+    assert!(
+        matches!(
+            higgs.revoke_key("admin"),
+            Err(HiggsError::LastKeyOnLan { .. })
+        ),
+        "emptying the store while a LAN listener is armed is refused"
+    );
+
+    // Deregistering lifts the exposure, and the same revoke then succeeds.
+    assert!(guard.release(), "sole listener");
+    assert!(!higgs.lan_exposed(), "no phantom exposure");
+    higgs
+        .revoke_key("admin")
+        .expect("revoke once nothing is live");
+
+    // SAFETY: serialized by TEST_ENV_LOCK.
+    unsafe {
+        match prev {
+            Some(v) => std::env::set_var("HIGGS_HOME", v),
+            None => std::env::remove_var("HIGGS_HOME"),
+        }
+    }
+}
+
+/// A CANCELLED serve future (an embedder aborting the task) never runs code past
+/// its await point — but it DOES run destructors. The registration must therefore
+/// be released by the guard's `Drop`, or an aborted LAN serve would strand
+/// `lan_exposed` at true and refuse a legitimate last-key revoke forever.
+#[tokio::test]
+async fn aborting_a_serve_future_releases_its_registration() {
+    let higgs = Arc::new(fake_higgs(vec![]));
+    let serving = Arc::clone(&higgs);
+    // A task that registers a LAN listener and then parks forever, exactly as a
+    // real `serve_v1` parks on `axum::serve(..).await`.
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+    let task = tokio::spawn(async move {
+        let _guard = serving.register_serve(true, None, vec![]);
+        let _ = ready_tx.send(());
+        std::future::pending::<()>().await;
+    });
+    ready_rx.await.expect("the serve task registered");
+    assert!(higgs.lan_exposed(), "the LAN listener is live");
+
+    // Abort it — no code after the await runs, only the guard's Drop.
+    task.abort();
+    let _ = task.await;
+    assert!(
+        !higgs.lan_exposed(),
+        "an aborted serve must not strand its LAN registration"
+    );
+}
+
+/// The serve-scoped disclosures are PER-LISTENER: `bound_addr` and the applied
+/// CORS snapshot come from the primary (first-registered) live listener, and a
+/// sibling serve starting or exiting must never rewrite or erase them. They return
+/// to pre-serve semantics only once every listener is gone.
+#[tokio::test]
+async fn serve_disclosures_are_per_listener() {
+    let higgs = Arc::new(fake_higgs(vec![]));
+    let a_addr: std::net::SocketAddr = "127.0.0.1:31415".parse().unwrap();
+    let b_addr: std::net::SocketAddr = "127.0.0.1:31416".parse().unwrap();
+
+    let a = higgs.register_serve(false, Some(a_addr), vec!["https://a.example".to_string()]);
+    // A SECOND listener starts with a different address + CORS list. It must not
+    // overwrite the primary's disclosures (the old flat slots did exactly that).
+    let b = higgs.register_serve(false, Some(b_addr), vec!["https://b.example".to_string()]);
+    assert_eq!(
+        higgs.bound_addr(),
+        Some(a_addr),
+        "primary keeps its address"
+    );
+    assert_eq!(
+        higgs.applied_cors_origins(),
+        Some(vec!["https://a.example".to_string()]),
+        "primary keeps its applied snapshot"
+    );
+
+    // B exits first: A is still live, so nothing is cleared and nothing shifts.
+    drop(b);
+    assert_eq!(
+        higgs.bound_addr(),
+        Some(a_addr),
+        "live serve keeps its address"
+    );
+    assert_eq!(
+        higgs.applied_cors_origins(),
+        Some(vec!["https://a.example".to_string()]),
+        "live serve keeps its applied snapshot"
+    );
+
+    // The last one exits: back to honest pre-serve semantics.
+    drop(a);
+    assert_eq!(higgs.bound_addr(), None, "no listener → no bound address");
+    assert_eq!(
+        higgs.applied_cors_origins(),
+        None,
+        "no listener → no applied snapshot (pre-serve semantics)"
+    );
+}
+
+/// `ServeGuard::release` reports whether the releasing listener was the LAST one —
+/// that flag is what makes `serve_v1` own the facade teardown only when nothing else
+/// is serving. With a sibling still live, draining the shared node would strand it.
+/// It also deregisters immediately (before the caller's terminal worker drain), so a
+/// stopped listener never keeps disclosing itself or forcing [HG059].
+#[tokio::test]
+async fn only_the_last_listener_reports_itself_as_last() {
+    let higgs = Arc::new(fake_higgs(vec![]));
+    let a = higgs.register_serve(true, None, vec![]);
+    let b = higgs.register_serve(false, None, vec![]);
+
+    // A sibling is still live → NOT last → its `serve_v1` must not stop the facade.
+    assert!(
+        !a.release(),
+        "a listener with a live sibling is not the last"
+    );
+    // Releasing also deregistered it: the LAN exposure it contributed is gone at
+    // once, without waiting for any worker drain.
+    assert!(
+        !higgs.lan_exposed(),
+        "released LAN listener stops contributing exposure immediately"
+    );
+
+    // The remaining one IS last → its `serve_v1` owns the teardown.
+    assert!(b.release(), "the final listener reports itself as last");
+    assert_eq!(higgs.bound_addr(), None, "registry is empty");
+}
+
+/// `release` and `Drop` must not double-deregister: a released guard's drop is a
+/// no-op, so it can never remove a LATER listener that reused nothing (ids are
+/// monotonic) or mis-report emptiness.
+#[tokio::test]
+async fn releasing_a_guard_makes_its_drop_a_no_op() {
+    let higgs = Arc::new(fake_higgs(vec![]));
+    let a = higgs.register_serve(false, None, vec![]);
+    assert!(a.release(), "sole listener is last"); // `a` consumed + dropped here
+
+    // A fresh listener registers after the released guard was dropped.
+    let _b = higgs.register_serve(true, None, vec![]);
+    assert!(
+        higgs.lan_exposed(),
+        "the new listener is live (the released guard's drop removed nothing)"
+    );
+}
+
+/// `restart_required` asks whether ANY live listener runs a list other than the
+/// persisted one — not just the primary. A stale sibling must still demand a
+/// restart even while the primary happens to match.
+#[tokio::test]
+async fn restart_required_when_any_live_serve_differs() {
+    let higgs = Arc::new(fake_higgs(vec![]));
+    higgs
+        .set_cors_origins(vec!["https://tools.example".to_string()])
+        .expect("valid origin persists");
+
+    // The PRIMARY matches the persisted list; a SECOND, older-config listener does
+    // not. A restart is still required — the mismatch is real for that listener.
+    let _primary = higgs.register_serve(false, None, vec!["https://tools.example".to_string()]);
+    assert!(
+        !higgs.cors_settings().restart_required,
+        "the only live listener matches → nothing pending"
+    );
+    let stale = higgs.register_serve(false, None, vec![]);
+    assert!(
+        higgs.cors_settings().restart_required,
+        "a live listener running a different list → restart required"
+    );
+    drop(stale);
+    assert!(
+        !higgs.cors_settings().restart_required,
+        "the stale listener is gone → nothing pending"
+    );
+}

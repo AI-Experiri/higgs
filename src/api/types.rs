@@ -143,7 +143,10 @@ higgs_ts! {
     /// no mutable state and no mutating endpoint.
     #[derive(Debug, Clone, serde::Serialize)]
     pub struct HiggsServerConfig {
-        /// Loopback host the listener binds to — always [`BIND_HOST`] (localhost).
+        /// The `/v1` listener's bound address. Once serving this is the RECORDED
+        /// live address (`ip:port` — the embedder owns the listener and may bind
+        /// loopback or `0.0.0.0` for LAN mode); before any serve it is the
+        /// built-in loopback default [`BIND_HOST`] (host only).
         pub bind_host: String,
         /// Configured LM Studio scan directories, as absolute path strings.
         pub lmstudio_dirs: Vec<String>,

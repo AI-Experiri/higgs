@@ -638,6 +638,20 @@ pub enum HiggsError {
     #[snafu(display("[HG070] GGUF enrichment failed for {path}: {reason}"))]
     #[diagnostic(code(HG070))]
     GgufEnrichFailed { path: String, reason: String },
+
+    /// A CORS origin submitted to [`crate::Higgs::set_cors_origins`] is not a bare
+    /// origin. The extra-origins allowlist stores exact-match `Origin` header
+    /// values — a browser's `Origin` is always `scheme://host[:port]` with an
+    /// `http`/`https` scheme and NO userinfo, path (beyond a single trailing `/`,
+    /// which is normalized away), query, or fragment. The offending entry is
+    /// echoed with the specific reason so the operator can fix the one bad value.
+    /// Rejected BEFORE persistence, so a bad entry never reaches `config.json` or
+    /// the running CORS allowlist.
+    #[snafu(display(
+        "[HG071] invalid CORS origin {origin:?}: {reason} (expected an exact origin like \"https://tools.example\" — scheme://host[:port], no path/query/fragment)"
+    ))]
+    #[diagnostic(code(HG071), severity(Error))]
+    InvalidCorsOrigin { origin: String, reason: String },
 }
 
 #[cfg(test)]

@@ -37,13 +37,18 @@ set of PURE helpers those facade methods delegate to, not HTTP handlers.
 
 - `pub fn v1_router(higgs: Arc<Higgs>) -> Router` — the loopback-guarded `/v1`
   router for embedders. The relaxed-host variant `v1_router_with_host_policy`
-  (takes an `enforce_loopback_host: bool`) is **`pub(crate)` by design** (never
-  `pub`): the only way to reach the relaxed policy is `serve_v1`, which runs the
-  `[HG058]` keyless-LAN and `[HG069]` no-Admin-key refusals and records
-  `lan_exposed` first.
-- `pub async fn serve_v1(higgs, listener, shutdown)` — the single
-  graceful-shutdown entry point and the ONLY HTTP surface higgs exposes; drains
-  in-flight requests then calls `Higgs::stop`. An embedder that wants an external
+  (takes an `enforce_loopback_host: bool` plus the `extra_origins` its CORS layer
+  is built with) is **`pub(crate)` by design** (never `pub`): the only way to
+  reach the relaxed policy is `serve_v1`, which runs the `[HG058]` keyless-LAN and
+  `[HG069]` no-Admin-key refusals and arms `lan_exposed` first — atomically, in
+  one keystore critical section (`Higgs::arm_lan_serve`), so a concurrent
+  last-key revoke can never leave a listener keyless on a LAN. Building a router
+  records nothing: only a listener that actually serves registers itself.
+- `pub async fn serve_v1(higgs, listener, shutdown)` — the graceful-shutdown
+  entry point and the ONLY HTTP surface higgs exposes; drains in-flight requests,
+  deregisters its listener, and calls `Higgs::stop` **only if it was the last live
+  listener** (several may share one `Arc<Higgs>`; draining the shared node while a
+  sibling still serves would strand it). An embedder that wants an external
   OpenAI endpoint (e.g. jigglebot) calls it with its own `shutdown` future; the
   node-only `higgs` binary itself runs the iroh daemon, not this HTTP server.
 - `pub mod readiness` (`ModelReadiness` + derivation) — public because

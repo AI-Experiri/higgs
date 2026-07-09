@@ -156,8 +156,28 @@ bypass them):
   **not** flow through `http_status`.
 - **Startup `[HG069]`**: `serve_v1` likewise refuses a non-loopback listener
   whose keys are ALL non-Admin — the Admin-only key API would be locked out.
-- **Runtime `[HG059]`/`[HG066]`**: `serve_v1` records
-  `higgs.set_lan_exposed(!loopback)`. `decide_revoke` then refuses to revoke the
+- **Atomicity of the LAN gate**: a non-loopback `serve_v1` runs its `[HG058]`/
+  `[HG069]` key checks **and** arms its LAN exposure in one critical section
+  (`Higgs::arm_lan_serve`, holding `keys_io`) — the same lock `revoke_key` commits
+  under (it reads `lan_exposed()` *inside* `mutate_api_keys`). Without that, a revoke
+  could read `lan_exposed() == false`, the serve could pass its key check against the
+  not-yet-published store, and the revoke would then empty it: a **keyless listener on
+  a LAN**. Serialized, one always loses. Lock order is `keys_io` → `serves`.
+- **Runtime `[HG059]`/`[HG066]`**: `serve_v1` registers each live listener with
+  `higgs.register_serve(…)`. On a normal exit it calls
+  `ServeGuard::release()` — which deregisters **before** the terminal worker drain
+  (so a stopped listener never keeps disclosing itself or forcing `[HG059]` while
+  workers shut down) and reports whether it was the **last** listener; only the last
+  one calls `higgs.stop()`, since draining the shared node while a sibling still
+  serves would strand it. On task **cancellation** `release` never runs and the
+  guard's `Drop` deregisters instead (an aborted future runs destructors but no code
+  past its await, so an explicit-only call would leak the registration). Serve state is
+  per-listener, not flat slots: `lan_exposed` is "any live non-loopback listener"
+  (so a loopback serve starting, or a sibling exiting, can't strip a live LAN
+  listener's protection); `bind_host`/applied-CORS disclose the **primary**
+  (first-registered) listener; `restart_required` is "**any** live listener runs a
+  list other than the persisted one". `decide_revoke`
+  refuses to revoke the
   LAST key while `lan_exposed` (`Revoke::LastKeyOnLan` → `409`), and refuses to
   revoke the last VISIBLE Admin key while other visible keys remain
   (`Revoke::LastAdminKey` → `409`) — the runtime counterparts of the startup

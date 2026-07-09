@@ -45,8 +45,8 @@ pub use diagnostic::HiggsError;
 pub use keys::Scope;
 pub use log_bus::{log_filter, HiggsLogLayer, LogBus, LogLine, LogSource};
 pub use serve::wire::{
-    HiggsHubStatus, HiggsKeyRemoved, HiggsMintKeyResponse, HiggsModelEntry, HiggsRuntimeSettings,
-    HiggsVersionResponse, LogSettings,
+    HiggsCorsSettings, HiggsHubStatus, HiggsKeyRemoved, HiggsMintKeyResponse, HiggsModelEntry,
+    HiggsRuntimeSettings, HiggsVersionResponse, LogSettings,
 };
 pub use shutdown::shutdown_signal;
 pub use supervisor::HiggsEvent;
