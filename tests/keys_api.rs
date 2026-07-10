@@ -214,7 +214,7 @@ async fn authorized_request_stamps_created_and_last_used() {
 /// Every KEYSTORE validation failure must render as `[HG072]` and must NOT hand
 /// the caller advice about the OpenAI chat schema.
 ///
-/// These four rules used to share [HG049] with `/v1` request-body validation,
+/// These five rules used to share [HG049] with `/v1` request-body validation,
 /// whose message ends "— check the request body against the OpenAI chat schema
 /// and retry". jigglebot's Manage-Tokens dialog renders the higgs message
 /// verbatim, so a duplicate token label told the user to go inspect a chat
