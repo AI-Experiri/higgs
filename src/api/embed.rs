@@ -260,7 +260,7 @@ impl Higgs {
             }
             None => Err(HiggsError::HubControlFailed {
                 op: "pair".into(),
-                detail: "the server is not running as a hub — enable the hub first (the `hub_enable` control op; standalone servers can also set HIGGS_HUB=1)".into(),
+                detail: "the server is not running as a hub — enable the hub first (`Higgs::hub_enable` / the `hub_enable` control op)".into(),
             }),
         }
     }
@@ -472,7 +472,7 @@ impl Higgs {
         // An EXPLICIT empty scope list is a client error regardless of store state.
         if scopes.as_ref().is_some_and(Vec::is_empty) {
             return Err(HiggsError::InvalidKeyRequest {
-                detail: "at least one scope required (chat, models, admin)".into(),
+                detail: "at least one scope required — pass any of chat, models, admin".into(),
             });
         }
         let token = crate::keys::mint_token(rand::random());
@@ -713,7 +713,7 @@ impl Higgs {
 fn not_a_hub_error(op: &str) -> HiggsError {
     HiggsError::HubControlFailed {
         op: op.to_owned(),
-        detail: "the server is not running as a hub — enable the hub first (the `hub_enable` control op; standalone servers can also set HIGGS_HUB=1)".into(),
+        detail: "the server is not running as a hub — enable the hub first (`Higgs::hub_enable` / the `hub_enable` control op)".into(),
     }
 }
 

@@ -263,6 +263,12 @@ async fn keystore_validation_errors_are_hg072_without_chat_schema_advice() {
             !rendered.contains("[HG049]"),
             "{what} is no longer the /v1 body error: {rendered}"
         );
+        assert!(
+            rendered.contains(" \u{2014} "),
+            "{what} carries the crate's em-dash remediation clause — HG072's display \
+             is just its detail, so each PRODUCTION detail must state rule and remedy \
+             itself (the diagnostic_tests invariant can't see these): {rendered}"
+        );
     }
 
     higgs.shutdown().await;

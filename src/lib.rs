@@ -75,7 +75,8 @@ pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 /// `higgs_port` default; the node-only standalone binary serves no HTTP):
 /// 31415 (pi). Chosen to be memorable and to
 /// NOT collide with well-known local-LLM ports (ollama's 11434, LM Studio's
-/// 1234). Override with `HIGGS_PORT`.
+/// 1234). (No env override exists — an embedder passes whatever listener it
+/// wants to `serve_v1`; this const is just the documented convention.)
 pub const DEFAULT_PORT: u16 = 31415;
 
 pub(crate) const LLAMA_CPP_2_VERSION: &str = "0.1.151";

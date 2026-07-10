@@ -214,7 +214,7 @@ pub(crate) fn validate_key_label(label: &str) -> Result<(), HiggsError> {
     } else {
         Err(HiggsError::InvalidKeyRequest {
             detail: format!(
-                "invalid key label {label:?}: 1-64 chars from [A-Za-z0-9._-] (it must fit in a single URL path segment)"
+                "invalid key label {label:?} — use 1-64 chars from [A-Za-z0-9._-] (the label must fit in a single URL path segment to be revocable)"
             ),
         })
     }
