@@ -209,7 +209,8 @@ pub struct Higgs {
     /// across the load `.await`.
     loading: parking_lot::Mutex<Option<crate::api::types::ModelLoading>>,
     /// Live fan-out of model-load lifecycle events ([`ModelLoadEvent`]) to
-    /// `GET /api/higgs/events` SSE subscribers. Pushed at each real phase seam in
+    /// `watch_events` subscribers (formerly `GET /api/higgs/events` SSE). Pushed
+    /// at each real phase seam in
     /// [`load_inner`](Self::load_inner) so the UI drives its loading indicator from
     /// PUSH events instead of polling `status`. A `send` with no subscribers is a
     /// harmless no-op; late subscribers simply miss already-past phases (the bar is

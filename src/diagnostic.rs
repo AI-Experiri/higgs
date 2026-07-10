@@ -468,7 +468,7 @@ pub enum HiggsError {
     /// bug — capture the backtrace and report it. Emitted by the embedding host's
     /// serve-task supervisor, NOT returned from a request handler.
     #[snafu(display(
-        "[HG045] higgs control surface is DOWN ({reason}) — /api/higgs + /v1 are unreachable while the gateway is still up; restart the server (a panic is a bug: capture the backtrace and report it)"
+        "[HG045] higgs serve task is DOWN ({reason}) — the `/v1` surface is unreachable while the embedding host is still up; restart the server (a panic is a bug: capture the backtrace and report it)"
     ))]
     #[diagnostic(code(HG045), severity(Error))]
     ControlSurfaceDown { reason: String },
@@ -542,9 +542,11 @@ pub enum HiggsError {
     /// with ZERO configured API keys would expose the open control + `/v1`
     /// surface to the whole network — the Host guard and CORS only protect
     /// browser clients. Fail closed at startup instead of serving wide open:
-    /// mint a key first (`higgs keys add <label>`), or bind loopback.
+    /// mint a key first (`Higgs::mint_key` / the `keys_mint` control op), or
+    /// bind loopback. (No CLI or HTTP key command is named here: `higgs keys`
+    /// does not exist yet and `/api/higgs/keys` no longer does.)
     #[snafu(display(
-        "[HG058] refusing to bind {bind}: no API keys are configured, so the entire control + /v1 surface would be OPEN to the network — run `higgs keys add <label> admin` first (an Admin-capable key is required on a LAN bind, [HG069]), or bind 127.0.0.1"
+        "[HG058] refusing to bind {bind}: no API keys are configured, so the `/v1` surface would be OPEN to the network — mint an Admin-capable key first (`Higgs::mint_key` / the `keys_mint` control op; a LAN bind requires Admin, [HG069]), or bind 127.0.0.1"
     ))]
     #[diagnostic(code(HG058), severity(Error))]
     LanBindWithoutKeys { bind: String },
@@ -626,14 +628,16 @@ pub enum HiggsError {
     BenchInProgress { id: String },
 
     /// Startup refused: a non-loopback bind with keys present but NONE holding the
-    /// `Admin` scope. Auth would be ON, but every Admin-scoped control/key route
-    /// (mint/revoke) is then rejected — the operator can't manage keys over the API
-    /// on the running LAN server and must edit the keystore out-of-band or restart.
-    /// `higgs keys add <label>` defaults to `chat,models`, so this is the easy
-    /// footgun. Fail closed at startup: add an Admin key (`higgs keys add <label>
-    /// admin`) and restart, or bind loopback. Symmetric to [HG058].
+    /// `Admin` scope. Auth would be ON, but every Admin-scoped operation
+    /// (mint/revoke) is then rejected — the operator can't manage keys on the
+    /// running LAN server and must fix the keystore out-of-band and restart.
+    /// A mint without explicit scopes defaults to `chat,models`, so this is the
+    /// easy footgun. Fail closed at startup: mint an Admin key and restart, or
+    /// bind loopback. Symmetric to [HG058]. (No CLI or HTTP key command is named
+    /// in the message: `higgs keys` does not exist yet and `/api/higgs/keys` no
+    /// longer does — key management is `Higgs::mint_key`/`revoke_key`.)
     #[snafu(display(
-        "[HG069] refusing to bind {bind}: API keys are configured but NONE is Admin-capable, so the key-management API (/api/higgs/keys) would be locked out on this LAN bind — add an Admin key (`higgs keys add <label> admin`) and restart, or bind 127.0.0.1"
+        "[HG069] refusing to bind {bind}: API keys are configured but NONE is Admin-capable, so key management (mint/revoke) would be locked out on this LAN bind — mint an Admin-capable key (`Higgs::mint_key` / the `keys_mint` control op) and restart, or bind 127.0.0.1"
     ))]
     #[diagnostic(code(HG069), severity(Error))]
     LanBindWithoutAdminKey { bind: String },

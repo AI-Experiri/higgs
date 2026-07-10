@@ -1,8 +1,9 @@
 //! The single home for higgs Developer-Log lines.
 //!
-//! A [`LogBus`] holds a bounded history ring PER source (the snapshot source for
-//! `GET /api/higgs/logs`) and a live broadcast tap (the source for the
-//! `GET /api/higgs/logs/stream` SSE endpoint). Every line — worker child stderr
+//! A [`LogBus`] holds a bounded history ring PER source (the snapshot the
+//! `logs` control op returns — formerly `GET /api/higgs/logs`) and a live
+//! broadcast tap (the `watch_logs` stream — formerly the `/logs/stream` SSE
+//! endpoint). Every line — worker child stderr
 //! ([`LogSource::Worker`]) AND higgs serve-layer `tracing` events
 //! ([`LogSource::Serve`]) — enters through [`LogBus::push`], which appends to
 //! that source's ring and sends the tagged line on the broadcast. Separate rings

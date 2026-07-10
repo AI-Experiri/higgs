@@ -54,16 +54,18 @@ use crate::diagnostic::HiggsError;
 /// ours is larger because a long conversation transcript is legitimately big.)
 pub const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 
-/// Whole-request timeout for the **non-streaming control surface**
-/// (`/api/higgs/*`). Generous (a cold model load can take seconds), but bounded
-/// so a wedged control request can't pin a connection forever. Deliberately
+/// Whole-request timeout for the **non-streaming `/v1` routes** (models list
+/// and friends — named "control" from when it bounded the deleted
+/// `/api/higgs/*` surface; also reported in `system` info as
+/// `control_timeout_secs`). Generous (a cold model load can take seconds), but
+/// bounded so a wedged request can't pin a connection forever. Deliberately
 /// **not** applied to `/v1/chat/completions`: a long SSE stream must outlive any
 /// per-request timeout (its duration is bounded separately by the worker
 /// chat-RPC timeout, a different layer).
 pub const CONTROL_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Whole-request timeout for the LONG model-op routes (`POST
-/// /api/higgs/models/load` and `/api/higgs/models/tune`), exempt from the tighter
+/// Whole-request timeout for the LONG model ops (load and tune — formerly the
+/// `/api/higgs/models/load` and `/models/tune` routes), exempt from the tighter
 /// [`CONTROL_TIMEOUT`]. A **load** can walk the G5 OOM degrade-retry ladder (the
 /// initial load plus several rungs, each a worker load bounded by the control-RPC
 /// timeout, with a `SETTLE_BEFORE_RETRY` pause between); a Turbotune **benchmark**

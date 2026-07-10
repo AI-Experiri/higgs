@@ -1,19 +1,20 @@
 #![allow(dead_code)] // shared test helpers; each test binary uses a subset
-//! Shared harness for higgs black-box integration tests.
+//! Shared harness for higgs integration tests.
 //!
-//! Spawns the real `higgs` binary on a localhost port, waits for the
-//! worker to come up, and kills the process (and its worker) on drop. Tests
-//! drive the server purely over HTTP — exactly how an external client would.
+//! Builds an IN-PROCESS [`Higgs`] facade over a staged scan root (`higgs_local`
+//! below) — control ops are typed method calls, and only the `/v1` inference
+//! surface is ever served over HTTP (`serve_v1_local`), because that is the
+//! only HTTP surface higgs has. The old harness that spawned the `higgs`
+//! binary and drove `/api/higgs/*` routes went with those routes; its helpers
+//! would hang forever polling endpoints that now 404.
 //!
 //! To run against a real, tiny model in CI the harness stages a small GGUF into
-//! a temp LM-Studio-style scan root and points the spawned binary at it via
-//! `HIGGS_MODEL_DIR`. The model is `ggml-org`'s ~1MB `stories260K.gguf` (a real
-//! llama-arch toy GGUF that loads and generates) — enough to exercise the full
-//! load → chat → unload engine path. The default path is the on-disk HF-cache
-//! copy; override with `HIGGS_TEST_GGUF`.
+//! a temp LM-Studio-style scan root. The model is `ggml-org`'s ~1MB
+//! `stories260K.gguf` (a real llama-arch toy GGUF that loads and generates) —
+//! enough to exercise the full load → chat → unload engine path. The default
+//! path is the on-disk HF-cache copy; override with `HIGGS_TEST_GGUF`.
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -37,71 +38,6 @@ pub fn tiny_gguf_path() -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
-/// A running `higgs` child process. Killed (with its worker) on drop.
-///
-/// Holds the staging `TempDir` so the scan root outlives the server.
-pub struct ServerGuard {
-    child: Child,
-    /// Base URL, e.g. `http://127.0.0.1:11500`.
-    pub base: String,
-    /// Staging dir for the tiny model (kept alive for the server's lifetime).
-    _model_dir: TempDir,
-    /// Isolated `HIGGS_HOME` (kept alive for the server's lifetime) so the spawned server
-    /// never picks up the developer's / CI's real `~/.higgs` — e.g. an `api_keys.json` that
-    /// would enable auth and 401 these no-token tests.
-    _home: TempDir,
-}
-
-impl Drop for ServerGuard {
-    fn drop(&mut self) {
-        // SIGTERM (not SIGKILL): higgs shuts down gracefully — stopping
-        // its worker and running at-exit handlers — then we reap it. Under
-        // coverage instrumentation the graceful exit is what flushes the spawned
-        // process's profile; a hard kill() would discard it.
-        // SAFETY: a plain kill(2) on our own child's pid.
-        unsafe {
-            libc::kill(self.child.id() as libc::pid_t, libc::SIGTERM);
-        }
-        // BOUNDED grace, then SIGKILL: a server wedged mid-load (e.g. stuck in
-        // the llama.cpp FFI) ignores SIGTERM, and an unconditional `wait()`
-        // here has twice hung an entire test binary for HOURS on one flaky
-        // load. The happy path reaps within the first poll or two (profile
-        // flushed as before); only a wedged child is hard-killed, losing that
-        // one process's coverage profile — the right trade against a gate that
-        // never finishes.
-        for _ in 0..100 {
-            match self.child.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) => std::thread::sleep(Duration::from_millis(100)),
-                Err(_) => break,
-            }
-        }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-impl ServerGuard {
-    /// The spawned `higgs` server process pid (for tests that need to find its worker child).
-    pub fn pid(&self) -> u32 {
-        self.child.id()
-    }
-
-    /// Absolute path of the staged GGUF for `id` (the `stage_models` layout
-    /// `<model_dir>/<id>/stories260K.gguf`). Lets staleness tests mutate the file
-    /// so its `model_file_sig` changes and a saved profile reads back as stale.
-    pub fn staged_gguf(&self, id: &str) -> PathBuf {
-        self._model_dir.path().join(id).join("stories260K.gguf")
-    }
-
-    /// The server's isolated `HIGGS_HOME` — where `models.json` / `config.json`
-    /// live. Lets a test induce a persistence failure (e.g. occupy `models.json`
-    /// with a directory so the store flush can't write the file).
-    pub fn home(&self) -> &std::path::Path {
-        self._home.path()
-    }
-}
-
 /// Stage `gguf` into a temp LM-Studio layout (`<tmp>/higgs-test/stories260k/`)
 /// so the scanner discovers it under [`TINY_MODEL_ID`]. Returns the temp dir
 /// (the scan root) — keep it alive for the server's lifetime. The GGUF is
@@ -123,37 +59,6 @@ pub fn stage_models(gguf: &Path, ids: &[&str]) -> TempDir {
         std::fs::copy(gguf, model_dir.join("stories260K.gguf")).expect("copy tiny gguf");
     }
     dir
-}
-
-/// Spawn `higgs` on `127.0.0.1:{port}` with the tiny model staged into a temp
-/// scan root (passed via `HIGGS_MODEL_DIR`), and wait until `/api/higgs/status`
-/// answers (listener bound). `gguf` is the source GGUF (see [`tiny_gguf_path`]).
-/// A fresh higgs has NO worker yet — spawn-on-load brings one up on the first
-/// `/api/higgs/models/load`.
-//
-// The spawned child is reaped by `ServerGuard::drop` (kill + wait), so the
-// zombie-process lint is a false positive — clippy can't see the Drop impl.
-#[allow(clippy::zombie_processes)]
-pub async fn spawn_with_tiny_model(port: u16, gguf: &Path) -> ServerGuard {
-    spawn_with_models(port, gguf, &[TINY_MODEL_ID]).await
-}
-
-/// Prepare (autotune) the tiny model so a subsequent JIT chat is allowed by the
-/// readiness gate — JIT refuses an un-profiled model. Tests that intentionally
-/// exercise the JIT happy path call this once after spawn; tests that explicitly
-/// `POST /models/load` don't need it (an explicit load bypasses the gate).
-pub async fn prepare_tiny(base: &str) {
-    let r = reqwest::Client::new()
-        .post(format!("{base}/api/higgs/models/tune"))
-        .json(&serde_json::json!({ "id": TINY_MODEL_ID }))
-        .send()
-        .await
-        .expect("send tune request");
-    assert!(
-        r.status().is_success(),
-        "Prepare (tune) tiny model succeeded, got {}",
-        r.status()
-    );
 }
 
 /// The chat-template/parser test fleet: REAL small instruct models (downloaded
@@ -201,132 +106,6 @@ pub fn fleet_dir() -> Option<PathBuf> {
         .iter()
         .all(|(_, id, file)| root.join(id).join(file).is_file())
         .then_some(root)
-}
-
-/// Spawn `higgs` with `HIGGS_MODEL_DIR` pointed at an EXISTING scan root (the
-/// fleet dir) instead of a staged temp copy — the fleet GGUFs are hundreds of
-/// MB each, so copying them per test is not viable. The isolated `HIGGS_HOME`
-/// still applies.
-#[allow(clippy::zombie_processes)]
-pub async fn spawn_with_model_root(port: u16, root: &Path) -> ServerGuard {
-    // Dummy staging dir: ServerGuard owns TempDirs for lifetime symmetry.
-    let staged = TempDir::new().expect("create dummy staging dir");
-    let home = TempDir::new().expect("create temp HIGGS_HOME");
-    let child = Command::new(env!("CARGO_BIN_EXE_higgs"))
-        .env("HIGGS_BIND", "127.0.0.1")
-        .env("HIGGS_PORT", port.to_string())
-        .env("HIGGS_MODEL_DIR", root)
-        .env("HIGGS_HOME", home.path())
-        .env("HIGGS_HF_ENDPOINT", "http://127.0.0.1:1")
-        .env("RUST_LOG", "warn")
-        .spawn()
-        .expect("spawn higgs");
-    let base = format!("http://127.0.0.1:{port}");
-    let client = reqwest::Client::new();
-    for _ in 0..150 {
-        if let Ok(r) = client.get(format!("{base}/api/higgs/status")).send().await {
-            if r.status().is_success() {
-                return ServerGuard {
-                    child,
-                    base,
-                    _model_dir: staged,
-                    _home: home,
-                };
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    panic!("higgs never became ready on {base}");
-}
-
-/// Like [`spawn_with_tiny_model`] but stages one model per id in `ids` (each loadable under that
-/// id), for multi-model / multi-worker tests.
-#[allow(clippy::zombie_processes)]
-pub async fn spawn_with_models(port: u16, gguf: &Path, ids: &[&str]) -> ServerGuard {
-    let staged = stage_models(gguf, ids);
-    // Isolated home so the server never reads the machine's real ~/.higgs (a present
-    // api_keys.json there would turn auth ON and 401 these no-token tests).
-    let home = TempDir::new().expect("create temp HIGGS_HOME");
-    let child = Command::new(env!("CARGO_BIN_EXE_higgs"))
-        .env("HIGGS_BIND", "127.0.0.1")
-        .env("HIGGS_PORT", port.to_string())
-        .env("HIGGS_MODEL_DIR", staged.path())
-        .env("HIGGS_HOME", home.path())
-        // Point the HF hub at a dead local port so `Prepare`/tune's best-effort card
-        // fetch FAILS FAST (connection refused) instead of paying the 10s bounded
-        // timeout on offline/firewalled CI — `prepare_tiny` runs in many tests. The
-        // tiny fixture is pre-staged on disk (never downloaded), so no test here
-        // needs a live hub; the download tests set their OWN endpoint and don't use
-        // this helper.
-        .env("HIGGS_HF_ENDPOINT", "http://127.0.0.1:1")
-        .env("RUST_LOG", "warn")
-        .spawn()
-        .expect("spawn higgs");
-    let base = format!("http://127.0.0.1:{port}");
-    let client = reqwest::Client::new();
-    // Up to ~30s for the listener bind + host-side model scan.
-    for _ in 0..150 {
-        if let Ok(r) = client.get(format!("{base}/api/higgs/status")).send().await {
-            if r.status().is_success() {
-                return ServerGuard {
-                    child,
-                    base,
-                    _model_dir: staged,
-                    _home: home,
-                };
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    panic!("higgs never became ready on {base}");
-}
-
-/// Spawn `higgs` bound to 0.0.0.0 with a PRE-SEEDED admin key (a non-loopback
-/// bind with zero keys refuses to start, [HG058]) — the keyed-LAN mode. Returns
-/// the guard plus the admin bearer token. Requests still connect via 127.0.0.1;
-/// LAN behavior is exercised through the `Host` header.
-#[allow(clippy::zombie_processes)]
-pub async fn spawn_lan_keyed(port: u16, gguf: &Path) -> (ServerGuard, String) {
-    let staged = stage_models(gguf, &[TINY_MODEL_ID]);
-    let home = TempDir::new().expect("create temp HIGGS_HOME");
-    let token = higgs::keys::mint_token([42u8; 16]);
-    let mut keys = higgs::keys::ApiKeys::default();
-    keys.add(&token, "lan-admin".into(), vec![higgs::keys::Scope::Admin]);
-    keys.save(&home.path().join("api_keys.json"))
-        .expect("seed keystore");
-    let child = Command::new(env!("CARGO_BIN_EXE_higgs"))
-        .env("HIGGS_BIND", "0.0.0.0")
-        .env("HIGGS_PORT", port.to_string())
-        .env("HIGGS_MODEL_DIR", staged.path())
-        .env("HIGGS_HOME", home.path())
-        .env("HIGGS_HF_ENDPOINT", "http://127.0.0.1:1")
-        .env("RUST_LOG", "warn")
-        .spawn()
-        .expect("spawn higgs");
-    let base = format!("http://127.0.0.1:{port}");
-    let client = reqwest::Client::new();
-    for _ in 0..150 {
-        if let Ok(r) = client
-            .get(format!("{base}/api/higgs/status"))
-            .bearer_auth(&token)
-            .send()
-            .await
-        {
-            if r.status().is_success() {
-                return (
-                    ServerGuard {
-                        child,
-                        base,
-                        _model_dir: staged,
-                        _home: home,
-                    },
-                    token,
-                );
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    panic!("keyed-LAN higgs never became ready on {base}");
 }
 
 // ── In-process harness (library-first) ───────────────────────────────────────

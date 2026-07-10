@@ -186,7 +186,7 @@ impl Higgs {
         Ok(entries)
     }
 
-    /// A single enriched model row by HuggingFace repo id — the `GET
+    /// A single enriched model row by HuggingFace repo id — formerly the `GET
     /// /api/higgs/models/{*id}` behavior. `ModelNotFound` ([HG002] → 404) when the
     /// id is absent from the scanned catalog.
     pub async fn model_by_id(&self, id: &str) -> Result<HiggsModelEntry, HiggsError> {
@@ -199,8 +199,8 @@ impl Higgs {
 
     // ── A1.2: hub lifecycle + node ops ─────────────────────────────────────
 
-    /// Turn the hub network ON (the kill switch) — the `POST /api/higgs/hub/enable`
-    /// orchestration. Binds the iroh endpoint + spawns the accept loop against the
+    /// Turn the hub network ON (the kill switch) — formerly the `POST
+    /// /api/higgs/hub/enable` orchestration. Binds the iroh endpoint + spawns the accept loop against the
     /// EXISTING fleet (routes preserved). Idempotent: a no-op returning the current
     /// status when already enabled. The whole check→start→publish runs under the
     /// hub-lifecycle lock so two enables can't orphan a loser endpoint.
@@ -224,8 +224,8 @@ impl Higgs {
         }
     }
 
-    /// Turn the hub network OFF (the kill switch) — the `POST /api/higgs/hub/disable`
-    /// orchestration. Closes the iroh endpoint + every node transport but KEEPS the
+    /// Turn the hub network OFF (the kill switch) — formerly the `POST
+    /// /api/higgs/hub/disable` orchestration. Closes the iroh endpoint + every node transport but KEEPS the
     /// fleet route table so re-enabling is a pure reconnect. Idempotent.
     pub async fn hub_disable(&self) -> HiggsHubStatus {
         let _lifecycle = self.hub_lifecycle().lock().await;
@@ -242,7 +242,7 @@ impl Higgs {
         crate::serve::control::hub_status(self).await
     }
 
-    /// Mint a one-time node-pairing credential — the `POST /api/higgs/pair`
+    /// Mint a one-time node-pairing credential — formerly the `POST /api/higgs/pair`
     /// behavior. Serialized against the kill switch so a mint runs either fully
     /// before a disable (valid) or fully after (sees no hub). Errors only when the
     /// server is not a hub (the caller maps that to a 409).
@@ -394,7 +394,8 @@ impl Higgs {
 
     // ── A1.3: load_flat / unload_spec ──────────────────────────────────────
 
-    /// Load a model from the flat `POST /api/higgs/models/load` request shape,
+    /// Load a model from the flat load-request shape (formerly `POST
+    /// /api/higgs/models/load`),
     /// building the [`LoadParams`] the handler used to build inline. A request with
     /// NO pinned field is a fully-default load (`None`); a full `params` supersedes
     /// the flat fields; otherwise the three base fields fall back to `default_load`
@@ -578,7 +579,7 @@ impl Higgs {
 
     // ── A1.7: remaining thin control wrappers ──────────────────────────────
 
-    /// The current Developer-Log toggles — `GET /api/higgs/logs/settings`.
+    /// The current Developer-Log toggles — formerly `GET /api/higgs/logs/settings`.
     pub fn logs_settings(&self) -> LogSettings {
         LogSettings {
             verbose: self.verbose(),
