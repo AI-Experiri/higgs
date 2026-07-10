@@ -71,8 +71,9 @@ pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 /// the `binding` field from here. The crate resolves from the AI-Experiri
 /// fork (restored OpenAI-compat chat API — see Cargo.toml), which keeps
 /// upstream's version number.
-/// Default listen port for the standalone `higgs` binary (and the documented
-/// default for external clients): 31415 (pi). Chosen to be memorable and to
+/// Default `/v1` listen port an embedder is documented to prefer (jigglebot's
+/// `higgs_port` default; the node-only standalone binary serves no HTTP):
+/// 31415 (pi). Chosen to be memorable and to
 /// NOT collide with well-known local-LLM ports (ollama's 11434, LM Studio's
 /// 1234). Override with `HIGGS_PORT`.
 pub const DEFAULT_PORT: u16 = 31415;

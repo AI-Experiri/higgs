@@ -172,8 +172,9 @@ pub struct Higgs {
     /// routes through this instead of the local `Supervisor` (the two correlation domains
     /// stay separate, DESIGN-remote.md §2.3).
     fleet: parking_lot::Mutex<Option<Arc<crate::node::fleet::HubFleet>>>,
-    /// API-key store gating the HTTP surface (P5). Default is empty = auth OFF (the embedded
-    /// in-process host wants no gate); the standalone binary loads `api_keys.json` at startup.
+    /// API-key store gating the `/v1` surface (P5). Default is empty = auth OFF (the embedded
+    /// in-process host wants no gate); an embedder that serves beyond loopback loads
+    /// `api_keys.json` (or mints in-process) and installs it via [`Self::set_api_keys`].
     /// Swapped wholesale, so a reload is one atomic store.
     api_keys: parking_lot::Mutex<Arc<crate::keys::ApiKeys>>,
     /// The running hub (P3), when the server is in hub mode — used by the pairing API to mint
@@ -884,8 +885,8 @@ impl Higgs {
         // a stale `api_keys.json` exists (standalone/CLI leftovers); loading
         // the file would RESURRECT those keys on any mutation (even a failed
         // duplicate mint) and lock out a UI that holds no bearer. Mutations
-        // act on what `GET /api/higgs/keys` shows, and the file is synced TO
-        // the live state.
+        // act on what the live store (`keys_list`) shows, and the file is
+        // synced TO the live state.
         let before = self.api_keys();
         let mut keys = (*before).clone();
         let out = f(&mut keys);

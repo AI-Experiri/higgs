@@ -388,7 +388,7 @@ pub enum HiggsError {
     /// self-retire). The usual cause is the hub no longer recognizing this node or
     /// a spent/expired pairing token. `stage` names the rejected request.
     #[snafu(display(
-        "[HG039] hub rejected this node's {stage} request: {detail} — re-pair with a fresh token (`higgs node --hub <ticket> <token>`) if the hub no longer recognizes this node"
+        "[HG039] hub rejected this node's {stage} request: {detail} — re-pair with a fresh token (`higgs --node <ticket> <token>`, or one-shot `higgs node connect <ticket> <token>`) if the hub no longer recognizes this node"
     ))]
     #[diagnostic(code(HG039))]
     HubRequestRejected { stage: String, detail: String },
@@ -547,7 +547,7 @@ pub enum HiggsError {
     /// `Higgs::mint_key` from an embedder), or bind loopback. The deleted
     /// `/api/higgs/keys` HTTP surface is deliberately not mentioned.
     #[snafu(display(
-        "[HG058] refusing to bind {bind}: no API keys are configured, so the `/v1` surface would be OPEN to the network — mint an Admin-capable key first (`higgs keys add <label> admin`, or `Higgs::mint_key` from an embedder; a LAN bind requires Admin, [HG069]), or bind 127.0.0.1"
+        "[HG058] refusing to bind {bind}: no API keys are configured, so the `/v1` surface would be OPEN to the network — mint an Admin-capable key first (`higgs keys add <label> admin` under the server's HIGGS_HOME, then restart; or `Higgs::mint_key` from an embedder — a LAN bind requires Admin, [HG069]), or bind 127.0.0.1"
     ))]
     #[diagnostic(code(HG058), severity(Error))]
     LanBindWithoutKeys { bind: String },
@@ -639,7 +639,7 @@ pub enum HiggsError {
     /// and the crate API — never `keys_mint`, which is an EMBEDDER's wire tag
     /// (jigglebot's control-op name), not a higgs identifier.
     #[snafu(display(
-        "[HG069] refusing to bind {bind}: API keys are configured but NONE is Admin-capable, so key management (mint/revoke) would be locked out on this LAN bind — mint an Admin-capable key (`higgs keys add <label> admin`, or `Higgs::mint_key` from an embedder) and restart, or bind 127.0.0.1"
+        "[HG069] refusing to bind {bind}: API keys are configured but NONE is Admin-capable, so key management (mint/revoke) would be locked out on this LAN bind — mint an Admin-capable key (`higgs keys add <label> admin` under the server's HIGGS_HOME, or `Higgs::mint_key` from an embedder) and restart, or bind 127.0.0.1"
     ))]
     #[diagnostic(code(HG069), severity(Error))]
     LanBindWithoutAdminKey { bind: String },
