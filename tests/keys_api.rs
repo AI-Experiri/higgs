@@ -31,7 +31,7 @@ async fn keys_lifecycle_mint_scope_list_revoke() {
     // mint is rejected (it would self-lock the management API).
     let boot = higgs.mint_key("chatonly", Some(vec![Scope::Chat]));
     assert!(
-        matches!(boot, Err(HiggsError::InvalidRequest { .. })),
+        matches!(boot, Err(HiggsError::InvalidKeyRequest { .. })),
         "non-admin first key refused: {boot:?}"
     );
     assert!(
@@ -77,14 +77,14 @@ async fn keys_lifecycle_mint_scope_list_revoke() {
     // Unroutable label (path separator) → rejected at mint, never persisted.
     let slash = higgs.mint_key("bad/label", None);
     assert!(
-        matches!(slash, Err(HiggsError::InvalidRequest { .. })),
+        matches!(slash, Err(HiggsError::InvalidKeyRequest { .. })),
         "slash labels are unrevokable — rejected at mint: {slash:?}"
     );
 
     // Duplicate label → rejected, nothing minted.
     let dup = higgs.mint_key("reader", None);
     assert!(
-        matches!(&dup, Err(HiggsError::InvalidRequest { detail }) if detail.contains("already exists")),
+        matches!(&dup, Err(HiggsError::InvalidKeyRequest { detail }) if detail.contains("already exists")),
         "duplicate label refused: {dup:?}"
     );
 
@@ -104,7 +104,7 @@ async fn keys_lifecycle_mint_scope_list_revoke() {
     // Revoking an unknown label is an error.
     let ghost = higgs.revoke_key("ghost");
     assert!(
-        matches!(ghost, Err(HiggsError::InvalidRequest { .. })),
+        matches!(ghost, Err(HiggsError::InvalidKeyRequest { .. })),
         "revoking an unknown label errors: {ghost:?}"
     );
 
@@ -208,5 +208,62 @@ async fn authorized_request_stamps_created_and_last_used() {
     );
 
     guard.shutdown().await;
+    higgs.shutdown().await;
+}
+
+/// Every KEYSTORE validation failure must render as `[HG072]` and must NOT hand
+/// the caller advice about the OpenAI chat schema.
+///
+/// These four rules used to share [HG049] with `/v1` request-body validation,
+/// whose message ends "— check the request body against the OpenAI chat schema
+/// and retry". jigglebot's Manage-Tokens dialog renders the higgs message
+/// verbatim, so a duplicate token label told the user to go inspect a chat
+/// request they never made. Reverting `InvalidKeyRequest` back to
+/// `InvalidRequest` at any of these sites fails this test on the tail assertion.
+#[tokio::test]
+async fn keystore_validation_errors_are_hg072_without_chat_schema_advice() {
+    let Some(higgs) = higgs_local(&[TINY_MODEL_ID]).await else {
+        eprintln!("SKIP keystore_validation_errors: tiny gguf not found (set HIGGS_TEST_GGUF)");
+        return;
+    };
+
+    // Each of the five keystore validation paths, in the order they can be hit.
+    let bad_label = higgs.mint_key("has/slash", None).unwrap_err();
+    let empty_scopes = higgs.mint_key("ok-label", Some(vec![])).unwrap_err();
+    let bootstrap = higgs
+        .mint_key("chatonly", Some(vec![Scope::Chat]))
+        .unwrap_err();
+    higgs
+        .mint_key("admin", Some(vec![Scope::Admin]))
+        .expect("bootstrap admin mint");
+    let duplicate = higgs.mint_key("admin", None).unwrap_err();
+    let unknown = higgs.revoke_key("ghost").unwrap_err();
+
+    for (what, err) in [
+        ("bad label", bad_label),
+        ("empty scopes", empty_scopes),
+        ("bootstrap needs admin", bootstrap),
+        ("duplicate label", duplicate),
+        ("revoke unknown label", unknown),
+    ] {
+        assert!(
+            matches!(err, HiggsError::InvalidKeyRequest { .. }),
+            "{what} is a keystore request error: {err:?}"
+        );
+        let rendered = err.to_string();
+        assert!(
+            rendered.starts_with("[HG072]"),
+            "{what} renders its code: {rendered}"
+        );
+        assert!(
+            !rendered.contains("OpenAI chat schema"),
+            "{what} must not advise about the chat schema: {rendered}"
+        );
+        assert!(
+            !rendered.contains("[HG049]"),
+            "{what} is no longer the /v1 body error: {rendered}"
+        );
+    }
+
     higgs.shutdown().await;
 }

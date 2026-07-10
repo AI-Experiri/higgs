@@ -579,7 +579,7 @@ async fn mint_scope_defaults_duplicate_and_revoke() {
     // A duplicate label is rejected.
     let dup = higgs.mint_key("admin-key", None);
     assert!(
-        matches!(&dup, Err(HiggsError::InvalidRequest { detail }) if detail.contains("already exists")),
+        matches!(&dup, Err(HiggsError::InvalidKeyRequest { detail }) if detail.contains("already exists")),
         "duplicate label rejected: {dup:?}"
     );
 
@@ -603,7 +603,7 @@ async fn mint_bootstrap_requires_admin() {
     };
     let res = higgs.mint_key("chat-only", Some(vec![Scope::Chat]));
     assert!(
-        matches!(&res, Err(HiggsError::InvalidRequest { detail }) if detail.contains("admin")),
+        matches!(&res, Err(HiggsError::InvalidKeyRequest { detail }) if detail.contains("admin")),
         "bootstrap with non-admin scopes is refused: {res:?}"
     );
     higgs.shutdown().await;

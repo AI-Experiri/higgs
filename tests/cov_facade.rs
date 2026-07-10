@@ -328,8 +328,8 @@ async fn internal_token_arms_auth_and_empty_scopes_reject() {
         .mint_key("empty", Some(vec![]))
         .expect_err("explicit empty scopes are rejected");
     assert!(
-        matches!(err, HiggsError::InvalidRequest { .. }),
-        "empty scopes → InvalidRequest: {err:?}"
+        matches!(err, HiggsError::InvalidKeyRequest { .. }),
+        "empty scopes → InvalidKeyRequest: {err:?}"
     );
 
     higgs.shutdown().await;

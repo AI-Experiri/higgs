@@ -470,7 +470,7 @@ impl Higgs {
         validate_key_label(&label)?;
         // An EXPLICIT empty scope list is a client error regardless of store state.
         if scopes.as_ref().is_some_and(Vec::is_empty) {
-            return Err(HiggsError::InvalidRequest {
+            return Err(HiggsError::InvalidKeyRequest {
                 detail: "at least one scope required (chat, models, admin)".into(),
             });
         }
@@ -490,10 +490,10 @@ impl Higgs {
                 scopes,
                 token,
             }),
-            Mint::Duplicate => Err(HiggsError::InvalidRequest {
+            Mint::Duplicate => Err(HiggsError::InvalidKeyRequest {
                 detail: format!("a key labeled {label:?} already exists — revoke it first"),
             }),
-            Mint::BootstrapNeedsAdmin => Err(HiggsError::InvalidRequest {
+            Mint::BootstrapNeedsAdmin => Err(HiggsError::InvalidKeyRequest {
                 detail: "the first API key must include the `admin` scope (it is the only key able to manage keys) — pass scopes: [\"admin\"], or omit scopes to default to admin".into(),
             }),
             // trusted=true skips the Unauthorized branch, so this is unreachable.
@@ -564,7 +564,7 @@ impl Higgs {
             }
         };
         if removed == 0 {
-            return Err(HiggsError::InvalidRequest {
+            return Err(HiggsError::InvalidKeyRequest {
                 detail: format!("no key labeled {label:?}"),
             });
         }

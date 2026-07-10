@@ -138,6 +138,10 @@ pub(crate) fn http_status(err: &HiggsError) -> StatusCode {
         | HiggsError::InvalidSamplingParam { .. }
         | HiggsError::InvalidModelId { .. }
         | HiggsError::InvalidRequest { .. }
+        // HG072: a keystore request (mint/revoke) that failed validation — same
+        // 400 class as HG049, split only so the message doesn't hand a token
+        // mint advice about the chat schema.
+        | HiggsError::InvalidKeyRequest { .. }
         // A model that isn't Prepared (or whose profile is stale) is a client
         // precondition failure — the caller must Prepare/Re-tune first.
         | HiggsError::NotPrepared { .. }

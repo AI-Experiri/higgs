@@ -212,7 +212,7 @@ pub(crate) fn validate_key_label(label: &str) -> Result<(), HiggsError> {
     if label_ok {
         Ok(())
     } else {
-        Err(HiggsError::InvalidRequest {
+        Err(HiggsError::InvalidKeyRequest {
             detail: format!(
                 "invalid key label {label:?}: 1-64 chars from [A-Za-z0-9._-] (it must fit in a single URL path segment)"
             ),

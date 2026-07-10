@@ -652,6 +652,17 @@ pub enum HiggsError {
     ))]
     #[diagnostic(code(HG071), severity(Error))]
     InvalidCorsOrigin { origin: String, reason: String },
+
+    /// A KEYSTORE request failed validation: an empty scope list, a duplicate
+    /// label, a first key that omits `admin`, or a revoke naming a key that does
+    /// not exist. Split from [HG049], which is the `/v1` request-body error and
+    /// signs off with "check the request body against the OpenAI chat schema" —
+    /// advice that is nonsense for a token mint, and which the Manage-Tokens UI
+    /// renders verbatim. `detail` states the specific rule and its remedy, so no
+    /// generic tail is appended here.
+    #[snafu(display("[HG072] {detail}"))]
+    #[diagnostic(code(HG072), severity(Error))]
+    InvalidKeyRequest { detail: String },
 }
 
 #[cfg(test)]
