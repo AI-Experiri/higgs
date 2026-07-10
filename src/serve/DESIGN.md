@@ -289,7 +289,8 @@ Codes RAISED in serve code:
 |------|-------|--------|
 | `HG012` `ForbiddenHost` | `host_guard` | 403 |
 | `HG048` `Unauthorized` | `auth_guard` / `unauthorized()` | 401 |
-| `HG049` `InvalidRequest` | `v1_bad_request` (malformed body), `validate_key_label` | 400 |
+| `HG049` `InvalidRequest` | `v1_bad_request` (malformed body) | 400 |
+| `HG072` `InvalidKeyRequest` | keystore validation: `validate_key_label`, the mint scope/duplicate/bootstrap rules, revoke of an unknown label | 400 |
 | `HG013` `InvalidSamplingParam` | `validate_sampling` | 400 |
 | `HG019` `ServingDisabled` | `v1_chat_completions` serving gate | 503 |
 | `HG055` | `chat_template_kwargs` not a JSON object | warn-only (ignored) |

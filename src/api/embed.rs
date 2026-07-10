@@ -565,7 +565,9 @@ impl Higgs {
         };
         if removed == 0 {
             return Err(HiggsError::InvalidKeyRequest {
-                detail: format!("no key labeled {label:?}"),
+                detail: format!(
+                    "no key labeled {label:?} — nothing was revoked; list the keys for the current labels"
+                ),
             });
         }
         Ok(HiggsKeyRemoved {
