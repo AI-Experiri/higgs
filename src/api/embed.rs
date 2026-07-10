@@ -588,7 +588,7 @@ impl Higgs {
         }
     }
 
-    /// Set both Developer-Log toggles — `PUT /api/higgs/logs/settings`.
+    /// Set both Developer-Log toggles — formerly `PUT /api/higgs/logs/settings`.
     pub fn set_logs_settings(&self, settings: &LogSettings) {
         self.set_verbose(settings.verbose);
         self.set_log_incoming_tokens(settings.log_incoming_tokens);
@@ -648,7 +648,7 @@ impl Higgs {
         Ok(self.cors_settings())
     }
 
-    /// Unload every resident worker, freeing their memory — `POST
+    /// Unload every resident worker, freeing their memory — formerly `POST
     /// /api/higgs/worker/stop`. The server stays up; a later load (or JIT chat)
     /// spawns a fresh worker. A NON-terminal bulk unload (not the terminal `stop`).
     pub async fn worker_stop(&self) -> Result<(), HiggsError> {

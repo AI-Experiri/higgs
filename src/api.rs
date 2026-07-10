@@ -1605,7 +1605,7 @@ impl Higgs {
         from_request: bool,
     ) -> Result<(), HiggsError> {
         use crate::api::types::ModelLoadPhase;
-        // PUSH the load lifecycle to `GET /api/higgs/events` subscribers. `Queued`
+        // PUSH the load lifecycle to `watch_events` subscribers. `Queued`
         // fires FIRST — before the (possibly contended) lifecycle lock — so the UI's
         // bar appears the instant a load is requested, even while it waits behind
         // another in-flight load. The inner impl emits the mid-load phases
@@ -2596,7 +2596,8 @@ impl Higgs {
     }
 
     /// Subscribe to live model-load lifecycle events ([`ModelLoadEvent`]) pushed
-    /// AFTER this call — the source for the `GET /api/higgs/events` SSE endpoint.
+    /// AFTER this call — formerly the source for the `/api/higgs/events` SSE
+    /// endpoint; now the embedder's `watch_events` feed.
     /// Unlike the log bus there is no replay ring: the loading bar is transient, so
     /// a subscriber that joins mid-load still receives every REMAINING phase plus the
     /// terminal `Ready`/`Failed` that closes it out.
