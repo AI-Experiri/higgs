@@ -741,9 +741,9 @@ impl Higgs {
     }
 
     /// This instance's `config.json` `name` — the local node's operator label, shown first in
-    /// `GET /api/higgs/nodes`. Read through the SAME per-instance seam ([`Self::config_file_path`])
-    /// that [`Self::with_config_mut`] writes, so a `POST /api/higgs/nodes/label {node:"local"}`
-    /// rename round-trips. (In production the seam resolves to the global `~/.higgs/config.json`;
+    /// the fleet view (`Higgs::nodes()`). Read through the SAME per-instance seam
+    /// ([`Self::config_file_path`]) that [`Self::with_config_mut`] writes, so a
+    /// `node_label("local", …)` rename round-trips. (In production the seam resolves to the global `~/.higgs/config.json`;
     /// only in unit tests is it a per-instance override — reading the global path directly there
     /// meant the view never saw the write.) Empty/absent → `None`.
     pub(crate) fn instance_name(&self) -> Option<String> {
@@ -2486,7 +2486,7 @@ impl Higgs {
     /// local machine's full hardware (incl. GPUs) is already served by `GET /api/higgs/system`.
     pub async fn local_node_view(&self, label: String) -> crate::node::fleet::NodeView {
         // ONE instance snapshot drives BOTH the served-id map and the worker list, so a
-        // concurrent local load/unload can't make `/api/higgs/nodes` disagree with `/v1/models`
+        // concurrent local load/unload can't make the fleet view (`nodes`) disagree with `/v1/models`
         // (a worker shown with a stale/empty served id). Same `served_ids` algorithm as
         // `local_served`/`local_served_ids`, applied to this single snapshot — no worker spawn.
         let instances = self.local.instances().await;

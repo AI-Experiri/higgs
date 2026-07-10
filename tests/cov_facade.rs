@@ -155,7 +155,7 @@ async fn prepare_chat_stale_profile_is_hg047() {
 }
 
 /// The node-mutation facade methods with NO hub/fleet installed all fail with
-/// `HubControlFailed` (the "not running in hub mode" arm) — the `Err` branch the
+/// `HubControlFailed` (the "not running as a hub" arm) — the `Err` branch the
 /// live-fleet suite never hits because it enables the hub first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn node_ops_without_a_hub_are_not_a_hub_errors() {

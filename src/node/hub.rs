@@ -73,7 +73,7 @@ impl Hub {
 
     /// Rename a paired node (operator action): update its allowlist label; persists. Returns
     /// whether the node was found (`false` = unknown id, no change). Errors only on a persistence
-    /// failure. The next `GET /api/higgs/nodes` reflects the new label.
+    /// failure. The next fleet read (`Higgs::nodes()`, the `nodes` control op) reflects the new label.
     pub async fn set_label(&self, node: &str, label: Option<String>) -> std::io::Result<bool> {
         self.allow.lock().await.relabel(node, label)
     }

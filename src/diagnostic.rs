@@ -435,13 +435,16 @@ pub enum HiggsError {
     // ── Fleet/hub admin (control ops) + background chat task ─────────────────────
     /// A fleet admin mutation failed (enable the hub, pair, or a node op like
     /// load/unload/retire/relabel). `op` names the operation; `detail` carries the
-    /// cause. The remediation tail scopes its node advice with "for node ops" —
-    /// the raisers span "hub disabled", "pairing failed" and "unknown node", and
-    /// an unconditional node-id hint is nonsense for `pair`/`hub enable`. Fleet
-    /// state is read via the `hub`/`nodes` CONTROL ops (the old advice named
-    /// `GET /api/higgs/nodes`, an HTTP surface that no longer exists).
+    /// cause. The remediation tail DEFERS to that cause rather than prescribing —
+    /// the raisers span "hub disabled", "pairing failed", "unknown node" and
+    /// wrapped persistence failures ([HG040] inside the detail), so any concrete
+    /// one-size advice is wrong for some of them (a node-id hint is nonsense for
+    /// `pair`; "check the fleet list" is nonsense when the real lever is disk
+    /// space). The `hub`/`nodes` pointer is framed as where to INSPECT state, not
+    /// as the fix. (The old tail named `GET /api/higgs/nodes`, an HTTP surface
+    /// that no longer exists.)
     #[snafu(display(
-        "[HG043] fleet admin operation '{op}' failed: {detail} — check the hub state (the `hub` control op) and, for node ops, that the target is still in the fleet list (`nodes`)"
+        "[HG043] fleet admin operation '{op}' failed: {detail} — address the cause above and retry (the `hub`/`nodes` control ops report the current fleet state)"
     ))]
     #[diagnostic(code(HG043))]
     HubControlFailed { op: String, detail: String },

@@ -265,8 +265,8 @@ impl Higgs {
         }
     }
 
-    /// Load a model on a paired node and record the route — `POST
-    /// /api/higgs/nodes/load`. A thin wrapper over the fleet so the embedder never
+    /// Load a model on a paired node and record the route (formerly `POST
+    /// /api/higgs/nodes/load`). A thin wrapper over the fleet so the embedder never
     /// touches [`HubFleet`](crate::node::fleet::HubFleet) directly. Errors when the
     /// server is not a hub (no fleet installed).
     pub async fn node_load(&self, node: &str, model: &str) -> Result<WorkerId, HiggsError> {
@@ -276,8 +276,8 @@ impl Higgs {
         }
     }
 
-    /// Unload a remote-routed model and drop its route — `POST
-    /// /api/higgs/nodes/unload`.
+    /// Unload a remote-routed model and drop its route (formerly `POST
+    /// /api/higgs/nodes/unload`).
     pub async fn node_unload(&self, model: &str) -> Result<(), HiggsError> {
         match self.fleet() {
             Some(fleet) => fleet.unload(model).await,
@@ -285,8 +285,8 @@ impl Higgs {
         }
     }
 
-    /// Retire a paired node for good (drop from the allowlist + the fleet) — `POST
-    /// /api/higgs/nodes/retire`.
+    /// Retire a paired node for good (drop from the allowlist + the fleet) —
+    /// formerly `POST /api/higgs/nodes/retire`.
     pub async fn node_retire(&self, node: &str) -> Result<(), HiggsError> {
         match self.hub() {
             Some(hub) => hub
@@ -300,7 +300,7 @@ impl Higgs {
         }
     }
 
-    /// Rename a node — `POST /api/higgs/nodes/label`. `node == "local"` renames this
+    /// Rename a node (formerly `POST /api/higgs/nodes/label`). `node == "local"` renames this
     /// instance's `config.json`; any other id renames that paired node's allowlist
     /// label (empty clears it). `Ok(true)` = renamed, `Ok(false)` = unknown remote
     /// node (the caller maps that to a 404); the remote path needs the hub enabled.
@@ -327,9 +327,9 @@ impl Higgs {
             })
     }
 
-    /// A paired node's on-disk model catalog — `GET /api/higgs/nodes/{node}/models`.
-    /// Wraps `fleet().scan_node`; the node's `{ "models": [...] }` reply is returned
-    /// verbatim.
+    /// A paired node's on-disk model catalog (formerly
+    /// `GET /api/higgs/nodes/{node}/models`). Wraps `fleet().scan_node`; the node's
+    /// `{ "models": [...] }` reply is returned verbatim.
     pub async fn node_scan(&self, node: &str) -> Result<Value, HiggsError> {
         match self.fleet() {
             Some(fleet) => fleet.scan_node(node).await,
