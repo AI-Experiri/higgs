@@ -181,8 +181,12 @@ async fn node_ops_without_a_hub_are_not_a_hub_errors() {
             "{name} with no hub → HubControlFailed: {err:?}"
         );
         assert!(
-            err.to_string().contains("hub mode"),
-            "{name} error mentions hub mode: {err}"
+            err.to_string().contains("not running as a hub"),
+            "{name} error names the not-a-hub condition: {err}"
+        );
+        assert!(
+            err.to_string().contains("hub_enable"),
+            "{name} error states the remedy (enable the hub): {err}"
         );
     }
 

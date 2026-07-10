@@ -260,7 +260,7 @@ impl Higgs {
             }
             None => Err(HiggsError::HubControlFailed {
                 op: "pair".into(),
-                detail: "server is not running in hub mode (set HIGGS_HUB=1)".into(),
+                detail: "the server is not running as a hub — enable the hub first (the `hub_enable` control op; standalone servers can also set HIGGS_HUB=1)".into(),
             }),
         }
     }
@@ -712,7 +712,7 @@ impl Higgs {
 fn not_a_hub_error(op: &str) -> HiggsError {
     HiggsError::HubControlFailed {
         op: op.to_owned(),
-        detail: "server is not running in hub mode (set HIGGS_HUB=1)".into(),
+        detail: "the server is not running as a hub — enable the hub first (the `hub_enable` control op; standalone servers can also set HIGGS_HUB=1)".into(),
     }
 }
 

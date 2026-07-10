@@ -432,12 +432,16 @@ pub enum HiggsError {
     #[diagnostic(code(HG042), severity(Error))]
     InternalFault { context: String, detail: String },
 
-    // ── Fleet/hub admin (HTTP) + background chat task ───────────────────────────
-    /// A `/api/higgs/hub/*` or `/api/higgs/nodes/*` admin mutation failed (enable
-    /// the hub, retire/relabel a node). `op` names the operation; `detail` carries
-    /// the cause. Usually the hub is disabled or the target node id is wrong/gone.
+    // ── Fleet/hub admin (control ops) + background chat task ─────────────────────
+    /// A fleet admin mutation failed (enable the hub, pair, or a node op like
+    /// load/unload/retire/relabel). `op` names the operation; `detail` carries the
+    /// cause. The remediation tail scopes its node advice with "for node ops" —
+    /// the raisers span "hub disabled", "pairing failed" and "unknown node", and
+    /// an unconditional node-id hint is nonsense for `pair`/`hub enable`. Fleet
+    /// state is read via the `hub`/`nodes` CONTROL ops (the old advice named
+    /// `GET /api/higgs/nodes`, an HTTP surface that no longer exists).
     #[snafu(display(
-        "[HG043] fleet admin operation '{op}' failed: {detail} — verify the hub is enabled and the target node id is current (`GET /api/higgs/nodes`)"
+        "[HG043] fleet admin operation '{op}' failed: {detail} — check the hub state (the `hub` control op) and, for node ops, that the target is still in the fleet list (`nodes`)"
     ))]
     #[diagnostic(code(HG043))]
     HubControlFailed { op: String, detail: String },
@@ -484,11 +488,15 @@ pub enum HiggsError {
     #[diagnostic(code(HG047))]
     ProfileStale { id: String },
 
-    /// A `/v1` or `/api/higgs` request presented no API key, or one that does not
-    /// match the node's `api_keys.json`. Carries the code so a `401` is as
-    /// diagnosable as any other reply.
+    /// A `/v1` request presented no API key, or one the node's keystore does not
+    /// hold. Carries the code so a `401` is as diagnosable as any other reply.
+    /// The message names no file: auth is armed by the LIVE keystore, which an
+    /// embedder can populate with in-memory internal tokens
+    /// (`register_internal_token`) that `api_keys.json` never contains — advice
+    /// to edit or delete that file would be wrong, and possibly ineffective,
+    /// on such a node.
     #[snafu(display(
-        "[HG048] unauthorized: missing or insufficient API key — send `Authorization: Bearer <key>` with a key from the node's api_keys.json (or remove that file to disable auth)"
+        "[HG048] unauthorized: missing or insufficient API key — send `Authorization: Bearer <key>` with a key minted on this node (its operator manages keys via mint/revoke)"
     ))]
     #[diagnostic(code(HG048))]
     Unauthorized,
