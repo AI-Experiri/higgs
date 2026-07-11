@@ -716,6 +716,21 @@ async fn params_load_payload_carries_ctx_at_protocol_two() {
         .await
         .expect("all-None params behave as a bare load");
 
+    // Zero normalization: ctx 0 / threads 0 read as ABSENT hub-side, so this
+    // params-load degrades to a BARE payload (the "bare/load" mock arm asserts
+    // keys == ["id"]) — an older major-2 node can never see a zero to coerce.
+    let zeros = higgs::remote::NodeLoadParams {
+        id: String::new(),
+        ctx_len: Some(0),
+        gpu_layers: None,
+        threads: Some(0),
+        params: None,
+    };
+    fleet
+        .load(&peer, "bare/load", Some(zeros))
+        .await
+        .expect("zero params normalize to a bare load");
+
     // Partial params: only ctx set — gpu_layers/threads stay off the wire.
     let partial = higgs::remote::NodeLoadParams {
         id: "only/ctx".into(),

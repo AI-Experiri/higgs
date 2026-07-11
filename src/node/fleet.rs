@@ -928,6 +928,19 @@ impl HubFleet {
         // (re-admit with a newer version) sends correctly or fails HG027 on
         // the dead transport.
         let transport = self.transport(node).await?;
+        // Normalize count-zeros to ABSENT before anything else, so the wire is
+        // coherent regardless of which node build receives it (an older
+        // major-2 node would coerce ctx 0 to a hardcoded 4096; a current one
+        // reads it as absent — after this, neither ever sees a zero). A
+        // normalized-empty params then falls into the bare arm below.
+        // GpuLayers::Count{n:0} is deliberately untouched: an explicit 0 is
+        // the meaningful CPU-only request, not an auto spelling.
+
+        let params = params.map(|mut p| {
+            p.ctx_len = p.ctx_len.filter(|c| *c > 0);
+            p.threads = p.threads.filter(|t| *t > 0);
+            p
+        });
         let payload = match params {
             None => json!({ "id": model }),
             // ALL-None params serialize byte-identically to a bare load

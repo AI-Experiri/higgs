@@ -82,8 +82,8 @@ async fn params_load_reaches_the_node_at_protocol_two() {
 /// The T8 params gate: a params-load needs the node's HELLO-negotiated major
 /// ≥ 2. A version-less admission (tests/direct callers, or a pre-plumbing
 /// admission) reads as the conservative floor 1 → [HG078]; param-less loads
-/// keep working against any node. (The ≥2 happy path — payload carries the
-/// params — is pinned in embed_tests over a version-2 admission.)
+/// keep working against any node. (The ≥2 happy path's PAYLOAD is pinned by
+/// cov_fleet2's mock cases; embed_tests pins the facade dispatch + id-force.)
 #[tokio::test]
 async fn params_load_refused_below_protocol_two() {
     let (fleet, node_key, model_id, _root) = fleet_with_one_node().await;
@@ -147,6 +147,53 @@ async fn params_load_against_a_seeded_offline_node_is_unreachable_not_too_old() 
     assert!(
         matches!(err, HiggsError::NodeUnreachable { .. }),
         "offline node → HG027, not a version refusal: {err:?}"
+    );
+}
+
+/// A version-less re-admission CLEARS the stored major (the field doc's
+/// promised floor) — it must not inherit the previous connection's version.
+/// Fail-on-revert for the AdmitNode None → remove arm.
+#[tokio::test]
+async fn versionless_readmission_clears_the_stored_major() {
+    let hub = local_endpoint().await;
+    let node = local_endpoint().await;
+    let hub_addr = hub.addr();
+    let node_key = node.id().to_string();
+
+    // Two sequential dials from the SAME node identity (each dial needs a
+    // concurrent accept — join the two sides).
+    let (dial1, conn1) = tokio::join!(node.connect(hub_addr.clone(), ALPN), async {
+        hub.accept().await.expect("incoming").await.expect("conn 1")
+    });
+    let (dial2, conn2) = tokio::join!(node.connect(hub_addr, ALPN), async {
+        hub.accept().await.expect("incoming").await.expect("conn 2")
+    });
+    let _keep = (dial1.expect("dial 1"), dial2.expect("dial 2"));
+    std::mem::forget(hub);
+
+    let fleet = Arc::new(HubFleet::new(Arc::new(crate::log_bus::LogBus::new())));
+    fleet
+        .add_node(
+            node_key.clone(),
+            Arc::new(NodeTransport::new(conn1)),
+            None,
+            Some(2),
+        )
+        .await;
+    assert_eq!(fleet.node_protocol(&node_key).await, Some(2));
+
+    fleet
+        .add_node(
+            node_key.clone(),
+            Arc::new(NodeTransport::new(conn2)),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(
+        fleet.node_protocol(&node_key).await,
+        None,
+        "a None re-admit clears to the floor, never inherits"
     );
 }
 

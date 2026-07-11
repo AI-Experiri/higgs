@@ -130,6 +130,35 @@ async fn params_load_applies_ctx_on_a_real_node() {
         .request(M_NODE_STATUS, serde_json::json!({ "worker_id": worker.0 }))
         .await
         .expect("node status");
+    // NODE-side zero backstop, pinned DIRECTLY (the hub normalizes zeros away
+    // before the wire — that arm is pinned in cov_fleet2 — so only a raw
+    // request can reach the node's own filter): ctx 0 reads as ABSENT →
+    // trained-cap default (2048 for the tiny model), never the worker's old
+    // hardcoded 0→4096 coercion. Fail-on-revert: drop do_load's
+    // `.filter(|c| *c > 0)` and this reads 4096.
+    let raw = transport
+        .request(
+            higgs::remote::M_NODE_LOAD,
+            serde_json::json!({ "id": TINY_MODEL_ID, "ctx_len": 0 }),
+        )
+        .await
+        .expect("raw ctx-0 load");
+    let w0 = raw
+        .get("worker_id")
+        .and_then(serde_json::Value::as_u64)
+        .expect("worker id");
+    let status0 = transport
+        .request(M_NODE_STATUS, serde_json::json!({ "worker_id": w0 }))
+        .await
+        .expect("node status for the ctx-0 worker");
+    assert_eq!(
+        status0
+            .pointer("/loaded/ctx_len/n")
+            .and_then(serde_json::Value::as_u64),
+        Some(2048),
+        "ctx 0 → trained-cap default, not the 4096 coercion: {status0}"
+    );
+
     // ctx_len is the typed CtxLen on the wire: {"kind":"fixed","n":256}.
     let ctx = status
         .pointer("/loaded/ctx_len/n")

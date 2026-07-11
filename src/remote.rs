@@ -151,9 +151,12 @@ pub struct HelloResult {
 
 /// `higgs/node/load` params — spawn a NEW worker for model `id` (host-resolved).
 ///
-/// `deny_unknown_fields`: a control RPC must reject params the node can't honor rather
-/// than silently drop them (e.g. a hub sending `idle_ttl_minutes` to a node with no idle
-/// reaper). Forward-compat for *optional* peer features rides the HELLO capabilities map,
+/// `deny_unknown_fields`: a control RPC must reject TOP-LEVEL params the node can't
+/// honor rather than silently drop them (e.g. a hub sending `idle_ttl_minutes` to a node
+/// with no idle reaper). The rich `params` OBJECT inside is deliberately looser
+/// (`LlamaCppParams` tolerates unknown fields — engine-versioned) and its copies of the
+/// base trio are ignored (base fields are authoritative at the top level only — pinned
+/// in the runtime tests). Forward-compat for *optional* peer features rides the HELLO capabilities map,
 /// not silently-ignored load fields.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

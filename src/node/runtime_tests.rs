@@ -40,12 +40,12 @@ fn load_params(id: &str) -> NodeLoadParams {
     }
 }
 
-/// Degenerate zeros never reach the engine: the base `threads: 0` is FLOORED
-/// to 1 (nothing upstream validates the wire value; `with_n_threads(0)` is
-/// GGML-assert territory), and zero thread/batch counts in the RICH overrides
-/// (`n_threads_batch`/`n_batch`/`n_ubatch`/`n_seq_max`) are SKIPPED — absence
-/// is the auto spelling, and a deferred first-chat crash must never leave the
-/// node. Fail-on-revert for both the floor and the skips.
+/// ONE zero policy: every count-zero reads as ABSENT — the base `threads: 0`
+/// and the RICH zero thread/batch counts (`n_threads_batch`/`n_batch`/
+/// `n_ubatch`/`n_seq_max`) are all SKIPPED so the engine/worker defaults
+/// apply; `with_n_threads(0)` / `with_n_threads_batch(0)` GGML-assert
+/// territory never leaves the node, at load OR at first chat. Fail-on-revert
+/// for the skips.
 #[test]
 fn worker_load_params_floors_and_skips_degenerate_zeros() {
     use crate::worker::engine::llamacpp::params::LlamaCppParams;
@@ -57,10 +57,9 @@ fn worker_load_params_floors_and_skips_degenerate_zeros() {
     }))
     .expect("rich params parse");
     let v = worker_load_params("org/m", "/p/m.gguf", None, None, Some(0), &Some(rich));
-    assert_eq!(
-        v.get("threads").and_then(serde_json::Value::as_u64),
-        Some(1),
-        "base threads 0 floors to 1: {v}"
+    assert!(
+        v.get("threads").is_none(),
+        "base threads 0 reads as ABSENT (worker default), one zero policy: {v}"
     );
     for k in ["n_threads_batch", "n_batch", "n_ubatch", "n_seq_max"] {
         assert!(
@@ -68,6 +67,25 @@ fn worker_load_params_floors_and_skips_degenerate_zeros() {
             "zero {k} is skipped (absence = engine default): {v}"
         );
     }
+
+    // Base fields smuggled INSIDE the rich object are IGNORED — the base trio
+    // is authoritative at the top level only (documented on the wire op) — and
+    // this is contractual, not accidental.
+    let rich: LlamaCppParams = serde_json::from_value(serde_json::json!({
+        "ctx_len": { "kind": "fixed", "n": 8192 },
+        "threads": 9
+    }))
+    .expect("rich params parse");
+    let v = worker_load_params("org/m", "/p/m.gguf", Some(2048), None, None, &Some(rich));
+    assert_eq!(
+        v.get("ctx_len").and_then(serde_json::Value::as_u64),
+        Some(2048),
+        "the top-level base wins; the rich-object ctx is ignored: {v}"
+    );
+    assert!(
+        v.get("threads").is_none(),
+        "a rich-object base field never rides when the base is absent: {v}"
+    );
 
     // NON-zero twins of the same fields still ride verbatim.
     let rich: LlamaCppParams = serde_json::from_value(serde_json::json!({

@@ -270,7 +270,10 @@ impl Higgs {
     /// touches [`HubFleet`](crate::node::fleet::HubFleet) directly. Errors when the
     /// server is not a hub (no fleet installed).
     ///
-    /// `params = None` is the classic default load (any node); `Some` ships the
+    /// `params = None` — or a `Some` whose fields are all `None`, or whose only
+    /// values are the count-zeros the fleet normalizes to absent — is the
+    /// classic default load (any node, never version-gated); any other `Some`
+    /// ships the
     /// OPTION-shaped [`NodeLoadParams`](crate::remote::NodeLoadParams) fields
     /// VERBATIM (`id` is forced from `model`) — an absent ctx/gpu/threads stays
     /// absent on the wire so the NODE's defaults apply; mapping through a
@@ -569,6 +572,13 @@ impl Higgs {
     /// NO pinned field is a fully-default load (`None`); a full `params` supersedes
     /// the flat fields; otherwise the three base fields fall back to `default_load`
     /// and every optional override passes through verbatim.
+    /// KNOWN residual (pre-existing, T8 r4 note): a PARTIAL `params` umbrella
+    /// in the request supersedes the flat fields wholesale, so its serde
+    /// struct-defaults (gpu_layers Count{0} = CPU-only, threads 0) ride as
+    /// explicit values — the same defaults-laundering class the REMOTE path
+    /// closed with Option-shaped `NodeLoadParams`. A local-surface fix means
+    /// Option-shaping `HiggsLoadRequest.params` or merging it over the flat
+    /// fields; deferred as its own change (this surface predates T8).
     pub async fn load_flat(&self, req: &HiggsLoadRequest) -> Result<(), HiggsError> {
         let any_pinned = req.ctx_len.is_some()
             || req.gpu_layers.is_some()
