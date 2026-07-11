@@ -47,7 +47,7 @@ fn load_params(id: &str) -> NodeLoadParams {
 /// territory never leaves the node, at load OR at first chat. Fail-on-revert
 /// for the skips.
 #[test]
-fn worker_load_params_floors_and_skips_degenerate_zeros() {
+fn worker_load_params_skips_degenerate_zeros() {
     use crate::worker::engine::llamacpp::params::LlamaCppParams;
     let rich: LlamaCppParams = serde_json::from_value(serde_json::json!({
         "n_threads_batch": 0,

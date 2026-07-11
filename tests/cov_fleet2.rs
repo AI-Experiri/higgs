@@ -731,6 +731,20 @@ async fn params_load_payload_carries_ctx_at_protocol_two() {
         .await
         .expect("zero params normalize to a bare load");
 
+    // An all-DEFAULT rich object asks nothing: it normalizes away and the
+    // load rides the bare arm (keys == ["id"]) — never version-refused.
+    let empty_rich = higgs::remote::NodeLoadParams {
+        id: String::new(),
+        ctx_len: None,
+        gpu_layers: None,
+        threads: None,
+        params: Some(Default::default()),
+    };
+    fleet
+        .load(&peer, "bare/load", Some(empty_rich))
+        .await
+        .expect("an all-default rich object normalizes to a bare load");
+
     // Partial params: only ctx set — gpu_layers/threads stay off the wire.
     let partial = higgs::remote::NodeLoadParams {
         id: "only/ctx".into(),

@@ -98,7 +98,9 @@ Loading a model on a node reuses the same load *procedure* as the local path:
 resolve the id → path off the executor (with the same canonical-containment
 guard), run the RAM-headroom check, default the context from the model, and
 record the load so a respawn replays it. A node load accepts `ctx_len`,
-`gpu_layers`, and `threads`, and rejects any parameter it can't honor.
+`gpu_layers`, `threads`, and the rich llama.cpp `params` object (protocol
+major 2 — the hub refuses a params-load against an older node instead of
+silently loading with defaults), and rejects any unknown top-level parameter.
 
 ## Routing & self-healing
 
@@ -111,8 +113,10 @@ reconnects, because a node's workers persist across a dropped connection.
   load re-establishes a route. (The hub does not silently re-route on its own.)
 - If a node is merely disconnected, calls fail fast with a clear error and the
   route is **kept** until it reconnects.
-- An unload the hub owes a node that was offline is **reconciled on reconnect**,
-  so a displaced worker is never leaked.
+- Loads are strictly ADDITIVE: each load spawns a fresh worker and records a
+  new instance, so no displaced workers are ever owed to an offline node — there
+  are no pending unloads to reconcile on reconnect (unloads against an offline
+  node simply fail fast with the unreachable error).
 
 ## Remote model pull
 

@@ -939,6 +939,15 @@ impl HubFleet {
         let params = params.map(|mut p| {
             p.ctx_len = p.ctx_len.filter(|c| *c > 0);
             p.threads = p.threads.filter(|t| *t > 0);
+            // An all-default rich object asks nothing either (`{"params": {}}`
+            // parses to a default LlamaCppParams) — drop it so the bare arm's
+            // "never version-refused for asking nothing" principle holds for
+            // the rich field too, not just for absent/zero base fields.
+            p.params = p.params.filter(|lc| lc.has_overrides());
+            // An all-default rich object asks nothing either (`{"params": {}}`
+            // parses to a default LlamaCppParams) — drop it so the bare arm's
+            // "never version-refused for asking nothing" principle holds for
+            // the rich field too, not just for absent/zero base fields.
             p
         });
         let payload = match params {

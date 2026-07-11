@@ -804,10 +804,10 @@ fn worker_load_params(
                     continue;
                 }
                 // Zero thread/batch counts are the same GGML-assert territory
-                // as the base `threads: 0` floored above — but for these,
-                // ABSENCE (the engine default) is the honest reading of "0",
-                // so skip rather than floor. Deferred-to-first-chat crashes
-                // (with_n_threads_batch(0) etc.) never leave this node.
+                // as the base `threads: 0` SKIPPED above — one zero policy:
+                // ABSENCE (the engine default) is the only reading of "0".
+                // Deferred-to-first-chat crashes (with_n_threads_batch(0)
+                // etc.) never leave this node.
                 if matches!(
                     k.as_str(),
                     "n_threads_batch" | "n_batch" | "n_ubatch" | "n_seq_max"

@@ -533,7 +533,7 @@ calling `Supervisor::request`.
 | Const | Method | Sent by | Params | Hub does (on receive) |
 |---|---|---|---|---|
 | `M_HELLO` | `higgs/node/hello` | node → hub | `HelloParams` | gate (pairing/allowlist §7) → reply `HelloResult` |
-| `M_INVENTORY` | `higgs/node/inventory` | node → hub (push) | `NodeInventory` `{reason:"boot"\|"refresh"}` | store into `HashMap<NodeId,NodeView>` (wraps it, §4.2.1); reply `StatusOk` |
+| `M_INVENTORY` | `higgs/node/inventory` | hub → node (request) | `{}` → `NodeInventory` | AS SHIPPED the HUB pulls inventory on connect and after each lifecycle op (`refresh_inventory`); the design's node-push never landed |
 
 ```jsonc
 // NodeInventory — push payload. reason:"boot" = first full report;
@@ -609,7 +609,7 @@ operation, then replies. **None reach `WorkerState`** — they live one layer up
 | `M_LOAD` | `higgs/node/load` | `NodeLoadParams` (`id`, `ctx_len?`, `gpu_layers?`, `threads?`, rich `params?` — no per-load idle TTL; `deny_unknown_fields`) | `{ "worker_id", "loaded": LoadedInfo }` | **fit-check VRAM** (fix below) → spawn a NEW `Supervisor` → assign a NEW `WorkerId` → insert into registry → load model |
 | `M_UNLOAD` | `higgs/node/unload` | `{ "worker_id" }` | `StatusOk` | look up worker → `Supervisor::stop()` → remove from registry → free `WorkerId` → drop its log ring (§6) |
 | `M_KILL` | `higgs/node/kill` | `{ "worker_id" }` | `StatusOk` | look up worker → `Supervisor::stop()` (force-reap that ONE child) → remove → free `WorkerId` → drop ring |
-| `M_SCAN` | `higgs/node/scan` | `{}` | `NodeInventory` | `Higgs::scan` (`api.rs:604` — read-only `ModelStore::scan`) + assemble inventory |
+| `M_SCAN` | `higgs/node/scan` | `{}` | `{ "models": [HiggsModel…] }` | the node's on-disk catalog (read-only scan); inventory is the SEPARATE `M_INVENTORY` op |
 | `M_SYSINFO` | `higgs/node/sysinfo` | `{}` | `{ "hardware":HardwareInfo, "runtime":RuntimeInfo }` | `SystemInfo::gather(config, Higgs::sysinfo)` — see fix C below |
 | `M_PULL` | `higgs/node/pull` | `{ "repo", "revision"?, "files"? }` | `StatusOk` (progress on data plane, §4.4) | **NEW HF downloader** → higgs's OWN `models/` dir (fix D) |
 
