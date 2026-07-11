@@ -44,6 +44,7 @@ exec cargo llvm-cov \
   --test control_api \
   --test control_errors \
   --test control_fleet_routes \
+  --test cors_live \
   --test cov_facade \
   --test cov_fleet2 \
   --test cov_infra \
@@ -60,8 +61,10 @@ exec cargo llvm-cov \
   --test keys_api \
   --test load_params_variety \
   --test models_scan_ollama \
+  --test node_chat_test \
   --test pull \
   --test reasoning_v1 \
+  --test rebind \
   --test remote_cli \
   --test remote_hub_e2e \
   --test remote_node_e2e \
