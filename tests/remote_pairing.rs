@@ -59,10 +59,10 @@ async fn valid_token_pairs() {
     let node_id = node.id().to_string();
     let res = dial_and_hello(&node, hub_addr, node_id, String::new(), Some(tok)).await;
     assert!(res.is_ok(), "valid token should pair: {res:?}");
-    assert_eq!(res.unwrap().agreed_version, 1);
+    assert_eq!(res.unwrap().agreed_version, 2);
 
     let (outcome, now_paired) = hub_task.await.unwrap();
-    assert_eq!(outcome, GateOutcome::Admitted { agreed_version: 1 });
+    assert_eq!(outcome, GateOutcome::Admitted { agreed_version: 2 });
     assert!(now_paired, "node added to allowlist after pairing");
 }
 
@@ -238,7 +238,7 @@ async fn hello_exchanges_friendly_names() {
     );
 
     let (outcome, label) = hub_task.await.unwrap();
-    assert_eq!(outcome, GateOutcome::Admitted { agreed_version: 1 });
+    assert_eq!(outcome, GateOutcome::Admitted { agreed_version: 2 });
     assert_eq!(
         label.as_deref(),
         Some("node-friendly(box)"),
@@ -285,7 +285,7 @@ async fn allowlisted_node_reconnects_without_token() {
     let res = dial_and_hello(&node, hub_addr, node_id, String::new(), None)
         .await
         .expect("admitted");
-    assert_eq!(res.agreed_version, 1);
+    assert_eq!(res.agreed_version, 2);
     assert_eq!(
         res.assigned_label.as_deref(),
         Some("known"),
@@ -293,7 +293,7 @@ async fn allowlisted_node_reconnects_without_token() {
     );
     assert_eq!(
         hub_task.await.unwrap(),
-        GateOutcome::Admitted { agreed_version: 1 }
+        GateOutcome::Admitted { agreed_version: 2 }
     );
     let _ = std::fs::remove_file(&path);
 }
