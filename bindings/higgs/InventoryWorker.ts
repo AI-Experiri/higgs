@@ -15,10 +15,12 @@ export type InventoryWorker = { worker_id: number, model: string,
  */
 served_id: string, 
 /**
- * The EFFECTIVE context window the worker was loaded with (post
- * trained-cap defaulting — what the engine actually allocated), from the
- * node's own load-time cache: no RPC to a possibly-busy worker. Absent
- * from pre-stats nodes (`serde(default)` — additive, no protocol bump).
+ * The EFFECTIVE context window the worker was loaded with — what the
+ * engine actually allocated (explicit param, else trained-cap default,
+ * else the worker's own fallback; `node/runtime.rs` `effective_ctx`) —
+ * from the node's load-time cache: no RPC to a possibly-busy worker.
+ * Absent ONLY from pre-stats nodes (`serde(default)` — additive, no
+ * protocol bump); a current node always knows it.
  */
 ctx_len?: number, 
 /**
@@ -30,16 +32,22 @@ gpu_layers?: GpuLayers,
  */
 threads?: number, 
 /**
- * Wall-clock ms (Unix epoch) when the worker loaded.
+ * Wall-clock ms (Unix epoch) when this worker id FIRST loaded its model.
+ * A crash-respawn (the Supervisor restart FSM replaying the load) keeps
+ * the original stamp — "when did this worker come up", not "when did the
+ * child process last restart". `ts(type = "number")` like every other
+ * wire u64 (`system.rs`): the JSON value is a number, and epoch ms sit
+ * far below 2^53.
  */
-loaded_at_ms?: bigint, 
+loaded_at_ms?: number, 
 /**
  * Milliseconds since the worker's last chat activity, measured at
  * snapshot time (the idle reaper's own clock). Freshness is
  * event-driven: the hub re-pulls inventory on connect and after
- * lifecycle ops, so this ages between pulls.
+ * lifecycle ops, so this ages between pulls. `ts(type = "number")` as
+ * above.
  */
-idle_ms?: bigint, 
+idle_ms?: number, 
 /**
  * Chats in flight on this worker at snapshot time.
  */

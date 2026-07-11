@@ -40,6 +40,62 @@ fn load_params(id: &str) -> NodeLoadParams {
     }
 }
 
+/// T9 r1: `effective_ctx` — the wire value and the ALLOCATED value the
+/// inventory reports. The allocated value is never absent and never a value
+/// the engine doesn't use: an explicit ctx wins; a missing/degenerate trained
+/// context falls through to the worker's own fallback (shared const), and a
+/// literal 0 never rides the wire or the inventory.
+#[test]
+fn effective_ctx_reports_what_the_engine_allocates() {
+    use crate::worker::DEFAULT_WORKER_CTX;
+    // Explicit ctx: wire and allocation are exactly it.
+    assert_eq!(effective_ctx(Some(256), Some(2048)), (Some(256), 256));
+    // Absent ctx + trained metadata: trained-cap default.
+    assert_eq!(effective_ctx(None, Some(2048)), (Some(2048), 2048));
+    assert_eq!(
+        effective_ctx(None, Some(10_000_000)),
+        (
+            Some(crate::api::DEFAULT_CTX_CAP),
+            crate::api::DEFAULT_CTX_CAP
+        )
+    );
+    // No usable ctx anywhere: absent on the wire, but the ALLOCATION is the
+    // worker's documented fallback — the inventory must not go blank.
+    assert_eq!(effective_ctx(None, None), (None, DEFAULT_WORKER_CTX));
+    // Zero spellings (explicit 0, malformed GGUF ctx_train 0) read as absent:
+    // no "ctx 0" lie for what the worker coerces to its fallback anyway.
+    assert_eq!(effective_ctx(Some(0), None), (None, DEFAULT_WORKER_CTX));
+    assert_eq!(effective_ctx(None, Some(0)), (None, DEFAULT_WORKER_CTX));
+    assert_eq!(effective_ctx(Some(0), Some(0)), (None, DEFAULT_WORKER_CTX));
+}
+
+/// T9 r1: a load with NO ctx on a model with NO readable trained context (the
+/// dummy GGUF) still reports the ctx the worker actually allocates — its
+/// fallback — instead of a blank stat indistinguishable from a pre-stats
+/// node. Fail-on-revert vs `LoadFacts.ctx_len: Some(ctx_allocated)`.
+#[tokio::test]
+async fn snapshot_reports_worker_fallback_ctx_when_nothing_specifies_one() {
+    let (root, model_id) = crate::node::test_support::stage_dummy_model("higgs-test/noctx");
+    let rt = crate::node::test_support::fake_runtime(vec![root.path().to_path_buf()]);
+    let (id, _) = rt
+        .load(NodeLoadParams {
+            id: model_id,
+            ctx_len: None,
+            gpu_layers: None,
+            threads: None,
+            params: None,
+        })
+        .await
+        .expect("load");
+    let snap = rt.worker_snapshot().await;
+    let row = snap.iter().find(|w| w.worker_id == id.0).expect("row");
+    assert_eq!(
+        row.ctx_len,
+        Some(crate::worker::DEFAULT_WORKER_CTX),
+        "the allocation the worker actually made: {row:?}"
+    );
+}
+
 /// T9: a load stamps the APPLIED facts into the worker snapshot — effective
 /// ctx (here the explicit 512), loaded-at, a running idle clock, zero
 /// in-flight — and an unload evicts the row (and its facts) entirely.

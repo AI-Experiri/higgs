@@ -222,10 +222,12 @@ pub struct InventoryWorker {
     /// `nodes_view`. Empty for a resident worker the hub holds no route for.
     #[serde(default)]
     pub served_id: String,
-    /// The EFFECTIVE context window the worker was loaded with (post
-    /// trained-cap defaulting — what the engine actually allocated), from the
-    /// node's own load-time cache: no RPC to a possibly-busy worker. Absent
-    /// from pre-stats nodes (`serde(default)` — additive, no protocol bump).
+    /// The EFFECTIVE context window the worker was loaded with — what the
+    /// engine actually allocated (explicit param, else trained-cap default,
+    /// else the worker's own fallback; `node/runtime.rs` `effective_ctx`) —
+    /// from the node's load-time cache: no RPC to a possibly-busy worker.
+    /// Absent ONLY from pre-stats nodes (`serde(default)` — additive, no
+    /// protocol bump); a current node always knows it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub ctx_len: Option<u32>,
@@ -237,16 +239,22 @@ pub struct InventoryWorker {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub threads: Option<u32>,
-    /// Wall-clock ms (Unix epoch) when the worker loaded.
+    /// Wall-clock ms (Unix epoch) when this worker id FIRST loaded its model.
+    /// A crash-respawn (the Supervisor restart FSM replaying the load) keeps
+    /// the original stamp — "when did this worker come up", not "when did the
+    /// child process last restart". `ts(type = "number")` like every other
+    /// wire u64 (`system.rs`): the JSON value is a number, and epoch ms sit
+    /// far below 2^53.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
+    #[ts(optional, type = "number")]
     pub loaded_at_ms: Option<u64>,
     /// Milliseconds since the worker's last chat activity, measured at
     /// snapshot time (the idle reaper's own clock). Freshness is
     /// event-driven: the hub re-pulls inventory on connect and after
-    /// lifecycle ops, so this ages between pulls.
+    /// lifecycle ops, so this ages between pulls. `ts(type = "number")` as
+    /// above.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
+    #[ts(optional, type = "number")]
     pub idle_ms: Option<u64>,
     /// Chats in flight on this worker at snapshot time.
     #[serde(default, skip_serializing_if = "Option::is_none")]

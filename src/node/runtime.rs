@@ -645,6 +645,11 @@ impl NodeActor {
             .collect();
         self.last_activity.clear();
         self.in_flight.clear();
+        // Same lifecycle as the activity books: a drained registry must not
+        // strand load facts (today both callers are terminal — shutting_down
+        // blocks any later snapshot — but a future non-terminal drain would
+        // otherwise serve stale facts for re-used worker ids).
+        self.load_facts.clear();
         out
     }
 
@@ -923,15 +928,7 @@ async fn do_load(
         guard.commit();
         return Err(fail(e));
     }
-    // When the caller omits ctx_len, default to the model's trained context capped at
-    // DEFAULT_CTX_CAP (mirrors Higgs::load) rather than the worker's hardcoded 4096.
-    // A wire `ctx_len: 0` reads as ABSENT (one consistent auto spelling —
-    // like the zero thread/batch skips): the trained-cap default applies here
-    // instead of the worker's hardcoded 0→4096 coercion.
-    let ctx_len = params
-        .ctx_len
-        .filter(|c| *c > 0)
-        .or_else(|| ctx_train.map(|t| (t as u32).min(crate::api::DEFAULT_CTX_CAP)));
+    let (ctx_len, ctx_allocated) = effective_ctx(params.ctx_len, ctx_train);
     let load_params = worker_load_params(
         &params.id,
         &path,
@@ -952,12 +949,39 @@ async fn do_load(
     sup.record_last_load(load_params);
     guard.commit(); // handed back to the actor — don't reap
     let facts = LoadFacts {
-        ctx_len,
+        ctx_len: Some(ctx_allocated),
         gpu_layers: params.gpu_layers,
         threads: params.threads.filter(|t| *t > 0),
         loaded_at_ms: unix_ms(),
     };
     Ok((sup, loaded, facts))
+}
+
+/// The context window for a load: what goes on the `M_LOAD` wire, and what the
+/// worker's engine will ACTUALLY allocate for it (the inventory's `ctx_len`
+/// claim — never a value the engine doesn't use).
+///
+/// Wire value: the caller's explicit ctx when non-zero, else the model's
+/// trained context capped at `DEFAULT_CTX_CAP` (mirrors `Higgs::load`) —
+/// rather than the worker's hardcoded fallback. A `ctx_len: 0` reads as
+/// ABSENT (one consistent auto spelling, like the zero thread/batch skips),
+/// and a degenerate trained context of 0 (malformed GGUF metadata) is
+/// filtered the same way instead of riding the wire as a literal `0` — the
+/// worker coerces both shapes to the same [`crate::worker::DEFAULT_WORKER_CTX`], so the
+/// wire behavior is unchanged; only the lie ("ctx 0" in the inventory for a
+/// 4096 allocation) is gone.
+///
+/// Allocated value: the wire value when present, else [`crate::worker::DEFAULT_WORKER_CTX`]
+/// — the exact coercion `handle_load` applies to an absent/zero ctx (shared
+/// const, can't drift).
+fn effective_ctx(requested: Option<u32>, ctx_train: Option<u64>) -> (Option<u32>, u32) {
+    let wire = requested.filter(|c| *c > 0).or_else(|| {
+        ctx_train
+            .map(|t| (t as u32).min(crate::api::DEFAULT_CTX_CAP))
+            .filter(|c| *c > 0)
+    });
+    let allocated = wire.unwrap_or(crate::worker::DEFAULT_WORKER_CTX);
+    (wire, allocated)
 }
 
 /// Node-level model catalog (`{ "models": [HiggsModel, …] }`) from a fresh scan. Read-only.

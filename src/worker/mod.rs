@@ -24,6 +24,12 @@ pub const M_SHUTDOWN: &str = "higgs/shutdown";
 /// Cheap and read-only (no model load, no resident-state mutation). Reply
 /// carries `{gpus: [GpuDevice, …]}`.
 pub const M_SYSINFO: &str = "higgs/sysinfo";
+/// Context window the worker allocates when `M_LOAD` carries no usable
+/// `ctx_len` (absent or 0). ONE home for the fallback: `handle_load`'s
+/// coercion and the node's load-facts cache (`node/runtime.rs`) both read it,
+/// so the inventory's "what the engine actually allocated" claim can't drift
+/// from the worker's real behavior.
+pub(crate) const DEFAULT_WORKER_CTX: u32 = 4096;
 /// Set the worker's log verbosity at runtime: `{verbose: bool}`. `false` (normal)
 /// = llama.cpp INFO+; `true` (verbose) = DEBUG+. Flips the engine-log level
 /// filter live so the user's "Verbose Logging" toggle takes effect without a
@@ -192,10 +198,10 @@ impl WorkerState {
         // (tokens + max_tokens > n_ctx) fail for every request, so the
         // model loads yet is unusable. Coerce 0 → default so the stored
         // window matches the real one.
-        let mut ctx_len = u32_param(&req.params, "ctx_len", 4096);
+        let mut ctx_len = u32_param(&req.params, "ctx_len", DEFAULT_WORKER_CTX);
         if ctx_len == 0 {
-            tracing::warn!("higgs: ctx_len=0 requested; using default 4096");
-            ctx_len = 4096;
+            tracing::warn!("higgs: ctx_len=0 requested; using default {DEFAULT_WORKER_CTX}");
+            ctx_len = DEFAULT_WORKER_CTX;
         }
         // The worker wire is FLAT (no engine tag): deserialize the engine-specific
         // `LlamaCppParams` directly from the params object (each optional is
