@@ -92,7 +92,7 @@ async fn snapshot_reports_worker_fallback_ctx_when_nothing_specifies_one() {
     assert_eq!(
         row.ctx_len,
         Some(crate::worker::DEFAULT_WORKER_CTX),
-        "the allocation the worker actually made: {row:?}"
+        "the operative window the worker pins: {row:?}"
     );
 }
 

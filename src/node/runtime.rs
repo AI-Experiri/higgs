@@ -311,8 +311,8 @@ struct NodeActor {
 }
 
 /// The APPLIED facts of one worker's load, captured where `do_load` resolved
-/// them — the effective context (post trained-cap defaulting: what the engine
-/// actually allocated), the offload/threads as sent (absent = worker
+/// them — the effective context (post trained-cap defaulting: the operative
+/// window the worker pins), the offload/threads as sent (absent = worker
 /// defaults), and the wall-clock load time.
 #[derive(Debug, Clone)]
 struct LoadFacts {
@@ -957,9 +957,10 @@ async fn do_load(
     Ok((sup, loaded, facts))
 }
 
-/// The context window for a load: what goes on the `M_LOAD` wire, and what the
-/// worker's engine will ACTUALLY allocate for it (the inventory's `ctx_len`
-/// claim — never a value the engine doesn't use).
+/// The context window for a load: what goes on the `M_LOAD` wire, and the
+/// OPERATIVE window the worker will run with (the inventory's `ctx_len`
+/// claim — the value the worker pins and every fit-check enforces; llama.cpp
+/// may pad its internal allocation upward, which no higgs surface observes).
 ///
 /// Wire value: the caller's explicit ctx when non-zero, else the model's
 /// trained context capped at `DEFAULT_CTX_CAP` (mirrors `Higgs::load`) —

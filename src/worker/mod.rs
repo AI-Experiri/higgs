@@ -27,8 +27,8 @@ pub const M_SYSINFO: &str = "higgs/sysinfo";
 /// Context window the worker allocates when `M_LOAD` carries no usable
 /// `ctx_len` (absent or 0). ONE home for the fallback: `handle_load`'s
 /// coercion and the node's load-facts cache (`node/runtime.rs`) both read it,
-/// so the inventory's "what the engine actually allocated" claim can't drift
-/// from the worker's real behavior.
+/// so the inventory's operative-window claim can't drift from the worker's
+/// real behavior.
 pub(crate) const DEFAULT_WORKER_CTX: u32 = 4096;
 /// Set the worker's log verbosity at runtime: `{verbose: bool}`. `false` (normal)
 /// = llama.cpp INFO+; `true` (verbose) = DEBUG+. Flips the engine-log level

@@ -15,12 +15,15 @@ export type InventoryWorker = { worker_id: number, model: string,
  */
 served_id: string, 
 /**
- * The EFFECTIVE context window the worker was loaded with — what the
- * engine actually allocated (explicit param, else trained-cap default,
- * else the worker's own fallback; `node/runtime.rs` `effective_ctx`) —
- * from the node's load-time cache: no RPC to a possibly-busy worker.
- * Absent ONLY from pre-stats nodes (`serde(default)` — additive, no
- * protocol bump); a current node always knows it.
+ * The EFFECTIVE context window the worker was loaded with — the crate's
+ * OPERATIVE window: the value the load pinned (explicit param, else
+ * trained-cap default, else the worker's own fallback; `node/runtime.rs`
+ * `effective_ctx`) and the one every fit-check enforces. llama.cpp may
+ * pad its internal allocation upward (`n_ctx` to a 256 multiple) — the
+ * pad is unobservable through any higgs surface. From the node's
+ * load-time cache: no RPC to a possibly-busy worker. Absent ONLY from
+ * pre-stats nodes (`serde(default)` — additive, no protocol bump); a
+ * current node always knows it.
  */
 ctx_len?: number, 
 /**
