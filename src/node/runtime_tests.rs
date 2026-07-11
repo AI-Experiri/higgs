@@ -40,6 +40,54 @@ fn load_params(id: &str) -> NodeLoadParams {
     }
 }
 
+/// Degenerate zeros never reach the engine: the base `threads: 0` is FLOORED
+/// to 1 (nothing upstream validates the wire value; `with_n_threads(0)` is
+/// GGML-assert territory), and zero thread/batch counts in the RICH overrides
+/// (`n_threads_batch`/`n_batch`/`n_ubatch`/`n_seq_max`) are SKIPPED — absence
+/// is the auto spelling, and a deferred first-chat crash must never leave the
+/// node. Fail-on-revert for both the floor and the skips.
+#[test]
+fn worker_load_params_floors_and_skips_degenerate_zeros() {
+    use crate::worker::engine::llamacpp::params::LlamaCppParams;
+    let rich: LlamaCppParams = serde_json::from_value(serde_json::json!({
+        "n_threads_batch": 0,
+        "n_batch": 0,
+        "n_ubatch": 0,
+        "n_seq_max": 0
+    }))
+    .expect("rich params parse");
+    let v = worker_load_params("org/m", "/p/m.gguf", None, None, Some(0), &Some(rich));
+    assert_eq!(
+        v.get("threads").and_then(serde_json::Value::as_u64),
+        Some(1),
+        "base threads 0 floors to 1: {v}"
+    );
+    for k in ["n_threads_batch", "n_batch", "n_ubatch", "n_seq_max"] {
+        assert!(
+            v.get(k).is_none(),
+            "zero {k} is skipped (absence = engine default): {v}"
+        );
+    }
+
+    // NON-zero twins of the same fields still ride verbatim.
+    let rich: LlamaCppParams = serde_json::from_value(serde_json::json!({
+        "n_threads_batch": 3,
+        "n_batch": 512
+    }))
+    .expect("rich params parse");
+    let v = worker_load_params("org/m", "/p/m.gguf", None, None, None, &Some(rich));
+    assert_eq!(
+        v.get("n_threads_batch").and_then(serde_json::Value::as_u64),
+        Some(3),
+        "non-zero rich overrides still ride: {v}"
+    );
+    assert_eq!(
+        v.get("n_batch").and_then(serde_json::Value::as_u64),
+        Some(512),
+        "non-zero rich overrides still ride: {v}"
+    );
+}
+
 /// An absent base field (e.g. auto `ctx_len`) is OMITTED — not `null` — so the
 /// worker's `LlamaCppParams` deserialize doesn't fail and drop the merged rich
 /// overrides. The whole object must deserialize cleanly into `LlamaCppParams`.

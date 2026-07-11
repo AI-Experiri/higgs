@@ -1900,12 +1900,12 @@ impl Higgs {
                 NodeLoadParams {
                     id: id.to_owned(),
                     // A no-params load uses AUTO context (`None` → the model's TRAINED
-                    // context, capped at DEFAULT_CTX_CAP by the node, runtime.rs:842),
+                    // context, capped at DEFAULT_CTX_CAP by the node, runtime.rs `do_load`),
                     // NOT `default_load.ctx_len`. This asymmetry with gpu_layers/threads
                     // below is DELIBERATE: `gpu_layers = all` and a thread count are
                     // sensible UNIVERSAL defaults, but a fixed context (the base
                     // placeholder 4096) is NOT — the node uses a PINNED ctx_len verbatim
-                    // (runtime.rs:842 does NOT cap it at the trained context), so pinning
+                    // (runtime.rs `do_load` does NOT cap it at the trained context), so pinning
                     // 4096 would rope-extend a 2048-trained model and degrade it. Auto
                     // sizes per-model correctly. (See the fn doc + the Some(p) branch.)
                     ctx_len: None,
@@ -2274,7 +2274,7 @@ impl Higgs {
         {
             Some(LoadParams::LlamaCpp(p)) => {
                 // A recorded `Auto` was resolved BY THE NODE at load time to the trained
-                // context capped at DEFAULT_CTX_CAP (runtime.rs `load_worker`) — mirror
+                // context capped at DEFAULT_CTX_CAP (runtime.rs `do_load`) — mirror
                 // that resolution so the reported window is the real one, not the
                 // unresolved sentinel. No trained context known → `None` (unknown).
                 let ctx = match p.ctx_len {

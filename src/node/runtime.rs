@@ -802,6 +802,18 @@ fn worker_load_params(
                 if matches!(k.as_str(), "ctx_len" | "gpu_layers" | "threads") || v.is_null() {
                     continue;
                 }
+                // Zero thread/batch counts are the same GGML-assert territory
+                // as the base `threads: 0` floored above — but for these,
+                // ABSENCE (the engine default) is the honest reading of "0",
+                // so skip rather than floor. Deferred-to-first-chat crashes
+                // (with_n_threads_batch(0) etc.) never leave this node.
+                if matches!(
+                    k.as_str(),
+                    "n_threads_batch" | "n_batch" | "n_ubatch" | "n_seq_max"
+                ) && v.as_u64() == Some(0)
+                {
+                    continue;
+                }
                 obj.insert(k, v);
             }
         }
@@ -860,8 +872,12 @@ async fn do_load(
     }
     // When the caller omits ctx_len, default to the model's trained context capped at
     // DEFAULT_CTX_CAP (mirrors Higgs::load) rather than the worker's hardcoded 4096.
+    // A wire `ctx_len: 0` reads as ABSENT (one consistent auto spelling —
+    // like the zero thread/batch skips): the trained-cap default applies here
+    // instead of the worker's hardcoded 0→4096 coercion.
     let ctx_len = params
         .ctx_len
+        .filter(|c| *c > 0)
         .or_else(|| ctx_train.map(|t| (t as u32).min(crate::api::DEFAULT_CTX_CAP)));
     let load_params = worker_load_params(
         &params.id,

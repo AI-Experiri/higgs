@@ -106,8 +106,21 @@ async fn params_load_refused_below_protocol_two() {
         "params against a floor-1 node → HG078, got {err:?}"
     );
 
-    // The classic bare load is untouched by the gate.
+    // The classic bare load is untouched by the gate — and so is a Some(p)
+    // whose fields are ALL None (byte-identical wire): never version-refused
+    // for asking nothing. Fail-on-revert for the all-None-as-bare arm.
     fleet.load(&node_key, &model_id, None).await.unwrap();
+    let empty = crate::remote::NodeLoadParams {
+        id: String::new(),
+        ctx_len: None,
+        gpu_layers: None,
+        threads: None,
+        params: None,
+    };
+    fleet
+        .load(&node_key, &model_id, Some(empty))
+        .await
+        .expect("all-None params load against a floor-1 node");
 }
 
 /// Connectivity precedes the version gate: a SEEDED (paired-but-offline,

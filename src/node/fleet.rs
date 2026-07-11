@@ -496,8 +496,16 @@ impl Actor for FleetActor {
                     let _ = reply.send(None);
                 } else {
                     let node_id = self.node_ids.assign(&node);
-                    if let Some(v) = agreed_version {
-                        self.versions.insert(node.clone(), v);
+                    match agreed_version {
+                        Some(v) => {
+                            self.versions.insert(node.clone(), v);
+                        }
+                        // A version-less re-admission must not inherit the
+                        // PREVIOUS connection's major — clear to the floor, as
+                        // the field doc promises.
+                        None => {
+                            self.versions.remove(&node);
+                        }
                     }
                     let replaced = self.nodes.insert(node.clone(), transport);
                     // Bump on (re)admission so an inventory fetch from a PRIOR connection still in
@@ -891,8 +899,10 @@ impl HubFleet {
     /// a fresh worker on the node and adds an instance, so N loads of the same model coexist
     /// as N served ids (`org/model`, `org/model-1`, …). Returns the new worker's id.
     ///
-    /// `params = None` sends the classic bare `{ "id" }` (works against ANY node);
-    /// `Some(p)` sends the full [`NodeLoadParams`](crate::remote::NodeLoadParams) —
+    /// `params = None` — or a `Some(p)` whose fields are ALL `None` (its wire
+    /// bytes are identical) — sends the classic bare `{ "id" }` (works against
+    /// ANY node, never version-gated); a `Some(p)` with anything set sends the
+    /// full [`NodeLoadParams`](crate::remote::NodeLoadParams) —
     /// gated on the node having negotiated protocol major ≥ 2 ([HG078] otherwise:
     /// some major-1 builds would parse the fields and older ones hard-reject —
     /// indistinguishable from here — and silently loading with the node's
@@ -923,12 +933,16 @@ impl HubFleet {
             // ALL-None params serialize byte-identically to a bare load
             // (`skip_serializing_if` on every field) — treat them AS one, so a
             // caller's `params: {}` is never version-refused for asking nothing.
-            Some(p)
-                if p.ctx_len.is_none()
-                    && p.gpu_layers.is_none()
-                    && p.threads.is_none()
-                    && p.params.is_none() =>
-            {
+            // Exhaustive destructuring: adding a field to NodeLoadParams breaks
+            // THIS match at compile time, so the emptiness check can never
+            // silently ignore (and bare-drop) a new parameter.
+            Some(crate::remote::NodeLoadParams {
+                id: _,
+                ctx_len: None,
+                gpu_layers: None,
+                threads: None,
+                params: None,
+            }) => {
                 json!({ "id": model })
             }
             Some(mut p) => {

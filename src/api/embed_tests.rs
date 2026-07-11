@@ -321,10 +321,11 @@ async fn node_ops_without_a_hub_error() {
 }
 
 /// The FACADE params path: `node_load(.., Some(p))` dispatches over a major-2
-/// admission and the id-force is load-bearing — `p.id` deliberately names a
-/// model the node does NOT have; only the forced `id = model` makes the load
-/// resolve. Fail-on-revert: drop the `p.id = model` force (facade or fleet) and
-/// the node fails the load on the bogus id.
+/// admission and an id-force is load-bearing — `p.id` deliberately names a
+/// model the node does NOT have; only a forced `id = model` makes the load
+/// resolve. This test fails only when BOTH forces (facade + fleet) are dropped
+/// — the FLEET force in isolation is pinned by cov_fleet2's divergent-id mock
+/// case, which bypasses the facade.
 #[tokio::test]
 async fn node_load_params_forces_the_wire_id_from_model() {
     let (higgs, node_key, model_id, _guards) = fake_higgs_with_remote_node().await;

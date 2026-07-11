@@ -624,6 +624,17 @@ async fn params_load_payload_carries_ctx_at_protocol_two() {
                             "unset fields stay ABSENT (no CPU-only/0-thread laundering): {params}"
                         );
                     }
+                    "forced/id" => {
+                        // The FLEET-level id-force in isolation (the facade has
+                        // its own redundant force; this mock is reached via
+                        // fleet.load DIRECTLY, so only the fleet force can have
+                        // rewritten the divergent p.id below).
+                        assert_eq!(
+                            params.get("id").and_then(Value::as_str),
+                            Some("forced/id"),
+                            "the fleet rewrites a divergent p.id to model: {params}"
+                        );
+                    }
                     "bare/load" => {
                         let keys: Vec<_> = params
                             .as_object()
@@ -676,6 +687,34 @@ async fn params_load_payload_carries_ctx_at_protocol_two() {
         .load(&peer, "bare/load", None)
         .await
         .expect("bare load still works");
+
+    // Divergent p.id via the PUB fleet API: the fleet's own force wins.
+    let divergent = higgs::remote::NodeLoadParams {
+        id: "not/the-model".into(),
+        ctx_len: Some(64),
+        gpu_layers: None,
+        threads: None,
+        params: None,
+    };
+    fleet
+        .load(&peer, "forced/id", Some(divergent))
+        .await
+        .expect("divergent-id params-load dispatches with the forced id");
+
+    // ALL-None params are a BARE load: byte-identical payload, never
+    // version-gated — this node is admitted at major 2, but the same call
+    // against a floor-1 admission must also pass (pinned in fleet_tests).
+    let empty = higgs::remote::NodeLoadParams {
+        id: String::new(),
+        ctx_len: None,
+        gpu_layers: None,
+        threads: None,
+        params: None,
+    };
+    fleet
+        .load(&peer, "bare/load", Some(empty))
+        .await
+        .expect("all-None params behave as a bare load");
 
     // Partial params: only ctx set — gpu_layers/threads stay off the wire.
     let partial = higgs::remote::NodeLoadParams {
