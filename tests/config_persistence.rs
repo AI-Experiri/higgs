@@ -272,15 +272,12 @@ async fn cors_origins_persist_and_flag_restart_required() {
     higgs.shutdown().await;
 }
 
-/// A live listener's applied CORS origins belong to the SERVE, not to router
-/// construction: `serve_v1` records the snapshot its layer went live with, and
-/// building ANOTHER router for the same `Higgs` afterwards (the pub embedder
-/// constructor `serve::v1_router`) must NOT re-capture "applied" — that would
-/// adopt the newly-persisted list and flip `restart_required` to a false
-/// `false` while the live layer still runs the boot list. Fail-on-revert:
-/// moving the applied-origins capture back into the router builder makes the
-/// second `v1_router` call clobber the applied list and the final assertions
-/// fail.
+/// The CORS disclosures follow the LIVE list (G7): an API write applies to the
+/// running layer immediately (`restart_required` stays false, `applied`
+/// equals what was written), building ANOTHER router for the same `Higgs`
+/// (the pub embedder constructor `serve::v1_router`) perturbs nothing, and
+/// once the last listener exits the disclosures return to honest pre-serve
+/// semantics rather than claiming a dead listener's state.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn second_router_build_does_not_clobber_applied_cors() {
     let Some(higgs) = higgs_local(&[common::TINY_MODEL_ID]).await else {
@@ -328,28 +325,33 @@ async fn second_router_build_does_not_clobber_applied_cors() {
         "server_config discloses the live bound address"
     );
 
-    // Persist a NEW allowlist while live: the running layer was built with [],
-    // so a restart is genuinely pending.
+    // Persist a NEW allowlist while live: G7 publishes it to the live list the
+    // running layer reads per request — applied immediately, nothing pending.
     let updated = higgs
         .set_cors_origins(vec!["https://tools.example".to_string()])
         .expect("valid origin persists");
     assert!(
-        updated.restart_required,
-        "live layer lacks the new origin → restart pending"
+        !updated.restart_required,
+        "the write applied to the running layer — no restart pending (G7)"
+    );
+    assert_eq!(
+        updated.applied_origins,
+        vec!["https://tools.example".to_string()],
+        "the applied disclosure equals what was just written"
     );
 
     // Build a second router for the same instance WITHOUT serving it — the pub
-    // embedder constructor. It must not claim "applied".
+    // embedder constructor. It must not perturb the live disclosures.
     let _second = higgs::serve::v1_router(std::sync::Arc::clone(&higgs));
     let after = higgs.cors_settings();
     assert!(
-        after.restart_required,
-        "a built-but-never-served router must not clobber the live applied list"
+        !after.restart_required,
+        "a built-but-never-served router changes nothing"
     );
-    assert!(
-        after.applied_origins.is_empty(),
-        "applied stays the live listener's boot snapshot, got {:?}",
-        after.applied_origins
+    assert_eq!(
+        after.applied_origins,
+        vec!["https://tools.example".to_string()],
+        "the live disclosure survives a router build"
     );
 
     let _ = stop_tx.send(());

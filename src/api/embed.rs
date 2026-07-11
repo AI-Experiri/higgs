@@ -599,29 +599,37 @@ impl Higgs {
     /// now (`origins`), what the RUNNING server booted with (`applied_origins`), and
     /// whether they differ (`restart_required`).
     ///
-    /// The extra origins are read ONCE at serve start when the CORS layer is built,
-    /// so a persisted change applies only on the next restart — `restart_required`
-    /// surfaces that honestly (a live rebind of the running layer is a separate,
-    /// deferred feature). CORS only protects BROWSER clients; non-browser access is
-    /// gated by API keys, not this list.
+    /// Every listener's CORS layer reads the facade's LIVE allowlist per request
+    /// (G7), and [`Higgs::set_cors_origins`] publishes to that list as it
+    /// persists — so an API-driven change applies immediately and
+    /// `restart_required` stays `false`. It flips `true` only when the
+    /// persisted file diverges from the live list, which after G7 means a
+    /// HAND-EDITED `config.json` (nothing republishes a hand-edit while
+    /// listeners run — the next serve start, or any API write, reconciles).
+    /// CORS only protects BROWSER clients; non-browser access is gated by API
+    /// keys, not this list.
     pub fn cors_settings(&self) -> HiggsCorsSettings {
         let origins = self.extra_cors_origins();
-        // `applied` is `None` until a CORS layer has actually been built (pre-serve).
-        // Pre-serve there is nothing to diverge from — the first serve start applies
-        // the persisted list — so `restart_required` is `false`, NOT a comparison
-        // against a flattened-empty applied list (which would falsely flag a restart
-        // for origins set before the server ever served).
-        let applied = self.applied_cors_origins();
-        // ANY live listener running a different allowlist means a restart is needed
-        // — not just the primary one whose list `applied_origins` discloses. The
-        // comparison is by SET (the allowlist is exact-match membership, so order is
-        // meaningless to the layer): a reordered save of the same origins must not
-        // claim a restart. `false` when nothing is live (the first serve applies the
-        // persisted list, so nothing is pending).
-        let restart_required = self.any_live_serve_cors_differs(&origins);
+        // Pre-serve (no listener live) there is nothing to diverge from — the
+        // first serve start publishes the persisted list — so `applied` is
+        // empty and `restart_required` is `false`, NOT a comparison against a
+        // flattened-empty applied list (which would falsely flag a restart for
+        // origins set before the server ever served).
+        let live = if self.any_serve_live() {
+            self.live_cors_snapshot()
+        } else {
+            None
+        };
+        // Compared as SETS (the allowlist is exact-match membership, so order
+        // is meaningless to the layer): a reordered save of the same origins
+        // must not claim a restart.
+        let restart_required = live.as_ref().is_some_and(|l| {
+            use std::collections::HashSet;
+            l.iter().collect::<HashSet<_>>() != origins.iter().collect::<HashSet<_>>()
+        });
         HiggsCorsSettings {
             origins,
-            applied_origins: applied.unwrap_or_default(),
+            applied_origins: live.unwrap_or_default(),
             restart_required,
         }
     }
@@ -634,9 +642,12 @@ impl Higgs {
     /// allowlist can match; the STORED value is that canonical form, not the raw
     /// input. Repeated origins (after canonicalization) are deduped (first-seen
     /// order preserved) rather than erroring. The normalized list is written to
-    /// `config.json` via [`Higgs::with_config_mut`]; the returned
-    /// [`HiggsCorsSettings`] reflects the new persisted state (so `restart_required`
-    /// flips `true` when it diverges from the running server's boot-applied list).
+    /// `config.json` via [`Higgs::with_config_mut`] AND published as the LIVE
+    /// allowlist (G7): every running listener's layer reads the live list per
+    /// request, so the change is in force by the time this returns — the
+    /// returned [`HiggsCorsSettings`] therefore reports `restart_required:
+    /// false`. Publish happens only AFTER the persist succeeds: a failed write
+    /// changes nothing, neither on disk nor in force.
     pub fn set_cors_origins(&self, origins: Vec<String>) -> Result<HiggsCorsSettings, HiggsError> {
         let normalized = validate_and_dedup_cors_origins(origins)?;
         self.with_config_mut(|c| c.cors_origins = normalized.clone())
@@ -645,6 +656,7 @@ impl Higgs {
                 path: "config.json".into(),
                 source: e,
             })?;
+        self.publish_live_cors(normalized);
         Ok(self.cors_settings())
     }
 

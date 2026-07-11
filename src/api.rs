@@ -242,8 +242,7 @@ pub struct Higgs {
     /// Every CURRENTLY-LIVE `/v1` listener, in registration order. `serve_v1` is
     /// public and an embedder may run SEVERAL listeners on one facade, so this is
     /// a per-listener registry, not a set of flat slots that overlapping serves
-    /// would clobber: each entry owns the address it bound and the exact extra CORS
-    /// origins ITS layer was built with.
+    /// would clobber: each entry owns the address it bound.
     ///
     /// Entries are added by [`Higgs::register_serve`] and removed when the returned
     /// [`ServeGuard`] drops — which happens on graceful shutdown, on a serve error,
@@ -251,11 +250,20 @@ pub struct Higgs {
     /// can never strand its registration.
     ///
     /// Reads: [`Self::lan_exposed`] (any live LAN listener → the [HG059] revoke
-    /// gate), [`Self::bound_addr`] and [`Self::applied_cors_origins`] (the PRIMARY —
-    /// first-registered — live listener's disclosures), and
-    /// [`Self::any_live_serve_cors_differs`] (does ANY live listener run a CORS list
-    /// other than the persisted one → `restart_required`).
+    /// gate), [`Self::bound_addr`] (the PRIMARY — first-registered — live
+    /// listener's disclosed address), and [`Self::any_serve_live`] (the CORS
+    /// disclosures' pre-serve/live distinction). The enforced CORS allowlist is
+    /// NOT per-listener — every listener's layer reads the shared
+    /// [`Self::live_cors`] per request (G7 live rebind).
     serves: parking_lot::Mutex<Vec<ServeSlot>>,
+    /// The LIVE extra-CORS allowlist every listener's layer enforces, published
+    /// by `serve_v1` at listener start (from the persisted `config.json` list)
+    /// and by [`Higgs::set_cors_origins`] on every API write — which is what
+    /// makes a CORS change apply to running listeners WITHOUT a rebind (G7).
+    /// `None` until the first publish (no layer has ever gone live and no write
+    /// happened); the CORS predicate lazily initializes it from disk then, so a
+    /// router an embedder mounts directly still honors a hand-edited file.
+    live_cors: parking_lot::RwLock<Option<Vec<String>>>,
     /// Monotonic id source for [`ServeSlot`] — a slot is removed by id, never by
     /// index, so a sibling deregistration can't shift another's identity.
     next_serve_id: std::sync::atomic::AtomicU64,
@@ -320,8 +328,9 @@ fn overlay_sampling(
 
 /// One CURRENTLY-LIVE `/v1` listener's serve-scoped state (see [`Higgs::serves`]).
 /// Per-listener, not a flat facade slot: overlapping `serve_v1` calls each own their
-/// bound address and the exact extra CORS origins THEIR layer was built with, so one
-/// serve's start or exit can never rewrite another's disclosures.
+/// bound address, so one serve's start or exit can never rewrite another's
+/// disclosures. (The CORS allowlist is deliberately NOT here: every listener's
+/// layer reads the shared live list per request — G7 live rebind.)
 pub(crate) struct ServeSlot {
     /// Identity for removal — a sibling deregistration must not shift it.
     id: u64,
@@ -330,8 +339,6 @@ pub(crate) struct ServeSlot {
     lan: bool,
     /// The address this listener actually bound (`None` if unknowable).
     addr: Option<std::net::SocketAddr>,
-    /// The extra CORS origins THIS listener's layer was built with.
-    cors_origins: Vec<String>,
 }
 
 /// RAII registration for a live `/v1` listener, from [`Higgs::register_serve`].
@@ -361,20 +368,6 @@ impl ServeGuard {
             .find(|s| s.id == self.id)
         {
             slot.lan = true;
-        }
-    }
-
-    /// Record the extra CORS origins this listener's layer is being built with,
-    /// once `serve_v1`'s startup guards have passed and the list has been read.
-    pub(crate) fn set_cors_origins(&self, cors_origins: Vec<String>) {
-        if let Some(slot) = self
-            .higgs
-            .serves
-            .lock()
-            .iter_mut()
-            .find(|s| s.id == self.id)
-        {
-            slot.cors_origins = cors_origins;
         }
     }
 
@@ -771,6 +764,7 @@ impl Higgs {
             serves: parking_lot::Mutex::new(Vec::new()),
             next_serve_id: std::sync::atomic::AtomicU64::new(0),
             rebind_reservations: std::sync::atomic::AtomicUsize::new(0),
+            live_cors: parking_lot::RwLock::new(None),
             serve_lifecycle: tokio::sync::Mutex::new(()),
             lan_override: std::sync::atomic::AtomicBool::new(false),
             benchmarking: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
@@ -1036,17 +1030,11 @@ impl Higgs {
         self: &std::sync::Arc<Self>,
         lan: bool,
         addr: Option<std::net::SocketAddr>,
-        cors_origins: Vec<String>,
     ) -> ServeGuard {
         let id = self
             .next_serve_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.serves.lock().push(ServeSlot {
-            id,
-            lan,
-            addr,
-            cors_origins,
-        });
+        self.serves.lock().push(ServeSlot { id, lan, addr });
         ServeGuard {
             higgs: std::sync::Arc::clone(self),
             id,
@@ -1159,24 +1147,37 @@ impl Higgs {
         self.serves.lock().first().and_then(|s| s.addr)
     }
 
-    /// The PRIMARY live listener's applied extra CORS origins, or `None` pre-serve
-    /// (which [`Higgs::cors_settings`] distinguishes from an applied-but-empty list).
-    pub(crate) fn applied_cors_origins(&self) -> Option<Vec<String>> {
-        self.serves.lock().first().map(|s| s.cors_origins.clone())
+    /// Whether ANY `/v1` listener is currently live — the CORS disclosures'
+    /// pre-serve/live distinction ([`Higgs::cors_settings`]).
+    pub(crate) fn any_serve_live(&self) -> bool {
+        !self.serves.lock().is_empty()
     }
 
-    /// Does ANY live listener run a CORS allowlist other than `persisted`? That —
-    /// not just the primary's — is what "a restart is required to apply the
-    /// persisted list" means when several listeners are up. Compared as SETS (the
-    /// allowlist is exact-match membership; order is meaningless to the layer).
-    /// `false` when nothing is live: the first serve start applies `persisted`.
-    pub(crate) fn any_live_serve_cors_differs(&self, persisted: &[String]) -> bool {
-        use std::collections::HashSet;
-        let want: HashSet<&String> = persisted.iter().collect();
-        self.serves
-            .lock()
-            .iter()
-            .any(|s| s.cors_origins.iter().collect::<HashSet<_>>() != want)
+    /// The LIVE extra-CORS allowlist (what every listener's layer enforces
+    /// RIGHT NOW), or `None` if nothing has published yet (no listener ever
+    /// started and no [`Higgs::set_cors_origins`] write happened).
+    pub(crate) fn live_cors_snapshot(&self) -> Option<Vec<String>> {
+        self.live_cors.read().clone()
+    }
+
+    /// Publish `origins` as the live extra-CORS allowlist — takes effect on the
+    /// next request of EVERY live listener (their layers read this per request).
+    pub(crate) fn publish_live_cors(&self, origins: Vec<String>) {
+        *self.live_cors.write() = Some(origins);
+    }
+
+    /// The live allowlist, lazily initialized from the persisted `config.json`
+    /// on first use. The lazy path serves a router an embedder MOUNTS directly
+    /// (never passing through `serve_v1`, which publishes eagerly): its first
+    /// CORS check still honors a hand-edited persisted list.
+    pub(crate) fn live_cors_or_init(&self) -> Vec<String> {
+        if let Some(list) = self.live_cors.read().clone() {
+            return list;
+        }
+        let from_disk = self.extra_cors_origins();
+        let mut slot = self.live_cors.write();
+        // A racing publisher may have won between the locks — keep its list.
+        slot.get_or_insert(from_disk).clone()
     }
 
     /// Register an INTERNAL, in-memory-only bearer `token` for an in-process

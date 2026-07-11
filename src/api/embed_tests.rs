@@ -597,22 +597,31 @@ async fn cors_settings_persists_and_flags_restart_required() {
     let read_back = higgs.cors_settings();
     assert_eq!(read_back.origins, updated.origins);
 
-    // Once a listener IS live with a DIFFERENT list, the persisted change diverges
-    // from what's enforced → restart_required flips true.
+    // With a listener live, the disclosures compare the persisted file against
+    // the LIVE list (G7: layers read the shared live list per request). A
+    // divergence can only come from a HAND-EDITED config.json — an API write
+    // publishes live as it persists. Simulate the hand-edit with a direct
+    // config write that bypasses the publish.
     let higgs = Arc::new(higgs);
-    {
-        let _live = higgs.register_serve(false, None, vec!["https://old.example".to_string()]);
-        assert!(
-            higgs.cors_settings().restart_required,
-            "persisted list differs from the live listener's list → restart required"
-        );
-    }
-
-    // A listener live with EXACTLY the persisted list → nothing pending.
-    let _synced_live = higgs.register_serve(false, None, read_back.origins.clone());
+    let _live = higgs.register_serve(false, None);
+    higgs.publish_live_cors(vec!["https://old.example".to_string()]);
     assert!(
-        !higgs.cors_settings().restart_required,
-        "applied == persisted → no restart pending"
+        higgs.cors_settings().restart_required,
+        "persisted list differs from the LIVE list → restart required (hand-edit case)"
+    );
+
+    // An API write reconciles: it persists AND publishes, so nothing is pending
+    // and the applied disclosure equals the persisted list.
+    let after_write = higgs
+        .set_cors_origins(read_back.origins.clone())
+        .expect("valid origins persist");
+    assert!(
+        !after_write.restart_required,
+        "an API write applies LIVE (G7) → no restart pending"
+    );
+    assert_eq!(
+        after_write.applied_origins, read_back.origins,
+        "the live disclosure equals what was just written"
     );
 }
 
@@ -640,41 +649,45 @@ async fn cors_settings_pre_serve_never_flags_restart() {
 #[tokio::test]
 async fn cors_restart_flag_ignores_origin_order() {
     // The allowlist is exact-match MEMBERSHIP — order is meaningless to the
-    // running CORS layer, so persisting the SAME origins reordered must not
-    // claim a restart is needed. A genuinely different set still must.
+    // running CORS layer, so a hand-edited config.json holding the SAME
+    // origins reordered must not claim a restart. A genuinely different
+    // hand-edited set still must. (API writes publish live and can never
+    // diverge — the divergence is simulated with a direct config write.)
     let higgs = Arc::new(fake_higgs(vec![]));
-    let _live = higgs.register_serve(
-        false,
-        None,
-        vec![
-            "https://a.example".to_string(),
-            "https://b.example".to_string(),
-        ],
-    );
-    let reordered = higgs
-        .set_cors_origins(vec![
-            "https://b.example".to_string(),
-            "https://a.example".to_string(),
-        ])
-        .expect("valid origins persist");
-    assert_eq!(
-        reordered.origins,
-        vec![
-            "https://b.example".to_string(),
-            "https://a.example".to_string()
-        ],
-        "display keeps the persisted order"
-    );
+    let _live = higgs.register_serve(false, None);
+    higgs.publish_live_cors(vec![
+        "https://a.example".to_string(),
+        "https://b.example".to_string(),
+    ]);
+
+    higgs
+        .with_config_mut(|c| {
+            c.cors_origins = vec![
+                "https://b.example".to_string(),
+                "https://a.example".to_string(),
+            ]
+        })
+        .expect("direct config write");
     assert!(
-        !reordered.restart_required,
+        !higgs.cors_settings().restart_required,
         "same origins, different order → everything is already live"
     );
-    let changed = higgs
+
+    higgs
+        .with_config_mut(|c| c.cors_origins = vec!["https://b.example".to_string()])
+        .expect("direct config write");
+    assert!(
+        higgs.cors_settings().restart_required,
+        "a genuinely different hand-edited set requires a restart (or any API write)"
+    );
+
+    // The API write reconciles the divergence live.
+    let reconciled = higgs
         .set_cors_origins(vec!["https://b.example".to_string()])
         .expect("valid origin persists");
     assert!(
-        changed.restart_required,
-        "a genuinely different set still requires a restart"
+        !reconciled.restart_required,
+        "an API write publishes live → divergence gone"
     );
 }
 
@@ -726,8 +739,8 @@ async fn lan_exposure_tracks_every_live_serve() {
     // A LAN listener goes live, then a LOOPBACK one joins it. The loopback serve
     // must NOT clear the LAN exposure (the old bool `set_lan_exposed(!loopback)`
     // wrote `false` here and dropped the guard out from under a live LAN listener).
-    let lan = higgs.register_serve(true, None, vec![]);
-    let loopback = higgs.register_serve(false, None, vec![]);
+    let lan = higgs.register_serve(true, None);
+    let loopback = higgs.register_serve(false, None);
     assert!(higgs.lan_exposed(), "LAN listener still live");
 
     // The loopback listener exits: a SIBLING serve ending must not lift exposure.
@@ -742,8 +755,8 @@ async fn lan_exposure_tracks_every_live_serve() {
     assert!(!higgs.lan_exposed(), "last LAN listener gone → not exposed");
 
     // Two overlapping LAN listeners: exposure survives until BOTH are gone.
-    let a = higgs.register_serve(true, None, vec![]);
-    let b = higgs.register_serve(true, None, vec![]);
+    let a = higgs.register_serve(true, None);
+    let b = higgs.register_serve(true, None);
     drop(a);
     assert!(higgs.lan_exposed(), "one LAN listener remains");
     drop(b);
@@ -755,7 +768,7 @@ async fn lan_exposure_tracks_every_live_serve() {
     assert!(higgs.lan_exposed(), "override exposes");
     higgs.set_lan_exposed(false);
     assert!(!higgs.lan_exposed(), "override lifts");
-    let live_lan = higgs.register_serve(true, None, vec![]);
+    let live_lan = higgs.register_serve(true, None);
     higgs.set_lan_exposed(false);
     assert!(
         higgs.lan_exposed(),
@@ -798,7 +811,7 @@ async fn arm_lan_serve_gates_and_arms_atomically() {
     unsafe { std::env::set_var("HIGGS_HOME", home.path()) };
 
     let higgs = Arc::new(fake_higgs(vec![]));
-    let guard = higgs.register_serve(false, None, vec![]);
+    let guard = higgs.register_serve(false, None);
     assert!(!higgs.lan_exposed(), "registration alone does not arm");
 
     // Empty keystore → [HG058], and NOTHING is armed: a refused serve must leave no
@@ -857,7 +870,7 @@ async fn aborting_a_serve_future_releases_its_registration() {
     // real `serve_v1` parks on `axum::serve(..).await`.
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
     let task = tokio::spawn(async move {
-        let _guard = serving.register_serve(true, None, vec![]);
+        let _guard = serving.register_serve(true, None);
         let _ = ready_tx.send(());
         std::future::pending::<()>().await;
     });
@@ -873,29 +886,25 @@ async fn aborting_a_serve_future_releases_its_registration() {
     );
 }
 
-/// The serve-scoped disclosures are PER-LISTENER: `bound_addr` and the applied
-/// CORS snapshot come from the primary (first-registered) live listener, and a
-/// sibling serve starting or exiting must never rewrite or erase them. They return
-/// to pre-serve semantics only once every listener is gone.
+/// The `bound_addr` disclosure is PER-LISTENER: it comes from the primary
+/// (first-registered) live listener, and a sibling serve starting or exiting
+/// must never rewrite or erase it. It returns to pre-serve semantics only
+/// once every listener is gone. (The CORS disclosure is deliberately NOT
+/// per-listener after G7 — see `applied_cors_disclosure_follows_listener_liveness`.)
 #[tokio::test]
 async fn serve_disclosures_are_per_listener() {
     let higgs = Arc::new(fake_higgs(vec![]));
     let a_addr: std::net::SocketAddr = "127.0.0.1:31415".parse().unwrap();
     let b_addr: std::net::SocketAddr = "127.0.0.1:31416".parse().unwrap();
 
-    let a = higgs.register_serve(false, Some(a_addr), vec!["https://a.example".to_string()]);
-    // A SECOND listener starts with a different address + CORS list. It must not
-    // overwrite the primary's disclosures (the old flat slots did exactly that).
-    let b = higgs.register_serve(false, Some(b_addr), vec!["https://b.example".to_string()]);
+    let a = higgs.register_serve(false, Some(a_addr));
+    // A SECOND listener starts with a different address. It must not overwrite
+    // the primary's disclosure (the old flat slots did exactly that).
+    let b = higgs.register_serve(false, Some(b_addr));
     assert_eq!(
         higgs.bound_addr(),
         Some(a_addr),
         "primary keeps its address"
-    );
-    assert_eq!(
-        higgs.applied_cors_origins(),
-        Some(vec!["https://a.example".to_string()]),
-        "primary keeps its applied snapshot"
     );
 
     // B exits first: A is still live, so nothing is cleared and nothing shifts.
@@ -905,20 +914,10 @@ async fn serve_disclosures_are_per_listener() {
         Some(a_addr),
         "live serve keeps its address"
     );
-    assert_eq!(
-        higgs.applied_cors_origins(),
-        Some(vec!["https://a.example".to_string()]),
-        "live serve keeps its applied snapshot"
-    );
 
     // The last one exits: back to honest pre-serve semantics.
     drop(a);
     assert_eq!(higgs.bound_addr(), None, "no listener → no bound address");
-    assert_eq!(
-        higgs.applied_cors_origins(),
-        None,
-        "no listener → no applied snapshot (pre-serve semantics)"
-    );
 }
 
 /// `ServeGuard::release` reports whether the releasing listener was the LAST one —
@@ -929,8 +928,8 @@ async fn serve_disclosures_are_per_listener() {
 #[tokio::test]
 async fn only_the_last_listener_reports_itself_as_last() {
     let higgs = Arc::new(fake_higgs(vec![]));
-    let a = higgs.register_serve(true, None, vec![]);
-    let b = higgs.register_serve(false, None, vec![]);
+    let a = higgs.register_serve(true, None);
+    let b = higgs.register_serve(false, None);
 
     // A sibling is still live → NOT last → its `serve_v1` must not stop the facade.
     assert!(
@@ -955,42 +954,50 @@ async fn only_the_last_listener_reports_itself_as_last() {
 #[tokio::test]
 async fn releasing_a_guard_makes_its_drop_a_no_op() {
     let higgs = Arc::new(fake_higgs(vec![]));
-    let a = higgs.register_serve(false, None, vec![]);
+    let a = higgs.register_serve(false, None);
     assert!(a.release(), "sole listener is last"); // `a` consumed + dropped here
 
     // A fresh listener registers after the released guard was dropped.
-    let _b = higgs.register_serve(true, None, vec![]);
+    let _b = higgs.register_serve(true, None);
     assert!(
         higgs.lan_exposed(),
         "the new listener is live (the released guard's drop removed nothing)"
     );
 }
 
-/// `restart_required` asks whether ANY live listener runs a list other than the
-/// persisted one — not just the primary. A stale sibling must still demand a
-/// restart even while the primary happens to match.
+/// The applied-CORS disclosure keys off "any listener live" — after G7 the
+/// live list is SHARED across listeners (their layers all read it per
+/// request), so per-listener staleness cannot exist: a sibling exit changes
+/// nothing, and only the LAST exit returns to pre-serve semantics.
 #[tokio::test]
-async fn restart_required_when_any_live_serve_differs() {
+async fn applied_cors_disclosure_follows_listener_liveness() {
     let higgs = Arc::new(fake_higgs(vec![]));
     higgs
         .set_cors_origins(vec!["https://tools.example".to_string()])
         .expect("valid origin persists");
+    assert!(
+        higgs.cors_settings().applied_origins.is_empty(),
+        "pre-serve: nothing is applied"
+    );
 
-    // The PRIMARY matches the persisted list; a SECOND, older-config listener does
-    // not. A restart is still required — the mismatch is real for that listener.
-    let _primary = higgs.register_serve(false, None, vec!["https://tools.example".to_string()]);
-    assert!(
-        !higgs.cors_settings().restart_required,
-        "the only live listener matches → nothing pending"
+    let a = higgs.register_serve(false, None);
+    let b = higgs.register_serve(false, None);
+    assert_eq!(
+        higgs.cors_settings().applied_origins,
+        vec!["https://tools.example".to_string()],
+        "live: the shared list is the applied disclosure for every listener"
     );
-    let stale = higgs.register_serve(false, None, vec![]);
-    assert!(
-        higgs.cors_settings().restart_required,
-        "a live listener running a different list → restart required"
+
+    drop(b);
+    assert_eq!(
+        higgs.cors_settings().applied_origins,
+        vec!["https://tools.example".to_string()],
+        "a sibling exit changes nothing"
     );
-    drop(stale);
+
+    drop(a);
     assert!(
-        !higgs.cors_settings().restart_required,
-        "the stale listener is gone → nothing pending"
+        higgs.cors_settings().applied_origins.is_empty(),
+        "the last exit returns to pre-serve semantics"
     );
 }

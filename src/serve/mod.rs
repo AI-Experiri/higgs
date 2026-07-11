@@ -228,16 +228,13 @@ async fn health() -> StatusCode {
 /// [`host_guard`] → [`local_cors`] → `with_state`. Embedded hosts bind loopback,
 /// so the DNS-rebinding Host guard is on.
 pub fn v1_router(higgs: Arc<Higgs>) -> Router {
-    // NOTE: building a router does NOT record `applied_cors_origins` — only
-    // [`serve_v1`] (the entrypoint that actually puts a listener behind the
-    // layer) captures what went live, so a built-but-never-served router (or a
-    // second router built while another serves) can't clobber the running
-    // listener's applied list and flip `restart_required` to a false `false`.
-    // An embedder that mounts this router itself gets pre-serve semantics from
-    // `Higgs::cors_settings` (`applied_origins` empty, `restart_required`
-    // false): higgs cannot know when a mounted router goes live.
-    let extra_origins = higgs.extra_cors_origins();
-    v1_router_with_host_policy(higgs, true, extra_origins)
+    // The CORS layer reads the facade's LIVE allowlist per request (G7), so a
+    // mounted router honors `set_cors_origins` changes immediately, exactly
+    // like a `serve_v1` listener. Disclosure semantics for a mounted router
+    // stay pre-serve (`Higgs::cors_settings` keys "live" off registered
+    // listeners, and a mounted router never registers): higgs cannot know
+    // when a mounted router goes live.
+    v1_router_with_host_policy(higgs, true)
 }
 
 /// [`v1_router`] with the Host-guard policy made explicit. `enforce_loopback_host`
@@ -250,14 +247,7 @@ pub fn v1_router(higgs: Arc<Higgs>) -> Router {
 /// refusals and arms `lan_exposed` BEFORE building it. A `pub` relaxed
 /// constructor would let an out-of-crate embedder serve unauthenticated on a LAN
 /// with the Host guard off.
-/// `extra_origins` is the extra CORS allowlist the layer is built with — passed
-/// in (not read here) so the caller that records it as APPLIED ([`serve_v1`])
-/// hands the layer the exact same snapshot it recorded (no double-read skew).
-pub(crate) fn v1_router_with_host_policy(
-    higgs: Arc<Higgs>,
-    enforce_loopback_host: bool,
-    extra_origins: Vec<String>,
-) -> Router {
+pub(crate) fn v1_router_with_host_policy(higgs: Arc<Higgs>, enforce_loopback_host: bool) -> Router {
     // Streaming surface: NO whole-request timeout (an SSE stream must outlive any
     // per-request bound). The chat duration is bounded separately by the worker
     // chat-RPC timeout.
@@ -281,7 +271,7 @@ pub(crate) fn v1_router_with_host_policy(
         .layer(middleware::from_fn(move |req, next| {
             host_guard(enforce_loopback_host, req, next)
         }))
-        .layer(local_cors(extra_origins))
+        .layer(local_cors(higgs.clone()))
         .with_state(higgs)
 }
 
@@ -478,7 +468,7 @@ pub async fn serve_v1(
                           // one is about to drain for good.
     let serve_guard = {
         let _lifecycle = higgs.serve_lifecycle().await;
-        higgs.register_serve(false, listener.local_addr().ok(), Vec::new())
+        higgs.register_serve(false, listener.local_addr().ok())
     };
     // Refusing to serve, but an embedded caller may have already `start()`ed this
     // facade (spawning a worker). Tear it down before the early return so the
@@ -512,22 +502,15 @@ pub async fn serve_v1(
             refuse!(e);
         }
     }
-    // The EXACT extra CORS origins THIS listener's layer is built with — read once
-    // and handed BOTH to the layer and to the registration, so the disclosed
-    // "applied" list is byte-identical to what is actually enforced (no double-read
-    // skew). Captured HERE (not in the router builder) so only a router that really
-    // goes live behind a listener claims "applied"; see the note on [`v1_router`].
-    // Residual race (accepted, self-correcting): a `set_cors_origins` landing
-    // between this read and the record below can get a response computed against
-    // pre-record state; the next `cors_settings` read is correct.
-    let extra_origins = higgs.extra_cors_origins();
-    // Record the CORS list this listener enforces (the LAN flag was armed at
-    // registration — see there). Per-listener state, so a sibling serve starting or
-    // exiting can't rewrite this one's disclosures. `serve_guard` deregisters on
-    // DROP — covering task CANCELLATION (an aborted future runs destructors but no
-    // code past its await) — and on the explicit `release()` below.
-    serve_guard.set_cors_origins(extra_origins.clone());
-    let app = v1_router_with_host_policy(Arc::clone(&higgs), enforce_loopback_host, extra_origins);
+    // Publish the persisted allowlist as the LIVE one (G7): every listener's
+    // layer reads the shared live list per request, so this listener starting
+    // brings the file's current contents into force for ALL listeners — the
+    // one honest interpretation when layers no longer own snapshots. A
+    // concurrent `set_cors_origins` write can land right after this publish
+    // and simply wins: last write is the live list, and the disclosures read
+    // the same slot, so enforced and disclosed can never diverge.
+    higgs.publish_live_cors(higgs.extra_cors_origins());
+    let app = v1_router_with_host_policy(Arc::clone(&higgs), enforce_loopback_host);
     let served = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
         .await;
@@ -566,13 +549,17 @@ pub async fn serve_v1(
 /// here). Rather than enumerate ports, allow any localhost/127.0.0.1 origin
 /// plus the tauri webview origins. higgs is localhost/webview only — not a
 /// public surface — so trusting any loopback origin matches its threat model.
-fn local_cors(extra_origins: Vec<String>) -> CorsLayer {
+fn local_cors(higgs: Arc<Higgs>) -> CorsLayer {
     CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(move |origin: &HeaderValue, _req| {
+            // The extra allowlist is read from the facade's LIVE list on EVERY
+            // check (G7): a `set_cors_origins` write applies to running
+            // listeners immediately, no rebind. Lazily initialized from the
+            // persisted config on the first check of a mounted router.
             is_local_origin(origin)
                 || origin
                     .to_str()
-                    .is_ok_and(|o| extra_origins.iter().any(|e| e == o))
+                    .is_ok_and(|o| higgs.live_cors_or_init().iter().any(|e| e == o))
         }))
         .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
         .allow_headers(tower_http::cors::Any)
