@@ -603,9 +603,10 @@ impl Higgs {
     /// (G7), and [`Higgs::set_cors_origins`] publishes to that list as it
     /// persists — so an API-driven change applies immediately and
     /// `restart_required` stays `false`. It flips `true` only when the
-    /// persisted file diverges from the live list, which after G7 means a
-    /// HAND-EDITED `config.json` (nothing republishes a hand-edit while
-    /// listeners run — the next serve start, or any API write, reconciles).
+    /// persisted file diverges from the live list — after G7 that means a
+    /// HAND-EDITED `config.json`, or the loser of two concurrent API writes
+    /// whose persist/publish orders inverted (disclosed either way; the
+    /// next write or serve start reconciles).
     /// CORS only protects BROWSER clients; non-browser access is gated by API
     /// keys, not this list.
     pub fn cors_settings(&self) -> HiggsCorsSettings {
