@@ -867,6 +867,13 @@ impl Higgs {
     /// survives, so a chat test passes every gate and fails at the transport —
     /// but the node CANNOT reconnect until the hub is re-enabled, which the
     /// plain HG027 text never says. Other errors pass through untouched.
+    ///
+    /// Accepted residual: `hub()` is also None for the DURATION of an in-flight
+    /// re-enable (`start_hub` binds an endpoint and may wait ~10s for a relay
+    /// before the hub is installed), so a chat test failing inside that window
+    /// gets this enrichment while the operator's enable is already running —
+    /// stale for seconds, then true or moot. Never fires on a first enable or
+    /// a failed enable (no fleet is installed on either path).
     fn note_hub_disabled(&self, e: HiggsError) -> HiggsError {
         match e {
             HiggsError::NodeUnreachable {
