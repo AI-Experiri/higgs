@@ -76,6 +76,7 @@ exec cargo llvm-cov \
   --test turbotune \
   --test v1_errors \
   --test v1_models_servable \
+  --test worker_exe_seam \
   --test worker_logs \
   --test worker_roundtrip \
   --ignore-filename-regex '/tune/' \

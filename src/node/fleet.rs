@@ -983,7 +983,86 @@ impl HubFleet {
         ),
         HiggsError,
     > {
+        self.chat_inner(
+            served,
+            None,
+            messages_json,
+            max_tokens,
+            temperature,
+            tools_json,
+            chat_template_kwargs,
+        )
+        .await
+    }
+
+    /// [`chat`](Self::chat), but REFUSES to dispatch unless the served id still
+    /// resolves to `pin_node` — for callers whose result ATTESTS which node
+    /// answered (the node chat test). Served ids are derived by renumbering the
+    /// model's whole instance set ([`crate::node::served::served_ids`]), so a
+    /// single unload or additive load elsewhere can re-home an id between a
+    /// caller's own resolution and this dispatch; the pin is checked against the
+    /// SAME resolution that picks the transport, so a re-homed id is refused
+    /// ([HG076], transient — the caller re-resolves) instead of silently
+    /// exercising, and then reporting, the wrong node.
+    pub async fn chat_pinned(
+        self: &Arc<Self>,
+        served: &str,
+        pin_node: &str,
+        messages_json: String,
+        max_tokens: usize,
+        temperature: f32,
+        tools_json: Option<String>,
+        chat_template_kwargs: Option<String>,
+    ) -> Result<
+        (
+            crate::delta_queue::DeltaReceiver,
+            impl std::future::Future<Output = Result<serde_json::Value, HiggsError>> + Send,
+        ),
+        HiggsError,
+    > {
+        self.chat_inner(
+            served,
+            Some(pin_node),
+            messages_json,
+            max_tokens,
+            temperature,
+            tools_json,
+            chat_template_kwargs,
+        )
+        .await
+    }
+
+    /// Shared body of [`chat`](Self::chat) / [`chat_pinned`](Self::chat_pinned):
+    /// one `require_served` resolution drives the pin check (when any) AND the
+    /// transport pick, so the two can never disagree.
+    async fn chat_inner(
+        self: &Arc<Self>,
+        served: &str,
+        pin_node: Option<&str>,
+        messages_json: String,
+        max_tokens: usize,
+        temperature: f32,
+        tools_json: Option<String>,
+        chat_template_kwargs: Option<String>,
+    ) -> Result<
+        (
+            crate::delta_queue::DeltaReceiver,
+            impl std::future::Future<Output = Result<serde_json::Value, HiggsError>> + Send,
+        ),
+        HiggsError,
+    > {
         let (node, worker, model) = self.require_served(served).await?;
+        if let Some(pin) = pin_node {
+            if node != pin {
+                return Err(HiggsError::InvalidChatTestTarget {
+                    detail: format!(
+                        "served instance {served} resolved to node {node} at dispatch, not the \
+                         pinned node {pin} — served ids renumber when a model's instance set \
+                         changes; refresh the fleet view and retry"
+                    ),
+                });
+            }
+        }
         let transport = self.transport(&node).await?;
         let (rx, fut) = match transport
             .chat(

@@ -693,14 +693,17 @@ pub enum HiggsError {
     RebindAfterShutdown,
 
     /// A node-directed chat test ([`crate::Higgs::node_chat_test`]) found NO served
-    /// instance routed on the target node, so there is nothing to send the test
-    /// prompt to. Routes are durable across disconnects, so this genuinely means no
-    /// model is loaded there (or the node id is not one the fleet knows) — it is
-    /// not a transient connectivity state (that surfaces as [HG027] from the chat
-    /// itself). The remedy is a load, not a retry.
+    /// instance ROUTED on the target node, so the hub has nothing to relay the test
+    /// prompt to. The route table is the hub's in-memory dispatch truth: it survives
+    /// a node DISCONNECT (that case surfaces as [HG027] from the chat itself, not
+    /// here) but NOT a hub process restart — after one, a node's still-resident
+    /// workers are route-less until a load re-records them, and this code fires even
+    /// though the node's card shows a resident model. Either way the remedy is the
+    /// same: a load on the node (which routes it), not a retry. The node itself is
+    /// guaranteed known — an unknown endpoint id is refused earlier as [HG075].
     #[snafu(display(
         "[HG074] no served model instance is routed on node {endpoint_id} — load a model on \
-         it first (`Higgs::node_load` / the Fleet view's Load)"
+         it there (`Higgs::node_load` / the Fleet view's Load) to (re-)record the route"
     ))]
     #[diagnostic(code(HG074), severity(Error))]
     NodeNothingServed { endpoint_id: String },
@@ -717,13 +720,17 @@ pub enum HiggsError {
     #[diagnostic(code(HG075), severity(Error))]
     UnknownNode { endpoint_id: String },
 
-    /// A node chat test ([`crate::Higgs::node_chat_test`]) was given an explicit
-    /// `served` operand that cannot prove the requested link: the id is not
-    /// routed anywhere (perhaps just unloaded), or it is routed on a DIFFERENT
-    /// node than the one the test names (a reply would attest a link the test
-    /// never exercised). A caller-input error — the request will fail
-    /// identically until the operands change; `detail` names the specific
-    /// conflict and its remedy.
+    /// A node chat test ([`crate::Higgs::node_chat_test`]) refused its chat
+    /// target: the explicit `served` operand is not routed anywhere (perhaps
+    /// just unloaded), or resolves to a DIFFERENT node than the one the test
+    /// names — at the caller's pre-check or at the pinned dispatch itself
+    /// ([`chat_pinned`](crate::node::fleet::HubFleet::chat_pinned), whose check
+    /// rides the same resolution that picks the transport). A reply would
+    /// attest a link the test never exercised, so refusing is the only honest
+    /// outcome. The conflict is against the CURRENT route state (served ids
+    /// renumber as instance sets change), so the same call can succeed after a
+    /// load or a re-resolve; `detail` names the specific conflict and its
+    /// remedy.
     #[snafu(display("[HG076] invalid chat-test target: {detail}"))]
     #[diagnostic(code(HG076), severity(Error))]
     InvalidChatTestTarget { detail: String },

@@ -186,6 +186,38 @@ async fn unload_and_chat_unrouted_model_error() {
 }
 
 #[tokio::test]
+async fn chat_pinned_refuses_when_the_id_resolves_elsewhere() {
+    let (fleet, node_key, model_id, _root) = fleet_with_one_node().await;
+    fleet.load(&node_key, &model_id).await.unwrap();
+
+    // Pin to a node the id does NOT resolve to → refused at dispatch, no chat.
+    match fleet
+        .chat_pinned(
+            &model_id,
+            "some-other-node",
+            "[]".into(),
+            8,
+            0.0,
+            None,
+            None,
+        )
+        .await
+    {
+        Err(HiggsError::InvalidChatTestTarget { .. }) => {}
+        Err(other) => panic!("mismatched pin → HG076, got {other:?}"),
+        Ok(_) => panic!("a mismatched pin must be refused, not dispatched"),
+    }
+
+    // Pin to the resolving node → dispatches like plain chat.
+    let (rx, fut) = fleet
+        .chat_pinned(&model_id, &node_key, "[]".into(), 8, 0.0, None, None)
+        .await
+        .expect("a matching pin dispatches");
+    drop(rx);
+    assert_eq!(fut.await.unwrap()["content"], "hello");
+}
+
+#[tokio::test]
 async fn served_on_lists_one_nodes_instances_and_survives_disconnect() {
     let (fleet, node_key, model_id, _root) = fleet_with_one_node().await;
     assert!(fleet.served_on(&node_key).await.is_empty());

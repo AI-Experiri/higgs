@@ -340,11 +340,11 @@ impl Higgs {
     /// Fire one short test prompt at a served instance on a SPECIFIC node and
     /// return what came back — the Fleet view's "prove the iroh link" action.
     ///
-    /// Always relays through the fleet ([`HubFleet::chat`]
-    /// (crate::node::fleet::HubFleet::chat)), NEVER the generic chat dispatch:
-    /// `chat_stream` resolves LOCAL-first, so a served id that is also locally
-    /// resident would silently test the local worker instead of the remote link
-    /// this exists to prove.
+    /// Always relays through the fleet ([`HubFleet::chat_pinned`]
+    /// (crate::node::fleet::HubFleet::chat_pinned)), NEVER the generic chat
+    /// dispatch: `chat_stream` resolves LOCAL-first, so a served id that is also
+    /// locally resident would silently test the local worker instead of the
+    /// remote link this exists to prove.
     ///
     /// The refusal ladder, most-specific first: an endpoint id the hub never
     /// paired is [HG075] (before any route lookup, so nobody is told to "load a
@@ -357,14 +357,19 @@ impl Higgs {
     /// truncated reply (`finish_reason: "length"`) is still a successful round
     /// trip. Node offline surfaces as the chat's own HG027.
     ///
-    /// Accepted residual (documented, not defended): the served id is pinned to
-    /// the node here, but [`HubFleet::chat`](crate::node::fleet::HubFleet::chat)
-    /// re-resolves it independently a moment later. If, between those two actor
-    /// round trips, the instance is unloaded AND the same model re-loaded on
-    /// another node so the served id re-homes, the chat exercises the new node
-    /// while the report names the old one. The window is sub-millisecond, needs
-    /// a full unload+reload to open, and degrades to a mislabeled (not
-    /// fabricated) success; closing it needs a node-pinned fleet chat API.
+    /// The report ATTESTS which node answered, so dispatch is node-PINNED:
+    /// [`HubFleet::chat_pinned`](crate::node::fleet::HubFleet::chat_pinned)
+    /// checks the pin against the same resolution that picks the transport.
+    /// Served ids renumber over a model's whole instance set (a single unload —
+    /// or an additive load on an earlier-sorting node — re-homes an id), so the
+    /// facade's own pick here can go stale before dispatch; a re-homed id is
+    /// refused ([HG076], transient — re-resolve and retry) rather than silently
+    /// testing, and then reporting, the wrong node.
+    ///
+    /// Accepted residual: the refusal LADDER itself is not atomic — a retire
+    /// landing between the [HG075] gate and the route resolution can surface as
+    /// [HG074]/[HG076] instead of [HG075]. Wrong refusal CLASS only, never a
+    /// wrong success; the next call refuses correctly.
     pub async fn node_chat_test(
         &self,
         node: &str,
@@ -430,7 +435,7 @@ impl Higgs {
 
         let started = std::time::Instant::now();
         let (rx, outcome) = fleet
-            .chat(&served, messages, TEST_MAX_TOKENS, 0.0, None, None)
+            .chat_pinned(&served, node, messages, TEST_MAX_TOKENS, 0.0, None, None)
             .await?;
         // The test wants only the final result; the delta stream is not consumed
         // (same non-streaming pattern as an embedder's blocking chat).

@@ -312,14 +312,18 @@ async fn node_ops_without_a_hub_error() {
 
 // ── node_chat_test: the Fleet view's per-node iroh-link proof ────────────────
 
-/// A `Higgs` whose fleet routes one fake-worker remote node (in-process iroh via
-/// `test_support::local_endpoint`), plus the node's key and its loaded model's
-/// served id — the same seam `fleet_tests::fleet_with_one_node` uses, lifted onto
-/// the facade so `node_chat_test`'s arms are drivable without llama.cpp.
-async fn fake_higgs_with_remote_node() -> (Higgs, String, String, tempfile::TempDir) {
+/// Spawn ONE in-process fake remote node serving `model_id` and register it on
+/// `fleet` (real iroh via `test_support::local_endpoint`, fake worker halves —
+/// the PLAIN fake, whose chat reply is "hello" with NO token counts). Returns
+/// the node's endpoint key; the staged scan root rides in `roots`.
+async fn add_fake_remote_node(
+    fleet: &Arc<crate::node::fleet::HubFleet>,
+    model_id: &str,
+    roots: &mut Vec<tempfile::TempDir>,
+) -> String {
     use crate::node::test_support::{fake_runtime, local_endpoint, stage_dummy_model};
 
-    let (root, model_id) = stage_dummy_model("higgs-test/m");
+    let (root, _) = stage_dummy_model(model_id);
     let hub = local_endpoint().await;
     let node = local_endpoint().await;
     let hub_addr = hub.addr();
@@ -336,9 +340,6 @@ async fn fake_higgs_with_remote_node() -> (Higgs, String, String, tempfile::Temp
     let conn = hub.accept().await.expect("incoming").await.expect("conn");
     std::mem::forget(hub);
 
-    let fleet = Arc::new(crate::node::fleet::HubFleet::new(Arc::new(
-        crate::log_bus::LogBus::new(),
-    )));
     fleet
         .add_node(
             node_key.clone(),
@@ -346,18 +347,34 @@ async fn fake_higgs_with_remote_node() -> (Higgs, String, String, tempfile::Temp
             None,
         )
         .await;
-    fleet.load(&node_key, &model_id).await.expect("remote load");
+    fleet.load(&node_key, model_id).await.expect("remote load");
+    roots.push(root);
+    node_key
+}
+
+/// A `Higgs` whose fleet routes one fake-worker remote node (nothing scanned
+/// locally), plus the node's key and its loaded model's served id — the same
+/// seam `fleet_tests::fleet_with_one_node` uses, lifted onto the facade so
+/// `node_chat_test`'s arms are drivable without llama.cpp.
+async fn fake_higgs_with_remote_node() -> (Higgs, String, String, Vec<tempfile::TempDir>) {
+    let fleet = Arc::new(crate::node::fleet::HubFleet::new(Arc::new(
+        crate::log_bus::LogBus::new(),
+    )));
+    let mut roots = Vec::new();
+    let model_id = "higgs-test/m".to_string();
+    let node_key = add_fake_remote_node(&fleet, &model_id, &mut roots).await;
 
     let higgs = fake_higgs(vec![]);
     higgs.set_fleet(fleet);
-    (higgs, node_key, model_id, root)
+    (higgs, node_key, model_id, roots)
 }
 
 /// Happy path: the test prompt relays over the (in-process) iroh link to the
 /// node's routed instance and the report carries the worker's actual reply.
-/// Fail-on-revert: route the test through the generic local-first chat dispatch
-/// instead of `fleet.chat` and a locally-resident same-id model would answer —
-/// this seam has NO local model, so only the fleet relay can produce "hello".
+/// (The always-remote property itself is pinned by
+/// `node_chat_test_bypasses_the_local_first_dispatch` below, which sets up a
+/// distinguishable LOCAL twin — this seam has no local model, so a local-first
+/// revert would relay remotely here too and still pass.)
 #[tokio::test]
 async fn node_chat_test_relays_to_the_nodes_instance() {
     let (higgs, node_key, model_id, _root) = fake_higgs_with_remote_node().await;
@@ -379,6 +396,90 @@ async fn node_chat_test_relays_to_the_nodes_instance() {
         .expect("explicit chat test");
     assert_eq!(explicit.served_id, model_id);
     assert_eq!(explicit.content, "hello");
+}
+
+/// THE always-remote pin: the same id resident BOTH locally and on the remote
+/// node, with distinguishable answers — the LOCAL stateful fake reports
+/// `prompt_tokens: 10`, the REMOTE plain fake omits token counts (→ 0). The
+/// generic dispatch (`chat_stream`) resolves LOCAL-first, so a revert of
+/// `node_chat_test` onto it answers locally with `prompt_tokens == 10` and this
+/// test fails; only the fleet relay produces the remote shape. (Fail-on-revert
+/// verified by actually rerouting the dispatch and watching this fail.)
+#[tokio::test]
+async fn node_chat_test_bypasses_the_local_first_dispatch() {
+    let fleet = Arc::new(crate::node::fleet::HubFleet::new(Arc::new(
+        crate::log_bus::LogBus::new(),
+    )));
+    let mut roots = Vec::new();
+    let model_id = "higgs-test/m".to_string();
+    let node_key = add_fake_remote_node(&fleet, &model_id, &mut roots).await;
+
+    // The LOCAL engine scans the same staged root, so the SAME id is locally
+    // loadable; load it on the local stateful fake engine (the "local twin").
+    let higgs = fake_higgs(vec![roots[0].path().to_path_buf()]);
+    higgs.set_fleet(fleet);
+    higgs.load(&model_id, None).await.expect("local twin loads");
+
+    let report = higgs
+        .node_chat_test(&node_key, None, None)
+        .await
+        .expect("chat test with a local twin resident");
+    assert_eq!(report.content, "hello");
+    assert_eq!(
+        report.prompt_tokens, 0,
+        "the REMOTE plain fake omits token counts; the local twin would report 10 — \
+         a local-first dispatch answered this: {report:?}"
+    );
+}
+
+/// Two remote nodes serving the SAME model split it into `m` / `m-1` served ids.
+/// Each node's implicit test must dispatch to ITS OWN instance, and pinning one
+/// node's served id to the other node is [HG076] — exercised with REAL suffixed
+/// routes, not stand-ins.
+#[tokio::test]
+async fn node_chat_test_pins_across_two_nodes_sharing_a_model() {
+    let fleet = Arc::new(crate::node::fleet::HubFleet::new(Arc::new(
+        crate::log_bus::LogBus::new(),
+    )));
+    let mut roots = Vec::new();
+    let node_a = add_fake_remote_node(&fleet, "higgs-test/m", &mut roots).await;
+    let node_b = add_fake_remote_node(&fleet, "higgs-test/m", &mut roots).await;
+    let higgs = fake_higgs(vec![]);
+    higgs.set_fleet(fleet.clone());
+
+    // The shared model splits into base + "-1" across the two nodes (assignment
+    // order rides the endpoint-key sort — derive it, don't assume it).
+    let served_a = fleet.served_on(&node_a).await;
+    let served_b = fleet.served_on(&node_b).await;
+    assert_eq!(served_a.len(), 1, "one instance on node A");
+    assert_eq!(served_b.len(), 1, "one instance on node B");
+    assert_ne!(served_a[0], served_b[0], "distinct served ids");
+    let mut both = vec![served_a[0].clone(), served_b[0].clone()];
+    both.sort();
+    assert_eq!(both, vec!["higgs-test/m", "higgs-test/m-1"]);
+
+    // Implicit pick tests each node's OWN instance.
+    for (node, served) in [(&node_a, &served_a[0]), (&node_b, &served_b[0])] {
+        let report = higgs.node_chat_test(node, None, None).await.expect("test");
+        assert_eq!(&report.endpoint_id, node);
+        assert_eq!(&report.served_id, served);
+        assert_eq!(report.content, "hello");
+    }
+
+    // Cross-pin: node A's served id on node B → HG076 naming both nodes.
+    let cross = higgs
+        .node_chat_test(&node_b, Some(&served_a[0]), None)
+        .await;
+    match cross {
+        Err(HiggsError::InvalidChatTestTarget { ref detail }) => {
+            assert!(detail.contains(&node_a), "names the routed node: {detail}");
+            assert!(
+                detail.contains(&node_b),
+                "names the requested node: {detail}"
+            );
+        }
+        other => panic!("expected HG076 for a cross-node pin, got {other:?}"),
+    }
 }
 
 /// The refusal ladder, most-specific first: a never-paired endpoint id is
