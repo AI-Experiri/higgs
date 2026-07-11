@@ -67,6 +67,7 @@ exec cargo llvm-cov \
   --test rebind \
   --test remote_cli \
   --test remote_hub_e2e \
+  --test remote_load_params \
   --test remote_node_e2e \
   --test remote_pairing \
   --test scan_edges \
