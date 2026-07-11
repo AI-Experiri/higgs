@@ -158,7 +158,7 @@ enum NodeMsg {
     /// failure/cancellation) and answer the original caller.
     LoadCommit {
         id: WorkerId,
-        result: Result<(Arc<Supervisor>, Value), LoadFailure>,
+        result: Result<(Arc<Supervisor>, Value, LoadFacts), LoadFailure>,
         reply: oneshot::Sender<Result<(WorkerId, Value), HiggsError>>,
     },
     /// Graceful unload (and `Kill`, which is identical at this layer): remove from the
@@ -202,6 +202,11 @@ enum NodeMsg {
     ReapIdle,
     /// Snapshot the resident instances as `(worker, raw model)` — the engine's input to the
     /// global served-id derivation (P4b).
+    /// The full per-worker inventory snapshot (model + T9 stats), one atomic
+    /// actor read — the same rows `M_NODE_INVENTORY` carries, minus hardware.
+    WorkerSnapshot {
+        reply: oneshot::Sender<Vec<crate::remote::InventoryWorker>>,
+    },
     Instances {
         reply: oneshot::Sender<Vec<(WorkerId, String)>>,
     },
@@ -287,6 +292,11 @@ struct NodeActor {
     /// Per-worker last chat activity (stamped on load, and on chat start + end). The idle
     /// reaper unloads a worker whose entry is older than `idle_ttl` with no in-flight chat.
     last_activity: HashMap<WorkerId, Instant>,
+    /// Per-worker APPLIED load facts, cached at commit (T9): the effective ctx
+    /// (post trained-cap defaulting), the gpu/threads as sent, and the load
+    /// wall-clock. Feeds `snapshot_workers` so inventory carries per-worker
+    /// stats WITHOUT an RPC to a possibly-busy worker.
+    load_facts: HashMap<WorkerId, LoadFacts>,
     /// Per-worker count of in-flight chats (held via [`ChatLease`]). A worker with a non-zero
     /// count is never idle-reaped, so a generation longer than the TTL is not killed mid-chat.
     in_flight: HashMap<WorkerId, u32>,
@@ -298,6 +308,26 @@ struct NodeActor {
     /// Lifecycle event fan-out (ModelLoaded/ModelUnloaded), so the engine's event stream works
     /// the same for a local NodeRuntime as it did for the single Supervisor (P4b).
     events_tx: broadcast::Sender<HiggsEvent>,
+}
+
+/// The APPLIED facts of one worker's load, captured where `do_load` resolved
+/// them — the effective context (post trained-cap defaulting: what the engine
+/// actually allocated), the offload/threads as sent (absent = worker
+/// defaults), and the wall-clock load time.
+#[derive(Debug, Clone)]
+struct LoadFacts {
+    ctx_len: Option<u32>,
+    gpu_layers: Option<crate::worker::engine::GpuLayers>,
+    threads: Option<u32>,
+    loaded_at_ms: u64,
+}
+
+/// Wall-clock ms since the Unix epoch (0 if the clock predates it).
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 impl NodeActor {
@@ -313,15 +343,27 @@ impl NodeActor {
             .ids()
             .into_iter()
             .filter_map(|id| {
-                self.registry
-                    .get(id)
-                    .map(|sup| crate::remote::InventoryWorker {
+                self.registry.get(id).map(|sup| {
+                    let facts = self.load_facts.get(&id);
+                    crate::remote::InventoryWorker {
                         worker_id: id.0,
                         model: sup.loaded_model_id().unwrap_or_default(),
                         // The node does not know its hub-assigned served id; the hub
                         // fills this in when it folds the inventory into the fleet view.
                         served_id: String::new(),
-                    })
+                        // T9 stats — straight from the actor's own bookkeeping, no
+                        // RPC to a possibly-busy worker.
+                        ctx_len: facts.and_then(|f| f.ctx_len),
+                        gpu_layers: facts.and_then(|f| f.gpu_layers),
+                        threads: facts.and_then(|f| f.threads),
+                        loaded_at_ms: facts.map(|f| f.loaded_at_ms),
+                        idle_ms: self
+                            .last_activity
+                            .get(&id)
+                            .map(|t| t.elapsed().as_millis() as u64),
+                        in_flight: Some(self.in_flight.get(&id).copied().unwrap_or(0)),
+                    }
+                })
             })
             .collect()
     }
@@ -359,7 +401,7 @@ impl Actor for NodeActor {
                             // Runtime gone (Drop without shutdown_all): best-effort detached
                             // reap so a built worker can't orphan.
                             let sup = match result {
-                                Ok((sup, _)) => Some(sup),
+                                Ok((sup, _, _)) => Some(sup),
                                 Err(LoadFailure { sup, .. }) => sup,
                             };
                             if let Some(sup) = sup {
@@ -371,7 +413,7 @@ impl Actor for NodeActor {
             }
             NodeMsg::LoadCommit { id, result, reply } => {
                 match result {
-                    Ok((sup, loaded)) => {
+                    Ok((sup, loaded, facts)) => {
                         if self.shutting_down {
                             // Shutdown started while this load was in flight — reap the worker
                             // (tracked, so shutdown_all awaits it) and refuse the load.
@@ -391,6 +433,7 @@ impl Actor for NodeActor {
                                     // Start the idle clock now (a loaded-but-unused model is
                                     // idle from load time).
                                     self.last_activity.insert(id, Instant::now());
+                                    self.load_facts.insert(id, facts);
                                     self.emit(HiggsEvent::ModelLoaded { id: model });
                                 }
                                 Err(_) => self.reap(id, sup, None),
@@ -521,6 +564,9 @@ impl Actor for NodeActor {
                     }
                 }
             }
+            NodeMsg::WorkerSnapshot { reply } => {
+                let _ = reply.send(self.snapshot_workers());
+            }
             NodeMsg::Instances { reply } => {
                 let _ = reply.send(
                     self.registry
@@ -608,6 +654,7 @@ impl NodeActor {
     /// recreate the ring).
     fn forget_activity(&mut self, id: WorkerId) {
         self.last_activity.remove(&id);
+        self.load_facts.remove(&id);
         self.in_flight.remove(&id);
     }
 
@@ -833,7 +880,7 @@ async fn do_load(
     spawner: SupervisorSpawner,
     config: Arc<NodeConfig>,
     relay: broadcast::Sender<(WorkerId, String)>,
-) -> Result<(Arc<Supervisor>, Value), LoadFailure> {
+) -> Result<(Arc<Supervisor>, Value, LoadFacts), LoadFailure> {
     let (path, size_bytes, ctx_train) = resolve_model(&config, &params.id).await?;
     // Reject before spawning a worker if the model can't fit (mirrors Higgs::load).
     crate::api::guard_memory_headroom(&params.id, size_bytes)?;
@@ -904,7 +951,13 @@ async fn do_load(
     // otherwise the replacement child would come back model-less.
     sup.record_last_load(load_params);
     guard.commit(); // handed back to the actor — don't reap
-    Ok((sup, loaded))
+    let facts = LoadFacts {
+        ctx_len,
+        gpu_layers: params.gpu_layers,
+        threads: params.threads.filter(|t| *t > 0),
+        loaded_at_ms: unix_ms(),
+    };
+    Ok((sup, loaded, facts))
 }
 
 /// Node-level model catalog (`{ "models": [HiggsModel, …] }`) from a fresh scan. Read-only.
@@ -1009,6 +1062,7 @@ impl NodeRuntime {
             shutdown_waiters: Vec::new(),
             shutdown_done: false,
             last_activity: HashMap::new(),
+            load_facts: HashMap::new(),
             in_flight: HashMap::new(),
             idle: idle_for_actor,
             events_tx: events_for_actor,
@@ -1087,6 +1141,19 @@ impl NodeRuntime {
 
     /// Resident instances as `(worker, raw model)` — the engine's input to global served-id
     /// derivation. Empty if the actor has stopped.
+    pub async fn worker_snapshot(&self) -> Vec<crate::remote::InventoryWorker> {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .handle
+            .send(NodeMsg::WorkerSnapshot { reply: tx })
+            .is_err()
+        {
+            return Vec::new();
+        }
+        rx.await.unwrap_or_default()
+    }
+
+    /// Resident `(worker, model)` pairs — the fast id/model read.
     pub async fn instances(&self) -> Vec<(WorkerId, String)> {
         let (tx, rx) = oneshot::channel();
         if self.handle.send(NodeMsg::Instances { reply: tx }).is_err() {

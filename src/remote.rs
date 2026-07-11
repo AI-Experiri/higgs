@@ -222,6 +222,36 @@ pub struct InventoryWorker {
     /// `nodes_view`. Empty for a resident worker the hub holds no route for.
     #[serde(default)]
     pub served_id: String,
+    /// The EFFECTIVE context window the worker was loaded with (post
+    /// trained-cap defaulting — what the engine actually allocated), from the
+    /// node's own load-time cache: no RPC to a possibly-busy worker. Absent
+    /// from pre-stats nodes (`serde(default)` — additive, no protocol bump).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub ctx_len: Option<u32>,
+    /// GPU offload the load requested (absent = the worker default, all).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub gpu_layers: Option<crate::worker::engine::GpuLayers>,
+    /// Generation threads the load requested (absent = the worker default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub threads: Option<u32>,
+    /// Wall-clock ms (Unix epoch) when the worker loaded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub loaded_at_ms: Option<u64>,
+    /// Milliseconds since the worker's last chat activity, measured at
+    /// snapshot time (the idle reaper's own clock). Freshness is
+    /// event-driven: the hub re-pulls inventory on connect and after
+    /// lifecycle ops, so this ages between pulls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub idle_ms: Option<u64>,
+    /// Chats in flight on this worker at snapshot time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub in_flight: Option<u32>,
 }
 }
 

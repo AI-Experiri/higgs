@@ -18,7 +18,7 @@ use crate::diagnostic::HiggsError;
 use crate::log_bus::{LogBus, LogLine, LogSource};
 use crate::node::runtime::{NodeConfig, NodeRuntime, DEFAULT_IDLE_TTL};
 use crate::node::worker_id::WorkerId;
-use crate::remote::{InventoryWorker, NodeInventory, NodeLoadParams};
+use crate::remote::{NodeInventory, NodeLoadParams};
 use crate::supervisor::HiggsEvent;
 use crate::system::HardwareInfo;
 use crate::tune::store::{JsonModelStore, TuneRecord};
@@ -2597,22 +2597,21 @@ impl Higgs {
         // concurrent local load/unload can't make the fleet view (`nodes`) disagree with `/v1/models`
         // (a worker shown with a stale/empty served id). Same `served_ids` algorithm as
         // `local_served`/`local_served_ids`, applied to this single snapshot — no worker spawn.
-        let instances = self.local.instances().await;
-        let located: Vec<((), WorkerId, String)> =
-            instances.iter().map(|(w, m)| ((), *w, m.clone())).collect();
+        // The full per-worker snapshot (model + T9 stats) in ONE actor read —
+        // served ids derive from the same rows, keeping the atomicity note above.
+        let mut workers = self.local.worker_snapshot().await;
+        let located: Vec<((), WorkerId, String)> = workers
+            .iter()
+            .map(|w| ((), WorkerId(w.worker_id), w.model.clone()))
+            .collect();
         let by_worker: std::collections::HashMap<u32, String> =
             crate::node::served::served_ids(&located)
                 .into_iter()
                 .map(|(served, ((), worker))| (worker.0, served))
                 .collect();
-        let workers: Vec<InventoryWorker> = instances
-            .into_iter()
-            .map(|(worker, model)| InventoryWorker {
-                worker_id: worker.0,
-                model,
-                served_id: by_worker.get(&worker.0).cloned().unwrap_or_default(),
-            })
-            .collect();
+        for w in &mut workers {
+            w.served_id = by_worker.get(&w.worker_id).cloned().unwrap_or_default();
+        }
         // CPU/RAM/engine snapshot with NO GPU enumeration (empty `gpus` → no transient worker).
         let (hardware, runtime) = tokio::task::spawn_blocking(|| {
             crate::system::SystemInfo::gather_hardware_runtime(vec![])

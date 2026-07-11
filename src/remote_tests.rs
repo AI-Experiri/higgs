@@ -1,5 +1,25 @@
 use super::*;
 
+/// T9 version-skew: a PRE-stats node's inventory (no per-worker stat keys)
+/// still decodes on a current hub — the fields are additive Options with
+/// serde defaults, exactly why no protocol bump was needed.
+#[test]
+fn legacy_inventory_worker_decodes_without_stats() {
+    let w: InventoryWorker =
+        serde_json::from_value(serde_json::json!({ "worker_id": 3, "model": "org/m" }))
+            .expect("legacy row decodes");
+    assert_eq!(w.worker_id, 3);
+    assert!(w.ctx_len.is_none() && w.loaded_at_ms.is_none() && w.in_flight.is_none());
+    // And a CURRENT row round-trips its stats.
+    let full: InventoryWorker = serde_json::from_value(serde_json::json!({
+        "worker_id": 4, "model": "org/m", "ctx_len": 256,
+        "loaded_at_ms": 1, "idle_ms": 2, "in_flight": 1
+    }))
+    .expect("stats row decodes");
+    assert_eq!(full.ctx_len, Some(256));
+    assert_eq!(full.in_flight, Some(1));
+}
+
 #[test]
 fn negotiate_picks_max_common_version() {
     assert_eq!(negotiate_version(&[1], 1, &[1], 1), Ok(1));

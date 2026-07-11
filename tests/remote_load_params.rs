@@ -166,6 +166,30 @@ async fn params_load_applies_ctx_on_a_real_node() {
         "ctx 0 → the model's trained-cap default, never the 4096 coercion: {status0}"
     );
 
+    // T9: the hub's own INVENTORY (refreshed by fleet.load) now carries the
+    // per-worker stats — the ctx that applied, when it loaded, its idle clock
+    // and in-flight count — with no per-worker RPC. Fail-on-revert: drop the
+    // node's load_facts cache (or the snapshot fill) and ctx_len reads None.
+    let view = fleet.nodes_view().await;
+    let inv = view
+        .iter()
+        .find(|n| n.endpoint_id == peer)
+        .and_then(|n| n.inventory.as_ref())
+        .expect("inventory cached after the load");
+    let row = inv
+        .workers
+        .iter()
+        .find(|w| w.worker_id == worker.0)
+        .expect("the params-loaded worker is in the inventory");
+    assert_eq!(
+        row.ctx_len,
+        Some(256),
+        "inventory carries the APPLIED ctx: {row:?}"
+    );
+    assert!(row.loaded_at_ms.is_some(), "loaded-at stamped: {row:?}");
+    assert!(row.idle_ms.is_some(), "idle clock present: {row:?}");
+    assert_eq!(row.in_flight, Some(0), "no chats in flight: {row:?}");
+
     // ctx_len is the typed CtxLen on the wire: {"kind":"fixed","n":256}.
     let ctx = status
         .pointer("/loaded/ctx_len/n")

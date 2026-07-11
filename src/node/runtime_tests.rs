@@ -40,6 +40,44 @@ fn load_params(id: &str) -> NodeLoadParams {
     }
 }
 
+/// T9: a load stamps the APPLIED facts into the worker snapshot — effective
+/// ctx (here the explicit 512), loaded-at, a running idle clock, zero
+/// in-flight — and an unload evicts the row (and its facts) entirely.
+#[tokio::test]
+async fn worker_snapshot_carries_load_facts_and_evicts_on_unload() {
+    let (root, model_id) = crate::node::test_support::stage_dummy_model("higgs-test/m");
+    let rt = crate::node::test_support::fake_runtime(vec![root.path().to_path_buf()]);
+    let (id, _) = rt
+        .load(NodeLoadParams {
+            id: model_id.clone(),
+            ctx_len: Some(512),
+            gpu_layers: None,
+            threads: None,
+            params: None,
+        })
+        .await
+        .expect("load");
+
+    let snap = rt.worker_snapshot().await;
+    let row = snap
+        .iter()
+        .find(|w| w.worker_id == id.0)
+        .expect("loaded worker in the snapshot");
+    assert_eq!(row.ctx_len, Some(512), "applied ctx cached: {row:?}");
+    assert!(row.loaded_at_ms.is_some(), "loaded-at stamped: {row:?}");
+    assert!(row.idle_ms.is_some(), "idle clock running: {row:?}");
+    assert_eq!(row.in_flight, Some(0), "nothing in flight: {row:?}");
+
+    rt.unload(id).await.expect("unload");
+    assert!(
+        rt.worker_snapshot()
+            .await
+            .iter()
+            .all(|w| w.worker_id != id.0),
+        "the row (and its facts) evict on unload"
+    );
+}
+
 /// ONE zero policy: every count-zero reads as ABSENT — the base `threads: 0`
 /// and the RICH zero thread/batch counts (`n_threads_batch`/`n_batch`/
 /// `n_ubatch`/`n_seq_max`) are all SKIPPED so the engine/worker defaults
