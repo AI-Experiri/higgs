@@ -125,6 +125,12 @@ enum FleetMsg {
     RoutedModels {
         reply: oneshot::Sender<Vec<String>>,
     },
+    /// A single node's served instance ids (routes are durable, so a disconnected
+    /// node still reports its instances), sorted for determinism.
+    ServedOn {
+        node: NodeKey,
+        reply: oneshot::Sender<Vec<String>>,
+    },
     Transport {
         node: NodeKey,
         reply: oneshot::Sender<Result<Arc<NodeTransport>, HiggsError>>,
@@ -432,6 +438,16 @@ impl Actor for FleetActor {
             }
             FleetMsg::RoutedModels { reply } => {
                 let _ = reply.send(self.routed_models());
+            }
+            FleetMsg::ServedOn { node, reply } => {
+                let mut v: Vec<_> = self
+                    .served_ids()
+                    .into_iter()
+                    .filter(|(_, (n, _))| *n == node)
+                    .map(|(served, _)| served)
+                    .collect();
+                v.sort();
+                let _ = reply.send(v);
             }
             FleetMsg::Transport { node, reply } => {
                 let _ = reply.send(self.nodes.get(&node).cloned().ok_or_else(|| {
@@ -920,6 +936,22 @@ impl HubFleet {
         self.ask(|reply| FleetMsg::RoutedModels { reply })
             .await
             .unwrap_or_default()
+    }
+
+    /// One node's served instance ids, sorted. Derived from the DURABLE route set
+    /// (like [`is_remote`](Self::is_remote), not the connected-only
+    /// [`routed_models`](Self::routed_models)): a disconnected node still reports
+    /// its instances, so a caller picking a chat-test target gets HG027 from the
+    /// chat itself (accurate: node offline) rather than a misleading "nothing
+    /// served" for a node that merely dropped its transport. Empty for an unknown
+    /// node.
+    pub async fn served_on(&self, node: &str) -> Vec<String> {
+        self.ask(|reply| FleetMsg::ServedOn {
+            node: node.to_string(),
+            reply,
+        })
+        .await
+        .unwrap_or_default()
     }
 
     /// Error returned when the actor mailbox is gone (loop ended — only after all handles

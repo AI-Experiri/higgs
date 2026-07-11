@@ -21,7 +21,7 @@ use crate::serve::wire::{
 use crate::worker::engine::llamacpp::params::LlamaCppParams;
 use crate::worker::engine::{CtxLen, LoadParams};
 
-use super::{Higgs, LoadedInfo, PairInfo, PreparedChat, ProfileState};
+use super::{Higgs, LoadedInfo, NodeChatTestReport, PairInfo, PreparedChat, ProfileState};
 
 impl Higgs {
     // ── A1.0: prepare_chat — the full `/v1` chat gate ──────────────────────
@@ -335,6 +335,94 @@ impl Higgs {
             Some(fleet) => fleet.scan_node(node).await,
             None => Err(not_a_hub_error("nodes/{node}/models")),
         }
+    }
+
+    /// Fire one short test prompt at a served instance on a SPECIFIC node and
+    /// return what came back — the Fleet view's "prove the iroh link" action.
+    ///
+    /// Always relays through the fleet ([`HubFleet::chat`]
+    /// (crate::node::fleet::HubFleet::chat)), NEVER the generic chat dispatch:
+    /// `chat_stream` resolves LOCAL-first, so a served id that is also locally
+    /// resident would silently test the local worker instead of the remote link
+    /// this exists to prove.
+    ///
+    /// `served` picks the exact instance to test; `None` tests the node's first
+    /// served instance (sorted) — [HG074] when nothing is routed there. A `served`
+    /// that is unrouted is HG002; one routed on a DIFFERENT node is refused (the
+    /// report would claim a link the test never exercised). `prompt` defaults to a
+    /// terse fixed prompt; generation runs deterministically (temperature 0) under
+    /// a small token budget, so a truncated reply (`finish_reason: "length"`) is
+    /// still a successful round trip. Node offline surfaces as the chat's own
+    /// HG027.
+    pub async fn node_chat_test(
+        &self,
+        node: &str,
+        served: Option<&str>,
+        prompt: Option<&str>,
+    ) -> Result<NodeChatTestReport, HiggsError> {
+        /// Enough for a short sentence; truncation still proves the link.
+        const TEST_MAX_TOKENS: usize = 48;
+        const TEST_PROMPT: &str = "Reply with the single word: pong";
+
+        let Some(fleet) = self.fleet() else {
+            return Err(not_a_hub_error("nodes/chat_test"));
+        };
+
+        // Pin the served instance to the REQUESTED node before dispatch.
+        let served = match served {
+            Some(s) => {
+                let (routed_node, _) = fleet
+                    .resolve(s)
+                    .await
+                    .ok_or_else(|| HiggsError::ModelNotFound { id: s.to_owned() })?;
+                if routed_node != node {
+                    return Err(HiggsError::HubControlFailed {
+                        op: "chat_test".into(),
+                        detail: format!(
+                            "served instance {s} is routed on node {routed_node}, not the \
+                             requested node {node} — pass that node, or omit `served` to test \
+                             the requested node's own instance"
+                        ),
+                    });
+                }
+                s.to_owned()
+            }
+            None => fleet
+                .served_on(node)
+                .await
+                .into_iter()
+                .next()
+                .ok_or_else(|| HiggsError::NodeNothingServed {
+                    endpoint_id: node.to_owned(),
+                })?,
+        };
+
+        let messages = serde_json::json!([{
+            "role": "user",
+            "content": prompt.unwrap_or(TEST_PROMPT),
+        }])
+        .to_string();
+
+        let started = std::time::Instant::now();
+        let (rx, outcome) = fleet
+            .chat(&served, messages, TEST_MAX_TOKENS, 0.0, None, None)
+            .await?;
+        // The test wants only the final result; the delta stream is not consumed
+        // (same non-streaming pattern as an embedder's blocking chat).
+        drop(rx);
+        let value = outcome.await?;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+
+        let outcome = super::types::chat_outcome_from_value(&value);
+        Ok(NodeChatTestReport {
+            endpoint_id: node.to_owned(),
+            served_id: served,
+            content: outcome.content,
+            finish_reason: outcome.finish_reason,
+            prompt_tokens: outcome.prompt_tokens,
+            completion_tokens: outcome.completion_tokens,
+            elapsed_ms,
+        })
     }
 
     /// The unified fleet view — the `GET /api/higgs/nodes` behavior lifted onto the

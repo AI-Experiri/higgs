@@ -186,6 +186,21 @@ async fn unload_and_chat_unrouted_model_error() {
 }
 
 #[tokio::test]
+async fn served_on_lists_one_nodes_instances_and_survives_disconnect() {
+    let (fleet, node_key, model_id, _root) = fleet_with_one_node().await;
+    assert!(fleet.served_on(&node_key).await.is_empty());
+    fleet.load(&node_key, &model_id).await.unwrap();
+    assert_eq!(fleet.served_on(&node_key).await, vec![model_id.clone()]);
+    // Filtered BY node: another node key sees nothing.
+    assert!(fleet.served_on("someone/else").await.is_empty());
+    // Durable-route semantics (like `is_remote`, unlike `routed_models`): a
+    // disconnect keeps the node's served list, so a chat-test target still
+    // resolves and the chat itself reports the offline node (HG027).
+    fleet.disconnect_all().await;
+    assert_eq!(fleet.served_on(&node_key).await, vec![model_id]);
+}
+
+#[tokio::test]
 async fn routed_models_lists_connected_only() {
     let (fleet, node_key, model_id, _root) = fleet_with_one_node().await;
     assert!(fleet.routed_models().await.is_empty());

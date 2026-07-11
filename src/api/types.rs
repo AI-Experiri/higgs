@@ -380,6 +380,38 @@ pub struct PreparedChat {
     pub max_gen: usize,
 }
 
+higgs_ts! {
+    /// The result of a node-directed chat test
+    /// ([`Higgs::node_chat_test`](crate::api::Higgs::node_chat_test)): one short
+    /// prompt relayed to a served instance on a SPECIFIC node over the live iroh
+    /// link, proving the hub→node→worker path end to end. Carries what the
+    /// operator needs to trust the link: which instance answered, what it said,
+    /// and how long the round trip (relay + full generation) took.
+    #[derive(Debug, Clone, serde::Serialize)]
+    pub struct NodeChatTestReport {
+        /// The tested node's canonical iroh endpoint id (as passed in).
+        pub endpoint_id: String,
+        /// The served instance id the test prompt was relayed to.
+        pub served_id: String,
+        /// The model's reply text (may be empty if the model answered with
+        /// reasoning only under the small test budget).
+        pub content: String,
+        /// OpenAI-style finish reason ("stop", or "length" when the test budget
+        /// truncated the reply — still a successful link proof).
+        pub finish_reason: String,
+        /// Prompt token count reported by the remote engine.
+        #[ts(type = "number")]
+        pub prompt_tokens: u32,
+        /// Completion token count reported by the remote engine.
+        #[ts(type = "number")]
+        pub completion_tokens: u32,
+        /// Wall-clock milliseconds from dispatch to the final result — the full
+        /// hub→node relay plus generation, not a bare network ping.
+        #[ts(type = "number")]
+        pub elapsed_ms: u64,
+    }
+}
+
 /// A minted node-pairing credential, returned by [`Higgs::pair`](crate::api::Higgs::pair).
 ///
 /// The operator runs `node_command` on the target node (`higgs --node <ticket>

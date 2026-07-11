@@ -46,7 +46,9 @@ rule in `../../CLAUDE.md`).
   (relay); `routed_models()` is folded into `Higgs::chat_model_ids()` for `GET /v1/models`;
   `nodes_view()` ← `Higgs::nodes()` (Fleet view, merged with allowlist labels + the local node);
   `load`/`unload` ← `node_load`/`node_unload` (`kill` is the force-unload variant);
-  `disconnect_all()` ← `hub_disable()` (kill switch). `NodeView` derives ts-rs bindings.
+  `served_on(node)` + `resolve` + `chat` ← `node_chat_test` (the Fleet view's per-node
+  link proof — always relayed, never local); `disconnect_all()` ← `hub_disable()`
+  (kill switch). `NodeView` derives ts-rs bindings.
 - **`runtime::{NodeRuntime, NodeConfig, IdleConfig, DEFAULT_IDLE_TTL}`** — the node daemon owns a
   `NodeRuntime`; the local single-machine engine also uses it as its own multi-worker orchestrator
   (`instances()` feeds served-id derivation, `events()`/`subscribe_logs()`/`bus()` feed the SSE +

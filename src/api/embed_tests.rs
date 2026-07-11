@@ -304,9 +304,123 @@ async fn node_ops_without_a_hub_error() {
     assert!(higgs.node_unload("m").await.is_err());
     assert!(higgs.node_retire("n").await.is_err());
     assert!(higgs.node_scan("n").await.is_err());
+    assert!(higgs.node_chat_test("n", None, None).await.is_err());
     // hub_disable is a no-op returning a disabled status when no hub is installed.
     let status = higgs.hub_disable().await;
     assert!(!status.enabled);
+}
+
+// ── node_chat_test: the Fleet view's per-node iroh-link proof ────────────────
+
+/// A `Higgs` whose fleet routes one fake-worker remote node (in-process iroh via
+/// `test_support::local_endpoint`), plus the node's key and its loaded model's
+/// served id — the same seam `fleet_tests::fleet_with_one_node` uses, lifted onto
+/// the facade so `node_chat_test`'s arms are drivable without llama.cpp.
+async fn fake_higgs_with_remote_node() -> (Higgs, String, String, tempfile::TempDir) {
+    use crate::node::test_support::{fake_runtime, local_endpoint, stage_dummy_model};
+
+    let (root, model_id) = stage_dummy_model("higgs-test/m");
+    let hub = local_endpoint().await;
+    let node = local_endpoint().await;
+    let hub_addr = hub.addr();
+    let node_key = node.id().to_string();
+
+    let rt = Arc::new(fake_runtime(vec![root.path().to_path_buf()]));
+    tokio::spawn(async move {
+        let node_conn = node
+            .connect(hub_addr, crate::remote::ALPN)
+            .await
+            .expect("connect");
+        crate::node::serve_node(node_conn, rt).await;
+    });
+    let conn = hub.accept().await.expect("incoming").await.expect("conn");
+    std::mem::forget(hub);
+
+    let fleet = Arc::new(crate::node::fleet::HubFleet::new(Arc::new(
+        crate::log_bus::LogBus::new(),
+    )));
+    fleet
+        .add_node(
+            node_key.clone(),
+            Arc::new(crate::node::transport::NodeTransport::new(conn)),
+            None,
+        )
+        .await;
+    fleet.load(&node_key, &model_id).await.expect("remote load");
+
+    let higgs = fake_higgs(vec![]);
+    higgs.set_fleet(fleet);
+    (higgs, node_key, model_id, root)
+}
+
+/// Happy path: the test prompt relays over the (in-process) iroh link to the
+/// node's routed instance and the report carries the worker's actual reply.
+/// Fail-on-revert: route the test through the generic local-first chat dispatch
+/// instead of `fleet.chat` and a locally-resident same-id model would answer —
+/// this seam has NO local model, so only the fleet relay can produce "hello".
+#[tokio::test]
+async fn node_chat_test_relays_to_the_nodes_instance() {
+    let (higgs, node_key, model_id, _root) = fake_higgs_with_remote_node().await;
+
+    // Implicit instance pick (served = None → the node's first served id).
+    let report = higgs
+        .node_chat_test(&node_key, None, None)
+        .await
+        .expect("chat test");
+    assert_eq!(report.endpoint_id, node_key);
+    assert_eq!(report.served_id, model_id);
+    assert_eq!(report.content, "hello", "the fake remote worker's reply");
+    assert_eq!(report.finish_reason, "stop");
+
+    // Explicit instance pick lands on the same worker.
+    let explicit = higgs
+        .node_chat_test(&node_key, Some(&model_id), Some("ping?"))
+        .await
+        .expect("explicit chat test");
+    assert_eq!(explicit.served_id, model_id);
+    assert_eq!(explicit.content, "hello");
+}
+
+/// The refusal arms: nothing routed on the node ([HG074]), an unrouted served id
+/// (HG002), and a served id routed on a DIFFERENT node (refused — the report
+/// would claim a link the test never exercised).
+#[tokio::test]
+async fn node_chat_test_refusal_arms() {
+    let (higgs, node_key, model_id, _root) = fake_higgs_with_remote_node().await;
+
+    // A node the fleet has no routes for → HG074 (load first), not a chat error.
+    let bare = higgs.node_chat_test("unknown-node", None, None).await;
+    assert!(
+        matches!(bare, Err(HiggsError::NodeNothingServed { ref endpoint_id }) if endpoint_id == "unknown-node"),
+        "expected HG074, got {bare:?}"
+    );
+
+    // An unrouted served id → HG002 model-not-found.
+    let unrouted = higgs
+        .node_chat_test(&node_key, Some("nope/none"), None)
+        .await;
+    assert!(
+        matches!(unrouted, Err(HiggsError::ModelNotFound { .. })),
+        "expected HG002, got {unrouted:?}"
+    );
+
+    // A REAL served id but the WRONG node → refused with both nodes named.
+    let mismatch = higgs
+        .node_chat_test("unknown-node", Some(&model_id), None)
+        .await;
+    match mismatch {
+        Err(HiggsError::HubControlFailed { ref detail, .. }) => {
+            assert!(
+                detail.contains(&node_key),
+                "names the routed node: {detail}"
+            );
+            assert!(
+                detail.contains("unknown-node"),
+                "names the requested node: {detail}"
+            );
+        }
+        other => panic!("expected a node-mismatch refusal, got {other:?}"),
+    }
 }
 
 // ── nodes(): the unified fleet view carries the local node's operator label ──

@@ -691,6 +691,19 @@ pub enum HiggsError {
     ))]
     #[diagnostic(code(HG073), severity(Error))]
     RebindAfterShutdown,
+
+    /// A node-directed chat test ([`crate::Higgs::node_chat_test`]) found NO served
+    /// instance routed on the target node, so there is nothing to send the test
+    /// prompt to. Routes are durable across disconnects, so this genuinely means no
+    /// model is loaded there (or the node id is not one the fleet knows) — it is
+    /// not a transient connectivity state (that surfaces as [HG027] from the chat
+    /// itself). The remedy is a load, not a retry.
+    #[snafu(display(
+        "[HG074] no served model instance is routed on node {endpoint_id} — load a model on \
+         it first (`Higgs::node_load` / the Fleet view's Load), or check the node id"
+    ))]
+    #[diagnostic(code(HG074), severity(Error))]
+    NodeNothingServed { endpoint_id: String },
 }
 
 #[cfg(test)]
