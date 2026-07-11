@@ -47,7 +47,12 @@ async fn params_load_reaches_the_node_at_protocol_two() {
         let node_conn = node.connect(hub_addr, ALPN).await.expect("connect");
         serve_node(node_conn, rt).await;
     });
-    let conn = hub.accept().await.expect("incoming").await.expect("conn");
+    let conn = tokio::time::timeout(std::time::Duration::from_secs(30), hub.accept())
+        .await
+        .expect("accept within 30s (a swallowed node-task panic otherwise hangs here)")
+        .expect("incoming")
+        .await
+        .expect("conn");
     std::mem::forget(hub);
     let fleet = Arc::new(HubFleet::new(Arc::new(crate::log_bus::LogBus::new())));
     fleet
@@ -72,6 +77,15 @@ async fn params_load_reaches_the_node_at_protocol_two() {
         .await
         .expect("params-load against a major-2 node");
     assert!(worker.0 >= 1, "the gated load spawned a worker");
+
+    // Retire clears the stored major (the TOCTOU residual note leans on this;
+    // it had no direct pin).
+    fleet.retire(&node_key).await;
+    assert_eq!(
+        fleet.node_protocol(&node_key).await,
+        None,
+        "retire clears the version slot"
+    );
     // NB the fake worker echoes only the id, and InventoryWorker carries no
     // ctx field (a T9 gap), so the PAYLOAD-content pin (ctx_len actually on
     // the wire) lives in the mock-transport test in tests/cov_fleet2.rs, and

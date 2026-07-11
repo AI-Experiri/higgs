@@ -854,7 +854,7 @@ live in a new `remote` module:
 | `higgs/node/*` const | NodeRuntime dispatch arm | Backed by |
 |---|---|---|
 | `M_HELLO` | (node EMITS — outbound, §5.4c) | version vector + `SystemInfo::gather(config, Higgs::sysinfo)` (fix C) |
-| `M_INVENTORY` | (node EMITS — outbound, §5.4c) | `Higgs::scan` (`api.rs:604`) + `SystemInfo::gather` + per-worker `LoadedInfo` |
+| `M_INVENTORY` | (hub REQUESTS — AS SHIPPED the node-push design never landed) | node assembles hostname/os + `snapshot_workers` + hardware/runtime |
 | `M_SCAN` | re-scan node disk → `NodeInventory` | `Higgs::scan` (`api.rs:604`, read-only `ModelStore::scan`) |
 | `M_LOAD` | **fit-check → spawn NEW Supervisor → assign WorkerId → insert** | NET-NEW orchestration (NOT `Higgs::load` only-keep-last) |
 | `M_UNLOAD` | look up `worker_id` → `Supervisor::stop()` → remove → free WorkerId → drop ring | reuse `Supervisor::stop` (`:625`) + registry removal |
@@ -900,7 +900,7 @@ which drives the unchanged `serve_state` of the real llama.cpp child. `M_CHAT` i
       (§5.4a)                                     correlate replies on the per-node pending map
   (b) SEND node→hub frames                    (c) DISPATCH inbound node→hub frames
       hello()  → M_HELLO  (on dial)               receive M_HELLO  → gate (§7) → reply HelloResult
-      inventory() → M_INVENTORY (push)            receive M_INVENTORY → store in fleet map → StatusOk
+      (AS SHIPPED: the hub PULLS inventory via refresh_inventory — this push flow never landed)
       via the node's outbound requester           (these are NOT hub methods calling
                                                    Supervisor::request — the node is the caller)
 ```

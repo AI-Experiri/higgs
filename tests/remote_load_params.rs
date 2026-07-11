@@ -151,12 +151,15 @@ async fn params_load_applies_ctx_on_a_real_node() {
         .request(M_NODE_STATUS, serde_json::json!({ "worker_id": w0 }))
         .await
         .expect("node status for the ctx-0 worker");
-    assert_eq!(
-        status0
-            .pointer("/loaded/ctx_len/n")
-            .and_then(serde_json::Value::as_u64),
-        Some(2048),
-        "ctx 0 → trained-cap default, not the 4096 coercion: {status0}"
+    let ctx0 = status0
+        .pointer("/loaded/ctx_len/n")
+        .and_then(serde_json::Value::as_u64);
+    // Discriminate against the two WRONG outcomes without hardcoding the tiny
+    // model's trained context (a different HIGGS_TEST_GGUF must not break
+    // this): the old worker coercion read 4096; a leaked 0 would read 0.
+    assert!(
+        ctx0.is_some() && ctx0 != Some(4096) && ctx0 != Some(0),
+        "ctx 0 → the model's trained-cap default, never the 4096 coercion: {status0}"
     );
 
     // ctx_len is the typed CtxLen on the wire: {"kind":"fixed","n":256}.
