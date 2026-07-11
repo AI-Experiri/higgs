@@ -422,6 +422,13 @@ RPC would duplicate the transport's own keepalive. Fleet-state refreshes (loaded
 are not a liveness signal; AS SHIPPED the hub PULLS `M_INVENTORY` on connect and after
 lifecycle ops (no periodic deltas; no `reason` field — see §4.2), the single home for inventory.
 
+**AS SHIPPED — protocol major 2 (T8, per-load params):** the hub stores each node's
+HELLO-negotiated major and SENDS the optional `NodeLoadParams` fields on `M_LOAD`
+only to nodes that negotiated ≥ 2; against a major-1 node a params-load is refused
+hub-side with `[HG078]` ("update higgs on the node … or load without params") —
+param-less loads work against any node. Count-zeros and no-override rich objects
+normalize to a bare load before the gate.
+
 | Event | Signal | Handling |
 |---|---|---|
 | keepalive | QUIC PING (iroh, automatic) | keeps the conn alive through NAT; no app frame |
@@ -1051,7 +1058,7 @@ each its own code — no "two auth rejections" miscount:
 | HG024 | `NotAllowlisted` | `[HG024] peer {endpoint_id} is not in the allowlist and presented no valid pairing token` | non-fatal | `node.rs` (post-HELLO gate, §3.2) |
 | HG025 | `DownloadFailed` | `[HG025] model download failed: {repo}: {detail}` | non-fatal | `node.rs` (`M_PULL` HF download, §4.4) |
 | HG026 | `NotImplemented` | `[HG026] not implemented: {method}` | non-fatal | `node.rs` (`M_UPDATE` stub today, §9) |
-| HG027 | `NodeUnreachable` | `[HG027] node {endpoint_id} unreachable; retired from fleet: {detail}` | non-fatal (retire, best-effort) | `node.rs` (conn-closed / dial failure / wedged-worker escalation, §3.4, §3.4.1) |
+| HG027 | `NodeUnreachable` | AS SHIPPED: `[HG027] node {endpoint_id} unreachable: {detail} — …recovers once it reconnects` (routes KEPT; retire is a separate explicit op) | non-fatal | `node.rs` (conn-closed / dial failure / wedged-worker escalation, §3.4, §3.4.1) |
 | HG028 | `HandshakeStalled` | `[HG028] peer {endpoint_id} completed QUIC but sent no HELLO within {window}s; dropped` | non-fatal | `node.rs` (post-HELLO timeout, §3.2.1) |
 
 > **HG026 use-site note.** HG026 = `NotImplemented`, used by the `M_UPDATE` stub (§9). The two
