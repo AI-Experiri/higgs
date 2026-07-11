@@ -876,6 +876,15 @@ impl HubFleet {
     }
 
     /// Unload a served instance's remote worker and drop its route.
+    ///
+    /// Known residual (pre-existing, documented per the chat-test round that
+    /// closed the same class for chat): the caller's served id comes from ITS
+    /// OWN earlier snapshot, and served ids renumber over a model's whole
+    /// instance set — so an id captured before a concurrent unload/load can
+    /// resolve to a DIFFERENT instance here and unload the wrong worker with a
+    /// 200. Chat closed this with [`chat_pinned`](Self::chat_pinned); unload
+    /// has no pinned variant yet (needs the same expected-node lever; candidate
+    /// for the next fleet-surface task).
     pub async fn unload(&self, served: &str) -> Result<(), HiggsError> {
         self.unload_or_kill(served, M_NODE_UNLOAD).await
     }

@@ -734,17 +734,19 @@ pub enum HiggsError {
     #[diagnostic(code(HG076), severity(Error))]
     InvalidChatTestTarget { detail: String },
 
-    /// The node chat test's target MOVED between the facade's pick and the
-    /// pinned dispatch ([`chat_pinned`](crate::node::fleet::HubFleet::chat_pinned)):
-    /// served ids renumber over a model's whole instance set, so a concurrent
-    /// unload or additive load can re-home the picked id onto another node — or
-    /// unroute it entirely — inside that window. Refused rather than silently
-    /// exercising (and then reporting) the wrong node. A transient state
-    /// conflict, not a caller mistake: the fleet changed underneath the call;
-    /// re-resolve and retry.
+    /// The pinned chat dispatch
+    /// ([`chat_pinned`](crate::node::fleet::HubFleet::chat_pinned)) found the
+    /// served id NOT at the pinned node: it resolved to a different node, or to
+    /// nothing at all. Via the facade's chat test this means the target moved
+    /// CONCURRENTLY between pick and dispatch (served ids renumber over a
+    /// model's whole instance set, so a single unload or additive load re-homes
+    /// them) and a retry succeeds; a DIRECT `chat_pinned` caller can also land
+    /// here on a first call with an id that never resolved — the detail states
+    /// only what was checked, fabricating no history either way. Refused rather
+    /// than silently exercising (and then reporting) the wrong node.
     #[snafu(display(
         "[HG077] chat-test target not at the pinned node at dispatch: {detail} — served ids \
-         renumber as instance sets change; re-resolve against the fleet view and retry"
+         renumber as instance sets change; re-resolve against the fleet view"
     ))]
     #[diagnostic(code(HG077), severity(Error))]
     ChatTestTargetMoved { detail: String },

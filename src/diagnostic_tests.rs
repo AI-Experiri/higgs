@@ -269,6 +269,58 @@ fn subsystem_fault_codes_render_with_remediation() {
     );
 }
 
+/// The node-chat-test ladder codes render their `[HGxxx]` tags AND `code()`
+/// returns the bare string jigglebot's status mapping keys on. The `code()`
+/// assertion is the load-bearing one for [HG077]: it is race-only (never
+/// dispatch-drivable end to end), so this attribute is the ONLY link between
+/// `ChatTestTargetMoved` and jigglebot's 409 — a typo'd or dropped
+/// `#[diagnostic(code(HG077))]` would silently demote the race to the 500
+/// default with every other test green.
+#[test]
+fn chat_test_ladder_codes_render_and_key() {
+    use miette::Diagnostic;
+    let cases: Vec<(HiggsError, &str)> = vec![
+        (
+            HiggsError::NodeNothingServed {
+                endpoint_id: "abc".into(),
+            },
+            "HG074",
+        ),
+        (
+            HiggsError::UnknownNode {
+                endpoint_id: "abc".into(),
+            },
+            "HG075",
+        ),
+        (
+            HiggsError::InvalidChatTestTarget { detail: "x".into() },
+            "HG076",
+        ),
+        (
+            HiggsError::ChatTestTargetMoved { detail: "x".into() },
+            "HG077",
+        ),
+    ];
+    for (err, code) in cases {
+        let s = err.to_string();
+        assert!(s.starts_with(&format!("[{code}]")), "display prefix: {s}");
+        // HG076 is detail-only like HG072: its remediation lives in the
+        // call-site detail (pinned by the embed tests' wording asserts), so the
+        // fixed display carries no em-dash of its own.
+        if code != "HG076" {
+            assert!(
+                s.contains(" — "),
+                "every diagnostic must carry a remediation clause (em-dash): {s}"
+            );
+        }
+        assert_eq!(
+            err.code().expect("diagnostic code").to_string(),
+            code,
+            "code() must render the bare HGxxx string the status mapping keys on"
+        );
+    }
+}
+
 #[test]
 fn version_mismatch_is_fatal() {
     use miette::Diagnostic;

@@ -34,8 +34,9 @@ iroh transport — `dispatch_node_control` — never an HTTP route:
   .pair() ────────────────▶ hub.mint_pairing()  (ticket + one-time token)
   .node_retire()/.node_label()/.nodes() ─▶ hub.retire()/set_label()/labels(), fleet.nodes_view()
   .node_load()/.node_unload()/.node_scan() ─▶ fleet.load()/unload()/scan_node()
-  .node_chat_test() ─▶ fleet.served_on()+resolve() then fleet.chat_pinned() (always-remote,
-                       node-pinned at dispatch — a re-homed id refuses [HG077], never mis-attests)
+  .node_chat_test() ─▶ fleet.node_id() gate ([HG075] unknown node) ─▶ fleet.served_on()+resolve()
+                       ([HG074]/[HG076]) then fleet.chat_pinned() (always-remote, node-pinned at
+                       dispatch — a re-homed id refuses [HG077], never mis-attests)
   POST /v1/chat (serve::v1) ─▶ Higgs::chat_stream ─▶ fleet.is_remote()/resolve()/chat()
                                                         │
                                        transport::NodeTransport (one iroh bidi stream per RPC)

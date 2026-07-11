@@ -492,8 +492,9 @@ async fn node_chat_test_pins_across_two_nodes_sharing_a_model() {
 
     // Cross-pin: node A's served id on node B → HG076 naming both nodes, from
     // the facade's PRE-CHECK (its wording carries the caller-mistake remedy
-    // "omit `served`" — the dispatch-time [HG077] backstop says "moved during
-    // dispatch" instead; asserting the wording pins the pre-check itself).
+    // "omit `served`" — the dispatch-time [HG077] backstop's display is "not at
+    // the pinned node at dispatch" with no such remedy; asserting the wording
+    // pins the pre-check itself).
     let cross = higgs
         .node_chat_test(&node_b, Some(&served_a[0]), None)
         .await;
@@ -564,8 +565,8 @@ async fn node_chat_test_refusal_arms() {
 
     // A REAL served id but the WRONG (known) node → HG076 naming both nodes,
     // from the facade's PRE-CHECK: the "omit `served`" remedy is unique to it —
-    // the dispatch-time [HG077] backstop catches the same mismatch but with
-    // race wording ("moved during dispatch"), the wrong advice for a caller who
+    // the dispatch-time [HG077] backstop catches the same mismatch but its
+    // "re-resolve against the fleet view" advice is wrong for a caller who
     // simply named the wrong node. Fail-on-revert for the pre-check itself.
     let mismatch = higgs
         .node_chat_test("bare-node", Some(&model_id), None)
