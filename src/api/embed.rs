@@ -371,10 +371,13 @@ impl Higgs {
     /// refusal — of the impossible local-sentinel target, or of a bad explicit
     /// `served` operand.
     ///
-    /// Accepted residual: the refusal LADDER itself is not atomic — a retire
+    /// Accepted residuals: the refusal LADDER itself is not atomic — a retire
     /// landing between the [HG075] gate and the route resolution can surface as
-    /// [HG074]/[HG076] instead of [HG075]. Wrong refusal CLASS only, never a
-    /// wrong success; the next call refuses correctly.
+    /// [HG074]/[HG076] instead of [HG075]; likewise one physical event ("that
+    /// id was just unloaded") splits by where the race lands — [HG076] when the
+    /// pre-check sees it, [HG077] at the pinned dispatch — so status-keying
+    /// callers should treat both as "re-resolve". Wrong refusal CLASS only,
+    /// never a wrong success; the next call refuses correctly.
     pub async fn node_chat_test(
         &self,
         node: &str,
@@ -455,11 +458,12 @@ impl Higgs {
         let started = std::time::Instant::now();
         let (rx, outcome) = fleet
             .chat_pinned(&served, node, messages, TEST_MAX_TOKENS, 0.0, None, None)
-            .await?;
+            .await
+            .map_err(|e| self.note_hub_disabled(e))?;
         // The test wants only the final result; the delta stream is not consumed
         // (same non-streaming pattern as an embedder's blocking chat).
         drop(rx);
-        let value = outcome.await?;
+        let value = outcome.await.map_err(|e| self.note_hub_disabled(e))?;
         let elapsed_ms = started.elapsed().as_millis() as u64;
 
         let outcome = super::types::chat_outcome_from_value(&value);
@@ -853,6 +857,29 @@ impl Higgs {
             engine_version: crate::worker::engine::llamacpp::engine_version(),
             binding: crate::LLAMA_CPP_2_VERSION.to_owned(),
             supported_formats: vec!["gguf".to_owned()],
+        }
+    }
+}
+
+impl Higgs {
+    /// Make [HG027]'s "recovers once it reconnects" advice honest when the hub
+    /// NETWORK is off: after `hub_disable` the fleet (and its durable routes)
+    /// survives, so a chat test passes every gate and fails at the transport —
+    /// but the node CANNOT reconnect until the hub is re-enabled, which the
+    /// plain HG027 text never says. Other errors pass through untouched.
+    fn note_hub_disabled(&self, e: HiggsError) -> HiggsError {
+        match e {
+            HiggsError::NodeUnreachable {
+                endpoint_id,
+                detail,
+            } if self.hub().is_none() => HiggsError::NodeUnreachable {
+                endpoint_id,
+                detail: format!(
+                    "{detail}; NOTE the hub network is currently disabled, so the node cannot \
+                     reconnect until it is re-enabled (`Higgs::hub_enable` / the hub toggle)"
+                ),
+            },
+            other => other,
         }
     }
 }

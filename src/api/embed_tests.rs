@@ -330,6 +330,7 @@ async fn add_fake_remote_node(
     fleet: &Arc<crate::node::fleet::HubFleet>,
     model_id: &str,
     roots: &mut Vec<tempfile::TempDir>,
+    endpoints: &mut Vec<iroh::Endpoint>,
 ) -> String {
     use crate::node::test_support::{fake_runtime, local_endpoint, stage_dummy_model};
 
@@ -348,7 +349,10 @@ async fn add_fake_remote_node(
         crate::node::serve_node(node_conn, rt).await;
     });
     let conn = hub.accept().await.expect("incoming").await.expect("conn");
-    std::mem::forget(hub);
+    // Keep the hub endpoint ALIVE via the caller's guard (dropping it would
+    // close the accepted connection) — bounded by the test's scope instead of
+    // the old `mem::forget` leak-per-node-per-test.
+    endpoints.push(hub);
 
     fleet
         .add_node(
@@ -366,17 +370,27 @@ async fn add_fake_remote_node(
 /// locally), plus the node's key and its loaded model's served id — the same
 /// seam `fleet_tests::fleet_with_one_node` uses, lifted onto the facade so
 /// `node_chat_test`'s arms are drivable without llama.cpp.
-async fn fake_higgs_with_remote_node() -> (Higgs, String, String, Vec<tempfile::TempDir>) {
+async fn fake_higgs_with_remote_node() -> (Higgs, String, String, RemoteNodeGuards) {
     let fleet = Arc::new(crate::node::fleet::HubFleet::new(Arc::new(
         crate::log_bus::LogBus::new(),
     )));
-    let mut roots = Vec::new();
+    let mut guards = RemoteNodeGuards::default();
     let model_id = "higgs-test/m".to_string();
-    let node_key = add_fake_remote_node(&fleet, &model_id, &mut roots).await;
+    let node_key =
+        add_fake_remote_node(&fleet, &model_id, &mut guards.roots, &mut guards.endpoints).await;
 
     let higgs = fake_higgs(vec![]);
     higgs.set_fleet(fleet);
-    (higgs, node_key, model_id, roots)
+    (higgs, node_key, model_id, guards)
+}
+
+/// Keeps the fake-remote-node scaffolding alive for a test's duration: the
+/// staged scan roots AND the hub-side iroh endpoints (dropping an endpoint
+/// closes its accepted connection).
+#[derive(Default)]
+struct RemoteNodeGuards {
+    roots: Vec<tempfile::TempDir>,
+    endpoints: Vec<iroh::Endpoint>,
 }
 
 /// Happy path: the test prompt relays over the (in-process) iroh link to the
@@ -387,7 +401,7 @@ async fn fake_higgs_with_remote_node() -> (Higgs, String, String, Vec<tempfile::
 /// revert would relay remotely here too and still pass.)
 #[tokio::test]
 async fn node_chat_test_relays_to_the_nodes_instance() {
-    let (higgs, node_key, model_id, _root) = fake_higgs_with_remote_node().await;
+    let (higgs, node_key, model_id, _guards) = fake_higgs_with_remote_node().await;
 
     // Implicit instance pick (served = None → the node's first served id).
     let report = higgs
@@ -420,13 +434,14 @@ async fn node_chat_test_bypasses_the_local_first_dispatch() {
     let fleet = Arc::new(crate::node::fleet::HubFleet::new(Arc::new(
         crate::log_bus::LogBus::new(),
     )));
-    let mut roots = Vec::new();
+    let mut guards = RemoteNodeGuards::default();
     let model_id = "higgs-test/m".to_string();
-    let node_key = add_fake_remote_node(&fleet, &model_id, &mut roots).await;
+    let node_key =
+        add_fake_remote_node(&fleet, &model_id, &mut guards.roots, &mut guards.endpoints).await;
 
     // The LOCAL engine scans the same staged root, so the SAME id is locally
     // loadable; load it on the local stateful fake engine (the "local twin").
-    let higgs = fake_higgs(vec![roots[0].path().to_path_buf()]);
+    let higgs = fake_higgs(vec![guards.roots[0].path().to_path_buf()]);
     higgs.set_fleet(fleet);
     higgs.load(&model_id, None).await.expect("local twin loads");
 
@@ -475,9 +490,21 @@ async fn node_chat_test_pins_across_two_nodes_sharing_a_model() {
     let fleet = Arc::new(crate::node::fleet::HubFleet::new(Arc::new(
         crate::log_bus::LogBus::new(),
     )));
-    let mut roots = Vec::new();
-    let node_a = add_fake_remote_node(&fleet, "higgs-test/m", &mut roots).await;
-    let node_b = add_fake_remote_node(&fleet, "higgs-test/m", &mut roots).await;
+    let mut guards = RemoteNodeGuards::default();
+    let node_a = add_fake_remote_node(
+        &fleet,
+        "higgs-test/m",
+        &mut guards.roots,
+        &mut guards.endpoints,
+    )
+    .await;
+    let node_b = add_fake_remote_node(
+        &fleet,
+        "higgs-test/m",
+        &mut guards.roots,
+        &mut guards.endpoints,
+    )
+    .await;
     let higgs = fake_higgs(vec![]);
     higgs.set_fleet(fleet.clone());
 
@@ -524,6 +551,34 @@ async fn node_chat_test_pins_across_two_nodes_sharing_a_model() {
     }
 }
 
+/// After the hub kill switch (`disconnect_all` — the fleet and its durable
+/// routes survive, the transports drop), a chat test fails with [HG027] whose
+/// advice is enriched to say the node CANNOT reconnect until the hub network
+/// is re-enabled — the plain "recovers once it reconnects" would be a
+/// follow-it-and-wait-forever runaround. (The seam has no `Hub` installed, so
+/// `hub().is_none()` — the same state a production kill switch leaves.)
+#[tokio::test]
+async fn node_chat_test_after_kill_switch_names_the_real_remedy() {
+    let (higgs, node_key, _model_id, _guards) = fake_higgs_with_remote_node().await;
+    higgs
+        .fleet()
+        .expect("fleet installed")
+        .disconnect_all()
+        .await;
+
+    let err = higgs.node_chat_test(&node_key, None, None).await;
+    match err {
+        Err(HiggsError::NodeUnreachable { ref detail, .. }) => {
+            assert!(
+                detail.contains("hub network is currently disabled")
+                    && detail.contains("hub_enable"),
+                "the enriched advice names the real remedy: {detail}"
+            );
+        }
+        other => panic!("expected enriched HG027, got {other:?}"),
+    }
+}
+
 /// The refusal ladder, most-specific first: a never-paired endpoint id is
 /// [HG075] (no "load first" advice for a nonexistent node); a KNOWN node with
 /// nothing routed is [HG074]; an explicit served id that is unrouted, or routed
@@ -531,7 +586,7 @@ async fn node_chat_test_pins_across_two_nodes_sharing_a_model() {
 /// never exercised).
 #[tokio::test]
 async fn node_chat_test_refusal_arms() {
-    let (higgs, node_key, model_id, _root) = fake_higgs_with_remote_node().await;
+    let (higgs, node_key, model_id, _guards) = fake_higgs_with_remote_node().await;
     let fleet = higgs.fleet().expect("fleet installed");
 
     // The LOCAL machine's sentinel id → HG076 "chat it directly", never the
