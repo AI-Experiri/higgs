@@ -155,8 +155,12 @@ async fn params_load_applies_ctx_on_a_real_node() {
         .pointer("/loaded/ctx_len/n")
         .and_then(serde_json::Value::as_u64);
     // Discriminate against the two WRONG outcomes without hardcoding the tiny
-    // model's trained context (a different HIGGS_TEST_GGUF must not break
-    // this): the old worker coercion read 4096; a leaked 0 would read 0.
+    // model's trained context: the old worker coercion read 4096; a leaked 0
+    // would read 0. Scope caveat: a HIGGS_TEST_GGUF trained at exactly 4096
+    // (correct outcome == coercion outcome) or with an unreadable trained ctx
+    // (worker's own 4096 default is then CORRECT) would fail here spuriously —
+    // the assert assumes a tiny model with a readable trained ctx ≠ 4096, as
+    // the default stories260K (2048) is.
     assert!(
         ctx0.is_some() && ctx0 != Some(4096) && ctx0 != Some(0),
         "ctx 0 → the model's trained-cap default, never the 4096 coercion: {status0}"

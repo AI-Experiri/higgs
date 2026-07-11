@@ -418,9 +418,9 @@ no app-level heartbeat frame (§3.4).
 
 Liveness is **iroh-native** (invent-nothing): QUIC keepalive PINGs keep the conn warm and
 `conn.closed()` fires on death. There is **no app-level heartbeat frame** — an `M_HEARTBEAT`
-RPC would duplicate the transport's own keepalive. Periodic fleet deltas (loaded set, cpu/ram)
-are not a liveness signal; they ride `M_INVENTORY{reason:"refresh"}` (§4.2), the single home
-for inventory.
+RPC would duplicate the transport's own keepalive. Fleet-state refreshes (loaded set, cpu/ram)
+are not a liveness signal; AS SHIPPED the hub PULLS `M_INVENTORY` on connect and after
+lifecycle ops (no periodic deltas; no `reason` field — see §4.2), the single home for inventory.
 
 | Event | Signal | Handling |
 |---|---|---|
@@ -536,7 +536,8 @@ calling `Supervisor::request`.
 | `M_INVENTORY` | `higgs/node/inventory` | hub → node (request) | `{}` → `NodeInventory` | AS SHIPPED the HUB pulls inventory on connect and after each lifecycle op (`refresh_inventory`); the design's node-push never landed |
 
 ```jsonc
-// NodeInventory — push payload. reason:"boot" = first full report;
+// NodeInventory — AS SHIPPED: the reply to a hub `M_INVENTORY` request (the push design
+// below, with its reason field, never landed):
 // reason:"refresh" = periodic delta (loaded set + cpu/ram), the SOLE periodic frame
 // (no separate heartbeat — iroh keepalive carries liveness, §3.4). Composes existing
 // types verbatim — no parallel struct:
