@@ -58,11 +58,11 @@ pub const N_PROGRESS: &str = "higgs/node/progress";
 pub const M_NODE_LEAVE: &str = "higgs/node/leave";
 
 /// The wire-protocol majors this build speaks. Major 2 (T8) is where the hub
-/// STARTED SENDING the optional load params below on `M_NODE_LOAD` — the
-/// fields existed (and parse) since major 1, so 2 is a capability statement
-/// ("this node predates the params-sending hub" vs not), letting the hub
-/// refuse a params-load against an old node honestly instead of silently
-/// sending fields the node may not honor.
+/// STARTED SENDING the optional load params below on `M_NODE_LOAD`. Some
+/// major-1 builds parse those fields; older ones hard-reject them
+/// (`deny_unknown_fields` predating the rich `params` / typed `gpu_layers`) —
+/// the hub cannot distinguish, so 2 is the capability statement that lets it
+/// refuse a params-load against ANY major-1 node honestly.
 pub const PROTOCOL_VERSIONS: &[u32] = &[1, 2];
 /// The lowest major this build still accepts.
 pub const MIN_SUPPORTED: u32 = 1;
@@ -175,8 +175,9 @@ pub struct NodeLoadParams {
     /// a plain/default load carries no payload. Exercised on the in-process LOCAL
     /// path (`Higgs::load` → `NodeRuntime::load`) since major 1, and on the hub's
     /// REMOTE `M_NODE_LOAD` (`HubFleet::load`) since major 2 (T8) — a params-load
-    /// against a node that only negotiated major 1 is refused with [HG078] (the
-    /// fields would PARSE there, but honoring them is a version-2 statement).
+    /// against a node that only negotiated major 1 is refused with [HG078]
+    /// (some major-1 builds would parse the fields, older ones hard-reject;
+    /// honoring them is a version-2 statement either way).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<crate::worker::engine::llamacpp::params::LlamaCppParams>,
     // NOTE: no `idle_ttl_minutes` on the wire yet. The idle reaper lives in the node's

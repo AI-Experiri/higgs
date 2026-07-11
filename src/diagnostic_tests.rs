@@ -311,6 +311,10 @@ fn chat_test_ladder_codes_render_and_key() {
     for (err, code) in cases {
         let s = err.to_string();
         assert!(s.starts_with(&format!("[{code}]")), "display prefix: {s}");
+        assert!(
+            !s.contains("  "),
+            "no doubled spaces from a missing line-continuation: {s}"
+        );
         // HG076 is detail-only like HG072: its remediation lives in the
         // call-site detail — all THREE producing arms are wording-pinned in the
         // embed tests (local sentinel: "this machine"+"directly"+em-dash;

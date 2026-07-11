@@ -762,12 +762,16 @@ pub enum HiggsError {
 
     /// A remote load carried explicit params, but the target node negotiated
     /// only protocol major `agreed` (< 2, the major where the hub started
-    /// sending per-load params). The fields would PARSE on the old node, but
-    /// silently loading with ITS defaults when the operator asked for specific
-    /// params would be a lie — refuse instead. Param-less loads still work
-    /// against any node.
+    /// sending per-load params). Some major-1 builds would PARSE the fields;
+    /// older ones (pre-rich-params / pre-typed-gpu_layers) would hard-reject
+    /// them — the hub cannot distinguish, and silently loading with the node's
+    /// defaults when the operator asked for specific params would be a lie
+    /// either way — refuse instead. Param-less loads still work against any
+    /// node.
     #[snafu(display(
-        "[HG078] node {endpoint_id} negotiated protocol {agreed}, which predates per-load          params (major 2) — update higgs on the node and reconnect, or load without params"
+        "[HG078] node {endpoint_id} is on protocol {agreed} (or predates version reporting), \
+         before per-load params (major 2) — update higgs on the node and reconnect, or load \
+         without params"
     ))]
     #[diagnostic(code(HG078), severity(Error))]
     NodeTooOldForParams { endpoint_id: String, agreed: u32 },

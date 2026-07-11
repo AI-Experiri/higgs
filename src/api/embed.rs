@@ -281,11 +281,19 @@ impl Higgs {
         &self,
         node: &str,
         model: &str,
-        params: Option<&crate::worker::engine::LoadParams>,
+        params: Option<crate::remote::NodeLoadParams>,
     ) -> Result<WorkerId, HiggsError> {
         match self.fleet() {
             Some(fleet) => {
-                let wire = params.map(|p| crate::api::node_params_for(model, p));
+                // OPTION-shaped fields ride verbatim: an absent ctx/gpu/threads
+                // stays ABSENT on the wire (the node's defaults apply) — mapping
+                // through a concrete LoadParams here would launder serde struct
+                // defaults (gpu 0 = CPU-only, threads 0) into explicit values.
+                // `id` is forced from `model`: the route is recorded under it.
+                let wire = params.map(|mut p| {
+                    p.id = model.to_owned();
+                    p
+                });
                 fleet.load(node, model, wire).await
             }
             None => Err(not_a_hub_error("nodes/load")),

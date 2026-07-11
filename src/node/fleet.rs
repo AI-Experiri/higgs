@@ -894,9 +894,10 @@ impl HubFleet {
     /// `params = None` sends the classic bare `{ "id" }` (works against ANY node);
     /// `Some(p)` sends the full [`NodeLoadParams`](crate::remote::NodeLoadParams) —
     /// gated on the node having negotiated protocol major ≥ 2 ([HG078] otherwise:
-    /// the fields would parse on an older node, but honoring them is a major-2
-    /// statement, and silently loading with the node's defaults when the caller
-    /// asked for specific params would misreport what is running). An admission
+    /// some major-1 builds would parse the fields and older ones hard-reject —
+    /// indistinguishable from here — and silently loading with the node's
+    /// defaults when the caller asked for specific params would misreport what
+    /// is running). An admission
     /// that predates version plumbing reads as the conservative floor (1).
     pub async fn load(
         &self,
@@ -904,6 +905,11 @@ impl HubFleet {
         model: &str,
         params: Option<crate::remote::NodeLoadParams>,
     ) -> Result<WorkerId, HiggsError> {
+        // Connectivity FIRST: an offline/unknown node must surface as HG027,
+        // not as a version refusal — after a hub cold start, seeded nodes are
+        // version-less until they reconnect, and "update the node" would be
+        // false advice for a current node that is merely disconnected.
+        let transport = self.transport(node).await?;
         let payload = match params {
             None => json!({ "id": model }),
             Some(p) => {
@@ -920,7 +926,6 @@ impl HubFleet {
                 })?
             }
         };
-        let transport = self.transport(node).await?;
         let result = match transport.request(M_NODE_LOAD, payload).await {
             Ok(v) => v,
             Err(e) => return Err(self.handle_op_error(node, &transport, e).await),

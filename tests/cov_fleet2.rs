@@ -609,6 +609,21 @@ async fn params_load_payload_carries_ctx_at_protocol_two() {
                             "params-load payload must carry gpu_layers: {params}"
                         );
                     }
+                    "only/ctx" => {
+                        // The r1 HIGH regression pin: a PARTIAL params-load
+                        // must NOT launder hub struct-defaults onto the wire —
+                        // absent fields stay absent so the NODE's defaults
+                        // (all-GPU, its own threads) genuinely apply.
+                        assert_eq!(
+                            params.get("ctx_len").and_then(Value::as_u64),
+                            Some(256),
+                            "partial params carry the one set field: {params}"
+                        );
+                        assert!(
+                            params.get("gpu_layers").is_none() && params.get("threads").is_none(),
+                            "unset fields stay ABSENT (no CPU-only/0-thread laundering): {params}"
+                        );
+                    }
                     "bare/load" => {
                         let keys: Vec<_> = params
                             .as_object()
@@ -661,4 +676,17 @@ async fn params_load_payload_carries_ctx_at_protocol_two() {
         .load(&peer, "bare/load", None)
         .await
         .expect("bare load still works");
+
+    // Partial params: only ctx set — gpu_layers/threads stay off the wire.
+    let partial = higgs::remote::NodeLoadParams {
+        id: "only/ctx".into(),
+        ctx_len: Some(256),
+        gpu_layers: None,
+        threads: None,
+        params: None,
+    };
+    fleet
+        .load(&peer, "only/ctx", Some(partial))
+        .await
+        .expect("partial params-load dispatches");
 }
