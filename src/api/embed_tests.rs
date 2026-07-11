@@ -420,6 +420,30 @@ async fn node_chat_test_bypasses_the_local_first_dispatch() {
     higgs.set_fleet(fleet);
     higgs.load(&model_id, None).await.expect("local twin loads");
 
+    // SELF-GUARD for the distinguisher: prove the local twin really answers
+    // with prompt_tokens == 10 through the generic dispatch. If a fake refactor
+    // ever makes the two shapes identical, this fails loudly instead of letting
+    // the probe assertion below pass against a local-first dispatch.
+    let (rx, handle) = higgs
+        .chat_stream(
+            model_id.clone(),
+            json!([{"role": "user", "content": "hi"}]).to_string(),
+            8,
+            crate::worker::engine::SamplingParams::default(),
+            None,
+            None,
+        )
+        .await
+        .expect("generic dispatch reaches the local twin");
+    drop(rx);
+    let local_shape = handle.await.expect("join").expect("local twin outcome");
+    assert_eq!(
+        local_shape.prompt_tokens, 10,
+        "the local twin's shape must stay distinguishable from the remote fake's \
+         (prompt_tokens 10 vs absent→0), or this test can no longer detect a \
+         local-first dispatch: {local_shape:?}"
+    );
+
     let report = higgs
         .node_chat_test(&node_key, None, None)
         .await
@@ -466,7 +490,10 @@ async fn node_chat_test_pins_across_two_nodes_sharing_a_model() {
         assert_eq!(report.content, "hello");
     }
 
-    // Cross-pin: node A's served id on node B → HG076 naming both nodes.
+    // Cross-pin: node A's served id on node B → HG076 naming both nodes, from
+    // the facade's PRE-CHECK (its wording carries the caller-mistake remedy
+    // "omit `served`" — the dispatch-time [HG077] backstop says "moved during
+    // dispatch" instead; asserting the wording pins the pre-check itself).
     let cross = higgs
         .node_chat_test(&node_b, Some(&served_a[0]), None)
         .await;
@@ -476,6 +503,10 @@ async fn node_chat_test_pins_across_two_nodes_sharing_a_model() {
             assert!(
                 detail.contains(&node_b),
                 "names the requested node: {detail}"
+            );
+            assert!(
+                detail.contains("omit `served`"),
+                "the PRE-CHECK's caller-mistake remedy, not the HG077 race wording: {detail}"
             );
         }
         other => panic!("expected HG076 for a cross-node pin, got {other:?}"),
@@ -531,7 +562,11 @@ async fn node_chat_test_refusal_arms() {
         other => panic!("expected HG076 for an unrouted served id, got {other:?}"),
     }
 
-    // A REAL served id but the WRONG (known) node → HG076 naming both nodes.
+    // A REAL served id but the WRONG (known) node → HG076 naming both nodes,
+    // from the facade's PRE-CHECK: the "omit `served`" remedy is unique to it —
+    // the dispatch-time [HG077] backstop catches the same mismatch but with
+    // race wording ("moved during dispatch"), the wrong advice for a caller who
+    // simply named the wrong node. Fail-on-revert for the pre-check itself.
     let mismatch = higgs
         .node_chat_test("bare-node", Some(&model_id), None)
         .await;
@@ -544,6 +579,10 @@ async fn node_chat_test_refusal_arms() {
             assert!(
                 detail.contains("bare-node"),
                 "names the requested node: {detail}"
+            );
+            assert!(
+                detail.contains("omit `served`"),
+                "the PRE-CHECK's caller-mistake remedy, not the HG077 race wording: {detail}"
             );
         }
         other => panic!("expected HG076 for a node mismatch, got {other:?}"),

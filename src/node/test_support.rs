@@ -116,6 +116,12 @@ pub(crate) fn fake_worker_factory_stateful() -> HalvesFactory {
                         }
                     }
                     // Include token counts so callers can verify usage propagation.
+                    // LOAD-BEARING SHAPE: the counts here (present, 10/3) vs the plain
+                    // fake's reply (absent → 0) are what let
+                    // `embed_tests::node_chat_test_bypasses_the_local_first_dispatch`
+                    // tell a LOCAL answer from a REMOTE relay. If you change either
+                    // fake's usage fields, that test's self-guard fails first — keep
+                    // the two shapes distinguishable.
                     let resp = RpcResponse {
                         jsonrpc: "2.0".into(),
                         id: r.id,

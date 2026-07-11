@@ -190,7 +190,8 @@ async fn chat_pinned_refuses_when_the_id_resolves_elsewhere() {
     let (fleet, node_key, model_id, _root) = fleet_with_one_node().await;
     fleet.load(&node_key, &model_id).await.unwrap();
 
-    // Pin to a node the id does NOT resolve to → refused at dispatch, no chat.
+    // Pin to a node the id does NOT resolve to → refused at dispatch as the
+    // transient concurrent-change class ([HG077]), no chat.
     match fleet
         .chat_pinned(
             &model_id,
@@ -203,10 +204,41 @@ async fn chat_pinned_refuses_when_the_id_resolves_elsewhere() {
         )
         .await
     {
-        Err(HiggsError::InvalidChatTestTarget { .. }) => {}
-        Err(other) => panic!("mismatched pin → HG076, got {other:?}"),
+        Err(HiggsError::ChatTestTargetMoved { .. }) => {}
+        Err(other) => panic!("mismatched pin → HG077, got {other:?}"),
         Ok(_) => panic!("a mismatched pin must be refused, not dispatched"),
     }
+
+    // Pin an id that does not resolve AT ALL → the same [HG077] class, not
+    // HG002's "not found on disk" (no disk is consulted at dispatch).
+    match fleet
+        .chat_pinned(
+            "gone/never-routed",
+            &node_key,
+            "[]".into(),
+            8,
+            0.0,
+            None,
+            None,
+        )
+        .await
+    {
+        Err(HiggsError::ChatTestTargetMoved { .. }) => {}
+        Err(other) => panic!("unrouted pin → HG077, got {other:?}"),
+        Ok(_) => panic!("an unrouted pin must be refused, not dispatched"),
+    }
+
+    // The UNPINNED path is unchanged: an unrouted id is still plain HG002.
+    assert!(
+        matches!(
+            fleet
+                .chat("gone/never-routed", "[]".into(), 8, 0.0, None, None)
+                .await
+                .map(|_| ()),
+            Err(HiggsError::ModelNotFound { .. })
+        ),
+        "generic chat keeps its HG002 contract"
+    );
 
     // Pin to the resolving node → dispatches like plain chat.
     let (rx, fut) = fleet

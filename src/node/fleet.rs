@@ -1001,9 +1001,9 @@ impl HubFleet {
     /// model's whole instance set ([`crate::node::served::served_ids`]), so a
     /// single unload or additive load elsewhere can re-home an id between a
     /// caller's own resolution and this dispatch; the pin is checked against the
-    /// SAME resolution that picks the transport, so a re-homed id is refused
-    /// ([HG076], transient — the caller re-resolves) instead of silently
-    /// exercising, and then reporting, the wrong node.
+    /// SAME resolution that picks the transport, so a re-homed (or freshly
+    /// unrouted) id is refused ([HG077], transient — the caller re-resolves)
+    /// instead of silently exercising, and then reporting, the wrong node.
     pub async fn chat_pinned(
         self: &Arc<Self>,
         served: &str,
@@ -1051,14 +1051,29 @@ impl HubFleet {
         ),
         HiggsError,
     > {
-        let (node, worker, model) = self.require_served(served).await?;
+        // Under a pin, BOTH stale-pick shapes are the same transient conflict
+        // ([HG077]): the id re-homed to another node, or it unrouted entirely.
+        // Without the remap the unroute shape would surface as HG002 ("not
+        // found on disk" — no disk was consulted) and jump status class.
+        let resolved = self.require_served(served).await;
+        let (node, worker, model) = match (resolved, pin_node) {
+            (Ok(r), _) => r,
+            (Err(HiggsError::ModelNotFound { .. }), Some(pin)) => {
+                return Err(HiggsError::ChatTestTargetMoved {
+                    detail: format!(
+                        "served instance {served} is no longer routed anywhere (it was picked \
+                         for node {pin} moments ago)"
+                    ),
+                });
+            }
+            (Err(e), _) => return Err(e),
+        };
         if let Some(pin) = pin_node {
             if node != pin {
-                return Err(HiggsError::InvalidChatTestTarget {
+                return Err(HiggsError::ChatTestTargetMoved {
                     detail: format!(
                         "served instance {served} resolved to node {node} at dispatch, not the \
-                         pinned node {pin} — served ids renumber when a model's instance set \
-                         changes; refresh the fleet view and retry"
+                         pinned node {pin}"
                     ),
                 });
             }

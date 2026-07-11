@@ -362,9 +362,11 @@ impl Higgs {
     /// checks the pin against the same resolution that picks the transport.
     /// Served ids renumber over a model's whole instance set (a single unload —
     /// or an additive load on an earlier-sorting node — re-homes an id), so the
-    /// facade's own pick here can go stale before dispatch; a re-homed id is
-    /// refused ([HG076], transient — re-resolve and retry) rather than silently
-    /// testing, and then reporting, the wrong node.
+    /// facade's own pick here can go stale before dispatch; a re-homed OR
+    /// freshly-unrouted id is refused ([HG077], the transient concurrent-change
+    /// class — re-resolve and retry) rather than silently testing, and then
+    /// reporting, the wrong node. [HG076] stays the DETERMINISTIC pre-check
+    /// refusal of a bad explicit `served` operand.
     ///
     /// Accepted residual: the refusal LADDER itself is not atomic — a retire
     /// landing between the [HG075] gate and the route resolution can surface as

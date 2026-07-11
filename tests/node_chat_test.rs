@@ -131,10 +131,11 @@ async fn node_chat_test_proves_the_iroh_link_end_to_end() {
         "never-paired node → HG075, got {err:?}"
     );
 
-    // ── A REAL (paired) node but a served id it does not route → [HG076]. The
-    // local hub machine's own endpoint is not this node's, so route a mismatch
-    // via an id that is served but pinned to the real node: test the refusal by
-    // asking the real node for a served id that is NOT routed anywhere. ──
+    // ── A REAL (paired) node but a served id that is NOT routed anywhere →
+    // [HG076], the unrouted-operand arm. (The cross-node mismatch and the
+    // dispatch-time [HG077] race arms need a second routed node / a live race —
+    // they are unit-covered in embed_tests / fleet_tests; this e2e exercises
+    // the operand refusal over the real facade.) ──
     let err = higgs
         .node_chat_test(&node_id, Some("no-such/served-id"), None)
         .await
