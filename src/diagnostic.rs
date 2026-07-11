@@ -743,8 +743,8 @@ pub enum HiggsError {
     /// conflict, not a caller mistake: the fleet changed underneath the call;
     /// re-resolve and retry.
     #[snafu(display(
-        "[HG077] chat-test target moved during dispatch: {detail} — the fleet's instance set \
-         changed concurrently; refresh the fleet view and retry"
+        "[HG077] chat-test target not at the pinned node at dispatch: {detail} — served ids \
+         renumber as instance sets change; re-resolve against the fleet view and retry"
     ))]
     #[diagnostic(code(HG077), severity(Error))]
     ChatTestTargetMoved { detail: String },

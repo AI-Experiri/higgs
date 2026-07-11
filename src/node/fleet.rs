@@ -1059,10 +1059,12 @@ impl HubFleet {
         let (node, worker, model) = match (resolved, pin_node) {
             (Ok(r), _) => r,
             (Err(HiggsError::ModelNotFound { .. }), Some(pin)) => {
+                // No fabricated history: a DIRECT chat_pinned caller may hit this
+                // on a first call with a bad id, not only via a concurrent unroute.
                 return Err(HiggsError::ChatTestTargetMoved {
                     detail: format!(
-                        "served instance {served} is no longer routed anywhere (it was picked \
-                         for node {pin} moments ago)"
+                        "served instance {served} is not routed on any node at dispatch \
+                         (pinned to node {pin})"
                     ),
                 });
             }
