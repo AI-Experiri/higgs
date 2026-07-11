@@ -943,7 +943,9 @@ impl HubFleet {
             // parses to a default LlamaCppParams) — drop it so the bare arm's
             // "never version-refused for asking nothing" principle holds for
             // the rich field too, not just for absent/zero base fields.
-            p.params = p.params.filter(|lc| lc.has_overrides());
+            p.params = p
+                .params
+                .filter(crate::worker::engine::llamacpp::params::LlamaCppParams::has_overrides);
             // An all-default rich object asks nothing either (`{"params": {}}`
             // parses to a default LlamaCppParams) — drop it so the bare arm's
             // "never version-refused for asking nothing" principle holds for
