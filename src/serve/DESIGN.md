@@ -174,9 +174,14 @@ bypass them):
   past its await, so an explicit-only call would leak the registration). Serve state is
   per-listener, not flat slots: `lan_exposed` is "any live non-loopback listener"
   (so a loopback serve starting, or a sibling exiting, can't strip a live LAN
-  listener's protection); `bind_host`/applied-CORS disclose the **primary**
-  (first-registered) listener; `restart_required` is "**any** live listener runs a
-  list other than the persisted one". `decide_revoke`
+  listener's protection); `bind_host` discloses the **primary**
+  (first-registered) listener. The extra-CORS allowlist is NOT per-listener (G7):
+  every layer reads the facade's LIVE list per request, `serve_v1` publishes the
+  persisted list at listener start, `set_cors_origins` publishes as it persists —
+  so an API write applies immediately and `restart_required` is only "the
+  persisted file was hand-edited away from the live list". A rebind's
+  zero-listener moment is covered by `Higgs::reserve_rebind` (an RAII count the
+  last-listener stop() decision respects; [HG073] refuses a stopped facade). `decide_revoke`
   refuses to revoke the
   LAST key while `lan_exposed` (`Revoke::LastKeyOnLan` → `409`), and refuses to
   revoke the last VISIBLE Admin key while other visible keys remain
