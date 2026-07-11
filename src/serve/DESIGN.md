@@ -179,7 +179,9 @@ bypass them):
   every layer reads the facade's LIVE list per request, `serve_v1` publishes the
   persisted list at listener start, `set_cors_origins` publishes as it persists —
   so an API write applies immediately and `restart_required` is only "the
-  persisted file was hand-edited away from the live list". A rebind's
+  persisted file diverged from the live list" (a hand-edit, or the loser of
+  two concurrent API writes whose persist/publish orders inverted — either
+  way disclosed, and the next write or serve start reconciles). A rebind's
   zero-listener moment is covered by `Higgs::reserve_rebind` (an RAII count the
   last-listener stop() decision respects; [HG073] refuses a stopped facade). `decide_revoke`
   refuses to revoke the
