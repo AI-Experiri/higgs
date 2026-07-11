@@ -2525,8 +2525,8 @@ impl Higgs {
                         in_flight: MAX_CONCURRENT_INFERENCE,
                         max: MAX_CONCURRENT_INFERENCE,
                     })?;
-                // Remote sampling forwarding is DEFERRED (like remote load-param
-                // forwarding): the node relay carries only temperature today. Extract
+                // Remote sampling forwarding is DEFERRED (remote LOAD params
+                // ship since T8/major 2): the node relay carries only temperature today. Extract
                 // it from the umbrella; the rest of the sampler set applies locally.
                 let temperature = sampling.as_llamacpp().temperature.unwrap_or(0.7);
                 let (rx, fut) = fleet
