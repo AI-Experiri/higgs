@@ -505,11 +505,11 @@ pub async fn serve_v1(
     // Publish the persisted allowlist as the LIVE one (G7): every listener's
     // layer reads the shared live list per request, so this listener starting
     // brings the file's current contents into force for ALL listeners — the
-    // one honest interpretation when layers no longer own snapshots. A
-    // concurrent `set_cors_origins` write can land right after this publish
-    // and simply wins: last write is the live list, and the disclosures read
-    // the same slot, so enforced and disclosed can never diverge.
-    higgs.publish_live_cors(higgs.extra_cors_origins());
+    // one honest interpretation when layers no longer own snapshots. The
+    // refresh is ATOMIC (disk read under the live-list write lock), so a
+    // concurrent `set_cors_origins` linearizes against it — a stale disk
+    // read here can never overwrite the setter's just-confirmed publish.
+    higgs.refresh_live_cors_from_disk();
     let app = v1_router_with_host_policy(Arc::clone(&higgs), enforce_loopback_host);
     let served = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)

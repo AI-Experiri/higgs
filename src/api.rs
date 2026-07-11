@@ -1166,6 +1166,19 @@ impl Higgs {
         *self.live_cors.write() = Some(origins);
     }
 
+    /// Refresh the live allowlist from the persisted `config.json`, ATOMICALLY:
+    /// the disk read happens under the live-list write lock, so it linearizes
+    /// with a concurrent [`Higgs::set_cors_origins`] (persist-then-publish) —
+    /// either this read sees the fresh persist, or the setter's publish lands
+    /// after this one. A bare read-then-publish could revert a just-confirmed
+    /// API write to the pre-write list (stale read, late publish). Called at
+    /// listener start; the disk read under the lock is fine there (rare, and
+    /// only the CORS predicate contends).
+    pub(crate) fn refresh_live_cors_from_disk(&self) {
+        let mut slot = self.live_cors.write();
+        *slot = Some(self.extra_cors_origins());
+    }
+
     /// The live allowlist, lazily initialized from the persisted `config.json`
     /// on first use. The lazy path serves a router an embedder MOUNTS directly
     /// (never passing through `serve_v1`, which publishes eagerly): its first
