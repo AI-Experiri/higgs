@@ -305,8 +305,9 @@ fn chat_test_ladder_codes_render_and_key() {
         let s = err.to_string();
         assert!(s.starts_with(&format!("[{code}]")), "display prefix: {s}");
         // HG076 is detail-only like HG072: its remediation lives in the
-        // call-site detail (pinned by the embed tests' wording asserts), so the
-        // fixed display carries no em-dash of its own.
+        // call-site detail — BOTH producing arms are wording-pinned in the
+        // embed tests (mismatch: "omit `served`"; unrouted: em-dash + "refresh
+        // the fleet view") — so the fixed display carries no em-dash of its own.
         if code != "HG076" {
             assert!(
                 s.contains(" — "),

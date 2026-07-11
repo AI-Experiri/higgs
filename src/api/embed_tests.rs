@@ -524,6 +524,19 @@ async fn node_chat_test_refusal_arms() {
     let (higgs, node_key, model_id, _root) = fake_higgs_with_remote_node().await;
     let fleet = higgs.fleet().expect("fleet installed");
 
+    // The LOCAL machine's sentinel id → HG076 "chat it directly", never the
+    // HG075 "pair the node first" advice it would otherwise fall through to.
+    let local = higgs.node_chat_test("local", None, None).await;
+    match local {
+        Err(HiggsError::InvalidChatTestTarget { ref detail }) => {
+            assert!(
+                detail.contains("this machine") && detail.contains("directly"),
+                "the local arm's remedy is a direct chat, not pairing: {detail}"
+            );
+        }
+        other => panic!("expected HG076 for the local sentinel, got {other:?}"),
+    }
+
     // A node the hub has NEVER paired → HG075 unknown-node, not load-first advice.
     let unknown = higgs.node_chat_test("unknown-node", None, None).await;
     assert!(
@@ -558,6 +571,15 @@ async fn node_chat_test_refusal_arms() {
             assert!(
                 detail.contains("not routed"),
                 "says what was actually checked: {detail}"
+            );
+            // HG076's display is detail-only (no fixed remediation tail), so the
+            // ladder-codes test exempts it from the em-dash rule ON THE PROMISE
+            // that every producing arm's detail carries its own remedy — this
+            // pin is that promise for the unrouted arm (the mismatch arm's
+            // "omit `served`" pins are below).
+            assert!(
+                detail.contains(" — ") && detail.contains("refresh the fleet view"),
+                "the unrouted arm's detail must carry its own remediation: {detail}"
             );
         }
         other => panic!("expected HG076 for an unrouted served id, got {other:?}"),

@@ -710,11 +710,15 @@ pub enum HiggsError {
     #[diagnostic(code(HG074), severity(Error))]
     NodeNothingServed { endpoint_id: String },
 
-    /// A node-directed op named an endpoint id this hub has NEVER paired (or has
-    /// since retired) — distinct from [HG074] (node known, route table empty →
-    /// load first) and from [HG027] (node known but offline → reconnect). Raised
+    /// The node chat test ([`crate::Higgs::node_chat_test`], its only producer
+    /// today) named an endpoint id this hub has NEVER paired (or has since
+    /// retired) — distinct from [HG074] (node known, route table empty → load
+    /// first) and from [HG027] (node known but offline → reconnect). Raised
     /// before any route/served resolution, so "load a model on it first" advice
-    /// is never issued for a node that does not exist.
+    /// is never issued for a node that does not exist. Sibling node ops
+    /// (`node_load`/`node_scan`) predate this gate and still surface an unknown
+    /// id as HG027 — aligning them is a candidate follow-up, not a property
+    /// this code already guarantees surface-wide.
     #[snafu(display(
         "[HG075] unknown node {endpoint_id} — it is not paired with this hub; check the id \
          (the fleet view / `nodes` op lists every paired node), or pair the node first"

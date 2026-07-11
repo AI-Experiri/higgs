@@ -346,7 +346,9 @@ impl Higgs {
     /// locally resident would silently test the local worker instead of the
     /// remote link this exists to prove.
     ///
-    /// The refusal ladder, most-specific first: an endpoint id the hub never
+    /// The refusal ladder, most-specific first: the local machine's sentinel id
+    /// (`"local"`, as `Higgs::nodes()` lists it) is [HG076] — there is no iroh
+    /// hop to prove, chat it directly; an endpoint id the hub never
     /// paired is [HG075] (before any route lookup, so nobody is told to "load a
     /// model" on a nonexistent node). On a KNOWN node, `served = None` tests the
     /// node's first served instance (sorted) — [HG074] when nothing is routed
@@ -385,6 +387,19 @@ impl Higgs {
         let Some(fleet) = self.fleet() else {
             return Err(not_a_hub_error("nodes/chat_test"));
         };
+
+        // The LOCAL machine has no iroh hop to prove — and it rides the fleet
+        // view under the sentinel id "local" (`Higgs::nodes()`), so without
+        // this arm it would fall through to HG075's "pair the node first":
+        // pair-your-own-hub advice.
+        if node == "local" {
+            return Err(HiggsError::InvalidChatTestTarget {
+                detail: "\"local\" is this machine — the chat test proves the hub→node iroh \
+                         link, which the local engine does not have; chat a local model \
+                         directly (`/v1/chat/completions`) instead"
+                    .into(),
+            });
+        }
 
         // Unknown endpoint id → HG075, before any route/served reasoning. The
         // node-id allocator remembers every admitted OR seeded node until retire,

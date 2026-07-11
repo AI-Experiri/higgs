@@ -33,6 +33,13 @@ impl Drop for Proc {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn node_chat_test_proves_the_iroh_link_end_to_end() {
+    // Hermetic on BOTH ends: the node child gets the env below, and the
+    // IN-PROCESS hub reads it at `hub_enable` — without this the hub binds a
+    // relay-enabled endpoint (talks to public relay infra; stalls ~10s
+    // offline). Safe to set process-wide: this file is its own test binary
+    // with a single test.
+    std::env::set_var("HIGGS_IROH_LOCAL", "1");
+
     // In-process hub Higgs; skips cleanly when no tiny GGUF.
     let Some(higgs) = higgs_local(&[TINY_MODEL_ID]).await else {
         eprintln!("skipping node_chat_test: no tiny GGUF (set HIGGS_TEST_GGUF)");
