@@ -245,7 +245,8 @@ struct FleetActor {
     /// authoritative; refreshed on connect and after every hub-driven lifecycle change.
     inventories: HashMap<NodeKey, NodeInventory>,
     /// The HELLO-negotiated protocol major per node, refreshed on every (re)admission —
-    /// what feature gating (per-load params) and the Fleet view read. Absent until the
+    /// what feature gating (per-load params) reads today; a Fleet-view version display
+    /// (T14) would read the same slot but does not exist yet. Absent until the
     /// node's first admission carries one; readers treat absent as the floor (1).
     versions: HashMap<NodeKey, u32>,
     /// Per-node lifecycle generation, bumped on every load/unload/kill/route-drop. A
@@ -904,7 +905,11 @@ impl HubFleet {
     /// read as "auto"), and a no-override rich object all collapse to the
     /// classic bare `{ "id" }` (works against ANY node, never version-gated).
     /// A `Some(p)` with anything real left after normalization sends the full
-    /// [`NodeLoadParams`](crate::remote::NodeLoadParams) —
+    /// [`NodeLoadParams`](crate::remote::NodeLoadParams) — with `p.id`
+    /// OVERWRITTEN by `model` (the route is recorded under `model`, so a
+    /// divergent caller id would make the node load one model while the served
+    /// id names another). Connectivity is checked FIRST: an offline/unknown
+    /// node is HG027 even for a params-load, never a version refusal —
     /// gated on the node having negotiated protocol major ≥ 2 ([HG078] otherwise:
     /// some major-1 builds would parse the fields and older ones hard-reject —
     /// indistinguishable from here — and silently loading with the node's

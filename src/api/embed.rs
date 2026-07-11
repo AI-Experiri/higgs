@@ -273,14 +273,16 @@ impl Higgs {
     /// `params = None` — or a `Some` the fleet NORMALIZES to nothing (all-`None`
     /// fields, count-zeros, or a rich object with no real overrides) — is the
     /// classic default load (any node, never version-gated); any other `Some`
-    /// ships the
+    /// has count-zeros stripped (a MIXED object like `{ctx: 5, threads: 0}`
+    /// ships only the non-zero fields) and then ships the
     /// OPTION-shaped [`NodeLoadParams`](crate::remote::NodeLoadParams) fields
     /// VERBATIM (`id` is forced from `model`) — an absent ctx/gpu/threads stays
     /// absent on the wire so the NODE's defaults apply; mapping through a
     /// concrete `LoadParams` here would launder struct defaults into explicit
     /// values. Requires the node to have negotiated protocol major ≥ 2 — an
     /// older node is refused with [HG078] rather than silently loaded with its
-    /// own defaults. The hub's local tune profiles are NEVER applied here: they
+    /// own defaults — but connectivity is checked FIRST, so an offline/unknown
+    /// node is HG027 even when params were requested. The hub's local tune profiles are NEVER applied here: they
     /// are anchored to THIS machine's hardware and file signatures, both wrong
     /// for a remote node.
     ///
