@@ -290,7 +290,10 @@ impl Higgs {
     /// that DROPS this future (e.g. an aborted control op) between the node's
     /// load reply and the route commit strands a resident, route-less worker on
     /// the node — unloadable from the hub (no served id) until the node's idle
-    /// reaper or a restart reclaims it. The Fleet UI never aborts loads.
+    /// reaper or a restart reclaims it. This IS reachable in the shipped
+    /// stack: the embedder's WS bridge aborts every in-flight op on socket
+    /// close, so a tab close/refresh mid-load can strand a worker; the node's
+    /// idle reaper is the designed recovery.
     pub async fn node_load(
         &self,
         node: &str,
