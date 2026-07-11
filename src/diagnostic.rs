@@ -703,8 +703,8 @@ pub enum HiggsError {
     /// unload lever) until the node's own idle reaper reclaims it. The node itself
     /// is guaranteed known — an unknown endpoint id is refused earlier as [HG075].
     #[snafu(display(
-        "[HG074] no served model instance is routed on node {endpoint_id} — load a model on \
-         it there (`Higgs::node_load` / the Fleet view's Load) to route a NEW instance (a \
+        "[HG074] no served model instance is routed on node {endpoint_id} — load a model \
+         there (`Higgs::node_load` / the Fleet view's Load) to route a NEW instance (a \
          worker parked by a hub restart is not re-attached; the node's idle reaper reclaims it)"
     ))]
     #[diagnostic(code(HG074), severity(Error))]
