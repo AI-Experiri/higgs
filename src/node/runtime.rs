@@ -807,7 +807,10 @@ fn worker_load_params(
                 // as the base `threads: 0` SKIPPED above — one zero policy:
                 // ABSENCE (the engine default) is the only reading of "0".
                 // Deferred-to-first-chat crashes (with_n_threads_batch(0)
-                // etc.) never leave this node.
+                // etc.) never leave this node. NB the HUB strips these same
+                // zeros before its fleet sends (fleet.rs normalization), so
+                // this arm is reachable only via RAW M_NODE_LOAD requests —
+                // the node must not trust its callers to normalize.
                 if matches!(
                     k.as_str(),
                     "n_threads_batch" | "n_batch" | "n_ubatch" | "n_seq_max"
