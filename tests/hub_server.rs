@@ -121,7 +121,7 @@ async fn hub_server_pairs_a_node_and_lists_it() {
     // ── Remote-load: load the model on the paired node, then confirm it's remotely routable in
     // the real /v1/models surface. ──
     higgs
-        .node_load(&node_id, TINY_MODEL_ID)
+        .node_load(&node_id, TINY_MODEL_ID, None)
         .await
         .expect("remote load ok");
 

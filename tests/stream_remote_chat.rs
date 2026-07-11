@@ -380,11 +380,14 @@ async fn hub_http_streaming_chat_routes_to_remote_node() {
         "node admitted: {outcome:?}"
     );
     fleet
-        .add_node(peer.clone(), Arc::new(NodeTransport::new(conn)), None)
+        .add_node(peer.clone(), Arc::new(NodeTransport::new(conn)), None, None)
         .await;
 
     // Load the tiny model on the remote node via the fleet → records the route.
-    fleet.load(&peer, TINY_MODEL_ID).await.expect("remote load");
+    fleet
+        .load(&peer, TINY_MODEL_ID, None)
+        .await
+        .expect("remote load");
     assert!(
         fleet.is_remote(TINY_MODEL_ID).await,
         "model is now remote-routable"

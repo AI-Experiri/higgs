@@ -164,7 +164,7 @@ async fn node_ops_without_a_hub_are_not_a_hub_errors() {
         return;
     };
 
-    let load = higgs.node_load("some-node", TINY_MODEL_ID).await;
+    let load = higgs.node_load("some-node", TINY_MODEL_ID, None).await;
     let unload = higgs.node_unload(TINY_MODEL_ID).await;
     let retire = higgs.node_retire("some-node").await;
     let scan = higgs.node_scan("some-node").await;

@@ -162,17 +162,33 @@ async fn two_nodes_same_model_two_served_ids_stream_each_then_retire_one() {
     // Admit both (dial order is nondeterministic).
     let (conn1, peer1) = admit_node(&hub, &mut allow, &mut tokens, &hub_id).await;
     fleet
-        .add_node(peer1.clone(), Arc::new(NodeTransport::new(conn1)), None)
+        .add_node(
+            peer1.clone(),
+            Arc::new(NodeTransport::new(conn1)),
+            None,
+            None,
+        )
         .await;
     let (conn2, peer2) = admit_node(&hub, &mut allow, &mut tokens, &hub_id).await;
     fleet
-        .add_node(peer2.clone(), Arc::new(NodeTransport::new(conn2)), None)
+        .add_node(
+            peer2.clone(),
+            Arc::new(NodeTransport::new(conn2)),
+            None,
+            None,
+        )
         .await;
     assert_ne!(peer1, peer2, "two distinct nodes paired");
 
     // Load the SAME model on BOTH nodes → two instances → two collision-free served ids.
-    fleet.load(&peer1, TINY_MODEL_ID).await.expect("load node1");
-    fleet.load(&peer2, TINY_MODEL_ID).await.expect("load node2");
+    fleet
+        .load(&peer1, TINY_MODEL_ID, None)
+        .await
+        .expect("load node1");
+    fleet
+        .load(&peer2, TINY_MODEL_ID, None)
+        .await
+        .expect("load node2");
 
     let mut served = fleet.routed_models().await;
     served.sort();
@@ -310,11 +326,14 @@ async fn hub_v1_chat_routes_to_remote_node() {
         "node admitted: {outcome:?}"
     );
     fleet
-        .add_node(peer.clone(), Arc::new(NodeTransport::new(conn)), None)
+        .add_node(peer.clone(), Arc::new(NodeTransport::new(conn)), None, None)
         .await;
 
     // Load a real model on the node via the fleet → records the route.
-    fleet.load(&peer, TINY_MODEL_ID).await.expect("remote load");
+    fleet
+        .load(&peer, TINY_MODEL_ID, None)
+        .await
+        .expect("remote load");
     assert!(
         fleet.is_remote(TINY_MODEL_ID).await,
         "model is now remote-routable"
@@ -432,7 +451,7 @@ async fn hub_v1_chat_routes_to_remote_node() {
 
     // Re-load, then force-kill the worker.
     fleet
-        .load(&peer, TINY_MODEL_ID)
+        .load(&peer, TINY_MODEL_ID, None)
         .await
         .expect("remote re-load");
     assert!(
@@ -447,7 +466,7 @@ async fn hub_v1_chat_routes_to_remote_node() {
 
     // Retire the node: its routes + transport are gone, and ops now report unreachable.
     fleet
-        .load(&peer, TINY_MODEL_ID)
+        .load(&peer, TINY_MODEL_ID, None)
         .await
         .expect("load before retire");
     fleet.retire(&peer).await;
@@ -536,9 +555,13 @@ async fn node_reconnects_and_route_survives() {
             peer.clone(),
             Arc::new(NodeTransport::new(conn1.clone())),
             None,
+            None,
         )
         .await;
-    fleet.load(&peer, TINY_MODEL_ID).await.expect("remote load");
+    fleet
+        .load(&peer, TINY_MODEL_ID, None)
+        .await
+        .expect("remote load");
     let worker_before = fleet.resolve(TINY_MODEL_ID).await.expect("routed").1;
 
     // Blip: drop the hub side. The node's serve loop returns and it redials after backoff.
@@ -549,7 +572,12 @@ async fn node_reconnects_and_route_survives() {
     let (conn2, peer2) = admit(&hub, &mut allow, &mut tokens, &hub_id).await;
     assert_eq!(peer2, peer, "same node reconnects");
     fleet
-        .add_node(peer2.clone(), Arc::new(NodeTransport::new(conn2)), None)
+        .add_node(
+            peer2.clone(),
+            Arc::new(NodeTransport::new(conn2)),
+            None,
+            None,
+        )
         .await;
     assert_eq!(
         fleet.resolve(TINY_MODEL_ID).await.map(|r| r.1),

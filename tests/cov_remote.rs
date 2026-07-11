@@ -441,7 +441,12 @@ async fn fleet_stale_admit_gen_is_refused() {
     let current = fleet.bump_admit_gen().await;
     assert_eq!(current, 1, "first bump yields generation 1");
     fleet
-        .add_node(peer.clone(), Arc::new(NodeTransport::new(conn)), Some(0))
+        .add_node(
+            peer.clone(),
+            Arc::new(NodeTransport::new(conn)),
+            Some(0),
+            None,
+        )
         .await;
 
     assert!(
@@ -468,7 +473,7 @@ async fn fleet_admit_disconnect_all_then_retire() {
     let fleet = Arc::new(HubFleet::new(Arc::new(LogBus::new())));
 
     fleet
-        .add_node(peer.clone(), Arc::new(NodeTransport::new(conn)), None)
+        .add_node(peer.clone(), Arc::new(NodeTransport::new(conn)), None, None)
         .await;
     assert_eq!(
         fleet.node_ids().await,
@@ -539,7 +544,7 @@ async fn fleet_seed_and_unknown_node_arms() {
     // Ops against a seeded-but-disconnected node → HG027 NodeUnreachable.
     assert!(
         matches!(
-            fleet.load(&known, "some/model").await,
+            fleet.load(&known, "some/model", None).await,
             Err(HiggsError::NodeUnreachable { .. })
         ),
         "load on a disconnected node → HG027"

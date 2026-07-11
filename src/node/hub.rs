@@ -238,7 +238,7 @@ pub fn spawn_accept_loop(
                 )
                 .await;
                 match outcome {
-                    GateOutcome::Admitted { .. } => {
+                    GateOutcome::Admitted { agreed_version } => {
                         tracing::info!(node = %peer, "higgs hub: node admitted");
                         // add_node runs UNDER the allowlist lock (held here) so it's mutually
                         // exclusive with a concurrent retire — the register can't race a removal.
@@ -250,6 +250,7 @@ pub fn spawn_accept_loop(
                                 peer.clone(),
                                 Arc::new(NodeTransport::new(conn)),
                                 Some(admit_gen),
+                                Some(agreed_version),
                             )
                             .await;
                         // Accept node→hub requests (self-`leave`) on this connection. Holds the

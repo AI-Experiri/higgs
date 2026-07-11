@@ -452,10 +452,10 @@ ignored), HG056 (malformed streamed tool-call fragment dropped), HG061 (OOM rung
 
 - **Stall-based load timeout (G5):** needs a llama.cpp load-progress callback (FFI + worker
   protocol) — deferred with evidence; the OOM ladder + dead-worker fast-fail cover most cases.
-- **Per-worker (per-load) idle TTL on the remote wire:** `NodeLoadParams` carries the full
-  `LlamaCppParams` only on the LOCAL path; forwarding rich params (and a per-load TTL) to a
-  remote `M_NODE_LOAD` is gated behind a protocol-version bump (an older `deny_unknown_fields`
-  node would reject an unknown field).
+- **Per-worker (per-load) idle TTL on the remote wire:** the hub FORWARDS rich load params on
+  remote `M_NODE_LOAD` since protocol major 2 (T8) — gated on the node's negotiated version
+  ([HG078] refusal against a major-1 node when params were requested; bare loads unchanged).
+  A per-load idle TTL remains deferred (the field is still absent from `NodeLoadParams`).
 - **`log_bus` double-clone (C1):** each line is cloned into the ring String and the broadcast
   `LogLine.text`; an `Arc<str>` would just move the alloc to the String-typed SSE boundary — no
   net win without reworking the log-stream channel type. Left as a documented TODO.

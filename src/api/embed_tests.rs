@@ -300,7 +300,7 @@ async fn unload_spec_one_vs_all() {
 async fn node_ops_without_a_hub_error() {
     let higgs = fake_higgs(vec![]);
     assert!(higgs.pair().await.is_err(), "no hub → pair errors");
-    assert!(higgs.node_load("n", "m").await.is_err());
+    assert!(higgs.node_load("n", "m", None).await.is_err());
     assert!(higgs.node_unload("m").await.is_err());
     assert!(higgs.node_retire("n").await.is_err());
     assert!(higgs.node_scan("n").await.is_err());
@@ -359,9 +359,13 @@ async fn add_fake_remote_node(
             node_key.clone(),
             Arc::new(crate::node::transport::NodeTransport::new(conn)),
             None,
+            None,
         )
         .await;
-    fleet.load(&node_key, model_id).await.expect("remote load");
+    fleet
+        .load(&node_key, model_id, None)
+        .await
+        .expect("remote load");
     roots.push(root);
     node_key
 }

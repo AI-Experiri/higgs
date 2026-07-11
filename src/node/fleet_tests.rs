@@ -20,16 +20,100 @@ async fn fleet_with_one_node() -> (Arc<HubFleet>, NodeKey, String, tempfile::Tem
 
     let fleet = Arc::new(HubFleet::new(Arc::new(crate::log_bus::LogBus::new())));
     fleet
-        .add_node(node_key.clone(), Arc::new(NodeTransport::new(conn)), None)
+        .add_node(
+            node_key.clone(),
+            Arc::new(NodeTransport::new(conn)),
+            None,
+            None,
+        )
         .await;
     (fleet, node_key, model_id, root)
+}
+
+/// A params-load against a MAJOR-2 admission passes the gate and dispatches
+/// (the version branch, complementing the floor-1 refusal above). What lands
+/// ON the wire is pinned by the mock-transport payload test (cov_fleet2), and
+/// real application by the integration test.
+#[tokio::test]
+async fn params_load_reaches_the_node_at_protocol_two() {
+    let (root, model_id) = stage_dummy_model("higgs-test/m");
+    let hub = local_endpoint().await;
+    let node = local_endpoint().await;
+    let hub_addr = hub.addr();
+    let node_key = node.id().to_string();
+    let rt = Arc::new(fake_runtime(vec![root.path().to_path_buf()]));
+    tokio::spawn(async move {
+        let node_conn = node.connect(hub_addr, ALPN).await.expect("connect");
+        serve_node(node_conn, rt).await;
+    });
+    let conn = hub.accept().await.expect("incoming").await.expect("conn");
+    std::mem::forget(hub);
+    let fleet = Arc::new(HubFleet::new(Arc::new(crate::log_bus::LogBus::new())));
+    fleet
+        .add_node(
+            node_key.clone(),
+            Arc::new(NodeTransport::new(conn)),
+            None,
+            Some(2),
+        )
+        .await;
+    assert_eq!(fleet.node_protocol(&node_key).await, Some(2));
+
+    let params = crate::remote::NodeLoadParams {
+        id: model_id.clone(),
+        ctx_len: Some(2048),
+        gpu_layers: None,
+        threads: None,
+        params: None,
+    };
+    let worker = fleet
+        .load(&node_key, &model_id, Some(params))
+        .await
+        .expect("params-load against a major-2 node");
+    assert!(worker.0 >= 1, "the gated load spawned a worker");
+    // NB the fake worker echoes only the id, and InventoryWorker carries no
+    // ctx field (a T9 gap), so the PAYLOAD-content pin (ctx_len actually on
+    // the wire) lives in the mock-transport test in tests/cov_fleet2.rs, and
+    // the real-application pin (node's worker reports ctx 2048) in the
+    // integration test over a held transport.
+}
+
+/// The T8 params gate: a params-load needs the node's HELLO-negotiated major
+/// ≥ 2. A version-less admission (tests/direct callers, or a pre-plumbing
+/// admission) reads as the conservative floor 1 → [HG078]; param-less loads
+/// keep working against any node. (The ≥2 happy path — payload carries the
+/// params — is pinned in embed_tests over a version-2 admission.)
+#[tokio::test]
+async fn params_load_refused_below_protocol_two() {
+    let (fleet, node_key, model_id, _root) = fleet_with_one_node().await;
+    // fleet_with_one_node admits with agreed_version = None → floor 1.
+    assert_eq!(fleet.node_protocol(&node_key).await, None);
+
+    let params = crate::remote::NodeLoadParams {
+        id: model_id.clone(),
+        ctx_len: Some(2048),
+        gpu_layers: None,
+        threads: None,
+        params: None,
+    };
+    let err = fleet
+        .load(&node_key, &model_id, Some(params))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, HiggsError::NodeTooOldForParams { agreed: 1, .. }),
+        "params against a floor-1 node → HG078, got {err:?}"
+    );
+
+    // The classic bare load is untouched by the gate.
+    fleet.load(&node_key, &model_id, None).await.unwrap();
 }
 
 #[tokio::test]
 async fn load_routes_and_resolves() {
     let (fleet, node_key, model_id, _root) = fleet_with_one_node().await;
     assert!(!fleet.is_remote(&model_id).await);
-    let worker = fleet.load(&node_key, &model_id).await.unwrap();
+    let worker = fleet.load(&node_key, &model_id, None).await.unwrap();
     assert!(fleet.is_remote(&model_id).await);
     assert_eq!(fleet.resolve(&model_id).await, Some((node_key, worker)));
 }
@@ -39,7 +123,7 @@ async fn disconnect_all_closes_transports_but_keeps_routes() {
     // The hub kill switch: disconnect_all severs every transport (nodes go offline) but the
     // route table SURVIVES, so re-enabling the hub is a pure reconnect, not a re-pair.
     let (fleet, node_key, model_id, _root) = fleet_with_one_node().await;
-    fleet.load(&node_key, &model_id).await.unwrap();
+    fleet.load(&node_key, &model_id, None).await.unwrap();
     assert!(fleet.is_remote(&model_id).await, "route present after load");
     assert!(
         fleet.node_ids().await.contains(&node_key),
@@ -82,7 +166,7 @@ async fn scan_node_returns_the_node_catalog() {
 #[tokio::test]
 async fn chat_relays_to_routed_worker() {
     let (fleet, node_key, model_id, _root) = fleet_with_one_node().await;
-    fleet.load(&node_key, &model_id).await.unwrap();
+    fleet.load(&node_key, &model_id, None).await.unwrap();
     let (mut rx, fut) = fleet
         .chat(&model_id, "[]".into(), 8, 0.0, None, None)
         .await
@@ -104,8 +188,8 @@ async fn chat_relays_to_routed_worker() {
 #[tokio::test]
 async fn loads_are_additive_two_instances_get_distinct_served_ids() {
     let (fleet, node_key, model_id, _root) = fleet_with_one_node().await;
-    let w1 = fleet.load(&node_key, &model_id).await.unwrap();
-    let w2 = fleet.load(&node_key, &model_id).await.unwrap();
+    let w1 = fleet.load(&node_key, &model_id, None).await.unwrap();
+    let w2 = fleet.load(&node_key, &model_id, None).await.unwrap();
     assert_ne!(w1, w2, "each load spawns a distinct worker");
     // Two instances of the same model → two served ids: `org/model` and `org/model-1`,
     // assigned deterministically by (node, worker) order.
@@ -137,8 +221,8 @@ async fn nodes_view_fills_served_id_per_worker() {
     // resident worker with its hub-assigned served id (`model`, `model-1`), NOT the
     // empty string the node reports.
     let (fleet, node_key, model_id, _root) = fleet_with_one_node().await;
-    fleet.load(&node_key, &model_id).await.unwrap();
-    fleet.load(&node_key, &model_id).await.unwrap();
+    fleet.load(&node_key, &model_id, None).await.unwrap();
+    fleet.load(&node_key, &model_id, None).await.unwrap();
     let view = fleet.nodes_view().await;
     let node = view
         .iter()
@@ -164,11 +248,11 @@ async fn nodes_view_fills_served_id_per_worker() {
 #[tokio::test]
 async fn unload_then_kill_drop_routes() {
     let (fleet, node_key, model_id, _root) = fleet_with_one_node().await;
-    fleet.load(&node_key, &model_id).await.unwrap();
+    fleet.load(&node_key, &model_id, None).await.unwrap();
     fleet.unload(&model_id).await.unwrap();
     assert!(!fleet.is_remote(&model_id).await, "unload drops the route");
 
-    fleet.load(&node_key, &model_id).await.unwrap();
+    fleet.load(&node_key, &model_id, None).await.unwrap();
     fleet.kill(&model_id).await.unwrap();
     assert!(!fleet.is_remote(&model_id).await, "kill drops the route");
 }
@@ -188,7 +272,7 @@ async fn unload_and_chat_unrouted_model_error() {
 #[tokio::test]
 async fn chat_pinned_refuses_when_the_id_resolves_elsewhere() {
     let (fleet, node_key, model_id, _root) = fleet_with_one_node().await;
-    fleet.load(&node_key, &model_id).await.unwrap();
+    fleet.load(&node_key, &model_id, None).await.unwrap();
 
     // Pin to a node the id does NOT resolve to → refused at dispatch as the
     // transient concurrent-change class ([HG077]), no chat.
@@ -253,7 +337,7 @@ async fn chat_pinned_refuses_when_the_id_resolves_elsewhere() {
 async fn served_on_lists_one_nodes_instances_and_survives_disconnect() {
     let (fleet, node_key, model_id, _root) = fleet_with_one_node().await;
     assert!(fleet.served_on(&node_key).await.is_empty());
-    fleet.load(&node_key, &model_id).await.unwrap();
+    fleet.load(&node_key, &model_id, None).await.unwrap();
     assert_eq!(fleet.served_on(&node_key).await, vec![model_id.clone()]);
     // Filtered BY node: another node key sees nothing.
     assert!(fleet.served_on("someone/else").await.is_empty());
@@ -268,7 +352,7 @@ async fn served_on_lists_one_nodes_instances_and_survives_disconnect() {
 async fn routed_models_lists_connected_only() {
     let (fleet, node_key, model_id, _root) = fleet_with_one_node().await;
     assert!(fleet.routed_models().await.is_empty());
-    fleet.load(&node_key, &model_id).await.unwrap();
+    fleet.load(&node_key, &model_id, None).await.unwrap();
     assert_eq!(fleet.routed_models().await, vec![model_id.clone()]);
     // After retiring the node, the route is gone → not advertised.
     fleet.retire(&node_key).await;
@@ -290,6 +374,7 @@ fn served_ids_are_collision_free_even_when_a_model_name_clashes_with_a_suffix() 
         routes,
         node_ids: NodeIdAllocator::new(),
         inventories: HashMap::new(),
+        versions: HashMap::new(),
         epochs: HashMap::new(),
         bus: Arc::new(crate::log_bus::LogBus::new()),
         admit_gen: 0,
@@ -328,8 +413,8 @@ fn served_id_for_worker_guards_stale_route_model_mismatch() {
 #[tokio::test]
 async fn unloading_one_instance_renumbers_the_survivor_to_the_base_served_id() {
     let (fleet, node_key, model_id, _root) = fleet_with_one_node().await;
-    let _w1 = fleet.load(&node_key, &model_id).await.unwrap();
-    let _w2 = fleet.load(&node_key, &model_id).await.unwrap();
+    let _w1 = fleet.load(&node_key, &model_id, None).await.unwrap();
+    let _w2 = fleet.load(&node_key, &model_id, None).await.unwrap();
     let suffixed = format!("{model_id}-1");
     assert!(fleet.is_remote(&suffixed).await, "two instances present");
 
@@ -390,7 +475,7 @@ async fn seed_node_lists_a_known_node_as_disconnected() {
 #[tokio::test]
 async fn ops_on_unknown_node_are_unreachable() {
     let fleet = Arc::new(HubFleet::new(Arc::new(crate::log_bus::LogBus::new())));
-    let err = fleet.load("ghost", "m").await.unwrap_err();
+    let err = fleet.load("ghost", "m", None).await.unwrap_err();
     assert!(err.to_string().starts_with("[HG027]"), "got {err}");
 }
 
@@ -405,7 +490,7 @@ async fn nodes_view_reflects_inventory_and_connection() {
     );
 
     // A hub-driven load refreshes the cached view from the node's authoritative state.
-    let w = fleet.load(&node_key, &model_id).await.unwrap();
+    let w = fleet.load(&node_key, &model_id, None).await.unwrap();
     let workers = fleet.nodes_view().await[0]
         .inventory
         .as_ref()
@@ -449,7 +534,7 @@ async fn nodes_view_reflects_inventory_and_connection() {
 #[tokio::test]
 async fn retire_drops_node_and_routes() {
     let (fleet, node_key, model_id, _root) = fleet_with_one_node().await;
-    fleet.load(&node_key, &model_id).await.unwrap();
+    fleet.load(&node_key, &model_id, None).await.unwrap();
     fleet.retire(&node_key).await;
     assert!(fleet.node_ids().await.is_empty());
     assert!(!fleet.is_remote(&model_id).await);

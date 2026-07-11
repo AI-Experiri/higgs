@@ -57,8 +57,13 @@ pub const N_PROGRESS: &str = "higgs/node/progress";
 /// fleet and replies `{ "status": "left" }`. Takes `{}`.
 pub const M_NODE_LEAVE: &str = "higgs/node/leave";
 
-/// The wire-protocol majors this build speaks.
-pub const PROTOCOL_VERSIONS: &[u32] = &[1];
+/// The wire-protocol majors this build speaks. Major 2 (T8) is where the hub
+/// STARTED SENDING the optional load params below on `M_NODE_LOAD` — the
+/// fields existed (and parse) since major 1, so 2 is a capability statement
+/// ("this node predates the params-sending hub" vs not), letting the hub
+/// refuse a params-load against an old node honestly instead of silently
+/// sending fields the node may not honor.
+pub const PROTOCOL_VERSIONS: &[u32] = &[1, 2];
 /// The lowest major this build still accepts.
 pub const MIN_SUPPORTED: u32 = 1;
 
@@ -167,11 +172,11 @@ pub struct NodeLoadParams {
     /// `None` (omitted on the wire) ⇒ a bare load with only the base fields.
     ///
     /// Set only when there's something to apply (`LlamaCppParams::has_overrides`), so
-    /// a plain/default load carries no payload. Today this is exercised ONLY on the
-    /// in-process LOCAL path (`Higgs::load` → `NodeRuntime::load`); the hub's REMOTE
-    /// `M_NODE_LOAD` (`HubFleet::load`) still sends a bare `{ "id" }`. Forwarding this
-    /// to a remote node is DEFERRED and must bump the negotiated protocol version
-    /// first (an older `deny_unknown_fields` node would reject an unknown field).
+    /// a plain/default load carries no payload. Exercised on the in-process LOCAL
+    /// path (`Higgs::load` → `NodeRuntime::load`) since major 1, and on the hub's
+    /// REMOTE `M_NODE_LOAD` (`HubFleet::load`) since major 2 (T8) — a params-load
+    /// against a node that only negotiated major 1 is refused with [HG078] (the
+    /// fields would PARSE there, but honoring them is a version-2 statement).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<crate::worker::engine::llamacpp::params::LlamaCppParams>,
     // NOTE: no `idle_ttl_minutes` on the wire yet. The idle reaper lives in the node's

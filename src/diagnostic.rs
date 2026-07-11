@@ -759,6 +759,18 @@ pub enum HiggsError {
     ))]
     #[diagnostic(code(HG077), severity(Error))]
     ChatTestTargetMoved { detail: String },
+
+    /// A remote load carried explicit params, but the target node negotiated
+    /// only protocol major `agreed` (< 2, the major where the hub started
+    /// sending per-load params). The fields would PARSE on the old node, but
+    /// silently loading with ITS defaults when the operator asked for specific
+    /// params would be a lie — refuse instead. Param-less loads still work
+    /// against any node.
+    #[snafu(display(
+        "[HG078] node {endpoint_id} negotiated protocol {agreed}, which predates per-load          params (major 2) — update higgs on the node and reconnect, or load without params"
+    ))]
+    #[diagnostic(code(HG078), severity(Error))]
+    NodeTooOldForParams { endpoint_id: String, agreed: u32 },
 }
 
 #[cfg(test)]

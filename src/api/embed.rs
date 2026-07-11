@@ -269,9 +269,25 @@ impl Higgs {
     /// /api/higgs/nodes/load`). A thin wrapper over the fleet so the embedder never
     /// touches [`HubFleet`](crate::node::fleet::HubFleet) directly. Errors when the
     /// server is not a hub (no fleet installed).
-    pub async fn node_load(&self, node: &str, model: &str) -> Result<WorkerId, HiggsError> {
+    ///
+    /// `params = None` is the classic default load (any node); `Some` maps the
+    /// [`LoadParams`] umbrella onto the wire shape (the same mapping the local
+    /// path uses) and requires the node to have negotiated protocol major ≥ 2 —
+    /// an older node is refused with [HG078] rather than silently loaded with
+    /// its own defaults. The hub's local tune profiles are NEVER applied here:
+    /// they are anchored to THIS machine's hardware and file signatures, both
+    /// wrong for a remote node.
+    pub async fn node_load(
+        &self,
+        node: &str,
+        model: &str,
+        params: Option<&crate::worker::engine::LoadParams>,
+    ) -> Result<WorkerId, HiggsError> {
         match self.fleet() {
-            Some(fleet) => fleet.load(node, model).await,
+            Some(fleet) => {
+                let wire = params.map(|p| crate::api::node_params_for(model, p));
+                fleet.load(node, model, wire).await
+            }
             None => Err(not_a_hub_error("nodes/load")),
         }
     }

@@ -135,14 +135,14 @@ async fn run() {
         "node admitted: {outcome:?}"
     );
     fleet
-        .add_node(peer.clone(), Arc::new(NodeTransport::new(conn)), None)
+        .add_node(peer.clone(), Arc::new(NodeTransport::new(conn)), None, None)
         .await;
     println!("node admitted: {peer}");
 
     // Load the real model ON THE NODE via the fleet → records the remote route.
     println!("loading {model} on the remote node …");
     let t_load = Instant::now();
-    if let Err(e) = fleet.load(&peer, &model).await {
+    if let Err(e) = fleet.load(&peer, &model, None).await {
         println!("❌ remote load failed: {e}");
         return;
     }

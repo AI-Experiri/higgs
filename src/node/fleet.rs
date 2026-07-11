@@ -135,6 +135,11 @@ enum FleetMsg {
         node: NodeKey,
         reply: oneshot::Sender<Result<Arc<NodeTransport>, HiggsError>>,
     },
+    /// The node's HELLO-negotiated protocol major, `None` if never admitted with one.
+    NodeProtocol {
+        node: NodeKey,
+        reply: oneshot::Sender<Option<u32>>,
+    },
     Epoch {
         node: NodeKey,
         reply: oneshot::Sender<u64>,
@@ -156,6 +161,9 @@ enum FleetMsg {
         transport: Arc<NodeTransport>,
         /// The accept loop's admission generation; `None` = admit unconditionally.
         gen: Option<u64>,
+        /// The HELLO-negotiated protocol major for THIS connection, `None` when the
+        /// caller has none (tests/direct) — read back as the conservative floor 1.
+        agreed_version: Option<u32>,
         #[allow(clippy::type_complexity)]
         reply: oneshot::Sender<Option<(NodeId, Option<Arc<NodeTransport>>)>>,
     },
@@ -236,6 +244,10 @@ struct FleetActor {
     /// Last-fetched inventory per node (host + workers + hw/rt). The node's reply is
     /// authoritative; refreshed on connect and after every hub-driven lifecycle change.
     inventories: HashMap<NodeKey, NodeInventory>,
+    /// The HELLO-negotiated protocol major per node, refreshed on every (re)admission —
+    /// what feature gating (per-load params) and the Fleet view read. Absent until the
+    /// node's first admission carries one; readers treat absent as the floor (1).
+    versions: HashMap<NodeKey, u32>,
     /// Per-node lifecycle generation, bumped on every load/unload/kill/route-drop. A
     /// `refresh_inventory` only commits its (possibly stale) result if this is unchanged
     /// since it started — so a slow connect-time fetch can't clobber a newer state.
@@ -343,6 +355,7 @@ impl FleetActor {
         // Bump so a refresh already in flight can't reinsert stale inventory after this.
         self.bump_epoch(node);
         self.inventories.remove(node);
+        self.versions.remove(node);
         // Forget the durable id slot so the node leaves the fleet view (not left disconnected).
         self.node_ids.remove(node);
     }
@@ -460,6 +473,9 @@ impl Actor for FleetActor {
             FleetMsg::Epoch { node, reply } => {
                 let _ = reply.send(self.epoch(&node));
             }
+            FleetMsg::NodeProtocol { node, reply } => {
+                let _ = reply.send(self.versions.get(&node).copied());
+            }
             FleetMsg::SeedNode { node, reply } => {
                 self.node_ids.assign(&node);
                 let _ = reply.send(());
@@ -468,6 +484,7 @@ impl Actor for FleetActor {
                 node,
                 transport,
                 gen,
+                agreed_version,
                 reply,
             } => {
                 if matches!(gen, Some(g) if g != self.admit_gen) {
@@ -479,6 +496,9 @@ impl Actor for FleetActor {
                     let _ = reply.send(None);
                 } else {
                     let node_id = self.node_ids.assign(&node);
+                    if let Some(v) = agreed_version {
+                        self.versions.insert(node.clone(), v);
+                    }
                     let replaced = self.nodes.insert(node.clone(), transport);
                     // Bump on (re)admission so an inventory fetch from a PRIOR connection still in
                     // flight can't commit its now-stale result over this fresh one.
@@ -577,6 +597,7 @@ impl HubFleet {
             routes: HashMap::new(),
             node_ids: NodeIdAllocator::new(),
             inventories: HashMap::new(),
+            versions: HashMap::new(),
             epochs: HashMap::new(),
             bus: bus_for_actor,
             admit_gen: 0,
@@ -628,6 +649,7 @@ impl HubFleet {
         node: NodeKey,
         transport: Arc<NodeTransport>,
         admit_gen: Option<u64>,
+        agreed_version: Option<u32>,
     ) {
         // Atomically admit: assign the stable NodeId, insert the transport, and bump the epoch in
         // ONE actor message, gated by the admission generation. If the kill switch bumped the
@@ -640,6 +662,7 @@ impl HubFleet {
                 node: node.clone(),
                 transport: transport.clone(),
                 gen: admit_gen,
+                agreed_version,
                 reply,
             })
             .await
@@ -787,6 +810,18 @@ impl HubFleet {
             .unwrap_or(0)
     }
 
+    /// A node's HELLO-negotiated protocol major, `None` if it was never admitted
+    /// with one (a pre-plumbing admission or a direct/test `add_node`). Callers
+    /// gating features treat `None` as the conservative floor (version 1).
+    pub async fn node_protocol(&self, node: &str) -> Option<u32> {
+        self.ask(|reply| FleetMsg::NodeProtocol {
+            node: node.to_string(),
+            reply,
+        })
+        .await
+        .flatten()
+    }
+
     /// Currently-connected node keys, ascending.
     pub async fn node_ids(&self) -> Vec<NodeKey> {
         self.ask(|reply| FleetMsg::NodeIds { reply })
@@ -855,9 +890,38 @@ impl HubFleet {
     /// Load `model` on `node` and record a NEW instance. Loads are ADDITIVE: each call spawns
     /// a fresh worker on the node and adds an instance, so N loads of the same model coexist
     /// as N served ids (`org/model`, `org/model-1`, …). Returns the new worker's id.
-    pub async fn load(&self, node: &str, model: &str) -> Result<WorkerId, HiggsError> {
+    ///
+    /// `params = None` sends the classic bare `{ "id" }` (works against ANY node);
+    /// `Some(p)` sends the full [`NodeLoadParams`](crate::remote::NodeLoadParams) —
+    /// gated on the node having negotiated protocol major ≥ 2 ([HG078] otherwise:
+    /// the fields would parse on an older node, but honoring them is a major-2
+    /// statement, and silently loading with the node's defaults when the caller
+    /// asked for specific params would misreport what is running). An admission
+    /// that predates version plumbing reads as the conservative floor (1).
+    pub async fn load(
+        &self,
+        node: &str,
+        model: &str,
+        params: Option<crate::remote::NodeLoadParams>,
+    ) -> Result<WorkerId, HiggsError> {
+        let payload = match params {
+            None => json!({ "id": model }),
+            Some(p) => {
+                let agreed = self.node_protocol(node).await.unwrap_or(1);
+                if agreed < 2 {
+                    return Err(HiggsError::NodeTooOldForParams {
+                        endpoint_id: node.to_owned(),
+                        agreed,
+                    });
+                }
+                serde_json::to_value(&p).map_err(|e| HiggsError::InternalFault {
+                    context: "encode NodeLoadParams".into(),
+                    detail: e.to_string(),
+                })?
+            }
+        };
         let transport = self.transport(node).await?;
-        let result = match transport.request(M_NODE_LOAD, json!({ "id": model })).await {
+        let result = match transport.request(M_NODE_LOAD, payload).await {
             Ok(v) => v,
             Err(e) => return Err(self.handle_op_error(node, &transport, e).await),
         };

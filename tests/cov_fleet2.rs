@@ -395,7 +395,12 @@ async fn hub_fleet_error_arms_over_mock_node() {
 
     let fleet = Arc::new(HubFleet::new(Arc::new(LogBus::new())));
     fleet
-        .add_node(peer.clone(), Arc::new(NodeTransport::new(dialer)), None)
+        .add_node(
+            peer.clone(),
+            Arc::new(NodeTransport::new(dialer)),
+            None,
+            None,
+        )
         .await;
 
     // Junk inventory → ProtocolViolation (the reply decoded but isn't a NodeInventory).
@@ -410,7 +415,7 @@ async fn hub_fleet_error_arms_over_mock_node() {
 
     // load reply missing worker_id → ProtocolViolation (parse_worker_id "missing" arm).
     let e = fleet
-        .load(&peer, "missing/wid")
+        .load(&peer, "missing/wid", None)
         .await
         .expect_err("a load reply missing worker_id is a protocol violation");
     assert!(
@@ -420,7 +425,7 @@ async fn hub_fleet_error_arms_over_mock_node() {
 
     // load reply worker_id out of u32 range → ProtocolViolation (the "out of range" arm).
     let e = fleet
-        .load(&peer, "oor/wid")
+        .load(&peer, "oor/wid", None)
         .await
         .expect_err("an out-of-range worker_id is a protocol violation");
     assert!(
@@ -429,7 +434,7 @@ async fn hub_fleet_error_arms_over_mock_node() {
     );
 
     // A real load records a route (served id == the raw model, one instance).
-    let worker = fleet.load(&peer, "ok/model").await.expect("load ok");
+    let worker = fleet.load(&peer, "ok/model", None).await.expect("load ok");
     assert_eq!(worker.0, 1, "the node-assigned worker id is threaded back");
     assert!(
         fleet.is_remote("ok/model").await,
@@ -574,4 +579,86 @@ async fn node_send_leave_error_arms() {
         unexpected.to_string().contains("HG038"),
         "an unexpected reply frame → HG038 protocol violation, got: {unexpected}"
     );
+}
+
+// ── 4. T8: the M_NODE_LOAD payload carries params at protocol 2, and only then ─────────────
+
+/// The WIRE pin for per-load params: against a MAJOR-2 admission a params-load
+/// puts `ctx_len` (and friends) on the `M_NODE_LOAD` payload, while a bare load
+/// still sends EXACTLY `{ "id" }` (no stray keys an old node could trip on).
+/// Fail-on-revert: revert `HubFleet::load`'s params branch to the bare payload
+/// and the ctx assert in the mock fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn params_load_payload_carries_ctx_at_protocol_two() {
+    let (dialer, acceptor, _eps) = connect_pair().await;
+    let peer = dialer.remote_id().to_string();
+
+    let _mock = tokio::spawn(serve_mock(acceptor, |method, id, params| {
+        match method.as_str() {
+            m if m == M_NODE_LOAD => {
+                let model = params.get("id").and_then(Value::as_str).unwrap_or("");
+                match model {
+                    "with/params" => {
+                        assert_eq!(
+                            params.get("ctx_len").and_then(Value::as_u64),
+                            Some(2048),
+                            "params-load payload must carry ctx_len: {params}"
+                        );
+                        assert!(
+                            params.get("gpu_layers").is_some(),
+                            "params-load payload must carry gpu_layers: {params}"
+                        );
+                    }
+                    "bare/load" => {
+                        let keys: Vec<_> = params
+                            .as_object()
+                            .map(|o| o.keys().cloned().collect())
+                            .unwrap_or_default();
+                        assert_eq!(keys, vec!["id"], "bare load sends ONLY the id: {params}");
+                    }
+                    other => panic!("unexpected model in mock: {other}"),
+                }
+                Reply::Response(resp_ok(id, json!({ "worker_id": 1 })))
+            }
+            // Post-load inventory refresh — an empty-but-valid inventory suffices.
+            m if m == M_NODE_INVENTORY => Reply::Response(resp_ok(
+                id,
+                json!({ "hostname": "mock", "os": "mock", "workers": [],
+                        "hardware": { "cpu_name": "m", "cpu_cores": 1, "ram_total_bytes": 1,
+                                       "vram_total_bytes": 0, "gpus": [] },
+                        "runtime": { "engine": "mock", "version": "0", "backend": "cpu" } }),
+            )),
+            _ => Reply::Response(resp_err(id, "HG037", "unknown method")),
+        }
+    }));
+
+    let fleet = Arc::new(HubFleet::new(Arc::new(LogBus::new())));
+    fleet
+        .add_node(
+            peer.clone(),
+            Arc::new(NodeTransport::new(dialer)),
+            None,
+            Some(2),
+        )
+        .await;
+
+    // Params-load: the mock's asserts fire inside the handler; a panic there
+    // fails the RPC and thus this expect.
+    let params = higgs::remote::NodeLoadParams {
+        id: "with/params".into(),
+        ctx_len: Some(2048),
+        gpu_layers: Some(higgs::worker::engine::GpuLayers::Count { n: 7 }),
+        threads: None,
+        params: None,
+    };
+    fleet
+        .load(&peer, "with/params", Some(params))
+        .await
+        .expect("params-load dispatches at protocol 2");
+
+    // Bare load: unchanged classic payload.
+    fleet
+        .load(&peer, "bare/load", None)
+        .await
+        .expect("bare load still works");
 }

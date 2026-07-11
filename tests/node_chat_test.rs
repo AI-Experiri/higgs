@@ -96,7 +96,7 @@ async fn node_chat_test_proves_the_iroh_link_end_to_end() {
 
     // ── Load the tiny model on the node, then the chat test traverses the REAL link. ──
     higgs
-        .node_load(&node_id, TINY_MODEL_ID)
+        .node_load(&node_id, TINY_MODEL_ID, None)
         .await
         .expect("tiny model loads on the live node");
 

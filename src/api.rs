@@ -621,7 +621,7 @@ where
 /// candidate is measured VERBATIM: no OOM-ladder degrade (the candidate set is
 /// itself the degrade ladder) and no `config.json` persist (the bench saves only
 /// its winning profile, once, at the end).
-fn node_params_for(id: &str, p: &LoadParams) -> crate::remote::NodeLoadParams {
+pub(crate) fn node_params_for(id: &str, p: &LoadParams) -> crate::remote::NodeLoadParams {
     crate::remote::NodeLoadParams {
         id: id.to_owned(),
         ctx_len: p.ctx_len().fixed_n(),

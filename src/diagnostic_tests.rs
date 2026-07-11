@@ -300,6 +300,13 @@ fn chat_test_ladder_codes_render_and_key() {
             HiggsError::ChatTestTargetMoved { detail: "x".into() },
             "HG077",
         ),
+        (
+            HiggsError::NodeTooOldForParams {
+                endpoint_id: "abc".into(),
+                agreed: 1,
+            },
+            "HG078",
+        ),
     ];
     for (err, code) in cases {
         let s = err.to_string();

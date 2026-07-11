@@ -104,7 +104,7 @@ async fn hub_node_mutation_error_arms_fire_with_a_live_fleet() {
 
     // ── load on an UNKNOWN node → HG027 NodeUnreachable (fleet present, so past the not-a-hub guard). ──
     let err = higgs
-        .node_load(bad_node, TINY_MODEL_ID)
+        .node_load(bad_node, TINY_MODEL_ID, None)
         .await
         .expect_err("load on an unknown node fails");
     assert!(
@@ -136,7 +136,7 @@ async fn hub_node_mutation_error_arms_fire_with_a_live_fleet() {
     // through the fleet; the hub surfaces it as an `Err` (not a hang, not an Ok). ──
     assert!(
         higgs
-            .node_load(&node_id, "definitely/not-a-real-model")
+            .node_load(&node_id, "definitely/not-a-real-model", None)
             .await
             .is_err(),
         "loading an unknown model on a real node fails (never Ok)"
@@ -156,7 +156,7 @@ async fn hub_node_mutation_error_arms_fire_with_a_live_fleet() {
     // ── The REAL node loads a model (happy fleet-load), proving the error arms above didn't wedge
     // the live link. Returns the new remote worker's id. ──
     let worker = higgs
-        .node_load(&node_id, TINY_MODEL_ID)
+        .node_load(&node_id, TINY_MODEL_ID, None)
         .await
         .expect("real model loads on the live node after the error arms");
     assert!(

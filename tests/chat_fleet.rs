@@ -171,11 +171,14 @@ async fn fleet_e2e_tool_chat() {
     // Admit the node's dial, gate it, and register it in the fleet.
     let (conn, peer) = admit_node(&hub, &mut allow, &mut tokens, &hub_id).await;
     fleet
-        .add_node(peer.clone(), Arc::new(NodeTransport::new(conn)), None)
+        .add_node(peer.clone(), Arc::new(NodeTransport::new(conn)), None, None)
         .await;
 
     // Load the tiny model on the node via the fleet → records the remote route.
-    fleet.load(&peer, TINY_MODEL_ID).await.expect("remote load");
+    fleet
+        .load(&peer, TINY_MODEL_ID, None)
+        .await
+        .expect("remote load");
     assert!(
         fleet.is_remote(TINY_MODEL_ID).await,
         "model is now remote-routable"
