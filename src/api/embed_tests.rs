@@ -305,6 +305,16 @@ async fn node_ops_without_a_hub_error() {
     assert!(higgs.node_retire("n").await.is_err());
     assert!(higgs.node_scan("n").await.is_err());
     assert!(higgs.node_chat_test("n", None, None).await.is_err());
+    // The "local" sentinel is refused as HG076 EVEN WITH THE HUB OFF (the arm
+    // precedes the not-a-hub gate, like node_label's) — never the "enable the
+    // hub first" runaround that would refuse again after being followed.
+    assert!(
+        matches!(
+            higgs.node_chat_test("local", None, None).await,
+            Err(HiggsError::InvalidChatTestTarget { .. })
+        ),
+        "hub-off local → HG076 chat-directly, not not-a-hub"
+    );
     // hub_disable is a no-op returning a disabled status when no hub is installed.
     let status = higgs.hub_disable().await;
     assert!(!status.enabled);
@@ -532,6 +542,10 @@ async fn node_chat_test_refusal_arms() {
             assert!(
                 detail.contains("this machine") && detail.contains("directly"),
                 "the local arm's remedy is a direct chat, not pairing: {detail}"
+            );
+            assert!(
+                detail.contains(" — "),
+                "the local arm's detail carries its own remediation: {detail}"
             );
         }
         other => panic!("expected HG076 for the local sentinel, got {other:?}"),

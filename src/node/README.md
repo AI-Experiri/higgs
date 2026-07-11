@@ -47,7 +47,8 @@ rule in `../../CLAUDE.md`).
   `nodes_view()` ← `Higgs::nodes()` (Fleet view, merged with allowlist labels + the local node);
   `load`/`unload` ← `node_load`/`node_unload` (`kill` is the force-unload variant);
   `served_on(node)` + `resolve` + `chat_pinned` ← `node_chat_test` (the Fleet view's
-  per-node link proof — always relayed, never local, and the pin rides the same
+  per-node link proof — always relayed, never local: the `"local"` sentinel is refused
+  outright [HG076], and the pin rides the same
   resolution that picks the transport so a concurrently re-homed id is refused
   [HG077], never mis-attested); `disconnect_all()` ← `hub_disable()` (kill
   switch). `NodeView` derives ts-rs bindings.

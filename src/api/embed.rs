@@ -368,7 +368,8 @@ impl Higgs {
     /// freshly-unrouted id is refused ([HG077], the transient concurrent-change
     /// class — re-resolve and retry) rather than silently testing, and then
     /// reporting, the wrong node. [HG076] stays the DETERMINISTIC pre-check
-    /// refusal of a bad explicit `served` operand.
+    /// refusal — of the impossible local-sentinel target, or of a bad explicit
+    /// `served` operand.
     ///
     /// Accepted residual: the refusal LADDER itself is not atomic — a retire
     /// landing between the [HG075] gate and the route resolution can surface as
@@ -384,14 +385,11 @@ impl Higgs {
         const TEST_MAX_TOKENS: usize = 48;
         const TEST_PROMPT: &str = "Reply with the single word: pong";
 
-        let Some(fleet) = self.fleet() else {
-            return Err(not_a_hub_error("nodes/chat_test"));
-        };
-
         // The LOCAL machine has no iroh hop to prove — and it rides the fleet
-        // view under the sentinel id "local" (`Higgs::nodes()`), so without
-        // this arm it would fall through to HG075's "pair the node first":
-        // pair-your-own-hub advice.
+        // view under the sentinel id "local" (`Higgs::nodes()`, emitted even
+        // with the hub role OFF), so this arm runs BEFORE the not-a-hub gate
+        // (the `node_label` precedent): otherwise a hub-off caller would be
+        // told "enable the hub first" only to be refused again afterwards.
         if node == "local" {
             return Err(HiggsError::InvalidChatTestTarget {
                 detail: "\"local\" is this machine — the chat test proves the hub→node iroh \
@@ -400,6 +398,10 @@ impl Higgs {
                     .into(),
             });
         }
+
+        let Some(fleet) = self.fleet() else {
+            return Err(not_a_hub_error("nodes/chat_test"));
+        };
 
         // Unknown endpoint id → HG075, before any route/served reasoning. The
         // node-id allocator remembers every admitted OR seeded node until retire,

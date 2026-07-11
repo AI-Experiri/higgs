@@ -718,7 +718,11 @@ pub enum HiggsError {
     /// is never issued for a node that does not exist. Sibling node ops
     /// (`node_load`/`node_scan`) predate this gate and still surface an unknown
     /// id as HG027 — aligning them is a candidate follow-up, not a property
-    /// this code already guarantees surface-wide.
+    /// this code already guarantees surface-wide. The hub's OWN endpoint id
+    /// lands here too when unpaired — deliberately: pairing the hub machine to
+    /// itself as a node is a real topology with a real iroh hop, so "pair the
+    /// node first" is honest advice there (unlike the `"local"` sentinel,
+    /// which is refused earlier as [HG076]).
     #[snafu(display(
         "[HG075] unknown node {endpoint_id} — it is not paired with this hub; check the id \
          (the fleet view / `nodes` op lists every paired node), or pair the node first"
@@ -726,14 +730,15 @@ pub enum HiggsError {
     #[diagnostic(code(HG075), severity(Error))]
     UnknownNode { endpoint_id: String },
 
-    /// A node chat test ([`crate::Higgs::node_chat_test`]) refused its explicit
-    /// `served` OPERAND at the pre-dispatch check: the id is not routed
-    /// anywhere, or it resolves to a DIFFERENT node than the one the test names
-    /// — a reply would attest a link the test never exercised. A caller-input
-    /// refusal against the routes as they stand when the call arrives; the
-    /// CONCURRENT-change refusal (target moved between the pre-check and the
-    /// pinned dispatch) is [HG077], not this. `detail` names the specific
-    /// conflict and its remedy.
+    /// A node chat test ([`crate::Higgs::node_chat_test`]) refused its target
+    /// at the pre-dispatch check — three shapes: the `"local"` sentinel (this
+    /// machine has no iroh hop to prove; runs before even the not-a-hub gate),
+    /// an explicit `served` operand that is not routed anywhere, or one that
+    /// resolves to a DIFFERENT node than the test names (a reply would attest
+    /// a link the test never exercised). A caller-input refusal against the
+    /// state as it stands when the call arrives; the CONCURRENT-change refusal
+    /// (target moved between the pre-check and the pinned dispatch) is
+    /// [HG077], not this. `detail` names the specific conflict and its remedy.
     #[snafu(display("[HG076] invalid chat-test target: {detail}"))]
     #[diagnostic(code(HG076), severity(Error))]
     InvalidChatTestTarget { detail: String },

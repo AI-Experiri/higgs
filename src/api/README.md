@@ -70,9 +70,10 @@ by `node::runtime`'s load path — one implementation, two callers:
   `node_unload` / `node_retire` / `node_label` / `node_scan` / `node_chat_test` (one
   short prompt relayed to a served instance ON a specific node via
   `fleet.chat_pinned` — always-remote AND node-pinned at dispatch, so a reply
-  proves the live iroh link to that exact node; refusal ladder [HG075] unknown
-  node / [HG074] nothing routed / [HG076] bad served operand / [HG077] target
-  moved concurrently), plus the installers
+  proves the live iroh link to that exact node; refusal ladder [HG076]
+  the local sentinel ("local" has no iroh hop — chat it directly; precedes even
+  the not-a-hub gate) / [HG075] unknown node / [HG074] nothing routed / [HG076]
+  bad served operand / [HG077] target moved concurrently), plus the installers
   `set_fleet`/`fleet`, `set_hub`/`hub`/`clear_hub`.
 - Keys/security: `mint_key(label, scopes?)` / `revoke_key(label)` (trusted, bearer-free
   but every structural invariant intact — `revoke_key` reads `lan_exposed()` INSIDE the
