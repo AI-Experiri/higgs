@@ -12,8 +12,8 @@ import type { SplitMode } from "./SplitMode";
  * [`crate::worker::engine::LoadParams`] umbrella. Covers every model+context
  * knob the `llama-cpp-2` 0.1.139 bindings expose (DESIGN §4a/§4b). The three
  * base fields (`ctx_len`/`gpu_layers`/`threads`) are always present — the
- * quick-load / `default_load` / suggester path fills them; `gpu_layers ==
- * u32::MAX` means "all on GPU" (LM Studio "max" semantics). Every other field
+ * quick-load / `default_load` / suggester path fills them; "all on GPU" is
+ * the typed `GpuLayers::All` (the old `u32::MAX` sentinel is gone). Every other field
  * is optional: absent (`None`/empty) means "use the engine default", which
  * reproduces the pre-expansion behavior exactly.
  */

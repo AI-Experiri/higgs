@@ -270,8 +270,8 @@ impl Higgs {
     /// touches [`HubFleet`](crate::node::fleet::HubFleet) directly. Errors when the
     /// server is not a hub (no fleet installed).
     ///
-    /// `params = None` — or a `Some` whose fields are all `None`, or whose only
-    /// values are the count-zeros the fleet normalizes to absent — is the
+    /// `params = None` — or a `Some` the fleet NORMALIZES to nothing (all-`None`
+    /// fields, count-zeros, or a rich object with no real overrides) — is the
     /// classic default load (any node, never version-gated); any other `Some`
     /// ships the
     /// OPTION-shaped [`NodeLoadParams`](crate::remote::NodeLoadParams) fields
@@ -283,6 +283,12 @@ impl Higgs {
     /// own defaults. The hub's local tune profiles are NEVER applied here: they
     /// are anchored to THIS machine's hardware and file signatures, both wrong
     /// for a remote node.
+    ///
+    /// Accepted residual (pre-existing, applies to bare loads too): a caller
+    /// that DROPS this future (e.g. an aborted control op) between the node's
+    /// load reply and the route commit strands a resident, route-less worker on
+    /// the node — unloadable from the hub (no served id) until the node's idle
+    /// reaper or a restart reclaims it. The Fleet UI never aborts loads.
     pub async fn node_load(
         &self,
         node: &str,

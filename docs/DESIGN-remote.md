@@ -547,7 +547,9 @@ calling `Supervisor::request`.
   "cpu_usage_percent": 41.0, "ram_used_bytes": 9000000000,   // refresh deltas
   "workers": [ { "worker_id":1, "loaded": LoadedInfo } ] }   // worker_id:u32 (§5.4a); LoadedInfo src/api.rs:170 UNCHANGED
 ```
-`M_INVENTORY` is push-style so the hub's view is event-driven, not poll. The hub keeps
+AS SHIPPED `M_INVENTORY` is a hub→node REQUEST (the hub pulls on connect and after
+each lifecycle op via `refresh_inventory`); the push-style/event-driven design above
+never landed, and the shipped `NodeInventory` carries no `reason` field. The hub keeps
 `HashMap<NodeId, NodeView>` (`NodeView` = `NodeInventory` + hub-observed addr/path, §4.2.1) —
 the single home for the fleet view that `/api/higgs/nodes` (UI panel) renders. `worker_id` is a
 `WorkerId` (§5.4a, `u32`) owned by the node's `NodeRuntime` registry; **`HardwareInfo`/
@@ -611,7 +613,7 @@ operation, then replies. **None reach `WorkerState`** — they live one layer up
 | `M_KILL` | `higgs/node/kill` | `{ "worker_id" }` | `StatusOk` | look up worker → `Supervisor::stop()` (force-reap that ONE child) → remove → free `WorkerId` → drop ring |
 | `M_SCAN` | `higgs/node/scan` | `{}` | `{ "models": [HiggsModel…] }` | the node's on-disk catalog (read-only scan); inventory is the SEPARATE `M_INVENTORY` op |
 | `M_SYSINFO` | `higgs/node/sysinfo` | `{}` | `{ "hardware":HardwareInfo, "runtime":RuntimeInfo }` | `SystemInfo::gather(config, Higgs::sysinfo)` — see fix C below |
-| `M_PULL` | `higgs/node/pull` | `{ "repo", "revision"?, "files"? }` | `StatusOk` (progress on data plane, §4.4) | **NEW HF downloader** → higgs's OWN `models/` dir (fix D) |
+| `M_PULL` | `higgs/node/pull` | `NodePullParams { request_id, repo, file, revision? }` | `N_PROGRESS` stream, then `{ "path" }` | AS SHIPPED: single-file pull with streamed progress (`remote.rs`) |
 
 > **`M_LOAD` = orchestrator spawns a NEW worker (multi-worker, net-new).** The node may
 > already host other workers; `M_LOAD` does NOT replace them. `NodeRuntime` spawns a fresh

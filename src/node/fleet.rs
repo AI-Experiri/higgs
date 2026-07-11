@@ -899,10 +899,12 @@ impl HubFleet {
     /// a fresh worker on the node and adds an instance, so N loads of the same model coexist
     /// as N served ids (`org/model`, `org/model-1`, …). Returns the new worker's id.
     ///
-    /// `params = None` — or a `Some(p)` whose fields are ALL `None` (its wire
-    /// bytes are identical) — sends the classic bare `{ "id" }` (works against
-    /// ANY node, never version-gated); a `Some(p)` with anything set sends the
-    /// full [`NodeLoadParams`](crate::remote::NodeLoadParams) —
+    /// `params = None` — or a `Some(p)` that NORMALIZES to nothing: all fields
+    /// `None`, count-zeros (ctx/threads and the rich thread/batch counts, which
+    /// read as "auto"), and a no-override rich object all collapse to the
+    /// classic bare `{ "id" }` (works against ANY node, never version-gated).
+    /// A `Some(p)` with anything real left after normalization sends the full
+    /// [`NodeLoadParams`](crate::remote::NodeLoadParams) —
     /// gated on the node having negotiated protocol major ≥ 2 ([HG078] otherwise:
     /// some major-1 builds would parse the fields and older ones hard-reject —
     /// indistinguishable from here — and silently loading with the node's
@@ -939,6 +941,16 @@ impl HubFleet {
         let params = params.map(|mut p| {
             p.ctx_len = p.ctx_len.filter(|c| *c > 0);
             p.threads = p.threads.filter(|t| *t > 0);
+            // Rich count-zeros are the same "asking nothing" as base zeros —
+            // the NODE strips them as absent anyway — so normalize them here
+            // too, BEFORE the emptiness filter below: a rich object whose only
+            // content is a zero count must not draw a version refusal.
+            if let Some(lc) = p.params.as_mut() {
+                lc.n_batch = lc.n_batch.filter(|n| *n > 0);
+                lc.n_ubatch = lc.n_ubatch.filter(|n| *n > 0);
+                lc.n_seq_max = lc.n_seq_max.filter(|n| *n > 0);
+                lc.n_threads_batch = lc.n_threads_batch.filter(|n| *n > 0);
+            }
             // An all-default rich object asks nothing either (`{"params": {}}`
             // parses to a default LlamaCppParams) — drop it so the bare arm's
             // "never version-refused for asking nothing" principle holds for
@@ -946,10 +958,6 @@ impl HubFleet {
             p.params = p
                 .params
                 .filter(crate::worker::engine::llamacpp::params::LlamaCppParams::has_overrides);
-            // An all-default rich object asks nothing either (`{"params": {}}`
-            // parses to a default LlamaCppParams) — drop it so the bare arm's
-            // "never version-refused for asking nothing" principle holds for
-            // the rich field too, not just for absent/zero base fields.
             p
         });
         let payload = match params {

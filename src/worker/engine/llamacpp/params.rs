@@ -135,8 +135,8 @@ higgs_ts! {
     /// [`crate::worker::engine::LoadParams`] umbrella. Covers every model+context
     /// knob the `llama-cpp-2` 0.1.139 bindings expose (DESIGN §4a/§4b). The three
     /// base fields (`ctx_len`/`gpu_layers`/`threads`) are always present — the
-    /// quick-load / `default_load` / suggester path fills them; `gpu_layers ==
-    /// u32::MAX` means "all on GPU" (LM Studio "max" semantics). Every other field
+    /// quick-load / `default_load` / suggester path fills them; "all on GPU" is
+    /// the typed `GpuLayers::All` (the old `u32::MAX` sentinel is gone). Every other field
     /// is optional: absent (`None`/empty) means "use the engine default", which
     /// reproduces the pre-expansion behavior exactly.
     #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, higgs_macros::TsParamHelp)]
@@ -398,27 +398,58 @@ impl LlamaCppParams {
     /// fields (`ctx_len`/`gpu_layers`/`threads`) ride their own dedicated wire
     /// fields, so a base-only load needs no payload (smaller wire; forward-compat).
     pub fn has_overrides(&self) -> bool {
-        self.use_mmap.is_some()
-            || self.use_mlock.is_some()
-            || self.cpu_moe.is_some()
-            || self.split_mode.is_some()
-            || self.main_gpu.is_some()
-            || self.devices.is_some()
-            || self.n_batch.is_some()
-            || self.n_ubatch.is_some()
-            || self.n_seq_max.is_some()
-            || self.n_threads_batch.is_some()
-            || self.flash_attn.is_some()
-            || self.offload_kqv.is_some()
-            || self.swa_full.is_some()
-            || self.type_k.is_some()
-            || self.type_v.is_some()
-            || self.rope_scaling_type.is_some()
-            || self.rope_freq_base.is_some()
-            || self.rope_freq_scale.is_some()
-            || self.seed.is_some()
-            || !self.cpu_buft_overrides.is_empty()
-            || !self.kv_overrides.is_empty()
+        // EXHAUSTIVE destructure: a new field added to the struct breaks this
+        // at compile time, so it can never be silently forgotten here — a
+        // forgotten field would make a load whose only override is that field
+        // read as "no overrides" and be DROPPED by the hub's emptiness filter
+        // (and skipped by the local attach gate): silent loss, not refusal.
+        let Self {
+            ctx_len: _,
+            gpu_layers: _,
+            threads: _,
+            use_mmap,
+            use_mlock,
+            cpu_moe,
+            cpu_buft_overrides,
+            split_mode,
+            main_gpu,
+            devices,
+            n_batch,
+            n_ubatch,
+            n_seq_max,
+            n_threads_batch,
+            flash_attn,
+            offload_kqv,
+            swa_full,
+            type_k,
+            type_v,
+            rope_scaling_type,
+            rope_freq_base,
+            rope_freq_scale,
+            kv_overrides,
+            seed,
+        } = self;
+        use_mmap.is_some()
+            || use_mlock.is_some()
+            || cpu_moe.is_some()
+            || split_mode.is_some()
+            || main_gpu.is_some()
+            || devices.is_some()
+            || n_batch.is_some()
+            || n_ubatch.is_some()
+            || n_seq_max.is_some()
+            || n_threads_batch.is_some()
+            || flash_attn.is_some()
+            || offload_kqv.is_some()
+            || swa_full.is_some()
+            || type_k.is_some()
+            || type_v.is_some()
+            || rope_scaling_type.is_some()
+            || rope_freq_base.is_some()
+            || rope_freq_scale.is_some()
+            || seed.is_some()
+            || !cpu_buft_overrides.is_empty()
+            || !kv_overrides.is_empty()
     }
 }
 

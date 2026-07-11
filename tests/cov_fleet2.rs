@@ -745,6 +745,23 @@ async fn params_load_payload_carries_ctx_at_protocol_two() {
         .await
         .expect("an all-default rich object normalizes to a bare load");
 
+    // A rich object whose ONLY content is a count-zero asks nothing either:
+    // the hub normalizes the zero (the node would strip it anyway), the
+    // emptiness filter drops the husk, and the load rides the bare arm.
+    let zero_rich = higgs::remote::NodeLoadParams {
+        id: String::new(),
+        ctx_len: None,
+        gpu_layers: None,
+        threads: None,
+        params: Some(
+            serde_json::from_value(serde_json::json!({ "n_batch": 0 })).expect("rich parse"),
+        ),
+    };
+    fleet
+        .load(&peer, "bare/load", Some(zero_rich))
+        .await
+        .expect("a zero-only rich object normalizes to a bare load");
+
     // Partial params: only ctx set — gpu_layers/threads stay off the wire.
     let partial = higgs::remote::NodeLoadParams {
         id: "only/ctx".into(),

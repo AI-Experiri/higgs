@@ -121,6 +121,21 @@ async fn params_load_refused_below_protocol_two() {
         .load(&node_key, &model_id, Some(empty))
         .await
         .expect("all-None params load against a floor-1 node");
+
+    // …and so is a Some whose rich object has no real overrides: it NORMALIZES
+    // to nothing before the version gate, so a floor-1 node still loads. A
+    // regression that moves normalization after the gate fails here with HG078.
+    let empty_rich = crate::remote::NodeLoadParams {
+        id: String::new(),
+        ctx_len: Some(0),
+        gpu_layers: None,
+        threads: None,
+        params: Some(Default::default()),
+    };
+    fleet
+        .load(&node_key, &model_id, Some(empty_rich))
+        .await
+        .expect("normalized-empty params load against a floor-1 node");
 }
 
 /// Connectivity precedes the version gate: a SEEDED (paired-but-offline,
