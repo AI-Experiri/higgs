@@ -1015,9 +1015,9 @@ impl Higgs {
     ///
     /// Only `addr` is final here. `lan` is armed afterwards by [`Higgs::arm_lan_serve`]
     /// — which does it under the KEYSTORE lock, together with those guards, so a
-    /// concurrent revoke can never interleave into a keyless LAN surface — and the
-    /// enforced CORS list is recorded by [`ServeGuard::set_cors_origins`] once it has
-    /// been read. A caller that knows both up front (a test) may pass them directly.
+    /// concurrent revoke can never interleave into a keyless LAN surface. (The CORS
+    /// allowlist is not per-listener: every layer reads the shared live list per
+    /// request — G7.) A caller that knows `lan` up front (a test) may pass it.
     ///
     /// The returned [`ServeGuard`] deregisters on drop, so the listener's state is
     /// released on graceful shutdown, on a serve error, and on task CANCELLATION
@@ -1224,8 +1224,10 @@ impl Higgs {
 
     /// Extra CORS origins from `config.json` (`cors_origins`), matched exactly
     /// against the request `Origin` in addition to the built-in loopback/tauri
-    /// set. Read once at serve start — a change needs a restart (G7 owns live
-    /// rebind). Errors read as empty (the built-in set still applies).
+    /// set. The PERSISTED list: serve start and every [`Higgs::set_cors_origins`]
+    /// write publish it to the LIVE list the layers actually read (G7), so this
+    /// is read at publish points, not per request. Errors read as empty (the
+    /// built-in set still applies).
     ///
     /// Every entry is CANONICALIZED on read (and an invalid one dropped with a
     /// warning), exactly as [`Higgs::set_cors_origins`] canonicalizes on write.
