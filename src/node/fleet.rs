@@ -909,10 +909,29 @@ impl HubFleet {
         // not as a version refusal — after a hub cold start, seeded nodes are
         // version-less until they reconnect, and "update the node" would be
         // false advice for a current node that is merely disconnected.
+        //
+        // Accepted residual: `transport()` and `node_protocol()` are two actor
+        // round trips, so a RETIRE landing between them clears the version and
+        // a live params-load reads the floor → a spurious [HG078] refusal
+        // (wrong refusal CLASS; never a wrong send — the retire also closed
+        // the transport, so a retry gets HG027). The reverse interleaving
+        // (re-admit with a newer version) sends correctly or fails HG027 on
+        // the dead transport.
         let transport = self.transport(node).await?;
         let payload = match params {
             None => json!({ "id": model }),
-            Some(p) => {
+            // ALL-None params serialize byte-identically to a bare load
+            // (`skip_serializing_if` on every field) — treat them AS one, so a
+            // caller's `params: {}` is never version-refused for asking nothing.
+            Some(p)
+                if p.ctx_len.is_none()
+                    && p.gpu_layers.is_none()
+                    && p.threads.is_none()
+                    && p.params.is_none() =>
+            {
+                json!({ "id": model })
+            }
+            Some(mut p) => {
                 let agreed = self.node_protocol(node).await.unwrap_or(1);
                 if agreed < 2 {
                     return Err(HiggsError::NodeTooOldForParams {
@@ -920,6 +939,12 @@ impl HubFleet {
                         agreed,
                     });
                 }
+                // The route below is recorded under `model` — force the wire id
+                // to match so a direct caller with a divergent `p.id` cannot
+                // make the node load one model while the served id names
+                // another (the facade forces this too; here it is load-bearing
+                // for `pub` callers).
+                p.id = model.to_owned();
                 serde_json::to_value(&p).map_err(|e| HiggsError::InternalFault {
                     context: "encode NodeLoadParams".into(),
                     detail: e.to_string(),

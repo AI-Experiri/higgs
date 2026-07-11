@@ -270,13 +270,16 @@ impl Higgs {
     /// touches [`HubFleet`](crate::node::fleet::HubFleet) directly. Errors when the
     /// server is not a hub (no fleet installed).
     ///
-    /// `params = None` is the classic default load (any node); `Some` maps the
-    /// [`LoadParams`] umbrella onto the wire shape (the same mapping the local
-    /// path uses) and requires the node to have negotiated protocol major ≥ 2 —
-    /// an older node is refused with [HG078] rather than silently loaded with
-    /// its own defaults. The hub's local tune profiles are NEVER applied here:
-    /// they are anchored to THIS machine's hardware and file signatures, both
-    /// wrong for a remote node.
+    /// `params = None` is the classic default load (any node); `Some` ships the
+    /// OPTION-shaped [`NodeLoadParams`](crate::remote::NodeLoadParams) fields
+    /// VERBATIM (`id` is forced from `model`) — an absent ctx/gpu/threads stays
+    /// absent on the wire so the NODE's defaults apply; mapping through a
+    /// concrete `LoadParams` here would launder struct defaults into explicit
+    /// values. Requires the node to have negotiated protocol major ≥ 2 — an
+    /// older node is refused with [HG078] rather than silently loaded with its
+    /// own defaults. The hub's local tune profiles are NEVER applied here: they
+    /// are anchored to THIS machine's hardware and file signatures, both wrong
+    /// for a remote node.
     pub async fn node_load(
         &self,
         node: &str,

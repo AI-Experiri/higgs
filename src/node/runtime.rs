@@ -787,7 +787,11 @@ fn worker_load_params(
         );
     }
     if let Some(t) = threads {
-        obj.insert("threads".into(), t.into());
+        // Floor at 1: nothing validates the wire value upstream, and an
+        // explicit `threads: 0` would reach `with_n_threads(0)` unclamped
+        // (GGML assert territory). The engine "auto" spelling is ABSENCE,
+        // never zero — the local default computes ≥ 1 the same way.
+        obj.insert("threads".into(), t.max(1).into());
     }
     // Merge the rich engine overrides (type_k, flash_attn, cpu_moe, n_seq_max, …) the
     // worker applies. The base fields stay authoritative (the node owns ctx-cap /

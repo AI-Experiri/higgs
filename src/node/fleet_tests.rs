@@ -32,8 +32,9 @@ async fn fleet_with_one_node() -> (Arc<HubFleet>, NodeKey, String, tempfile::Tem
 
 /// A params-load against a MAJOR-2 admission passes the gate and dispatches
 /// (the version branch, complementing the floor-1 refusal above). What lands
-/// ON the wire is pinned by the mock-transport payload test (cov_fleet2), and
-/// real application by the integration test.
+/// ON the wire is pinned by the mock-transport payload test (cov_fleet2), real
+/// application by the integration test, and the FACADE path (including the
+/// id-force) by embed_tests::node_load_params_forces_the_wire_id_from_model.
 #[tokio::test]
 async fn params_load_reaches_the_node_at_protocol_two() {
     let (root, model_id) = stage_dummy_model("higgs-test/m");
@@ -107,6 +108,33 @@ async fn params_load_refused_below_protocol_two() {
 
     // The classic bare load is untouched by the gate.
     fleet.load(&node_key, &model_id, None).await.unwrap();
+}
+
+/// Connectivity precedes the version gate: a SEEDED (paired-but-offline,
+/// version-less) node gets HG027 from a params-load — never "[HG078] update
+/// the node", which would be false advice for a current node that is merely
+/// disconnected. Fail-on-revert: swap the gate back before `transport()` and
+/// this reads HG078.
+#[tokio::test]
+async fn params_load_against_a_seeded_offline_node_is_unreachable_not_too_old() {
+    let fleet = Arc::new(HubFleet::new(Arc::new(crate::log_bus::LogBus::new())));
+    fleet.seed_node("paired-but-offline").await;
+
+    let params = crate::remote::NodeLoadParams {
+        id: "m".into(),
+        ctx_len: Some(256),
+        gpu_layers: None,
+        threads: None,
+        params: None,
+    };
+    let err = fleet
+        .load("paired-but-offline", "m", Some(params))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, HiggsError::NodeUnreachable { .. }),
+        "offline node → HG027, not a version refusal: {err:?}"
+    );
 }
 
 #[tokio::test]

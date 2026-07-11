@@ -320,6 +320,28 @@ async fn node_ops_without_a_hub_error() {
     assert!(!status.enabled);
 }
 
+/// The FACADE params path: `node_load(.., Some(p))` dispatches over a major-2
+/// admission and the id-force is load-bearing — `p.id` deliberately names a
+/// model the node does NOT have; only the forced `id = model` makes the load
+/// resolve. Fail-on-revert: drop the `p.id = model` force (facade or fleet) and
+/// the node fails the load on the bogus id.
+#[tokio::test]
+async fn node_load_params_forces_the_wire_id_from_model() {
+    let (higgs, node_key, model_id, _guards) = fake_higgs_with_remote_node().await;
+    let params = crate::remote::NodeLoadParams {
+        id: "divergent/id-the-node-lacks".into(),
+        ctx_len: Some(256),
+        gpu_layers: None,
+        threads: None,
+        params: None,
+    };
+    let worker = higgs
+        .node_load(&node_key, &model_id, Some(params))
+        .await
+        .expect("params-load dispatches with the forced id");
+    assert!(worker.0 >= 1);
+}
+
 // ── node_chat_test: the Fleet view's per-node iroh-link proof ────────────────
 
 /// Spawn ONE in-process fake remote node serving `model_id` and register it on
@@ -359,7 +381,10 @@ async fn add_fake_remote_node(
             node_key.clone(),
             Arc::new(crate::node::transport::NodeTransport::new(conn)),
             None,
-            None,
+            // Current-build semantics: the fake node "negotiated" major 2, so
+            // facade-level params-loads dispatch (the floor-1 refusal arm is
+            // pinned in fleet_tests over an explicitly version-less admit).
+            Some(2),
         )
         .await;
     fleet
