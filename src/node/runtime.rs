@@ -200,13 +200,13 @@ enum NodeMsg {
     /// Periodic tick from the idle reaper: unload every resident worker with no in-flight chat
     /// that has been idle past the TTL.
     ReapIdle,
-    /// Snapshot the resident instances as `(worker, raw model)` — the engine's input to the
-    /// global served-id derivation (P4b).
     /// The full per-worker inventory snapshot (model + T9 stats), one atomic
     /// actor read — the same rows `M_NODE_INVENTORY` carries, minus hardware.
     WorkerSnapshot {
         reply: oneshot::Sender<Vec<crate::remote::InventoryWorker>>,
     },
+    /// Snapshot the resident instances as `(worker, raw model)` — the engine's input to the
+    /// global served-id derivation (P4b).
     Instances {
         reply: oneshot::Sender<Vec<(WorkerId, String)>>,
     },
@@ -1163,8 +1163,10 @@ impl NodeRuntime {
         &self.bus
     }
 
-    /// Resident instances as `(worker, raw model)` — the engine's input to global served-id
-    /// derivation. Empty if the actor has stopped.
+    /// The full per-worker inventory rows (model + T9 runtime stats) in one
+    /// atomic actor read — what `M_NODE_INVENTORY` carries, minus hardware
+    /// (`served_id` left empty; the hub fills it). Empty if the actor has
+    /// stopped.
     pub async fn worker_snapshot(&self) -> Vec<crate::remote::InventoryWorker> {
         let (tx, rx) = oneshot::channel();
         if self
@@ -1177,7 +1179,9 @@ impl NodeRuntime {
         rx.await.unwrap_or_default()
     }
 
-    /// Resident `(worker, model)` pairs — the fast id/model read.
+    /// Resident `(worker, raw model)` pairs — the fast id/model read and the
+    /// engine's input to global served-id derivation. Empty if the actor has
+    /// stopped.
     pub async fn instances(&self) -> Vec<(WorkerId, String)> {
         let (tx, rx) = oneshot::channel();
         if self.handle.send(NodeMsg::Instances { reply: tx }).is_err() {
