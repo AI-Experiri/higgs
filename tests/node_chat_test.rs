@@ -119,14 +119,28 @@ async fn node_chat_test_proves_the_iroh_link_end_to_end() {
         .expect("explicit-served chat test");
     assert_eq!(explicit.served_id, TINY_MODEL_ID);
 
-    // ── A served id routed on the node but a WRONG requested node → refused, no chat fired. ──
+    // ── A NEVER-PAIRED endpoint id → [HG075] unknown node, before any served/route
+    // reasoning (even though the served id itself is real). ──
     let bad_node = "0000000000000000000000000000000000000000000000000000000000000000";
     let err = higgs
         .node_chat_test(bad_node, Some(TINY_MODEL_ID), None)
         .await
-        .expect_err("mismatched node/served is refused");
+        .expect_err("an unknown node is refused");
     assert!(
-        matches!(err, HiggsError::HubControlFailed { .. }),
-        "node/served mismatch → refusal, got {err:?}"
+        matches!(err, HiggsError::UnknownNode { .. }),
+        "never-paired node → HG075, got {err:?}"
+    );
+
+    // ── A REAL (paired) node but a served id it does not route → [HG076]. The
+    // local hub machine's own endpoint is not this node's, so route a mismatch
+    // via an id that is served but pinned to the real node: test the refusal by
+    // asking the real node for a served id that is NOT routed anywhere. ──
+    let err = higgs
+        .node_chat_test(&node_id, Some("no-such/served-id"), None)
+        .await
+        .expect_err("an unrouted served id is refused");
+    assert!(
+        matches!(err, HiggsError::InvalidChatTestTarget { .. }),
+        "unrouted served id → HG076, got {err:?}"
     );
 }

@@ -381,45 +381,71 @@ async fn node_chat_test_relays_to_the_nodes_instance() {
     assert_eq!(explicit.content, "hello");
 }
 
-/// The refusal arms: nothing routed on the node ([HG074]), an unrouted served id
-/// (HG002), and a served id routed on a DIFFERENT node (refused — the report
-/// would claim a link the test never exercised).
+/// The refusal ladder, most-specific first: a never-paired endpoint id is
+/// [HG075] (no "load first" advice for a nonexistent node); a KNOWN node with
+/// nothing routed is [HG074]; an explicit served id that is unrouted, or routed
+/// on a DIFFERENT node, is [HG076] (the report would claim a link the test
+/// never exercised).
 #[tokio::test]
 async fn node_chat_test_refusal_arms() {
     let (higgs, node_key, model_id, _root) = fake_higgs_with_remote_node().await;
+    let fleet = higgs.fleet().expect("fleet installed");
 
-    // A node the fleet has no routes for → HG074 (load first), not a chat error.
-    let bare = higgs.node_chat_test("unknown-node", None, None).await;
+    // A node the hub has NEVER paired → HG075 unknown-node, not load-first advice.
+    let unknown = higgs.node_chat_test("unknown-node", None, None).await;
     assert!(
-        matches!(bare, Err(HiggsError::NodeNothingServed { ref endpoint_id }) if endpoint_id == "unknown-node"),
+        matches!(unknown, Err(HiggsError::UnknownNode { ref endpoint_id }) if endpoint_id == "unknown-node"),
+        "expected HG075, got {unknown:?}"
+    );
+    // …even when it names a REAL served id (the node check is most-specific-first).
+    let unknown_with_served = higgs
+        .node_chat_test("unknown-node", Some(&model_id), None)
+        .await;
+    assert!(
+        matches!(unknown_with_served, Err(HiggsError::UnknownNode { .. })),
+        "expected HG075, got {unknown_with_served:?}"
+    );
+
+    // A KNOWN (seeded) node with an empty route table → HG074 (load first).
+    fleet.seed_node("bare-node").await;
+    let bare = higgs.node_chat_test("bare-node", None, None).await;
+    assert!(
+        matches!(bare, Err(HiggsError::NodeNothingServed { ref endpoint_id }) if endpoint_id == "bare-node"),
         "expected HG074, got {bare:?}"
     );
 
-    // An unrouted served id → HG002 model-not-found.
+    // An unrouted served id on a known node → HG076 naming the operand, not a
+    // "not found on disk" (no disk was consulted).
     let unrouted = higgs
         .node_chat_test(&node_key, Some("nope/none"), None)
         .await;
-    assert!(
-        matches!(unrouted, Err(HiggsError::ModelNotFound { .. })),
-        "expected HG002, got {unrouted:?}"
-    );
+    match unrouted {
+        Err(HiggsError::InvalidChatTestTarget { ref detail }) => {
+            assert!(detail.contains("nope/none"), "names the operand: {detail}");
+            assert!(
+                detail.contains("not routed"),
+                "says what was actually checked: {detail}"
+            );
+        }
+        other => panic!("expected HG076 for an unrouted served id, got {other:?}"),
+    }
 
-    // A REAL served id but the WRONG node → refused with both nodes named.
+    // A REAL served id but the WRONG (known) node → HG076 naming both nodes.
     let mismatch = higgs
-        .node_chat_test("unknown-node", Some(&model_id), None)
+        .node_chat_test("bare-node", Some(&model_id), None)
         .await;
     match mismatch {
-        Err(HiggsError::HubControlFailed { ref detail, .. }) => {
+        Err(HiggsError::InvalidChatTestTarget { ref detail }) => {
             assert!(
                 detail.contains(&node_key),
                 "names the routed node: {detail}"
             );
             assert!(
-                detail.contains("unknown-node"),
+                detail.contains("bare-node"),
                 "names the requested node: {detail}"
             );
         }
-        other => panic!("expected a node-mismatch refusal, got {other:?}"),
+        other => panic!("expected HG076 for a node mismatch, got {other:?}"),
     }
 }
 

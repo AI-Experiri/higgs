@@ -23,6 +23,12 @@ served_id: string,
  */
 content: string, 
 /**
+ * Model thinking (`reasoning_content`), when the model emitted any —
+ * lets the UI distinguish "reasoning-only reply, link OK" from a
+ * genuinely empty answer.
+ */
+reasoning_content?: string, 
+/**
  * OpenAI-style finish reason ("stop", or "length" when the test budget
  * truncated the reply — still a successful link proof).
  */

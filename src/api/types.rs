@@ -396,6 +396,12 @@ higgs_ts! {
         /// The model's reply text (may be empty if the model answered with
         /// reasoning only under the small test budget).
         pub content: String,
+        /// Model thinking (`reasoning_content`), when the model emitted any —
+        /// lets the UI distinguish "reasoning-only reply, link OK" from a
+        /// genuinely empty answer.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub reasoning_content: Option<String>,
         /// OpenAI-style finish reason ("stop", or "length" when the test budget
         /// truncated the reply — still a successful link proof).
         pub finish_reason: String,

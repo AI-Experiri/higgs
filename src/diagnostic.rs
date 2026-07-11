@@ -700,10 +700,33 @@ pub enum HiggsError {
     /// itself). The remedy is a load, not a retry.
     #[snafu(display(
         "[HG074] no served model instance is routed on node {endpoint_id} — load a model on \
-         it first (`Higgs::node_load` / the Fleet view's Load), or check the node id"
+         it first (`Higgs::node_load` / the Fleet view's Load)"
     ))]
     #[diagnostic(code(HG074), severity(Error))]
     NodeNothingServed { endpoint_id: String },
+
+    /// A node-directed op named an endpoint id this hub has NEVER paired (or has
+    /// since retired) — distinct from [HG074] (node known, route table empty →
+    /// load first) and from [HG027] (node known but offline → reconnect). Raised
+    /// before any route/served resolution, so "load a model on it first" advice
+    /// is never issued for a node that does not exist.
+    #[snafu(display(
+        "[HG075] unknown node {endpoint_id} — it is not paired with this hub; check the id \
+         (the fleet view / `nodes` op lists every paired node), or pair the node first"
+    ))]
+    #[diagnostic(code(HG075), severity(Error))]
+    UnknownNode { endpoint_id: String },
+
+    /// A node chat test ([`crate::Higgs::node_chat_test`]) was given an explicit
+    /// `served` operand that cannot prove the requested link: the id is not
+    /// routed anywhere (perhaps just unloaded), or it is routed on a DIFFERENT
+    /// node than the one the test names (a reply would attest a link the test
+    /// never exercised). A caller-input error — the request will fail
+    /// identically until the operands change; `detail` names the specific
+    /// conflict and its remedy.
+    #[snafu(display("[HG076] invalid chat-test target: {detail}"))]
+    #[diagnostic(code(HG076), severity(Error))]
+    InvalidChatTestTarget { detail: String },
 }
 
 #[cfg(test)]

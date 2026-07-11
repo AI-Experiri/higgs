@@ -346,14 +346,25 @@ impl Higgs {
     /// resident would silently test the local worker instead of the remote link
     /// this exists to prove.
     ///
-    /// `served` picks the exact instance to test; `None` tests the node's first
-    /// served instance (sorted) — [HG074] when nothing is routed there. A `served`
-    /// that is unrouted is HG002; one routed on a DIFFERENT node is refused (the
-    /// report would claim a link the test never exercised). `prompt` defaults to a
-    /// terse fixed prompt; generation runs deterministically (temperature 0) under
-    /// a small token budget, so a truncated reply (`finish_reason: "length"`) is
-    /// still a successful round trip. Node offline surfaces as the chat's own
-    /// HG027.
+    /// The refusal ladder, most-specific first: an endpoint id the hub never
+    /// paired is [HG075] (before any route lookup, so nobody is told to "load a
+    /// model" on a nonexistent node). On a KNOWN node, `served = None` tests the
+    /// node's first served instance (sorted) — [HG074] when nothing is routed
+    /// there; an explicit `served` that is unrouted, or routed on a DIFFERENT
+    /// node, is [HG076] (the report would claim a link the test never
+    /// exercised). `prompt` defaults to a terse fixed prompt; generation runs
+    /// deterministically (temperature 0) under a small token budget, so a
+    /// truncated reply (`finish_reason: "length"`) is still a successful round
+    /// trip. Node offline surfaces as the chat's own HG027.
+    ///
+    /// Accepted residual (documented, not defended): the served id is pinned to
+    /// the node here, but [`HubFleet::chat`](crate::node::fleet::HubFleet::chat)
+    /// re-resolves it independently a moment later. If, between those two actor
+    /// round trips, the instance is unloaded AND the same model re-loaded on
+    /// another node so the served id re-homes, the chat exercises the new node
+    /// while the report names the old one. The window is sub-millisecond, needs
+    /// a full unload+reload to open, and degrades to a mislabeled (not
+    /// fabricated) success; closing it needs a node-pinned fleet chat API.
     pub async fn node_chat_test(
         &self,
         node: &str,
@@ -368,34 +379,48 @@ impl Higgs {
             return Err(not_a_hub_error("nodes/chat_test"));
         };
 
+        // Unknown endpoint id → HG075, before any route/served reasoning. The
+        // node-id allocator remembers every admitted OR seeded node until retire,
+        // so "known but disconnected" (routes durable → the chat's own HG027)
+        // stays distinct from "never paired".
+        if fleet.node_id(node).await.is_none() {
+            return Err(HiggsError::UnknownNode {
+                endpoint_id: node.to_owned(),
+            });
+        }
+
         // Pin the served instance to the REQUESTED node before dispatch.
-        let served = match served {
-            Some(s) => {
-                let (routed_node, _) = fleet
-                    .resolve(s)
-                    .await
-                    .ok_or_else(|| HiggsError::ModelNotFound { id: s.to_owned() })?;
-                if routed_node != node {
-                    return Err(HiggsError::HubControlFailed {
-                        op: "chat_test".into(),
-                        detail: format!(
-                            "served instance {s} is routed on node {routed_node}, not the \
+        let served =
+            match served {
+                Some(s) => {
+                    let (routed_node, _) = fleet.resolve(s).await.ok_or_else(|| {
+                        HiggsError::InvalidChatTestTarget {
+                            detail: format!(
+                                "served instance {s} is not routed on any node — it may have \
+                                 been unloaded; refresh the fleet view and pick a live instance"
+                            ),
+                        }
+                    })?;
+                    if routed_node != node {
+                        return Err(HiggsError::InvalidChatTestTarget {
+                            detail: format!(
+                                "served instance {s} is routed on node {routed_node}, not the \
                              requested node {node} — pass that node, or omit `served` to test \
                              the requested node's own instance"
-                        ),
-                    });
+                            ),
+                        });
+                    }
+                    s.to_owned()
                 }
-                s.to_owned()
-            }
-            None => fleet
-                .served_on(node)
-                .await
-                .into_iter()
-                .next()
-                .ok_or_else(|| HiggsError::NodeNothingServed {
-                    endpoint_id: node.to_owned(),
-                })?,
-        };
+                None => fleet
+                    .served_on(node)
+                    .await
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| HiggsError::NodeNothingServed {
+                        endpoint_id: node.to_owned(),
+                    })?,
+            };
 
         let messages = serde_json::json!([{
             "role": "user",
@@ -418,6 +443,7 @@ impl Higgs {
             endpoint_id: node.to_owned(),
             served_id: served,
             content: outcome.content,
+            reasoning_content: outcome.reasoning_content,
             finish_reason: outcome.finish_reason,
             prompt_tokens: outcome.prompt_tokens,
             completion_tokens: outcome.completion_tokens,
