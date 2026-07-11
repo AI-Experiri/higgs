@@ -39,6 +39,7 @@ pub use api::{Higgs, HiggsConfig};
 // without reaching into `higgs::api::*` / `higgs::serve::*`.
 pub use api::{
     ChatOutcome, HiggsStatus, LoadedInfo, ModelLoadEvent, ModelLoadPhase, PairInfo, PreparedChat,
+    RebindReservation,
 };
 pub use delta_queue::DeltaReceiver;
 pub use diagnostic::HiggsError;

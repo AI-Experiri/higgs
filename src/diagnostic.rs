@@ -680,6 +680,17 @@ pub enum HiggsError {
     #[snafu(display("[HG072] {detail}"))]
     #[diagnostic(code(HG072), severity(Error))]
     InvalidKeyRequest { detail: String },
+
+    /// A listener rebind was requested on a facade whose terminal `stop()` has
+    /// already run — there is nothing left to serve. Raised by
+    /// `Higgs::reserve_rebind` before any listener is touched, so the caller's
+    /// old listener (if it still runs) keeps serving untouched.
+    #[snafu(display(
+        "[HG073] cannot rebind the /v1 listener: this higgs instance is shutting down — \
+         restart the embedding application to serve again"
+    ))]
+    #[diagnostic(code(HG073), severity(Error))]
+    RebindAfterShutdown,
 }
 
 #[cfg(test)]

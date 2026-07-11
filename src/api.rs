@@ -259,6 +259,15 @@ pub struct Higgs {
     /// Monotonic id source for [`ServeSlot`] — a slot is removed by id, never by
     /// index, so a sibling deregistration can't shift another's identity.
     next_serve_id: std::sync::atomic::AtomicU64,
+    /// Live [`RebindReservation`] count. While non-zero, a departing LAST
+    /// listener skips the terminal facade `stop()` — a rebind is a
+    /// drain-old-then-bind-new sequence (same-port rebinds cannot overlap:
+    /// binding a wildcard while the specific address is still held is
+    /// EADDRINUSE), and without the reservation the old listener's exit would
+    /// kill the facade the successor is about to serve. Read under the same
+    /// `serves` registry lock as the emptiness check ([`Self::deregister_serve`]);
+    /// incremented only under the `serve_lifecycle` lock.
+    rebind_reservations: std::sync::atomic::AtomicUsize,
     /// Serializes a listener's REGISTRATION against another listener's
     /// DEREGISTRATION-and-teardown. `ServeGuard::release` and the `Higgs::stop`
     /// that may follow it are two steps: without this an incoming `serve_v1` could
@@ -393,6 +402,41 @@ impl Drop for ServeGuard {
         if !self.released {
             self.higgs.deregister_serve(self.id);
         }
+    }
+}
+
+/// RAII facade reservation across a `/v1` listener rebind, from
+/// [`Higgs::reserve_rebind`].
+///
+/// While it lives, a departing LAST listener skips the terminal facade
+/// `stop()` — the reservation stands in for the successor listener the
+/// rebind promises. A rebind is drain-old-then-bind-new (same-port rebinds
+/// cannot overlap: binding a wildcard while the specific address is held is
+/// EADDRINUSE), so there is necessarily a moment with zero live listeners;
+/// without the reservation that moment is indistinguishable from "the last
+/// listener exited for good" and the facade would be drained under the
+/// successor.
+///
+/// Dropping it releases the reservation. If the successor never registered
+/// (its bind failed), the facade is left ALIVE with no listener — that is
+/// deliberate: the reserving embedder still holds the facade for in-process
+/// use and may retry the bind; it, not a heuristic here, owns the decision
+/// to `stop()`.
+pub struct RebindReservation {
+    higgs: Arc<Higgs>,
+}
+
+impl std::fmt::Debug for RebindReservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RebindReservation").finish_non_exhaustive()
+    }
+}
+
+impl Drop for RebindReservation {
+    fn drop(&mut self) {
+        self.higgs
+            .rebind_reservations
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -726,6 +770,7 @@ impl Higgs {
             key_touch_throttle: parking_lot::Mutex::new(std::collections::HashMap::new()),
             serves: parking_lot::Mutex::new(Vec::new()),
             next_serve_id: std::sync::atomic::AtomicU64::new(0),
+            rebind_reservations: std::sync::atomic::AtomicUsize::new(0),
             serve_lifecycle: tokio::sync::Mutex::new(()),
             lan_override: std::sync::atomic::AtomicBool::new(false),
             benchmarking: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
@@ -1016,6 +1061,39 @@ impl Higgs {
         self.serve_lifecycle.lock().await
     }
 
+    /// Reserve the facade across a `/v1` listener rebind.
+    ///
+    /// Call BEFORE shutting the old listener down. While the returned
+    /// [`RebindReservation`] lives, the old listener's exit — even as the last
+    /// live listener — skips the terminal facade `stop()`, so a successor
+    /// `serve_v1` can bind the (possibly same) address and register against a
+    /// facade that is still alive. Drop the reservation once the successor is
+    /// serving (or once the rebind is abandoned; see [`RebindReservation`] for
+    /// the abandoned case's semantics).
+    ///
+    /// Taken under the serve-lifecycle lock: a concurrent last-listener exit
+    /// runs its release-and-stop under the same lock, so this either lands
+    /// before that exit observes "last" (the exit then skips the stop) or
+    /// after the terminal `stop()` has been decided — in which case
+    /// [`HiggsError::RebindAfterShutdown`] ([HG073]) is returned and the
+    /// caller's listeners are untouched.
+    pub async fn reserve_rebind(
+        self: &Arc<Self>,
+    ) -> Result<RebindReservation, crate::diagnostic::HiggsError> {
+        let _lifecycle = self.serve_lifecycle().await;
+        if self
+            .shutting_down
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(crate::diagnostic::HiggsError::RebindAfterShutdown);
+        }
+        self.rebind_reservations
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(RebindReservation {
+            higgs: Arc::clone(self),
+        })
+    }
+
     /// Run the non-loopback startup key checks and ARM the listener's LAN exposure
     /// **atomically**, under the same `keys_io` lock that guards a key revoke.
     ///
@@ -1056,10 +1134,22 @@ impl Higgs {
 
     /// Drop a listener's registration BY ID (never by index — a sibling
     /// deregistration must not shift another's identity).
+    ///
+    /// Returns whether the departing listener was the last thing keeping the
+    /// facade served — i.e. no sibling listener remains AND no
+    /// [`RebindReservation`] is live. A reservation counts exactly like a
+    /// sibling: the successor listener it promises is about to register, and
+    /// the terminal `stop()` would kill the facade under it. Both reads happen
+    /// under the `serves` lock so a racing reserve/deregister pair resolves
+    /// one way or the other, never half.
     fn deregister_serve(&self, id: u64) -> bool {
         let mut serves = self.serves.lock();
         serves.retain(|s| s.id != id);
         serves.is_empty()
+            && self
+                .rebind_reservations
+                .load(std::sync::atomic::Ordering::SeqCst)
+                == 0
     }
 
     /// The PRIMARY (first-registered) live listener's bound address, or `None`
