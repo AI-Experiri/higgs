@@ -190,6 +190,19 @@ async fn fleet_e2e_tool_chat() {
         "model is now remote-routable"
     );
 
+    // T14 r1: freshness baseline — the load's refresh stamped the inventory;
+    // let it AGE measurably so the post-chat re-pull is discriminable from
+    // "it was already fresh".
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let age_before = fleet
+        .nodes_view()
+        .await
+        .into_iter()
+        .find(|n| n.endpoint_id == peer)
+        .and_then(|n| n.inventory_age_ms)
+        .expect("inventory cached after load");
+    assert!(age_before >= 1_400, "baseline aged: {age_before} ms");
+
     // Drive a tool-call chat over the REAL /v1 HTTP surface: the request routes
     // hub → fleet → node → worker and comes back in the OpenAI shape.
     let (base, guard) = serve_v1_local(higgs.clone()).await;
@@ -236,6 +249,28 @@ async fn fleet_e2e_tool_chat() {
         eprintln!("E2E fleet: structured tool call parsed");
     } else {
         eprintln!("E2E fleet: no structured call this run (content path)");
+    }
+
+    // T14 r1: a completed hub-routed chat re-pulls the node's inventory
+    // (detached), so the snapshot's age RESETS below the pre-chat baseline.
+    // Fail-on-revert: drop the chat-end refresh spawn and the age keeps
+    // growing past age_before forever.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let age_now = fleet
+            .nodes_view()
+            .await
+            .into_iter()
+            .find(|n| n.endpoint_id == peer)
+            .and_then(|n| n.inventory_age_ms);
+        if matches!(age_now, Some(a) if a < age_before) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "chat-end inventory refresh never landed (age stayed >= {age_before} ms: {age_now:?})"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
     // Teardown: retire the node so its routes + transport are dropped (the

@@ -520,6 +520,90 @@ async fn routed_models_lists_connected_only() {
     assert!(fleet.routed_models().await.is_empty());
 }
 
+/// T14 r1: the inventory age is WALL-CLOCK from the pull's START stamp — a
+/// snapshot committed with an old stamp reads OLD at view time. This is the
+/// direct pin for both r1 fixes: an `Instant`-typed stamp cannot represent
+/// "two hours ago" across a sleep (macOS Instant freezes asleep), and a
+/// commit-time `now()` stamp would read this seeded snapshot as fresh.
+#[test]
+fn inventory_age_is_wall_clock_from_the_pull_start_stamp() {
+    let mut node_ids = NodeIdAllocator::new();
+    node_ids.assign("nodeA");
+    let mut inventories = HashMap::new();
+    fn blank_inv() -> crate::remote::NodeInventory {
+        crate::remote::NodeInventory {
+            hostname: "h".into(),
+            os: "macos".into(),
+            workers: vec![],
+            hardware: crate::system::HardwareInfo {
+                cpu_name: String::new(),
+                arch: String::new(),
+                cpu_cores: 0,
+                ram_total_bytes: 0,
+                ram_used_bytes: 0,
+                cpu_usage_percent: 0.0,
+                gpus: vec![],
+                vram_total_bytes: 0,
+            },
+            runtime: crate::system::RuntimeInfo {
+                engine: String::new(),
+                backend: String::new(),
+                version: String::new(),
+                binding: String::new(),
+            },
+        }
+    }
+    let inv = blank_inv();
+    let two_hours_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+    inventories.insert("nodeA".to_string(), (inv, two_hours_ago));
+    let actor = FleetActor {
+        nodes: HashMap::new(),
+        routes: HashMap::new(),
+        node_ids,
+        inventories,
+        software_versions: HashMap::new(),
+        versions: HashMap::new(),
+        epochs: HashMap::new(),
+        bus: Arc::new(crate::log_bus::LogBus::new()),
+        admit_gen: 0,
+    };
+    let view = actor.nodes_view();
+    let age = view[0].inventory_age_ms.expect("age present");
+    assert!(
+        (7_200_000..7_300_000).contains(&age),
+        "a 2h-old stamp reads ~2h at view time, got {age} ms"
+    );
+    // A FUTURE stamp (backward wall-clock step at view time) saturates to 0 —
+    // never a fabricated huge age from unsigned underflow.
+    let mut inventories2 = HashMap::new();
+    let inv2 = blank_inv();
+    inventories2.insert(
+        "nodeA".to_string(),
+        (
+            inv2,
+            std::time::SystemTime::now() + std::time::Duration::from_secs(60),
+        ),
+    );
+    let mut node_ids2 = NodeIdAllocator::new();
+    node_ids2.assign("nodeA");
+    let actor2 = FleetActor {
+        nodes: HashMap::new(),
+        routes: HashMap::new(),
+        node_ids: node_ids2,
+        inventories: inventories2,
+        software_versions: HashMap::new(),
+        versions: HashMap::new(),
+        epochs: HashMap::new(),
+        bus: Arc::new(crate::log_bus::LogBus::new()),
+        admit_gen: 0,
+    };
+    assert_eq!(
+        actor2.nodes_view()[0].inventory_age_ms,
+        Some(0),
+        "future stamp saturates to 0"
+    );
+}
+
 #[test]
 fn served_ids_are_collision_free_even_when_a_model_name_clashes_with_a_suffix() {
     // Two `org/model` instances want served ids `org/model` + `org/model-1`; a literal
