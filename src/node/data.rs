@@ -83,8 +83,17 @@ pub(crate) async fn relay_chat(
     // worker can't be idle-reaped mid-generation.
     let (final_tx, final_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        let _lease = lease; // held until fut completes
-        let _ = final_tx.send(fut.await);
+        let res = fut.await;
+        // Drop the lease BEFORE the final result becomes visible to the relay
+        // (T14 r3): the drop posts `ChatEnd` into the node actor's mailbox, so
+        // it is enqueued strictly before the hub can receive the reply — and
+        // therefore before any reply-triggered inventory snapshot request
+        // reaches that same mailbox. A refresh can then never observe this
+        // finished chat as still in flight. The generation has ACTUALLY
+        // finished here (`fut` resolved), so the idle-reaper hold this lease
+        // exists for is already over.
+        drop(lease);
+        let _ = final_tx.send(res);
     });
     tokio::pin!(final_rx);
 

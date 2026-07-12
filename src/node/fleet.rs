@@ -280,9 +280,12 @@ enum FleetMsg {
 /// system sleep (a slept-through snapshot would read fresh), and `SystemTime`
 /// zeroes out after a backward NTP/manual step (a stale snapshot would read
 /// freshly synced until the clock catches up). Each stamp is a LOWER BOUND on
-/// the true age, so the view takes the MAX of the two — the only remaining
-/// error direction is OVERSTATING staleness (after a forward wall step),
-/// never claiming freshness the data doesn't have.
+/// the true age, so the view takes the MAX of the two, which covers every
+/// SINGLE-fault case. Accepted residual (T14 r3): a COMPOUND fault inside one
+/// cache window — a backward wall step AND a sleep — under-reads on both
+/// clocks at once (no std clock counts time across sleep monotonically), and
+/// a forward wall step overstates; any lifecycle op or hub-routed chat
+/// re-stamps and self-heals both.
 #[derive(Debug, Clone, Copy)]
 struct PulledAt {
     wall: std::time::SystemTime,
