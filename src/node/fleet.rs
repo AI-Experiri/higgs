@@ -266,6 +266,15 @@ enum FleetMsg {
         node: NodeKey,
         reply: oneshot::Sender<Option<u64>>,
     },
+    /// Chat-end refresh debounce, pre-pull check: is `gen` still the slot's
+    /// owner? A retire removes the slot while its detached owner may be mid-
+    /// settle; without this check that stale owner would still fire its pull
+    /// CONCURRENTLY with a re-paired successor's. `false` = stand down.
+    ChatRefreshOwner {
+        node: NodeKey,
+        gen: u64,
+        reply: oneshot::Sender<bool>,
+    },
     /// Chat-end refresh debounce, phase 2: the owned pull finished. `gen` must
     /// match the slot's owner generation — a STALE owner (its slot dropped by a
     /// retire, possibly re-created by a re-paired node's chat) gets `false` and
@@ -758,6 +767,13 @@ impl Actor for FleetActor {
                 };
                 let _ = reply.send(owned);
             }
+            FleetMsg::ChatRefreshOwner { node, gen, reply } => {
+                let owner = self
+                    .chat_refreshes
+                    .get(&node)
+                    .is_some_and(|(g, _)| *g == gen);
+                let _ = reply.send(owner);
+            }
             FleetMsg::ChatRefreshEnd { node, gen, reply } => {
                 let again = match self.chat_refreshes.entry(node) {
                     std::collections::hash_map::Entry::Occupied(mut e) if e.get().0 == gen => {
@@ -946,6 +962,26 @@ impl HubFleet {
             };
             loop {
                 tokio::time::sleep(SETTLE).await;
+                // Pre-pull ownership check (T14 r13): a retire during the settle
+                // removed our slot (and a re-paired successor may already own a
+                // new one) — stand down WITHOUT pulling, or two owners fire
+                // concurrent inventory RPCs. Residual: a retire landing DURING
+                // the pull below can still overlap the successor's first pull
+                // by at most one iteration — the commit-side epoch + mono-stamp
+                // guards keep the DATA correct either way; the cost is one
+                // duplicate probe, accepted (a full cancellation plumb isn't
+                // warranted for that window).
+                let still_owner = fleet
+                    .ask(|reply| FleetMsg::ChatRefreshOwner {
+                        node: node.clone(),
+                        gen,
+                        reply,
+                    })
+                    .await
+                    .unwrap_or(false);
+                if !still_owner {
+                    return;
+                }
                 // Hard bound (T14 r11): the owner MUST reach ChatRefreshEnd or
                 // the node's debounce slot strands forever (later completions
                 // only set the trailing flag). Chosen ABOVE the control-plane

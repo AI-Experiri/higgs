@@ -825,6 +825,26 @@ async fn chat_refresh_debounce_single_flight_with_trailing_rerun() {
         begin("n").await.is_none(),
         "burst coalesces into the successor"
     );
+    // The stale owner's PRE-PULL check (r13) reports it deposed — it stands
+    // down without firing a concurrent pull.
+    let still = fleet
+        .ask(|reply| FleetMsg::ChatRefreshOwner {
+            node: "n".to_string(),
+            gen: gen3,
+            reply,
+        })
+        .await
+        .unwrap_or(true);
+    assert!(!still, "deposed owner is told to stand down before pulling");
+    let successor_still = fleet
+        .ask(|reply| FleetMsg::ChatRefreshOwner {
+            node: "n".to_string(),
+            gen: gen4,
+            reply,
+        })
+        .await
+        .unwrap_or(false);
+    assert!(successor_still, "the live successor keeps its ownership");
     assert!(
         !end("n", gen3).await,
         "the STALE owner exits without touching the successor's slot"
