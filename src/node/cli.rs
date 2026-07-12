@@ -298,9 +298,17 @@ fn run_node_connect(args: &[String]) -> Result<()> {
         let name = name_or_init(Role::Node, &self_id, &crate::system::hostname())?;
         println!("higgs node   : {name} ({self_id})");
         let res = dial_and_hello(&endpoint, target, self_id, name, token).await?;
+        // Both hub-controlled strings are display-sanitized (T14 r24 — the
+        // one-shot pairing path is the FIRST thing a user runs against an
+        // untrusted ticket, exactly where terminal spoofing matters most).
         println!(
             "paired with hub {} ({}) (protocol v{}, label {:?})",
-            res.hub_name, res.node_id, res.agreed_version, res.assigned_label
+            crate::remote::sanitize_display(&res.hub_name),
+            res.node_id,
+            res.agreed_version,
+            res.assigned_label
+                .as_deref()
+                .map(crate::remote::sanitize_display)
         );
         Ok(())
     })
@@ -323,7 +331,10 @@ fn persist_hub(cfg_path: &Path, hello: &HelloResult, ticket: &str) {
     cfg.remember_hub(SavedHub {
         hub_id: hello.node_id.clone(),
         ticket: ticket.to_string(),
-        label: hello.hub_name.clone(),
+        // Sanitized at PERSIST (T14 r24): the label is hub-controlled and is
+        // replayed into the terminal on every later `--list`, so a dirty value
+        // must never enter config.json in the first place.
+        label: crate::remote::sanitize_display(&hello.hub_name),
         last_used_ms: now_ms(),
     });
     if let Err(e) = cfg.save(cfg_path) {
@@ -346,9 +357,14 @@ fn list_saved_hubs(cfg: &InstanceConfig, node_id: &str) -> Result<()> {
             ""
         };
         let short: String = h.hub_id.chars().take(8).collect();
+        // Sanitize at print too (T14 r24): labels persisted before the
+        // sanitize-at-persist fix may already be dirty in config.json.
         println!(
             "  {} ({})  last-used {}ms{}",
-            h.label, short, h.last_used_ms, default
+            crate::remote::sanitize_display(&h.label),
+            short,
+            h.last_used_ms,
+            default
         );
     }
     Ok(())
