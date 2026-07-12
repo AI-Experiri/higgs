@@ -526,7 +526,7 @@ async fn routed_models_lists_connected_only() {
 /// "two hours ago" across a sleep (macOS Instant freezes asleep), and a
 /// commit-time `now()` stamp would read this seeded snapshot as fresh.
 #[test]
-fn inventory_age_is_wall_clock_from_the_pull_start_stamp() {
+fn inventory_age_is_the_max_of_both_clocks_from_the_pull_start_stamp() {
     let mut node_ids = NodeIdAllocator::new();
     node_ids.assign("nodeA");
     let mut inventories = HashMap::new();
@@ -554,13 +554,20 @@ fn inventory_age_is_wall_clock_from_the_pull_start_stamp() {
         }
     }
     let inv = blank_inv();
-    let two_hours_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+    // Dual stamp, WALL side old: the monotonic side is fresh (as after an
+    // 8 h SLEEP, where Instant froze) — the wall clock must still surface the
+    // true age (max of the two lower bounds).
+    let two_hours_ago = PulledAt {
+        wall: std::time::SystemTime::now() - std::time::Duration::from_secs(7200),
+        mono: std::time::Instant::now(),
+    };
     inventories.insert("nodeA".to_string(), (inv, two_hours_ago));
     let actor = FleetActor {
         nodes: HashMap::new(),
         routes: HashMap::new(),
         node_ids,
         inventories,
+        chat_refreshes: HashMap::new(),
         software_versions: HashMap::new(),
         versions: HashMap::new(),
         epochs: HashMap::new(),
@@ -577,11 +584,17 @@ fn inventory_age_is_wall_clock_from_the_pull_start_stamp() {
     // never a fabricated huge age from unsigned underflow.
     let mut inventories2 = HashMap::new();
     let inv2 = blank_inv();
+    // Wall side FUTURE (a backward NTP step at view time zeroes the wall age)
+    // with a genuinely old monotonic side: the mono clock must rescue the age
+    // instead of the old single-clock saturation-to-0.
     inventories2.insert(
         "nodeA".to_string(),
         (
             inv2,
-            std::time::SystemTime::now() + std::time::Duration::from_secs(60),
+            PulledAt {
+                wall: std::time::SystemTime::now() + std::time::Duration::from_secs(60),
+                mono: std::time::Instant::now() - std::time::Duration::from_secs(30),
+            },
         ),
     );
     let mut node_ids2 = NodeIdAllocator::new();
@@ -591,17 +604,58 @@ fn inventory_age_is_wall_clock_from_the_pull_start_stamp() {
         routes: HashMap::new(),
         node_ids: node_ids2,
         inventories: inventories2,
+        chat_refreshes: HashMap::new(),
         software_versions: HashMap::new(),
         versions: HashMap::new(),
         epochs: HashMap::new(),
         bus: Arc::new(crate::log_bus::LogBus::new()),
         admit_gen: 0,
     };
-    assert_eq!(
-        actor2.nodes_view()[0].inventory_age_ms,
-        Some(0),
-        "future stamp saturates to 0"
+    let age2 = actor2.nodes_view()[0].inventory_age_ms.expect("age");
+    assert!(
+        (30_000..31_000).contains(&age2),
+        "the monotonic clock rescues the age after a backward wall step: {age2} ms"
     );
+}
+
+/// T14 r2: the chat-end refresh debounce — at most ONE pull owns a node's
+/// slot; completions during it coalesce into exactly one trailing re-run.
+/// Driven through the REAL actor messages (Begin/End), not a reimplementation.
+#[tokio::test]
+async fn chat_refresh_debounce_single_flight_with_trailing_rerun() {
+    let fleet = HubFleet::new(Arc::new(crate::log_bus::LogBus::new()));
+    let begin = |n: &str| {
+        let n = n.to_string();
+        let f = &fleet;
+        async move {
+            f.ask(|reply| FleetMsg::ChatRefreshBegin { node: n, reply })
+                .await
+                .unwrap_or(false)
+        }
+    };
+    let end = |n: &str| {
+        let n = n.to_string();
+        let f = &fleet;
+        async move {
+            f.ask(|reply| FleetMsg::ChatRefreshEnd { node: n, reply })
+                .await
+                .unwrap_or(false)
+        }
+    };
+    // First completion owns the slot; a burst of three more all coalesce.
+    assert!(begin("n").await, "first completion owns the refresh");
+    assert!(!begin("n").await, "second coalesces");
+    assert!(!begin("n").await, "third coalesces");
+    assert!(!begin("n").await, "fourth coalesces");
+    // The owned pull finishes: exactly ONE trailing re-run is owed (not three).
+    assert!(end("n").await, "coalesced completions => one re-run");
+    // The re-run finishes with no further completions: slot released.
+    assert!(!end("n").await, "no more re-runs; slot released");
+    // Released means the next completion owns a fresh slot again.
+    assert!(begin("n").await, "slot reusable after release");
+    assert!(!end("n").await, "clean end with no coalesced completions");
+    // Nodes are independent slots.
+    assert!(begin("other").await, "another node owns its own slot");
 }
 
 #[test]
@@ -619,6 +673,7 @@ fn served_ids_are_collision_free_even_when_a_model_name_clashes_with_a_suffix() 
         routes,
         node_ids: NodeIdAllocator::new(),
         inventories: HashMap::new(),
+        chat_refreshes: HashMap::new(),
         software_versions: HashMap::new(),
         versions: HashMap::new(),
         epochs: HashMap::new(),

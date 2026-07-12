@@ -249,17 +249,62 @@ enum FleetMsg {
         node: NodeKey,
         epoch_before: u64,
         inventory: Box<NodeInventory>,
-        /// Wall-clock time the pull STARTED (see the `inventories` field doc).
-        pulled_at: std::time::SystemTime,
+        /// Dual-clock stamp of the pull's START (see [`PulledAt`]).
+        pulled_at: PulledAt,
         reply: oneshot::Sender<()>,
     },
     BumpEpoch {
         node: NodeKey,
         reply: oneshot::Sender<()>,
     },
+    /// Chat-end refresh debounce, phase 1: may THIS completion own the (single)
+    /// refresh for `node`? `true` = caller schedules the pull; `false` = one is
+    /// already scheduled/running — this completion was coalesced into its
+    /// trailing re-run flag instead of spawning another pull.
+    ChatRefreshBegin {
+        node: NodeKey,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Chat-end refresh debounce, phase 2: the owned pull finished. `true` =
+    /// completions were coalesced meanwhile — run ONCE more (the flag resets);
+    /// `false` = done, the slot is released.
+    ChatRefreshEnd {
+        node: NodeKey,
+        reply: oneshot::Sender<bool>,
+    },
 }
 
 /// Private actor state: the hub's whole fleet read-model + routing table, owned by one task.
+/// When an inventory pull STARTED, on BOTH clocks. Neither clock alone is
+/// trustworthy for an age: macOS `Instant` (CLOCK_UPTIME_RAW) FREEZES across
+/// system sleep (a slept-through snapshot would read fresh), and `SystemTime`
+/// zeroes out after a backward NTP/manual step (a stale snapshot would read
+/// freshly synced until the clock catches up). Each stamp is a LOWER BOUND on
+/// the true age, so the view takes the MAX of the two — the only remaining
+/// error direction is OVERSTATING staleness (after a forward wall step),
+/// never claiming freshness the data doesn't have.
+#[derive(Debug, Clone, Copy)]
+struct PulledAt {
+    wall: std::time::SystemTime,
+    mono: std::time::Instant,
+}
+
+impl PulledAt {
+    fn now() -> Self {
+        Self {
+            wall: std::time::SystemTime::now(),
+            mono: std::time::Instant::now(),
+        }
+    }
+    /// Age in ms: the max of both clocks' elapsed (each saturating at 0).
+    fn age_ms(&self) -> u64 {
+        let wall = std::time::SystemTime::now()
+            .duration_since(self.wall)
+            .unwrap_or_default();
+        wall.max(self.mono.elapsed()).as_millis() as u64
+    }
+}
+
 struct FleetActor {
     /// Currently-connected nodes → their live transport (absent while disconnected).
     nodes: HashMap<NodeKey, Arc<NodeTransport>>,
@@ -270,19 +315,20 @@ struct FleetActor {
     routes: HashMap<(NodeKey, WorkerId), String>,
     /// Stable hub-local [`NodeId`] per `EndpointId`, for `LogSource::RemoteWorker` tagging.
     node_ids: NodeIdAllocator,
-    /// Last-fetched inventory per node (host + workers + hw/rt) with the WALL-CLOCK
-    /// time the pull STARTED. The node's reply is authoritative; refreshed on
-    /// connect, after every hub-driven lifecycle change, and after each hub-routed
-    /// chat completes — the stamp is what lets `nodes_view` report how stale the
-    /// snapshot is (`inventory_age_ms`, the T9-residual fix). `SystemTime`, not
-    /// `Instant`: on macOS `Instant` (CLOCK_UPTIME_RAW) FREEZES across system
-    /// sleep, so a hub waking from an 8-hour sleep would report an 8-hour-old
-    /// snapshot as seconds old — the exact deception the field exists to prevent.
-    /// Both the stamp and the view-time read come from the SAME host clock, so
-    /// the only wall-clock hazard is a backward step (NTP), which the age
-    /// computation saturates to 0. Stamped at fetch START (not commit) so a slow
-    /// pull doesn't under-age data that was already old when it arrived.
-    inventories: HashMap<NodeKey, (NodeInventory, std::time::SystemTime)>,
+    /// Last-fetched inventory per node (host + workers + hw/rt) with the DUAL
+    /// stamp of when the pull STARTED. The node's reply is authoritative;
+    /// refreshed on connect, after every hub-driven lifecycle change, and
+    /// (debounced) after hub-routed chats complete — the stamp is what lets
+    /// `nodes_view` report how stale the snapshot is (`inventory_age_ms`, the
+    /// T9-residual fix). Stamped at fetch START (not commit) so a slow pull
+    /// doesn't under-age data that was already old when it arrived.
+    inventories: HashMap<NodeKey, (NodeInventory, PulledAt)>,
+    /// Per-node chat-refresh debounce state (see [`FleetMsg::ChatRefreshBegin`]):
+    /// present = a chat-end inventory refresh is scheduled or running for the
+    /// node; the bool = a LATER chat completed meanwhile, so run once more when
+    /// the current pull finishes (trailing coalescing). Bounds the chat-driven
+    /// pulls to at most ONE in flight per node however bursty the chats.
+    chat_refreshes: HashMap<NodeKey, bool>,
     /// The HELLO-negotiated protocol major per node, refreshed on every (re)admission —
     /// what feature gating (per-load params) reads today; a Fleet-view version display
     /// (T14) would read the same slot but does not exist yet. Absent until the
@@ -430,14 +476,9 @@ impl FleetActor {
                         .cloned()
                         .map(|(mut inv, pulled_at)| {
                             // How stale this snapshot is, computed hub-side at VIEW
-                            // time. Wall clock on BOTH ends (same host); a backward
-                            // step saturates to 0 rather than fabricating a huge age.
-                            inventory_age_ms = Some(
-                                std::time::SystemTime::now()
-                                    .duration_since(pulled_at)
-                                    .unwrap_or_default()
-                                    .as_millis() as u64,
-                            );
+                            // time from BOTH clocks (see `PulledAt` — max of two
+                            // lower bounds, errs stale-ward only).
+                            inventory_age_ms = Some(pulled_at.age_ms());
                             for w in &mut inv.workers {
                                 let key = (endpoint_id.clone(), WorkerId(w.worker_id));
                                 w.served_id =
@@ -661,6 +702,36 @@ impl Actor for FleetActor {
                 self.bump_epoch(&node);
                 let _ = reply.send(());
             }
+            FleetMsg::ChatRefreshBegin { node, reply } => {
+                let owned = match self.chat_refreshes.entry(node) {
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(false);
+                        true
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut e) => {
+                        // Coalesce: the running pull will go once more.
+                        *e.get_mut() = true;
+                        false
+                    }
+                };
+                let _ = reply.send(owned);
+            }
+            FleetMsg::ChatRefreshEnd { node, reply } => {
+                let again = match self.chat_refreshes.entry(node) {
+                    std::collections::hash_map::Entry::Occupied(mut e) => {
+                        if *e.get() {
+                            *e.get_mut() = false;
+                            true
+                        } else {
+                            e.remove();
+                            false
+                        }
+                    }
+                    // Slot vanished (e.g. a retire cleared state) — nothing owed.
+                    std::collections::hash_map::Entry::Vacant(_) => false,
+                };
+                let _ = reply.send(again);
+            }
         }
     }
 }
@@ -684,6 +755,7 @@ impl HubFleet {
             routes: HashMap::new(),
             node_ids: NodeIdAllocator::new(),
             inventories: HashMap::new(),
+            chat_refreshes: HashMap::new(),
             software_versions: HashMap::new(),
             versions: HashMap::new(),
             epochs: HashMap::new(),
@@ -804,6 +876,44 @@ impl HubFleet {
         }
     }
 
+    /// Schedule the DEBOUNCED chat-end inventory refresh for `node` (T14 r2):
+    /// if no chat-refresh is scheduled/running for the node, own the slot and
+    /// spawn ONE detached pull after a short settle delay (the node records its
+    /// `ChatEnd` when the chat's lease drops, immediately after the reply — the
+    /// delay lets that land so the snapshot doesn't still say `in_flight`);
+    /// otherwise coalesce into the running pull's trailing re-run. Best-effort:
+    /// pull errors are dropped (the next lifecycle op or chat re-pulls).
+    fn schedule_chat_refresh(self: &Arc<Self>, node: NodeKey) {
+        const SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
+        let fleet = self.clone();
+        tokio::spawn(async move {
+            let owned = fleet
+                .ask(|reply| FleetMsg::ChatRefreshBegin {
+                    node: node.clone(),
+                    reply,
+                })
+                .await
+                .unwrap_or(false);
+            if !owned {
+                return; // coalesced into the owner's trailing re-run
+            }
+            loop {
+                tokio::time::sleep(SETTLE).await;
+                let _ = fleet.refresh_inventory(&node).await;
+                let again = fleet
+                    .ask(|reply| FleetMsg::ChatRefreshEnd {
+                        node: node.clone(),
+                        reply,
+                    })
+                    .await
+                    .unwrap_or(false);
+                if !again {
+                    break;
+                }
+            }
+        });
+    }
+
     /// Fetch `node`'s inventory over its live transport and cache it for the fleet view. The
     /// node's reply is AUTHORITATIVE and stored verbatim — except a result is dropped if a
     /// lifecycle op changed this node's generation while the request was in flight, so a slow
@@ -812,7 +922,7 @@ impl HubFleet {
         let epoch_before = self.epoch(node).await;
         // Stamp BEFORE the RPC: the node captures its stats at request time, so a
         // slow pull must not make already-old data read fresh at commit.
-        let pulled_at = std::time::SystemTime::now();
+        let pulled_at = PulledAt::now();
         let transport = self.transport(node).await?;
         let value = match transport.request(M_NODE_INVENTORY, json!({})).await {
             Ok(v) => v,
@@ -1342,15 +1452,16 @@ impl HubFleet {
             match fut.await {
                 Ok(v) => {
                     // A completed hub-routed chat is activity the hub KNOWS about —
-                    // re-pull the node's inventory (detached, best-effort) so the
-                    // fleet view's idle/in-flight stats and their age reflect it
-                    // instead of aging a pre-chat snapshot (T14 r1). Epoch-gating
-                    // in refresh_inventory keeps a racing lifecycle op authoritative.
-                    let refresh_fleet = fleet.clone();
-                    let refresh_node = node.clone();
-                    tokio::spawn(async move {
-                        let _ = refresh_fleet.refresh_inventory(&refresh_node).await;
-                    });
+                    // re-pull the node's inventory so the fleet view's idle/
+                    // in-flight stats and their age reflect it instead of aging a
+                    // pre-chat snapshot (T14 r1). DEBOUNCED per node (r2): at most
+                    // ONE pull in flight however bursty the chats — later
+                    // completions coalesce into a single trailing re-run — and each
+                    // pull waits a short settle so the node's own ChatEnd
+                    // bookkeeping (recorded when its lease drops, just after the
+                    // reply) lands before the snapshot is taken. Epoch-gating in
+                    // refresh_inventory keeps a racing lifecycle op authoritative.
+                    fleet.schedule_chat_refresh(node.clone());
                     Ok(v)
                 }
                 Err(e) if route_invalidating(&e) => {
