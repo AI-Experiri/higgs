@@ -89,9 +89,12 @@ pub(crate) async fn relay_chat(
         // it is enqueued strictly before the hub can receive the reply — and
         // therefore before any reply-triggered inventory snapshot request
         // reaches that same mailbox. A refresh can then never observe this
-        // finished chat as still in flight. The generation has ACTUALLY
-        // finished here (`fut` resolved), so the idle-reaper hold this lease
-        // exists for is already over.
+        // COMPLETED chat as still in flight. NB `fut` resolving means the chat
+        // CALL is over (result or the supervisor's ChatTimeout) — a timed-out
+        // generation may still be running inside the worker; releasing the
+        // in-flight hold then is PRE-EXISTING supervisor-timeout behavior
+        // (the lease always dropped when `fut` resolved), and the idle reaper
+        // reclaiming such a worker is the designed recovery for it.
         drop(lease);
         let _ = final_tx.send(res);
     });
