@@ -104,6 +104,20 @@ pub struct HelloParams {
     pub capabilities: Capabilities,
 }
 
+/// Sanitize a peer-supplied version string for DISPLAY (T14 r10): `Hello.
+/// software_version` is required on the wire but its content is entirely
+/// peer-controlled — raw newlines/ANSI escapes would let an admitted (or
+/// token-bearing) node spoof or erase pairing-terminal output. Keep only the
+/// characters a semver can contain (alphanumerics and `.+-_`), capped at 64
+/// — a normal version passes through unchanged; anything else degrades
+/// visibly rather than executing in someone's terminal.
+pub fn sanitize_version(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-' | '_'))
+        .take(64)
+        .collect()
+}
+
 /// The capabilities a node advertises in its HELLO. (P1 sends the set; decisions
 /// keyed on these arrive in later phases.)
 pub fn node_capabilities() -> Capabilities {

@@ -628,6 +628,15 @@ impl Actor for FleetActor {
                         }
                     }
                     let replaced = self.nodes.insert(node.clone(), transport);
+                    // The cached INVENTORY is deliberately KEPT across (re)admission
+                    // (same last-known-state continuity as across a disconnect), so
+                    // for the sub-second window until the post-connect refresh
+                    // commits — or indefinitely if that refresh fails — the card can
+                    // pair the NEW version facts with the previous process's workers/
+                    // hardware (T14 r10, accepted residual). The T14 age stamp keeps
+                    // counting from the OLD pull, so the staleness is self-describing;
+                    // clearing here would flash the card empty on every reconnect and
+                    // lose data a failed refresh can never restore.
                     // Bump on (re)admission so an inventory fetch from a PRIOR connection still in
                     // flight can't commit its now-stale result over this fresh one.
                     self.bump_epoch(&node);

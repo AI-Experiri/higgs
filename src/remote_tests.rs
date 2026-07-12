@@ -1,5 +1,20 @@
 use super::*;
 
+/// T14 r10: the peer-controlled version string is display-sanitized at the
+/// gate — ANSI escapes and newlines cannot reach a pairing terminal, while a
+/// normal semver passes through unchanged (the e2e equality pins rely on it).
+#[test]
+fn version_sanitizer_strips_terminal_control_and_keeps_semver() {
+    assert_eq!(sanitize_version("0.1.0-beta.1"), "0.1.0-beta.1");
+    assert_eq!(sanitize_version("1.2.3+build_7"), "1.2.3+build_7");
+    // ANSI clear-screen + CRLF injection reduce to their safe residue (the
+    // ESC, brackets, CR/LF, and space are all dropped — nothing executes).
+    assert_eq!(sanitize_version("1.0\x1b[2J\r\nfake ok"), "1.02Jfakeok");
+    assert_eq!(sanitize_version("\u{1b}[31mred\u{1b}[0m"), "31mred0m");
+    // Length cap.
+    assert_eq!(sanitize_version(&"9".repeat(200)).len(), 64);
+}
+
 /// T9 version-skew: a PRE-stats node's inventory (no per-worker stat keys)
 /// still decodes on a current hub — the fields are additive Options with
 /// serde defaults, exactly why no protocol bump was needed.

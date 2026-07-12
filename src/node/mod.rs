@@ -348,7 +348,9 @@ pub(crate) async fn gate_admit(
     }
     GateOutcome::Admitted {
         agreed_version,
-        software_version: hello.software_version,
+        // Sanitized at the trust boundary: the string is peer-controlled and
+        // flows to terminals (CLI pairing line) and the fleet view.
+        software_version: crate::remote::sanitize_version(&hello.software_version),
     }
 }
 
