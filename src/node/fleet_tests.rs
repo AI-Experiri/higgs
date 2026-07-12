@@ -617,6 +617,7 @@ fn inventory_age_is_the_max_of_both_clocks_from_the_pull_start_stamp() {
         node_ids,
         inventories,
         chat_refreshes: HashMap::new(),
+        chat_refresh_gen: 0,
         software_versions: HashMap::new(),
         versions: HashMap::new(),
         epochs: HashMap::new(),
@@ -654,6 +655,7 @@ fn inventory_age_is_the_max_of_both_clocks_from_the_pull_start_stamp() {
         node_ids: node_ids2,
         inventories: inventories2,
         chat_refreshes: HashMap::new(),
+        chat_refresh_gen: 0,
         software_versions: HashMap::new(),
         versions: HashMap::new(),
         epochs: HashMap::new(),
@@ -681,6 +683,7 @@ async fn older_started_pull_never_overwrites_a_newer_snapshot() {
         node_ids,
         inventories: HashMap::new(),
         chat_refreshes: HashMap::new(),
+        chat_refresh_gen: 0,
         software_versions: HashMap::new(),
         versions: HashMap::new(),
         epochs: HashMap::new(),
@@ -768,32 +771,69 @@ async fn chat_refresh_debounce_single_flight_with_trailing_rerun() {
         async move {
             f.ask(|reply| FleetMsg::ChatRefreshBegin { node: n, reply })
                 .await
-                .unwrap_or(false)
+                .flatten()
         }
     };
-    let end = |n: &str| {
+    let end = |n: &str, gen: u64| {
         let n = n.to_string();
         let f = &fleet;
         async move {
-            f.ask(|reply| FleetMsg::ChatRefreshEnd { node: n, reply })
-                .await
-                .unwrap_or(false)
+            f.ask(|reply| FleetMsg::ChatRefreshEnd {
+                node: n,
+                gen,
+                reply,
+            })
+            .await
+            .unwrap_or(false)
         }
     };
     // First completion owns the slot; a burst of three more all coalesce.
-    assert!(begin("n").await, "first completion owns the refresh");
-    assert!(!begin("n").await, "second coalesces");
-    assert!(!begin("n").await, "third coalesces");
-    assert!(!begin("n").await, "fourth coalesces");
+    let gen1 = begin("n").await.expect("first completion owns the refresh");
+    assert!(begin("n").await.is_none(), "second coalesces");
+    assert!(begin("n").await.is_none(), "third coalesces");
+    assert!(begin("n").await.is_none(), "fourth coalesces");
     // The owned pull finishes: exactly ONE trailing re-run is owed (not three).
-    assert!(end("n").await, "coalesced completions => one re-run");
+    assert!(end("n", gen1).await, "coalesced completions => one re-run");
     // The re-run finishes with no further completions: slot released.
-    assert!(!end("n").await, "no more re-runs; slot released");
+    assert!(!end("n", gen1).await, "no more re-runs; slot released");
     // Released means the next completion owns a fresh slot again.
-    assert!(begin("n").await, "slot reusable after release");
-    assert!(!end("n").await, "clean end with no coalesced completions");
+    let gen2 = begin("n").await.expect("slot reusable after release");
+    assert_ne!(gen1, gen2, "each owner gets a fresh generation");
+    assert!(
+        !end("n", gen2).await,
+        "clean end with no coalesced completions"
+    );
     // Nodes are independent slots.
-    assert!(begin("other").await, "another node owns its own slot");
+    assert!(
+        begin("other").await.is_some(),
+        "another node owns its own slot"
+    );
+
+    // T14 r12: a STALE owner (its slot dropped by retire, re-created for a
+    // re-paired node) must not mutate the successor's slot — even with a
+    // pending trailing flag, the stale End returns false and changes nothing.
+    let gen3 = begin("n").await.expect("owner before the retire");
+    fleet
+        .ask(|reply| FleetMsg::Retire {
+            node: "n".to_string(),
+            reply,
+        })
+        .await;
+    let gen4 = begin("n").await.expect("successor after re-pair");
+    assert_ne!(gen3, gen4);
+    assert!(
+        begin("n").await.is_none(),
+        "burst coalesces into the successor"
+    );
+    assert!(
+        !end("n", gen3).await,
+        "the STALE owner exits without touching the successor's slot"
+    );
+    assert!(
+        end("n", gen4).await,
+        "the successor still owes its trailing re-run (stale End didn't eat it)"
+    );
+    assert!(!end("n", gen4).await, "successor releases cleanly");
 }
 
 #[test]
@@ -812,6 +852,7 @@ fn served_ids_are_collision_free_even_when_a_model_name_clashes_with_a_suffix() 
         node_ids: NodeIdAllocator::new(),
         inventories: HashMap::new(),
         chat_refreshes: HashMap::new(),
+        chat_refresh_gen: 0,
         software_versions: HashMap::new(),
         versions: HashMap::new(),
         epochs: HashMap::new(),

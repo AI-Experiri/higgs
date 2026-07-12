@@ -258,18 +258,23 @@ enum FleetMsg {
         reply: oneshot::Sender<()>,
     },
     /// Chat-end refresh debounce, phase 1: may THIS completion own the (single)
-    /// refresh for `node`? `true` = caller schedules the pull; `false` = one is
-    /// already scheduled/running — this completion was coalesced into its
-    /// trailing re-run flag instead of spawning another pull.
+    /// refresh for `node`? `Some(gen)` = caller owns the slot under that
+    /// generation and schedules the pull; `None` = one is already
+    /// scheduled/running — this completion was coalesced into its trailing
+    /// re-run flag instead of spawning another pull.
     ChatRefreshBegin {
         node: NodeKey,
-        reply: oneshot::Sender<bool>,
+        reply: oneshot::Sender<Option<u64>>,
     },
-    /// Chat-end refresh debounce, phase 2: the owned pull finished. `true` =
-    /// completions were coalesced meanwhile — run ONCE more (the flag resets);
-    /// `false` = done, the slot is released.
+    /// Chat-end refresh debounce, phase 2: the owned pull finished. `gen` must
+    /// match the slot's owner generation — a STALE owner (its slot dropped by a
+    /// retire, possibly re-created by a re-paired node's chat) gets `false` and
+    /// exits without touching the successor. `true` = completions were
+    /// coalesced meanwhile — run ONCE more (the flag resets); `false` = done,
+    /// the slot is released (or was never this owner's).
     ChatRefreshEnd {
         node: NodeKey,
+        gen: u64,
         reply: oneshot::Sender<bool>,
     },
 }
@@ -332,10 +337,15 @@ struct FleetActor {
     inventories: HashMap<NodeKey, (NodeInventory, PulledAt)>,
     /// Per-node chat-refresh debounce state (see [`FleetMsg::ChatRefreshBegin`]):
     /// present = a chat-end inventory refresh is scheduled or running for the
-    /// node; the bool = a LATER chat completed meanwhile, so run once more when
-    /// the current pull finishes (trailing coalescing). Bounds the chat-driven
-    /// pulls to at most ONE in flight per node however bursty the chats.
-    chat_refreshes: HashMap<NodeKey, bool>,
+    /// node, keyed by an OWNER GENERATION (T14 r12: a retire + rapid re-pair can
+    /// leave a STALE owner running — its End must not mutate a successor's slot,
+    /// or two owners pull concurrently); the bool = a LATER chat completed
+    /// meanwhile, so run once more when the current pull finishes (trailing
+    /// coalescing). Bounds the chat-driven pulls to at most ONE live owner per
+    /// node however bursty the chats.
+    chat_refreshes: HashMap<NodeKey, (u64, bool)>,
+    /// Monotonic owner-generation source for `chat_refreshes`.
+    chat_refresh_gen: u64,
     /// The HELLO-negotiated protocol major per node, refreshed on every (re)admission —
     /// what feature gating (per-load params) reads today; a Fleet-view version display
     /// (T14) would read the same slot but does not exist yet. Absent until the
@@ -736,29 +746,34 @@ impl Actor for FleetActor {
             FleetMsg::ChatRefreshBegin { node, reply } => {
                 let owned = match self.chat_refreshes.entry(node) {
                     std::collections::hash_map::Entry::Vacant(e) => {
-                        e.insert(false);
-                        true
+                        self.chat_refresh_gen += 1;
+                        e.insert((self.chat_refresh_gen, false));
+                        Some(self.chat_refresh_gen)
                     }
                     std::collections::hash_map::Entry::Occupied(mut e) => {
                         // Coalesce: the running pull will go once more.
-                        *e.get_mut() = true;
-                        false
+                        e.get_mut().1 = true;
+                        None
                     }
                 };
                 let _ = reply.send(owned);
             }
-            FleetMsg::ChatRefreshEnd { node, reply } => {
+            FleetMsg::ChatRefreshEnd { node, gen, reply } => {
                 let again = match self.chat_refreshes.entry(node) {
-                    std::collections::hash_map::Entry::Occupied(mut e) => {
-                        if *e.get() {
-                            *e.get_mut() = false;
+                    std::collections::hash_map::Entry::Occupied(mut e) if e.get().0 == gen => {
+                        if e.get().1 {
+                            e.get_mut().1 = false;
                             true
                         } else {
                             e.remove();
                             false
                         }
                     }
-                    // Slot vanished (e.g. a retire cleared state) — nothing owed.
+                    // A different owner generation holds the slot (retire dropped
+                    // ours; a re-paired node's chat re-created it) — a STALE owner
+                    // must not mutate the successor's state. Exit without a re-run.
+                    std::collections::hash_map::Entry::Occupied(_) => false,
+                    // Slot vanished (a retire cleared state) — nothing owed.
                     std::collections::hash_map::Entry::Vacant(_) => false,
                 };
                 let _ = reply.send(again);
@@ -787,6 +802,7 @@ impl HubFleet {
             node_ids: NodeIdAllocator::new(),
             inventories: HashMap::new(),
             chat_refreshes: HashMap::new(),
+            chat_refresh_gen: 0,
             software_versions: HashMap::new(),
             versions: HashMap::new(),
             epochs: HashMap::new(),
@@ -918,16 +934,16 @@ impl HubFleet {
         const SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
         let fleet = self.clone();
         tokio::spawn(async move {
-            let owned = fleet
+            let Some(gen) = fleet
                 .ask(|reply| FleetMsg::ChatRefreshBegin {
                     node: node.clone(),
                     reply,
                 })
                 .await
-                .unwrap_or(false);
-            if !owned {
+                .flatten()
+            else {
                 return; // coalesced into the owner's trailing re-run
-            }
+            };
             loop {
                 tokio::time::sleep(SETTLE).await;
                 // Hard bound (T14 r11): the owner MUST reach ChatRefreshEnd or
@@ -944,6 +960,7 @@ impl HubFleet {
                 let again = fleet
                     .ask(|reply| FleetMsg::ChatRefreshEnd {
                         node: node.clone(),
+                        gen,
                         reply,
                     })
                     .await
