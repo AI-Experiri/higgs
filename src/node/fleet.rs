@@ -285,7 +285,11 @@ enum FleetMsg {
 /// cache window — a backward wall step AND a sleep — under-reads on both
 /// clocks at once (no std clock counts time across sleep monotonically), and
 /// a forward wall step overstates; any lifecycle op or hub-routed chat
-/// re-stamps and self-heals both.
+/// re-stamps and self-heals both. The stamp is taken BEFORE the RPC, so it
+/// predates the node's actual capture by the request's transit time — the
+/// reported age (and any idle+age sum a client renders) can only OVERSTATE
+/// staleness by that transit, never claim freshness the data lacks (T14
+/// r11): the design's one allowed error direction.
 #[derive(Debug, Clone, Copy)]
 struct PulledAt {
     wall: std::time::SystemTime,
@@ -452,6 +456,10 @@ impl FleetActor {
         self.inventories.remove(node);
         self.versions.remove(node);
         self.software_versions.remove(node);
+        // Drop any chat-refresh debounce slot too: a retired node needs no
+        // trailing re-run, and an owner task mid-loop then sees the Vacant arm
+        // at its next ChatRefreshEnd and exits cleanly.
+        self.chat_refreshes.remove(node);
         // Forget the durable id slot so the node leaves the fleet view (not left disconnected).
         self.node_ids.remove(node);
     }
@@ -922,7 +930,17 @@ impl HubFleet {
             }
             loop {
                 tokio::time::sleep(SETTLE).await;
-                let _ = fleet.refresh_inventory(&node).await;
+                // Hard bound (T14 r11): the owner MUST reach ChatRefreshEnd or
+                // the node's debounce slot strands forever (later completions
+                // only set the trailing flag). Chosen ABOVE the control-plane
+                // request timeout so it fires only when the transport is stuck
+                // in a state that timeout never covers (e.g. open_bi starved of
+                // stream credit on a connection that never closes).
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(150),
+                    fleet.refresh_inventory(&node),
+                )
+                .await;
                 let again = fleet
                     .ask(|reply| FleetMsg::ChatRefreshEnd {
                         node: node.clone(),
