@@ -20,6 +20,10 @@ fn version_sanitizer_strips_terminal_control_and_keeps_semver() {
         "hub-abc12345(my host)"
     );
     assert_eq!(sanitize_display("evil\u{1b}[2Jname\r\n"), "evil[2Jname");
+    // Bidi overrides/isolates are FORMAT (Cf) chars is_control misses — they
+    // visually reorder a printed line, the same spoof class (r23).
+    assert_eq!(sanitize_display("ok\u{202E}deriapnu"), "okderiapnu");
+    assert_eq!(sanitize_display("a\u{2066}b\u{2069}c\u{200F}"), "abc");
     assert_eq!(sanitize_display(&"x".repeat(300)).len(), 128);
 }
 

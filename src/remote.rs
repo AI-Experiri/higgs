@@ -104,22 +104,36 @@ pub struct HelloParams {
     pub capabilities: Capabilities,
 }
 
-/// Sanitize a peer-supplied version string for DISPLAY (T14 r10): `Hello.
+/// Sanitize a peer-supplied DISPLAY NAME for a terminal (T14 r22/r23): names
+/// (`hub-<eid8>(<host>)`, friendly labels) legitimately contain spaces,
+/// punctuation, and non-ASCII hostnames, so unlike [`sanitize_version`] this
+/// strips only what can SPOOF a terminal — control characters (Cc: ANSI
+/// escapes, CR/LF) AND the bidi-override/format characters `is_control`
+/// misses (Cf: RLO/LRO/isolates/marks, which visually reorder a printed
+/// line) — and caps the length. Normal names pass intact.
+pub fn sanitize_display(raw: &str) -> String {
+    fn is_bidi_control(c: char) -> bool {
+        matches!(
+            c,
+            '\u{200E}' | '\u{200F}' | '\u{061C}'            // LRM/RLM/ALM
+            | '\u{202A}'..='\u{202E}'                        // LRE/RLE/PDF/LRO/RLO
+            | '\u{2066}'..='\u{2069}'                        // isolates
+        )
+    }
+    raw.chars()
+        .filter(|c| !c.is_control() && !is_bidi_control(*c))
+        .take(128)
+        .collect()
+}
+
+/// Sanitize a peer-supplied VERSION string for DISPLAY (T14 r10): `Hello.
 /// software_version` is required on the wire but its content is entirely
 /// peer-controlled — raw newlines/ANSI escapes would let an admitted (or
 /// token-bearing) node spoof or erase pairing-terminal output. Keep only the
 /// characters a semver can contain (alphanumerics and `.+-_`), capped at 64
 /// — a normal version passes through unchanged; anything else degrades
-/// visibly rather than executing in someone's terminal.
-/// Sanitize a peer-supplied DISPLAY NAME for a terminal (T14 r22): names
-/// (`hub-<eid8>(<host>)`, friendly labels) legitimately contain spaces and
-/// punctuation, so unlike [`sanitize_version`] this only strips CONTROL
-/// characters (ANSI escapes, CR/LF) and caps the length — enough to stop
-/// terminal spoofing without mangling a normal name.
-pub fn sanitize_display(raw: &str) -> String {
-    raw.chars().filter(|c| !c.is_control()).take(128).collect()
-}
-
+/// visibly rather than executing in someone's terminal. An all-filtered
+/// input yields the empty string, which callers treat as ABSENT.
 pub fn sanitize_version(raw: &str) -> String {
     raw.chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-' | '_'))
