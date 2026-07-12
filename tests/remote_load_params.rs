@@ -103,6 +103,7 @@ async fn params_load_applies_ctx_on_a_real_node() {
     let GateOutcome::Admitted {
         agreed_version,
         software_version,
+        fleet_events: _,
     } = outcome
     else {
         panic!("admitted: {outcome:?}");
@@ -125,6 +126,7 @@ async fn params_load_applies_ctx_on_a_real_node() {
             None,
             Some(agreed_version),
             Some(software_version.clone()),
+            false,
         )
         .await;
 

@@ -115,6 +115,8 @@ fn run_link_pair() -> Result<()> {
                 GateOutcome::Admitted {
                     agreed_version,
                     software_version,
+                    // The CLI pairing loop keeps no fleet cache to push into.
+                    fleet_events: _,
                 } => {
                     // An all-filtered HELLO version sanitizes to empty — print a
                     // placeholder, not "higgs ," (T14 r22).

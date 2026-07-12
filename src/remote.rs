@@ -51,6 +51,16 @@ pub const M_NODE_PULL: &str = "higgs/node/pull";
 /// `{ request_id, downloaded, total? }` (`total` omitted when the server sends no length).
 pub const N_PROGRESS: &str = "higgs/node/progress";
 
+/// `N_FLEET_EVENT` — a node → hub notification pushed on a DEDICATED uni stream the node
+/// opens after HELLO (separate from the [`N_LOG_LINE`] stream; one stream ⇒ QUIC preserves
+/// event order). Each event marks a node-side worker-state change (chat start/end,
+/// worker load/unload) and CARRIES the authoritative post-change worker snapshot
+/// ([`NodeFleetEvent`]), so the hub can update its cached inventory without a pull —
+/// ordered by the same node-actor `snapshot_seq` as `M_NODE_INVENTORY` replies.
+/// Additive (T10): the `fleet_events` capability advertises it; a hub that doesn't
+/// know the method skips the frames (its notification reader filters by method).
+pub const N_FLEET_EVENT: &str = "higgs/node/fleet_event";
+
 /// `higgs/node/leave` — the one NODE→hub control op: the node asks the hub to retire IT
 /// (`higgs node leave`). The hub authenticates by the connection's TLS `remote_id` and IGNORES
 /// any payload, so a node can only ever remove ITSELF. The hub removes it from the allowlist +
@@ -153,6 +163,9 @@ pub fn node_capabilities() -> Capabilities {
         // `update` (M_UPDATE) is still only a stub (#18), so it stays advertised false.
         ("download", true),
         ("log_stream", true),
+        // `fleet_events` (T10): this node pushes N_FLEET_EVENT worker-state changes.
+        // The hub keys its chat-end debounced re-pull fallback on the ABSENCE of this.
+        ("fleet_events", true),
         ("update", false),
     ]
     .into_iter()
@@ -162,10 +175,16 @@ pub fn node_capabilities() -> Capabilities {
 
 /// The capabilities a hub advertises in its HELLO result.
 pub fn hub_capabilities() -> Capabilities {
-    [("update_push", true), ("log_aggregate", true)]
-        .into_iter()
-        .map(|(k, v)| (k.to_string(), serde_json::Value::Bool(v)))
-        .collect()
+    [
+        ("update_push", true),
+        ("log_aggregate", true),
+        // `fleet_events` (T10): this hub consumes N_FLEET_EVENT pushes. Informational —
+        // a node pushes regardless; an older hub's notification reader skips the method.
+        ("fleet_events", true),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), serde_json::Value::Bool(v)))
+    .collect()
 }
 
 /// hub → node HELLO result.
@@ -330,6 +349,43 @@ pub struct NodeInventory {
     #[ts(optional, type = "number")]
     pub snapshot_seq: Option<u64>,
 }
+}
+
+higgs_const_enum! {
+    /// What changed on a node, carried by every [`NodeFleetEvent`] and re-broadcast
+    /// hub-side (with hub-local kinds) as a [`crate::node::fleet::FleetEvent`] for
+    /// live UIs. Wire values are `snake_case`. Extensible: a reader ignores an
+    /// event whose kind it can't decode (additive, no protocol bump).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum FleetEventKind {
+        /// A chat began on a worker (`in_flight` rose).
+        ChatStart,
+        /// A chat finished on a worker (`in_flight` fell, idle clock restarted).
+        ChatEnd,
+        /// A worker finished loading its model and is resident.
+        WorkerLoaded,
+        /// A worker was unloaded/killed/idle-reaped and is gone.
+        WorkerUnloaded,
+        /// Hub-local (never on the node wire): the node's connection was admitted.
+        NodeConnected,
+        /// Hub-local (never on the node wire): the node retired or its connection dropped.
+        NodeDropped,
+    }
+}
+
+/// Params of one [`N_FLEET_EVENT`] notification: the state-change kind plus the
+/// FULL post-change worker snapshot, sequenced by the node actor's `snapshot_seq`
+/// (same counter as [`NodeInventory::snapshot_seq`], bumped in the same actor turn
+/// as the snapshot — mailbox order IS data order, across pushes AND pulls). Carrying
+/// the whole (small) worker list instead of a delta means the hub's cache merge is a
+/// guarded replace — there is no per-kind patch logic to drift, and a lost/lagged
+/// event self-heals on the next one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeFleetEvent {
+    pub kind: FleetEventKind,
+    pub snapshot_seq: u64,
+    pub workers: Vec<InventoryWorker>,
 }
 
 /// Hub → node `M_NODE_PULL` params on a DATA stream: the file to download + the hub's

@@ -310,6 +310,12 @@ struct NodeActor {
     /// Lifecycle event fan-out (ModelLoaded/ModelUnloaded), so the engine's event stream works
     /// the same for a local NodeRuntime as it did for the single Supervisor (P4b).
     events_tx: broadcast::Sender<HiggsEvent>,
+    /// Fleet-event fan-out (T10): a typed worker-state change + the post-change worker
+    /// snapshot, sequenced by `snapshot_seq` IN THE SAME ACTOR TURN as the change — so
+    /// mailbox order stays data order across pushes and `Inventory` pulls (T14 r17).
+    /// `serve_node`'s relay drains this onto a dedicated uni stream as `N_FLEET_EVENT`;
+    /// with no hub connected (no subscriber) the send is a dropped no-op.
+    fleet_tx: broadcast::Sender<crate::remote::NodeFleetEvent>,
 }
 
 /// The APPLIED facts of one worker's load, captured where `do_load` resolved
@@ -336,6 +342,23 @@ impl NodeActor {
     /// Best-effort lifecycle event emit (no subscribers ⇒ dropped).
     fn emit(&self, ev: HiggsEvent) {
         let _ = self.events_tx.send(ev);
+    }
+
+    /// Best-effort fleet-event emit (T10): bump the shared snapshot sequence and capture
+    /// the post-change worker snapshot in THIS actor turn, so the event's seq totally
+    /// orders it against every other push and `Inventory` pull. Cheap — `snapshot_workers`
+    /// reads only actor-owned bookkeeping (no hardware probe, no worker RPC). Call AFTER
+    /// the state change it reports.
+    fn emit_fleet(&mut self, kind: crate::remote::FleetEventKind) {
+        if self.fleet_tx.receiver_count() == 0 {
+            return; // no hub relay subscribed — skip the snapshot work entirely
+        }
+        self.snapshot_seq += 1;
+        let _ = self.fleet_tx.send(crate::remote::NodeFleetEvent {
+            kind,
+            snapshot_seq: self.snapshot_seq,
+            workers: self.snapshot_workers(),
+        });
     }
 
     /// Snapshot resident workers (id → model) synchronously off the registry — the fast
@@ -437,6 +460,7 @@ impl Actor for NodeActor {
                                     self.last_activity.insert(id, Instant::now());
                                     self.load_facts.insert(id, facts);
                                     self.emit(HiggsEvent::ModelLoaded { id: model });
+                                    self.emit_fleet(crate::remote::FleetEventKind::WorkerLoaded);
                                 }
                                 Err(_) => self.reap(id, sup, None),
                             }
@@ -466,6 +490,7 @@ impl Actor for NodeActor {
                         self.forget_activity(id);
                         self.reap(id, sup, Some(reply));
                         self.emit(HiggsEvent::ModelUnloaded { id: model });
+                        self.emit_fleet(crate::remote::FleetEventKind::WorkerUnloaded);
                     }
                     None => {
                         let _ = reply.send(Err(no_worker(id)));
@@ -530,7 +555,11 @@ impl Actor for NodeActor {
                     }
                     None => Err(no_worker(id)),
                 };
+                let started = lease.is_ok();
                 let _ = reply.send(lease);
+                if started {
+                    self.emit_fleet(crate::remote::FleetEventKind::ChatStart);
+                }
             }
             NodeMsg::ChatEnd { id } => {
                 if self.registry.get(id).is_some() {
@@ -539,6 +568,7 @@ impl Actor for NodeActor {
                     }
                     // Measure idle from the END of the generation.
                     self.last_activity.insert(id, Instant::now());
+                    self.emit_fleet(crate::remote::FleetEventKind::ChatEnd);
                 } else {
                     // Worker was unloaded mid-chat — drop its bookkeeping rather than leak it.
                     self.forget_activity(id);
@@ -561,13 +591,20 @@ impl Actor for NodeActor {
                                     .is_some_and(|t| t.elapsed() >= ttl)
                         })
                         .collect();
+                    let mut reaped = false;
                     for id in idle {
                         if let Some(sup) = self.registry.remove(id) {
                             let model = sup.loaded_model_id().unwrap_or_default();
                             self.forget_activity(id);
                             self.reap(id, sup, None);
                             self.emit(HiggsEvent::ModelUnloaded { id: model });
+                            reaped = true;
                         }
+                    }
+                    if reaped {
+                        // One event for the whole sweep — the snapshot already
+                        // reflects every reaped worker.
+                        self.emit_fleet(crate::remote::FleetEventKind::WorkerUnloaded);
                     }
                 }
             }
@@ -1063,6 +1100,9 @@ pub struct NodeRuntime {
     bus: Arc<LogBus>,
     /// Runtime-mutable idle policy, shared with the reaper.
     idle: Arc<IdleConfig>,
+    /// Fleet-event fan-out (T10), mirrored on the wrapper so `subscribe_fleet_events`
+    /// needs no mailbox round-trip.
+    fleet_tx: broadcast::Sender<crate::remote::NodeFleetEvent>,
 }
 
 impl NodeRuntime {
@@ -1076,6 +1116,8 @@ impl NodeRuntime {
     pub(crate) fn with_spawner(config: NodeConfig, spawner: SupervisorSpawner) -> Self {
         let (log_tx, _) = broadcast::channel(LOG_RELAY_CAP);
         let (events_tx, _) = broadcast::channel(EVENT_CAP);
+        let (fleet_tx, _) = broadcast::channel(EVENT_CAP);
+        let fleet_for_actor = fleet_tx.clone();
         let config = Arc::new(config);
         let bus = config.bus.clone();
         let relay = log_tx.clone();
@@ -1101,6 +1143,7 @@ impl NodeRuntime {
             in_flight: HashMap::new(),
             idle: idle_for_actor,
             events_tx: events_for_actor,
+            fleet_tx: fleet_for_actor,
         });
         // Idle reaper: a WeakHandle so it never keeps the actor alive — it exits the tick the
         // last real handle drops (upgrade fails). The cadence is ADAPTIVE — each iteration
@@ -1132,6 +1175,7 @@ impl NodeRuntime {
             events_tx,
             bus,
             idle,
+            fleet_tx,
         }
     }
 
@@ -1167,6 +1211,14 @@ impl NodeRuntime {
     /// Subscribe to lifecycle events (ModelLoaded/ModelUnloaded) — the engine's event stream.
     pub fn events(&self) -> broadcast::Receiver<HiggsEvent> {
         self.events_tx.subscribe()
+    }
+
+    /// Subscribe to fleet events (T10): typed worker-state changes carrying the
+    /// post-change worker snapshot, actor-sequenced. The node's `serve_node` drains
+    /// this onto a dedicated uni stream to the hub as `N_FLEET_EVENT`. The actor
+    /// skips the snapshot work entirely while there is no subscriber.
+    pub fn subscribe_fleet_events(&self) -> broadcast::Receiver<crate::remote::NodeFleetEvent> {
+        self.fleet_tx.subscribe()
     }
 
     /// The node's shared Developer-Log bus (Developer-Logs history + live stream + verbosity).

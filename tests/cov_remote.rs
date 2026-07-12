@@ -447,6 +447,7 @@ async fn fleet_stale_admit_gen_is_refused() {
             Some(0),
             None,
             None,
+            false,
         )
         .await;
 
@@ -480,6 +481,7 @@ async fn fleet_admit_disconnect_all_then_retire() {
             None,
             None,
             None,
+            false,
         )
         .await;
     assert_eq!(

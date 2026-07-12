@@ -37,7 +37,7 @@
 //! transport handle is compared by `Arc` identity so a stale failure can't drop a freshly
 //! reconnected transport.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use iroh::endpoint::Connection;
@@ -52,8 +52,8 @@ use crate::node::node_id::{NodeId, NodeIdAllocator};
 use crate::node::transport::NodeTransport;
 use crate::node::worker_id::WorkerId;
 use crate::remote::{
-    NodeInventory, M_NODE_INVENTORY, M_NODE_KILL, M_NODE_LOAD, M_NODE_SCAN, M_NODE_UNLOAD,
-    N_LOG_LINE,
+    FleetEventKind, InventoryWorker, NodeFleetEvent, NodeInventory, M_NODE_INVENTORY, M_NODE_KILL,
+    M_NODE_LOAD, M_NODE_SCAN, M_NODE_UNLOAD, N_FLEET_EVENT, N_LOG_LINE,
 };
 use crate::rpc::{self, RpcFrame};
 
@@ -98,11 +98,13 @@ pub struct NodeView {
     /// Age of the cached `inventory` snapshot in ms at the moment this view was
     /// taken, computed hub-side from a DUAL wall+monotonic stamp taken at the
     /// pull's start (see `PulledAt` — max of two lower bounds; errs stale-ward
-    /// only). The hub re-pulls inventory on connect, after lifecycle ops, and
-    /// (debounced) after hub-routed chats complete; node-LOCAL activity the hub
-    /// never sees still ages here until the next pull — a remote row's stats
-    /// are only as fresh as this says. Absent for the LIVE local card (its
-    /// stats are read per request) and when there is no cached inventory.
+    /// only). The hub re-pulls inventory on connect and after lifecycle ops,
+    /// and a `fleet_events` node (T10) re-stamps it on every pushed state
+    /// change — so its rows read fresh in event time. Only an event-LESS
+    /// legacy node still relies on the debounced chat-end pull, and only there
+    /// does node-local activity age invisibly until the next pull. Absent for
+    /// the LIVE local card (its stats are read per request) and when there is
+    /// no cached inventory.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional, type = "number")]
     pub inventory_age_ms: Option<u64>,
@@ -122,6 +124,24 @@ pub struct NodeView {
     pub protocol: Option<u32>,
 }
 }
+
+higgs_ts! {
+/// One live fleet event (T10), broadcast by the hub for real-time UIs: WHICH node
+/// changed and WHAT kind of change. The event is a cache-invalidation signal, not a
+/// data carrier — the hub has already folded the node's pushed snapshot into its
+/// inventory cache when this fires, so a subscriber re-reads `nodes_view` (or its
+/// serving layer's equivalent) for the actual state.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FleetEvent {
+    /// The node's canonical endpoint id (the [`NodeKey`], as `NodeView.endpoint_id`).
+    pub endpoint_id: String,
+    pub kind: FleetEventKind,
+}
+}
+
+/// Capacity of the hub's [`FleetEvent`] broadcast. Events are tiny invalidation
+/// signals; a subscriber that lags past 256 of them just refreshes on the next one.
+const FLEET_EVENT_CAP: usize = 256;
 
 /// The actor's typed mailbox. Reads carry a `reply` the wrapper awaits; writes are atomic
 /// state transitions (some also reply so the wrapper can sequence the next slow RPC).
@@ -193,6 +213,11 @@ enum FleetMsg {
         /// `None` when the caller has none (tests/direct). Same lifecycle as
         /// `agreed_version`: refreshed on every (re)admission, cleared at retire.
         software_version: Option<String>,
+        /// Whether the node's HELLO advertised the `fleet_events` capability (T10):
+        /// it pushes `N_FLEET_EVENT` state changes, so the hub's chat-end debounced
+        /// re-pull is demoted to a legacy fallback for it. Same lifecycle as the
+        /// version facts: refreshed per (re)admission, cleared at retire.
+        fleet_events: bool,
         #[allow(clippy::type_complexity)]
         reply: oneshot::Sender<Option<(NodeId, Option<Arc<NodeTransport>>)>>,
     },
@@ -200,7 +225,9 @@ enum FleetMsg {
     DropTransportIf {
         node: NodeKey,
         transport: Arc<NodeTransport>,
-        reply: oneshot::Sender<()>,
+        /// `true` = the transport was current and actually removed (the node went
+        /// disconnected now) — `false` for a stale watcher's no-op.
+        reply: oneshot::Sender<bool>,
     },
     Retire {
         node: NodeKey,
@@ -258,6 +285,27 @@ enum FleetMsg {
     BumpEpoch {
         node: NodeKey,
         reply: oneshot::Sender<()>,
+    },
+    /// Merge a node-PUSHED worker snapshot (`N_FLEET_EVENT`, T10) into the cached
+    /// inventory: replace `workers` + `snapshot_seq` + the freshness stamp, KEEP the
+    /// pulled host/hardware/runtime fields. Same epoch + seq ordering guards as
+    /// `CommitInventory` (pushes and pulls share the node actor's one seq counter, so
+    /// they order against each other exactly). Replies `true` when there is NO cached
+    /// inventory to merge into (an event raced ahead of the first pull) — the caller
+    /// then falls back to a full `refresh_inventory` instead of fabricating one.
+    CommitWorkers {
+        node: NodeKey,
+        epoch_before: u64,
+        workers: Vec<InventoryWorker>,
+        snapshot_seq: u64,
+        /// Dual-clock stamp of the event's RECEIPT (see [`PulledAt`]).
+        pulled_at: PulledAt,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Does this node push `N_FLEET_EVENT`s (its HELLO advertised `fleet_events`)?
+    NodePushesEvents {
+        node: NodeKey,
+        reply: oneshot::Sender<bool>,
     },
     /// Chat-end refresh debounce, phase 1: may THIS completion own the (single)
     /// refresh for `node`? `Some(gen)` = caller owns the slot under that
@@ -370,6 +418,11 @@ struct FleetActor {
     /// reconnects — the HELLO is the only source), cleared at retire. Absent for a
     /// node admitted by a pre-T14 caller path.
     software_versions: HashMap<NodeKey, String>,
+    /// Nodes whose CURRENT admission advertised the `fleet_events` capability (T10).
+    /// Membership decides whether the chat-end debounced re-pull is scheduled at all
+    /// (event-pushing nodes keep the hub cache fresh themselves). Refreshed per
+    /// (re)admission, cleared at retire — same lifecycle as the version facts.
+    event_nodes: HashSet<NodeKey>,
     /// Per-node lifecycle generation, bumped on every load/unload/kill/route-drop. A
     /// `refresh_inventory` only commits its (possibly stale) result if this is unchanged
     /// since it started — so a slow connect-time fetch can't clobber a newer state.
@@ -408,7 +461,7 @@ impl FleetActor {
 
     /// On connection close, remove ONLY the transport — and only if it's still the current
     /// one (Arc identity), so a reconnect's fresh transport isn't dropped by a stale watcher.
-    fn drop_transport_if(&mut self, node: &str, transport: &Arc<NodeTransport>) {
+    fn drop_transport_if(&mut self, node: &str, transport: &Arc<NodeTransport>) -> bool {
         let removed = if self
             .nodes
             .get(node)
@@ -418,14 +471,18 @@ impl FleetActor {
         } else {
             None
         };
-        if let Some(t) = removed {
-            tracing::warn!(
-                node,
-                "higgs: node connection dropped; transport removed (routes kept)"
-            );
-            // Close so a wedged-but-open connection's close-watcher wakes and releases its
-            // Arc (otherwise it would wait on `closed()` forever).
-            t.close();
+        match removed {
+            Some(t) => {
+                tracing::warn!(
+                    node,
+                    "higgs: node connection dropped; transport removed (routes kept)"
+                );
+                // Close so a wedged-but-open connection's close-watcher wakes and releases its
+                // Arc (otherwise it would wait on `closed()` forever).
+                t.close();
+                true
+            }
+            None => false,
         }
     }
 
@@ -479,6 +536,7 @@ impl FleetActor {
         self.inventories.remove(node);
         self.versions.remove(node);
         self.software_versions.remove(node);
+        self.event_nodes.remove(node);
         // Drop any chat-refresh debounce slot too: a retired node needs no
         // trailing re-run, and an owner task mid-loop then sees the Vacant arm
         // at its next ChatRefreshEnd and exits cleanly.
@@ -626,6 +684,7 @@ impl Actor for FleetActor {
                 gen,
                 agreed_version,
                 software_version,
+                fleet_events,
                 reply,
             } => {
                 if matches!(gen, Some(g) if g != self.admit_gen) {
@@ -671,6 +730,14 @@ impl Actor for FleetActor {
                             self.software_versions.remove(&node);
                         }
                     }
+                    // Same per-admission rule for the event-push capability (T10): a
+                    // node DOWNGRADED to an event-less build must fall back to the
+                    // debounced re-pull, so never inherit a prior connection's flag.
+                    if fleet_events {
+                        self.event_nodes.insert(node.clone());
+                    } else {
+                        self.event_nodes.remove(&node);
+                    }
                     let replaced = self.nodes.insert(node.clone(), transport);
                     // The cached INVENTORY is deliberately KEPT across (re)admission
                     // (same last-known-state continuity as across a disconnect), so
@@ -696,8 +763,8 @@ impl Actor for FleetActor {
                 transport,
                 reply,
             } => {
-                self.drop_transport_if(&node, &transport);
-                let _ = reply.send(());
+                let removed = self.drop_transport_if(&node, &transport);
+                let _ = reply.send(removed);
             }
             FleetMsg::Retire { node, reply } => {
                 self.retire(&node);
@@ -782,6 +849,44 @@ impl Actor for FleetActor {
                 self.bump_epoch(&node);
                 let _ = reply.send(());
             }
+            FleetMsg::CommitWorkers {
+                node,
+                epoch_before,
+                workers,
+                snapshot_seq,
+                pulled_at,
+                reply,
+            } => {
+                let mut needs_full = false;
+                if self.epoch(&node) == epoch_before {
+                    match self.inventories.get_mut(&node) {
+                        Some((cur_inv, cur_at)) => {
+                            // Same ordering rule as `CommitInventory`: prefer the node's
+                            // seq (pushes always carry one); the stamp arm covers only a
+                            // cached snapshot WITHOUT one (a legacy pull, or the seq
+                            // stripped at re-admission — where accepting the fresh push
+                            // re-establishes seq ordering, like the first new pull does).
+                            let newer = match cur_inv.snapshot_seq {
+                                Some(old_seq) => snapshot_seq > old_seq,
+                                None => pulled_at.mono > cur_at.mono,
+                            };
+                            if newer {
+                                cur_inv.workers = workers;
+                                cur_inv.snapshot_seq = Some(snapshot_seq);
+                                *cur_at = pulled_at;
+                            }
+                        }
+                        // No snapshot to merge into (the event outran the connect-time
+                        // pull): don't fabricate hostname/hardware — have the caller
+                        // pull the full inventory instead.
+                        None => needs_full = true,
+                    }
+                }
+                let _ = reply.send(needs_full);
+            }
+            FleetMsg::NodePushesEvents { node, reply } => {
+                let _ = reply.send(self.event_nodes.contains(&node));
+            }
             FleetMsg::ChatRefreshBegin { node, reply } => {
                 let owned = match self.chat_refreshes.entry(node) {
                     std::collections::hash_map::Entry::Vacant(e) => {
@@ -834,6 +939,10 @@ pub struct HubFleet {
     handle: Handle<FleetMsg>,
     /// Immutable, set at construction — kept on the wrapper so `bus()` needs no round-trip.
     bus: Arc<LogBus>,
+    /// Live [`FleetEvent`] fan-out (T10): node-pushed state changes (already folded into
+    /// the inventory cache when emitted) plus hub-local connect/drop/retire markers.
+    /// No subscribers ⇒ sends are dropped no-ops.
+    events_tx: tokio::sync::broadcast::Sender<FleetEvent>,
 }
 
 impl HubFleet {
@@ -850,12 +959,33 @@ impl HubFleet {
             chat_refreshes: HashMap::new(),
             chat_refresh_gen: 0,
             software_versions: HashMap::new(),
+            event_nodes: HashSet::new(),
             versions: HashMap::new(),
             epochs: HashMap::new(),
             bus: bus_for_actor,
             admit_gen: 0,
         });
-        Self { handle, bus }
+        let (events_tx, _) = tokio::sync::broadcast::channel(FLEET_EVENT_CAP);
+        Self {
+            handle,
+            bus,
+            events_tx,
+        }
+    }
+
+    /// Subscribe to live [`FleetEvent`]s (T10). Fired AFTER the corresponding cache
+    /// mutation, so a subscriber that re-reads the fleet view on receipt observes the
+    /// change the event announced.
+    pub fn subscribe_fleet_events(&self) -> tokio::sync::broadcast::Receiver<FleetEvent> {
+        self.events_tx.subscribe()
+    }
+
+    /// Best-effort fleet-event emit (no subscribers ⇒ dropped).
+    fn emit_fleet_event(&self, node: &str, kind: FleetEventKind) {
+        let _ = self.events_tx.send(FleetEvent {
+            endpoint_id: node.to_string(),
+            kind,
+        });
     }
 
     /// Send a message carrying a `reply` and await it; `None` if the actor mailbox is gone
@@ -904,6 +1034,7 @@ impl HubFleet {
         admit_gen: Option<u64>,
         agreed_version: Option<u32>,
         software_version: Option<String>,
+        fleet_events: bool,
     ) {
         // Atomically admit: assign the stable NodeId, insert the transport, and bump the epoch in
         // ONE actor message, gated by the admission generation. If the kill switch bumped the
@@ -918,6 +1049,7 @@ impl HubFleet {
                 gen: admit_gen,
                 agreed_version,
                 software_version,
+                fleet_events,
                 reply,
             })
             .await
@@ -929,12 +1061,17 @@ impl HubFleet {
         if let Some(old) = replaced {
             old.close(); // free the old connection + wake its close-watcher
         }
-        // Read the node's relayed worker stderr (its uni stream) into the hub bus for THIS
-        // connection; ends when the connection closes (accept_uni errors).
-        tokio::spawn(read_remote_logs(
+        self.emit_fleet_event(&node, FleetEventKind::NodeConnected);
+        // Read the node's uni-stream notifications for THIS connection — relayed worker
+        // stderr into the hub bus, and fleet events (T10) into the inventory cache —
+        // until the connection closes (accept_uni errors). Weak: the reader must not
+        // keep a retired fleet alive.
+        tokio::spawn(read_node_notifications(
             transport.connection(),
             node_id,
+            node.clone(),
             self.bus.clone(),
+            Arc::downgrade(self),
         ));
 
         // On (re)connect: refresh the inventory for the fleet view. Best-effort, off the hot
@@ -969,7 +1106,9 @@ impl HubFleet {
         }
     }
 
-    /// Schedule the DEBOUNCED chat-end inventory refresh for `node` (T14 r2):
+    /// Schedule the DEBOUNCED chat-end inventory refresh for `node` (T14 r2) —
+    /// since T10 a LEGACY FALLBACK: it stands down entirely for a node whose
+    /// admission advertised `fleet_events` (its own pushes keep the cache fresh):
     /// if no chat-refresh is scheduled/running for the node, own the slot and
     /// spawn ONE detached pull after a short settle delay (the node records its
     /// `ChatEnd` when the chat's lease drops, immediately after the reply — the
@@ -980,6 +1119,15 @@ impl HubFleet {
         const SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
         let fleet = self.clone();
         tokio::spawn(async move {
+            // LEGACY FALLBACK ONLY (T10): a node that pushes `N_FLEET_EVENT`s keeps the
+            // cache fresh itself (its ChatEnd event lands without any settle delay), so
+            // the debounced re-pull would only burn an inventory RPC to learn what the
+            // push already committed. Checked here (not at the Drop guard, which must
+            // stay sync) — per chat end, so a mid-chat re-admission that changes the
+            // capability is honored by the very next completion.
+            if fleet.node_pushes_events(&node).await {
+                return;
+            }
             let Some(gen) = fleet
                 .ask(|reply| FleetMsg::ChatRefreshBegin {
                     node: node.clone(),
@@ -1069,6 +1217,41 @@ impl HubFleet {
         Ok(inventory)
     }
 
+    /// Fold one node-pushed `N_FLEET_EVENT` into the fleet state (T10): merge its worker
+    /// snapshot into the cached inventory under the same epoch + seq guards as a pull
+    /// (`FleetMsg::CommitWorkers`), then re-broadcast the kind as a hub [`FleetEvent`].
+    /// If the event outran the connect-time pull (no cached inventory yet), fall back to
+    /// one full `refresh_inventory` — the event's data still lands, via the pull path.
+    async fn apply_node_event(self: &Arc<Self>, node: &NodeKey, ev: NodeFleetEvent) {
+        let epoch_before = self.epoch(node).await;
+        let needs_full = self
+            .ask(|reply| FleetMsg::CommitWorkers {
+                node: node.clone(),
+                epoch_before,
+                workers: ev.workers,
+                snapshot_seq: ev.snapshot_seq,
+                pulled_at: PulledAt::now(),
+                reply,
+            })
+            .await
+            .unwrap_or(false);
+        if needs_full {
+            let _ = self.refresh_inventory(node).await;
+        }
+        self.emit_fleet_event(node, ev.kind);
+    }
+
+    /// Does this node's CURRENT admission push `N_FLEET_EVENT`s? (T10 — decides whether
+    /// the chat-end debounced re-pull is needed at all.)
+    async fn node_pushes_events(&self, node: &str) -> bool {
+        self.ask(|reply| FleetMsg::NodePushesEvents {
+            node: node.to_string(),
+            reply,
+        })
+        .await
+        .unwrap_or(false)
+    }
+
     /// This node's current lifecycle generation (0 if never touched).
     async fn epoch(&self, node: &str) -> u64 {
         self.ask(|reply| FleetMsg::Epoch {
@@ -1100,12 +1283,18 @@ impl HubFleet {
     /// On connection close, remove ONLY the transport (Arc-identity guarded). Routes are kept
     /// (durable across reconnect); ops return HG027 until the node reconnects.
     async fn drop_transport_if(&self, node: &str, transport: &Arc<NodeTransport>) {
-        self.ask(|reply| FleetMsg::DropTransportIf {
-            node: node.to_string(),
-            transport: transport.clone(),
-            reply,
-        })
-        .await;
+        let removed = self
+            .ask(|reply| FleetMsg::DropTransportIf {
+                node: node.to_string(),
+                transport: transport.clone(),
+                reply,
+            })
+            .await
+            .unwrap_or(false);
+        if removed {
+            // Only a REAL disconnect (not a stale watcher's no-op) is an event.
+            self.emit_fleet_event(node, FleetEventKind::NodeDropped);
+        }
     }
 
     /// Explicitly retire a node: a FULL removal (operator action — the machine is being taken
@@ -1117,6 +1306,7 @@ impl HubFleet {
             reply,
         })
         .await;
+        self.emit_fleet_event(node, FleetEventKind::NodeDropped);
     }
 
     /// Close every node's transport and mark all nodes disconnected, WITHOUT dropping routes,
@@ -1577,17 +1767,16 @@ impl HubFleet {
         // socket close; an outcome-arm-only schedule would skip the abort path
         // and leave the cache reporting pre-chat activity indefinitely, T14 r8).
         // A Drop guard owned by the future covers all three. It is DEBOUNCED
-        // per node (r2: one pull in flight, later completions coalesce into one
-        // trailing re-run; 250 ms settle lets the node's ChatEnd land) and
-        // epoch-gated. On an abort the node's generation may still be running —
-        // the pulled snapshot then truthfully shows it in flight — or (r20) may
-        // not have STARTED yet (the M_CHAT handler hadn't reached ChatHandle),
-        // in which case the refresh snapshots a pre-chat state and the chat's
-        // later start/end go unrefreshed. Both are the same accepted pull-model
-        // residual (r5): node-side activity after the hub's last snapshot is
-        // invisible until the next refresh or lifecycle op — node-push events
-        // (the fleet-event SSE work) own the real fix; the UI's sync provenance
-        // keeps the aged claim honest meanwhile.
+        // per node (T14 r2: one pull in flight, later completions coalesce into
+        // one trailing re-run; 250 ms settle lets the node's ChatEnd land),
+        // epoch-gated, and since T10 a LEGACY FALLBACK: a node whose admission
+        // advertised `fleet_events` pushes its own ChatStart/ChatEnd snapshots
+        // (`N_FLEET_EVENT`) — covering node-local chats, hub-side aborts (incl.
+        // abort-before-start), and late timed-out generations the pull model
+        // could never see — so `schedule_chat_refresh` stands down for it. The
+        // old pull-model residuals (T14 r5/r20) now apply ONLY to event-less
+        // legacy nodes, where the UI's sync provenance keeps the aged claim
+        // honest.
         struct RefreshOnDrop {
             fleet: Arc<HubFleet>,
             node: NodeKey,
@@ -1676,18 +1865,43 @@ fn served_id_for_worker(
         .unwrap_or_default()
 }
 
-/// Accept the node's uni stream(s) of `N_LOG_LINE` notifications and file each line into the
-/// hub bus under `LogSource::RemoteWorker { node, worker }`. Returns when the connection
-/// closes. Best-effort: a malformed frame is skipped, not fatal.
-async fn read_remote_logs(conn: Connection, node: NodeId, bus: Arc<LogBus>) {
+/// Accept the node's uni stream(s) of notifications and dispatch by method: `N_LOG_LINE`
+/// worker stderr into the hub bus under `LogSource::RemoteWorker { node, worker }`, and
+/// `N_FLEET_EVENT` worker-state pushes (T10) into the inventory cache + the hub's
+/// [`FleetEvent`] broadcast. Returns when the connection closes. Best-effort: a malformed
+/// or unknown-method frame is skipped, not fatal (that skip is ALSO the forward/backward
+/// compatibility rule — an older peer's reader ignores methods it doesn't know). `fleet`
+/// is weak so a live connection's reader never keeps a dropped fleet alive.
+async fn read_node_notifications(
+    conn: Connection,
+    node: NodeId,
+    node_key: NodeKey,
+    bus: Arc<LogBus>,
+    fleet: std::sync::Weak<HubFleet>,
+) {
     while let Ok(recv) = conn.accept_uni().await {
         let bus = bus.clone();
+        let node_key = node_key.clone();
+        let fleet = fleet.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(recv).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let Ok(RpcFrame::Notification(n)) = rpc::decode(&line) else {
                     continue;
                 };
+                if n.method == N_FLEET_EVENT {
+                    // The node's push: fold it into the cache (epoch+seq guarded) and
+                    // re-broadcast. Awaited IN-ORDER on this stream task — one uni
+                    // stream carries all of a connection's events, so a burst can't
+                    // commit out of order hub-side.
+                    let Ok(ev) = serde_json::from_value::<NodeFleetEvent>(n.params) else {
+                        continue;
+                    };
+                    if let Some(fleet) = fleet.upgrade() {
+                        fleet.apply_node_event(&node_key, ev).await;
+                    }
+                    continue;
+                }
                 if n.method != N_LOG_LINE {
                     continue;
                 }

@@ -66,7 +66,9 @@ async fn valid_token_pairs() {
         outcome,
         GateOutcome::Admitted {
             agreed_version: 2,
-            software_version: env!("CARGO_PKG_VERSION").to_string()
+            software_version: env!("CARGO_PKG_VERSION").to_string(),
+            // A current node HELLO advertises the fleet_events push (T10).
+            fleet_events: true,
         }
     );
     assert!(now_paired, "node added to allowlist after pairing");
@@ -248,7 +250,9 @@ async fn hello_exchanges_friendly_names() {
         outcome,
         GateOutcome::Admitted {
             agreed_version: 2,
-            software_version: env!("CARGO_PKG_VERSION").to_string()
+            software_version: env!("CARGO_PKG_VERSION").to_string(),
+            // A current node HELLO advertises the fleet_events push (T10).
+            fleet_events: true,
         }
     );
     assert_eq!(
@@ -307,7 +311,9 @@ async fn allowlisted_node_reconnects_without_token() {
         hub_task.await.unwrap(),
         GateOutcome::Admitted {
             agreed_version: 2,
-            software_version: env!("CARGO_PKG_VERSION").to_string()
+            software_version: env!("CARGO_PKG_VERSION").to_string(),
+            // A current node HELLO advertises the fleet_events push (T10).
+            fleet_events: true,
         }
     );
     let _ = std::fs::remove_file(&path);

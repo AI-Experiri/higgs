@@ -24,11 +24,13 @@ label: string, inventory?: NodeInventory,
  * Age of the cached `inventory` snapshot in ms at the moment this view was
  * taken, computed hub-side from a DUAL wall+monotonic stamp taken at the
  * pull's start (see `PulledAt` — max of two lower bounds; errs stale-ward
- * only). The hub re-pulls inventory on connect, after lifecycle ops, and
- * (debounced) after hub-routed chats complete; node-LOCAL activity the hub
- * never sees still ages here until the next pull — a remote row's stats
- * are only as fresh as this says. Absent for the LIVE local card (its
- * stats are read per request) and when there is no cached inventory.
+ * only). The hub re-pulls inventory on connect and after lifecycle ops,
+ * and a `fleet_events` node (T10) re-stamps it on every pushed state
+ * change — so its rows read fresh in event time. Only an event-LESS
+ * legacy node still relies on the debounced chat-end pull, and only there
+ * does node-local activity age invisibly until the next pull. Absent for
+ * the LIVE local card (its stats are read per request) and when there is
+ * no cached inventory.
  */
 inventory_age_ms?: number, 
 /**

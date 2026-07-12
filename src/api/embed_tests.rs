@@ -387,6 +387,7 @@ async fn add_fake_remote_node(
             // pinned in fleet_tests over an explicitly version-less admit).
             Some(2),
             Some(env!("CARGO_PKG_VERSION").to_string()),
+            false,
         )
         .await;
     fleet

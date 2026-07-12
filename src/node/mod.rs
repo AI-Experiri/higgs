@@ -75,6 +75,10 @@ pub enum GateOutcome {
     Admitted {
         agreed_version: u32,
         software_version: String,
+        /// Whether the node's HELLO advertised the `fleet_events` capability (T10):
+        /// it will push `N_FLEET_EVENT` worker-state changes on a uni stream, so the
+        /// hub can skip its chat-end debounced inventory re-pull for it.
+        fleet_events: bool,
     },
     /// Rejected; `code` is the HG diagnostic that explains why (logged at origin).
     Rejected { code: &'static str },
@@ -351,6 +355,10 @@ pub(crate) async fn gate_admit(
         // Sanitized at the trust boundary: the string is peer-controlled and
         // flows to terminals (CLI pairing line) and the fleet view.
         software_version: crate::remote::sanitize_version(&hello.software_version),
+        // Capability map rule: only an explicit boolean `true` advertises the
+        // feature — absent/other shapes read as "doesn't push" (legacy node).
+        fleet_events: hello.capabilities.get("fleet_events")
+            == Some(&serde_json::Value::Bool(true)),
     }
 }
 
@@ -574,6 +582,9 @@ pub async fn serve_node(conn: Connection, rt: std::sync::Arc<crate::node::runtim
     // Relay resident workers' stderr to the hub on a dedicated uni stream for THIS
     // connection. Runs until the connection closes (a reconnect starts a fresh relay).
     let relay = tokio::spawn(relay_worker_logs(conn.clone(), rt.clone()));
+    // Fleet events (T10) get their OWN uni stream: one stream keeps the events in
+    // order; separate from the log stream so a log burst can't delay a state change.
+    let fleet_relay = tokio::spawn(relay_fleet_events(conn.clone(), rt.clone()));
     // Each iteration accepts a hub-opened stream; the loop ends when the connection
     // closes (caller decides whether to reconnect).
     while let Ok((send, recv)) = conn.accept_bi().await {
@@ -582,6 +593,7 @@ pub async fn serve_node(conn: Connection, rt: std::sync::Arc<crate::node::runtim
         tokio::spawn(handle_node_stream(rt, conn, send, recv));
     }
     relay.abort(); // connection closed — stop relaying logs for it
+    fleet_relay.abort(); // …and stop relaying fleet events for it
 }
 
 /// Node side: drain the runtime's per-worker log relay onto a uni stream to the hub as
@@ -605,6 +617,42 @@ async fn relay_worker_logs(
             jsonrpc: "2.0".into(),
             method: crate::remote::N_LOG_LINE.into(),
             params: serde_json::json!({ "worker_id": worker_id.0, "line": line }),
+        };
+        if write_frame(&mut send, &RpcFrame::Notification(note))
+            .await
+            .is_err()
+        {
+            return; // connection gone
+        }
+    }
+}
+
+/// Node side: drain the runtime's fleet events onto a dedicated uni stream to the hub as
+/// `N_FLEET_EVENT` notifications (T10). Returns when the connection drops (the uni write
+/// fails) or the runtime goes away. Best-effort: a lagged subscriber SKIPS the gap — each
+/// event carries the full current worker snapshot, so the next one self-heals, and the
+/// hub's pull paths remain as fallback.
+async fn relay_fleet_events(
+    conn: Connection,
+    rt: std::sync::Arc<crate::node::runtime::NodeRuntime>,
+) {
+    let Ok(mut send) = conn.open_uni().await else {
+        return;
+    };
+    let mut events = rt.subscribe_fleet_events();
+    loop {
+        let ev = match events.recv().await {
+            Ok(ev) => ev,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        };
+        let Ok(params) = serde_json::to_value(&ev) else {
+            continue;
+        };
+        let note = crate::rpc::RpcNotification {
+            jsonrpc: "2.0".into(),
+            method: crate::remote::N_FLEET_EVENT.into(),
+            params,
         };
         if write_frame(&mut send, &RpcFrame::Notification(note))
             .await

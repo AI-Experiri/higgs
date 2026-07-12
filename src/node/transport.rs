@@ -42,8 +42,9 @@ impl NodeTransport {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// A clone of the underlying connection, for the fleet's node→hub log-relay reader
-    /// (which accepts the node's uni stream of `N_LOG_LINE` frames).
+    /// A clone of the underlying connection, for the fleet's node→hub notification
+    /// reader (which accepts the node's uni streams of `N_LOG_LINE` and
+    /// `N_FLEET_EVENT` frames).
     pub(crate) fn connection(&self) -> Connection {
         self.conn.clone()
     }

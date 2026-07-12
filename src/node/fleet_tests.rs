@@ -26,6 +26,7 @@ async fn fleet_with_one_node() -> (Arc<HubFleet>, NodeKey, String, tempfile::Tem
             None,
             None,
             None,
+            false,
         )
         .await;
     (fleet, node_key, model_id, root)
@@ -63,6 +64,7 @@ async fn params_load_reaches_the_node_at_protocol_two() {
             None,
             Some(2),
             Some("9.9.9-test".to_string()),
+            false,
         )
         .await;
     assert_eq!(fleet.node_protocol(&node_key).await, Some(2));
@@ -233,6 +235,7 @@ async fn versionless_readmission_clears_the_stored_major() {
             None,
             Some(2),
             Some("9.9.9-test".to_string()),
+            false,
         )
         .await;
     assert_eq!(fleet.node_protocol(&node_key).await, Some(2));
@@ -244,6 +247,7 @@ async fn versionless_readmission_clears_the_stored_major() {
             None,
             None,
             None,
+            false,
         )
         .await;
     assert_eq!(
@@ -306,6 +310,7 @@ async fn versionless_readmission_clears_the_stored_major() {
             None,
             None,
             None,
+            false,
         )
         .await;
     // ...then the "restarted" node's first pull (seq 1, fresh epoch) commits.
@@ -707,6 +712,7 @@ fn inventory_age_is_the_max_of_both_clocks_from_the_pull_start_stamp() {
         chat_refreshes: HashMap::new(),
         chat_refresh_gen: 0,
         software_versions: HashMap::new(),
+        event_nodes: std::collections::HashSet::new(),
         versions: HashMap::new(),
         epochs: HashMap::new(),
         bus: Arc::new(crate::log_bus::LogBus::new()),
@@ -745,6 +751,7 @@ fn inventory_age_is_the_max_of_both_clocks_from_the_pull_start_stamp() {
         chat_refreshes: HashMap::new(),
         chat_refresh_gen: 0,
         software_versions: HashMap::new(),
+        event_nodes: std::collections::HashSet::new(),
         versions: HashMap::new(),
         epochs: HashMap::new(),
         bus: Arc::new(crate::log_bus::LogBus::new()),
@@ -803,6 +810,7 @@ async fn readmission_strips_the_previous_process_snapshot_seq() {
         chat_refreshes: HashMap::new(),
         chat_refresh_gen: 0,
         software_versions: HashMap::new(),
+        event_nodes: std::collections::HashSet::new(),
         versions: HashMap::new(),
         epochs: HashMap::new(),
         bus: Arc::new(crate::log_bus::LogBus::new()),
@@ -855,6 +863,7 @@ async fn older_started_pull_never_overwrites_a_newer_snapshot() {
         chat_refreshes: HashMap::new(),
         chat_refresh_gen: 0,
         software_versions: HashMap::new(),
+        event_nodes: std::collections::HashSet::new(),
         versions: HashMap::new(),
         epochs: HashMap::new(),
         bus: Arc::new(crate::log_bus::LogBus::new()),
@@ -1094,6 +1103,7 @@ fn served_ids_are_collision_free_even_when_a_model_name_clashes_with_a_suffix() 
         chat_refreshes: HashMap::new(),
         chat_refresh_gen: 0,
         software_versions: HashMap::new(),
+        event_nodes: std::collections::HashSet::new(),
         versions: HashMap::new(),
         epochs: HashMap::new(),
         bus: Arc::new(crate::log_bus::LogBus::new()),
@@ -1262,4 +1272,233 @@ async fn retire_drops_node_and_routes() {
         .chat(&model_id, "[]".into(), 8, 0.0, None, None)
         .await
         .is_err());
+}
+
+/// T10: a node-PUSHED worker snapshot (`CommitWorkers`) merges into the cached
+/// inventory under the same epoch + seq guards as a pull — the host/hardware
+/// fields are KEPT, an older seq is rejected, a stale epoch is dropped, and a
+/// missing cache is reported (`true`) for the full-pull fallback. Driven
+/// through the REAL handler, like the CommitInventory ordering pin above.
+#[tokio::test]
+async fn pushed_worker_snapshot_merges_under_the_seq_guard() {
+    let mut node_ids = NodeIdAllocator::new();
+    node_ids.assign("nodeA");
+    let mut actor = FleetActor {
+        nodes: HashMap::new(),
+        routes: HashMap::new(),
+        node_ids,
+        inventories: HashMap::new(),
+        chat_refreshes: HashMap::new(),
+        chat_refresh_gen: 0,
+        software_versions: HashMap::new(),
+        event_nodes: std::collections::HashSet::new(),
+        versions: HashMap::new(),
+        epochs: HashMap::new(),
+        bus: Arc::new(crate::log_bus::LogBus::new()),
+        admit_gen: 0,
+    };
+    fn inv(hostname: &str, seq: u64) -> crate::remote::NodeInventory {
+        crate::remote::NodeInventory {
+            hostname: hostname.into(),
+            os: "macos".into(),
+            workers: vec![],
+            snapshot_seq: Some(seq),
+            hardware: crate::system::HardwareInfo {
+                cpu_name: String::new(),
+                arch: String::new(),
+                cpu_cores: 0,
+                ram_total_bytes: 0,
+                ram_used_bytes: 0,
+                cpu_usage_percent: 0.0,
+                gpus: vec![],
+                vram_total_bytes: 0,
+            },
+            runtime: crate::system::RuntimeInfo {
+                engine: String::new(),
+                backend: String::new(),
+                version: String::new(),
+                binding: String::new(),
+            },
+        }
+    }
+    fn worker(in_flight: u32) -> crate::remote::InventoryWorker {
+        crate::remote::InventoryWorker {
+            worker_id: 1,
+            model: "org/m".into(),
+            served_id: String::new(),
+            ctx_len: Some(256),
+            gpu_layers: None,
+            threads: None,
+            loaded_at_ms: Some(1),
+            idle_ms: Some(0),
+            in_flight: Some(in_flight),
+        }
+    }
+    let commit_workers = |node: &str, epoch_before: u64, seq: u64, in_flight: u32| {
+        let (tx, rx) = oneshot::channel();
+        (
+            FleetMsg::CommitWorkers {
+                node: node.to_string(),
+                epoch_before,
+                workers: vec![worker(in_flight)],
+                snapshot_seq: seq,
+                pulled_at: PulledAt::now(),
+                reply: tx,
+            },
+            rx,
+        )
+    };
+    // No cached inventory yet: the push reports needs_full — nothing fabricated.
+    let (msg, rx) = commit_workers("nodeA", 0, 1, 0);
+    actor.handle(msg).await;
+    assert!(rx.await.unwrap(), "no cache to merge into -> needs_full");
+    assert!(actor.nodes_view()[0].inventory.is_none());
+
+    // Seed the cache like a pull would (seq 5, empty workers).
+    let (tx, _rx) = oneshot::channel();
+    actor
+        .handle(FleetMsg::CommitInventory {
+            node: "nodeA".to_string(),
+            epoch_before: 0,
+            inventory: Box::new(inv("host", 5)),
+            pulled_at: PulledAt::now(),
+            reply: tx,
+        })
+        .await;
+
+    // An OLDER-seq push never overwrites (data order, same rule as pulls).
+    let (msg, rx) = commit_workers("nodeA", 0, 4, 1);
+    actor.handle(msg).await;
+    assert!(!rx.await.unwrap());
+    let view_inv = actor.nodes_view()[0].inventory.clone().unwrap();
+    assert!(view_inv.workers.is_empty(), "stale push rejected");
+    assert_eq!(view_inv.snapshot_seq, Some(5));
+
+    // A NEWER-seq push merges: workers + seq replaced, host/hardware KEPT.
+    let (msg, rx) = commit_workers("nodeA", 0, 6, 1);
+    actor.handle(msg).await;
+    assert!(!rx.await.unwrap());
+    let view_inv = actor.nodes_view()[0].inventory.clone().unwrap();
+    assert_eq!(view_inv.workers.len(), 1, "pushed worker merged");
+    assert_eq!(view_inv.workers[0].in_flight, Some(1));
+    assert_eq!(view_inv.snapshot_seq, Some(6));
+    assert_eq!(view_inv.hostname, "host", "pulled host fields kept");
+
+    // A push whose epoch predates a lifecycle op is dropped (not needs_full).
+    actor.bump_epoch("nodeA");
+    let (msg, rx) = commit_workers("nodeA", 0, 7, 0);
+    actor.handle(msg).await;
+    assert!(!rx.await.unwrap());
+    assert_eq!(
+        actor.nodes_view()[0]
+            .inventory
+            .clone()
+            .unwrap()
+            .snapshot_seq,
+        Some(6),
+        "stale-epoch push dropped"
+    );
+}
+
+/// T10 end-to-end over REAL iroh: a node admitted with the `fleet_events`
+/// capability pushes typed events (load / chat start / chat end) that the hub
+/// folds into its cache WITHOUT a pull — and the chat-end debounced re-pull is
+/// demoted (no extra inventory RPC after the chat). Reverting the node-side
+/// emit/relay, the hub dispatch, or the cache merge fails this test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn node_pushed_events_update_the_cache_without_a_pull() {
+    use crate::remote::FleetEventKind;
+
+    let (root, model_id) = stage_dummy_model("higgs-test/m");
+    let hub = local_endpoint().await;
+    let node = local_endpoint().await;
+    let hub_addr = hub.addr();
+    let node_key = node.id().to_string();
+
+    let rt = Arc::new(fake_runtime(vec![root.path().to_path_buf()]));
+    tokio::spawn(async move {
+        let node_conn = node.connect(hub_addr, ALPN).await.expect("connect");
+        serve_node(node_conn, rt).await;
+    });
+    let conn = hub.accept().await.expect("incoming").await.expect("conn");
+    std::mem::forget(hub);
+
+    let fleet = Arc::new(HubFleet::new(Arc::new(crate::log_bus::LogBus::new())));
+    let mut events = fleet.subscribe_fleet_events();
+    fleet
+        .add_node(
+            node_key.clone(),
+            Arc::new(NodeTransport::new(conn)),
+            None,
+            Some(2),
+            None,
+            true, // the HELLO advertised fleet_events
+        )
+        .await;
+
+    // Await a specific kind, tolerating interleaved others (event order across
+    // KINDS is deterministic per node, but connect/load pulls interleave).
+    async fn next(
+        rx: &mut tokio::sync::broadcast::Receiver<FleetEvent>,
+        want: FleetEventKind,
+    ) -> FleetEvent {
+        let deadline = std::time::Duration::from_secs(10);
+        loop {
+            let ev = tokio::time::timeout(deadline, rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("no {want:?} event within 10s"))
+                .expect("event channel open");
+            if ev.kind == want {
+                return ev;
+            }
+        }
+    }
+
+    let ev = next(&mut events, FleetEventKind::NodeConnected).await;
+    assert_eq!(ev.endpoint_id, node_key);
+
+    fleet.load(&node_key, &model_id, None).await.unwrap();
+    next(&mut events, FleetEventKind::WorkerLoaded).await;
+
+    let (mut rx, fut) = fleet
+        .chat(&model_id, "[]".into(), 8, 0.0, None, None)
+        .await
+        .unwrap();
+    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    fut.await.unwrap();
+    next(&mut events, FleetEventKind::ChatStart).await;
+    next(&mut events, FleetEventKind::ChatEnd).await;
+
+    // The ChatEnd PUSH (not a pull) put the cache back to idle.
+    let view = fleet
+        .nodes_view()
+        .await
+        .into_iter()
+        .find(|n| n.endpoint_id == node_key)
+        .unwrap();
+    let inv = view.inventory.expect("cached inventory");
+    assert_eq!(inv.workers.len(), 1);
+    assert_eq!(inv.workers[0].in_flight, Some(0), "chat-end push landed");
+    let seq_after_chat = inv.snapshot_seq.expect("pushes carry the actor seq");
+
+    // Debounce demotion: an event-pushing node gets NO chat-end re-pull. A pull
+    // would bump the node's snapshot_seq — sleep past the 250 ms settle and
+    // assert the seq is exactly the ChatEnd push's.
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    let seq_later = fleet
+        .nodes_view()
+        .await
+        .into_iter()
+        .find(|n| n.endpoint_id == node_key)
+        .and_then(|n| n.inventory)
+        .and_then(|i| i.snapshot_seq)
+        .unwrap();
+    assert_eq!(
+        seq_later, seq_after_chat,
+        "no debounced re-pull for an event-pushing node"
+    );
+
+    // Retire is a hub-local event.
+    fleet.retire(&node_key).await;
+    next(&mut events, FleetEventKind::NodeDropped).await;
 }

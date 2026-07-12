@@ -386,6 +386,7 @@ async fn hub_http_streaming_chat_routes_to_remote_node() {
             None,
             None,
             None,
+            false,
         )
         .await;
 

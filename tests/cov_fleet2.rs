@@ -401,6 +401,7 @@ async fn hub_fleet_error_arms_over_mock_node() {
             None,
             None,
             None,
+            false,
         )
         .await;
 
@@ -667,6 +668,7 @@ async fn params_load_payload_carries_ctx_at_protocol_two() {
             None,
             Some(2),
             None,
+            false,
         )
         .await;
 

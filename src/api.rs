@@ -2696,6 +2696,16 @@ impl Higgs {
         self.local.events()
     }
 
+    /// Subscribe to live fleet events (T10) — node-pushed worker-state changes plus
+    /// hub-local connect/drop/retire markers, each emitted AFTER the hub folded the
+    /// change into its fleet cache (so re-reading [`nodes`](Self::nodes) on receipt
+    /// observes it). `None` when no fleet is installed (node-only / plain serve).
+    pub fn subscribe_fleet_events(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<crate::node::fleet::FleetEvent>> {
+        self.fleet().map(|f| f.subscribe_fleet_events())
+    }
+
     /// Return up to `n` recent Developer-Log lines (oldest first), optionally
     /// restricted to one [`LogSource`] (`None` = worker stderr + serve events).
     pub fn logs(&self, n: usize, filter: Option<LogSource>) -> Vec<String> {
