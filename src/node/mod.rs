@@ -632,33 +632,54 @@ async fn relay_worker_logs(
 /// fails) or the runtime goes away. Best-effort: a lagged subscriber SKIPS the gap — each
 /// event carries the full current worker snapshot, so the next one self-heals, and the
 /// hub's pull paths remain as fallback.
+/// The relay must outlive a STREAM-level failure (T10 r1 #2): the hub skips its
+/// chat-end re-pull for an event-advertising node, so if this relay died on a
+/// reset uni stream while the QUIC connection stayed healthy, later state
+/// changes would reach the hub by NEITHER push NOR pull — a permanently stale
+/// cache. So a failed write reopens a fresh uni stream (re-sending the event
+/// the write lost — every event carries the full worker list, so one resend
+/// fully re-syncs) and only a failed OPEN — the connection itself is gone, the
+/// caller's accept loop is ending too — returns.
 async fn relay_fleet_events(
     conn: Connection,
     rt: std::sync::Arc<crate::node::runtime::NodeRuntime>,
 ) {
-    let Ok(mut send) = conn.open_uni().await else {
-        return;
-    };
     let mut events = rt.subscribe_fleet_events();
-    loop {
-        let ev = match events.recv().await {
-            Ok(ev) => ev,
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-        };
-        let Ok(params) = serde_json::to_value(&ev) else {
-            continue;
-        };
-        let note = crate::rpc::RpcNotification {
-            jsonrpc: "2.0".into(),
-            method: crate::remote::N_FLEET_EVENT.into(),
-            params,
-        };
-        if write_frame(&mut send, &RpcFrame::Notification(note))
-            .await
-            .is_err()
-        {
+    // An event whose write failed on the previous stream, owed to the next one.
+    let mut pending: Option<crate::remote::NodeFleetEvent> = None;
+    'stream: loop {
+        let Ok(mut send) = conn.open_uni().await else {
             return; // connection gone
+        };
+        loop {
+            let ev = match pending.take() {
+                Some(ev) => ev,
+                None => match events.recv().await {
+                    Ok(ev) => ev,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                },
+            };
+            let Ok(params) = serde_json::to_value(&ev) else {
+                continue;
+            };
+            let note = crate::rpc::RpcNotification {
+                jsonrpc: "2.0".into(),
+                method: crate::remote::N_FLEET_EVENT.into(),
+                params,
+            };
+            if write_frame(&mut send, &RpcFrame::Notification(note))
+                .await
+                .is_err()
+            {
+                // Stream failed with the connection possibly alive: reopen and
+                // resend. The brief pause keeps a hub that STOP_SENDINGs every
+                // stream from turning this into a hot loop; if the connection is
+                // actually dead, the reopen fails and we exit above.
+                pending = Some(ev);
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                continue 'stream;
+            }
         }
     }
 }

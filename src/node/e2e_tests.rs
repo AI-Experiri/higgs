@@ -98,3 +98,88 @@ async fn node_hosts_two_workers_sysinfo_status_over_iroh() {
     node_task.abort();
     let _ = std::fs::remove_file(&allow_path);
 }
+
+/// T10 r1 #2: the fleet-event relay must SURVIVE a stream-level failure while
+/// the connection stays healthy — the hub skips its chat-end re-pull for an
+/// event-advertising node, so a relay that died with the connection alive
+/// would freeze the hub's cache (no push AND no pull). The hub side resets
+/// (STOP_SENDING) the first uni stream; the relay must reopen a fresh one and
+/// events must keep arriving on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fleet_event_relay_reopens_after_a_stream_reset() {
+    use tokio::io::AsyncBufReadExt;
+
+    let (model_root, model_id) = stage_dummy_model("higgs-test/m");
+    let hub = local_endpoint().await;
+    let node = local_endpoint().await;
+    let (dial, hub_conn) = tokio::join!(node.connect(hub.addr(), crate::remote::ALPN), async {
+        hub.accept().await.expect("incoming").await.expect("conn")
+    });
+    let node_conn = dial.expect("dial");
+    std::mem::forget(hub);
+
+    let rt = Arc::new(fake_runtime(vec![model_root.path().to_path_buf()]));
+    tokio::spawn(super::relay_fleet_events(node_conn, rt.clone()));
+
+    // Emit fleet events continuously (each fake load emits WorkerLoaded) so
+    // both the pre- and post-reset streams have traffic without timing games.
+    let rt_load = rt.clone();
+    let model = model_id.clone();
+    let feeder = tokio::spawn(async move {
+        loop {
+            let _ = rt_load
+                .load(crate::remote::NodeLoadParams {
+                    id: model.clone(),
+                    ctx_len: None,
+                    gpu_layers: None,
+                    threads: None,
+                    params: None,
+                })
+                .await;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    });
+
+    // Read one event off the FIRST relay stream, then reset it hub-side.
+    let mut recv1 = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        hub_conn.accept_uni().await.expect("first uni stream")
+    })
+    .await
+    .expect("relay opened its first stream");
+    let mut lines1 = tokio::io::BufReader::new(&mut recv1).lines();
+    let line1 = tokio::time::timeout(std::time::Duration::from_secs(10), lines1.next_line())
+        .await
+        .expect("an event within 10s")
+        .expect("stream readable")
+        .expect("a line");
+    assert!(
+        line1.contains(crate::remote::N_FLEET_EVENT),
+        "first stream carries fleet events: {line1}"
+    );
+    drop(lines1);
+    recv1.stop(1u32.into()).expect("reset the first stream");
+
+    // The relay must reopen: a SECOND uni stream arrives, still carrying events.
+    let recv2 = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        hub_conn.accept_uni().await.expect("second uni stream")
+    })
+    .await
+    .expect("relay reopened after the stream reset");
+    let mut lines2 = tokio::io::BufReader::new(recv2).lines();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let line = tokio::time::timeout(std::time::Duration::from_secs(10), lines2.next_line())
+            .await
+            .expect("an event on the reopened stream within 10s")
+            .expect("stream readable")
+            .expect("a line");
+        if line.contains(crate::remote::N_FLEET_EVENT) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no event after reopen"
+        );
+    }
+    feeder.abort();
+}

@@ -40,7 +40,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use iroh::endpoint::Connection;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::oneshot;
@@ -296,6 +295,14 @@ enum FleetMsg {
     CommitWorkers {
         node: NodeKey,
         epoch_before: u64,
+        /// The connection the event arrived on. The commit applies ONLY while this is
+        /// still the node's CURRENT transport (Arc identity, T10 r1): the epoch is
+        /// sampled at RECEIPT, so it cannot reject a stale-CONNECTION event the way it
+        /// rejects a stale pull (whose epoch predates the re-admission bump) — without
+        /// this check a push buffered from a replaced connection could land after the
+        /// re-admission stripped the cached seq and install the OLD process's high seq,
+        /// freezing out the new process until its counter catches up.
+        transport: Arc<NodeTransport>,
         workers: Vec<InventoryWorker>,
         snapshot_seq: u64,
         /// Dual-clock stamp of the event's RECEIPT (see [`PulledAt`]).
@@ -852,13 +859,22 @@ impl Actor for FleetActor {
             FleetMsg::CommitWorkers {
                 node,
                 epoch_before,
+                transport,
                 workers,
                 snapshot_seq,
                 pulled_at,
                 reply,
             } => {
+                // Stale-connection guard first (see the variant doc): only the node's
+                // CURRENT transport may push. A replaced/disconnected connection's
+                // buffered event is dropped outright — no needs_full either (its data
+                // is the OLD process's; the new admission runs its own connect pull).
+                let current = self
+                    .nodes
+                    .get(&node)
+                    .is_some_and(|cur| Arc::ptr_eq(cur, &transport));
                 let mut needs_full = false;
-                if self.epoch(&node) == epoch_before {
+                if current && self.epoch(&node) == epoch_before {
                     match self.inventories.get_mut(&node) {
                         Some((cur_inv, cur_at)) => {
                             // Same ordering rule as `CommitInventory`: prefer the node's
@@ -1067,21 +1083,27 @@ impl HubFleet {
         // until the connection closes (accept_uni errors). Weak: the reader must not
         // keep a retired fleet alive.
         tokio::spawn(read_node_notifications(
-            transport.connection(),
             node_id,
             node.clone(),
             self.bus.clone(),
             Arc::downgrade(self),
+            transport.clone(),
         ));
 
         // On (re)connect: refresh the inventory for the fleet view. Best-effort, off the hot
         // path. (Loads are additive — no displaced workers are ever owed to an offline node —
-        // so there are no pending unloads to reconcile.)
+        // so there are no pending unloads to reconcile.) When the refresh COMMITS, announce
+        // it (T10 r1 #3): `NodeConnected` above fires before this pull even starts, so an
+        // event-driven UI refreshing on it reads the pre-connect cache (none, or the
+        // previous process's retained workers) — without this second event nothing would
+        // tell it the real snapshot landed until the next poll.
         let inv_weak = Arc::downgrade(self);
         let inv_node = node.clone();
         tokio::spawn(async move {
             if let Some(fleet) = inv_weak.upgrade() {
-                let _ = fleet.refresh_inventory(&inv_node).await;
+                if fleet.refresh_inventory(&inv_node).await.is_ok() {
+                    fleet.emit_fleet_event(&inv_node, FleetEventKind::InventorySynced);
+                }
             }
         });
 
@@ -1222,12 +1244,18 @@ impl HubFleet {
     /// (`FleetMsg::CommitWorkers`), then re-broadcast the kind as a hub [`FleetEvent`].
     /// If the event outran the connect-time pull (no cached inventory yet), fall back to
     /// one full `refresh_inventory` — the event's data still lands, via the pull path.
-    async fn apply_node_event(self: &Arc<Self>, node: &NodeKey, ev: NodeFleetEvent) {
+    async fn apply_node_event(
+        self: &Arc<Self>,
+        node: &NodeKey,
+        ev: NodeFleetEvent,
+        transport: &Arc<NodeTransport>,
+    ) {
         let epoch_before = self.epoch(node).await;
         let needs_full = self
             .ask(|reply| FleetMsg::CommitWorkers {
                 node: node.clone(),
                 epoch_before,
+                transport: transport.clone(),
                 workers: ev.workers,
                 snapshot_seq: ev.snapshot_seq,
                 pulled_at: PulledAt::now(),
@@ -1873,16 +1901,18 @@ fn served_id_for_worker(
 /// compatibility rule — an older peer's reader ignores methods it doesn't know). `fleet`
 /// is weak so a live connection's reader never keeps a dropped fleet alive.
 async fn read_node_notifications(
-    conn: Connection,
     node: NodeId,
     node_key: NodeKey,
     bus: Arc<LogBus>,
     fleet: std::sync::Weak<HubFleet>,
+    transport: Arc<NodeTransport>,
 ) {
+    let conn = transport.connection();
     while let Ok(recv) = conn.accept_uni().await {
         let bus = bus.clone();
         let node_key = node_key.clone();
         let fleet = fleet.clone();
+        let transport = transport.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(recv).lines();
             while let Ok(Some(line)) = lines.next_line().await {
@@ -1898,7 +1928,7 @@ async fn read_node_notifications(
                         continue;
                     };
                     if let Some(fleet) = fleet.upgrade() {
-                        fleet.apply_node_event(&node_key, ev).await;
+                        fleet.apply_node_event(&node_key, ev, &transport).await;
                     }
                     continue;
                 }

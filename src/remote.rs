@@ -368,7 +368,14 @@ higgs_const_enum! {
         /// A worker was unloaded/killed/idle-reaped and is gone.
         WorkerUnloaded,
         /// Hub-local (never on the node wire): the node's connection was admitted.
+        /// Fires BEFORE the connect-time inventory pull — the cache still shows the
+        /// pre-connect state (or nothing); [`FleetEventKind::InventorySynced`] follows
+        /// once the pull commits.
         NodeConnected,
+        /// Hub-local (never on the node wire): the connect-time inventory pull for a
+        /// just-admitted node committed — the cache now shows the NEW process's state
+        /// (T10 r1). Subscribers that refreshed on `NodeConnected` re-read here.
+        InventorySynced,
         /// Hub-local (never on the node wire): the node retired or its connection dropped.
         NodeDropped,
     }

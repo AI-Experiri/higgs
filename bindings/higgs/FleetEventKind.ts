@@ -2,14 +2,15 @@
 // Backed by Rust enum via `#[derive(TsConstEnum)]` in `higgs-macros`.
 
 export const FleetEventKind = {
-    ChatStart      : "chat_start",
-    ChatEnd        : "chat_end",
-    WorkerLoaded   : "worker_loaded",
-    WorkerUnloaded : "worker_unloaded",
-    NodeConnected  : "node_connected",
-    NodeDropped    : "node_dropped",
+    ChatStart       : "chat_start",
+    ChatEnd         : "chat_end",
+    WorkerLoaded    : "worker_loaded",
+    WorkerUnloaded  : "worker_unloaded",
+    NodeConnected   : "node_connected",
+    InventorySynced : "inventory_synced",
+    NodeDropped     : "node_dropped",
 } as const;
 
-export const { ChatStart, ChatEnd, WorkerLoaded, WorkerUnloaded, NodeConnected, NodeDropped } = FleetEventKind;
+export const { ChatStart, ChatEnd, WorkerLoaded, WorkerUnloaded, NodeConnected, InventorySynced, NodeDropped } = FleetEventKind;
 
 export type FleetEventKind = (typeof FleetEventKind)[keyof typeof FleetEventKind];

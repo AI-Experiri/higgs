@@ -1281,6 +1281,16 @@ async fn retire_drops_node_and_routes() {
 /// through the REAL handler, like the CommitInventory ordering pin above.
 #[tokio::test]
 async fn pushed_worker_snapshot_merges_under_the_seq_guard() {
+    // A real (loopback iroh) connection: CommitWorkers applies only from the
+    // node's CURRENT transport (T10 r1 #1), so the actor needs one installed.
+    let hub = local_endpoint().await;
+    let node = local_endpoint().await;
+    let (dial, conn) = tokio::join!(node.connect(hub.addr(), ALPN), async {
+        hub.accept().await.expect("incoming").await.expect("conn")
+    });
+    let _keep = dial.expect("dial");
+    std::mem::forget(hub);
+    let transport = Arc::new(NodeTransport::new(conn));
     let mut node_ids = NodeIdAllocator::new();
     node_ids.assign("nodeA");
     let mut actor = FleetActor {
@@ -1297,6 +1307,7 @@ async fn pushed_worker_snapshot_merges_under_the_seq_guard() {
         bus: Arc::new(crate::log_bus::LogBus::new()),
         admit_gen: 0,
     };
+    actor.nodes.insert("nodeA".to_string(), transport.clone());
     fn inv(hostname: &str, seq: u64) -> crate::remote::NodeInventory {
         crate::remote::NodeInventory {
             hostname: hostname.into(),
@@ -1340,6 +1351,7 @@ async fn pushed_worker_snapshot_merges_under_the_seq_guard() {
             FleetMsg::CommitWorkers {
                 node: node.to_string(),
                 epoch_before,
+                transport: transport.clone(),
                 workers: vec![worker(in_flight)],
                 snapshot_seq: seq,
                 pulled_at: PulledAt::now(),
@@ -1456,6 +1468,10 @@ async fn node_pushed_events_update_the_cache_without_a_pull() {
 
     let ev = next(&mut events, FleetEventKind::NodeConnected).await;
     assert_eq!(ev.endpoint_id, node_key);
+    // T10 r1 #3: NodeConnected fires BEFORE the connect-time pull — a UI
+    // refreshing on it reads the pre-connect cache. The commit of that pull
+    // must announce itself, or the card stays wrong until the next poll.
+    next(&mut events, FleetEventKind::InventorySynced).await;
 
     fleet.load(&node_key, &model_id, None).await.unwrap();
     next(&mut events, FleetEventKind::WorkerLoaded).await;
@@ -1501,4 +1517,112 @@ async fn node_pushed_events_update_the_cache_without_a_pull() {
     // Retire is a hub-local event.
     fleet.retire(&node_key).await;
     next(&mut events, FleetEventKind::NodeDropped).await;
+}
+
+/// T10 r1 #1: a fleet-event push from a REPLACED connection is dropped — the
+/// epoch is sampled at receipt so it can't reject a stale-CONNECTION event the
+/// way it rejects a stale pull; the transport-identity check on CommitWorkers
+/// must. Without it, a buffered push from the old process (high seq) landing
+/// after the re-admission stripped the cached seq would install the OLD seq
+/// via the stamp fallback and freeze out the new process's pulls/pushes.
+#[tokio::test]
+async fn pushes_from_a_replaced_connection_are_dropped() {
+    let hub = local_endpoint().await;
+    let node = local_endpoint().await;
+    let hub_addr = hub.addr();
+    let node_key = node.id().to_string();
+
+    let (dial1, conn1) = tokio::join!(node.connect(hub_addr.clone(), ALPN), async {
+        hub.accept().await.expect("incoming").await.expect("conn 1")
+    });
+    let (dial2, conn2) = tokio::join!(node.connect(hub_addr, ALPN), async {
+        hub.accept().await.expect("incoming").await.expect("conn 2")
+    });
+    let _keep = (dial1.expect("dial 1"), dial2.expect("dial 2"));
+    std::mem::forget(hub);
+
+    let t1 = Arc::new(NodeTransport::new(conn1));
+    let t2 = Arc::new(NodeTransport::new(conn2));
+    let fleet = Arc::new(HubFleet::new(Arc::new(crate::log_bus::LogBus::new())));
+    fleet
+        .add_node(node_key.clone(), t1.clone(), None, Some(2), None, true)
+        .await;
+    // Seed a cached inventory under the current epoch (as the connect pull would).
+    let epoch = fleet
+        .ask(|reply| FleetMsg::Epoch {
+            node: node_key.clone(),
+            reply,
+        })
+        .await
+        .unwrap_or(0);
+    fleet
+        .ask(|reply| FleetMsg::CommitInventory {
+            node: node_key.clone(),
+            epoch_before: epoch,
+            inventory: Box::new(crate::remote::NodeInventory {
+                hostname: "process-a".into(),
+                os: "macos".into(),
+                workers: vec![],
+                snapshot_seq: Some(100),
+                hardware: crate::system::HardwareInfo {
+                    cpu_name: String::new(),
+                    arch: String::new(),
+                    cpu_cores: 0,
+                    ram_total_bytes: 0,
+                    ram_used_bytes: 0,
+                    cpu_usage_percent: 0.0,
+                    gpus: vec![],
+                    vram_total_bytes: 0,
+                },
+                runtime: crate::system::RuntimeInfo {
+                    engine: String::new(),
+                    backend: String::new(),
+                    version: String::new(),
+                    binding: String::new(),
+                },
+            }),
+            pulled_at: PulledAt::now(),
+            reply,
+        })
+        .await;
+
+    // The node process restarts: re-admission on a NEW connection strips the seq.
+    fleet
+        .add_node(node_key.clone(), t2.clone(), None, Some(2), None, true)
+        .await;
+
+    let push = |seq: u64, in_flight: u32| crate::remote::NodeFleetEvent {
+        kind: crate::remote::FleetEventKind::ChatEnd,
+        snapshot_seq: seq,
+        workers: vec![crate::remote::InventoryWorker {
+            worker_id: 1,
+            model: "org/m".into(),
+            served_id: String::new(),
+            ctx_len: None,
+            gpu_layers: None,
+            threads: None,
+            loaded_at_ms: None,
+            idle_ms: Some(0),
+            in_flight: Some(in_flight),
+        }],
+    };
+    // A buffered push from the OLD connection (process A, high seq) arrives late:
+    // it must be dropped, or its seq-101 would freeze out process B below.
+    fleet.apply_node_event(&node_key, push(101, 7), &t1).await;
+    let inv = fleet.nodes_view().await[0].inventory.clone().unwrap();
+    assert_eq!(inv.snapshot_seq, None, "stale-connection push dropped");
+    assert!(
+        inv.workers.is_empty(),
+        "old process's workers not installed"
+    );
+
+    // The CURRENT connection's push (process B, seq restarts at 1) commits.
+    fleet.apply_node_event(&node_key, push(1, 0), &t2).await;
+    let inv = fleet.nodes_view().await[0].inventory.clone().unwrap();
+    assert_eq!(
+        inv.snapshot_seq,
+        Some(1),
+        "current connection's push commits"
+    );
+    assert_eq!(inv.workers.len(), 1);
 }
