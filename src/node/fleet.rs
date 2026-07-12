@@ -1476,7 +1476,15 @@ impl HubFleet {
                 }
                 // Transport-level / other failure surfacing mid-stream: drop the dead
                 // transport (Arc-identity guarded) and remap to HG027. The instance is kept.
-                Err(e) => Err(fleet.handle_op_error(&node, &used, e).await),
+                Err(e) => {
+                    // A FAILED chat also ended node-side activity (the lease
+                    // dropped, resetting the idle clock) — refresh here too
+                    // (T14 r4), or the card shows a pre-chat "last active"
+                    // indefinitely. The route-invalidating arm above already
+                    // refreshes directly as part of its route repair.
+                    fleet.schedule_chat_refresh(node.clone());
+                    Err(fleet.handle_op_error(&node, &used, e).await)
+                }
             }
         };
         Ok((rx, wrapped))
