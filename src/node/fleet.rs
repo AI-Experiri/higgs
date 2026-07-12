@@ -1462,50 +1462,60 @@ impl HubFleet {
 
         let fleet = self.clone();
         let used = transport;
-        let wrapped = async move {
-            match fut.await {
-                Ok(v) => {
-                    // A completed hub-routed chat is activity the hub KNOWS about —
-                    // re-pull the node's inventory so the fleet view's idle/
-                    // in-flight stats and their age reflect it instead of aging a
-                    // pre-chat snapshot (T14 r1). DEBOUNCED per node (r2): at most
-                    // ONE pull in flight however bursty the chats — later
-                    // completions coalesce into a single trailing re-run — and each
-                    // pull waits a short settle so the node's own ChatEnd
-                    // bookkeeping (recorded when its lease drops, just after the
-                    // reply) lands before the snapshot is taken. Epoch-gating in
-                    // refresh_inventory keeps a racing lifecycle op authoritative.
-                    fleet.schedule_chat_refresh(node.clone());
-                    Ok(v)
+        // The refresh must fire on EVERY exit of the wrapped future — success,
+        // failure, AND hub-side abort (the WS bridge drops in-flight ops on
+        // socket close; an outcome-arm-only schedule would skip the abort path
+        // and leave the cache reporting pre-chat activity indefinitely, T14 r8).
+        // A Drop guard owned by the future covers all three. It is DEBOUNCED
+        // per node (r2: one pull in flight, later completions coalesce into one
+        // trailing re-run; 250 ms settle lets the node's ChatEnd land) and
+        // epoch-gated. On an abort the node's generation may still be running —
+        // the pulled snapshot then truthfully shows it in flight, and its REAL
+        // end goes unrefreshed (the r5 accepted residual; node-push events own
+        // it) with the UI's sync provenance keeping the aged claim honest.
+        struct RefreshOnDrop {
+            fleet: Arc<HubFleet>,
+            node: NodeKey,
+        }
+        impl Drop for RefreshOnDrop {
+            fn drop(&mut self) {
+                // A future can be dropped outside a runtime (process teardown) —
+                // scheduling spawns, so skip silently there; there is no view
+                // left to refresh anyway.
+                if tokio::runtime::Handle::try_current().is_ok() {
+                    self.fleet.schedule_chat_refresh(self.node.clone());
                 }
+            }
+        }
+        let refresh_guard = RefreshOnDrop {
+            fleet: fleet.clone(),
+            node: node.clone(),
+        };
+        let wrapped = async move {
+            let _refresh_guard = refresh_guard; // fires on every exit, incl. abort
+            match fut.await {
+                Ok(v) => Ok(v),
                 Err(e) if route_invalidating(&e) => {
-                    // Worker gone (node alive) — drop the instance so a retry re-resolves
-                    // (remove_instance_if bumps the node's generation), then re-sync the
-                    // fleet view through the SAME per-node debounce as every other chat
-                    // outcome (T14 r5): N concurrent stale-route failures must coalesce
-                    // into one pull, not fan out one direct RPC each. The epoch bump
-                    // already invalidates any pull that started before it.
+                    // Worker gone (node alive) — drop the instance so a retry
+                    // re-resolves (remove_instance_if bumps the node's generation);
+                    // the re-sync rides the guard's debounced refresh like every
+                    // other outcome (T14 r5/r8) — N concurrent stale-route failures
+                    // coalesce into one pull, and the epoch bump invalidates any
+                    // pull that started before it.
                     fleet.remove_instance_if(&node, worker, &model).await;
-                    fleet.schedule_chat_refresh(node.clone());
                     Err(e)
                 }
                 // Transport-level / other failure surfacing mid-stream: drop the dead
                 // transport (Arc-identity guarded) and remap to HG027. The instance is kept.
-                Err(e) => {
-                    // A FAILED chat also ended node-side activity (the lease
-                    // dropped, resetting the idle clock) — refresh here too
-                    // (T14 r4), or the card shows a pre-chat "last active"
-                    // indefinitely. ACCEPTED RESIDUAL (r5): a HUB-side timeout
-                    // lands here while the node may legitimately still be
-                    // generating — the pulled snapshot truthfully shows the
-                    // chat in flight, and when it really ends no hub refresh
-                    // fires (the node cannot push events yet; the fleet-event
-                    // SSE work owns that). The UI renders such rows with their
-                    // sync provenance ("N in flight · synced X ago"), so the
-                    // aged claim is self-describing, never fresh-looking.
-                    fleet.schedule_chat_refresh(node.clone());
-                    Err(fleet.handle_op_error(&node, &used, e).await)
-                }
+                // A FAILED chat also ended node-side activity (the guard's
+                // refresh covers it, T14 r4/r8). ACCEPTED RESIDUAL (r5): a
+                // HUB-side timeout lands here while the node may legitimately
+                // still be generating — the pulled snapshot truthfully shows
+                // the chat in flight, and when it really ends no hub refresh
+                // fires (the node cannot push events yet; the fleet-event SSE
+                // work owns that). The UI renders such rows with their sync
+                // provenance ("N in flight · synced X ago").
+                Err(e) => Err(fleet.handle_op_error(&node, &used, e).await),
             }
         };
         Ok((rx, wrapped))

@@ -324,6 +324,55 @@ async fn scan_node_returns_the_node_catalog() {
     assert!(fleet.scan_node("ghost").await.is_err());
 }
 
+/// T14 r8: the chat-end inventory refresh fires even when the HUB ABORTS the
+/// chat (the WS bridge drops in-flight ops on socket close) — the Drop guard
+/// on the wrapped future schedules it, not the outcome arms. Fail-on-revert:
+/// move the scheduling back into the arms and the dropped future never
+/// refreshes, so the age keeps growing past the pre-chat baseline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aborted_chat_still_schedules_the_inventory_refresh() {
+    let (fleet, node_key, model_id, _root) = fleet_with_one_node().await;
+    fleet.load(&node_key, &model_id, None).await.unwrap();
+    // Age the load-time snapshot measurably.
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    let age_before = fleet
+        .nodes_view()
+        .await
+        .into_iter()
+        .find(|n| n.endpoint_id == node_key)
+        .and_then(|n| n.inventory_age_ms)
+        .expect("inventory cached after load");
+    assert!(age_before >= 600, "baseline aged: {age_before} ms");
+
+    // Start a chat and ABORT it hub-side: drop the receiver and the future
+    // without awaiting either (what the WS bridge does on socket close).
+    let (rx, fut) = fleet
+        .chat(&model_id, "[]".into(), 8, 0.0, None, None)
+        .await
+        .unwrap();
+    drop(rx);
+    drop(fut);
+
+    // The guard's debounced refresh (250 ms settle) must land regardless.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let age_now = fleet
+            .nodes_view()
+            .await
+            .into_iter()
+            .find(|n| n.endpoint_id == node_key)
+            .and_then(|n| n.inventory_age_ms);
+        if matches!(age_now, Some(a) if a < age_before) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "abort-path refresh never landed (age stayed >= {age_before} ms: {age_now:?})"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 #[tokio::test]
 async fn chat_relays_to_routed_worker() {
     let (fleet, node_key, model_id, _root) = fleet_with_one_node().await;
