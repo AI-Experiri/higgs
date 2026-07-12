@@ -294,6 +294,15 @@ pub struct NodeInventory {
     pub workers: Vec<InventoryWorker>,
     pub hardware: crate::system::HardwareInfo,
     pub runtime: crate::system::RuntimeInfo,
+    /// Node-side MONOTONIC snapshot sequence (T14 r17): incremented on the
+    /// node ACTOR for every inventory snapshot, so it is true DATA order —
+    /// hub-side pull stamps are not (concurrent QUIC streams can be served
+    /// out of order, letting an earlier-stamped pull carry NEWER data). The
+    /// hub's commit guard prefers this when both sides carry one; absent from
+    /// pre-r17 nodes (`serde(default)` — additive, no protocol bump).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub snapshot_seq: Option<u64>,
 }
 }
 

@@ -584,6 +584,7 @@ fn inventory_age_is_the_max_of_both_clocks_from_the_pull_start_stamp() {
             hostname: "h".into(),
             os: "macos".into(),
             workers: vec![],
+            snapshot_seq: None,
             hardware: crate::system::HardwareInfo {
                 cpu_name: String::new(),
                 arch: String::new(),
@@ -695,6 +696,7 @@ async fn older_started_pull_never_overwrites_a_newer_snapshot() {
             hostname: hostname.into(),
             os: "macos".into(),
             workers: vec![],
+            snapshot_seq: None,
             hardware: crate::system::HardwareInfo {
                 cpu_name: String::new(),
                 arch: String::new(),
@@ -756,6 +758,55 @@ async fn older_started_pull_never_overwrites_a_newer_snapshot() {
             .as_ref()
             .map(|i| i.hostname.as_str()),
         Some("newest")
+    );
+
+    // T14 r17: the NODE's snapshot_seq is DATA order and beats the hub-side
+    // stamp — QUIC can serve concurrent pulls out of order, so an EARLIER-
+    // stamped pull can carry NEWER node data (and vice versa).
+    fn seq_inv(hostname: &str, seq: u64) -> crate::remote::NodeInventory {
+        let mut i = inv(hostname);
+        i.snapshot_seq = Some(seq);
+        i
+    }
+    // seq 2 arrives (mixed vs the stored seq-LESS snapshot, as after a node
+    // upgrade + reconnect: the guard falls back to stamps there, and this
+    // fresh pull's stamp is genuinely newer)...
+    let (msg, _rx) = commit(seq_inv("seq2", 2), PulledAt::now());
+    actor.handle(msg).await;
+    assert_eq!(
+        actor.nodes_view()[0]
+            .inventory
+            .as_ref()
+            .map(|i| i.hostname.as_str()),
+        Some("seq2"),
+        "the upgraded node's fresh pull replaces via the stamp fallback"
+    );
+    // ...then seq 1 arrives with a NEWER hub stamp: REJECTED — data order wins.
+    let (msg, _rx) = commit(seq_inv("seq1", 1), PulledAt::now());
+    actor.handle(msg).await;
+    assert_eq!(
+        actor.nodes_view()[0]
+            .inventory
+            .as_ref()
+            .map(|i| i.hostname.as_str()),
+        Some("seq2"),
+        "an older NODE snapshot never overwrites a newer one, whatever its stamp"
+    );
+    // And seq 3 with an even OLDER stamp still replaces — the stamp is only
+    // the fallback against pre-r17 nodes.
+    let older_stamp = PulledAt {
+        wall: std::time::SystemTime::now() - std::time::Duration::from_secs(60),
+        mono: std::time::Instant::now() - std::time::Duration::from_secs(60),
+    };
+    let (msg, _rx) = commit(seq_inv("seq3", 3), older_stamp);
+    actor.handle(msg).await;
+    assert_eq!(
+        actor.nodes_view()[0]
+            .inventory
+            .as_ref()
+            .map(|i| i.hostname.as_str()),
+        Some("seq3"),
+        "newer NODE data commits regardless of its hub stamp"
     );
 }
 

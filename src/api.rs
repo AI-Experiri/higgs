@@ -2624,6 +2624,8 @@ impl Higgs {
             workers,
             hardware,
             runtime,
+            // The local card is built fresh per request — no cache to order.
+            snapshot_seq: None,
         };
         crate::node::fleet::NodeView {
             node_id: 0, // remote NodeIds start at 1; 0 is the local sentinel

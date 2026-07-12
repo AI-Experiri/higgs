@@ -738,10 +738,17 @@ impl Actor for FleetActor {
                     // not commit out of order — an older-started pull never
                     // overwrites a newer-started one (monotonic stamps, same
                     // process, directly comparable).
-                    let newer = self
-                        .inventories
-                        .get(&node)
-                        .is_none_or(|(_, cur)| pulled_at.mono > cur.mono);
+                    let newer = self.inventories.get(&node).is_none_or(|(cur_inv, cur)| {
+                        // Prefer the NODE's snapshot sequence when both sides
+                        // carry one (T14 r17): it is true data order — hub-side
+                        // stamps are not under QUIC stream reordering, where an
+                        // earlier-stamped pull can carry NEWER data. Fall back
+                        // to the mono stamp against pre-r17 nodes.
+                        match (inventory.snapshot_seq, cur_inv.snapshot_seq) {
+                            (Some(new_seq), Some(old_seq)) => new_seq > old_seq,
+                            _ => pulled_at.mono > cur.mono,
+                        }
+                    });
                     if newer {
                         self.inventories.insert(node, (*inventory, pulled_at));
                     }

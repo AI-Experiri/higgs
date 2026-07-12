@@ -297,6 +297,8 @@ struct NodeActor {
     /// wall-clock. Feeds `snapshot_workers` so inventory carries per-worker
     /// stats WITHOUT an RPC to a possibly-busy worker.
     load_facts: HashMap<WorkerId, LoadFacts>,
+    /// Monotonic inventory-snapshot sequence (T14 r17) — see `NodeMsg::Inventory`.
+    snapshot_seq: u64,
     /// Per-worker count of in-flight chats (held via [`ChatLease`]). A worker with a non-zero
     /// count is never idle-reaped, so a generation longer than the TTL is not killed mid-chat.
     in_flight: HashMap<WorkerId, u32>,
@@ -499,11 +501,16 @@ impl Actor for NodeActor {
             }
             NodeMsg::Inventory { reply } => {
                 // Same as Sysinfo: the hardware probe's transient worker self-reaps.
+                // The seq is assigned HERE, on the actor, in the same turn as the
+                // worker snapshot — mailbox order IS data order (T14 r17), which
+                // hub-side pull stamps cannot guarantee under QUIC reordering.
+                self.snapshot_seq += 1;
+                let seq = self.snapshot_seq;
                 let workers = self.snapshot_workers();
                 let spawner = self.spawner.clone();
                 let bus = self.config.bus.clone();
                 tokio::spawn(async move {
-                    let _ = reply.send(do_inventory(workers, &spawner, &bus).await);
+                    let _ = reply.send(do_inventory(workers, seq, &spawner, &bus).await);
                 });
             }
             NodeMsg::WorkerIds { reply } => {
@@ -1026,6 +1033,7 @@ async fn do_sysinfo(spawner: &SupervisorSpawner, bus: &Arc<LogBus>) -> Result<Va
 /// (snapshot taken on the actor thread) + the hardware/runtime snapshot.
 async fn do_inventory(
     workers: Vec<crate::remote::InventoryWorker>,
+    snapshot_seq: u64,
     spawner: &SupervisorSpawner,
     bus: &Arc<LogBus>,
 ) -> Result<Value, HiggsError> {
@@ -1036,6 +1044,7 @@ async fn do_inventory(
         workers,
         hardware,
         runtime,
+        snapshot_seq: Some(snapshot_seq),
     };
     serde_json::to_value(inventory).map_err(|e| HiggsError::WorkerDead {
         context: format!("inventory serialize failed: {e}"),
@@ -1088,6 +1097,7 @@ impl NodeRuntime {
             shutdown_done: false,
             last_activity: HashMap::new(),
             load_facts: HashMap::new(),
+            snapshot_seq: 0,
             in_flight: HashMap::new(),
             idle: idle_for_actor,
             events_tx: events_for_actor,

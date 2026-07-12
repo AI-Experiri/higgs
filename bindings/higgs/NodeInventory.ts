@@ -20,4 +20,13 @@ os: string,
 /**
  * Every worker resident on the node right now.
  */
-workers: Array<InventoryWorker>, hardware: HardwareInfo, runtime: RuntimeInfo, };
+workers: Array<InventoryWorker>, hardware: HardwareInfo, runtime: RuntimeInfo, 
+/**
+ * Node-side MONOTONIC snapshot sequence (T14 r17): incremented on the
+ * node ACTOR for every inventory snapshot, so it is true DATA order —
+ * hub-side pull stamps are not (concurrent QUIC streams can be served
+ * out of order, letting an earlier-stamped pull carry NEWER data). The
+ * hub's commit guard prefers this when both sides carry one; absent from
+ * pre-r17 nodes (`serde(default)` — additive, no protocol bump).
+ */
+snapshot_seq?: number, };
