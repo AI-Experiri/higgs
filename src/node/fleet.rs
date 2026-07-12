@@ -746,6 +746,12 @@ impl Actor for FleetActor {
                         // to the mono stamp against pre-r17 nodes.
                         match (inventory.snapshot_seq, cur_inv.snapshot_seq) {
                             (Some(new_seq), Some(old_seq)) => new_seq > old_seq,
+                            // Fallback ONLY against pre-seq (legacy) nodes/pairs:
+                            // the stamp is the hub's best available order there,
+                            // and QUIC reordering can still invert it — an
+                            // inherent residual with no hub-side fix (the node
+                            // reports no data order), self-healing on the next
+                            // refresh. Current nodes always take the seq arm.
                             _ => pulled_at.mono > cur.mono,
                         }
                     });
