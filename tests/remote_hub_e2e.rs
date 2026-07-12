@@ -167,6 +167,7 @@ async fn two_nodes_same_model_two_served_ids_stream_each_then_retire_one() {
             Arc::new(NodeTransport::new(conn1)),
             None,
             None,
+            None,
         )
         .await;
     let (conn2, peer2) = admit_node(&hub, &mut allow, &mut tokens, &hub_id).await;
@@ -174,6 +175,7 @@ async fn two_nodes_same_model_two_served_ids_stream_each_then_retire_one() {
         .add_node(
             peer2.clone(),
             Arc::new(NodeTransport::new(conn2)),
+            None,
             None,
             None,
         )
@@ -326,7 +328,13 @@ async fn hub_v1_chat_routes_to_remote_node() {
         "node admitted: {outcome:?}"
     );
     fleet
-        .add_node(peer.clone(), Arc::new(NodeTransport::new(conn)), None, None)
+        .add_node(
+            peer.clone(),
+            Arc::new(NodeTransport::new(conn)),
+            None,
+            None,
+            None,
+        )
         .await;
 
     // Load a real model on the node via the fleet → records the route.
@@ -556,6 +564,7 @@ async fn node_reconnects_and_route_survives() {
             Arc::new(NodeTransport::new(conn1.clone())),
             None,
             None,
+            None,
         )
         .await;
     fleet
@@ -575,6 +584,7 @@ async fn node_reconnects_and_route_survives() {
         .add_node(
             peer2.clone(),
             Arc::new(NodeTransport::new(conn2)),
+            None,
             None,
             None,
         )

@@ -25,6 +25,7 @@ async fn fleet_with_one_node() -> (Arc<HubFleet>, NodeKey, String, tempfile::Tem
             Arc::new(NodeTransport::new(conn)),
             None,
             None,
+            None,
         )
         .await;
     (fleet, node_key, model_id, root)
@@ -61,6 +62,7 @@ async fn params_load_reaches_the_node_at_protocol_two() {
             Arc::new(NodeTransport::new(conn)),
             None,
             Some(2),
+            Some("9.9.9-test".to_string()),
         )
         .await;
     assert_eq!(fleet.node_protocol(&node_key).await, Some(2));
@@ -78,6 +80,20 @@ async fn params_load_reaches_the_node_at_protocol_two() {
         .expect("params-load against a major-2 node");
     assert!(worker.0 >= 1, "the gated load spawned a worker");
 
+    // T14: the fleet view carries what admission stored — the negotiated major
+    // and the node's self-reported build — before any retire.
+    let view = fleet.nodes_view().await;
+    let row = view
+        .iter()
+        .find(|n| n.endpoint_id == node_key)
+        .expect("admitted node in the view");
+    assert_eq!(row.protocol, Some(2), "view carries the negotiated major");
+    assert_eq!(
+        row.software_version.as_deref(),
+        Some("9.9.9-test"),
+        "view carries the HELLO semver"
+    );
+
     // Retire clears the stored major (the TOCTOU residual note leans on this;
     // it had no direct pin).
     fleet.retire(&node_key).await;
@@ -85,6 +101,16 @@ async fn params_load_reaches_the_node_at_protocol_two() {
         fleet.node_protocol(&node_key).await,
         None,
         "retire clears the version slot"
+    );
+    // T14: retire drops the whole row (node_ids removed), so the software slot
+    // cannot leak into a later view either — pin via a fresh view scan.
+    assert!(
+        fleet
+            .nodes_view()
+            .await
+            .iter()
+            .all(|n| n.endpoint_id != node_key),
+        "retired node leaves the view entirely"
     );
     // NB the fake worker echoes only the id, and InventoryWorker carries no
     // ctx field (a T9 gap), so the PAYLOAD-content pin (ctx_len actually on
@@ -207,6 +233,7 @@ async fn versionless_readmission_clears_the_stored_major() {
             Arc::new(NodeTransport::new(conn1)),
             None,
             Some(2),
+            Some("9.9.9-test".to_string()),
         )
         .await;
     assert_eq!(fleet.node_protocol(&node_key).await, Some(2));
@@ -217,12 +244,29 @@ async fn versionless_readmission_clears_the_stored_major() {
             Arc::new(NodeTransport::new(conn2)),
             None,
             None,
+            None,
         )
         .await;
     assert_eq!(
         fleet.node_protocol(&node_key).await,
         None,
         "a None re-admit clears to the floor, never inherits"
+    );
+    // T14: the view mirrors the clearing — neither the old major nor the old
+    // semver survives a version-less re-admission.
+    let row_after = fleet
+        .nodes_view()
+        .await
+        .into_iter()
+        .find(|n| n.endpoint_id == node_key)
+        .expect("readmitted node in the view");
+    assert_eq!(
+        row_after.protocol, None,
+        "view major cleared: {row_after:?}"
+    );
+    assert_eq!(
+        row_after.software_version, None,
+        "view semver cleared: {row_after:?}"
     );
 }
 
@@ -491,6 +535,7 @@ fn served_ids_are_collision_free_even_when_a_model_name_clashes_with_a_suffix() 
         routes,
         node_ids: NodeIdAllocator::new(),
         inventories: HashMap::new(),
+        software_versions: HashMap::new(),
         versions: HashMap::new(),
         epochs: HashMap::new(),
         bus: Arc::new(crate::log_bus::LogBus::new()),

@@ -100,15 +100,32 @@ async fn params_load_applies_ctx_on_a_real_node() {
         HELLO_DEADLINE,
     )
     .await;
-    let GateOutcome::Admitted { agreed_version } = outcome else {
+    let GateOutcome::Admitted {
+        agreed_version,
+        software_version,
+    } = outcome
+    else {
         panic!("admitted: {outcome:?}");
     };
     assert_eq!(agreed_version, 2, "a current node negotiates major 2");
+    // T14: the gate carries the node's self-reported build out of the HELLO —
+    // this spawned node IS this crate, so the semver must match exactly.
+    assert_eq!(
+        software_version,
+        env!("CARGO_PKG_VERSION"),
+        "the HELLO semver reaches the gate outcome"
+    );
 
     let transport = Arc::new(NodeTransport::new(conn));
     let fleet = Arc::new(HubFleet::new(Arc::new(higgs::log_bus::LogBus::new())));
     fleet
-        .add_node(peer.clone(), transport.clone(), None, Some(agreed_version))
+        .add_node(
+            peer.clone(),
+            transport.clone(),
+            None,
+            Some(agreed_version),
+            Some(software_version.clone()),
+        )
         .await;
 
     // Params-load: ctx 256 — the bare-load default (trained-cap) is 2048 for
@@ -165,6 +182,30 @@ async fn params_load_applies_ctx_on_a_real_node() {
         ctx0.is_some() && ctx0 != Some(4096) && ctx0 != Some(0),
         "ctx 0 → the model's trained-cap default, never the 4096 coercion: {status0}"
     );
+
+    // T14: the view row carries the node's HELLO-reported build (this spawned
+    // node IS this crate), the negotiated major, and the AGE of the inventory
+    // snapshot the hub is serving (stamped at commit — the T9 freshness
+    // residual's anchor). Fail-on-revert: drop the nodes_view fill for any of
+    // the three and its assert reads None.
+    {
+        let view = fleet.nodes_view().await;
+        let row = view
+            .iter()
+            .find(|n| n.endpoint_id == peer)
+            .expect("admitted node in the view");
+        assert_eq!(
+            row.software_version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION")),
+            "view carries the node's HELLO semver: {row:?}"
+        );
+        assert_eq!(row.protocol, Some(2), "view carries the negotiated major");
+        let age = row.inventory_age_ms.expect("inventory age stamped");
+        assert!(
+            age < 60_000,
+            "the just-refreshed snapshot reads fresh, got {age} ms"
+        );
+    }
 
     // T9: the hub's own INVENTORY (refreshed by fleet.load) now carries the
     // per-worker stats — the ctx that applied, when it loaded, its idle clock

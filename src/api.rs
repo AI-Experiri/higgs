@@ -2632,6 +2632,12 @@ impl Higgs {
             is_local: true,
             label,
             inventory: Some(inventory),
+            // The local card is LIVE (stats read per request) — no snapshot age.
+            inventory_age_ms: None,
+            // This process's own build; the local card has no HELLO to report from.
+            software_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            // No wire, no negotiation — protocol is meaningless locally.
+            protocol: None,
         }
     }
 

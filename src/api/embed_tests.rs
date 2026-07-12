@@ -386,6 +386,7 @@ async fn add_fake_remote_node(
             // facade-level params-loads dispatch (the floor-1 refusal arm is
             // pinned in fleet_tests over an explicitly version-less admit).
             Some(2),
+            Some(env!("CARGO_PKG_VERSION").to_string()),
         )
         .await;
     fleet

@@ -95,6 +95,29 @@ pub struct NodeView {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub inventory: Option<NodeInventory>,
+    /// Age of the cached `inventory` snapshot in ms at the moment this view was
+    /// taken, computed hub-side from a monotonic stamp (T14, the T9 freshness
+    /// residual's fix). The hub re-pulls inventory on connect and after lifecycle
+    /// ops but NEVER on chats — a remote row's idle/in-flight stats are only as
+    /// fresh as this says. Absent for the LIVE local card (its stats are read per
+    /// request) and when there is no cached inventory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub inventory_age_ms: Option<u64>,
+    /// The node's self-reported higgs semver from its HELLO at (re)admission
+    /// (T14). Refreshed only by a reconnect — a node upgraded while admitted
+    /// shows its old version until it reconnects. Absent when no HELLO carried
+    /// one (pre-T14 admit paths) — the UI omits it, never fabricates.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub software_version: Option<String>,
+    /// The HELLO-negotiated wire-protocol major for the node's CURRENT admission
+    /// (T14) — the same slot the per-load params gate reads ([HG078]). Absent =
+    /// the admission predates version reporting (effectively the floor, 1) or
+    /// the local card (no wire, no negotiation).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub protocol: Option<u32>,
 }
 }
 
@@ -164,6 +187,10 @@ enum FleetMsg {
         /// The HELLO-negotiated protocol major for THIS connection, `None` when the
         /// caller has none (tests/direct) — read back as the conservative floor 1.
         agreed_version: Option<u32>,
+        /// The node's self-reported semver from its HELLO (T14 Fleet-view display),
+        /// `None` when the caller has none (tests/direct). Same lifecycle as
+        /// `agreed_version`: refreshed on every (re)admission, cleared at retire.
+        software_version: Option<String>,
         #[allow(clippy::type_complexity)]
         reply: oneshot::Sender<Option<(NodeId, Option<Arc<NodeTransport>>)>>,
     },
@@ -241,14 +268,24 @@ struct FleetActor {
     routes: HashMap<(NodeKey, WorkerId), String>,
     /// Stable hub-local [`NodeId`] per `EndpointId`, for `LogSource::RemoteWorker` tagging.
     node_ids: NodeIdAllocator,
-    /// Last-fetched inventory per node (host + workers + hw/rt). The node's reply is
-    /// authoritative; refreshed on connect and after every hub-driven lifecycle change.
-    inventories: HashMap<NodeKey, NodeInventory>,
+    /// Last-fetched inventory per node (host + workers + hw/rt) with the MONOTONIC
+    /// instant the hub committed it. The node's reply is authoritative; refreshed on
+    /// connect and after every hub-driven lifecycle change — chats do NOT refresh it,
+    /// so the stamp is what lets `nodes_view` report how stale the snapshot is
+    /// (`inventory_age_ms`, the T9-residual fix). `Instant`, not wall-clock: the age
+    /// is computed hub-side at view time, so client clock skew can't corrupt it.
+    inventories: HashMap<NodeKey, (NodeInventory, std::time::Instant)>,
     /// The HELLO-negotiated protocol major per node, refreshed on every (re)admission —
     /// what feature gating (per-load params) reads today; a Fleet-view version display
     /// (T14) would read the same slot but does not exist yet. Absent until the
     /// node's first admission carries one; readers treat absent as the floor (1).
     versions: HashMap<NodeKey, u32>,
+    /// The node's self-reported higgs semver (from its HELLO), per node — the Fleet
+    /// view's version display (T14). Same lifecycle as `versions`: refreshed on every
+    /// (re)admission (a node UPGRADED while admitted keeps its old value until it
+    /// reconnects — the HELLO is the only source), cleared at retire. Absent for a
+    /// node admitted by a pre-T14 caller path.
+    software_versions: HashMap<NodeKey, String>,
     /// Per-node lifecycle generation, bumped on every load/unload/kill/route-drop. A
     /// `refresh_inventory` only commits its (possibly stale) result if this is unchanged
     /// since it started — so a slow connect-time fetch can't clobber a newer state.
@@ -357,6 +394,7 @@ impl FleetActor {
         self.bump_epoch(node);
         self.inventories.remove(node);
         self.versions.remove(node);
+        self.software_versions.remove(node);
         // Forget the durable id slot so the node leaves the fleet view (not left disconnected).
         self.node_ids.remove(node);
     }
@@ -377,13 +415,22 @@ impl FleetActor {
             .all()
             .into_iter()
             .map(|(endpoint_id, node_id)| {
-                let inventory = self.inventories.get(&endpoint_id).cloned().map(|mut inv| {
-                    for w in &mut inv.workers {
-                        let key = (endpoint_id.clone(), WorkerId(w.worker_id));
-                        w.served_id = served_id_for_worker(&key, &w.model, &self.routes, &rev);
-                    }
-                    inv
-                });
+                let mut inventory_age_ms = None;
+                let inventory =
+                    self.inventories
+                        .get(&endpoint_id)
+                        .cloned()
+                        .map(|(mut inv, pulled_at)| {
+                            // How stale this snapshot is, computed hub-side at VIEW time
+                            // (monotonic clock — client wall-clock skew can't corrupt it).
+                            inventory_age_ms = Some(pulled_at.elapsed().as_millis() as u64);
+                            for w in &mut inv.workers {
+                                let key = (endpoint_id.clone(), WorkerId(w.worker_id));
+                                w.served_id =
+                                    served_id_for_worker(&key, &w.model, &self.routes, &rev);
+                            }
+                            inv
+                        });
                 NodeView {
                     node_id: node_id.0,
                     connected: self.nodes.contains_key(&endpoint_id),
@@ -392,6 +439,9 @@ impl FleetActor {
                     is_local: false,
                     label: String::new(),
                     inventory,
+                    inventory_age_ms,
+                    software_version: self.software_versions.get(&endpoint_id).cloned(),
+                    protocol: self.versions.get(&endpoint_id).copied(),
                     endpoint_id,
                 }
             })
@@ -486,6 +536,7 @@ impl Actor for FleetActor {
                 transport,
                 gen,
                 agreed_version,
+                software_version,
                 reply,
             } => {
                 if matches!(gen, Some(g) if g != self.admit_gen) {
@@ -506,6 +557,16 @@ impl Actor for FleetActor {
                         // the field doc promises.
                         None => {
                             self.versions.remove(&node);
+                        }
+                    }
+                    // Same rule for the semver display: never inherit a prior
+                    // connection's value.
+                    match software_version {
+                        Some(v) => {
+                            self.software_versions.insert(node.clone(), v);
+                        }
+                        None => {
+                            self.software_versions.remove(&node);
                         }
                     }
                     let replaced = self.nodes.insert(node.clone(), transport);
@@ -575,7 +636,11 @@ impl Actor for FleetActor {
                 reply,
             } => {
                 if self.epoch(&node) == epoch_before {
-                    self.inventories.insert(node, *inventory);
+                    // Stamp the commit instant — `nodes_view` reports the snapshot's
+                    // age from it (chats never re-pull, so this is the ONLY freshness
+                    // anchor a remote row has).
+                    self.inventories
+                        .insert(node, (*inventory, std::time::Instant::now()));
                 }
                 let _ = reply.send(());
             }
@@ -606,6 +671,7 @@ impl HubFleet {
             routes: HashMap::new(),
             node_ids: NodeIdAllocator::new(),
             inventories: HashMap::new(),
+            software_versions: HashMap::new(),
             versions: HashMap::new(),
             epochs: HashMap::new(),
             bus: bus_for_actor,
@@ -659,6 +725,7 @@ impl HubFleet {
         transport: Arc<NodeTransport>,
         admit_gen: Option<u64>,
         agreed_version: Option<u32>,
+        software_version: Option<String>,
     ) {
         // Atomically admit: assign the stable NodeId, insert the transport, and bump the epoch in
         // ONE actor message, gated by the admission generation. If the kill switch bumped the
@@ -672,6 +739,7 @@ impl HubFleet {
                 transport: transport.clone(),
                 gen: admit_gen,
                 agreed_version,
+                software_version,
                 reply,
             })
             .await

@@ -19,4 +19,27 @@ is_local: boolean,
  * fills it from the allowlist (the editable source of truth). For the local node it is the
  * instance's `config.json` name.
  */
-label: string, inventory?: NodeInventory, };
+label: string, inventory?: NodeInventory, 
+/**
+ * Age of the cached `inventory` snapshot in ms at the moment this view was
+ * taken, computed hub-side from a monotonic stamp (T14, the T9 freshness
+ * residual's fix). The hub re-pulls inventory on connect and after lifecycle
+ * ops but NEVER on chats — a remote row's idle/in-flight stats are only as
+ * fresh as this says. Absent for the LIVE local card (its stats are read per
+ * request) and when there is no cached inventory.
+ */
+inventory_age_ms?: number, 
+/**
+ * The node's self-reported higgs semver from its HELLO at (re)admission
+ * (T14). Refreshed only by a reconnect — a node upgraded while admitted
+ * shows its old version until it reconnects. Absent when no HELLO carried
+ * one (pre-T14 admit paths) — the UI omits it, never fabricates.
+ */
+software_version?: string, 
+/**
+ * The HELLO-negotiated wire-protocol major for the node's CURRENT admission
+ * (T14) — the same slot the per-load params gate reads ([HG078]). Absent =
+ * the admission predates version reporting (effectively the floor, 1) or
+ * the local card (no wire, no negotiation).
+ */
+protocol?: number, };

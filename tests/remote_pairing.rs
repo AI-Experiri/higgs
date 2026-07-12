@@ -62,7 +62,13 @@ async fn valid_token_pairs() {
     assert_eq!(res.unwrap().agreed_version, 2);
 
     let (outcome, now_paired) = hub_task.await.unwrap();
-    assert_eq!(outcome, GateOutcome::Admitted { agreed_version: 2 });
+    assert_eq!(
+        outcome,
+        GateOutcome::Admitted {
+            agreed_version: 2,
+            software_version: env!("CARGO_PKG_VERSION").to_string()
+        }
+    );
     assert!(now_paired, "node added to allowlist after pairing");
 }
 
@@ -238,7 +244,13 @@ async fn hello_exchanges_friendly_names() {
     );
 
     let (outcome, label) = hub_task.await.unwrap();
-    assert_eq!(outcome, GateOutcome::Admitted { agreed_version: 2 });
+    assert_eq!(
+        outcome,
+        GateOutcome::Admitted {
+            agreed_version: 2,
+            software_version: env!("CARGO_PKG_VERSION").to_string()
+        }
+    );
     assert_eq!(
         label.as_deref(),
         Some("node-friendly(box)"),
@@ -293,7 +305,10 @@ async fn allowlisted_node_reconnects_without_token() {
     );
     assert_eq!(
         hub_task.await.unwrap(),
-        GateOutcome::Admitted { agreed_version: 2 }
+        GateOutcome::Admitted {
+            agreed_version: 2,
+            software_version: env!("CARGO_PKG_VERSION").to_string()
+        }
     );
     let _ = std::fs::remove_file(&path);
 }

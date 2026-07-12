@@ -69,8 +69,13 @@ impl HubIdentity {
 #[derive(Debug, PartialEq, Eq)]
 pub enum GateOutcome {
     /// Admitted: an already-allowlisted peer, or a valid pairing token (now burned
-    /// and the peer added to the allowlist).
-    Admitted { agreed_version: u32 },
+    /// and the peer added to the allowlist). `software_version` is the node's
+    /// self-reported semver from its HELLO (T14: shown in the Fleet view; empty
+    /// only if a peer sent an empty string — the field is required on the wire).
+    Admitted {
+        agreed_version: u32,
+        software_version: String,
+    },
     /// Rejected; `code` is the HG diagnostic that explains why (logged at origin).
     Rejected { code: &'static str },
 }
@@ -341,7 +346,10 @@ pub(crate) async fn gate_admit(
         tracing::warn!(error = %e, "higgs: failed to send HELLO result");
         return GateOutcome::Rejected { code: "HG027" };
     }
-    GateOutcome::Admitted { agreed_version }
+    GateOutcome::Admitted {
+        agreed_version,
+        software_version: hello.software_version,
+    }
 }
 
 /// Hub side: gate one accepted connection (read HELLO + admit). `now_ms`, `hub_id`, and

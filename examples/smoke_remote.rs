@@ -135,7 +135,13 @@ async fn run() {
         "node admitted: {outcome:?}"
     );
     fleet
-        .add_node(peer.clone(), Arc::new(NodeTransport::new(conn)), None, None)
+        .add_node(
+            peer.clone(),
+            Arc::new(NodeTransport::new(conn)),
+            None,
+            None,
+            None,
+        )
         .await;
     println!("node admitted: {peer}");
 

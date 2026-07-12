@@ -112,8 +112,11 @@ fn run_link_pair() -> Result<()> {
             )
             .await;
             match outcome {
-                GateOutcome::Admitted { agreed_version } => {
-                    println!("paired {peer} (protocol v{agreed_version})");
+                GateOutcome::Admitted {
+                    agreed_version,
+                    software_version,
+                } => {
+                    println!("paired {peer} (higgs {software_version}, protocol v{agreed_version})");
                     // Hold the connection until the node has read the HELLO result (it closes
                     // after reading) — and, if the node immediately asks to LEAVE (self-retire),
                     // handle it here too, so `higgs node leave` works against this CLI loop as

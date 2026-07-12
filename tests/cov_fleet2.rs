@@ -400,6 +400,7 @@ async fn hub_fleet_error_arms_over_mock_node() {
             Arc::new(NodeTransport::new(dialer)),
             None,
             None,
+            None,
         )
         .await;
 
@@ -665,6 +666,7 @@ async fn params_load_payload_carries_ctx_at_protocol_two() {
             Arc::new(NodeTransport::new(dialer)),
             None,
             Some(2),
+            None,
         )
         .await;
 

@@ -446,6 +446,7 @@ async fn fleet_stale_admit_gen_is_refused() {
             Arc::new(NodeTransport::new(conn)),
             Some(0),
             None,
+            None,
         )
         .await;
 
@@ -473,7 +474,13 @@ async fn fleet_admit_disconnect_all_then_retire() {
     let fleet = Arc::new(HubFleet::new(Arc::new(LogBus::new())));
 
     fleet
-        .add_node(peer.clone(), Arc::new(NodeTransport::new(conn)), None, None)
+        .add_node(
+            peer.clone(),
+            Arc::new(NodeTransport::new(conn)),
+            None,
+            None,
+            None,
+        )
         .await;
     assert_eq!(
         fleet.node_ids().await,
