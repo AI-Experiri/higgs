@@ -111,6 +111,15 @@ pub struct HelloParams {
 /// characters a semver can contain (alphanumerics and `.+-_`), capped at 64
 /// — a normal version passes through unchanged; anything else degrades
 /// visibly rather than executing in someone's terminal.
+/// Sanitize a peer-supplied DISPLAY NAME for a terminal (T14 r22): names
+/// (`hub-<eid8>(<host>)`, friendly labels) legitimately contain spaces and
+/// punctuation, so unlike [`sanitize_version`] this only strips CONTROL
+/// characters (ANSI escapes, CR/LF) and caps the length — enough to stop
+/// terminal spoofing without mangling a normal name.
+pub fn sanitize_display(raw: &str) -> String {
+    raw.chars().filter(|c| !c.is_control()).take(128).collect()
+}
+
 pub fn sanitize_version(raw: &str) -> String {
     raw.chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-' | '_'))

@@ -116,7 +116,14 @@ fn run_link_pair() -> Result<()> {
                     agreed_version,
                     software_version,
                 } => {
-                    println!("paired {peer} (higgs {software_version}, protocol v{agreed_version})");
+                    // An all-filtered HELLO version sanitizes to empty — print a
+                    // placeholder, not "higgs ," (T14 r22).
+                    let sv = if software_version.is_empty() {
+                        "?"
+                    } else {
+                        software_version.as_str()
+                    };
+                    println!("paired {peer} (higgs {sv}, protocol v{agreed_version})");
                     // Hold the connection until the node has read the HELLO result (it closes
                     // after reading) — and, if the node immediately asks to LEAVE (self-retire),
                     // handle it here too, so `higgs node leave` works against this CLI loop as
@@ -254,9 +261,16 @@ fn run_node_leave(args: &[String]) -> Result<()> {
         let name = name_or_init(Role::Node, &self_id, &crate::system::hostname())?;
         let (conn, hello) =
             crate::node::connect_node(&endpoint, target, self_id, name, None).await?;
-        println!("connected to hub {} ({})", hello.hub_name, hello.node_id);
+        println!(
+            "connected to hub {} ({})",
+            crate::remote::sanitize_display(&hello.hub_name),
+            hello.node_id
+        );
         crate::node::send_leave(&conn).await?;
-        println!("left hub {} — retired from its fleet", hello.hub_name);
+        println!(
+            "left hub {} — retired from its fleet",
+            crate::remote::sanitize_display(&hello.hub_name)
+        );
         Ok::<(), Error>(())
     })?;
 
@@ -455,7 +469,12 @@ pub fn run_node_daemon(args: &[String]) -> Result<()> {
                                 saved = true;
                                 persist_hub(&cfg_path, &hello, &ticket_str);
                             }
-                            println!("paired with hub {} ({}) (protocol v{})", hello.hub_name, hello.node_id, hello.agreed_version);
+                            println!(
+                                "paired with hub {} ({}) (protocol v{})",
+                                crate::remote::sanitize_display(&hello.hub_name),
+                                hello.node_id,
+                                hello.agreed_version
+                            );
                             tokio::select! {
                                 _ = &mut shutdown => break,
                                 _ = crate::node::serve_node(conn, node.clone()) => {

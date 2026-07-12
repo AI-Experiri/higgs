@@ -13,6 +13,14 @@ fn version_sanitizer_strips_terminal_control_and_keeps_semver() {
     assert_eq!(sanitize_version("\u{1b}[31mred\u{1b}[0m"), "31mred0m");
     // Length cap.
     assert_eq!(sanitize_version(&"9".repeat(200)).len(), 64);
+    // The NAME sanitizer keeps normal friendly names intact (spaces, parens)
+    // and strips only terminal-control characters.
+    assert_eq!(
+        sanitize_display("hub-abc12345(my host)"),
+        "hub-abc12345(my host)"
+    );
+    assert_eq!(sanitize_display("evil\u{1b}[2Jname\r\n"), "evil[2Jname");
+    assert_eq!(sanitize_display(&"x".repeat(300)).len(), 128);
 }
 
 /// T9 version-skew: a PRE-stats node's inventory (no per-worker stat keys)

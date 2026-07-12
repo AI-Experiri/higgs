@@ -22,11 +22,13 @@ is_local: boolean,
 label: string, inventory?: NodeInventory, 
 /**
  * Age of the cached `inventory` snapshot in ms at the moment this view was
- * taken, computed hub-side from a monotonic stamp (T14, the T9 freshness
- * residual's fix). The hub re-pulls inventory on connect and after lifecycle
- * ops but NEVER on chats — a remote row's idle/in-flight stats are only as
- * fresh as this says. Absent for the LIVE local card (its stats are read per
- * request) and when there is no cached inventory.
+ * taken, computed hub-side from a DUAL wall+monotonic stamp taken at the
+ * pull's start (see `PulledAt` — max of two lower bounds; errs stale-ward
+ * only). The hub re-pulls inventory on connect, after lifecycle ops, and
+ * (debounced) after hub-routed chats complete; node-LOCAL activity the hub
+ * never sees still ages here until the next pull — a remote row's stats
+ * are only as fresh as this says. Absent for the LIVE local card (its
+ * stats are read per request) and when there is no cached inventory.
  */
 inventory_age_ms?: number, 
 /**

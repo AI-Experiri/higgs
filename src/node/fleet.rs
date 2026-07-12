@@ -96,11 +96,13 @@ pub struct NodeView {
     #[ts(optional)]
     pub inventory: Option<NodeInventory>,
     /// Age of the cached `inventory` snapshot in ms at the moment this view was
-    /// taken, computed hub-side from a monotonic stamp (T14, the T9 freshness
-    /// residual's fix). The hub re-pulls inventory on connect and after lifecycle
-    /// ops but NEVER on chats — a remote row's idle/in-flight stats are only as
-    /// fresh as this says. Absent for the LIVE local card (its stats are read per
-    /// request) and when there is no cached inventory.
+    /// taken, computed hub-side from a DUAL wall+monotonic stamp taken at the
+    /// pull's start (see `PulledAt` — max of two lower bounds; errs stale-ward
+    /// only). The hub re-pulls inventory on connect, after lifecycle ops, and
+    /// (debounced) after hub-routed chats complete; node-LOCAL activity the hub
+    /// never sees still ages here until the next pull — a remote row's stats
+    /// are only as fresh as this says. Absent for the LIVE local card (its
+    /// stats are read per request) and when there is no cached inventory.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional, type = "number")]
     pub inventory_age_ms: Option<u64>,
@@ -658,8 +660,10 @@ impl Actor for FleetActor {
                         inv.snapshot_seq = None;
                     }
                     // Same rule for the semver display: never inherit a prior
-                    // connection's value.
-                    match software_version {
+                    // connection's value. An EMPTY string (a HELLO version that
+                    // sanitized away entirely) is stored as ABSENT — never a
+                    // present-but-blank display value (T14 r22).
+                    match software_version.filter(|v| !v.is_empty()) {
                         Some(v) => {
                             self.software_versions.insert(node.clone(), v);
                         }
