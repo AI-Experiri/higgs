@@ -1468,10 +1468,14 @@ impl HubFleet {
                     Ok(v)
                 }
                 Err(e) if route_invalidating(&e) => {
-                    // Worker gone (node alive) — drop the instance so a retry re-resolves, and
-                    // re-sync the fleet view (remove_instance_if bumped the node's generation).
+                    // Worker gone (node alive) — drop the instance so a retry re-resolves
+                    // (remove_instance_if bumps the node's generation), then re-sync the
+                    // fleet view through the SAME per-node debounce as every other chat
+                    // outcome (T14 r5): N concurrent stale-route failures must coalesce
+                    // into one pull, not fan out one direct RPC each. The epoch bump
+                    // already invalidates any pull that started before it.
                     fleet.remove_instance_if(&node, worker, &model).await;
-                    let _ = fleet.refresh_inventory(&node).await;
+                    fleet.schedule_chat_refresh(node.clone());
                     Err(e)
                 }
                 // Transport-level / other failure surfacing mid-stream: drop the dead
@@ -1480,8 +1484,14 @@ impl HubFleet {
                     // A FAILED chat also ended node-side activity (the lease
                     // dropped, resetting the idle clock) — refresh here too
                     // (T14 r4), or the card shows a pre-chat "last active"
-                    // indefinitely. The route-invalidating arm above already
-                    // refreshes directly as part of its route repair.
+                    // indefinitely. ACCEPTED RESIDUAL (r5): a HUB-side timeout
+                    // lands here while the node may legitimately still be
+                    // generating — the pulled snapshot truthfully shows the
+                    // chat in flight, and when it really ends no hub refresh
+                    // fires (the node cannot push events yet; the fleet-event
+                    // SSE work owns that). The UI renders such rows with their
+                    // sync provenance ("N in flight · synced X ago"), so the
+                    // aged claim is self-describing, never fresh-looking.
                     fleet.schedule_chat_refresh(node.clone());
                     Err(fleet.handle_op_error(&node, &used, e).await)
                 }
