@@ -618,6 +618,95 @@ fn inventory_age_is_the_max_of_both_clocks_from_the_pull_start_stamp() {
     );
 }
 
+/// T14 r7: same-epoch pull ORDERING — an older-started pull (stalled
+/// connect-time fetch) must never overwrite a newer-started one (a chat-end
+/// pull that already committed). Driven through the REAL CommitInventory
+/// handler with out-of-order dual stamps.
+#[tokio::test]
+async fn older_started_pull_never_overwrites_a_newer_snapshot() {
+    let mut node_ids = NodeIdAllocator::new();
+    node_ids.assign("nodeA");
+    let mut actor = FleetActor {
+        nodes: HashMap::new(),
+        routes: HashMap::new(),
+        node_ids,
+        inventories: HashMap::new(),
+        chat_refreshes: HashMap::new(),
+        software_versions: HashMap::new(),
+        versions: HashMap::new(),
+        epochs: HashMap::new(),
+        bus: Arc::new(crate::log_bus::LogBus::new()),
+        admit_gen: 0,
+    };
+    fn inv(hostname: &str) -> crate::remote::NodeInventory {
+        crate::remote::NodeInventory {
+            hostname: hostname.into(),
+            os: "macos".into(),
+            workers: vec![],
+            hardware: crate::system::HardwareInfo {
+                cpu_name: String::new(),
+                arch: String::new(),
+                cpu_cores: 0,
+                ram_total_bytes: 0,
+                ram_used_bytes: 0,
+                cpu_usage_percent: 0.0,
+                gpus: vec![],
+                vram_total_bytes: 0,
+            },
+            runtime: crate::system::RuntimeInfo {
+                engine: String::new(),
+                backend: String::new(),
+                version: String::new(),
+                binding: String::new(),
+            },
+        }
+    }
+    let older = PulledAt {
+        wall: std::time::SystemTime::now() - std::time::Duration::from_secs(20),
+        mono: std::time::Instant::now() - std::time::Duration::from_secs(20),
+    };
+    let newer = PulledAt {
+        wall: std::time::SystemTime::now() - std::time::Duration::from_secs(1),
+        mono: std::time::Instant::now() - std::time::Duration::from_secs(1),
+    };
+    let commit = |inventory: crate::remote::NodeInventory, pulled_at: PulledAt| {
+        let (tx, rx) = oneshot::channel();
+        (
+            FleetMsg::CommitInventory {
+                node: "nodeA".to_string(),
+                epoch_before: 0,
+                inventory: Box::new(inventory),
+                pulled_at,
+                reply: tx,
+            },
+            rx,
+        )
+    };
+    // Newer-started pull commits first...
+    let (msg, _rx) = commit(inv("newer"), newer);
+    actor.handle(msg).await;
+    // ...then the stalled older-started pull arrives: REJECTED.
+    let (msg, _rx) = commit(inv("older"), older);
+    actor.handle(msg).await;
+    let view = actor.nodes_view();
+    assert_eq!(
+        view[0].inventory.as_ref().map(|i| i.hostname.as_str()),
+        Some("newer"),
+        "the older-started pull must not overwrite: {view:?}"
+    );
+    // Sanity: a genuinely newer pull still replaces.
+    let newest = PulledAt::now();
+    let (msg, _rx) = commit(inv("newest"), newest);
+    actor.handle(msg).await;
+    assert_eq!(
+        actor.nodes_view()[0]
+            .inventory
+            .as_ref()
+            .map(|i| i.hostname.as_str()),
+        Some("newest")
+    );
+}
+
 /// T14 r2: the chat-end refresh debounce — at most ONE pull owns a node's
 /// slot; completions during it coalesce into exactly one trailing re-run.
 /// Driven through the REAL actor messages (Begin/End), not a reimplementation.

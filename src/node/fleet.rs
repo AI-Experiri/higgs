@@ -696,8 +696,19 @@ impl Actor for FleetActor {
             } => {
                 if self.epoch(&node) == epoch_before {
                     // The stamp is the pull's START (carried in, not taken here) —
-                    // `nodes_view` reports the snapshot's age from it.
-                    self.inventories.insert(node, (*inventory, pulled_at));
+                    // `nodes_view` reports the snapshot's age from it. SAME-epoch
+                    // ordering guard (T14 r7): two pulls under one lifecycle epoch
+                    // (a stalled connect-time pull vs a later chat-end pull) must
+                    // not commit out of order — an older-started pull never
+                    // overwrites a newer-started one (monotonic stamps, same
+                    // process, directly comparable).
+                    let newer = self
+                        .inventories
+                        .get(&node)
+                        .is_none_or(|(_, cur)| pulled_at.mono > cur.mono);
+                    if newer {
+                        self.inventories.insert(node, (*inventory, pulled_at));
+                    }
                 }
                 let _ = reply.send(());
             }
