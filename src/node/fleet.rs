@@ -1576,9 +1576,14 @@ impl HubFleet {
         // per node (r2: one pull in flight, later completions coalesce into one
         // trailing re-run; 250 ms settle lets the node's ChatEnd land) and
         // epoch-gated. On an abort the node's generation may still be running —
-        // the pulled snapshot then truthfully shows it in flight, and its REAL
-        // end goes unrefreshed (the r5 accepted residual; node-push events own
-        // it) with the UI's sync provenance keeping the aged claim honest.
+        // the pulled snapshot then truthfully shows it in flight — or (r20) may
+        // not have STARTED yet (the M_CHAT handler hadn't reached ChatHandle),
+        // in which case the refresh snapshots a pre-chat state and the chat's
+        // later start/end go unrefreshed. Both are the same accepted pull-model
+        // residual (r5): node-side activity after the hub's last snapshot is
+        // invisible until the next refresh or lifecycle op — node-push events
+        // (the fleet-event SSE work) own the real fix; the UI's sync provenance
+        // keeps the aged claim honest meanwhile.
         struct RefreshOnDrop {
             fleet: Arc<HubFleet>,
             node: NodeKey,
