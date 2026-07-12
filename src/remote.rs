@@ -112,16 +112,19 @@ pub struct HelloParams {
 /// misses (Cf: RLO/LRO/isolates/marks, which visually reorder a printed
 /// line) — and caps the length. Normal names pass intact.
 pub fn sanitize_display(raw: &str) -> String {
-    fn is_bidi_control(c: char) -> bool {
+    fn is_invisible_format(c: char) -> bool {
         matches!(
             c,
-            '\u{200E}' | '\u{200F}' | '\u{061C}'            // LRM/RLM/ALM
+            '\u{200B}'..='\u{200F}'                          // ZWSP/ZWNJ/ZWJ/LRM/RLM
+            | '\u{061C}'                                      // ALM
             | '\u{202A}'..='\u{202E}'                        // LRE/RLE/PDF/LRO/RLO
-            | '\u{2066}'..='\u{2069}'                        // isolates
+            | '\u{2060}'..='\u{2069}'                        // WJ/invisibles/isolates
+            | '\u{FEFF}'                                      // BOM/ZWNBSP
+            | '\u{E0000}'..='\u{E007F}'                      // tag characters
         )
     }
     raw.chars()
-        .filter(|c| !c.is_control() && !is_bidi_control(*c))
+        .filter(|c| !c.is_control() && !is_invisible_format(*c))
         .take(128)
         .collect()
 }

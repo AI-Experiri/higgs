@@ -301,14 +301,16 @@ fn run_node_connect(args: &[String]) -> Result<()> {
         // Both hub-controlled strings are display-sanitized (T14 r24 — the
         // one-shot pairing path is the FIRST thing a user runs against an
         // untrusted ticket, exactly where terminal spoofing matters most).
+        let label = res
+            .assigned_label
+            .as_deref()
+            .map(crate::remote::sanitize_display)
+            .unwrap_or_else(|| "-".into());
         println!(
-            "paired with hub {} ({}) (protocol v{}, label {:?})",
+            "paired with hub {} ({}) (protocol v{}, label {label})",
             crate::remote::sanitize_display(&res.hub_name),
             res.node_id,
             res.agreed_version,
-            res.assigned_label
-                .as_deref()
-                .map(crate::remote::sanitize_display)
         );
         Ok(())
     })

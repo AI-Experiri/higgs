@@ -24,6 +24,11 @@ fn version_sanitizer_strips_terminal_control_and_keeps_semver() {
     // visually reorder a printed line, the same spoof class (r23).
     assert_eq!(sanitize_display("ok\u{202E}deriapnu"), "okderiapnu");
     assert_eq!(sanitize_display("a\u{2066}b\u{2069}c\u{200F}"), "abc");
+    // Other INVISIBLE format chars (ZWSP/WJ/BOM/tag chars) also drop (r26).
+    assert_eq!(
+        sanitize_display("a\u{200B}b\u{2060}c\u{FEFF}d\u{E0041}"),
+        "abcd"
+    );
     assert_eq!(sanitize_display(&"x".repeat(300)).len(), 128);
 }
 
