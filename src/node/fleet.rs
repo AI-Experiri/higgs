@@ -318,6 +318,8 @@ impl PulledAt {
         }
     }
     /// Age in ms: the max of both clocks' elapsed (each saturating at 0).
+    /// (A suspend landing in the microseconds BETWEEN the two reads below can
+    /// under-read by the sleep once; the next view recomputes correctly.)
     fn age_ms(&self) -> u64 {
         let wall = std::time::SystemTime::now()
             .duration_since(self.wall)
@@ -643,6 +645,17 @@ impl Actor for FleetActor {
                         None => {
                             self.versions.remove(&node);
                         }
+                    }
+                    // A (re)admission invalidates the PREVIOUS process's data
+                    // order (T14 r19): snapshot_seq is per-node-process, so a
+                    // restarted node counts from 1 again — comparing its fresh
+                    // pulls against a retained seq-100 snapshot would reject
+                    // every refresh and freeze the old inventory forever. The
+                    // retained snapshot stays displayable (continuity) but its
+                    // seq is stripped, so the first new pull commits via the
+                    // stamp arm and re-establishes seq ordering.
+                    if let Some((inv, _)) = self.inventories.get_mut(&node) {
+                        inv.snapshot_seq = None;
                     }
                     // Same rule for the semver display: never inherit a prior
                     // connection's value.
