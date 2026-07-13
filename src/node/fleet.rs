@@ -142,6 +142,20 @@ pub struct FleetEvent {
 /// signals; a subscriber that lags past 256 of them just refreshes on the next one.
 const FLEET_EVENT_CAP: usize = 256;
 
+/// Outcome of a `CommitWorkers` push merge. Only `Applied` (and a `NeedsFull`
+/// whose fallback pull succeeds) re-broadcasts the public [`FleetEvent`] — a
+/// `Stale` push changed nothing, so announcing its kind would hand subscribers
+/// misleading (possibly reversed) signals about state that did not move (T10 r2 #4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PushOutcome {
+    /// Merged into the cached inventory.
+    Applied,
+    /// Dropped: stale connection, or not newer than the cached snapshot.
+    Stale,
+    /// No cached inventory to merge into — the caller pulls the full inventory.
+    NeedsFull,
+}
+
 /// The actor's typed mailbox. Reads carry a `reply` the wrapper awaits; writes are atomic
 /// state transitions (some also reply so the wrapper can sequence the next slow RPC).
 enum FleetMsg {
@@ -237,7 +251,10 @@ enum FleetMsg {
     /// reconnect restores the fleet with its previously-loaded routes intact. Used by the hub
     /// kill switch.
     DisconnectAll {
-        reply: oneshot::Sender<()>,
+        /// The keys whose transports were actually drained — the wrapper emits one
+        /// `NodeDropped` [`FleetEvent`] per key (T10 r2 #5), so event-driven UIs on
+        /// OTHER clients see the kill switch's disconnects without waiting for a poll.
+        reply: oneshot::Sender<Vec<NodeKey>>,
     },
     /// Bump the admission generation and return the NEW value — a fresh generation for an accept
     /// loop about to be spawned (`start_hub`). Invalidates any prior loop's in-flight admissions.
@@ -287,27 +304,29 @@ enum FleetMsg {
     },
     /// Merge a node-PUSHED worker snapshot (`N_FLEET_EVENT`, T10) into the cached
     /// inventory: replace `workers` + `snapshot_seq` + the freshness stamp, KEEP the
-    /// pulled host/hardware/runtime fields. Same epoch + seq ordering guards as
-    /// `CommitInventory` (pushes and pulls share the node actor's one seq counter, so
-    /// they order against each other exactly). Replies `true` when there is NO cached
-    /// inventory to merge into (an event raced ahead of the first pull) — the caller
-    /// then falls back to a full `refresh_inventory` instead of fabricating one.
+    /// pulled host/hardware/runtime fields. Guards: the transport-identity check below
+    /// plus the same seq ordering as `CommitInventory` (pushes and pulls share the node
+    /// actor's one seq counter, so they order against each other exactly). There is
+    /// deliberately NO epoch gate (T10 r2 #1): the epoch protects PULLS, whose data was
+    /// captured before hub-side route changes could land — a push is the node's own
+    /// truth, ordered by its stream and its seq, and pre-sampling an epoch outside this
+    /// message only opened a race where a lifecycle op between sample and commit
+    /// discarded a valid final event (e.g. the idle-reap `WorkerUnloaded`) that nothing
+    /// would ever resend, pinning a dead worker in the cache of an event-pushing node.
     CommitWorkers {
         node: NodeKey,
-        epoch_before: u64,
         /// The connection the event arrived on. The commit applies ONLY while this is
-        /// still the node's CURRENT transport (Arc identity, T10 r1): the epoch is
-        /// sampled at RECEIPT, so it cannot reject a stale-CONNECTION event the way it
-        /// rejects a stale pull (whose epoch predates the re-admission bump) — without
-        /// this check a push buffered from a replaced connection could land after the
+        /// still the node's CURRENT transport (Arc identity, T10 r1): without this
+        /// check a push buffered from a replaced connection could land after the
         /// re-admission stripped the cached seq and install the OLD process's high seq,
-        /// freezing out the new process until its counter catches up.
+        /// freezing out the new process until its counter catches up. (Retire empties
+        /// the transport slot, so post-retire pushes are dropped here too.)
         transport: Arc<NodeTransport>,
         workers: Vec<InventoryWorker>,
         snapshot_seq: u64,
         /// Dual-clock stamp of the event's RECEIPT (see [`PulledAt`]).
         pulled_at: PulledAt,
-        reply: oneshot::Sender<bool>,
+        reply: oneshot::Sender<PushOutcome>,
     },
     /// Does this node push `N_FLEET_EVENT`s (its HELLO advertised `fleet_events`)?
     NodePushesEvents {
@@ -787,14 +806,16 @@ impl Actor for FleetActor {
                 // Drain transports (closing each so a wedged-open connection's close-watcher
                 // wakes) but KEEP routes/inventories/node-ids — same "routes survive a dropped
                 // connection" contract as `drop_transport_if`, applied to every node at once.
+                let mut dropped = Vec::with_capacity(self.nodes.len());
                 for (node, t) in self.nodes.drain() {
                     tracing::info!(
                         node,
                         "higgs hub: disabling — node transport closed (route kept)"
                     );
                     t.close();
+                    dropped.push(node);
                 }
-                let _ = reply.send(());
+                let _ = reply.send(dropped);
             }
             FleetMsg::AddInstance {
                 node,
@@ -858,7 +879,6 @@ impl Actor for FleetActor {
             }
             FleetMsg::CommitWorkers {
                 node,
-                epoch_before,
                 transport,
                 workers,
                 snapshot_seq,
@@ -873,8 +893,9 @@ impl Actor for FleetActor {
                     .nodes
                     .get(&node)
                     .is_some_and(|cur| Arc::ptr_eq(cur, &transport));
-                let mut needs_full = false;
-                if current && self.epoch(&node) == epoch_before {
+                let outcome = if !current {
+                    PushOutcome::Stale
+                } else {
                     match self.inventories.get_mut(&node) {
                         Some((cur_inv, cur_at)) => {
                             // Same ordering rule as `CommitInventory`: prefer the node's
@@ -890,15 +911,18 @@ impl Actor for FleetActor {
                                 cur_inv.workers = workers;
                                 cur_inv.snapshot_seq = Some(snapshot_seq);
                                 *cur_at = pulled_at;
+                                PushOutcome::Applied
+                            } else {
+                                PushOutcome::Stale
                             }
                         }
                         // No snapshot to merge into (the event outran the connect-time
                         // pull): don't fabricate hostname/hardware — have the caller
                         // pull the full inventory instead.
-                        None => needs_full = true,
+                        None => PushOutcome::NeedsFull,
                     }
-                }
-                let _ = reply.send(needs_full);
+                };
+                let _ = reply.send(outcome);
             }
             FleetMsg::NodePushesEvents { node, reply } => {
                 let _ = reply.send(self.event_nodes.contains(&node));
@@ -1250,11 +1274,9 @@ impl HubFleet {
         ev: NodeFleetEvent,
         transport: &Arc<NodeTransport>,
     ) {
-        let epoch_before = self.epoch(node).await;
-        let needs_full = self
+        let outcome = self
             .ask(|reply| FleetMsg::CommitWorkers {
                 node: node.clone(),
-                epoch_before,
                 transport: transport.clone(),
                 workers: ev.workers,
                 snapshot_seq: ev.snapshot_seq,
@@ -1262,11 +1284,19 @@ impl HubFleet {
                 reply,
             })
             .await
-            .unwrap_or(false);
-        if needs_full {
-            let _ = self.refresh_inventory(node).await;
+            .unwrap_or(PushOutcome::Stale);
+        // Re-broadcast only what actually LANDED (T10 r2 #4): a Stale drop changed
+        // nothing, and a NeedsFull whose fallback pull failed left the cache as-was —
+        // announcing those kinds would signal state that didn't move.
+        match outcome {
+            PushOutcome::Applied => self.emit_fleet_event(node, ev.kind),
+            PushOutcome::NeedsFull => {
+                if self.refresh_inventory(node).await.is_ok() {
+                    self.emit_fleet_event(node, ev.kind);
+                }
+            }
+            PushOutcome::Stale => {}
         }
-        self.emit_fleet_event(node, ev.kind);
     }
 
     /// Does this node's CURRENT admission push `N_FLEET_EVENT`s? (T10 — decides whether
@@ -1342,7 +1372,16 @@ impl HubFleet {
     /// activity but keeps the route table, so re-enabling is a pure reconnect (previously-loaded
     /// remote routes survive — see `tests/remote_hub_e2e.rs::node_reconnects_and_route_survives`).
     pub async fn disconnect_all(&self) {
-        self.ask(|reply| FleetMsg::DisconnectAll { reply }).await;
+        let dropped = self
+            .ask(|reply| FleetMsg::DisconnectAll { reply })
+            .await
+            .unwrap_or_default();
+        // The kill switch's disconnects are fleet events too (T10 r2 #5) — without
+        // them an event-driven UI on ANOTHER client keeps rendering the nodes as
+        // connected until its fallback poll.
+        for node in dropped {
+            self.emit_fleet_event(&node, FleetEventKind::NodeDropped);
+        }
     }
 
     /// Bump the admission generation and return the fresh value, for an accept loop about to be

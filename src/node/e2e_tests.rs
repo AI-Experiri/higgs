@@ -119,7 +119,8 @@ async fn fleet_event_relay_reopens_after_a_stream_reset() {
     std::mem::forget(hub);
 
     let rt = Arc::new(fake_runtime(vec![model_root.path().to_path_buf()]));
-    tokio::spawn(super::relay_fleet_events(node_conn, rt.clone()));
+    let fleet_events = rt.subscribe_fleet_events();
+    tokio::spawn(super::relay_fleet_events(node_conn, fleet_events));
 
     // Emit fleet events continuously (each fake load emits WorkerLoaded) so
     // both the pre- and post-reset streams have traffic without timing games.
@@ -182,4 +183,71 @@ async fn fleet_event_relay_reopens_after_a_stream_reset() {
         );
     }
     feeder.abort();
+}
+
+/// T10 r2 #2: a reset landing while the relay is IDLE — after its FINAL event
+/// was buffered locally but possibly before the hub decoded it — must still be
+/// detected (`send.stopped()`), and the LAST event must be resent on the fresh
+/// stream with NO new node activity. Otherwise a lost trailing ChatEnd pins the
+/// hub at `in_flight: 1` forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fleet_event_relay_resends_the_last_event_after_an_idle_reset() {
+    use tokio::io::AsyncBufReadExt;
+
+    let (model_root, model_id) = stage_dummy_model("higgs-test/m");
+    let hub = local_endpoint().await;
+    let node = local_endpoint().await;
+    let (dial, hub_conn) = tokio::join!(node.connect(hub.addr(), crate::remote::ALPN), async {
+        hub.accept().await.expect("incoming").await.expect("conn")
+    });
+    let node_conn = dial.expect("dial");
+    std::mem::forget(hub);
+
+    let rt = Arc::new(fake_runtime(vec![model_root.path().to_path_buf()]));
+    let fleet_events = rt.subscribe_fleet_events();
+    tokio::spawn(super::relay_fleet_events(node_conn, fleet_events));
+
+    // Exactly ONE event (a single load), then the node goes idle.
+    rt.load(crate::remote::NodeLoadParams {
+        id: model_id,
+        ctx_len: None,
+        gpu_layers: None,
+        threads: None,
+        params: None,
+    })
+    .await
+    .expect("fake load");
+
+    let mut recv1 = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        hub_conn.accept_uni().await.expect("first uni stream")
+    })
+    .await
+    .expect("relay opened its first stream");
+    let mut lines1 = tokio::io::BufReader::new(&mut recv1).lines();
+    let line1 = tokio::time::timeout(std::time::Duration::from_secs(10), lines1.next_line())
+        .await
+        .expect("the load event within 10s")
+        .expect("stream readable")
+        .expect("a line");
+    assert!(line1.contains(crate::remote::N_FLEET_EVENT));
+    drop(lines1);
+    // Idle reset: no further node activity will ever produce another write.
+    recv1.stop(1u32.into()).expect("reset the stream");
+
+    // The relay must notice via stopped() and resend the LAST event unprompted.
+    let recv2 = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        hub_conn.accept_uni().await.expect("second uni stream")
+    })
+    .await
+    .expect("relay reopened after the idle reset");
+    let mut lines2 = tokio::io::BufReader::new(recv2).lines();
+    let line2 = tokio::time::timeout(std::time::Duration::from_secs(10), lines2.next_line())
+        .await
+        .expect("the resent event within 10s — with NO new node activity")
+        .expect("stream readable")
+        .expect("a line");
+    assert!(
+        line2.contains(crate::remote::N_FLEET_EVENT),
+        "the last event is resent on the fresh stream: {line2}"
+    );
 }

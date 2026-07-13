@@ -1345,12 +1345,11 @@ async fn pushed_worker_snapshot_merges_under_the_seq_guard() {
             in_flight: Some(in_flight),
         }
     }
-    let commit_workers = |node: &str, epoch_before: u64, seq: u64, in_flight: u32| {
+    let commit_workers = |node: &str, seq: u64, in_flight: u32| {
         let (tx, rx) = oneshot::channel();
         (
             FleetMsg::CommitWorkers {
                 node: node.to_string(),
-                epoch_before,
                 transport: transport.clone(),
                 workers: vec![worker(in_flight)],
                 snapshot_seq: seq,
@@ -1360,10 +1359,10 @@ async fn pushed_worker_snapshot_merges_under_the_seq_guard() {
             rx,
         )
     };
-    // No cached inventory yet: the push reports needs_full — nothing fabricated.
-    let (msg, rx) = commit_workers("nodeA", 0, 1, 0);
+    // No cached inventory yet: the push reports NeedsFull — nothing fabricated.
+    let (msg, rx) = commit_workers("nodeA", 1, 0);
     actor.handle(msg).await;
-    assert!(rx.await.unwrap(), "no cache to merge into -> needs_full");
+    assert_eq!(rx.await.unwrap(), PushOutcome::NeedsFull);
     assert!(actor.nodes_view()[0].inventory.is_none());
 
     // Seed the cache like a pull would (seq 5, empty workers).
@@ -1379,36 +1378,40 @@ async fn pushed_worker_snapshot_merges_under_the_seq_guard() {
         .await;
 
     // An OLDER-seq push never overwrites (data order, same rule as pulls).
-    let (msg, rx) = commit_workers("nodeA", 0, 4, 1);
+    let (msg, rx) = commit_workers("nodeA", 4, 1);
     actor.handle(msg).await;
-    assert!(!rx.await.unwrap());
+    assert_eq!(rx.await.unwrap(), PushOutcome::Stale);
     let view_inv = actor.nodes_view()[0].inventory.clone().unwrap();
     assert!(view_inv.workers.is_empty(), "stale push rejected");
     assert_eq!(view_inv.snapshot_seq, Some(5));
 
     // A NEWER-seq push merges: workers + seq replaced, host/hardware KEPT.
-    let (msg, rx) = commit_workers("nodeA", 0, 6, 1);
+    let (msg, rx) = commit_workers("nodeA", 6, 1);
     actor.handle(msg).await;
-    assert!(!rx.await.unwrap());
+    assert_eq!(rx.await.unwrap(), PushOutcome::Applied);
     let view_inv = actor.nodes_view()[0].inventory.clone().unwrap();
     assert_eq!(view_inv.workers.len(), 1, "pushed worker merged");
     assert_eq!(view_inv.workers[0].in_flight, Some(1));
     assert_eq!(view_inv.snapshot_seq, Some(6));
     assert_eq!(view_inv.hostname, "host", "pulled host fields kept");
 
-    // A push whose epoch predates a lifecycle op is dropped (not needs_full).
+    // T10 r2 #1: a push is NOT epoch-gated — a lifecycle op bumping the epoch
+    // between receipt and commit must not discard a valid final event (the
+    // idle-reap WorkerUnloaded case: nothing would ever resend it, pinning a
+    // dead worker in an event-pushing node's cache). Seq + transport identity
+    // are the push's ordering guards; the epoch protects pulls only.
     actor.bump_epoch("nodeA");
-    let (msg, rx) = commit_workers("nodeA", 0, 7, 0);
+    let (msg, rx) = commit_workers("nodeA", 7, 0);
     actor.handle(msg).await;
-    assert!(!rx.await.unwrap());
+    assert_eq!(rx.await.unwrap(), PushOutcome::Applied);
     assert_eq!(
         actor.nodes_view()[0]
             .inventory
             .clone()
             .unwrap()
             .snapshot_seq,
-        Some(6),
-        "stale-epoch push dropped"
+        Some(7),
+        "a push commits across an epoch bump (r2 #1)"
     );
 }
 
@@ -1625,4 +1628,100 @@ async fn pushes_from_a_replaced_connection_are_dropped() {
         "current connection's push commits"
     );
     assert_eq!(inv.workers.len(), 1);
+}
+
+/// T10 r2 #4 + #5: (a) a STALE push re-broadcasts NO public FleetEvent — the
+/// cache didn't move, so announcing its kind would hand subscribers reversed
+/// signals; (b) the kill switch's `disconnect_all` announces every drained
+/// node as `NodeDropped`, so event-driven UIs on OTHER clients see the
+/// disable without waiting for a poll.
+#[tokio::test]
+async fn stale_pushes_are_silent_and_disconnect_all_announces_drops() {
+    let hub = local_endpoint().await;
+    let node = local_endpoint().await;
+    let hub_addr = hub.addr();
+    let node_key = node.id().to_string();
+    let (dial, conn) = tokio::join!(node.connect(hub_addr, ALPN), async {
+        hub.accept().await.expect("incoming").await.expect("conn")
+    });
+    let _keep = dial.expect("dial");
+    std::mem::forget(hub);
+
+    let t = Arc::new(NodeTransport::new(conn));
+    let fleet = Arc::new(HubFleet::new(Arc::new(crate::log_bus::LogBus::new())));
+    let mut events = fleet.subscribe_fleet_events();
+    fleet
+        .add_node(node_key.clone(), t.clone(), None, Some(2), None, true)
+        .await;
+    assert_eq!(
+        events.recv().await.unwrap().kind,
+        crate::remote::FleetEventKind::NodeConnected
+    );
+
+    let push = |seq: u64| crate::remote::NodeFleetEvent {
+        kind: crate::remote::FleetEventKind::ChatEnd,
+        snapshot_seq: seq,
+        workers: vec![],
+    };
+    // First push seeds (NeedsFull path fails its pull — no real node behind the
+    // conn — so nothing is cached and nothing is emitted). Seed via a pull-style
+    // commit instead, then apply an APPLIED push and a STALE push.
+    let epoch = fleet
+        .ask(|reply| FleetMsg::Epoch {
+            node: node_key.clone(),
+            reply,
+        })
+        .await
+        .unwrap_or(0);
+    fleet
+        .ask(|reply| FleetMsg::CommitInventory {
+            node: node_key.clone(),
+            epoch_before: epoch,
+            inventory: Box::new(crate::remote::NodeInventory {
+                hostname: "h".into(),
+                os: "macos".into(),
+                workers: vec![],
+                snapshot_seq: Some(5),
+                hardware: crate::system::HardwareInfo {
+                    cpu_name: String::new(),
+                    arch: String::new(),
+                    cpu_cores: 0,
+                    ram_total_bytes: 0,
+                    ram_used_bytes: 0,
+                    cpu_usage_percent: 0.0,
+                    gpus: vec![],
+                    vram_total_bytes: 0,
+                },
+                runtime: crate::system::RuntimeInfo {
+                    engine: String::new(),
+                    backend: String::new(),
+                    version: String::new(),
+                    binding: String::new(),
+                },
+            }),
+            pulled_at: PulledAt::now(),
+            reply,
+        })
+        .await;
+
+    // APPLIED push (seq 6 > 5) → exactly one ChatEnd event.
+    fleet.apply_node_event(&node_key, push(6), &t).await;
+    assert_eq!(
+        events.recv().await.unwrap().kind,
+        crate::remote::FleetEventKind::ChatEnd
+    );
+    // STALE push (seq 4 < 6) → silent: the next event on the channel must NOT
+    // be another ChatEnd from it (r2 #4). Prove by draining after the next
+    // REAL event below.
+    fleet.apply_node_event(&node_key, push(4), &t).await;
+
+    // disconnect_all announces the drop (r2 #5) — and doing so right after the
+    // stale push doubles as the silence proof: the NEXT event is NodeDropped,
+    // not a ChatEnd.
+    fleet.disconnect_all().await;
+    assert_eq!(
+        events.recv().await.unwrap().kind,
+        crate::remote::FleetEventKind::NodeDropped,
+        "stale push emitted nothing; disconnect_all announced the drop"
+    );
 }

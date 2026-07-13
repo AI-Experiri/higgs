@@ -584,7 +584,13 @@ pub async fn serve_node(conn: Connection, rt: std::sync::Arc<crate::node::runtim
     let relay = tokio::spawn(relay_worker_logs(conn.clone(), rt.clone()));
     // Fleet events (T10) get their OWN uni stream: one stream keeps the events in
     // order; separate from the log stream so a log burst can't delay a state change.
-    let fleet_relay = tokio::spawn(relay_fleet_events(conn.clone(), rt.clone()));
+    // Subscribe HERE, before the accept loop below runs (T10 r2 #3): the actor drops
+    // events with no receiver, and every hub-induced state change arrives through
+    // streams this loop accepts — subscribing inside the spawned relay would leave a
+    // scheduling window where the first op's event (e.g. an immediate post-reconnect
+    // ChatStart) is emitted before the relay task is ever polled, and lost.
+    let fleet_events = rt.subscribe_fleet_events();
+    let fleet_relay = tokio::spawn(relay_fleet_events(conn.clone(), fleet_events));
     // Each iteration accepts a hub-opened stream; the loop ends when the connection
     // closes (caller decides whether to reconnect).
     while let Ok((send, recv)) = conn.accept_bi().await {
@@ -636,17 +642,26 @@ async fn relay_worker_logs(
 /// chat-end re-pull for an event-advertising node, so if this relay died on a
 /// reset uni stream while the QUIC connection stayed healthy, later state
 /// changes would reach the hub by NEITHER push NOR pull — a permanently stale
-/// cache. So a failed write reopens a fresh uni stream (re-sending the event
-/// the write lost — every event carries the full worker list, so one resend
-/// fully re-syncs) and only a failed OPEN — the connection itself is gone, the
-/// caller's accept loop is ending too — returns.
+/// cache. So a stream failure reopens a fresh uni stream and RESENDS the event
+/// in flight (every event carries the full worker list, so one resend fully
+/// re-syncs); only a failed OPEN — the connection itself is gone, the caller's
+/// accept loop is ending too — returns. The failure is detected two ways: a
+/// write error, and `send.stopped()` observed WHILE IDLE between events (T10
+/// r2 #2) — a reset arriving after the FINAL event was locally buffered but
+/// before the hub decoded it would otherwise never surface (no later write to
+/// fail), leaving the hub pinned on the pre-reset state (e.g. `in_flight: 1`
+/// forever after a lost ChatEnd); on that idle reset the LAST-sent event is
+/// resent on the fresh stream, restoring the hub to the current snapshot.
+/// `events` is subscribed by the CALLER, before any hub op can run (r2 #3).
 async fn relay_fleet_events(
     conn: Connection,
-    rt: std::sync::Arc<crate::node::runtime::NodeRuntime>,
+    mut events: tokio::sync::broadcast::Receiver<crate::remote::NodeFleetEvent>,
 ) {
-    let mut events = rt.subscribe_fleet_events();
-    // An event whose write failed on the previous stream, owed to the next one.
+    // The event owed to the next stream (a write failed, or an idle reset may have
+    // eaten the last delivery — resend it; pushes are idempotent full snapshots).
     let mut pending: Option<crate::remote::NodeFleetEvent> = None;
+    // The most recent event written to the CURRENT stream.
+    let mut last_sent: Option<crate::remote::NodeFleetEvent> = None;
     'stream: loop {
         let Ok(mut send) = conn.open_uni().await else {
             return; // connection gone
@@ -654,11 +669,23 @@ async fn relay_fleet_events(
         loop {
             let ev = match pending.take() {
                 Some(ev) => ev,
-                None => match events.recv().await {
-                    Ok(ev) => ev,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-                },
+                None => {
+                    tokio::select! {
+                        got = events.recv() => match got {
+                            Ok(ev) => ev,
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                        },
+                        // Idle reset: the hub stopped THIS stream while no event was
+                        // flowing — the last write may not have been decoded. Reopen
+                        // and resend it (nothing to do if nothing was ever sent).
+                        _ = send.stopped() => {
+                            pending = last_sent.take();
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                            continue 'stream;
+                        }
+                    }
+                }
             };
             let Ok(params) = serde_json::to_value(&ev) else {
                 continue;
@@ -677,9 +704,11 @@ async fn relay_fleet_events(
                 // stream from turning this into a hot loop; if the connection is
                 // actually dead, the reopen fails and we exit above.
                 pending = Some(ev);
+                last_sent = None;
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 continue 'stream;
             }
+            last_sent = Some(ev);
         }
     }
 }
