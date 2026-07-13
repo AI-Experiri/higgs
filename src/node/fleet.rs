@@ -152,8 +152,13 @@ enum PushOutcome {
     Applied,
     /// Dropped: stale connection, or not newer than the cached snapshot.
     Stale,
-    /// No cached inventory to merge into — the caller pulls the full inventory.
+    /// No cached inventory to merge into — the caller runs the (single,
+    /// coalesced) full-inventory fallback pull. The push itself was RETAINED
+    /// for replay on the next committed pull (T10 r5 #1).
     NeedsFull,
+    /// Retained like `NeedsFull`, but a fallback pull is already in flight —
+    /// the caller spawns nothing (T10 r5 #2).
+    Deferred,
 }
 
 /// The actor's typed mailbox. Reads carry a `reply` the wrapper awaits; writes are atomic
@@ -332,6 +337,15 @@ enum FleetMsg {
         pulled_at: PulledAt,
         reply: oneshot::Sender<PushOutcome>,
     },
+    /// A NeedsFull fallback pull finished (either way). Clears the node's
+    /// coalescing flag; replies `true` when the caller should RETRY (the pull
+    /// left no cached inventory, a retained push is still waiting, and the node
+    /// is still connected) — without the retry a single failed fallback would
+    /// strand the pending push until the next lifecycle op (T10 r5 #2).
+    FallbackDone {
+        node: NodeKey,
+        reply: oneshot::Sender<bool>,
+    },
     /// Does this node push `N_FLEET_EVENT`s (its HELLO advertised `fleet_events`)?
     NodePushesEvents {
         node: NodeKey,
@@ -475,6 +489,19 @@ struct FleetActor {
     /// landing BEFORE a just-committed pull's `InventorySynced` (a false sync
     /// after a terminal drop).
     events_tx: tokio::sync::broadcast::Sender<FleetEvent>,
+    /// A push that arrived BEFORE any cached inventory existed (T10 r5 #1): its
+    /// worker snapshot + seq are RETAINED here (newest seq wins) instead of
+    /// discarded, and replayed on top of the next committed pull if the push is
+    /// newer — otherwise an older, delayed connect-time pull committing after a
+    /// failed fallback would resurrect state the push had already superseded
+    /// (e.g. an idle-reaped worker), with no watermark left to reject it.
+    /// Cleared per (re)admission and at retire (a new process's data order).
+    pending_pushes: HashMap<NodeKey, (FleetEventKind, Vec<InventoryWorker>, u64, PulledAt)>,
+    /// Nodes with a NeedsFull fallback pull IN FLIGHT (T10 r5 #2): further
+    /// cache-less pushes update `pending_pushes` but spawn NO additional pull —
+    /// each pull runs a hardware probe on the node, so per-event spawning under
+    /// an event burst would pile up control streams and probe processes.
+    fallback_inflight: HashSet<NodeKey>,
 }
 
 impl FleetActor {
@@ -582,6 +609,8 @@ impl FleetActor {
         self.versions.remove(node);
         self.software_versions.remove(node);
         self.event_nodes.remove(node);
+        self.pending_pushes.remove(node);
+        self.fallback_inflight.remove(node);
         // Drop any chat-refresh debounce slot too: a retired node needs no
         // trailing re-run, and an owner task mid-loop then sees the Vacant arm
         // at its next ChatRefreshEnd and exits cleanly.
@@ -775,6 +804,11 @@ impl Actor for FleetActor {
                             self.software_versions.remove(&node);
                         }
                     }
+                    // A retained pre-cache push and its fallback slot belong to the
+                    // PREVIOUS connection's data order — never replay them into the
+                    // new process's cache (T10 r5 #1).
+                    self.pending_pushes.remove(&node);
+                    self.fallback_inflight.remove(&node);
                     // Same per-admission rule for the event-push capability (T10): a
                     // node DOWNGRADED to an event-less build must fall back to the
                     // debounced re-pull, so never inherit a prior connection's flag.
@@ -905,11 +939,32 @@ impl Actor for FleetActor {
                     if newer {
                         self.inventories
                             .insert(node.clone(), (*inventory, pulled_at));
+                        // A push retained from before any cache existed (r5 #1) is
+                        // replayed ON TOP of this commit when it is the newer data
+                        // (its kind announces it, below, like any applied push).
+                        let replayed = match self.pending_pushes.remove(&node) {
+                            Some((kind, workers, seq, at)) => {
+                                let (inv, cur_at) =
+                                    self.inventories.get_mut(&node).expect("just inserted");
+                                if inv.snapshot_seq.is_none_or(|pull_seq| seq > pull_seq) {
+                                    inv.workers = workers;
+                                    inv.snapshot_seq = Some(seq);
+                                    *cur_at = at;
+                                    Some(kind)
+                                } else {
+                                    None
+                                }
+                            }
+                            None => None,
+                        };
                         // Announced atomically with the commit (T10 r3 #1 / r4 #1):
                         // the pull is where hub-initiated lifecycle changes land,
                         // and the node's own (seq-stale) push for the change is
                         // rightly silenced — this event is the invalidation.
                         self.emit(&node, FleetEventKind::InventorySynced);
+                        if let Some(kind) = replayed {
+                            self.emit(&node, kind);
+                        }
                         let _ = reply.send(true);
                     } else {
                         let _ = reply.send(false);
@@ -935,10 +990,16 @@ impl Actor for FleetActor {
                 // CURRENT transport may push. A replaced/disconnected connection's
                 // buffered event is dropped outright — no needs_full either (its data
                 // is the OLD process's; the new admission runs its own connect pull).
-                let current = self
-                    .nodes
-                    .get(&node)
-                    .is_some_and(|cur| Arc::ptr_eq(cur, &transport));
+                // The admission must also have DECLARED `fleet_events` (T10 r5): the
+                // capability is the contract that pushes participate in this node's
+                // cache ordering — an undeclared admission stays a pure pull-model
+                // node (its debounced re-pull remains active), so accepting its
+                // pushes would mix both freshness models on one cache.
+                let current = self.event_nodes.contains(&node)
+                    && self
+                        .nodes
+                        .get(&node)
+                        .is_some_and(|cur| Arc::ptr_eq(cur, &transport));
                 let outcome = if !current {
                     PushOutcome::Stale
                 } else {
@@ -956,6 +1017,16 @@ impl Actor for FleetActor {
                             if newer {
                                 cur_inv.workers = workers;
                                 cur_inv.snapshot_seq = Some(snapshot_seq);
+                                // The single freshness stamp now dates the WORKER
+                                // snapshot — the thing pushes update and the thing
+                                // the UI's per-row chips describe. ACCEPTED RESIDUAL
+                                // (T10 r5 #3): the retained host/hardware readings
+                                // (cpu%, ram) can be older than this stamp suggests
+                                // on a chatty node that is never re-pulled; every
+                                // lifecycle op and (re)connect still runs a full
+                                // pull, which bounds it in practice. A split
+                                // hardware stamp / periodic hardware re-pull is
+                                // future work, not warranted for display-only data.
                                 *cur_at = pulled_at;
                                 self.emit(&node, kind);
                                 PushOutcome::Applied
@@ -964,12 +1035,39 @@ impl Actor for FleetActor {
                             }
                         }
                         // No snapshot to merge into (the event outran the connect-time
-                        // pull): don't fabricate hostname/hardware — have the caller
-                        // pull the full inventory instead.
-                        None => PushOutcome::NeedsFull,
+                        // pull): don't fabricate hostname/hardware — RETAIN the push
+                        // for replay on the next committed pull (r5 #1) and have the
+                        // caller run ONE coalesced full pull (r5 #2).
+                        None => {
+                            let newer = self
+                                .pending_pushes
+                                .get(&node)
+                                .is_none_or(|(_, _, seq, _)| snapshot_seq > *seq);
+                            if newer {
+                                self.pending_pushes
+                                    .insert(node.clone(), (kind, workers, snapshot_seq, pulled_at));
+                            }
+                            if self.fallback_inflight.insert(node.clone()) {
+                                PushOutcome::NeedsFull
+                            } else {
+                                PushOutcome::Deferred
+                            }
+                        }
                     }
                 };
                 let _ = reply.send(outcome);
+            }
+            FleetMsg::FallbackDone { node, reply } => {
+                self.fallback_inflight.remove(&node);
+                let retry = !self.inventories.contains_key(&node)
+                    && self.pending_pushes.contains_key(&node)
+                    && self.nodes.contains_key(&node);
+                if retry {
+                    // Re-claim the slot so racing pushes keep deferring to this
+                    // caller's retry loop.
+                    self.fallback_inflight.insert(node);
+                }
+                let _ = reply.send(retry);
             }
             FleetMsg::NodePushesEvents { node, reply } => {
                 let _ = reply.send(self.event_nodes.contains(&node));
@@ -1054,6 +1152,8 @@ impl HubFleet {
             bus: bus_for_actor,
             admit_gen: 0,
             events_tx: events_for_actor,
+            pending_pushes: HashMap::new(),
+            fallback_inflight: HashSet::new(),
         });
         Self {
             handle,
@@ -1331,19 +1431,33 @@ impl HubFleet {
             .unwrap_or(PushOutcome::Stale);
         // The actor announced an APPLIED merge atomically (r4 #1); a Stale drop is
         // silent (r2 #4 — and if the newer state arrived via a pull instead, THAT
-        // commit already announced InventorySynced, r3 #1). A NeedsFull falls back
-        // to one full pull, spawned DETACHED (r4 #2): this fn runs on the event
-        // stream's reader task, and awaiting the pull inline would head-of-line
-        // block every later push behind a possibly-stuck RPC. Ordering is safe —
-        // the pull's commit is seq-guarded like any other. Residual (documented):
-        // if BOTH this fallback and the connect-time pull fail on a live
-        // connection, the pushed snapshot is lost until the next event or pull —
-        // the same failure domain as the pre-T10 pull-only model.
+        // commit already announced InventorySynced, r3 #1). A cache-less push was
+        // RETAINED for replay (r5 #1); NeedsFull means this caller owns the ONE
+        // coalesced fallback pull (r5 #2 — Deferred callers spawn nothing). It is
+        // spawned DETACHED (r4 #2): this fn runs on the event stream's reader
+        // task, and awaiting the pull inline would head-of-line block every later
+        // push behind a possibly-stuck RPC. Ordering is safe — the pull's commit
+        // is seq-guarded, and the retained push replays on top when newer. On
+        // failure the actor grants ONE paced retry at a time while the node stays
+        // connected and the push is still waiting.
         if outcome == PushOutcome::NeedsFull {
             let fleet = self.clone();
             let node = node.clone();
             tokio::spawn(async move {
-                let _ = fleet.refresh_inventory(&node).await;
+                loop {
+                    let _ = fleet.refresh_inventory(&node).await;
+                    let retry = fleet
+                        .ask(|reply| FleetMsg::FallbackDone {
+                            node: node.clone(),
+                            reply,
+                        })
+                        .await
+                        .unwrap_or(false);
+                    if !retry {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
             });
         }
     }
@@ -1999,6 +2113,20 @@ async fn read_node_notifications(
                     let Ok(ev) = serde_json::from_value::<NodeFleetEvent>(n.params) else {
                         continue;
                     };
+                    // Node-origin kinds only (T10 r5 #4): the hub-local markers
+                    // (NodeConnected/NodeDropped/InventorySynced) are the HUB's
+                    // statements about connectivity and its own cache — a peer
+                    // must not be able to broadcast a phantom disconnect (or a
+                    // fake sync) by naming one in a push.
+                    if !matches!(
+                        ev.kind,
+                        FleetEventKind::ChatStart
+                            | FleetEventKind::ChatEnd
+                            | FleetEventKind::WorkerLoaded
+                            | FleetEventKind::WorkerUnloaded
+                    ) {
+                        continue;
+                    }
                     if let Some(fleet) = fleet.upgrade() {
                         fleet.apply_node_event(&node_key, ev, &transport).await;
                     }

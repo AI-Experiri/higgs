@@ -714,6 +714,8 @@ fn inventory_age_is_the_max_of_both_clocks_from_the_pull_start_stamp() {
         software_versions: HashMap::new(),
         event_nodes: std::collections::HashSet::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
+        pending_pushes: HashMap::new(),
+        fallback_inflight: std::collections::HashSet::new(),
         versions: HashMap::new(),
         epochs: HashMap::new(),
         bus: Arc::new(crate::log_bus::LogBus::new()),
@@ -754,6 +756,8 @@ fn inventory_age_is_the_max_of_both_clocks_from_the_pull_start_stamp() {
         software_versions: HashMap::new(),
         event_nodes: std::collections::HashSet::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
+        pending_pushes: HashMap::new(),
+        fallback_inflight: std::collections::HashSet::new(),
         versions: HashMap::new(),
         epochs: HashMap::new(),
         bus: Arc::new(crate::log_bus::LogBus::new()),
@@ -814,6 +818,8 @@ async fn readmission_strips_the_previous_process_snapshot_seq() {
         software_versions: HashMap::new(),
         event_nodes: std::collections::HashSet::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
+        pending_pushes: HashMap::new(),
+        fallback_inflight: std::collections::HashSet::new(),
         versions: HashMap::new(),
         epochs: HashMap::new(),
         bus: Arc::new(crate::log_bus::LogBus::new()),
@@ -868,6 +874,8 @@ async fn older_started_pull_never_overwrites_a_newer_snapshot() {
         software_versions: HashMap::new(),
         event_nodes: std::collections::HashSet::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
+        pending_pushes: HashMap::new(),
+        fallback_inflight: std::collections::HashSet::new(),
         versions: HashMap::new(),
         epochs: HashMap::new(),
         bus: Arc::new(crate::log_bus::LogBus::new()),
@@ -1109,6 +1117,8 @@ fn served_ids_are_collision_free_even_when_a_model_name_clashes_with_a_suffix() 
         software_versions: HashMap::new(),
         event_nodes: std::collections::HashSet::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
+        pending_pushes: HashMap::new(),
+        fallback_inflight: std::collections::HashSet::new(),
         versions: HashMap::new(),
         epochs: HashMap::new(),
         bus: Arc::new(crate::log_bus::LogBus::new()),
@@ -1308,12 +1318,16 @@ async fn pushed_worker_snapshot_merges_under_the_seq_guard() {
         software_versions: HashMap::new(),
         event_nodes: std::collections::HashSet::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
+        pending_pushes: HashMap::new(),
+        fallback_inflight: std::collections::HashSet::new(),
         versions: HashMap::new(),
         epochs: HashMap::new(),
         bus: Arc::new(crate::log_bus::LogBus::new()),
         admit_gen: 0,
     };
     actor.nodes.insert("nodeA".to_string(), transport.clone());
+    // Pushes are accepted only from an admission that DECLARED fleet_events.
+    actor.event_nodes.insert("nodeA".to_string());
     fn inv(hostname: &str, seq: u64) -> crate::remote::NodeInventory {
         crate::remote::NodeInventory {
             hostname: hostname.into(),
@@ -1756,5 +1770,127 @@ async fn stale_pushes_are_silent_and_disconnect_all_announces_drops() {
         events.recv().await.unwrap().kind,
         crate::remote::FleetEventKind::NodeDropped,
         "stale push emitted nothing; disconnect_all announced the drop"
+    );
+}
+
+/// T10 r5 #1/#2: a push arriving BEFORE any cached inventory is RETAINED (not
+/// discarded) and replayed on top of the next committed pull when it is the
+/// newer data — otherwise a delayed, OLDER connect pull committing after a
+/// failed fallback would resurrect state the push had superseded, with no
+/// watermark left to reject it. Concurrent cache-less pushes coalesce into ONE
+/// fallback pull (`Deferred`). Driven through the REAL handlers.
+#[tokio::test]
+async fn a_pre_cache_push_is_retained_and_replayed_over_an_older_pull() {
+    let hub = local_endpoint().await;
+    let node = local_endpoint().await;
+    let (dial, conn) = tokio::join!(node.connect(hub.addr(), ALPN), async {
+        hub.accept().await.expect("incoming").await.expect("conn")
+    });
+    let _keep = dial.expect("dial");
+    std::mem::forget(hub);
+    let transport = Arc::new(NodeTransport::new(conn));
+
+    let mut node_ids = NodeIdAllocator::new();
+    node_ids.assign("nodeA");
+    let mut actor = FleetActor {
+        nodes: HashMap::new(),
+        routes: HashMap::new(),
+        node_ids,
+        inventories: HashMap::new(),
+        chat_refreshes: HashMap::new(),
+        chat_refresh_gen: 0,
+        software_versions: HashMap::new(),
+        event_nodes: std::collections::HashSet::new(),
+        events_tx: tokio::sync::broadcast::channel(8).0,
+        pending_pushes: HashMap::new(),
+        fallback_inflight: std::collections::HashSet::new(),
+        versions: HashMap::new(),
+        epochs: HashMap::new(),
+        bus: Arc::new(crate::log_bus::LogBus::new()),
+        admit_gen: 0,
+    };
+    actor.nodes.insert("nodeA".to_string(), transport.clone());
+    // Pushes are accepted only from an admission that DECLARED fleet_events.
+    actor.event_nodes.insert("nodeA".to_string());
+
+    let push = |seq: u64| {
+        let (tx, rx) = oneshot::channel();
+        (
+            FleetMsg::CommitWorkers {
+                node: "nodeA".to_string(),
+                transport: transport.clone(),
+                kind: crate::remote::FleetEventKind::WorkerUnloaded,
+                workers: vec![], // post-reap truth: no resident workers
+                snapshot_seq: seq,
+                pulled_at: PulledAt::now(),
+                reply: tx,
+            },
+            rx,
+        )
+    };
+    // First cache-less push: retained, owns the one fallback pull.
+    let (msg, rx) = push(7);
+    actor.handle(msg).await;
+    assert_eq!(rx.await.unwrap(), PushOutcome::NeedsFull);
+    // Second cache-less push while the fallback is in flight: coalesced.
+    let (msg, rx) = push(8);
+    actor.handle(msg).await;
+    assert_eq!(rx.await.unwrap(), PushOutcome::Deferred);
+
+    // The DELAYED connect pull commits with OLDER data (seq 5, one worker that
+    // the pushes above already saw reaped)...
+    let (tx, _rx) = oneshot::channel();
+    actor
+        .handle(FleetMsg::CommitInventory {
+            node: "nodeA".to_string(),
+            epoch_before: 0,
+            inventory: Box::new(crate::remote::NodeInventory {
+                hostname: "h".into(),
+                os: "macos".into(),
+                workers: vec![crate::remote::InventoryWorker {
+                    worker_id: 1,
+                    model: "org/reaped".into(),
+                    served_id: String::new(),
+                    ctx_len: None,
+                    gpu_layers: None,
+                    threads: None,
+                    loaded_at_ms: None,
+                    idle_ms: Some(0),
+                    in_flight: Some(0),
+                }],
+                snapshot_seq: Some(5),
+                hardware: crate::system::HardwareInfo {
+                    cpu_name: String::new(),
+                    arch: String::new(),
+                    cpu_cores: 0,
+                    ram_total_bytes: 0,
+                    ram_used_bytes: 0,
+                    cpu_usage_percent: 0.0,
+                    gpus: vec![],
+                    vram_total_bytes: 0,
+                },
+                runtime: crate::system::RuntimeInfo {
+                    engine: String::new(),
+                    backend: String::new(),
+                    version: String::new(),
+                    binding: String::new(),
+                },
+            }),
+            pulled_at: PulledAt::now(),
+            reply: tx,
+        })
+        .await;
+
+    // ...and the retained NEWER push replays on top: the reaped worker must
+    // NOT be resurrected, and the pushed seq (the newest retained, 8) rules.
+    let inv = actor.nodes_view()[0].inventory.clone().unwrap();
+    assert!(
+        inv.workers.is_empty(),
+        "the retained newer push replays over the older pull: {inv:?}"
+    );
+    assert_eq!(inv.snapshot_seq, Some(8));
+    assert_eq!(
+        inv.hostname, "h",
+        "the pull's host/hardware fields are kept"
     );
 }
