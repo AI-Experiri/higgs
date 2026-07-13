@@ -146,13 +146,32 @@ async fn real_node_pushes_fleet_events_the_hub_rebroadcasts() {
         )
         .await;
     next_event(&mut events, &peer, FleetEventKind::NodeConnected).await;
+    // Drain the connect-time pull's own announcement BEFORE loading, so the
+    // post-load wait below can't be satisfied by this earlier event.
+    next_event(&mut events, &peer, FleetEventKind::InventorySynced).await;
 
-    // Load: the node pushes WorkerLoaded (in addition to the hub's own refresh).
+    // Load: announced by the node's WorkerLoaded push OR (when the hub's own
+    // post-load refresh commits a newer snapshot first, stale-silencing the
+    // push) by that committed pull's InventorySynced — either way subscribers
+    // are invalidated (T10 r3 #1).
     fleet
         .load(&peer, TINY_MODEL_ID, None)
         .await
         .expect("remote load");
-    next_event(&mut events, &peer, FleetEventKind::WorkerLoaded).await;
+    loop {
+        let ev = tokio::time::timeout(Duration::from_secs(30), events.recv())
+            .await
+            .expect("a post-load announcement within 30s")
+            .expect("fleet-event channel open");
+        if ev.endpoint_id == peer
+            && matches!(
+                ev.kind,
+                FleetEventKind::WorkerLoaded | FleetEventKind::InventorySynced
+            )
+        {
+            break;
+        }
+    }
 
     // Chat through the fleet: the node pushes ChatStart then ChatEnd.
     let messages = serde_json::json!([{ "role": "user", "content": "hi" }]).to_string();

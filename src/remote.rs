@@ -356,7 +356,7 @@ higgs_const_enum! {
     /// hub-side (with hub-local kinds) as a [`crate::node::fleet::FleetEvent`] for
     /// live UIs. Wire values are `snake_case`. Extensible: a reader ignores an
     /// event whose kind it can't decode (additive, no protocol bump).
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
     #[serde(rename_all = "snake_case")]
     pub enum FleetEventKind {
         /// A chat began on a worker (`in_flight` rose).

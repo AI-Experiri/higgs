@@ -1477,7 +1477,26 @@ async fn node_pushed_events_update_the_cache_without_a_pull() {
     next(&mut events, FleetEventKind::InventorySynced).await;
 
     fleet.load(&node_key, &model_id, None).await.unwrap();
-    next(&mut events, FleetEventKind::WorkerLoaded).await;
+    // Two announcements, in either arrival order: the node's WorkerLoaded push
+    // AND the load refresh's committed-pull InventorySynced (T10 r3 #1 — the
+    // pull is where a HUB-initiated change lands, and the node's own push for
+    // it can be seq-stale, so the commit itself must invalidate subscribers).
+    {
+        let mut want: std::collections::HashSet<FleetEventKind> = [
+            FleetEventKind::WorkerLoaded,
+            FleetEventKind::InventorySynced,
+        ]
+        .into_iter()
+        .collect();
+        let deadline = std::time::Duration::from_secs(10);
+        while !want.is_empty() {
+            let ev = tokio::time::timeout(deadline, events.recv())
+                .await
+                .unwrap_or_else(|_| panic!("missing post-load events: {want:?}"))
+                .expect("event channel open");
+            want.remove(&ev.kind);
+        }
+    }
 
     let (mut rx, fut) = fleet
         .chat(&model_id, "[]".into(), 8, 0.0, None, None)

@@ -296,7 +296,10 @@ enum FleetMsg {
         inventory: Box<NodeInventory>,
         /// Dual-clock stamp of the pull's START (see [`PulledAt`]).
         pulled_at: PulledAt,
-        reply: oneshot::Sender<()>,
+        /// `true` = the snapshot actually replaced the cache (epoch current AND
+        /// newer by seq/stamp) — what `refresh_inventory` keys its
+        /// `InventorySynced` announcement on (T10 r3 #2).
+        reply: oneshot::Sender<bool>,
     },
     BumpEpoch {
         node: NodeKey,
@@ -869,9 +872,13 @@ impl Actor for FleetActor {
                     });
                     if newer {
                         self.inventories.insert(node, (*inventory, pulled_at));
+                        let _ = reply.send(true);
+                    } else {
+                        let _ = reply.send(false);
                     }
+                } else {
+                    let _ = reply.send(false);
                 }
-                let _ = reply.send(());
             }
             FleetMsg::BumpEpoch { node, reply } => {
                 self.bump_epoch(&node);
@@ -1116,18 +1123,15 @@ impl HubFleet {
 
         // On (re)connect: refresh the inventory for the fleet view. Best-effort, off the hot
         // path. (Loads are additive — no displaced workers are ever owed to an offline node —
-        // so there are no pending unloads to reconcile.) When the refresh COMMITS, announce
-        // it (T10 r1 #3): `NodeConnected` above fires before this pull even starts, so an
-        // event-driven UI refreshing on it reads the pre-connect cache (none, or the
-        // previous process's retained workers) — without this second event nothing would
-        // tell it the real snapshot landed until the next poll.
+        // so there are no pending unloads to reconcile.) When it COMMITS, the refresh itself
+        // announces `InventorySynced` (T10 r1 #3 / r3 #2): `NodeConnected` above fires before
+        // this pull even starts, so an event-driven UI refreshing on it reads the pre-connect
+        // cache — the commit-keyed event is what tells it the real snapshot landed.
         let inv_weak = Arc::downgrade(self);
         let inv_node = node.clone();
         tokio::spawn(async move {
             if let Some(fleet) = inv_weak.upgrade() {
-                if fleet.refresh_inventory(&inv_node).await.is_ok() {
-                    fleet.emit_fleet_event(&inv_node, FleetEventKind::InventorySynced);
-                }
+                let _ = fleet.refresh_inventory(&inv_node).await;
             }
         });
 
@@ -1252,14 +1256,27 @@ impl HubFleet {
                 detail: format!("M_NODE_INVENTORY reply did not decode: {e}"),
             })?;
         // Commit only if no lifecycle op superseded us (the check+store is one message).
-        self.ask(|reply| FleetMsg::CommitInventory {
-            node: node.to_string(),
-            epoch_before,
-            inventory: Box::new(inventory.clone()),
-            pulled_at,
-            reply,
-        })
-        .await;
+        let committed = self
+            .ask(|reply| FleetMsg::CommitInventory {
+                node: node.to_string(),
+                epoch_before,
+                inventory: Box::new(inventory.clone()),
+                pulled_at,
+                reply,
+            })
+            .await
+            .unwrap_or(false);
+        // Every COMMITTED pull announces itself (T10 r3 #1/#2): the pull is where a
+        // hub-initiated lifecycle change (load/unload/kill) actually lands in the
+        // cache — the node's own push for that change often arrives with an OLDER
+        // seq and is (correctly) dropped as stale, so without this event other
+        // subscribers would never hear about the change. Emitting on COMMIT only
+        // (not on the RPC's Ok) also keeps a guard-rejected pull silent — e.g. a
+        // retire racing the connect-time pull must not follow its NodeDropped with
+        // a phantom "synced" (the r1 connect-time emit had exactly that hole).
+        if committed {
+            self.emit_fleet_event(node, FleetEventKind::InventorySynced);
+        }
         Ok(inventory)
     }
 
@@ -1286,14 +1303,14 @@ impl HubFleet {
             .await
             .unwrap_or(PushOutcome::Stale);
         // Re-broadcast only what actually LANDED (T10 r2 #4): a Stale drop changed
-        // nothing, and a NeedsFull whose fallback pull failed left the cache as-was —
-        // announcing those kinds would signal state that didn't move.
+        // nothing (if the newer state arrived via a pull instead, THAT commit already
+        // announced InventorySynced, r3 #1 — no invalidation is lost by the silence),
+        // and the NeedsFull fallback pull announces its own commit the same way, so
+        // the pushed kind is not re-signalled on top of possibly-uncommitted data.
         match outcome {
             PushOutcome::Applied => self.emit_fleet_event(node, ev.kind),
             PushOutcome::NeedsFull => {
-                if self.refresh_inventory(node).await.is_ok() {
-                    self.emit_fleet_event(node, ev.kind);
-                }
+                let _ = self.refresh_inventory(node).await;
             }
             PushOutcome::Stale => {}
         }
