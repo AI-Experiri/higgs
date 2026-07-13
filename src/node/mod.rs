@@ -581,7 +581,18 @@ pub async fn send_leave(conn: &Connection) -> std::io::Result<()> {
 pub async fn serve_node(conn: Connection, rt: std::sync::Arc<crate::node::runtime::NodeRuntime>) {
     // Relay resident workers' stderr to the hub on a dedicated uni stream for THIS
     // connection. Runs until the connection closes (a reconnect starts a fresh relay).
-    let relay = tokio::spawn(relay_worker_logs(conn.clone(), rt.clone()));
+    /// Abort a spawned relay on EVERY exit of `serve_node` — including the
+    /// future being CANCELLED (T10 r23): a trailing explicit `abort()` runs only
+    /// on the normal accept-loop exit, so an embedder dropping `serve_node`
+    /// mid-flight would leak the relay task, its uni stream, and its broadcast
+    /// receiver — still pushing events on a session whose request loop is gone.
+    struct AbortOnDrop(tokio::task::JoinHandle<()>);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let _relay = AbortOnDrop(tokio::spawn(relay_worker_logs(conn.clone(), rt.clone())));
     // Fleet events (T10) get their OWN uni stream: one stream keeps the events in
     // order; separate from the log stream so a log burst can't delay a state change.
     // Subscribe HERE, before the accept loop below runs (T10 r2 #3): the actor drops
@@ -590,7 +601,7 @@ pub async fn serve_node(conn: Connection, rt: std::sync::Arc<crate::node::runtim
     // scheduling window where the first op's event (e.g. an immediate post-reconnect
     // ChatStart) is emitted before the relay task is ever polled, and lost.
     let fleet_events = rt.subscribe_fleet_events();
-    let fleet_relay = tokio::spawn(relay_fleet_events(conn.clone(), fleet_events));
+    let _fleet_relay = AbortOnDrop(tokio::spawn(relay_fleet_events(conn.clone(), fleet_events)));
     // Each iteration accepts a hub-opened stream; the loop ends when the connection
     // closes (caller decides whether to reconnect).
     while let Ok((send, recv)) = conn.accept_bi().await {
@@ -598,8 +609,8 @@ pub async fn serve_node(conn: Connection, rt: std::sync::Arc<crate::node::runtim
         let conn = conn.clone();
         tokio::spawn(handle_node_stream(rt, conn, send, recv));
     }
-    relay.abort(); // connection closed — stop relaying logs for it
-    fleet_relay.abort(); // …and stop relaying fleet events for it
+    // Both relays abort via their drop guards — on this normal exit AND on a
+    // cancelled `serve_node` future alike.
 }
 
 /// Node side: drain the runtime's per-worker log relay onto a uni stream to the hub as
