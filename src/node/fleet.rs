@@ -537,7 +537,11 @@ struct FleetActor {
     /// generation stops a STALE owner (its slot cleared by a re-admission, and
     /// possibly re-claimed by the new connection's own fallback) from removing
     /// or retrying against the successor's slot.
-    fallback_inflight: HashMap<NodeKey, u64>,
+    /// Value = (owner generation, the pending push's seq the owner is serving).
+    /// A give-up only finalizes if the pending seq hasn't advanced past what the
+    /// owner set out to serve (r13 #2) — fresh data arriving during the terminal
+    /// attempt extends the owner instead of stranding the retained push.
+    fallback_inflight: HashMap<NodeKey, (u64, u64)>,
     /// Monotonic owner-generation source for `fallback_inflight`.
     fallback_gen: u64,
 }
@@ -1040,6 +1044,14 @@ impl Actor for FleetActor {
                 // CURRENT transport may push. A replaced/disconnected connection's
                 // buffered event is dropped outright — no needs_full either (its data
                 // is the OLD process's; the new admission runs its own connect pull).
+                // ACCEPTED RESIDUAL (r13 #1): a final event buffered when the
+                // connection dies can decode AFTER the close watcher removed the
+                // transport and is rejected here — the disconnected card then
+                // keeps the pre-event snapshot (e.g. `in_flight: 1`) until
+                // reconnect. Deliberate: a disconnected cache is last-known
+                // state by definition (the age chip says so), and accepting
+                // pushes from a REMOVED transport would reopen the r1 stale-
+                // connection hazard this guard exists to close.
                 // The admission must also have DECLARED `fleet_events` (T10 r5): the
                 // capability is the contract that pushes participate in this node's
                 // cache ordering — an undeclared admission stays a pure pull-model
@@ -1097,10 +1109,15 @@ impl Actor for FleetActor {
                                 self.pending_pushes
                                     .insert(node.clone(), (kind, workers, snapshot_seq, pulled_at));
                             }
+                            let pending_seq = self
+                                .pending_pushes
+                                .get(&node)
+                                .map(|(_, _, seq, _)| *seq)
+                                .unwrap_or(snapshot_seq);
                             match self.fallback_inflight.entry(node.clone()) {
                                 std::collections::hash_map::Entry::Vacant(e) => {
                                     self.fallback_gen += 1;
-                                    e.insert(self.fallback_gen);
+                                    e.insert((self.fallback_gen, pending_seq));
                                     PushOutcome::NeedsFull(self.fallback_gen)
                                 }
                                 std::collections::hash_map::Entry::Occupied(_) => {
@@ -1119,7 +1136,10 @@ impl Actor for FleetActor {
                 let _ = reply.send(());
             }
             FleetMsg::FallbackOwner { node, gen, reply } => {
-                let owner = self.fallback_inflight.get(&node) == Some(&gen);
+                let owner = self
+                    .fallback_inflight
+                    .get(&node)
+                    .is_some_and(|(g, _)| *g == gen);
                 let _ = reply.send(owner);
             }
             FleetMsg::FallbackDone {
@@ -1128,22 +1148,36 @@ impl Actor for FleetActor {
                 give_up,
                 reply,
             } => {
-                if self.fallback_inflight.get(&node) != Some(&gen) {
+                let Some(&(cur_gen, served_seq)) = self.fallback_inflight.get(&node) else {
+                    let _ = reply.send(false);
+                    return;
+                };
+                if cur_gen != gen {
                     // Stale owner: the slot was cleared by a re-admission/retire
                     // (and possibly re-claimed by a successor) — exit without
                     // touching it (r6 #2).
                     let _ = reply.send(false);
                     return;
                 }
-                self.fallback_inflight.remove(&node);
-                let retry = !give_up
-                    && !self.inventories.contains_key(&node)
-                    && self.pending_pushes.contains_key(&node)
+                let pending_seq = self.pending_pushes.get(&node).map(|(_, _, s, _)| *s);
+                let live = !self.inventories.contains_key(&node)
+                    && pending_seq.is_some()
                     && self.nodes.contains_key(&node);
+                // A give-up finalizes ONLY if the pending data hasn't advanced past
+                // what this owner set out to serve (r13 #2): fresh events arriving
+                // during the terminal attempt EXTEND the owner (its budget resets)
+                // instead of stranding the retained push. Extension is event-paced
+                // — a permanently failing pull with NO new events still terminates
+                // (r9 #1's bound holds).
+                let extend = give_up && live && pending_seq.is_some_and(|s| s > served_seq);
+                let retry = live && (!give_up || extend);
                 if retry {
-                    // Re-claim the slot (same gen — this owner continues) so
+                    // Keep/renew the slot (same gen — this owner continues) so
                     // racing pushes keep deferring to this caller's retry loop.
-                    self.fallback_inflight.insert(node, gen);
+                    self.fallback_inflight
+                        .insert(node, (gen, pending_seq.unwrap_or(served_seq)));
+                } else {
+                    self.fallback_inflight.remove(&node);
                 }
                 let _ = reply.send(retry);
             }
@@ -1560,17 +1594,23 @@ impl HubFleet {
                     )
                     .await;
                     attempts += 1;
+                    let give_up = attempts >= 5;
                     let retry = fleet
                         .ask(|reply| FleetMsg::FallbackDone {
                             node: node.clone(),
                             gen,
-                            give_up: attempts >= 5,
+                            give_up,
                             reply,
                         })
                         .await
                         .unwrap_or(false);
                     if !retry {
                         return;
+                    }
+                    if give_up {
+                        // Extended (r13 #2): fresh pending data arrived during the
+                        // terminal attempt — a new budget for the new data.
+                        attempts = 0;
                     }
                     drop(fleet); // don't hold the strong ref across the sleep
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
