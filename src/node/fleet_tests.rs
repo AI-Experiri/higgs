@@ -713,6 +713,7 @@ fn inventory_age_is_the_max_of_both_clocks_from_the_pull_start_stamp() {
         chat_refresh_gen: 0,
         software_versions: HashMap::new(),
         event_nodes: std::collections::HashSet::new(),
+        events_tx: tokio::sync::broadcast::channel(8).0,
         versions: HashMap::new(),
         epochs: HashMap::new(),
         bus: Arc::new(crate::log_bus::LogBus::new()),
@@ -752,6 +753,7 @@ fn inventory_age_is_the_max_of_both_clocks_from_the_pull_start_stamp() {
         chat_refresh_gen: 0,
         software_versions: HashMap::new(),
         event_nodes: std::collections::HashSet::new(),
+        events_tx: tokio::sync::broadcast::channel(8).0,
         versions: HashMap::new(),
         epochs: HashMap::new(),
         bus: Arc::new(crate::log_bus::LogBus::new()),
@@ -811,6 +813,7 @@ async fn readmission_strips_the_previous_process_snapshot_seq() {
         chat_refresh_gen: 0,
         software_versions: HashMap::new(),
         event_nodes: std::collections::HashSet::new(),
+        events_tx: tokio::sync::broadcast::channel(8).0,
         versions: HashMap::new(),
         epochs: HashMap::new(),
         bus: Arc::new(crate::log_bus::LogBus::new()),
@@ -864,6 +867,7 @@ async fn older_started_pull_never_overwrites_a_newer_snapshot() {
         chat_refresh_gen: 0,
         software_versions: HashMap::new(),
         event_nodes: std::collections::HashSet::new(),
+        events_tx: tokio::sync::broadcast::channel(8).0,
         versions: HashMap::new(),
         epochs: HashMap::new(),
         bus: Arc::new(crate::log_bus::LogBus::new()),
@@ -1104,6 +1108,7 @@ fn served_ids_are_collision_free_even_when_a_model_name_clashes_with_a_suffix() 
         chat_refresh_gen: 0,
         software_versions: HashMap::new(),
         event_nodes: std::collections::HashSet::new(),
+        events_tx: tokio::sync::broadcast::channel(8).0,
         versions: HashMap::new(),
         epochs: HashMap::new(),
         bus: Arc::new(crate::log_bus::LogBus::new()),
@@ -1302,6 +1307,7 @@ async fn pushed_worker_snapshot_merges_under_the_seq_guard() {
         chat_refresh_gen: 0,
         software_versions: HashMap::new(),
         event_nodes: std::collections::HashSet::new(),
+        events_tx: tokio::sync::broadcast::channel(8).0,
         versions: HashMap::new(),
         epochs: HashMap::new(),
         bus: Arc::new(crate::log_bus::LogBus::new()),
@@ -1351,6 +1357,7 @@ async fn pushed_worker_snapshot_merges_under_the_seq_guard() {
             FleetMsg::CommitWorkers {
                 node: node.to_string(),
                 transport: transport.clone(),
+                kind: crate::remote::FleetEventKind::ChatEnd,
                 workers: vec![worker(in_flight)],
                 snapshot_seq: seq,
                 pulled_at: PulledAt::now(),
@@ -1722,6 +1729,13 @@ async fn stale_pushes_are_silent_and_disconnect_all_announces_drops() {
             reply,
         })
         .await;
+
+    // The seeding commit is itself announced (T10 r3 #1: every committed
+    // pull-style commit emits InventorySynced, atomically, r4 #1).
+    assert_eq!(
+        events.recv().await.unwrap().kind,
+        crate::remote::FleetEventKind::InventorySynced
+    );
 
     // APPLIED push (seq 6 > 5) → exactly one ChatEnd event.
     fleet.apply_node_event(&node_key, push(6), &t).await;

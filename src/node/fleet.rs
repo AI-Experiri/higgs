@@ -251,10 +251,7 @@ enum FleetMsg {
     /// reconnect restores the fleet with its previously-loaded routes intact. Used by the hub
     /// kill switch.
     DisconnectAll {
-        /// The keys whose transports were actually drained — the wrapper emits one
-        /// `NodeDropped` [`FleetEvent`] per key (T10 r2 #5), so event-driven UIs on
-        /// OTHER clients see the kill switch's disconnects without waiting for a poll.
-        reply: oneshot::Sender<Vec<NodeKey>>,
+        reply: oneshot::Sender<()>,
     },
     /// Bump the admission generation and return the NEW value — a fresh generation for an accept
     /// loop about to be spawned (`start_hub`). Invalidates any prior loop's in-flight admissions.
@@ -325,6 +322,10 @@ enum FleetMsg {
         /// freezing out the new process until its counter catches up. (Retire empties
         /// the transport slot, so post-retire pushes are dropped here too.)
         transport: Arc<NodeTransport>,
+        /// The pushed event's kind, re-broadcast (atomically with the merge, T10
+        /// r4 #1) as the public [`FleetEvent`] when — and only when — the merge
+        /// APPLIES (r2 #4).
+        kind: FleetEventKind,
         workers: Vec<InventoryWorker>,
         snapshot_seq: u64,
         /// Dual-clock stamp of the event's RECEIPT (see [`PulledAt`]).
@@ -467,9 +468,24 @@ struct FleetActor {
     /// quick re-enable spawns a fresh loop at a newer gen (the stale task's gen can never match
     /// again). Direct callers (tests) pass `None` to admit unconditionally.
     admit_gen: u64,
+    /// The hub-level [`FleetEvent`] fan-out, cloned from the wrapper (T10 r4 #1):
+    /// EVERY event is emitted HERE, inside the actor handler that performs the
+    /// state change it announces — so the event order equals the state order.
+    /// Wrapper-side emits allowed interleavings like a retire's `NodeDropped`
+    /// landing BEFORE a just-committed pull's `InventorySynced` (a false sync
+    /// after a terminal drop).
+    events_tx: tokio::sync::broadcast::Sender<FleetEvent>,
 }
 
 impl FleetActor {
+    /// Best-effort fleet-event emit (no subscribers ⇒ dropped).
+    fn emit(&self, node: &str, kind: FleetEventKind) {
+        let _ = self.events_tx.send(FleetEvent {
+            endpoint_id: node.to_string(),
+            kind,
+        });
+    }
+
     /// This node's current lifecycle generation (0 if never touched).
     fn epoch(&self, node: &str) -> u64 {
         self.epochs.get(node).copied().unwrap_or(0)
@@ -768,6 +784,10 @@ impl Actor for FleetActor {
                         self.event_nodes.remove(&node);
                     }
                     let replaced = self.nodes.insert(node.clone(), transport);
+                    // Announced HERE, atomic with the insert (T10 r4 #1) — a
+                    // wrapper-side emit could interleave with a racing retire's
+                    // NodeDropped in the wrong order.
+                    self.emit(&node, FleetEventKind::NodeConnected);
                     // The cached INVENTORY is deliberately KEPT across (re)admission
                     // (same last-known-state continuity as across a disconnect), so
                     // for the sub-second window until the post-connect refresh
@@ -793,10 +813,20 @@ impl Actor for FleetActor {
                 reply,
             } => {
                 let removed = self.drop_transport_if(&node, &transport);
+                if removed {
+                    // A REAL disconnect (not a stale watcher's no-op) is an event.
+                    self.emit(&node, FleetEventKind::NodeDropped);
+                }
                 let _ = reply.send(removed);
             }
             FleetMsg::Retire { node, reply } => {
+                // Only a node the fleet actually knew is a drop event — a retire
+                // of an unknown key must not fabricate one.
+                let known = self.node_ids.get(&node).is_some();
                 self.retire(&node);
+                if known {
+                    self.emit(&node, FleetEventKind::NodeDropped);
+                }
                 let _ = reply.send(());
             }
             FleetMsg::DisconnectAll { reply } => {
@@ -809,16 +839,18 @@ impl Actor for FleetActor {
                 // Drain transports (closing each so a wedged-open connection's close-watcher
                 // wakes) but KEEP routes/inventories/node-ids — same "routes survive a dropped
                 // connection" contract as `drop_transport_if`, applied to every node at once.
-                let mut dropped = Vec::with_capacity(self.nodes.len());
-                for (node, t) in self.nodes.drain() {
+                let drained: Vec<(NodeKey, Arc<NodeTransport>)> = self.nodes.drain().collect();
+                for (node, t) in drained {
                     tracing::info!(
                         node,
                         "higgs hub: disabling — node transport closed (route kept)"
                     );
                     t.close();
-                    dropped.push(node);
+                    // The kill switch's disconnects are fleet events too (T10 r2
+                    // #5), emitted atomically with the drain (r4 #1).
+                    self.emit(&node, FleetEventKind::NodeDropped);
                 }
-                let _ = reply.send(dropped);
+                let _ = reply.send(());
             }
             FleetMsg::AddInstance {
                 node,
@@ -871,7 +903,13 @@ impl Actor for FleetActor {
                         }
                     });
                     if newer {
-                        self.inventories.insert(node, (*inventory, pulled_at));
+                        self.inventories
+                            .insert(node.clone(), (*inventory, pulled_at));
+                        // Announced atomically with the commit (T10 r3 #1 / r4 #1):
+                        // the pull is where hub-initiated lifecycle changes land,
+                        // and the node's own (seq-stale) push for the change is
+                        // rightly silenced — this event is the invalidation.
+                        self.emit(&node, FleetEventKind::InventorySynced);
                         let _ = reply.send(true);
                     } else {
                         let _ = reply.send(false);
@@ -887,6 +925,7 @@ impl Actor for FleetActor {
             FleetMsg::CommitWorkers {
                 node,
                 transport,
+                kind,
                 workers,
                 snapshot_seq,
                 pulled_at,
@@ -918,6 +957,7 @@ impl Actor for FleetActor {
                                 cur_inv.workers = workers;
                                 cur_inv.snapshot_seq = Some(snapshot_seq);
                                 *cur_at = pulled_at;
+                                self.emit(&node, kind);
                                 PushOutcome::Applied
                             } else {
                                 PushOutcome::Stale
@@ -998,6 +1038,8 @@ impl HubFleet {
     /// Spawns the actor task — must be called from within a Tokio runtime.
     pub fn new(bus: Arc<LogBus>) -> Self {
         let bus_for_actor = bus.clone();
+        let (events_tx, _) = tokio::sync::broadcast::channel(FLEET_EVENT_CAP);
+        let events_for_actor = events_tx.clone();
         let handle = spawn_actor(FleetActor {
             nodes: HashMap::new(),
             routes: HashMap::new(),
@@ -1011,8 +1053,8 @@ impl HubFleet {
             epochs: HashMap::new(),
             bus: bus_for_actor,
             admit_gen: 0,
+            events_tx: events_for_actor,
         });
-        let (events_tx, _) = tokio::sync::broadcast::channel(FLEET_EVENT_CAP);
         Self {
             handle,
             bus,
@@ -1025,14 +1067,6 @@ impl HubFleet {
     /// change the event announced.
     pub fn subscribe_fleet_events(&self) -> tokio::sync::broadcast::Receiver<FleetEvent> {
         self.events_tx.subscribe()
-    }
-
-    /// Best-effort fleet-event emit (no subscribers ⇒ dropped).
-    fn emit_fleet_event(&self, node: &str, kind: FleetEventKind) {
-        let _ = self.events_tx.send(FleetEvent {
-            endpoint_id: node.to_string(),
-            kind,
-        });
     }
 
     /// Send a message carrying a `reply` and await it; `None` if the actor mailbox is gone
@@ -1108,7 +1142,6 @@ impl HubFleet {
         if let Some(old) = replaced {
             old.close(); // free the old connection + wake its close-watcher
         }
-        self.emit_fleet_event(&node, FleetEventKind::NodeConnected);
         // Read the node's uni-stream notifications for THIS connection — relayed worker
         // stderr into the hub bus, and fleet events (T10) into the inventory cache —
         // until the connection closes (accept_uni errors). Weak: the reader must not
@@ -1256,27 +1289,20 @@ impl HubFleet {
                 detail: format!("M_NODE_INVENTORY reply did not decode: {e}"),
             })?;
         // Commit only if no lifecycle op superseded us (the check+store is one message).
-        let committed = self
-            .ask(|reply| FleetMsg::CommitInventory {
-                node: node.to_string(),
-                epoch_before,
-                inventory: Box::new(inventory.clone()),
-                pulled_at,
-                reply,
-            })
-            .await
-            .unwrap_or(false);
-        // Every COMMITTED pull announces itself (T10 r3 #1/#2): the pull is where a
-        // hub-initiated lifecycle change (load/unload/kill) actually lands in the
-        // cache — the node's own push for that change often arrives with an OLDER
-        // seq and is (correctly) dropped as stale, so without this event other
-        // subscribers would never hear about the change. Emitting on COMMIT only
-        // (not on the RPC's Ok) also keeps a guard-rejected pull silent — e.g. a
-        // retire racing the connect-time pull must not follow its NodeDropped with
-        // a phantom "synced" (the r1 connect-time emit had exactly that hole).
-        if committed {
-            self.emit_fleet_event(node, FleetEventKind::InventorySynced);
-        }
+        // A COMMITTED pull announces InventorySynced from INSIDE the commit handler
+        // (T10 r3 #1/#2, r4 #1): the pull is where hub-initiated lifecycle changes
+        // land (the node's own seq-stale push is rightly silenced), and emitting
+        // atomically with the commit keeps a guard-rejected pull silent AND keeps
+        // event order equal to state order (no InventorySynced after a racing
+        // retire's NodeDropped).
+        self.ask(|reply| FleetMsg::CommitInventory {
+            node: node.to_string(),
+            epoch_before,
+            inventory: Box::new(inventory.clone()),
+            pulled_at,
+            reply,
+        })
+        .await;
         Ok(inventory)
     }
 
@@ -1295,6 +1321,7 @@ impl HubFleet {
             .ask(|reply| FleetMsg::CommitWorkers {
                 node: node.clone(),
                 transport: transport.clone(),
+                kind: ev.kind,
                 workers: ev.workers,
                 snapshot_seq: ev.snapshot_seq,
                 pulled_at: PulledAt::now(),
@@ -1302,17 +1329,22 @@ impl HubFleet {
             })
             .await
             .unwrap_or(PushOutcome::Stale);
-        // Re-broadcast only what actually LANDED (T10 r2 #4): a Stale drop changed
-        // nothing (if the newer state arrived via a pull instead, THAT commit already
-        // announced InventorySynced, r3 #1 — no invalidation is lost by the silence),
-        // and the NeedsFull fallback pull announces its own commit the same way, so
-        // the pushed kind is not re-signalled on top of possibly-uncommitted data.
-        match outcome {
-            PushOutcome::Applied => self.emit_fleet_event(node, ev.kind),
-            PushOutcome::NeedsFull => {
-                let _ = self.refresh_inventory(node).await;
-            }
-            PushOutcome::Stale => {}
+        // The actor announced an APPLIED merge atomically (r4 #1); a Stale drop is
+        // silent (r2 #4 — and if the newer state arrived via a pull instead, THAT
+        // commit already announced InventorySynced, r3 #1). A NeedsFull falls back
+        // to one full pull, spawned DETACHED (r4 #2): this fn runs on the event
+        // stream's reader task, and awaiting the pull inline would head-of-line
+        // block every later push behind a possibly-stuck RPC. Ordering is safe —
+        // the pull's commit is seq-guarded like any other. Residual (documented):
+        // if BOTH this fallback and the connect-time pull fail on a live
+        // connection, the pushed snapshot is lost until the next event or pull —
+        // the same failure domain as the pre-T10 pull-only model.
+        if outcome == PushOutcome::NeedsFull {
+            let fleet = self.clone();
+            let node = node.clone();
+            tokio::spawn(async move {
+                let _ = fleet.refresh_inventory(&node).await;
+            });
         }
     }
 
@@ -1358,18 +1390,12 @@ impl HubFleet {
     /// On connection close, remove ONLY the transport (Arc-identity guarded). Routes are kept
     /// (durable across reconnect); ops return HG027 until the node reconnects.
     async fn drop_transport_if(&self, node: &str, transport: &Arc<NodeTransport>) {
-        let removed = self
-            .ask(|reply| FleetMsg::DropTransportIf {
-                node: node.to_string(),
-                transport: transport.clone(),
-                reply,
-            })
-            .await
-            .unwrap_or(false);
-        if removed {
-            // Only a REAL disconnect (not a stale watcher's no-op) is an event.
-            self.emit_fleet_event(node, FleetEventKind::NodeDropped);
-        }
+        self.ask(|reply| FleetMsg::DropTransportIf {
+            node: node.to_string(),
+            transport: transport.clone(),
+            reply,
+        })
+        .await;
     }
 
     /// Explicitly retire a node: a FULL removal (operator action — the machine is being taken
@@ -1381,7 +1407,6 @@ impl HubFleet {
             reply,
         })
         .await;
-        self.emit_fleet_event(node, FleetEventKind::NodeDropped);
     }
 
     /// Close every node's transport and mark all nodes disconnected, WITHOUT dropping routes,
@@ -1389,16 +1414,7 @@ impl HubFleet {
     /// activity but keeps the route table, so re-enabling is a pure reconnect (previously-loaded
     /// remote routes survive — see `tests/remote_hub_e2e.rs::node_reconnects_and_route_survives`).
     pub async fn disconnect_all(&self) {
-        let dropped = self
-            .ask(|reply| FleetMsg::DisconnectAll { reply })
-            .await
-            .unwrap_or_default();
-        // The kill switch's disconnects are fleet events too (T10 r2 #5) — without
-        // them an event-driven UI on ANOTHER client keeps rendering the nodes as
-        // connected until its fallback poll.
-        for node in dropped {
-            self.emit_fleet_event(&node, FleetEventKind::NodeDropped);
-        }
+        self.ask(|reply| FleetMsg::DisconnectAll { reply }).await;
     }
 
     /// Bump the admission generation and return the fresh value, for an accept loop about to be
