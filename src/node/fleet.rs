@@ -2035,17 +2035,15 @@ impl HubFleet {
         if !routed {
             // The load physically ran, but on a connection that was replaced
             // before the route could install (r18 #1) — reporting success would
-            // hand the caller an unroutable worker. Reconnects reuse the same
-            // NodeRuntime, so that worker stays RESIDENT (r20 #2): reap it
-            // best-effort over the CURRENT transport so a retried load doesn't
-            // duplicate it; if this fails too, the idle reaper collects it.
-            if let Ok(t) = self.transport(node).await {
-                let _ = t
-                    .request(M_NODE_UNLOAD, json!({ "worker_id": worker.0 }))
-                    .await;
-            }
-            // The re-admitted process's connect pull owns the fresh state; the
-            // caller retries the load.
+            // hand the caller an unroutable worker. ACCEPTED RESIDUAL (r20 #2 /
+            // r21): if the SAME daemon reconnected, that worker stays resident
+            // (unrouted, chat-less) until the idle reaper collects it. It must
+            // NOT be reaped by id over the new transport: worker ids restart per
+            // process, so after a real daemon restart the id can name the NEW
+            // process's innocent worker — a safe reap needs the deferred
+            // per-worker generation token on the wire. The re-admitted
+            // process's connect pull owns the fresh state; the caller retries
+            // the load.
             return Err(HiggsError::NodeUnreachable {
                 endpoint_id: node.to_owned(),
                 detail: "node reconnected while the load was in flight; retry the load".into(),
