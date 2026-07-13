@@ -610,7 +610,13 @@ pub async fn serve_node(conn: Connection, rt: std::sync::Arc<crate::node::runtim
         tokio::spawn(handle_node_stream(rt, conn, send, recv));
     }
     // Both relays abort via their drop guards — on this normal exit AND on a
-    // cancelled `serve_node` future alike.
+    // cancelled `serve_node` future alike. The per-stream handlers spawned above
+    // stay DETACHED (pre-T10 design): a cancel during a long chat/pull leaves
+    // that handler holding the connection until it finishes, with the relays
+    // gone (r24 #1) — bounded self-heal: the hub's next control op on the
+    // acceptor-less connection times out and drops the transport (NodeDropped),
+    // restoring pull-model behavior; the daemon never cancels serve_node while
+    // keeping the connection open.
 }
 
 /// Node side: drain the runtime's per-worker log relay onto a uni stream to the hub as
