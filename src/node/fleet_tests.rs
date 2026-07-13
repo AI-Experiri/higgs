@@ -2161,3 +2161,113 @@ async fn fallback_give_up_finalizes_only_without_fresh_pending_data() {
     // And once served (seq unchanged), the next give-up finalizes.
     assert!(!done(gen2, true).await, "give-up after serving finalizes");
 }
+
+/// T10 r22 #1: an event with an UNKNOWN (future) kind still applies its
+/// authoritative worker snapshot — the hub substitutes the generic
+/// InventorySynced invalidation for the kind it can't decode instead of
+/// dropping the data (which would leave the cache stale until another
+/// lifecycle op, since event nodes get no chat-end re-pull).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unknown_event_kind_still_applies_its_snapshot() {
+    use crate::node::write_frame;
+
+    let hub = local_endpoint().await;
+    let node = local_endpoint().await;
+    let (dial, conn) = tokio::join!(node.connect(hub.addr(), ALPN), async {
+        hub.accept().await.expect("incoming").await.expect("conn")
+    });
+    let node_conn = dial.expect("dial");
+    std::mem::forget(hub);
+
+    let t = Arc::new(NodeTransport::new(conn));
+    let fleet = Arc::new(HubFleet::new(Arc::new(crate::log_bus::LogBus::new())));
+    let mut events = fleet.subscribe_fleet_events();
+    let node_key = node.id().to_string();
+    fleet
+        .add_node(node_key.clone(), t.clone(), None, Some(2), None, true)
+        .await;
+    assert_eq!(
+        events.recv().await.unwrap().kind,
+        crate::remote::FleetEventKind::NodeConnected
+    );
+
+    // Seed a cached inventory (seq 1) so the push merges instead of NeedsFull.
+    let epoch = fleet
+        .ask(|reply| FleetMsg::Epoch {
+            node: node_key.clone(),
+            reply,
+        })
+        .await
+        .unwrap_or(0);
+    fleet
+        .ask(|reply| FleetMsg::CommitInventory {
+            node: node_key.clone(),
+            epoch_before: epoch,
+            inventory: Box::new(crate::remote::NodeInventory {
+                hostname: "h".into(),
+                os: "macos".into(),
+                workers: vec![],
+                snapshot_seq: Some(1),
+                hardware: crate::system::HardwareInfo {
+                    cpu_name: String::new(),
+                    arch: String::new(),
+                    cpu_cores: 0,
+                    ram_total_bytes: 0,
+                    ram_used_bytes: 0,
+                    cpu_usage_percent: 0.0,
+                    gpus: vec![],
+                    vram_total_bytes: 0,
+                },
+                runtime: crate::system::RuntimeInfo {
+                    engine: String::new(),
+                    backend: String::new(),
+                    version: String::new(),
+                    binding: String::new(),
+                },
+            }),
+            pulled_at: PulledAt::now(),
+            reply,
+        })
+        .await;
+    assert_eq!(
+        events.recv().await.unwrap().kind,
+        crate::remote::FleetEventKind::InventorySynced
+    );
+
+    // The "node" pushes a FUTURE kind this build doesn't know, on a real uni
+    // stream (the same reader add_node spawned).
+    let mut send = node_conn.open_uni().await.expect("uni");
+    let note = crate::rpc::RpcNotification {
+        jsonrpc: "2.0".into(),
+        method: crate::remote::N_FLEET_EVENT.into(),
+        params: serde_json::json!({
+            "kind": "worker_crashed",
+            "snapshot_seq": 2,
+            "workers": [{ "worker_id": 9, "model": "org/m", "in_flight": 0 }],
+        }),
+    };
+    write_frame(&mut send, &crate::rpc::RpcFrame::Notification(note))
+        .await
+        .expect("push written");
+
+    // The snapshot applied (worker 9 cached) and the generic invalidation fired.
+    let ev = tokio::time::timeout(std::time::Duration::from_secs(10), events.recv())
+        .await
+        .expect("an event within 10s")
+        .unwrap();
+    assert_eq!(ev.kind, crate::remote::FleetEventKind::InventorySynced);
+    let inv = fleet
+        .nodes_view()
+        .await
+        .into_iter()
+        .find(|n| n.endpoint_id == node_key)
+        .and_then(|n| n.inventory)
+        .expect("cached inventory");
+    assert_eq!(inv.snapshot_seq, Some(2));
+    assert_eq!(
+        inv.workers.len(),
+        1,
+        "unknown-kind snapshot applied: {inv:?}"
+    );
+    assert_eq!(inv.workers[0].worker_id, 9);
+}

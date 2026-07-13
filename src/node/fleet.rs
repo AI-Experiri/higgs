@@ -2421,24 +2421,43 @@ async fn read_node_notifications(
                     // The node's push: fold it into the cache (epoch+seq guarded) and
                     // re-broadcast. Awaited IN-ORDER on this stream task — one uni
                     // stream carries all of a connection's events, so a burst can't
-                    // commit out of order hub-side.
-                    let Ok(ev) = serde_json::from_value::<NodeFleetEvent>(n.params) else {
+                    // commit out of order hub-side. Decoded LENIENTLY (r22 #1): the
+                    // snapshot is authoritative regardless of the kind, so an event
+                    // whose kind this build doesn't know (a NEWER node's addition)
+                    // must not lose its worker data — the merge still applies, and
+                    // the re-broadcast substitutes the generic InventorySynced
+                    // invalidation for the unknown kind.
+                    #[derive(serde::Deserialize)]
+                    struct LenientPush {
+                        kind: serde_json::Value,
+                        snapshot_seq: u64,
+                        workers: Vec<InventoryWorker>,
+                    }
+                    let Ok(raw) = serde_json::from_value::<LenientPush>(n.params) else {
                         continue;
                     };
-                    // Node-origin kinds only (T10 r5 #4): the hub-local markers
-                    // (NodeConnected/NodeDropped/InventorySynced) are the HUB's
-                    // statements about connectivity and its own cache — a peer
-                    // must not be able to broadcast a phantom disconnect (or a
-                    // fake sync) by naming one in a push.
-                    if !matches!(
-                        ev.kind,
-                        FleetEventKind::ChatStart
+                    let kind = match serde_json::from_value::<FleetEventKind>(raw.kind) {
+                        // Node-origin kinds only (T10 r5 #4): the hub-local markers
+                        // (NodeConnected/NodeDropped/InventorySynced/HubStateChanged)
+                        // are the HUB's statements about connectivity and its own
+                        // state — a peer must not broadcast a phantom disconnect
+                        // (or a fake sync/toggle) by naming one in a push. A KNOWN
+                        // hub-local kind is a protocol violation → drop the event.
+                        Ok(
+                            k @ (FleetEventKind::ChatStart
                             | FleetEventKind::ChatEnd
                             | FleetEventKind::WorkerLoaded
-                            | FleetEventKind::WorkerUnloaded
-                    ) {
-                        continue;
-                    }
+                            | FleetEventKind::WorkerUnloaded),
+                        ) => k,
+                        Ok(_) => continue,
+                        // Unknown FUTURE kind: keep the data, generify the signal.
+                        Err(_) => FleetEventKind::InventorySynced,
+                    };
+                    let ev = NodeFleetEvent {
+                        kind,
+                        snapshot_seq: raw.snapshot_seq,
+                        workers: raw.workers,
+                    };
                     if let Some(fleet) = fleet.upgrade() {
                         fleet.apply_node_event(&node_key, ev, &transport).await;
                     }
