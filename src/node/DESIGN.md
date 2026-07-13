@@ -104,7 +104,9 @@ mailbox — no mutex, so concurrent ops can't interleave across an `.await`.
 ### `HubFleet` (`fleet.rs`)
 
 Private state = `nodes` (connected → transport), `routes` (`(node, worker) → raw model`),
-`node_ids`, `inventories`, `epochs`, `admit_gen` — all behind one mailbox. This dissolved the
+`node_ids`, `inventories` (+ dual `PulledAt` freshness stamps), `versions`/`software_versions`
+(T14), `event_nodes`/`pending_pushes`/`fallback_inflight` and the `FleetEvent` sender (T10),
+`epochs`, `admit_gen` — all behind one mailbox. This dissolved the
 old 7-mutex TOCTOU class: compound transitions (`AdmitNode`, `RemoveInstanceIf`,
 `CommitInventory`, `Retire`, `DisconnectAll`) are each ONE message, applied all-or-nothing, and
 the cross-map `nodes_view` snapshot is atomic. Slow iroh RPCs run in the async wrapper methods
@@ -126,7 +128,59 @@ reconnects, so its workers/ids persist. Instance routes survive a dropped connec
 per-connection transport comes and goes (`drop_transport_if`, Arc-identity guarded so a stale
 close-watcher can't drop a freshly reconnected transport). A genuine node-process restart leaves
 stale routes that self-heal on the first worker-gone error (`route_invalidating`: HG006/HG007/
-HG018 → instance dropped).
+HG018 → instance dropped). Since T10, an APPLIED push or seq-ordered pull whose snapshot no
+longer contains a routed worker also drops that route proactively (see below).
+
+## Live fleet events (T10)
+
+The pull model (connect / lifecycle / debounced chat-end re-pulls) is replaced, for capable
+nodes, by node PUSH: every worker-state change on the node actor (chat start/end via
+`ChatHandle`/`ChatEnd`, `LoadCommit`, `Unload`/`Kill`, the idle-reap sweep) emits a
+`NodeFleetEvent { kind, snapshot_seq, workers }` — the FULL worker snapshot, sequenced by the
+SAME actor counter as `Inventory` pulls, so pushes and pulls are totally ordered by node data
+order. `serve_node` relays them on a dedicated uni stream (`N_FLEET_EVENT`; in-order by
+construction); the `fleet_events` HELLO capability advertises it (additive, no protocol bump).
+
+**Hub-side guard stack**, in order, all inside the `CommitWorkers` actor handler:
+
+1. **Capability** — pushes are accepted only from an admission that DECLARED `fleet_events`
+   (an undeclared admission stays a pure pull-model node; mixing freshness models on one
+   cache made the T14 age tests flake).
+2. **Transport identity (CAS)** — only the node's CURRENT transport may push; a buffered
+   event from a replaced connection is dropped (its high seq would otherwise freeze out a
+   restarted process whose counter restarted).
+3. **Kind allowlist + lenient decode** — node-origin kinds only (`ChatStart`/`ChatEnd`/
+   `WorkerLoaded`/`WorkerUnloaded`/`Resync`); a KNOWN hub-local kind off the wire is a
+   protocol violation (no phantom `NodeDropped`), while an UNKNOWN future kind still applies
+   its snapshot and re-broadcasts as the generic `InventorySynced`.
+4. **Seq ordering** — newer-seq wins; the receive-stamp fallback exists only for seq-less
+   caches (legacy pairs, post-re-admission strips) and NEVER reconciles routes (cross-process
+   diffs could delete a just-installed route for a reused worker id).
+5. **Route reconciliation** — under seq order, a worker present in the old snapshot but
+   absent from the new one is really gone: its route drops with the merge (CAS'd on the old
+   model, no epoch bump — commit-derived removals must not invalidate concurrent higher-seq
+   pulls).
+
+**Cache-less pushes** (the event outran the connect pull) are RETAINED (`pending_pushes`,
+newest seq wins) and replayed on top of the next committed pull when newer; ONE
+generation-tokened fallback pull runs per node (150 s hard bound, pre-pull ownership check,
+5 retries with give-up that extends only for fresh pending data, Weak fleet ref) — further
+cache-less pushes defer to it.
+
+**Every `FleetEvent` emit lives inside the actor handler that performs the state change**
+(admit → `NodeConnected`; drop/retire/kill-switch drain → `NodeDropped`; committed pull /
+route install / seq-ordered reconciliation → `InventorySynced`; applied push → its kind;
+hub enable/disable → `HubStateChanged`, emitted AFTER the state publishes), so subscribers
+can never observe an event ordering that contradicts state order. Events are invalidation
+signals, not data carriers — consumers re-read `nodes_view`.
+
+**Relay robustness** (`relay_fleet_events`): subscribes in `serve_node` BEFORE the accept
+loop (no first-event loss window); survives stream-level failures by watching
+`send.stopped()` while idle and reopening; recovery emits a FRESH `Resync` snapshot via
+`FleetResnapshot` rather than resending the stale event (frozen `idle_ms` must never be
+re-stamped fresh at the hub — receipt-time stamping errs fresh-ward only by healthy-stream
+transit, documented); both relays are `AbortOnDrop`-guarded so a cancelled `serve_node`
+cannot leak them.
 
 ### Pairing-lock two-phase gate (`mod.rs`, `hub.rs`)
 
@@ -215,7 +269,17 @@ through via `worker_origin_code_data`, they are not owned here):
 - **Per-worker generation token** (`RemoveInstanceIf` residual): a node PROCESS restart that reuses
   the exact same worker id for the SAME model could in principle let a stale invalidation drop the
   new instance. Not readily reachable (the restart drops the transport first → `WorkerDead`, and
-  unload/kill re-resolve per call); a full fix needs a per-worker gen token on the wire.
+  unload/kill re-resolve per call); a full fix needs a per-worker gen token on the wire. The same
+  missing token is the root of the T10 route/identity residuals below.
+- **T10 accepted residuals** (each documented at its site in `fleet.rs`/`mod.rs`): ms-scale
+  push freshness understatement on a healthy stream (receipt-time stamps); stale hardware
+  readings under a fresh worker stamp on a chatty never-re-pulled node; a final event buffered
+  across a disconnect is dropped (disconnected cache = last-known state; accepting it would
+  reopen the stale-connection hazard); a route whose worker never entered the cache can still
+  go stale (pre-T10 HG007 self-heal contract); a CAS-refused load's same-daemon orphan worker
+  waits for the idle reaper (reap-by-id is unsafe across process restarts); a `serve_node`
+  cancelled mid-stream leaves detached handlers until the hub's next timed-out op drops the
+  transport.
 - **`is_remote` breadth**: intentionally counts a served id whose node is currently DISCONNECTED
   (routes outlive a transport drop) so a chat yields the accurate HG027 (host offline → reconnect)
   rather than HG002. Accepted residual: a stale route to an offline node shadows a same-named

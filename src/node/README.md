@@ -16,10 +16,10 @@ full spec.
 
 | File | Responsibility |
 |---|---|
-| `mod.rs` | **Not a barrel** — it declares the child modules AND owns the live-iroh handshake surface: `HELLO_DEADLINE`, `HubIdentity`, `GateOutcome`, the two-phase hub gate (`gate_read_hello` lock-free + `gate_admit` locked, wrapped by `gate_connection`), the node dialers (`connect_node`, `dial_and_hello`, `send_leave`), the persistent node serve loop (`serve_node` → `handle_node_stream` + `relay_worker_logs`), and the shared frame helpers (`write_frame`, `worker_origin_code_data`, `close_after_reject`). |
-| `runtime.rs` | `NodeRuntime` — the net-new multi-worker orchestrator, an **actor** (private `WorkerRegistry<Arc<Supervisor>>`, no mutex). Lifecycle (`load`/`unload`/`kill`/`status`/`scan`/`sysinfo`/`inventory`), idle auto-unload reaper (`IdleConfig`), lease-based chat (`ChatLease`), cancellation-safe teardown (`StopOnDrop` + tracked `reap` + `shutdown_all`), log + lifecycle-event fan-out. |
+| `mod.rs` | **Not a barrel** — it declares the child modules AND owns the live-iroh handshake surface: `HELLO_DEADLINE`, `HubIdentity`, `GateOutcome`, the two-phase hub gate (`gate_read_hello` lock-free + `gate_admit` locked, wrapped by `gate_connection`), the node dialers (`connect_node`, `dial_and_hello`, `send_leave`), the persistent node serve loop (`serve_node` → `handle_node_stream` + the `AbortOnDrop`-guarded `relay_worker_logs` / `relay_fleet_events` uni-stream relays), and the shared frame helpers (`write_frame`, `worker_origin_code_data`, `close_after_reject`). |
+| `runtime.rs` | `NodeRuntime` — the net-new multi-worker orchestrator, an **actor** (private `WorkerRegistry<Arc<Supervisor>>`, no mutex). Lifecycle (`load`/`unload`/`kill`/`status`/`scan`/`sysinfo`/`inventory`), idle auto-unload reaper (`IdleConfig`), lease-based chat (`ChatLease`), cancellation-safe teardown (`StopOnDrop` + tracked `reap` + `shutdown_all`), log + lifecycle-event fan-out, and the T10 fleet-event fan-out: every worker-state change (chat start/end, load, unload, reap) emits a `NodeFleetEvent` carrying the full worker snapshot, sequenced by the actor's `snapshot_seq` (shared with `Inventory` pulls, so mailbox order IS data order); `FleetResnapshot` re-emits a fresh `Resync` snapshot for the relay's stream-failure recovery. |
 | `hub.rs` | Production hub listener: `start_hub` binds the endpoint, seeds/reuses the `HubFleet`, spawns `spawn_accept_loop` (gates each dial, registers admitted nodes), and returns the live `Hub` (mint pairings, `retire`/`set_label`/`labels`, `shutdown`). Also `serve_node_requests` (hub side of node self-`leave`). |
-| `fleet.rs` | `HubFleet` — the hub's fleet read-model + `model→(node,worker)` routing table, an **actor** (was 7 mutexes). Node admission/retire, durable instance routes, per-node epochs, served-id derivation, the atomic `nodes_view`, and the remote ops `scan_node`/`load`/`unload`/`kill`/`chat`/`refresh_inventory`. `NodeView` is the ts-rs UI wire type. |
+| `fleet.rs` | `HubFleet` — the hub's fleet read-model + `model→(node,worker)` routing table, an **actor** (was 7 mutexes). Node admission/retire, durable instance routes, per-node epochs, served-id derivation, the atomic `nodes_view`, the remote ops `scan_node`/`load`/`unload`/`kill`/`chat`/`refresh_inventory`, and the T10 event side: `read_node_notifications` folds node-pushed `N_FLEET_EVENT`s into the inventory cache (seq/transport/capability guarded, with pending-push retention + one bounded fallback pull) and re-broadcasts `FleetEvent`s — every emit happens INSIDE the actor handler that performs the state change, so event order equals state order. `NodeView`/`FleetEvent` are the ts-rs UI wire types. |
 | `transport.rs` | `NodeTransport` — hub-side per-node client over one live iroh `Connection`: `request()` (one `higgs/node/*` control RPC per bidi stream) and `chat()` (relay `M_CHAT`, stream `N_CHAT_CHUNK` + final). One stream per call is the demux. |
 | `data.rs` | Node-side DATA relay: `relay_chat` bridges a hub chat stream to `Supervisor::chat()` (via a `ChatLease`), `relay_pull` downloads a GGUF (`M_NODE_PULL`) streaming `N_PROGRESS`. Single writer per stream; cancelled on connection/stream drop. |
 | `control.rs` | Node-side CONTROL dispatch: `dispatch_node_control` maps a `higgs/node/*` request to a `NodeRuntime` op and builds the JSON-RPC reply (carrying the origin HG code in `data`). |
@@ -51,7 +51,9 @@ rule in `../../CLAUDE.md`).
   outright [HG076], and the pin rides the same
   resolution that picks the transport so a concurrently re-homed id is refused
   [HG077], never mis-attested); `disconnect_all()` ← `hub_disable()` (kill
-  switch). `NodeView` derives ts-rs bindings.
+  switch); `subscribe_fleet_events()` ← `Higgs::subscribe_fleet_events()` (the live fleet-event
+  broadcast the embedder's UI lane forwards — see "Live fleet events" below). `NodeView` and
+  `FleetEvent` derive ts-rs bindings.
 - **`runtime::{NodeRuntime, NodeConfig, IdleConfig, DEFAULT_IDLE_TTL}`** — the node daemon owns a
   `NodeRuntime`; the local single-machine engine also uses it as its own multi-worker orchestrator
   (`instances()` feeds served-id derivation, `events()`/`subscribe_logs()`/`bus()` feed the SSE +
@@ -61,6 +63,19 @@ rule in `../../CLAUDE.md`).
   GateOutcome, HELLO_DEADLINE}`** — the transport handshake, used by `cli.rs` and `hub.rs`.
 - **`identity::{load_or_create_secret, bind_endpoint}`**, **`node_id::{NodeId, NodeIdAllocator}`**,
   **`worker_id::{WorkerId, WorkerRegistry}`** — the identity/id primitives.
+
+## Live fleet events (T10)
+
+A node whose HELLO advertises the `fleet_events` capability PUSHES its worker-state changes
+instead of waiting to be polled: each change emits an `N_FLEET_EVENT` notification (kind +
+full worker snapshot + actor `snapshot_seq`) on a dedicated uni stream. The hub merges the
+snapshot into its inventory cache under the same seq ordering as pulls and re-broadcasts a
+`FleetEvent {endpoint_id, kind}` — a pure invalidation signal (subscribers re-read
+`nodes_view`). Hub-local kinds (`NodeConnected`/`NodeDropped`/`InventorySynced`/
+`HubStateChanged`) announce admissions, drops, committed pulls, route changes, and the kill
+switch; the chat-end debounced re-pull survives only as the legacy fallback for admissions
+that did not declare the capability. See `DESIGN.md` § "Live fleet events" for the guard
+stack and residuals.
 
 ## Auth (two surfaces)
 
