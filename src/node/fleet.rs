@@ -153,9 +153,10 @@ enum PushOutcome {
     /// Dropped: stale connection, or not newer than the cached snapshot.
     Stale,
     /// No cached inventory to merge into — the caller runs the (single,
-    /// coalesced) full-inventory fallback pull. The push itself was RETAINED
-    /// for replay on the next committed pull (T10 r5 #1).
-    NeedsFull,
+    /// coalesced) full-inventory fallback pull, identified by this owner
+    /// generation (r6 #2). The push itself was RETAINED for replay on the
+    /// next committed pull (T10 r5 #1).
+    NeedsFull(u64),
     /// Retained like `NeedsFull`, but a fallback pull is already in flight —
     /// the caller spawns nothing (T10 r5 #2).
     Deferred,
@@ -344,6 +345,9 @@ enum FleetMsg {
     /// strand the pending push until the next lifecycle op (T10 r5 #2).
     FallbackDone {
         node: NodeKey,
+        /// The owner generation from `PushOutcome::NeedsFull` — a stale owner
+        /// (slot cleared/re-claimed since) gets `false` and exits (r6 #2).
+        gen: u64,
         reply: oneshot::Sender<bool>,
     },
     /// Does this node push `N_FLEET_EVENT`s (its HELLO advertised `fleet_events`)?
@@ -497,11 +501,17 @@ struct FleetActor {
     /// (e.g. an idle-reaped worker), with no watermark left to reject it.
     /// Cleared per (re)admission and at retire (a new process's data order).
     pending_pushes: HashMap<NodeKey, (FleetEventKind, Vec<InventoryWorker>, u64, PulledAt)>,
-    /// Nodes with a NeedsFull fallback pull IN FLIGHT (T10 r5 #2): further
+    /// Nodes with a NeedsFull fallback pull IN FLIGHT (T10 r5 #2), keyed by an
+    /// OWNER GENERATION (r6 #2, same pattern as `chat_refreshes`): further
     /// cache-less pushes update `pending_pushes` but spawn NO additional pull —
     /// each pull runs a hardware probe on the node, so per-event spawning under
-    /// an event burst would pile up control streams and probe processes.
-    fallback_inflight: HashSet<NodeKey>,
+    /// an event burst would pile up control streams and probe processes. The
+    /// generation stops a STALE owner (its slot cleared by a re-admission, and
+    /// possibly re-claimed by the new connection's own fallback) from removing
+    /// or retrying against the successor's slot.
+    fallback_inflight: HashMap<NodeKey, u64>,
+    /// Monotonic owner-generation source for `fallback_inflight`.
+    fallback_gen: u64,
 }
 
 impl FleetActor {
@@ -1047,25 +1057,37 @@ impl Actor for FleetActor {
                                 self.pending_pushes
                                     .insert(node.clone(), (kind, workers, snapshot_seq, pulled_at));
                             }
-                            if self.fallback_inflight.insert(node.clone()) {
-                                PushOutcome::NeedsFull
-                            } else {
-                                PushOutcome::Deferred
+                            match self.fallback_inflight.entry(node.clone()) {
+                                std::collections::hash_map::Entry::Vacant(e) => {
+                                    self.fallback_gen += 1;
+                                    e.insert(self.fallback_gen);
+                                    PushOutcome::NeedsFull(self.fallback_gen)
+                                }
+                                std::collections::hash_map::Entry::Occupied(_) => {
+                                    PushOutcome::Deferred
+                                }
                             }
                         }
                     }
                 };
                 let _ = reply.send(outcome);
             }
-            FleetMsg::FallbackDone { node, reply } => {
+            FleetMsg::FallbackDone { node, gen, reply } => {
+                if self.fallback_inflight.get(&node) != Some(&gen) {
+                    // Stale owner: the slot was cleared by a re-admission/retire
+                    // (and possibly re-claimed by a successor) — exit without
+                    // touching it (r6 #2).
+                    let _ = reply.send(false);
+                    return;
+                }
                 self.fallback_inflight.remove(&node);
                 let retry = !self.inventories.contains_key(&node)
                     && self.pending_pushes.contains_key(&node)
                     && self.nodes.contains_key(&node);
                 if retry {
-                    // Re-claim the slot so racing pushes keep deferring to this
-                    // caller's retry loop.
-                    self.fallback_inflight.insert(node);
+                    // Re-claim the slot (same gen — this owner continues) so
+                    // racing pushes keep deferring to this caller's retry loop.
+                    self.fallback_inflight.insert(node, gen);
                 }
                 let _ = reply.send(retry);
             }
@@ -1153,7 +1175,8 @@ impl HubFleet {
             admit_gen: 0,
             events_tx: events_for_actor,
             pending_pushes: HashMap::new(),
-            fallback_inflight: HashSet::new(),
+            fallback_inflight: HashMap::new(),
+            fallback_gen: 0,
         });
         Self {
             handle,
@@ -1440,15 +1463,25 @@ impl HubFleet {
         // is seq-guarded, and the retained push replays on top when newer. On
         // failure the actor grants ONE paced retry at a time while the node stays
         // connected and the push is still waiting.
-        if outcome == PushOutcome::NeedsFull {
+        if let PushOutcome::NeedsFull(gen) = outcome {
             let fleet = self.clone();
             let node = node.clone();
             tokio::spawn(async move {
                 loop {
-                    let _ = fleet.refresh_inventory(&node).await;
+                    // Hard bound (r6 #1, same 150 s rationale as the chat-refresh
+                    // owner's): the control-plane request timeout starts only
+                    // AFTER open_bi succeeds, so a node out of bidi credit (with
+                    // its uni event stream healthy) would otherwise pin this
+                    // owner — and with it the coalescing slot — forever.
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(150),
+                        fleet.refresh_inventory(&node),
+                    )
+                    .await;
                     let retry = fleet
                         .ask(|reply| FleetMsg::FallbackDone {
                             node: node.clone(),
+                            gen,
                             reply,
                         })
                         .await

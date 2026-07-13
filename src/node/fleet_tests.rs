@@ -715,7 +715,8 @@ fn inventory_age_is_the_max_of_both_clocks_from_the_pull_start_stamp() {
         event_nodes: std::collections::HashSet::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
-        fallback_inflight: std::collections::HashSet::new(),
+        fallback_inflight: HashMap::new(),
+        fallback_gen: 0,
         versions: HashMap::new(),
         epochs: HashMap::new(),
         bus: Arc::new(crate::log_bus::LogBus::new()),
@@ -757,7 +758,8 @@ fn inventory_age_is_the_max_of_both_clocks_from_the_pull_start_stamp() {
         event_nodes: std::collections::HashSet::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
-        fallback_inflight: std::collections::HashSet::new(),
+        fallback_inflight: HashMap::new(),
+        fallback_gen: 0,
         versions: HashMap::new(),
         epochs: HashMap::new(),
         bus: Arc::new(crate::log_bus::LogBus::new()),
@@ -819,7 +821,8 @@ async fn readmission_strips_the_previous_process_snapshot_seq() {
         event_nodes: std::collections::HashSet::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
-        fallback_inflight: std::collections::HashSet::new(),
+        fallback_inflight: HashMap::new(),
+        fallback_gen: 0,
         versions: HashMap::new(),
         epochs: HashMap::new(),
         bus: Arc::new(crate::log_bus::LogBus::new()),
@@ -875,7 +878,8 @@ async fn older_started_pull_never_overwrites_a_newer_snapshot() {
         event_nodes: std::collections::HashSet::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
-        fallback_inflight: std::collections::HashSet::new(),
+        fallback_inflight: HashMap::new(),
+        fallback_gen: 0,
         versions: HashMap::new(),
         epochs: HashMap::new(),
         bus: Arc::new(crate::log_bus::LogBus::new()),
@@ -1118,7 +1122,8 @@ fn served_ids_are_collision_free_even_when_a_model_name_clashes_with_a_suffix() 
         event_nodes: std::collections::HashSet::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
-        fallback_inflight: std::collections::HashSet::new(),
+        fallback_inflight: HashMap::new(),
+        fallback_gen: 0,
         versions: HashMap::new(),
         epochs: HashMap::new(),
         bus: Arc::new(crate::log_bus::LogBus::new()),
@@ -1319,7 +1324,8 @@ async fn pushed_worker_snapshot_merges_under_the_seq_guard() {
         event_nodes: std::collections::HashSet::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
-        fallback_inflight: std::collections::HashSet::new(),
+        fallback_inflight: HashMap::new(),
+        fallback_gen: 0,
         versions: HashMap::new(),
         epochs: HashMap::new(),
         bus: Arc::new(crate::log_bus::LogBus::new()),
@@ -1383,7 +1389,7 @@ async fn pushed_worker_snapshot_merges_under_the_seq_guard() {
     // No cached inventory yet: the push reports NeedsFull — nothing fabricated.
     let (msg, rx) = commit_workers("nodeA", 1, 0);
     actor.handle(msg).await;
-    assert_eq!(rx.await.unwrap(), PushOutcome::NeedsFull);
+    assert!(matches!(rx.await.unwrap(), PushOutcome::NeedsFull(_)));
     assert!(actor.nodes_view()[0].inventory.is_none());
 
     // Seed the cache like a pull would (seq 5, empty workers).
@@ -1803,7 +1809,8 @@ async fn a_pre_cache_push_is_retained_and_replayed_over_an_older_pull() {
         event_nodes: std::collections::HashSet::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
-        fallback_inflight: std::collections::HashSet::new(),
+        fallback_inflight: HashMap::new(),
+        fallback_gen: 0,
         versions: HashMap::new(),
         epochs: HashMap::new(),
         bus: Arc::new(crate::log_bus::LogBus::new()),
@@ -1831,7 +1838,7 @@ async fn a_pre_cache_push_is_retained_and_replayed_over_an_older_pull() {
     // First cache-less push: retained, owns the one fallback pull.
     let (msg, rx) = push(7);
     actor.handle(msg).await;
-    assert_eq!(rx.await.unwrap(), PushOutcome::NeedsFull);
+    assert!(matches!(rx.await.unwrap(), PushOutcome::NeedsFull(_)));
     // Second cache-less push while the fallback is in flight: coalesced.
     let (msg, rx) = push(8);
     actor.handle(msg).await;
