@@ -213,6 +213,9 @@ impl Higgs {
             Ok(hub) => {
                 let hub = std::sync::Arc::new(hub);
                 self.set_fleet(hub.fleet.clone());
+                // Announce the toggle (T10 r11 #2) — subscribers on OTHER clients
+                // re-read the hub status; with zero nodes nothing else would fire.
+                hub.fleet.announce_hub_state().await;
                 self.set_hub(hub);
                 tracing::warn!("higgs: hub ENABLED");
                 Ok(crate::serve::control::hub_status(self).await)
@@ -236,6 +239,9 @@ impl Higgs {
             hub.shutdown().await;
             if let Some(fleet) = self.fleet() {
                 fleet.disconnect_all().await;
+                // Fleet-visible even with zero nodes (T10 r11 #2): another
+                // client's live view must hear the toggle.
+                fleet.announce_hub_state().await;
             }
             tracing::warn!("higgs: hub DISABLED (network off; routes kept)");
         }

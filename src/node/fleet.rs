@@ -343,6 +343,14 @@ enum FleetMsg {
     /// left no cached inventory, a retained push is still waiting, and the node
     /// is still connected) — without the retry a single failed fallback would
     /// strand the pending push until the next lifecycle op (T10 r5 #2).
+    /// Emit a hub-local [`FleetEventKind::HubStateChanged`] (r11 #2): the kill
+    /// switch's enable/disable is fleet-visible state a SECOND client's view
+    /// must hear about — with zero connected nodes a toggle otherwise emits
+    /// nothing at all. Routed through the actor so it stays ordered with the
+    /// per-node NodeDropped events a disable also emits.
+    AnnounceHubState {
+        reply: oneshot::Sender<()>,
+    },
     /// Pre-pull ownership check for the fallback loop (r8, mirroring
     /// `ChatRefreshOwner`): is `gen` still the slot's owner? A re-admission
     /// clears the slot while a detached owner may be pre-pull or mid-sleep —
@@ -360,17 +368,15 @@ enum FleetMsg {
         /// The owner generation from `PushOutcome::NeedsFull` — a stale owner
         /// (slot cleared/re-claimed since) gets `false` and exits (r6 #2).
         gen: u64,
+        /// The owner exhausted its retry budget (r9 #1): release the slot with
+        /// NO retry grant, so a node persistently returning malformed inventory
+        /// cannot pin an immortal 1 Hz probe loop. Give-up is decided IN THIS
+        /// message (r11 #1 — a separate abandon message raced fresh pushes) and
+        /// the retained push is NEVER deleted: a later event claims a fresh
+        /// owner (Vacant slot ⇒ NeedsFull), and any later committed pull still
+        /// replays the retained data — recovery is event-paced, not lost.
+        give_up: bool,
         reply: oneshot::Sender<bool>,
-    },
-    /// The fallback owner exhausted its retry budget (r9 #1): clear the slot
-    /// AND the retained push, so a node persistently returning malformed
-    /// inventory cannot pin an immortal 1 Hz probe loop. The NEXT event from
-    /// the node re-seeds the pending push and claims a fresh owner — recovery
-    /// stays event-paced instead of timer-paced.
-    FallbackAbandon {
-        node: NodeKey,
-        gen: u64,
-        reply: oneshot::Sender<()>,
     },
     /// Does this node push `N_FLEET_EVENT`s (its HELLO advertised `fleet_events`)?
     NodePushesEvents {
@@ -1106,18 +1112,22 @@ impl Actor for FleetActor {
                 };
                 let _ = reply.send(outcome);
             }
+            FleetMsg::AnnounceHubState { reply } => {
+                // No single node: the marker carries an empty endpoint id — it is
+                // a whole-fleet invalidation, and subscribers re-read the view.
+                self.emit("", FleetEventKind::HubStateChanged);
+                let _ = reply.send(());
+            }
             FleetMsg::FallbackOwner { node, gen, reply } => {
                 let owner = self.fallback_inflight.get(&node) == Some(&gen);
                 let _ = reply.send(owner);
             }
-            FleetMsg::FallbackAbandon { node, gen, reply } => {
-                if self.fallback_inflight.get(&node) == Some(&gen) {
-                    self.fallback_inflight.remove(&node);
-                    self.pending_pushes.remove(&node);
-                }
-                let _ = reply.send(());
-            }
-            FleetMsg::FallbackDone { node, gen, reply } => {
+            FleetMsg::FallbackDone {
+                node,
+                gen,
+                give_up,
+                reply,
+            } => {
                 if self.fallback_inflight.get(&node) != Some(&gen) {
                     // Stale owner: the slot was cleared by a re-admission/retire
                     // (and possibly re-claimed by a successor) — exit without
@@ -1126,7 +1136,8 @@ impl Actor for FleetActor {
                     return;
                 }
                 self.fallback_inflight.remove(&node);
-                let retry = !self.inventories.contains_key(&node)
+                let retry = !give_up
+                    && !self.inventories.contains_key(&node)
                     && self.pending_pushes.contains_key(&node)
                     && self.nodes.contains_key(&node);
                 if retry {
@@ -1548,26 +1559,17 @@ impl HubFleet {
                         fleet.refresh_inventory(&node),
                     )
                     .await;
+                    attempts += 1;
                     let retry = fleet
                         .ask(|reply| FleetMsg::FallbackDone {
                             node: node.clone(),
                             gen,
+                            give_up: attempts >= 5,
                             reply,
                         })
                         .await
                         .unwrap_or(false);
                     if !retry {
-                        return;
-                    }
-                    attempts += 1;
-                    if attempts >= 5 {
-                        fleet
-                            .ask(|reply| FleetMsg::FallbackAbandon {
-                                node: node.clone(),
-                                gen,
-                                reply,
-                            })
-                            .await;
                         return;
                     }
                     drop(fleet); // don't hold the strong ref across the sleep
@@ -1644,6 +1646,13 @@ impl HubFleet {
     /// remote routes survive — see `tests/remote_hub_e2e.rs::node_reconnects_and_route_survives`).
     pub async fn disconnect_all(&self) {
         self.ask(|reply| FleetMsg::DisconnectAll { reply }).await;
+    }
+
+    /// Announce a hub enable/disable to fleet-event subscribers (T10 r11 #2) —
+    /// the kill switch is fleet state a second client's live view must hear
+    /// about even when no node is connected to emit anything else.
+    pub async fn announce_hub_state(&self) {
+        self.ask(|reply| FleetMsg::AnnounceHubState { reply }).await;
     }
 
     /// Bump the admission generation and return the fresh value, for an accept loop about to be

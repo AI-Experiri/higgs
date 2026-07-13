@@ -367,6 +367,10 @@ higgs_const_enum! {
         WorkerLoaded,
         /// A worker was unloaded/killed/idle-reaped and is gone.
         WorkerUnloaded,
+        /// Hub-local (never on the node wire): the hub's fleet networking was
+        /// enabled or disabled (the kill switch, T10 r11). Carried with an EMPTY
+        /// `endpoint_id` — a whole-fleet invalidation, not a per-node one.
+        HubStateChanged,
         /// Hub-local (never on the node wire): the node's connection was admitted.
         /// Fires BEFORE the connect-time inventory pull — the cache still shows the
         /// pre-connect state (or nothing); [`FleetEventKind::InventorySynced`] follows
