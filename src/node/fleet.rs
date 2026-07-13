@@ -924,7 +924,14 @@ impl Actor for FleetActor {
                 model,
                 reply,
             } => {
-                self.routes.insert((node, worker), model);
+                self.routes.insert((node.clone(), worker), model);
+                // A route install is hub-visible node state (the worker's served id
+                // appears) — announce it atomically (T10 r10): the load's follow-up
+                // inventory refresh also announces on commit, but that pull is
+                // best-effort, and without this an event-only subscriber that saw
+                // the WorkerLoaded push race ahead of the route would keep a
+                // served_id-less worker forever if the pull failed.
+                self.emit(&node, FleetEventKind::InventorySynced);
                 let _ = reply.send(());
             }
             FleetMsg::RemoveInstanceIf {
@@ -933,7 +940,12 @@ impl Actor for FleetActor {
                 expected_model,
                 reply,
             } => {
+                let had_route = self.routes.contains_key(&(node.clone(), worker));
                 self.remove_instance_if(&node, worker, &expected_model);
+                // Announce an ACTUAL route drop (same rationale as AddInstance).
+                if had_route && !self.routes.contains_key(&(node.clone(), worker)) {
+                    self.emit(&node, FleetEventKind::InventorySynced);
+                }
                 let _ = reply.send(());
             }
             FleetMsg::CommitInventory {

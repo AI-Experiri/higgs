@@ -372,9 +372,11 @@ higgs_const_enum! {
         /// pre-connect state (or nothing); [`FleetEventKind::InventorySynced`] follows
         /// once the pull commits.
         NodeConnected,
-        /// Hub-local (never on the node wire): the connect-time inventory pull for a
-        /// just-admitted node committed — the cache now shows the NEW process's state
-        /// (T10 r1). Subscribers that refreshed on `NodeConnected` re-read here.
+        /// Hub-local (never on the node wire): the hub's own view of this node
+        /// changed — an inventory pull COMMITTED (connect-time or lifecycle; the
+        /// cache now shows the node's current state, T10 r1/r3), or the hub's
+        /// routing table for the node changed (a served id appeared/disappeared,
+        /// r10). Subscribers re-read the fleet view on receipt.
         InventorySynced,
         /// Hub-local (never on the node wire): the node retired or its connection dropped.
         NodeDropped,
