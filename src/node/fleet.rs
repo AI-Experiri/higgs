@@ -276,9 +276,11 @@ enum FleetMsg {
         /// the route installs only while this is still the node's CURRENT
         /// transport — a load completing after a re-admission otherwise installs
         /// a phantom route into the NEW process (callable until a chat fails
-        /// HG007/HG018; pulls never remove routes).
+        /// HG007/HG018; pulls never recreate routes).
         transport: Arc<NodeTransport>,
-        reply: oneshot::Sender<()>,
+        /// `false` = refused (stale transport) — the caller must NOT report the
+        /// load as routed (r18 #1).
+        reply: oneshot::Sender<bool>,
     },
     /// CAS instance-drop: remove `(node, worker)` only if it STILL serves `expected_model`
     /// (guards against a node restart reusing the id for a DIFFERENT model). On removal also
@@ -949,7 +951,7 @@ impl Actor for FleetActor {
                     // Stale load completion (see the variant doc): the worker
                     // belongs to a connection that was replaced — no route, no
                     // event.
-                    let _ = reply.send(());
+                    let _ = reply.send(false);
                     return;
                 }
                 self.routes.insert((node.clone(), worker), model);
@@ -960,7 +962,7 @@ impl Actor for FleetActor {
                 // the WorkerLoaded push race ahead of the route would keep a
                 // served_id-less worker forever if the pull failed.
                 self.emit(&node, FleetEventKind::InventorySynced);
-                let _ = reply.send(());
+                let _ = reply.send(true);
             }
             FleetMsg::RemoveInstanceIf {
                 node,
@@ -991,24 +993,62 @@ impl Actor for FleetActor {
                     // not commit out of order — an older-started pull never
                     // overwrites a newer-started one (monotonic stamps, same
                     // process, directly comparable).
-                    let newer = self.inventories.get(&node).is_none_or(|(cur_inv, cur)| {
-                        // Prefer the NODE's snapshot sequence when both sides
-                        // carry one (T14 r17): it is true data order — hub-side
-                        // stamps are not under QUIC stream reordering, where an
-                        // earlier-stamped pull can carry NEWER data. Fall back
-                        // to the mono stamp against pre-r17 nodes.
-                        match (inventory.snapshot_seq, cur_inv.snapshot_seq) {
-                            (Some(new_seq), Some(old_seq)) => new_seq > old_seq,
-                            // Fallback ONLY against pre-seq (legacy) nodes/pairs:
-                            // the stamp is the hub's best available order there,
-                            // and QUIC reordering can still invert it — an
-                            // inherent residual with no hub-side fix (the node
-                            // reports no data order), self-healing on the next
-                            // refresh. Current nodes always take the seq arm.
-                            _ => pulled_at.mono > cur.mono,
+                    // (newer, seq_ordered): the seq arm is TRUE same-process data
+                    // order; the stamp arm is a best-effort fallback that can be
+                    // wrong across processes. Route reconciliation (below) runs
+                    // ONLY when seq-ordered (T10 r18 #3): under the stamp fallback
+                    // a restarted node reusing a (worker_id, model) could have a
+                    // just-installed route deleted by an earlier snapshot of the
+                    // new process — routes are never recreated by commits, so
+                    // that loss would be permanent.
+                    let (newer, seq_ordered) = match self.inventories.get(&node) {
+                        None => (true, false),
+                        Some((cur_inv, cur)) => {
+                            match (inventory.snapshot_seq, cur_inv.snapshot_seq) {
+                                // Prefer the NODE's snapshot sequence when both
+                                // sides carry one (T14 r17): it is true data order
+                                // — hub-side stamps are not under QUIC stream
+                                // reordering, where an earlier-stamped pull can
+                                // carry NEWER data.
+                                (Some(new_seq), Some(old_seq)) => (new_seq > old_seq, true),
+                                // Fallback ONLY against pre-seq (legacy) nodes/pairs
+                                // and post-re-admission caches: the stamp is the
+                                // hub's best available order there, and QUIC
+                                // reordering can still invert it — an inherent
+                                // residual with no hub-side fix, self-healing on
+                                // the next refresh.
+                                _ => (pulled_at.mono > cur.mono, false),
+                            }
                         }
-                    });
+                    };
                     if newer {
+                        // A pull committed under SEQ order also reconciles routes
+                        // (r18 #2): a delayed unload push can be masked (Stale) by
+                        // this newer pull, which would otherwise preserve the
+                        // vanished worker's route with nothing left to remove it.
+                        let gone_from_pull: Vec<(WorkerId, String)> = if seq_ordered {
+                            self.inventories
+                                .get(&node)
+                                .map(|(cur_inv, _)| {
+                                    cur_inv
+                                        .workers
+                                        .iter()
+                                        .filter(|old| {
+                                            !inventory
+                                                .workers
+                                                .iter()
+                                                .any(|w| w.worker_id == old.worker_id)
+                                        })
+                                        .map(|old| (WorkerId(old.worker_id), old.model.clone()))
+                                        .collect()
+                                })
+                                .unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        };
+                        for (worker, model) in gone_from_pull {
+                            self.remove_instance_if(&node, worker, &model);
+                        }
                         self.inventories
                             .insert(node.clone(), (*inventory, pulled_at));
                         // A push retained from before any cache existed (r5 #1) is
@@ -1104,29 +1144,38 @@ impl Actor for FleetActor {
                             // cached snapshot WITHOUT one (a legacy pull, or the seq
                             // stripped at re-admission — where accepting the fresh push
                             // re-establishes seq ordering, like the first new pull does).
-                            let newer = match cur_inv.snapshot_seq {
-                                Some(old_seq) => snapshot_seq > old_seq,
-                                None => pulled_at.mono > cur_at.mono,
+                            let (newer, seq_ordered) = match cur_inv.snapshot_seq {
+                                Some(old_seq) => (snapshot_seq > old_seq, true),
+                                None => (pulled_at.mono > cur_at.mono, false),
                             };
                             if newer {
-                                // An APPLIED push is node truth at a NEWER seq than
-                                // the cache (mailbox order = data order), so a worker
-                                // present in the old snapshot but absent from this one
-                                // is REALLY gone — drop its route too (T10 r16 #1):
+                                // An APPLIED push under SEQ order is node truth at a
+                                // NEWER seq than the cache (mailbox order = data
+                                // order), so a worker present in the old snapshot but
+                                // absent from this one is REALLY gone — drop its
+                                // route too (T10 r16 #1). SKIPPED under the stamp
+                                // fallback (r18 #3): across a re-admission the old
+                                // cache is another process's — an early snapshot of
+                                // the new process must not delete a just-installed
+                                // route for a reused (worker_id, model).
                                 // an idle-reaped worker otherwise stays advertised on
                                 // /v1/models (mislabeling a same-model survivor) until
                                 // a chat fails into it with HG007. CAS'd on the OLD
                                 // snapshot's model via remove_instance_if, so a worker
                                 // the cache never saw (e.g. a load racing this push)
                                 // is never touched.
-                                let gone: Vec<(WorkerId, String)> = cur_inv
-                                    .workers
-                                    .iter()
-                                    .filter(|old| {
-                                        !workers.iter().any(|w| w.worker_id == old.worker_id)
-                                    })
-                                    .map(|old| (WorkerId(old.worker_id), old.model.clone()))
-                                    .collect();
+                                let gone: Vec<(WorkerId, String)> = if seq_ordered {
+                                    cur_inv
+                                        .workers
+                                        .iter()
+                                        .filter(|old| {
+                                            !workers.iter().any(|w| w.worker_id == old.worker_id)
+                                        })
+                                        .map(|old| (WorkerId(old.worker_id), old.model.clone()))
+                                        .collect()
+                                } else {
+                                    Vec::new()
+                                };
                                 cur_inv.workers = workers;
                                 cur_inv.snapshot_seq = Some(snapshot_seq);
                                 // The single freshness stamp now dates the WORKER
@@ -1947,14 +1996,26 @@ impl HubFleet {
             Err(e) => return Err(self.handle_op_error(node, &transport, e).await),
         };
         let worker = WorkerId(parse_worker_id(&result)?);
-        self.ask(|reply| FleetMsg::AddInstance {
-            node: node.to_string(),
-            worker,
-            model: model.to_string(),
-            transport: transport.clone(),
-            reply,
-        })
-        .await;
+        let routed = self
+            .ask(|reply| FleetMsg::AddInstance {
+                node: node.to_string(),
+                worker,
+                model: model.to_string(),
+                transport: transport.clone(),
+                reply,
+            })
+            .await
+            .unwrap_or(false);
+        if !routed {
+            // The load physically ran, but on a connection that was replaced
+            // before the route could install (r18 #1) — reporting success would
+            // hand the caller an unroutable worker. The re-admitted process's
+            // connect pull owns the fresh state; the caller retries the load.
+            return Err(HiggsError::NodeUnreachable {
+                endpoint_id: node.to_owned(),
+                detail: "node reconnected while the load was in flight; retry the load".into(),
+            });
+        }
         // Refresh the fleet view from the node's authoritative state after the load lands.
         self.bump_epoch(node).await;
         let _ = self.refresh_inventory(node).await;
