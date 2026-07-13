@@ -1044,6 +1044,14 @@ impl Actor for FleetActor {
                         // (r18 #2): a delayed unload push can be masked (Stale) by
                         // this newer pull, which would otherwise preserve the
                         // vanished worker's route with nothing left to remove it.
+                        // ACCEPTED RESIDUAL (r20 #1): reconciliation diffs against
+                        // the CACHED snapshot, not the route table — a route whose
+                        // worker never entered the cache (its load+reap pushes both
+                        // overtaken by this pull) can still go stale. That corner
+                        // degrades to the pre-T10 contract: the route self-heals on
+                        // its first failing chat (HG007). Diffing routes against
+                        // every commit would re-open the r18 #3 reused-id deletion
+                        // hazard the cache diff exists to avoid.
                         let gone_from_pull: Vec<(WorkerId, String)> = if seq_ordered {
                             self.inventories
                                 .get(&node)
@@ -2027,8 +2035,17 @@ impl HubFleet {
         if !routed {
             // The load physically ran, but on a connection that was replaced
             // before the route could install (r18 #1) — reporting success would
-            // hand the caller an unroutable worker. The re-admitted process's
-            // connect pull owns the fresh state; the caller retries the load.
+            // hand the caller an unroutable worker. Reconnects reuse the same
+            // NodeRuntime, so that worker stays RESIDENT (r20 #2): reap it
+            // best-effort over the CURRENT transport so a retried load doesn't
+            // duplicate it; if this fails too, the idle reaper collects it.
+            if let Ok(t) = self.transport(node).await {
+                let _ = t
+                    .request(M_NODE_UNLOAD, json!({ "worker_id": worker.0 }))
+                    .await;
+            }
+            // The re-admitted process's connect pull owns the fresh state; the
+            // caller retries the load.
             return Err(HiggsError::NodeUnreachable {
                 endpoint_id: node.to_owned(),
                 detail: "node reconnected while the load was in flight; retry the load".into(),
