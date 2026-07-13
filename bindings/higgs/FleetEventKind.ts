@@ -6,12 +6,13 @@ export const FleetEventKind = {
     ChatEnd         : "chat_end",
     WorkerLoaded    : "worker_loaded",
     WorkerUnloaded  : "worker_unloaded",
+    Resync          : "resync",
     HubStateChanged : "hub_state_changed",
     NodeConnected   : "node_connected",
     InventorySynced : "inventory_synced",
     NodeDropped     : "node_dropped",
 } as const;
 
-export const { ChatStart, ChatEnd, WorkerLoaded, WorkerUnloaded, HubStateChanged, NodeConnected, InventorySynced, NodeDropped } = FleetEventKind;
+export const { ChatStart, ChatEnd, WorkerLoaded, WorkerUnloaded, Resync, HubStateChanged, NodeConnected, InventorySynced, NodeDropped } = FleetEventKind;
 
 export type FleetEventKind = (typeof FleetEventKind)[keyof typeof FleetEventKind];

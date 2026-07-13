@@ -202,12 +202,11 @@ enum NodeMsg {
     ReapIdle,
     /// The full per-worker inventory snapshot (model + T9 stats), one atomic
     /// actor read — the same rows `M_NODE_INVENTORY` carries, minus hardware.
-    /// Emit a FRESH fleet event of `kind` (current workers, current idle_ms,
-    /// next seq) — the relay's stream-failure recovery (T10 r25), replacing a
-    /// stale resend whose frozen idle_ms would read falsely fresh at the hub.
-    FleetResnapshot {
-        kind: crate::remote::FleetEventKind,
-    },
+    /// Emit a FRESH `Resync` fleet event (current workers, current idle_ms,
+    /// next seq) — the relay's stream-failure recovery (T10 r25/r26), replacing
+    /// a stale resend whose frozen idle_ms would read falsely fresh at the hub
+    /// (and whose kind would misdescribe the newer snapshot).
+    FleetResnapshot,
     WorkerSnapshot {
         reply: oneshot::Sender<Vec<crate::remote::InventoryWorker>>,
     },
@@ -614,13 +613,15 @@ impl Actor for NodeActor {
                     }
                 }
             }
-            NodeMsg::FleetResnapshot { kind } => {
+            NodeMsg::FleetResnapshot => {
                 // A relay recovering from a stream failure asks for a FRESH event
                 // instead of resending its stale copy (T10 r25): the retained
                 // event's idle_ms froze at capture, so re-delivering it after a
                 // long stall would let the hub stamp old data as fresh (the one
-                // error direction the T14 freshness design forbids).
-                self.emit_fleet(kind);
+                // error direction the T14 freshness design forbids). Emitted as
+                // Resync (r26) — a whole-state re-sync, never the lost event's
+                // kind, which would misdescribe this newer snapshot.
+                self.emit_fleet(crate::remote::FleetEventKind::Resync);
             }
             NodeMsg::WorkerSnapshot { reply } => {
                 let _ = reply.send(self.snapshot_workers());
@@ -1237,8 +1238,8 @@ impl NodeRuntime {
 
     /// Ask the actor for a FRESH fleet event of `kind` (T10 r25) — the relay's
     /// stream-failure recovery. Best-effort: ignored if the actor is gone.
-    pub fn request_fleet_resnapshot(&self, kind: crate::remote::FleetEventKind) {
-        let _ = self.handle.send(NodeMsg::FleetResnapshot { kind });
+    pub fn request_fleet_resnapshot(&self) {
+        let _ = self.handle.send(NodeMsg::FleetResnapshot);
     }
 
     /// The node's shared Developer-Log bus (Developer-Logs history + live stream + verbosity).

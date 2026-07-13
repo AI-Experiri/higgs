@@ -367,6 +367,11 @@ higgs_const_enum! {
         WorkerLoaded,
         /// A worker was unloaded/killed/idle-reaped and is gone.
         WorkerUnloaded,
+        /// A fresh whole-state snapshot re-sync, NOT a specific transition (T10
+        /// r26): the node's relay emits this when recovering a possibly-lost
+        /// delivery after a stream failure — reusing the lost event's kind would
+        /// let a later, idle snapshot masquerade as e.g. a final ChatStart.
+        Resync,
         /// Hub-local (never on the node wire): the hub's fleet networking was
         /// enabled or disabled (the kill switch, T10 r11). Carried with an EMPTY
         /// `endpoint_id` — a whole-fleet invalidation, not a per-node one.

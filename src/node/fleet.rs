@@ -2455,7 +2455,8 @@ async fn read_node_notifications(
                             k @ (FleetEventKind::ChatStart
                             | FleetEventKind::ChatEnd
                             | FleetEventKind::WorkerLoaded
-                            | FleetEventKind::WorkerUnloaded),
+                            | FleetEventKind::WorkerUnloaded
+                            | FleetEventKind::Resync),
                         ) => k,
                         Ok(_) => continue,
                         // Unknown FUTURE kind: keep the data, generify the signal.

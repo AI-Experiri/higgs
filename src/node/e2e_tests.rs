@@ -256,6 +256,24 @@ async fn fleet_event_relay_resends_the_last_event_after_an_idle_reset() {
         .expect("a line");
     assert!(
         line2.contains(crate::remote::N_FLEET_EVENT),
-        "the last event is resent on the fresh stream: {line2}"
+        "a recovery event arrives on the fresh stream: {line2}"
     );
+    // r26: the recovery is a FRESH Resync snapshot, not a verbatim resend — its
+    // seq must ADVANCE past the lost event's (a resend would repeat it, letting
+    // frozen idle_ms be stamped fresh at the hub), and its kind must be Resync
+    // (reusing the lost kind would misdescribe the newer snapshot).
+    let decode = |line: &str| -> (u64, String) {
+        let frame: serde_json::Value = serde_json::from_str(line).expect("frame json");
+        (
+            frame["params"]["snapshot_seq"].as_u64().expect("seq"),
+            frame["params"]["kind"].as_str().expect("kind").to_string(),
+        )
+    };
+    let (seq1, _) = decode(&line1);
+    let (seq2, kind2) = decode(&line2);
+    assert!(
+        seq2 > seq1,
+        "recovery snapshot is FRESH (seq {seq2} > {seq1}), not a resend"
+    );
+    assert_eq!(kind2, "resync", "recovery carries the Resync kind");
 }
