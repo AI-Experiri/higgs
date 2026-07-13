@@ -272,6 +272,12 @@ enum FleetMsg {
         node: NodeKey,
         worker: WorkerId,
         model: String,
+        /// The connection the load ran on (T10 r17 #1, same CAS as CommitWorkers):
+        /// the route installs only while this is still the node's CURRENT
+        /// transport — a load completing after a re-admission otherwise installs
+        /// a phantom route into the NEW process (callable until a chat fails
+        /// HG007/HG018; pulls never remove routes).
+        transport: Arc<NodeTransport>,
         reply: oneshot::Sender<()>,
     },
     /// CAS instance-drop: remove `(node, worker)` only if it STILL serves `expected_model`
@@ -932,8 +938,20 @@ impl Actor for FleetActor {
                 node,
                 worker,
                 model,
+                transport,
                 reply,
             } => {
+                let current = self
+                    .nodes
+                    .get(&node)
+                    .is_some_and(|cur| Arc::ptr_eq(cur, &transport));
+                if !current {
+                    // Stale load completion (see the variant doc): the worker
+                    // belongs to a connection that was replaced — no route, no
+                    // event.
+                    let _ = reply.send(());
+                    return;
+                }
                 self.routes.insert((node.clone(), worker), model);
                 // A route install is hub-visible node state (the worker's served id
                 // appears) — announce it atomically (T10 r10): the load's follow-up
@@ -996,21 +1014,35 @@ impl Actor for FleetActor {
                         // A push retained from before any cache existed (r5 #1) is
                         // replayed ON TOP of this commit when it is the newer data
                         // (its kind announces it, below, like any applied push).
-                        let replayed = match self.pending_pushes.remove(&node) {
+                        let (replayed, gone) = match self.pending_pushes.remove(&node) {
                             Some((kind, workers, seq, at)) => {
                                 let (inv, cur_at) =
                                     self.inventories.get_mut(&node).expect("just inserted");
                                 if inv.snapshot_seq.is_none_or(|pull_seq| seq > pull_seq) {
+                                    // Same vanished-route cleanup as a directly
+                                    // applied push (r17 #2): the replayed push is
+                                    // newer node truth than the pull it lands on.
+                                    let gone: Vec<(WorkerId, String)> = inv
+                                        .workers
+                                        .iter()
+                                        .filter(|old| {
+                                            !workers.iter().any(|w| w.worker_id == old.worker_id)
+                                        })
+                                        .map(|old| (WorkerId(old.worker_id), old.model.clone()))
+                                        .collect();
                                     inv.workers = workers;
                                     inv.snapshot_seq = Some(seq);
                                     *cur_at = at;
-                                    Some(kind)
+                                    (Some(kind), gone)
                                 } else {
-                                    None
+                                    (None, Vec::new())
                                 }
                             }
-                            None => None,
+                            None => (None, Vec::new()),
                         };
+                        for (worker, model) in gone {
+                            self.remove_instance_if(&node, worker, &model);
+                        }
                         // Announced atomically with the commit (T10 r3 #1 / r4 #1):
                         // the pull is where hub-initiated lifecycle changes land,
                         // and the node's own (seq-stale) push for the change is
@@ -1919,6 +1951,7 @@ impl HubFleet {
             node: node.to_string(),
             worker,
             model: model.to_string(),
+            transport: transport.clone(),
             reply,
         })
         .await;
