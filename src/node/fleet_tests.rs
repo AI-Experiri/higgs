@@ -1901,3 +1901,102 @@ async fn a_pre_cache_push_is_retained_and_replayed_over_an_older_pull() {
         "the pull's host/hardware fields are kept"
     );
 }
+
+/// T10 r8: the fallback owner's PRE-PULL ownership check — a re-admission
+/// clears the slot (and a successor may re-claim it) while the detached owner
+/// is pre-pull or mid-sleep; the stale owner must see `false` and stand down
+/// WITHOUT firing another inventory RPC. Driven through the real messages.
+#[tokio::test]
+async fn a_stale_fallback_owner_stands_down_before_pulling() {
+    let hub = local_endpoint().await;
+    let node = local_endpoint().await;
+    let (dial, conn) = tokio::join!(node.connect(hub.addr(), ALPN), async {
+        hub.accept().await.expect("incoming").await.expect("conn")
+    });
+    let _keep = dial.expect("dial");
+    std::mem::forget(hub);
+    let transport = Arc::new(NodeTransport::new(conn));
+
+    let mut node_ids = NodeIdAllocator::new();
+    node_ids.assign("nodeA");
+    let mut actor = FleetActor {
+        nodes: HashMap::new(),
+        routes: HashMap::new(),
+        node_ids,
+        inventories: HashMap::new(),
+        chat_refreshes: HashMap::new(),
+        chat_refresh_gen: 0,
+        software_versions: HashMap::new(),
+        event_nodes: std::collections::HashSet::new(),
+        events_tx: tokio::sync::broadcast::channel(8).0,
+        pending_pushes: HashMap::new(),
+        fallback_inflight: HashMap::new(),
+        fallback_gen: 0,
+        versions: HashMap::new(),
+        epochs: HashMap::new(),
+        bus: Arc::new(crate::log_bus::LogBus::new()),
+        admit_gen: 0,
+    };
+    actor.nodes.insert("nodeA".to_string(), transport.clone());
+    actor.event_nodes.insert("nodeA".to_string());
+
+    // Owner A claims the slot via a cache-less push.
+    let (tx, rx) = oneshot::channel();
+    actor
+        .handle(FleetMsg::CommitWorkers {
+            node: "nodeA".to_string(),
+            transport: transport.clone(),
+            kind: crate::remote::FleetEventKind::ChatEnd,
+            workers: vec![],
+            snapshot_seq: 1,
+            pulled_at: PulledAt::now(),
+            reply: tx,
+        })
+        .await;
+    let PushOutcome::NeedsFull(gen_a) = rx.await.unwrap() else {
+        panic!("first cache-less push claims the fallback slot");
+    };
+    let owner = |gen: u64| {
+        let (tx, rx) = oneshot::channel();
+        (
+            FleetMsg::FallbackOwner {
+                node: "nodeA".to_string(),
+                gen,
+                reply: tx,
+            },
+            rx,
+        )
+    };
+    let (msg, rx) = owner(gen_a);
+    actor.handle(msg).await;
+    assert!(rx.await.unwrap(), "the claiming owner is current");
+
+    // A retire (as at re-admission) clears the slot; a successor push re-claims.
+    actor.retire("nodeA");
+    actor.nodes.insert("nodeA".to_string(), transport.clone());
+    actor.event_nodes.insert("nodeA".to_string());
+    let (tx, rx) = oneshot::channel();
+    actor
+        .handle(FleetMsg::CommitWorkers {
+            node: "nodeA".to_string(),
+            transport: transport.clone(),
+            kind: crate::remote::FleetEventKind::ChatEnd,
+            workers: vec![],
+            snapshot_seq: 1,
+            pulled_at: PulledAt::now(),
+            reply: tx,
+        })
+        .await;
+    let PushOutcome::NeedsFull(gen_b) = rx.await.unwrap() else {
+        panic!("the successor push claims a fresh slot");
+    };
+    assert_ne!(gen_a, gen_b);
+
+    // The STALE owner stands down; the successor is current.
+    let (msg, rx) = owner(gen_a);
+    actor.handle(msg).await;
+    assert!(!rx.await.unwrap(), "stale owner must stand down (r8)");
+    let (msg, rx) = owner(gen_b);
+    actor.handle(msg).await;
+    assert!(rx.await.unwrap());
+}

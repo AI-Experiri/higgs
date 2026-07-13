@@ -343,6 +343,18 @@ enum FleetMsg {
     /// left no cached inventory, a retained push is still waiting, and the node
     /// is still connected) — without the retry a single failed fallback would
     /// strand the pending push until the next lifecycle op (T10 r5 #2).
+    /// Pre-pull ownership check for the fallback loop (r8, mirroring
+    /// `ChatRefreshOwner`): is `gen` still the slot's owner? A re-admission
+    /// clears the slot while a detached owner may be pre-pull or mid-sleep —
+    /// without this check that stale owner still fires one full inventory RPC
+    /// (150 s bound, hardware probe) CONCURRENTLY with the successor's.
+    /// Residual (same shape as the chat-refresh one): a re-admission landing
+    /// DURING the pull still overlaps by at most that one bounded pull.
+    FallbackOwner {
+        node: NodeKey,
+        gen: u64,
+        reply: oneshot::Sender<bool>,
+    },
     FallbackDone {
         node: NodeKey,
         /// The owner generation from `PushOutcome::NeedsFull` — a stale owner
@@ -1072,6 +1084,10 @@ impl Actor for FleetActor {
                 };
                 let _ = reply.send(outcome);
             }
+            FleetMsg::FallbackOwner { node, gen, reply } => {
+                let owner = self.fallback_inflight.get(&node) == Some(&gen);
+                let _ = reply.send(owner);
+            }
             FleetMsg::FallbackDone { node, gen, reply } => {
                 if self.fallback_inflight.get(&node) != Some(&gen) {
                     // Stale owner: the slot was cleared by a re-admission/retire
@@ -1468,6 +1484,22 @@ impl HubFleet {
             let node = node.clone();
             tokio::spawn(async move {
                 loop {
+                    // Pre-pull ownership check (r8): a re-admission may have
+                    // cleared (and a successor re-claimed) this owner's slot
+                    // while it was being spawned or sleeping between retries —
+                    // stand down WITHOUT pulling, or two owners fire concurrent
+                    // inventory RPCs against the new connection.
+                    let still_owner = fleet
+                        .ask(|reply| FleetMsg::FallbackOwner {
+                            node: node.clone(),
+                            gen,
+                            reply,
+                        })
+                        .await
+                        .unwrap_or(false);
+                    if !still_owner {
+                        return;
+                    }
                     // Hard bound (r6 #1, same 150 s rationale as the chat-refresh
                     // owner's): the control-plane request timeout starts only
                     // AFTER open_bi succeeds, so a node out of bidi credit (with
