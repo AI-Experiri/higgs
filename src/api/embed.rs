@@ -213,10 +213,13 @@ impl Higgs {
             Ok(hub) => {
                 let hub = std::sync::Arc::new(hub);
                 self.set_fleet(hub.fleet.clone());
-                // Announce the toggle (T10 r11 #2) — subscribers on OTHER clients
-                // re-read the hub status; with zero nodes nothing else would fire.
-                hub.fleet.announce_hub_state().await;
+                let fleet = hub.fleet.clone();
                 self.set_hub(hub);
+                // Announce AFTER set_hub published the enabled hub (T10 r12): a
+                // subscriber re-reads hub status on this event, and announcing
+                // first let it still observe "disabled" with nothing to correct
+                // it. Same rule as hub_disable (clear_hub precedes its announce).
+                fleet.announce_hub_state().await;
                 tracing::warn!("higgs: hub ENABLED");
                 Ok(crate::serve::control::hub_status(self).await)
             }
