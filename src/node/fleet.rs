@@ -362,6 +362,16 @@ enum FleetMsg {
         gen: u64,
         reply: oneshot::Sender<bool>,
     },
+    /// The fallback owner exhausted its retry budget (r9 #1): clear the slot
+    /// AND the retained push, so a node persistently returning malformed
+    /// inventory cannot pin an immortal 1 Hz probe loop. The NEXT event from
+    /// the node re-seeds the pending push and claims a fresh owner — recovery
+    /// stays event-paced instead of timer-paced.
+    FallbackAbandon {
+        node: NodeKey,
+        gen: u64,
+        reply: oneshot::Sender<()>,
+    },
     /// Does this node push `N_FLEET_EVENT`s (its HELLO advertised `fleet_events`)?
     NodePushesEvents {
         node: NodeKey,
@@ -1088,6 +1098,13 @@ impl Actor for FleetActor {
                 let owner = self.fallback_inflight.get(&node) == Some(&gen);
                 let _ = reply.send(owner);
             }
+            FleetMsg::FallbackAbandon { node, gen, reply } => {
+                if self.fallback_inflight.get(&node) == Some(&gen) {
+                    self.fallback_inflight.remove(&node);
+                    self.pending_pushes.remove(&node);
+                }
+                let _ = reply.send(());
+            }
             FleetMsg::FallbackDone { node, gen, reply } => {
                 if self.fallback_inflight.get(&node) != Some(&gen) {
                     // Stale owner: the slot was cleared by a re-admission/retire
@@ -1480,10 +1497,19 @@ impl HubFleet {
         // failure the actor grants ONE paced retry at a time while the node stays
         // connected and the push is still waiting.
         if let PushOutcome::NeedsFull(gen) = outcome {
-            let fleet = self.clone();
+            // Weak (r9 #1): a detached retry loop must not keep a dropped fleet —
+            // and with it the actor and the transport — alive.
+            let fleet = Arc::downgrade(self);
             let node = node.clone();
             tokio::spawn(async move {
+                // Bounded retries (r9 #1): a connected node that persistently
+                // returns malformed inventory would otherwise drive this loop —
+                // and its hardware probes — forever at 1 Hz.
+                let mut attempts = 0u32;
                 loop {
+                    let Some(fleet) = fleet.upgrade() else {
+                        return;
+                    };
                     // Pre-pull ownership check (r8): a re-admission may have
                     // cleared (and a successor re-claimed) this owner's slot
                     // while it was being spawned or sleeping between retries —
@@ -1521,6 +1547,18 @@ impl HubFleet {
                     if !retry {
                         return;
                     }
+                    attempts += 1;
+                    if attempts >= 5 {
+                        fleet
+                            .ask(|reply| FleetMsg::FallbackAbandon {
+                                node: node.clone(),
+                                gen,
+                                reply,
+                            })
+                            .await;
+                        return;
+                    }
+                    drop(fleet); // don't hold the strong ref across the sleep
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 }
             });
