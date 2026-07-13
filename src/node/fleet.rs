@@ -611,6 +611,25 @@ impl FleetActor {
     /// CAS instance-drop (see [`FleetMsg::RemoveInstanceIf`]): remove `(node, worker)` only if
     /// it still serves `expected_model`.
     fn remove_instance_if(&mut self, node: &str, worker: WorkerId, expected_model: &str) {
+        if self.remove_instance_no_bump(node, worker, expected_model) {
+            // Invalidate any in-flight inventory fetch; the caller refreshes after.
+            self.bump_epoch(node);
+        }
+    }
+
+    /// The CAS route-drop WITHOUT the epoch bump (T10 r19): commit-side
+    /// reconciliation (a route removed because a COMMITTED snapshot proved its
+    /// worker gone) derives from node truth that the seq guard already orders —
+    /// bumping the epoch there would discard a concurrently in-flight HIGHER-seq
+    /// pull before its seq comparison ever ran, leaving staler data cached. The
+    /// bump belongs to HUB-INITIATED route mutations only (unload/kill/stale-
+    /// route drops), whose in-flight pulls really can carry pre-change state.
+    fn remove_instance_no_bump(
+        &mut self,
+        node: &str,
+        worker: WorkerId,
+        expected_model: &str,
+    ) -> bool {
         let key = (node.to_string(), worker);
         let removed = if self.routes.get(&key).map(String::as_str) == Some(expected_model) {
             self.routes.remove(&key).is_some()
@@ -619,9 +638,8 @@ impl FleetActor {
         };
         if removed {
             self.evict_remote_logs(node, worker);
-            // Invalidate any in-flight inventory fetch; the caller refreshes after.
-            self.bump_epoch(node);
         }
+        removed
     }
 
     /// Derive the SERVED-instance-id → `(node, worker)` map from the live instance set. The
@@ -1047,7 +1065,7 @@ impl Actor for FleetActor {
                             Vec::new()
                         };
                         for (worker, model) in gone_from_pull {
-                            self.remove_instance_if(&node, worker, &model);
+                            self.remove_instance_no_bump(&node, worker, &model);
                         }
                         self.inventories
                             .insert(node.clone(), (*inventory, pulled_at));
@@ -1081,7 +1099,7 @@ impl Actor for FleetActor {
                             None => (None, Vec::new()),
                         };
                         for (worker, model) in gone {
-                            self.remove_instance_if(&node, worker, &model);
+                            self.remove_instance_no_bump(&node, worker, &model);
                         }
                         // Announced atomically with the commit (T10 r3 #1 / r4 #1):
                         // the pull is where hub-initiated lifecycle changes land,
@@ -1190,7 +1208,7 @@ impl Actor for FleetActor {
                                 // future work, not warranted for display-only data.
                                 *cur_at = pulled_at;
                                 for (worker, model) in gone {
-                                    self.remove_instance_if(&node, worker, &model);
+                                    self.remove_instance_no_bump(&node, worker, &model);
                                 }
                                 self.emit(&node, kind);
                                 PushOutcome::Applied
