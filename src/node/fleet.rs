@@ -1077,6 +1077,24 @@ impl Actor for FleetActor {
                                 None => pulled_at.mono > cur_at.mono,
                             };
                             if newer {
+                                // An APPLIED push is node truth at a NEWER seq than
+                                // the cache (mailbox order = data order), so a worker
+                                // present in the old snapshot but absent from this one
+                                // is REALLY gone — drop its route too (T10 r16 #1):
+                                // an idle-reaped worker otherwise stays advertised on
+                                // /v1/models (mislabeling a same-model survivor) until
+                                // a chat fails into it with HG007. CAS'd on the OLD
+                                // snapshot's model via remove_instance_if, so a worker
+                                // the cache never saw (e.g. a load racing this push)
+                                // is never touched.
+                                let gone: Vec<(WorkerId, String)> = cur_inv
+                                    .workers
+                                    .iter()
+                                    .filter(|old| {
+                                        !workers.iter().any(|w| w.worker_id == old.worker_id)
+                                    })
+                                    .map(|old| (WorkerId(old.worker_id), old.model.clone()))
+                                    .collect();
                                 cur_inv.workers = workers;
                                 cur_inv.snapshot_seq = Some(snapshot_seq);
                                 // The single freshness stamp now dates the WORKER
@@ -1090,6 +1108,9 @@ impl Actor for FleetActor {
                                 // hardware stamp / periodic hardware re-pull is
                                 // future work, not warranted for display-only data.
                                 *cur_at = pulled_at;
+                                for (worker, model) in gone {
+                                    self.remove_instance_if(&node, worker, &model);
+                                }
                                 self.emit(&node, kind);
                                 PushOutcome::Applied
                             } else {

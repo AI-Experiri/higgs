@@ -2000,3 +2000,164 @@ async fn a_stale_fallback_owner_stands_down_before_pulling() {
     actor.handle(msg).await;
     assert!(rx.await.unwrap());
 }
+
+/// T10 r16 #1: an APPLIED push whose snapshot no longer contains a previously
+/// cached worker drops that worker's ROUTE too — an idle-reaped worker must
+/// not stay advertised (mislabeling a same-model survivor) until a chat fails
+/// into it. CAS'd on the old snapshot's model, so a worker the cache never saw
+/// is untouched.
+#[tokio::test]
+async fn an_applied_push_drops_routes_of_vanished_workers() {
+    let (root, model_id) = stage_dummy_model("higgs-test/m");
+    let hub = local_endpoint().await;
+    let node = local_endpoint().await;
+    let hub_addr = hub.addr();
+    let node_key = node.id().to_string();
+    let rt = Arc::new(fake_runtime(vec![root.path().to_path_buf()]));
+    tokio::spawn(async move {
+        let node_conn = node.connect(hub_addr, ALPN).await.expect("connect");
+        serve_node(node_conn, rt).await;
+    });
+    let conn = hub.accept().await.expect("incoming").await.expect("conn");
+    std::mem::forget(hub);
+    let fleet = Arc::new(HubFleet::new(Arc::new(crate::log_bus::LogBus::new())));
+    let t = Arc::new(NodeTransport::new(conn));
+    fleet
+        .add_node(node_key.clone(), t.clone(), None, Some(2), None, true)
+        .await;
+
+    // Load → route + cached inventory with the worker.
+    let worker = fleet.load(&node_key, &model_id, None).await.unwrap();
+    assert!(
+        !fleet
+            .nodes_view()
+            .await
+            .into_iter()
+            .find(|n| n.endpoint_id == node_key)
+            .and_then(|n| n.inventory)
+            .map(|i| i.workers)
+            .unwrap_or_default()
+            .is_empty(),
+        "worker cached after load"
+    );
+    assert!(fleet.is_remote(&model_id).await, "route installed");
+
+    // The node "idle-reaps" the worker: an APPLIED push with NO workers and a
+    // seq far beyond anything the pulls used.
+    fleet
+        .apply_node_event(
+            &node_key,
+            crate::remote::NodeFleetEvent {
+                kind: crate::remote::FleetEventKind::WorkerUnloaded,
+                snapshot_seq: 1_000_000,
+                workers: vec![],
+            },
+            &t,
+        )
+        .await;
+    assert!(
+        !fleet.is_remote(&model_id).await,
+        "the vanished worker's route is dropped with the applied push"
+    );
+    let _ = worker;
+}
+
+/// T10 r13 #2 / r16 #2: the FallbackDone give-up decision through the REAL
+/// message — a plain retry is granted while pending data waits; a give-up with
+/// UNCHANGED pending seq finalizes (slot cleared, push retained); a give-up
+/// with an ADVANCED pending seq EXTENDS the owner instead of stranding the
+/// fresh data.
+#[tokio::test]
+async fn fallback_give_up_finalizes_only_without_fresh_pending_data() {
+    let hub = local_endpoint().await;
+    let node = local_endpoint().await;
+    let (dial, conn) = tokio::join!(node.connect(hub.addr(), ALPN), async {
+        hub.accept().await.expect("incoming").await.expect("conn")
+    });
+    let _keep = dial.expect("dial");
+    std::mem::forget(hub);
+    let transport = Arc::new(NodeTransport::new(conn));
+    let fleet = Arc::new(HubFleet::new(Arc::new(crate::log_bus::LogBus::new())));
+    fleet
+        .add_node(
+            "nodeA".to_string(),
+            transport.clone(),
+            None,
+            Some(2),
+            None,
+            true,
+        )
+        .await;
+
+    // Claim the slot directly (apply_node_event would spawn the real fallback
+    // loop and race this test's own FallbackDone calls).
+    let outcome = fleet
+        .ask(|reply| FleetMsg::CommitWorkers {
+            node: "nodeA".to_string(),
+            transport: transport.clone(),
+            kind: crate::remote::FleetEventKind::ChatEnd,
+            workers: vec![],
+            snapshot_seq: 10,
+            pulled_at: PulledAt::now(),
+            reply,
+        })
+        .await
+        .unwrap();
+    let PushOutcome::NeedsFull(gen) = outcome else {
+        panic!("cache-less push claims the slot: {outcome:?}");
+    };
+    let done = |gen: u64, give_up: bool| {
+        let f = fleet.clone();
+        async move {
+            f.ask(|reply| FleetMsg::FallbackDone {
+                node: "nodeA".to_string(),
+                gen,
+                give_up,
+                reply,
+            })
+            .await
+            .unwrap()
+        }
+    };
+    // Plain failure: retry granted (pending waits, node connected, no cache).
+    assert!(done(gen, false).await, "non-terminal failure retries");
+    // Terminal with UNCHANGED pending: finalizes.
+    assert!(
+        !done(gen, true).await,
+        "give-up with stale pending finalizes"
+    );
+    // The push stayed retained and the slot is free: the next push re-claims.
+    let outcome = fleet
+        .ask(|reply| FleetMsg::CommitWorkers {
+            node: "nodeA".to_string(),
+            transport: transport.clone(),
+            kind: crate::remote::FleetEventKind::ChatEnd,
+            workers: vec![],
+            snapshot_seq: 11,
+            pulled_at: PulledAt::now(),
+            reply,
+        })
+        .await
+        .unwrap();
+    let PushOutcome::NeedsFull(gen2) = outcome else {
+        panic!("slot re-claimed after finalize: {outcome:?}");
+    };
+    // Fresh data lands DURING the terminal attempt (seq 12 > the 11 claimed)...
+    let outcome = fleet
+        .ask(|reply| FleetMsg::CommitWorkers {
+            node: "nodeA".to_string(),
+            transport: transport.clone(),
+            kind: crate::remote::FleetEventKind::ChatEnd,
+            workers: vec![],
+            snapshot_seq: 12,
+            pulled_at: PulledAt::now(),
+            reply,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(outcome, PushOutcome::Deferred));
+    // ...so the give-up EXTENDS instead of stranding it (r13 #2).
+    assert!(done(gen2, true).await, "give-up with fresh pending extends");
+    // And once served (seq unchanged), the next give-up finalizes.
+    assert!(!done(gen2, true).await, "give-up after serving finalizes");
+}
