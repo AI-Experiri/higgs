@@ -601,7 +601,11 @@ pub async fn serve_node(conn: Connection, rt: std::sync::Arc<crate::node::runtim
     // scheduling window where the first op's event (e.g. an immediate post-reconnect
     // ChatStart) is emitted before the relay task is ever polled, and lost.
     let fleet_events = rt.subscribe_fleet_events();
-    let _fleet_relay = AbortOnDrop(tokio::spawn(relay_fleet_events(conn.clone(), fleet_events)));
+    let _fleet_relay = AbortOnDrop(tokio::spawn(relay_fleet_events(
+        conn.clone(),
+        rt.clone(),
+        fleet_events,
+    )));
     // Each iteration accepts a hub-opened stream; the loop ends when the connection
     // closes (caller decides whether to reconnect).
     while let Ok((send, recv)) = conn.accept_bi().await {
@@ -672,35 +676,40 @@ async fn relay_worker_logs(
 /// `events` is subscribed by the CALLER, before any hub op can run (r2 #3).
 async fn relay_fleet_events(
     conn: Connection,
+    rt: std::sync::Arc<crate::node::runtime::NodeRuntime>,
     mut events: tokio::sync::broadcast::Receiver<crate::remote::NodeFleetEvent>,
 ) {
-    // The event owed to the next stream (a write failed, or an idle reset may have
-    // eaten the last delivery — resend it; pushes are idempotent full snapshots).
-    let mut pending: Option<crate::remote::NodeFleetEvent> = None;
-    // The most recent event written to the CURRENT stream.
-    let mut last_sent: Option<crate::remote::NodeFleetEvent> = None;
+    // The kind owed a FRESH re-snapshot on the next stream (T10 r25): a write
+    // failed, or an idle reset may have eaten the last delivery. The stale event
+    // itself is NOT resent — its idle_ms froze at capture, and the hub stamps at
+    // receipt, so re-delivering it after a stall would read falsely fresh (the
+    // one error direction the T14 freshness design forbids). A fresh actor
+    // snapshot carries current idle_ms and the next seq.
+    let mut resnap: Option<crate::remote::FleetEventKind> = None;
+    // The most recent event kind written to the CURRENT stream.
+    let mut last_sent: Option<crate::remote::FleetEventKind> = None;
     'stream: loop {
         let Ok(mut send) = conn.open_uni().await else {
             return; // connection gone
         };
+        if let Some(kind) = resnap.take() {
+            rt.request_fleet_resnapshot(kind); // arrives via the broadcast below
+        }
         loop {
-            let ev = match pending.take() {
-                Some(ev) => ev,
-                None => {
-                    tokio::select! {
-                        got = events.recv() => match got {
-                            Ok(ev) => ev,
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-                        },
-                        // Idle reset: the hub stopped THIS stream while no event was
-                        // flowing — the last write may not have been decoded. Reopen
-                        // and resend it (nothing to do if nothing was ever sent).
-                        _ = send.stopped() => {
-                            pending = last_sent.take();
-                            tokio::time::sleep(Duration::from_millis(200)).await;
-                            continue 'stream;
-                        }
+            let ev = {
+                tokio::select! {
+                    got = events.recv() => match got {
+                        Ok(ev) => ev,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                    },
+                    // Idle reset: the hub stopped THIS stream while no event was
+                    // flowing — the last write may not have been decoded. Reopen
+                    // and re-snapshot (nothing to do if nothing was ever sent).
+                    _ = send.stopped() => {
+                        resnap = last_sent.take();
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        continue 'stream;
                     }
                 }
             };
@@ -717,15 +726,16 @@ async fn relay_fleet_events(
                 .is_err()
             {
                 // Stream failed with the connection possibly alive: reopen and
-                // resend. The brief pause keeps a hub that STOP_SENDINGs every
-                // stream from turning this into a hot loop; if the connection is
-                // actually dead, the reopen fails and we exit above.
-                pending = Some(ev);
+                // re-snapshot. The brief pause keeps a hub that STOP_SENDINGs
+                // every stream from turning this into a hot loop; if the
+                // connection is actually dead, the reopen fails and we exit
+                // above.
+                resnap = Some(ev.kind);
                 last_sent = None;
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 continue 'stream;
             }
-            last_sent = Some(ev);
+            last_sent = Some(ev.kind);
         }
     }
 }

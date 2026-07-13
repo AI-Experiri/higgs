@@ -202,6 +202,12 @@ enum NodeMsg {
     ReapIdle,
     /// The full per-worker inventory snapshot (model + T9 stats), one atomic
     /// actor read — the same rows `M_NODE_INVENTORY` carries, minus hardware.
+    /// Emit a FRESH fleet event of `kind` (current workers, current idle_ms,
+    /// next seq) — the relay's stream-failure recovery (T10 r25), replacing a
+    /// stale resend whose frozen idle_ms would read falsely fresh at the hub.
+    FleetResnapshot {
+        kind: crate::remote::FleetEventKind,
+    },
     WorkerSnapshot {
         reply: oneshot::Sender<Vec<crate::remote::InventoryWorker>>,
     },
@@ -607,6 +613,14 @@ impl Actor for NodeActor {
                         self.emit_fleet(crate::remote::FleetEventKind::WorkerUnloaded);
                     }
                 }
+            }
+            NodeMsg::FleetResnapshot { kind } => {
+                // A relay recovering from a stream failure asks for a FRESH event
+                // instead of resending its stale copy (T10 r25): the retained
+                // event's idle_ms froze at capture, so re-delivering it after a
+                // long stall would let the hub stamp old data as fresh (the one
+                // error direction the T14 freshness design forbids).
+                self.emit_fleet(kind);
             }
             NodeMsg::WorkerSnapshot { reply } => {
                 let _ = reply.send(self.snapshot_workers());
@@ -1219,6 +1233,12 @@ impl NodeRuntime {
     /// skips the snapshot work entirely while there is no subscriber.
     pub fn subscribe_fleet_events(&self) -> broadcast::Receiver<crate::remote::NodeFleetEvent> {
         self.fleet_tx.subscribe()
+    }
+
+    /// Ask the actor for a FRESH fleet event of `kind` (T10 r25) — the relay's
+    /// stream-failure recovery. Best-effort: ignored if the actor is gone.
+    pub fn request_fleet_resnapshot(&self, kind: crate::remote::FleetEventKind) {
+        let _ = self.handle.send(NodeMsg::FleetResnapshot { kind });
     }
 
     /// The node's shared Developer-Log bus (Developer-Logs history + live stream + verbosity).

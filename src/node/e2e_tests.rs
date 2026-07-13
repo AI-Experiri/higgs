@@ -120,7 +120,11 @@ async fn fleet_event_relay_reopens_after_a_stream_reset() {
 
     let rt = Arc::new(fake_runtime(vec![model_root.path().to_path_buf()]));
     let fleet_events = rt.subscribe_fleet_events();
-    tokio::spawn(super::relay_fleet_events(node_conn, fleet_events));
+    tokio::spawn(super::relay_fleet_events(
+        node_conn,
+        rt.clone(),
+        fleet_events,
+    ));
 
     // Emit fleet events continuously (each fake load emits WorkerLoaded) so
     // both the pre- and post-reset streams have traffic without timing games.
@@ -205,7 +209,11 @@ async fn fleet_event_relay_resends_the_last_event_after_an_idle_reset() {
 
     let rt = Arc::new(fake_runtime(vec![model_root.path().to_path_buf()]));
     let fleet_events = rt.subscribe_fleet_events();
-    tokio::spawn(super::relay_fleet_events(node_conn, fleet_events));
+    tokio::spawn(super::relay_fleet_events(
+        node_conn,
+        rt.clone(),
+        fleet_events,
+    ));
 
     // Exactly ONE event (a single load), then the node goes idle.
     rt.load(crate::remote::NodeLoadParams {

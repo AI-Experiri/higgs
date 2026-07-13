@@ -1204,6 +1204,14 @@ impl Actor for FleetActor {
                                 };
                                 cur_inv.workers = workers;
                                 cur_inv.snapshot_seq = Some(snapshot_seq);
+                                // Push stamps are taken at hub RECEIPT — capture
+                                // time is unknowable without synced clocks, so a
+                                // delayed delivery UNDERSTATES staleness by the
+                                // transit (T10 r25). Bounded: in-order stream, ms
+                                // transit in health; the known long-delay path
+                                // (stream-failure recovery) re-SNAPSHOTS instead
+                                // of resending, so frozen idle_ms is never
+                                // re-stamped as fresh.
                                 // The single freshness stamp now dates the WORKER
                                 // snapshot — the thing pushes update and the thing
                                 // the UI's per-row chips describe. ACCEPTED RESIDUAL
