@@ -86,6 +86,17 @@ higgs_ts! {
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         pub loaded_id: Option<String>,
+        /// The ids chat can actually reach — `Higgs::chat_model_ids`, the SAME set
+        /// `/v1/models` advertises and the dispatch gates accept.
+        ///
+        /// A UI must gate its model picker on THIS list and never re-derive one
+        /// from `models[].readiness`: readiness is a per-scan-row verdict keyed by
+        /// id, while reachability is decided by the LOADED worker's facts and the
+        /// fleet's routes. The two legitimately disagree — a resident embedding
+        /// worker under an id whose first scan variant is a generative file reads
+        /// `Loaded` on that row, yet every chat to it is refused ([HG079]). Only
+        /// the crate can join those sources, so it ships the answer.
+        pub chat_model_ids: Vec<String>,
     }
 }
 

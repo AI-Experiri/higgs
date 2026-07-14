@@ -2169,10 +2169,17 @@ impl HubFleet {
     }
 
     /// The CACHED-inventory domain of the remote worker behind `served`, when the
-    /// hub knows it. `None` = unknown (no route, no cached inventory/row, or an
-    /// older node that never reports domains) — callers stay permissive and the
-    /// node's own `ChatHandle` gate remains the enforcement. `Some` lets the hub
-    /// refuse a non-generative remote target BEFORE committing a response stream.
+    /// hub knows it. `None` = unknown (no route, or no cached inventory row for
+    /// that worker+model) — callers stay permissive and the node's own `ChatHandle`
+    /// gate remains the enforcement. `Some` lets the hub refuse a non-generative
+    /// remote target BEFORE committing a response stream.
+    ///
+    /// An OLDER node that never reports a domain does not land here as `None`: its
+    /// row deserializes `domain` to the `serde(default)` `Llm` (see
+    /// [`InventoryWorker::domain`](crate::remote::InventoryWorker), which documents
+    /// why that default is the permissive one), so this returns `Some(Llm)` and the
+    /// hub declines to pre-refuse — the same outcome as unknown, reached by a
+    /// different route.
     pub async fn remote_domain(&self, served: &str) -> Option<crate::worker::models::ModelDomain> {
         let (node, worker, model) = self.require_served(served).await.ok()?;
         self.ask(|reply| FleetMsg::RemoteDomain {

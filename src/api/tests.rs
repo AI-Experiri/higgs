@@ -2879,6 +2879,74 @@ async fn a_shadow_file_cannot_flip_a_resident_models_chat_verdict() {
     );
 }
 
+/// A scan row's `readiness` is NOT a reachability verdict — `chat_model_ids` is.
+///
+/// The mirror of the shadow test: the RESIDENT worker is the embedding file, and
+/// the generative variant is the one a fresh scan resolves FIRST. That first row
+/// therefore reads `Loaded` (readiness matches residency by ID, and this row's own
+/// scanned domain is `Llm`, so no terminal state short-circuits it) — while chat
+/// on the id is refused ([HG079]) against the resident worker's LOAD-TIME facts.
+///
+/// A consumer that derives its picker from `readiness` re-offers this id and every
+/// send 400s; that is the divergence `HiggsModelsResponse::chat_model_ids` exists
+/// to end. This test pins BOTH halves — the misleading row AND the honest list —
+/// so neither can be "reconciled" by teaching `chat_model_ids` to trust readiness.
+///
+/// It also pins why `chat_model_ids`' JIT leg needs no `local_non_chat` guard
+/// (only the remote leg has one): a resident id can never read `Servable`, so
+/// `servable_model_ids` cannot re-admit an id the domain filter dropped.
+#[tokio::test]
+async fn a_loaded_readiness_row_does_not_make_a_non_chat_id_reachable() {
+    let dir = tempfile::TempDir::new().unwrap();
+    // Embedding only, so the load resolves IT and the worker's facts say Embedding.
+    crate::serve::test_support::write_embedding_gguf_fixture(dir.path(), "org/flip");
+    let higgs = fake_higgs(vec![dir.path().to_path_buf()]);
+    seed_fresh_profile(&higgs, "org/flip", CtxLen::Fixed { n: 512 }).await;
+    higgs.load("org/flip", None).await.expect("load");
+
+    // AFTER the load, a generative variant lands under the SAME id with a
+    // path-lexically FIRST filename ("model-Q4_K_M.gguf" < "model-f16.gguf").
+    crate::serve::test_support::write_gguf_fixture(dir.path(), "org/flip");
+    let entries = higgs.model_entries().await.expect("scan");
+    let first = entries
+        .iter()
+        .find(|m| m.model.id == "org/flip")
+        .expect("scanned");
+    assert_eq!(
+        first.model.domain,
+        crate::worker::models::ModelDomain::Llm,
+        "precondition: the scan's FIRST variant for the id is now the generative file"
+    );
+
+    // The misleading half: that row reads `Loaded`.
+    assert_eq!(
+        first.readiness,
+        crate::serve::readiness::ModelReadiness::Loaded,
+        "precondition: the first row reads Loaded — residency is matched by id, and \
+         this row's own domain is Llm, so no terminal state masks it"
+    );
+
+    // The honest half: the id is NOT chat-reachable, and a chat proves it.
+    assert!(
+        !higgs
+            .chat_model_ids()
+            .await
+            .contains(&"org/flip".to_owned()),
+        "a `Loaded` readiness row must not make a non-generative resident reachable"
+    );
+    let err = higgs
+        .prepare_chat("org/flip", None, "[]")
+        .await
+        .expect_err("chat against the resident embedding worker must be refused");
+    assert!(
+        matches!(
+            err,
+            crate::diagnostic::HiggsError::ModelNotChatCapable { .. }
+        ),
+        "expected [HG079] ModelNotChatCapable, got: {err}"
+    );
+}
+
 /// `servable_model_ids` judges each id by its FIRST scan variant — the file a
 /// JIT load actually resolves. A tuned generative SECOND variant behind an
 /// embedding first file must not advertise an id every chat then refuses
