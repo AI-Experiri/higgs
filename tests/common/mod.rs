@@ -147,6 +147,52 @@ pub struct LocalHiggs {
     prev_hf: Option<std::ffi::OsString>,
 }
 
+impl LocalHiggs {
+    /// The staged scan root. Live: `Higgs::scan` re-reads the roots per call, so a
+    /// model written here AFTER construction is discovered by the next scan.
+    pub fn scan_root(&self) -> &Path {
+        self._scan.path()
+    }
+}
+
+/// Stage a synthetic EMBEDDING-only GGUF under `id` in `root` — a header-only file (no
+/// tensors) whose arch-scoped keys declare a pooling head and non-causal attention,
+/// exactly as `bge-small`/`qwen3-embedding` do on disk.
+///
+/// Header-only is sufficient and deliberate: the chat gate ([HG079]) refuses these
+/// BEFORE any load, so no engine ever opens the file. That is the property under test —
+/// if the gate regressed, the request would reach llama.cpp instead.
+pub fn stage_embedding_model(root: &Path, id: &str) {
+    use ggus::{GGufFileHeader, GGufFileWriter, GGufMetaDataValueType as T};
+    use std::io::Cursor;
+
+    fn gguf_str(s: &str) -> Vec<u8> {
+        let b = s.as_bytes();
+        let mut out = (b.len() as u64).to_le_bytes().to_vec();
+        out.extend_from_slice(b);
+        out
+    }
+
+    let kvs: Vec<(&str, T, Vec<u8>)> = vec![
+        ("general.architecture", T::String, gguf_str("bert")),
+        ("bert.pooling_type", T::U32, 2u32.to_le_bytes().to_vec()),
+        ("bert.attention.causal", T::Bool, vec![0u8]),
+        ("bert.context_length", T::U32, 512u32.to_le_bytes().to_vec()),
+        ("bert.block_count", T::U32, 12u32.to_le_bytes().to_vec()),
+    ];
+    let mut buf = Cursor::new(Vec::<u8>::new());
+    let mut w = GGufFileWriter::new(&mut buf, GGufFileHeader::new(3, 0, kvs.len() as u64))
+        .expect("gguf writer");
+    for (k, t, v) in &kvs {
+        w.write_meta_kv(k, *t, v).expect("write kv");
+    }
+    w.finish::<Vec<u8>>(false).finish().expect("finish gguf");
+
+    let dir = root.join(id);
+    std::fs::create_dir_all(&dir).expect("create embedding model dir");
+    std::fs::write(dir.join("model-f16.gguf"), buf.into_inner()).expect("write embedding gguf");
+}
+
 impl std::ops::Deref for LocalHiggs {
     type Target = Arc<Higgs>;
     fn deref(&self) -> &Arc<Higgs> {

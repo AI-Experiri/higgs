@@ -117,6 +117,10 @@ pub(crate) fn http_status(err: &HiggsError) -> StatusCode {
         HiggsError::ModelNotFound { .. } | HiggsError::ModelNotLoaded { .. } => {
             StatusCode::NOT_FOUND
         }
+        // The id exists and is loadable — it just isn't a chat model ([HG079]). The
+        // request is well-formed but asks the wrong capability of it, so 400, not the
+        // 404 of an absent/unloaded id: re-issuing it against this id can never work.
+        HiggsError::ModelNotChatCapable { .. } => StatusCode::BAD_REQUEST,
         // Missing/insufficient API key.
         HiggsError::Unauthorized => StatusCode::UNAUTHORIZED,
         // Refused state transition (last-key revoke on a LAN bind): the

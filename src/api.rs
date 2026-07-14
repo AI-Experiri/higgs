@@ -2300,6 +2300,7 @@ impl Higgs {
             max_context_length: scanned.and_then(|m| m.ctx_train),
             size_bytes: scanned.map(|m| m.size_bytes),
             has_chat_template: scanned.map(|m| m.has_chat_template),
+            domain: scanned.map(|m| m.domain),
             idle_ttl_minutes: None,
         }
     }
@@ -2330,6 +2331,7 @@ impl Higgs {
             max_context_length: scanned.and_then(|m| m.ctx_train),
             size_bytes: scanned.map(|m| m.size_bytes),
             has_chat_template: scanned.map(|m| m.has_chat_template),
+            domain: scanned.map(|m| m.domain),
             // Always `None` (= "uses the global idle TTL"): per-load idle-TTL
             // ENFORCEMENT is a deferred follow-up (the node reaper applies one
             // per-node TTL to every worker — runtime.rs `ReapIdle`), so surfacing a
@@ -3055,6 +3057,7 @@ impl Higgs {
             loaded,
             fits,
             serving,
+            chat_capable: model.domain == crate::worker::models::ModelDomain::Llm,
         });
         (readiness, fit)
     }

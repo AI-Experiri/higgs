@@ -40,6 +40,18 @@ pub enum HiggsError {
     #[diagnostic(code(HG002))]
     ModelNotFound { id: String },
 
+    /// Chat requested for a model whose GGUF header declares it embedding-only (a
+    /// pooling head and/or non-causal attention — see
+    /// [`crate::worker::models::ModelDomain`]). The engine would NOT fail on it: it
+    /// samples the embedding head and returns fluent nonsense, so this gate exists to
+    /// turn silently-wrong output into a refusal the client can act on.
+    #[snafu(display(
+        "[HG079] {id} is an embedding model ({arch}) — it cannot serve chat; pick a \
+         generative model"
+    ))]
+    #[diagnostic(code(HG079), severity(Error))]
+    ModelNotChatCapable { id: String, arch: String },
+
     /// Chat requested for a model that is not loaded — JIT auto-load is off, or a
     /// transient race (a restart/reap window) left it unloaded.
     #[snafu(display(

@@ -1,6 +1,8 @@
 use super::*;
 
-/// Build inputs for an on-disk model with the given flags.
+/// Build inputs for an on-disk, CHAT-CAPABLE model with the given flags — the
+/// ladder every case below exercises. Embedding-only models take the dedicated
+/// `chat_capable: false` cases at the bottom of this file.
 fn inputs(profiled: bool, stale: bool, loaded: bool, fits: bool, serving: bool) -> ReadinessInputs {
     ReadinessInputs {
         on_disk: true,
@@ -9,6 +11,7 @@ fn inputs(profiled: bool, stale: bool, loaded: bool, fits: bool, serving: bool) 
         loaded,
         fits,
         serving,
+        chat_capable: true,
     }
 }
 
@@ -122,4 +125,37 @@ fn missing_on_disk_is_discovered_fallback() {
         ..inputs(true, false, false, true, true)
     };
     assert_eq!(derive_readiness(&i), ModelReadiness::Discovered);
+}
+
+/// An embedding-only model is `Embedding` no matter where it sits on the chat ladder —
+/// including while RESIDENT. Reporting a loaded embedding model as `Loaded` would put it
+/// straight back into the model picker as a chat target, which is exactly the bug this
+/// state closes; `servable_model_ids` (readiness == `Servable`) drops it either way.
+#[test]
+fn an_embedding_model_never_climbs_the_chat_ladder() {
+    let embedding = |profiled, stale, loaded, fits, serving| ReadinessInputs {
+        chat_capable: false,
+        ..inputs(profiled, stale, loaded, fits, serving)
+    };
+    // Profiled, fresh, fits, serving on — would be `Servable` if it could chat.
+    assert_eq!(
+        derive_readiness(&embedding(true, false, false, true, true)),
+        ModelReadiness::Embedding
+    );
+    // Resident — `Embedding` outranks `Loaded`.
+    assert_eq!(
+        derive_readiness(&embedding(true, false, true, true, true)),
+        ModelReadiness::Embedding
+    );
+    // Untuned — still `Embedding`, not `Discovered`: tuning it changes nothing.
+    assert_eq!(
+        derive_readiness(&embedding(false, false, false, false, true)),
+        ModelReadiness::Embedding
+    );
+    // The same flags on a chat-capable model DO reach `Servable` — proving the
+    // demotion above comes from `chat_capable` and nothing else.
+    assert_eq!(
+        derive_readiness(&inputs(true, false, false, true, true)),
+        ModelReadiness::Servable
+    );
 }

@@ -1210,3 +1210,112 @@ fn supports_tools_follows_the_parser_registry_sniff() {
         "plain chat template advertises no tools"
     );
 }
+
+/// A GGUF whose header declares an embedding model must scan as
+/// [`ModelDomain::Embedding`] — the classification the chat gate ([HG079]) reads.
+///
+/// The two fixtures below are the two REAL shapes in the wild, and neither is
+/// catchable by the other's signal:
+///
+/// - `bert` / `bge-small` — an ENCODER: `attention.causal = false`, no chat template.
+/// - `qwen3` / `qwen3-embedding` — a DECODER converted for embedding: `pooling_type = 3`,
+///   causal attention, AND its base model's chat template. Every signal except
+///   `pooling_type` says "chat model".
+///
+/// (Key/value shapes verified against the actual files on disk.)
+fn write_gguf(dir: &TempDir, rel: &str, kvs: &[(&str, ggus::GGufMetaDataValueType, Vec<u8>)]) {
+    use ggus::{GGufFileHeader, GGufFileWriter};
+    use std::io::Cursor;
+    let header = GGufFileHeader::new(3, 0, kvs.len() as u64);
+    let mut buf = Cursor::new(Vec::<u8>::new());
+    let mut writer = GGufFileWriter::new(&mut buf, header).unwrap();
+    for (k, t, v) in kvs {
+        writer.write_meta_kv(k, *t, v).unwrap();
+    }
+    writer.finish::<Vec<u8>>(false).finish().unwrap();
+    write_file(&dir.path().join(rel), buf.into_inner().as_slice());
+}
+
+#[test]
+fn embedding_headers_scan_as_the_embedding_domain() {
+    use ggus::GGufMetaDataValueType as T;
+    let dir = TempDir::new().unwrap();
+
+    // Encoder: non-causal attention (bge-small's actual shape).
+    write_gguf(
+        &dir,
+        "enc/bge/model-f16.gguf",
+        &[
+            ("general.architecture", T::String, gguf_str("bert")),
+            ("bert.attention.causal", T::Bool, vec![0u8]),
+        ],
+    );
+    // Decoder converted for embedding: pooling head + a chat template it inherited.
+    write_gguf(
+        &dir,
+        "dec/qwen3emb/model-Q8_0.gguf",
+        &[
+            ("general.architecture", T::String, gguf_str("qwen3")),
+            ("qwen3.pooling_type", T::U32, 3u32.to_le_bytes().to_vec()),
+            (
+                "tokenizer.chat_template",
+                T::String,
+                gguf_str("{% for m in messages %}{{ m.content }}{% endfor %}"),
+            ),
+        ],
+    );
+    // A generative model that explicitly declares pooling NONE (0) stays an LLM —
+    // presence of the key is not the signal, a non-zero value is.
+    write_gguf(
+        &dir,
+        "gen/llama/model-Q4_K_M.gguf",
+        &[
+            ("general.architecture", T::String, gguf_str("llama")),
+            ("llama.pooling_type", T::U32, 0u32.to_le_bytes().to_vec()),
+            ("llama.attention.causal", T::Bool, vec![1u8]),
+        ],
+    );
+
+    let mut store = ModelStore::default();
+    let models = store.scan(&[dir.path().to_path_buf()], &[], &[]).unwrap();
+    let domain = |id: &str| {
+        models
+            .iter()
+            .find(|m| m.id == id)
+            .unwrap_or_else(|| panic!("{id} not scanned"))
+            .domain
+    };
+
+    assert_eq!(
+        domain("enc/bge"),
+        ModelDomain::Embedding,
+        "non-causal attention is an embedding declaration"
+    );
+    assert_eq!(
+        domain("dec/qwen3emb"),
+        ModelDomain::Embedding,
+        "a non-zero pooling_type is an embedding declaration EVEN WITH a chat template"
+    );
+    assert_eq!(
+        domain("gen/llama"),
+        ModelDomain::Llm,
+        "pooling_type 0 (NONE) + causal attention is a generative model"
+    );
+}
+
+/// A header with neither key present — the overwhelmingly common case, and the
+/// unreadable-header case — must stay `Llm`. The classifier only ever demotes on a
+/// POSITIVE declaration; it must never hide a chat model from the catalog.
+#[test]
+fn a_silent_header_stays_an_llm() {
+    use ggus::GGufMetaDataValueType as T;
+    let dir = TempDir::new().unwrap();
+    write_gguf(
+        &dir,
+        "org/quiet/model-Q4_K_M.gguf",
+        &[("general.architecture", T::String, gguf_str("llama"))],
+    );
+    let mut store = ModelStore::default();
+    let models = store.scan(&[dir.path().to_path_buf()], &[], &[]).unwrap();
+    assert_eq!(models[0].domain, ModelDomain::Llm);
+}

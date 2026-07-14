@@ -20,6 +20,7 @@ use crate::serve::wire::{
 };
 use crate::worker::engine::llamacpp::params::LlamaCppParams;
 use crate::worker::engine::{CtxLen, LoadParams};
+use crate::worker::models::ModelDomain;
 
 use super::{Higgs, LoadedInfo, NodeChatTestReport, PairInfo, PreparedChat, ProfileState};
 
@@ -64,6 +65,8 @@ impl Higgs {
     ///   benchmark candidate (fall through to the remote check, then `[HG068]`).
     /// - Remote-resident → a permissive placeholder [`LoadedInfo`] (the fleet routes
     ///   it; the remote worker's `[HG005]` is the prompt-fit backstop).
+    /// - Resident-but-embedding-only, or a scanned embedding-only JIT candidate →
+    ///   `[HG079]` `ModelNotChatCapable` (refused BEFORE any load).
     /// - Benchmark-owned and not remote → `[HG068]` `BenchInProgress`.
     /// - Not loaded, JIT OFF → `[HG003]` `ModelNotLoaded`.
     /// - Not loaded, JIT ON → must be a scanned id (`[HG002]` else), Prepared
@@ -74,6 +77,15 @@ impl Higgs {
         // re-checked AFTER the awaited resident lookup (a bench can make its
         // candidate transiently resident during the await), mirroring `ensure_loaded`.
         let local_bench_candidate = match self.local_loaded_info(model).await {
+            // Resident, but embedding-only: refuse [HG079] instead of generating from a
+            // pooling head. This arm is reachable — a model can be loaded explicitly
+            // (Load Model / a tune) without ever passing the JIT gate below.
+            Some(loaded) if loaded.domain == Some(ModelDomain::Embedding) => {
+                return Err(HiggsError::ModelNotChatCapable {
+                    id: model.to_owned(),
+                    arch: loaded.arch.unwrap_or_else(|| "unknown".into()),
+                });
+            }
             Some(loaded) if !self.is_benchmarking(model) => return Ok(loaded),
             Some(_) => true,
             None => false,
@@ -97,6 +109,9 @@ impl Higgs {
                 max_context_length: None,
                 size_bytes: None,
                 has_chat_template: None,
+                // UNKNOWN, not Llm: only the owning node scanned this file. Permissive
+                // here — that node's own [HG079] gate refuses an embedding model.
+                domain: None,
                 idle_ttl_minutes: None,
             });
         }
@@ -118,9 +133,18 @@ impl Higgs {
 
         // JIT path: the id must be a scanned model (never load an unknown id).
         let scanned = self.scan().await?;
-        if !scanned.iter().any(|m| m.id == model) {
+        let Some(candidate) = scanned.iter().find(|m| m.id == model) else {
             return Err(HiggsError::ModelNotFound {
                 id: model.to_owned(),
+            });
+        };
+        // …and it must be able to chat. Refuse BEFORE the load: JIT-loading an embedding
+        // model to then generate nonsense from it is the exact failure [HG079] exists to
+        // stop, and the refusal costs the caller nothing (no worker spawned).
+        if candidate.domain == ModelDomain::Embedding {
+            return Err(HiggsError::ModelNotChatCapable {
+                id: model.to_owned(),
+                arch: candidate.arch.clone().unwrap_or_else(|| "unknown".into()),
             });
         }
 

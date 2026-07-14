@@ -23,6 +23,11 @@ higgs_const_enum! {
         NeedsRetune,
         /// Resident in the worker, actively serving.
         Loaded,
+        /// Embedding-only (the GGUF declares a pooling head / non-causal attention) —
+        /// it can be tuned and loaded, but it is NOT a chat target and chat against it
+        /// is refused ([HG079]). A terminal classification, not a step toward
+        /// `Servable`: no amount of tuning or free memory makes it generate.
+        Embedding,
     }
 }
 
@@ -42,6 +47,9 @@ pub struct ReadinessInputs {
     pub fits: bool,
     /// Serving is enabled on this node.
     pub serving: bool,
+    /// The model can generate text at all — its GGUF header does not declare it
+    /// embedding-only ([`crate::worker::models::ModelDomain::Llm`]).
+    pub chat_capable: bool,
 }
 
 /// Does an estimated footprint fit the model into the resources free **right
@@ -70,10 +78,18 @@ pub fn footprint_fits_free(
 
 /// Collapse the facts into one state.
 ///
-/// Precedence: `Loaded` (resident — true regardless of staleness/fit) > not on
-/// disk or not profiled → `Discovered` > stale → `NeedsRetune` > serving off →
-/// `Profiled` > fits → `Servable` else `Unservable`.
+/// Precedence: not chat-capable → `Embedding` (terminal — outranks residency, because
+/// a resident embedding model is still not a chat target) > `Loaded` (resident — true
+/// regardless of staleness/fit) > not on disk or not profiled → `Discovered` > stale →
+/// `NeedsRetune` > serving off → `Profiled` > fits → `Servable` else `Unservable`.
 pub fn derive_readiness(i: &ReadinessInputs) -> ModelReadiness {
+    // Ahead of `loaded`: the chat-serving ladder (Discovered → … → Servable) does not
+    // apply to a model that cannot chat, and residency does not change that. A resident
+    // embedding model is still `Embedding` — reporting it `Loaded` would put it back in
+    // the picker as a chat target, which is the bug this state exists to close.
+    if !i.chat_capable {
+        return ModelReadiness::Embedding;
+    }
     if i.loaded {
         return ModelReadiness::Loaded;
     }

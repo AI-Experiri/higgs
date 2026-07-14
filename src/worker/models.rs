@@ -22,6 +22,30 @@ higgs_const_enum! {
     }
 }
 
+higgs_const_enum! {
+    /// What a scanned model is FOR — the capability class the GGUF header declares.
+    ///
+    /// A GGUF is not self-evidently a chat model: an embedding conversion carries a
+    /// pooling head (and, for encoder architectures, non-causal attention) and cannot
+    /// generate text. Feeding one to `/v1/chat/completions` does not fail — llama.cpp
+    /// happily samples from it and returns fluent-looking garbage — so the class has
+    /// to be read from the header and enforced, never inferred at generation time.
+    ///
+    /// Deliberately NOT derived from `has_chat_template`: `qwen3-embedding` ships the
+    /// base model's chat template (verified in its header) while being pure embedding.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ModelDomain {
+        /// Generative: causal attention, no pooling head — a valid chat target.
+        #[default]
+        Llm,
+        /// Embedding-only: the header declares a pooling head and/or non-causal
+        /// attention. Not a chat target (see [`crate::diagnostic::HiggsError::ModelNotChatCapable`]);
+        /// a future `/v1/embeddings` is what serves it.
+        Embedding,
+    }
+}
+
 higgs_ts! {
     /// One discoverable model file on disk.
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,6 +111,13 @@ higgs_ts! {
     /// Whether `tokenizer.chat_template` is present in the GGUF header.
     /// `false` when the header could not be read.
     pub has_chat_template: bool,
+    /// The capability class read from the GGUF header ([`ModelDomain`]) — whether this
+    /// model can serve chat at all. `serde(default)` = [`ModelDomain::Llm`], which is
+    /// both the pre-field wire behaviour and the safe read of an unreadable header:
+    /// an unenrichable model stays a chat candidate and fails (if it fails) at load,
+    /// rather than being silently hidden from the catalog.
+    #[serde(default)]
+    pub domain: ModelDomain,
     /// Whether the chat template declares tool/function calling. Heuristic: the
     /// embedded template references tool calls (`tool_call`/`tools`). `false`
     /// when there is no template or it carries no tool markup. `serde(default)`
@@ -150,6 +181,7 @@ impl HiggsModel {
             embedding_length: None,
             expert_count: None,
             has_chat_template: false,
+            domain: ModelDomain::Llm,
             supports_tools: false,
             supports_reasoning: false,
             gguf_components: Vec::new(),
@@ -301,6 +333,7 @@ fn enrich_from_gguf(model: &mut HiggsModel, mmap: &memmap2::Mmap) {
         model.head_count_kv = read_u32("attention.head_count_kv");
         model.embedding_length = read_u32("embedding_length");
         model.expert_count = read_u32("expert_count");
+        model.domain = read_domain(&gguf, a);
     }
     // Read the embedded chat template once and derive capabilities from it
     // (the template is the GGUF's own declaration of how it talks).
@@ -321,6 +354,36 @@ fn enrich_from_gguf(model: &mut HiggsModel, mmap: &memmap2::Mmap) {
         model.chat_template = Some(t.to_string());
     }
     model.gguf_components = curated_components(&gguf, arch.as_deref());
+}
+
+/// Read the capability class ([`ModelDomain`]) out of the arch-scoped GGUF header.
+///
+/// Two independent header declarations mark a model as embedding-only, and BOTH are
+/// needed — neither alone covers the field:
+///
+/// - `{arch}.pooling_type` non-zero. `0` is llama.cpp's `NONE` (no pooling head), so a
+///   generative model that happens to carry the key stays [`ModelDomain::Llm`]. This is
+///   what catches a DECODER converted for embedding: `qwen3-embedding` reports
+///   `qwen3.pooling_type = 3` under `general.architecture = qwen3`, with a chat template
+///   inherited from its base model and causal attention — every other signal says "chat".
+/// - `{arch}.attention.causal == false`. This is what catches an ENCODER: `bge-small`
+///   reports `bert.attention.causal = false`. Bidirectional attention cannot autoregress.
+///
+/// Absent keys mean absent evidence → [`ModelDomain::Llm`] (the pre-existing behaviour):
+/// this classifier only ever demotes a model on a POSITIVE declaration, so a sparse or
+/// unreadable header never hides a chat model from the catalog.
+fn read_domain(gguf: &GGuf, arch: &str) -> ModelDomain {
+    let pooled = gguf
+        .get_usize(&format!("{arch}.pooling_type"))
+        .is_ok_and(|p| p != 0);
+    let bidirectional = gguf
+        .get_bool(&format!("{arch}.attention.causal"))
+        .is_ok_and(|causal| !causal);
+    if pooled || bidirectional {
+        ModelDomain::Embedding
+    } else {
+        ModelDomain::Llm
+    }
 }
 
 /// Build the curated list of LOAD-RELEVANT GGUF header fields for the UI.

@@ -219,6 +219,13 @@ higgs_ts! {
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         pub has_chat_template: Option<bool>,
+        /// The resident model's capability class, filled from the host scan. `None` =
+        /// UNKNOWN, not "chat": the remote-routed placeholder leaves it unset because
+        /// only the owning node has scanned that file — the chat gate treats `None` as
+        /// permissive and lets the remote node's own [HG079] be the backstop.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub domain: Option<crate::worker::models::ModelDomain>,
         /// Per-load idle-TTL override in minutes. RESERVED: per-load idle-TTL
         /// enforcement is a deferred follow-up (the node reaper applies one per-node
         /// TTL to every worker), so this is currently ALWAYS absent — every loaded

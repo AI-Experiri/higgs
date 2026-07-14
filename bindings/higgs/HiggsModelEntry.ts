@@ -2,6 +2,7 @@
 import type { GgufComponent } from "./GgufComponent";
 import type { HiggsModelSource } from "./HiggsModelSource";
 import type { LoadParams } from "./LoadParams";
+import type { ModelDomain } from "./ModelDomain";
 import type { ModelFit } from "./ModelFit";
 import type { ModelReadiness } from "./ModelReadiness";
 import type { TuneProvenance } from "./TuneProvenance";
@@ -157,6 +158,14 @@ expert_count?: number,
  * `false` when the header could not be read.
  */
 has_chat_template: boolean, 
+/**
+ * The capability class read from the GGUF header ([`ModelDomain`]) — whether this
+ * model can serve chat at all. `serde(default)` = [`ModelDomain::Llm`], which is
+ * both the pre-field wire behaviour and the safe read of an unreadable header:
+ * an unenrichable model stays a chat candidate and fails (if it fails) at load,
+ * rather than being silently hidden from the catalog.
+ */
+domain: ModelDomain, 
 /**
  * Whether the chat template declares tool/function calling. Heuristic: the
  * embedded template references tool calls (`tool_call`/`tools`). `false`

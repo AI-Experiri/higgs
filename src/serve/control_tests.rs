@@ -23,6 +23,7 @@ fn model_with_template(template: Option<&str>) -> crate::worker::models::HiggsMo
         embedding_length: None,
         expert_count: None,
         has_chat_template: template.is_some(),
+        domain: crate::worker::models::ModelDomain::Llm,
         supports_tools: false,
         supports_reasoning: false,
         gguf_components: Vec::new(),

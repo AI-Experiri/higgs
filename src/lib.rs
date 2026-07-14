@@ -45,6 +45,9 @@ pub use delta_queue::DeltaReceiver;
 pub use diagnostic::HiggsError;
 pub use keys::Scope;
 pub use log_bus::{log_filter, HiggsLogLayer, LogBus, LogLine, LogSource};
+// The per-model capability class + readiness state an embedder's UI renders (a
+// `ModelReadiness::Embedding` row is not a chat target — see `HiggsError::ModelNotChatCapable`).
+pub use serve::readiness::ModelReadiness;
 pub use serve::wire::{
     HiggsCorsSettings, HiggsHubStatus, HiggsKeyRemoved, HiggsMintKeyResponse, HiggsModelEntry,
     HiggsRuntimeSettings, HiggsVersionResponse, LogSettings,
@@ -53,6 +56,7 @@ pub use shutdown::shutdown_signal;
 pub use supervisor::HiggsEvent;
 pub use tune::{EstimateReport, EstimateRequest, TuneRequest, TuneSuggestion};
 pub use worker::engine::{ChatDelta, ChatDeltaKind, LoadParams, SamplingParams};
+pub use worker::models::ModelDomain;
 
 /// Serializes lib tests that mutate the process-global `HIGGS_HOME` env var (which cargo runs
 /// in parallel threads of one process), so they never read each other's override or a path
