@@ -73,6 +73,26 @@ async fn an_embedding_model_is_refused_for_chat_and_never_advertised() {
         "the refusal must carry the embedding-model code so a client can act on it; got: {message}"
     );
 
+    // ── `stream: true` refuses the same way, BEFORE any SSE commits: the gate
+    // runs pre-stream, so a streaming client gets the same HTTP 400, not a 200
+    // whose error arrives as an in-stream event. ──
+    let resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": EMBED_ID,
+            "stream": true,
+            "messages": [ { "role": "user", "content": "hi" } ],
+            "max_tokens": 16,
+        }))
+        .send()
+        .await
+        .expect("streaming chat request");
+    assert_eq!(
+        resp.status(),
+        400,
+        "a streaming chat against an embedding model must 400 before SSE commits"
+    );
+
     // ── …and it must not be advertised to OpenAI clients as a chat model. ──
     let listed: serde_json::Value = client
         .get(format!("{base}/v1/models"))

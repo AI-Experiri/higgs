@@ -107,8 +107,11 @@ mailbox — no mutex, so concurrent ops can't interleave across an `.await`.
   the file, alongside its arch) is not `Llm`: llama.cpp will happily sample fluent nonsense
   from an embedding/reranker head, so the refusal must live where every dispatch converges,
   on load-time facts a post-load file deletion or scan failure can't reopen. The facade's own
-  scan-derived `[HG079]` arms in `resolve_loaded` are fast-path courtesies, not the
-  enforcement. Refusal is not a chat: no activity stamp, no in-flight hold, no `ChatStart`.
+  facade's pre-stream `[HG079]` arms in `resolve_loaded` read the SAME facts — the
+  resident arm via `worker_domains()` (this actor's `LoadFacts`), the remote arm via the
+  node-reported inventory domain — never a fresh scan, which a same-id shadow file added
+  after the load could flip (codex r3). Refusal is not a chat: no activity stamp, no
+  in-flight hold, no `ChatStart`.
 
 ### `HubFleet` (`fleet.rs`)
 

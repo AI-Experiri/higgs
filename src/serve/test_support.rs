@@ -227,9 +227,42 @@ pub(crate) fn write_embedding_gguf_fixture(root: &std::path::Path, id: &str) {
         .unwrap();
     writer.finish::<Vec<u8>>(false).finish().unwrap();
 
-    let path = root.join(id).join("model-f16.gguf");
+    write_named(root, id, "model-f16.gguf", buf.into_inner());
+}
+
+/// [`write_embedding_gguf_fixture`] with a caller-chosen FILENAME — scan order
+/// inside one model dir is path-lexical, so tests that need the embedding
+/// variant to sort before/after a sibling control the order through the name.
+pub(crate) fn write_embedding_gguf_fixture_named(root: &std::path::Path, id: &str, filename: &str) {
+    // Re-build the same header bytes (cheap; keeps ONE source of the fixture shape).
+    use ggus::{GGufFileHeader, GGufFileWriter, GGufMetaDataValueType as T};
+    use std::io::Cursor;
+    fn gguf_string(s: &str) -> Vec<u8> {
+        let bytes = s.as_bytes();
+        let mut out = Vec::with_capacity(8 + bytes.len());
+        out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        out.extend_from_slice(bytes);
+        out
+    }
+    let kvs: Vec<(&str, T, Vec<u8>)> = vec![
+        ("general.architecture", T::String, gguf_string("bert")),
+        ("bert.context_length", T::U32, 512u32.to_le_bytes().to_vec()),
+        ("bert.pooling_type", T::U32, 2u32.to_le_bytes().to_vec()),
+        ("bert.attention.causal", T::Bool, vec![0u8]),
+    ];
+    let mut buf = Cursor::new(Vec::<u8>::new());
+    let mut w = GGufFileWriter::new(&mut buf, GGufFileHeader::new(3, 0, kvs.len() as u64)).unwrap();
+    for (k, t, v) in &kvs {
+        w.write_meta_kv(k, *t, v).unwrap();
+    }
+    w.finish::<Vec<u8>>(false).finish().unwrap();
+    write_named(root, id, filename, buf.into_inner());
+}
+
+fn write_named(root: &std::path::Path, id: &str, filename: &str, bytes: Vec<u8>) {
+    let path = root.join(id).join(filename);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(&path, buf.into_inner()).unwrap();
+    std::fs::write(&path, bytes).unwrap();
 }
 
 /// A `GET` request to `uri`. Carries a loopback `Host` so it passes the

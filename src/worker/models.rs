@@ -394,6 +394,11 @@ fn enrich_from_gguf(model: &mut HiggsModel, mmap: &memmap2::Mmap) {
 /// Absent keys mean absent evidence → [`ModelDomain::Llm`] (the pre-existing behaviour):
 /// this classifier only ever demotes a model on a POSITIVE declaration, so a sparse or
 /// unreadable header never hides a chat model from the catalog.
+///
+/// `Embedding` is a FAMILY label, not a claim about output shape: any bidirectional
+/// non-generative conversion (a bert classifier, an MLM) lands here too. The refusal
+/// is what matters — none of them can autoregress — and the UI copy says
+/// "non-generative" rather than promising vectors (codex r3).
 fn read_domain(gguf: &GGuf, arch: &str) -> ModelDomain {
     // llama.cpp's pooling enum: 0 NONE, 1 MEAN, 2 CLS, 3 LAST, 4 RANK. RANK is a
     // reranker's declaration (scores, not vectors) — its own domain, so a future

@@ -76,21 +76,35 @@ impl Higgs {
         // Already locally served — serve it, no load. Benchmark exclusivity is
         // re-checked AFTER the awaited resident lookup (a bench can make its
         // candidate transiently resident during the await), mirroring `ensure_loaded`.
-        let local_bench_candidate = match self.local_loaded_info(model).await {
-            // Resident, but non-generative (embedding/reranker): refuse [HG079] instead
-            // of generating from a pooling head. This arm is reachable — a model can be
-            // loaded explicitly (Load Model / a tune) without ever passing the JIT gate
-            // below. A fast-path courtesy only: the LOAD-TIME domain gate at the node
-            // actor's `ChatHandle` (the dispatch choke point) is the enforcement, and
-            // holds even when this scan-derived read goes permissive (file deleted
-            // after load, enrichment failure).
-            Some(loaded) if loaded.domain.is_some_and(|d| d != ModelDomain::Llm) => {
-                return Err(HiggsError::ModelNotChatCapable {
-                    id: model.to_owned(),
-                    arch: loaded.arch.unwrap_or_else(|| "unknown".into()),
-                    domain: loaded.domain.unwrap_or(ModelDomain::Embedding),
-                });
+        // Resident, but non-generative (embedding/reranker): refuse [HG079] BEFORE a
+        // response stream commits. Reachable — a model can be loaded explicitly
+        // (Load Model / a tune) without ever passing the JIT gate below. The verdict
+        // reads the worker's LOAD-TIME domain (`worker_domains` — the SAME facts the
+        // `ChatHandle` choke point enforces), NEVER the scan: a shadow file added
+        // under the same id after the load would flip a scan-derived answer and
+        // falsely refuse a genuinely generative resident (codex r3). Permissive when
+        // the worker has no facts — the choke point still enforces.
+        let resident_domain = {
+            let served = self.local_served().await;
+            match served.get(model) {
+                Some((worker, _raw)) => self.local.worker_domains().await.get(worker).copied(),
+                None => None,
             }
+        };
+        if let Some(domain) = resident_domain.filter(|d| *d != ModelDomain::Llm) {
+            let scanned_arch = self
+                .scan()
+                .await
+                .ok()
+                .and_then(|ms| ms.into_iter().find(|m| m.id == model).and_then(|m| m.arch));
+            return Err(HiggsError::ModelNotChatCapable {
+                id: model.to_owned(),
+                arch: scanned_arch.unwrap_or_else(|| "unknown".into()),
+                domain,
+            });
+        }
+
+        let local_bench_candidate = match self.local_loaded_info(model).await {
             Some(loaded) if !self.is_benchmarking(model) => return Ok(loaded),
             Some(_) => true,
             None => false,
@@ -103,6 +117,25 @@ impl Higgs {
             None => false,
         };
         if is_remote {
+            // The hub-side pre-stream refusal for MODERN nodes: the cached inventory
+            // carries the remote worker's load-time domain, so a non-generative
+            // target 400s HERE — before `stream: true` commits an SSE response the
+            // node's own refusal could only reach as an in-stream error. Unknown
+            // (no cache/row, or an older node) stays permissive: the node's
+            // `ChatHandle` gate is the enforcement.
+            if let Some(fleet) = self.fleet() {
+                if let Some(domain) = fleet
+                    .remote_domain(model)
+                    .await
+                    .filter(|d| *d != ModelDomain::Llm)
+                {
+                    return Err(HiggsError::ModelNotChatCapable {
+                        id: model.to_owned(),
+                        arch: "remote".into(),
+                        domain,
+                    });
+                }
+            }
             return Ok(LoadedInfo {
                 id: model.to_owned(),
                 worker_id: 0,
@@ -907,25 +940,26 @@ impl Higgs {
     /// omit fleet-routed remotes and (JIT-off) local-served ids, silently shrinking
     /// the picker — hence this method, not that call.
     pub async fn chat_model_ids(&self) -> Vec<String> {
-        let mut ids = self.local_served_ids().await;
-        // A RESIDENT embedding model is served by a worker (explicit loads are
+        // A RESIDENT non-generative model is served by a worker (explicit loads are
         // allowed — only chat is refused, [HG079]) but is NOT chat-reachable, so it
-        // must not be advertised here. Best-effort: a failed scan keeps the id — the
-        // same permissive read as the chat gate's `domain: None`, and the gate is
-        // the enforcement either way.
-        if let Ok(scanned) = self.scan().await {
-            ids.retain(|id| {
-                // FIRST match, not `any`: on an id collision across stores the load
-                // path (`ModelStore::get`) resolves to the first scanned variant, so
-                // the resident worker IS that variant — judging the id by any other
-                // same-id file would hide a resident generative model because some
-                // other store carries an embedding conversion under the same name.
-                scanned
-                    .iter()
-                    .find(|m| &m.id == id)
-                    .is_none_or(|m| m.domain == crate::worker::models::ModelDomain::Llm)
-            });
-        }
+        // must not be advertised. Judged by each worker's LOAD-TIME domain — the
+        // facts the `ChatHandle` gate enforces — never by re-scanning: a shadow file
+        // added under the same id after the load would flip a scan answer and hide a
+        // genuinely generative resident (codex r3). No facts for a worker → keep the
+        // id (permissive; the gate enforces).
+        let domains = self.local.worker_domains().await;
+        let mut ids: Vec<String> = self
+            .local_served()
+            .await
+            .into_iter()
+            .filter(|(_, (worker, _))| {
+                domains
+                    .get(worker)
+                    .is_none_or(|d| *d == crate::worker::models::ModelDomain::Llm)
+            })
+            .map(|(served, _)| served)
+            .collect();
+        ids.sort();
         // Advertise servable (JIT-loadable) catalog ids too, but ONLY while JIT is
         // on — with JIT off an unloaded servable model is not reachable.
         if self.jit_enabled() {

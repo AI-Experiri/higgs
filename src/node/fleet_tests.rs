@@ -2324,3 +2324,35 @@ async fn a_non_generative_remote_worker_is_unadvertised_but_still_refused_on_the
         "the node's refusal code survives the relay: {err}"
     );
 }
+
+/// The HUB refuses a chat against a remote non-generative worker BEFORE any
+/// dispatch — directly from `resolve_loaded`'s remote arm, using the domain the
+/// node's inventory reported. This is what keeps `stream: true` a clean HTTP
+/// 400 instead of a 200/SSE whose refusal arrives as an in-stream error.
+/// Fail-on-revert: without the pre-refusal the error only comes back from the
+/// node over the wire as a `WorkerRpc` — a different variant.
+#[tokio::test]
+async fn the_hub_refuses_a_remote_non_generative_chat_before_dispatch() {
+    let (fleet, node_key, _model_id, root) = fleet_with_one_node().await;
+    crate::serve::test_support::write_embedding_gguf_fixture(root.path(), "org/embed");
+    fleet.load(&node_key, "org/embed", None).await.unwrap();
+    fleet.refresh_inventory(&node_key).await.unwrap();
+
+    let higgs = crate::api::Higgs::with_log_bus(
+        crate::api::HiggsConfig::default(),
+        Arc::new(crate::log_bus::LogBus::new()),
+    );
+    higgs.set_fleet(fleet.clone());
+
+    let err = higgs
+        .prepare_chat("org/embed", None, "[]")
+        .await
+        .expect_err("the hub must refuse before dispatch");
+    assert!(
+        matches!(
+            err,
+            crate::diagnostic::HiggsError::ModelNotChatCapable { .. }
+        ),
+        "a DIRECT [HG079] from the hub's own gate (not a relayed WorkerRpc): {err}"
+    );
+}

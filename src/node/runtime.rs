@@ -187,6 +187,16 @@ enum NodeMsg {
     WorkerIds {
         reply: oneshot::Sender<Vec<WorkerId>>,
     },
+    /// The LOAD-TIME domain of every resident worker (`LoadFacts.domain`) — the
+    /// SAME facts the `ChatHandle` gate enforces, exposed so the facade's
+    /// advertising and pre-stream refusals agree with the gate instead of
+    /// re-deriving from the mutable scan (a shadow file added after the load
+    /// would otherwise flip the answer).
+    WorkerDomains {
+        reply: oneshot::Sender<
+            std::collections::HashMap<WorkerId, crate::worker::models::ModelDomain>,
+        >,
+    },
     ChatHandle {
         id: WorkerId,
         reply: oneshot::Sender<Result<ChatLease, HiggsError>>,
@@ -337,6 +347,12 @@ struct LoadFacts {
     /// RESOLVED THE FILE. `ChatHandle` gates on this — not on a fresh scan — so a
     /// post-load file deletion, enrichment failure, or id collision cannot re-open
     /// the chat door for a non-generative worker ([HG079]).
+    ///
+    /// RESIDUAL (accepted, codex r3): a supervisor crash-restart replays the
+    /// recorded `M_LOAD` by PATH without re-reading these facts — a file REPLACED
+    /// in place across that window loads the new content under the old facts.
+    /// That window inherits a pre-existing identity hazard (the replayed "model X"
+    /// is silently different weights, domain aside), so it is not closed here.
     domain: crate::worker::models::ModelDomain,
     /// The GGUF arch at load time, for the [HG079] diagnostic.
     arch: Option<String>,
@@ -553,6 +569,14 @@ impl Actor for NodeActor {
             }
             NodeMsg::WorkerIds { reply } => {
                 let _ = reply.send(self.registry.ids());
+            }
+            NodeMsg::WorkerDomains { reply } => {
+                let _ = reply.send(
+                    self.load_facts
+                        .iter()
+                        .map(|(id, f)| (*id, f.domain))
+                        .collect(),
+                );
             }
             NodeMsg::ChatHandle { id, reply } => {
                 let lease = match self.registry.get(id).cloned() {
@@ -1328,6 +1352,22 @@ impl NodeRuntime {
         let (tx, rx) = oneshot::channel();
         if self.handle.send(NodeMsg::Gpus { reply: tx }).is_err() {
             return Vec::new();
+        }
+        rx.await.unwrap_or_default()
+    }
+
+    /// Every resident worker's LOAD-TIME domain (empty if the actor has stopped).
+    /// See [`NodeMsg::WorkerDomains`] for why this exists next to the scan.
+    pub(crate) async fn worker_domains(
+        &self,
+    ) -> std::collections::HashMap<WorkerId, crate::worker::models::ModelDomain> {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .handle
+            .send(NodeMsg::WorkerDomains { reply: tx })
+            .is_err()
+        {
+            return Default::default();
         }
         rx.await.unwrap_or_default()
     }

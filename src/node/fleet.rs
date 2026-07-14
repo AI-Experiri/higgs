@@ -186,6 +186,13 @@ enum FleetMsg {
         served: String,
         reply: oneshot::Sender<bool>,
     },
+    /// The cached-inventory domain for one (node, worker) — `None` when no
+    /// inventory/row is cached (see `HubFleet::remote_domain`).
+    RemoteDomain {
+        node: NodeKey,
+        worker: WorkerId,
+        reply: oneshot::Sender<Option<crate::worker::models::ModelDomain>>,
+    },
     RoutedModels {
         reply: oneshot::Sender<Vec<String>>,
     },
@@ -814,6 +821,19 @@ impl Actor for FleetActor {
             }
             FleetMsg::RoutedModels { reply } => {
                 let _ = reply.send(self.routed_models());
+            }
+            FleetMsg::RemoteDomain {
+                node,
+                worker,
+                reply,
+            } => {
+                let domain = self.inventories.get(&node).and_then(|(inv, _)| {
+                    inv.workers
+                        .iter()
+                        .find(|w| w.worker_id == worker.0)
+                        .map(|w| w.domain)
+                });
+                let _ = reply.send(domain);
             }
             FleetMsg::ServedOn { node, reply } => {
                 let mut v: Vec<_> = self
@@ -2131,6 +2151,22 @@ impl HubFleet {
             .await
             .ok()
             .map(|(node, worker, _model)| (node, worker))
+    }
+
+    /// The CACHED-inventory domain of the remote worker behind `served`, when the
+    /// hub knows it. `None` = unknown (no route, no cached inventory/row, or an
+    /// older node that never reports domains) — callers stay permissive and the
+    /// node's own `ChatHandle` gate remains the enforcement. `Some` lets the hub
+    /// refuse a non-generative remote target BEFORE committing a response stream.
+    pub async fn remote_domain(&self, served: &str) -> Option<crate::worker::models::ModelDomain> {
+        let (node, worker) = self.resolve(served).await?;
+        self.ask(|reply| FleetMsg::RemoteDomain {
+            node,
+            worker,
+            reply,
+        })
+        .await
+        .flatten()
     }
 
     /// Is this served instance id resident on some remote node? TRUE for ANY durable

@@ -2782,3 +2782,52 @@ async fn an_id_collision_does_not_hide_the_resident_generative_variant() {
          embedding file"
     );
 }
+
+/// A shadow file appearing under a resident model's id must not flip the chat
+/// verdict: the resident checks read the worker's LOAD-TIME domain (the same
+/// facts the `ChatHandle` gate enforces), never a re-scan. Fail-on-revert for
+/// the scan-derived logic this replaces (codex r3): with the shadow sorting
+/// path-first, a scan-based resident arm falsely refuses [HG079] and a
+/// scan-based listing filter hides the id.
+#[tokio::test]
+async fn a_shadow_file_cannot_flip_a_resident_models_chat_verdict() {
+    let dir = tempfile::TempDir::new().unwrap();
+    crate::serve::test_support::write_gguf_fixture(dir.path(), "org/shadow");
+    let higgs = fake_higgs(vec![dir.path().to_path_buf()]);
+    seed_fresh_profile(&higgs, "org/shadow", CtxLen::Fixed { n: 512 }).await;
+    higgs.load("org/shadow", None).await.expect("load");
+
+    // AFTER the load, an embedding conversion lands under the SAME id with a
+    // path-lexically FIRST filename — the variant a fresh scan resolves first.
+    crate::serve::test_support::write_embedding_gguf_fixture_named(
+        dir.path(),
+        "org/shadow",
+        "model-0-shadow.gguf",
+    );
+    let first = higgs
+        .scan()
+        .await
+        .expect("scan")
+        .into_iter()
+        .find(|m| m.id == "org/shadow")
+        .expect("scanned");
+    assert_eq!(
+        first.domain,
+        crate::worker::models::ModelDomain::Embedding,
+        "precondition: the scan's first variant is now the embedding shadow"
+    );
+
+    // The RESIDENT worker is still the generative file it loaded: chat resolves…
+    higgs
+        .prepare_chat("org/shadow", None, "[]")
+        .await
+        .expect("the resident generative model still chats — no false [HG079]");
+    // …and the id stays advertised.
+    assert!(
+        higgs
+            .chat_model_ids()
+            .await
+            .contains(&"org/shadow".to_owned()),
+        "the resident generative model stays advertised despite the shadow file"
+    );
+}
