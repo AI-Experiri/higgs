@@ -948,14 +948,19 @@ impl Higgs {
         // genuinely generative resident (codex r3). No facts for a worker → keep the
         // id (permissive; the gate enforces).
         let domains = self.local.worker_domains().await;
+        let mut local_non_chat: HashSet<String> = HashSet::new();
         let mut ids: Vec<String> = self
             .local_served()
             .await
             .into_iter()
-            .filter(|(_, (worker, _))| {
-                domains
+            .filter(|(served, (worker, _))| {
+                let capable = domains
                     .get(worker)
-                    .is_none_or(|d| *d == crate::worker::models::ModelDomain::Llm)
+                    .is_none_or(|d| *d == crate::worker::models::ModelDomain::Llm);
+                if !capable {
+                    local_non_chat.insert(served.clone());
+                }
+                capable
             })
             .map(|(served, _)| served)
             .collect();
@@ -975,7 +980,13 @@ impl Higgs {
             None => HashSet::new(),
         };
         for id in &remote_ids {
-            if !ids.contains(id) {
+            // A same-id remote route does NOT resurrect an id the local domain
+            // filter dropped: dispatch resolves LOCAL FIRST, so every chat on that
+            // id hits the resident non-generative worker's [HG079] — advertising it
+            // via the remote leg would promise a chat that can never happen
+            // (Fable r9). The one benchmark exception below is different: a bench
+            // candidate is TRANSIENT and dispatch deliberately skips it.
+            if !ids.contains(id) && !local_non_chat.contains(id) {
                 ids.push(id.clone());
             }
         }

@@ -2568,3 +2568,85 @@ async fn a_stale_inventory_row_does_not_unadvertise_a_reused_worker_id() {
         "a matching reranker row filters its own route"
     );
 }
+
+/// A same-id REMOTE route does not resurrect an id the LOCAL domain filter
+/// dropped from `/v1/models`: dispatch resolves local first, so a chat on that
+/// id always hits the resident non-generative worker's [HG079] — advertising it
+/// via the remote leg promises a chat that can never happen (Fable r9; a
+/// cross-machine id collision, so it fails SAFE — the honest fix is to not
+/// advertise). Fail-on-revert: the plain `!ids.contains` remote union re-adds it.
+#[tokio::test]
+async fn a_remote_route_does_not_resurrect_a_local_non_chat_id() {
+    // The NODE serves a (dummy, generative-scanning) model under the SAME id the
+    // hub holds locally as an embedding model.
+    let (node_root, model_id) = stage_dummy_model("org/dual2");
+    let hub_ep = local_endpoint().await;
+    let node_ep = local_endpoint().await;
+    let hub_addr = hub_ep.addr();
+    let node_key = node_ep.id().to_string();
+    let rt = Arc::new(fake_runtime(vec![node_root.path().to_path_buf()]));
+    tokio::spawn(async move {
+        let conn = node_ep.connect(hub_addr, ALPN).await.expect("connect");
+        serve_node(conn, rt).await;
+    });
+    let conn = hub_ep
+        .accept()
+        .await
+        .expect("incoming")
+        .await
+        .expect("conn");
+    std::mem::forget(hub_ep);
+
+    let bus = Arc::new(crate::log_bus::LogBus::new());
+    let fleet = Arc::new(HubFleet::new(bus.clone()));
+    fleet
+        .add_node(
+            node_key.clone(),
+            Arc::new(NodeTransport::new(conn)),
+            None,
+            None,
+            None,
+            false,
+        )
+        .await;
+
+    // The HUB's local side: a stateful-fake node with an EMBEDDING model under
+    // the same id, explicitly loaded (loads are allowed; only chat refuses).
+    let local_dir = tempfile::TempDir::new().unwrap();
+    crate::serve::test_support::write_embedding_gguf_fixture(local_dir.path(), "org/dual2");
+    let local = Arc::new(crate::node::test_support::fake_runtime_stateful(vec![
+        local_dir.path().to_path_buf(),
+    ]));
+    let higgs = crate::api::Higgs::with_local(
+        local,
+        crate::api::HiggsConfig {
+            lmstudio_dirs: vec![local_dir.path().to_path_buf()],
+            hf_dirs: vec![],
+            ollama_dirs: vec![],
+            default_load: crate::api::HiggsConfig::default().default_load,
+            worker_exe: None,
+        },
+    );
+    higgs.set_fleet(fleet.clone());
+    higgs
+        .load("org/dual2", None)
+        .await
+        .expect("explicit local load of the embedding model");
+
+    // Route the node's same-id model remotely.
+    fleet.load(&node_key, &model_id, None).await.unwrap();
+    assert!(
+        fleet.routed_models().await.contains(&model_id),
+        "the remote route itself exists and is advertisable on its own"
+    );
+
+    // The union must NOT list the id: local-first dispatch makes it a guaranteed
+    // [HG079] no matter what the remote leg could serve.
+    assert!(
+        !higgs
+            .chat_model_ids()
+            .await
+            .contains(&"org/dual2".to_owned()),
+        "a same-id remote route must not resurrect the locally-refused id"
+    );
+}
