@@ -159,6 +159,10 @@ impl LocalHiggs {
 /// tensors) whose arch-scoped keys declare a pooling head and non-causal attention,
 /// exactly as `bge-small`/`qwen3-embedding` do on disk.
 ///
+/// A deliberate COPY of `src/serve/test_support.rs`'s
+/// `write_embedding_gguf_fixture_named` kv list — integration tests cannot see
+/// `pub(crate)` helpers. Keep the two in sync when the shape changes.
+///
 /// Header-only is sufficient and deliberate: the chat gate ([HG079]) refuses these
 /// BEFORE any load, so no engine ever opens the file. That is the property under test —
 /// if the gate regressed, the request would reach llama.cpp instead.

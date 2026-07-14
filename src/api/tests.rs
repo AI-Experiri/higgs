@@ -3056,3 +3056,83 @@ async fn a_reranker_is_refused_at_every_gate() {
         "a resident reranker is not advertised"
     );
 }
+
+/// The JIT advertising leg must not list an id whose durable REMOTE route is
+/// known non-generative: dispatch consults the route BEFORE the JIT arm (routes
+/// win over JIT by design), so its [HG079] pre-refusal preempts the local load
+/// the ad would promise — the r9 rule's mirror image (Fable r10). Fail-on-revert:
+/// the unconditional JIT leg re-advertises the id.
+#[tokio::test]
+async fn a_remote_non_chat_route_suppresses_the_jit_ad() {
+    use crate::node::test_support::{fake_runtime, local_endpoint, stage_dummy_model};
+    use crate::node::transport::NodeTransport;
+    use crate::node::{fleet::HubFleet, serve_node};
+    use crate::remote::ALPN;
+
+    // LOCAL: a generative model under org/dual4, tuned + fresh — Servable.
+    let local_dir = tempfile::TempDir::new().unwrap();
+    crate::serve::test_support::write_gguf_fixture(local_dir.path(), "org/dual4");
+    let higgs = fake_higgs(vec![local_dir.path().to_path_buf()]);
+    seed_fresh_profile(&higgs, "org/dual4", CtxLen::Fixed { n: 512 }).await;
+    assert!(
+        higgs
+            .servable_model_ids()
+            .await
+            .contains(&"org/dual4".to_owned()),
+        "precondition: locally JIT-able on its own terms"
+    );
+
+    // REMOTE: a real loopback node serving an EMBEDDING file under the SAME id.
+    let (node_root, _) = stage_dummy_model("org/other"); // scan root; the real model:
+    crate::serve::test_support::write_embedding_gguf_fixture(node_root.path(), "org/dual4");
+    let hub_ep = local_endpoint().await;
+    let node_ep = local_endpoint().await;
+    let hub_addr = hub_ep.addr();
+    let node_key = node_ep.id().to_string();
+    let rt = std::sync::Arc::new(fake_runtime(vec![node_root.path().to_path_buf()]));
+    tokio::spawn(async move {
+        let conn = node_ep.connect(hub_addr, ALPN).await.expect("connect");
+        serve_node(conn, rt).await;
+    });
+    let conn = hub_ep
+        .accept()
+        .await
+        .expect("incoming")
+        .await
+        .expect("conn");
+    std::mem::forget(hub_ep);
+    let fleet = std::sync::Arc::new(HubFleet::new(std::sync::Arc::new(
+        crate::log_bus::LogBus::new(),
+    )));
+    fleet
+        .add_node(
+            node_key.clone(),
+            std::sync::Arc::new(NodeTransport::new(conn)),
+            None,
+            None,
+            None,
+            false,
+        )
+        .await;
+    fleet.load(&node_key, "org/dual4", None).await.unwrap();
+    fleet.refresh_inventory(&node_key).await.unwrap();
+    higgs.set_fleet(fleet.clone());
+
+    // Dispatch would pre-refuse via the remote route (routes win over JIT)…
+    let err = higgs
+        .prepare_chat("org/dual4", None, "[]")
+        .await
+        .expect_err("the remote non-chat route preempts the JIT load");
+    assert!(matches!(
+        err,
+        crate::diagnostic::HiggsError::ModelNotChatCapable { .. }
+    ));
+    // …so the ad must not stand.
+    assert!(
+        !higgs
+            .chat_model_ids()
+            .await
+            .contains(&"org/dual4".to_owned()),
+        "an id whose remote route is known non-generative is not advertised via JIT"
+    );
+}

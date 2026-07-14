@@ -966,12 +966,27 @@ impl Higgs {
             .collect();
         ids.sort();
         // Advertise servable (JIT-loadable) catalog ids too, but ONLY while JIT is
-        // on — with JIT off an unloaded servable model is not reachable.
+        // on — with JIT off an unloaded servable model is not reachable. And NOT
+        // when the id's durable remote route is KNOWN non-generative: dispatch
+        // consults the remote route BEFORE the JIT arm (routes win over JIT by
+        // design), so its [HG079] pre-refusal preempts the local load this ad
+        // would promise — the r9 rule's mirror image (Fable r10). Unknown remote
+        // domains stay permissive, as everywhere.
         if self.jit_enabled() {
             for id in self.servable_model_ids().await {
-                if !ids.contains(&id) {
-                    ids.push(id);
+                if ids.contains(&id) {
+                    continue;
                 }
+                if let Some(fleet) = self.fleet() {
+                    if fleet
+                        .remote_domain(&id)
+                        .await
+                        .is_some_and(|d| d != ModelDomain::Llm)
+                    {
+                        continue;
+                    }
+                }
+                ids.push(id);
             }
         }
         // Remote-resident ids routed through the fleet (skip any already local).

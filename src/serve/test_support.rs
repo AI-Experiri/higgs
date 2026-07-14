@@ -190,51 +190,17 @@ pub(crate) fn write_gguf_fixture(root: &std::path::Path, id: &str) {
 /// (bge-small's actual declarations). For tests of the chat-vs-embedding gate
 /// ([HG079]) that need a scannable embedding model without a real weights file.
 pub(crate) fn write_embedding_gguf_fixture(root: &std::path::Path, id: &str) {
-    fn gguf_string(s: &str) -> Vec<u8> {
-        let bytes = s.as_bytes();
-        let mut out = Vec::with_capacity(8 + bytes.len());
-        out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-        out.extend_from_slice(bytes);
-        out
-    }
-
-    let header = GGufFileHeader::new(3, 0, 4);
-    let mut buf = Cursor::new(Vec::<u8>::new());
-    let mut writer = GGufFileWriter::new(&mut buf, header).unwrap();
-    writer
-        .write_meta_kv(
-            "general.architecture",
-            GGufMetaDataValueType::String,
-            &gguf_string("bert"),
-        )
-        .unwrap();
-    writer
-        .write_meta_kv(
-            "bert.context_length",
-            GGufMetaDataValueType::U32,
-            &512u32.to_le_bytes(),
-        )
-        .unwrap();
-    writer
-        .write_meta_kv(
-            "bert.pooling_type",
-            GGufMetaDataValueType::U32,
-            &2u32.to_le_bytes(),
-        )
-        .unwrap();
-    writer
-        .write_meta_kv("bert.attention.causal", GGufMetaDataValueType::Bool, &[0u8])
-        .unwrap();
-    writer.finish::<Vec<u8>>(false).finish().unwrap();
-
-    write_named(root, id, "model-f16.gguf", buf.into_inner());
+    write_embedding_gguf_fixture_named(root, id, "model-f16.gguf");
 }
 
 /// [`write_embedding_gguf_fixture`] with a caller-chosen FILENAME — scan order
 /// inside one model dir is path-lexical, so tests that need the embedding
 /// variant to sort before/after a sibling control the order through the name.
+/// THE one in-crate source of the fixture bytes (the unnamed helper delegates
+/// here). `tests/common/mod.rs`'s `stage_embedding_model` necessarily carries
+/// its own copy — integration tests cannot see `pub(crate)` helpers — keep the
+/// two kv lists in sync when the shape changes (Fable r10).
 pub(crate) fn write_embedding_gguf_fixture_named(root: &std::path::Path, id: &str, filename: &str) {
-    // Re-build the same header bytes (cheap; keeps ONE source of the fixture shape).
     use ggus::{GGufFileHeader, GGufFileWriter, GGufMetaDataValueType as T};
     use std::io::Cursor;
     fn gguf_string(s: &str) -> Vec<u8> {
