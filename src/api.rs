@@ -2864,6 +2864,29 @@ impl Higgs {
             .find(|m| m.id == id)
             .ok_or_else(|| HiggsError::ModelNotFound { id: id.clone() })?;
         let meta = ModelMeta::from_model(&model);
+
+        // Turbotune measures CHAT decode throughput. A non-generative model cannot
+        // take the measurement lease (the ChatHandle gate refuses it, [HG079]) —
+        // without this check every candidate would LOAD, fail its measurement, and
+        // burn a full rung before surfacing a misleading "all candidates failed"
+        // [HG063]. Refuse with the true reason, and refuse it HERE: the verdict is
+        // already decided by the scan row above, so waiting would only stall a certain
+        // failure behind the bounded HF-card fetch below (~10s offline) and an
+        // analytical derive whose result this path then throws away (Fable r13).
+        //
+        // Only BENCHMARK mode is refused. A `Suggest`/analytical tune of an embedding
+        // model is legitimate — it never generates, and a load profile is exactly what
+        // an embedding load needs.
+        if req.mode.unwrap_or_default() == TuneMode::Benchmark
+            && model.domain != crate::worker::models::ModelDomain::Llm
+        {
+            return Err(HiggsError::ModelNotChatCapable {
+                id: id.clone(),
+                arch: model.arch.clone().unwrap_or_else(|| "unknown".into()),
+                domain: model.domain,
+            });
+        }
+
         // Capture the file signature ALONGSIDE the metadata the profile is derived
         // from — NOT at persist time below. The bounded HF-card fetch can take ~10s;
         // a GGUF swapped in that window would otherwise have its NEW signature
@@ -2916,20 +2939,6 @@ impl Higgs {
         //    surfaces [HG063]. Suggest mode skips this entirely.
         let mut bench_tps = None;
         if req.mode.unwrap_or_default() == TuneMode::Benchmark {
-            // Turbotune measures CHAT decode throughput. A non-generative model
-            // cannot take the measurement lease (the ChatHandle gate refuses it,
-            // [HG079]) — without this check every candidate would LOAD, fail its
-            // measurement, and burn a full rung before surfacing a misleading
-            // "all candidates failed" [HG063]. Refuse up-front with the true reason.
-            // The ANALYTICAL tune (above) still runs for these models — it never
-            // generates, and a load profile is exactly what /v1/embeddings will need.
-            if model.domain != crate::worker::models::ModelDomain::Llm {
-                return Err(HiggsError::ModelNotChatCapable {
-                    id: id.clone(),
-                    arch: model.arch.clone().unwrap_or_else(|| "unknown".into()),
-                    domain: model.domain,
-                });
-            }
             let pins = req.pins.clone().unwrap_or_default();
             let (benchmarked_load, bench) = self
                 .turbotune_bench(&id, &meta, &hw, &budget, &suggestion, &pins)
@@ -3025,6 +3034,14 @@ impl Higgs {
     /// not advertise an id whose actual load target is a different file — e.g. a
     /// tuned generative second file behind an embedding first file would advertise an
     /// id every chat then refuses ([HG079], codex r4).
+    ///
+    /// A row's readiness decided residency in SERVED-id space (`local_served_ids`,
+    /// which disambiguates same-model workers), not raw instance-model space. The two
+    /// agree on every catalog id — a worker holding model `X` always yields the bare
+    /// served id `X` — and differ only for a catalog id that collides textually with
+    /// another model's disambiguating alias, where reading `Loaded` (not `Servable`)
+    /// is the truthful answer anyway: dispatch resolves that local served id before
+    /// any JIT load could run (Fable r13).
     pub(crate) fn servable_ids_from_entries(
         entries: &[crate::serve::wire::HiggsModelEntry],
     ) -> Vec<String> {

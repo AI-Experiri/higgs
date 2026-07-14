@@ -949,8 +949,17 @@ impl Higgs {
     /// A scan is blocking I/O (`read_dir` + `mmap` of every GGUF header) and is not
     /// cached, so a caller that needs both the rows and the reachable set — the
     /// `models` control op, which ships them together as `HiggsModelsResponse` —
-    /// must not pay for two. It also makes the pair CONSISTENT: both come from one
-    /// scan, so a load landing mid-call cannot leave the rows and the set disagreeing.
+    /// must not pay for two. The rows and the JIT leg then share ONE scan, so they
+    /// agree about what is on disk. (Only the scan is shared: residency, worker
+    /// domains, fleet routes and the benchmark slot are all sampled live in here, so
+    /// a load or a benchmark landing mid-call can still leave a row reading `Servable`
+    /// for an id the set omits. That is a one-poll skew that heals itself, and it errs
+    /// the safe way — the SET is what the gates enforce.)
+    ///
+    /// `entries` must be THIS facade's [`model_entries`](Self::model_entries) output.
+    /// Stale or foreign rows only distort the ADVERTISEMENT (an id whose JIT load then
+    /// fails [HG040]/[HG002], or a fresh id missing for a poll); they cannot bypass a
+    /// gate, since every chat path re-reads live state.
     ///
     /// The servable (JIT-loadable) ids are read back off those rows rather than
     /// re-derived: `readiness` is exactly what `servable_model_ids` computes per row,
