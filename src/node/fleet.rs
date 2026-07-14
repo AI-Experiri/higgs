@@ -777,10 +777,19 @@ impl FleetActor {
     /// embedding workers stay advertised and can still return garbage — an
     /// accepted residual the hub cannot see; upgrading the node closes it.
     fn worker_chat_capable(&self, node: &NodeKey, worker: WorkerId) -> bool {
+        // The row must match the route's MODEL too, not just the worker id — the
+        // same rule as `RemoteDomain` (r4): a node restart can reuse a worker id
+        // for a different file, and a stale row (the hub retains inventories
+        // across re-admission) must not hide a freshly routed generative model —
+        // nor keep a stale non-generative route advertised. Mismatch = the row
+        // says nothing about THIS route → capable (permissive, like no row).
+        let Some(model) = self.routes.get(&(node.clone(), worker)) else {
+            return true;
+        };
         self.inventories.get(node).is_none_or(|(inv, _)| {
             inv.workers
                 .iter()
-                .find(|w| w.worker_id == worker.0)
+                .find(|w| w.worker_id == worker.0 && &w.model == model)
                 .is_none_or(|w| w.domain == crate::worker::models::ModelDomain::Llm)
         })
     }

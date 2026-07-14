@@ -198,6 +198,13 @@ enum NodeMsg {
         >,
     },
     ChatHandle {
+        /// The RAW model id this chat is FOR. The domain gate below refuses only
+        /// when the worker actually serves this model — a mismatch (a stale hub
+        /// route to a reused worker id) must fall through to the worker's own
+        /// [HG018] model-bind check, which is route-invalidating and heals the
+        /// route; a domain verdict about a model the client never asked for
+        /// would 400 forever instead (Fable r5).
+        model: String,
         id: WorkerId,
         reply: oneshot::Sender<Result<ChatLease, HiggsError>>,
     },
@@ -578,7 +585,7 @@ impl Actor for NodeActor {
                         .collect(),
                 );
             }
-            NodeMsg::ChatHandle { id, reply } => {
+            NodeMsg::ChatHandle { id, model, reply } => {
                 let lease = match self.registry.get(id).cloned() {
                     // THE dispatch choke point: every generation — local `/v1`,
                     // in-process, AND the hub relay (`relay_chat`, which never runs
@@ -588,10 +595,16 @@ impl Actor for NodeActor {
                     // post-load deletion, enrichment failure, or id collision cannot
                     // re-open the door. No activity stamp, no in-flight hold, no
                     // ChatStart emit — the refusal is not a chat.
+                    //
+                    // ONLY when the worker serves the REQUESTED model: a mismatch is
+                    // a stale route, and the verdict for it belongs to the worker's
+                    // route-invalidating [HG018] bind check — not to a permanent
+                    // [HG079] about a model the client never named (Fable r5).
                     Some(sup)
-                        if self.load_facts.get(&id).is_some_and(|f| {
-                            f.domain != crate::worker::models::ModelDomain::Llm
-                        }) =>
+                        if sup.loaded_model_id().as_deref() == Some(model.as_str())
+                            && self.load_facts.get(&id).is_some_and(|f| {
+                                f.domain != crate::worker::models::ModelDomain::Llm
+                            }) =>
                     {
                         // The gate above proved the facts exist.
                         let facts = &self.load_facts[&id];
@@ -1420,8 +1433,14 @@ impl NodeRuntime {
 
     /// Lease a worker's Supervisor for one chat (idle-reaper-safe — see [`ChatLease`]). Hold
     /// the returned lease for the whole generation; dropping it ends the chat's in-flight hold.
-    pub(crate) async fn chat_handle(&self, id: WorkerId) -> Result<ChatLease, HiggsError> {
-        self.call(|reply| NodeMsg::ChatHandle { id, reply }).await
+    pub(crate) async fn chat_handle(
+        &self,
+        id: WorkerId,
+        model: &str,
+    ) -> Result<ChatLease, HiggsError> {
+        let model = model.to_owned();
+        self.call(|reply| NodeMsg::ChatHandle { id, model, reply })
+            .await
     }
 
     /// Graceful drain: stop every resident worker and empty the registry. The node daemon

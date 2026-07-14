@@ -2459,3 +2459,103 @@ async fn a_reused_worker_id_does_not_lend_its_domain_to_a_stale_route() {
         Some(crate::worker::models::ModelDomain::Embedding)
     );
 }
+
+/// `worker_chat_capable` (the `/v1/models` advertising filter) requires the
+/// inventory row to match the route's MODEL, not just the worker id — the same
+/// rule as `RemoteDomain` (r4). The hub retains inventories across a node
+/// re-admission, and worker ids restart per process: a stale row must neither
+/// hide a freshly routed generative model nor lend a verdict to a route it no
+/// longer describes. Mismatch = permissive (advertised), like no row at all.
+#[tokio::test]
+async fn a_stale_inventory_row_does_not_unadvertise_a_reused_worker_id() {
+    // A real loopback transport: routed_models advertises CONNECTED nodes only.
+    let hub = local_endpoint().await;
+    let node = local_endpoint().await;
+    let (dial, conn) = tokio::join!(node.connect(hub.addr(), ALPN), async {
+        hub.accept().await.expect("incoming").await.expect("conn")
+    });
+    let _keep = dial.expect("dial");
+    std::mem::forget(hub);
+    let transport = Arc::new(NodeTransport::new(conn));
+    let mut node_ids = NodeIdAllocator::new();
+    node_ids.assign("nodeA");
+    let mut actor = FleetActor {
+        nodes: HashMap::new(),
+        routes: HashMap::new(),
+        node_ids,
+        inventories: HashMap::new(),
+        chat_refreshes: HashMap::new(),
+        chat_refresh_gen: 0,
+        software_versions: HashMap::new(),
+        event_nodes: std::collections::HashSet::new(),
+        events_tx: tokio::sync::broadcast::channel(8).0,
+        pending_pushes: HashMap::new(),
+        fallback_inflight: HashMap::new(),
+        fallback_gen: 0,
+        versions: HashMap::new(),
+        epochs: HashMap::new(),
+        bus: Arc::new(crate::log_bus::LogBus::new()),
+        admit_gen: 0,
+    };
+    actor.nodes.insert("nodeA".to_string(), transport);
+    // The FRESH route: worker 1 now serves the generative org/gen…
+    actor
+        .routes
+        .insert(("nodeA".to_string(), WorkerId(1)), "org/gen".to_string());
+    // …but the RETAINED inventory still shows the old process's worker 1 as an
+    // embedding model.
+    let inv = crate::remote::NodeInventory {
+        hostname: "host".into(),
+        os: "macos".into(),
+        workers: vec![crate::remote::InventoryWorker {
+            worker_id: 1,
+            model: "org/embed".into(),
+            served_id: String::new(),
+            ctx_len: Some(256),
+            gpu_layers: None,
+            threads: None,
+            loaded_at_ms: Some(1),
+            idle_ms: Some(0),
+            in_flight: Some(0),
+            domain: crate::worker::models::ModelDomain::Embedding,
+        }],
+        snapshot_seq: Some(1),
+        hardware: crate::system::HardwareInfo {
+            cpu_name: String::new(),
+            arch: String::new(),
+            cpu_cores: 0,
+            ram_total_bytes: 0,
+            ram_used_bytes: 0,
+            cpu_usage_percent: 0.0,
+            gpus: vec![],
+            vram_total_bytes: 0,
+        },
+        runtime: crate::system::RuntimeInfo {
+            engine: String::new(),
+            backend: String::new(),
+            version: String::new(),
+            binding: String::new(),
+        },
+    };
+    actor
+        .inventories
+        .insert("nodeA".to_string(), (inv, PulledAt::now()));
+
+    // The stale embedding row says nothing about THIS route → advertised.
+    assert_eq!(
+        actor.routed_models(),
+        vec!["org/gen".to_string()],
+        "a stale row must not hide the freshly routed generative model"
+    );
+
+    // And when the row DOES match the route, the verdict applies: flip the
+    // route to the model the row describes → dropped from the advertisement.
+    actor.routes.clear();
+    actor
+        .routes
+        .insert(("nodeA".to_string(), WorkerId(1)), "org/embed".to_string());
+    assert!(
+        actor.routed_models().is_empty(),
+        "a matching non-generative row still filters its own route"
+    );
+}

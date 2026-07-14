@@ -2711,7 +2711,7 @@ async fn a_resident_embedding_model_is_refused_and_unlisted() {
         .await
         .pop()
         .expect("the load left a resident worker");
-    match higgs.local.chat_handle(worker).await {
+    match higgs.local.chat_handle(worker, "org/embed").await {
         Err(err) => assert!(
             matches!(
                 err,
@@ -2721,6 +2721,20 @@ async fn a_resident_embedding_model_is_refused_and_unlisted() {
         ),
         Ok(_) => panic!("the actor must refuse a chat lease on an embedding worker"),
     }
+
+    // A MISMATCHED requested model gets the LEASE, not [HG079]: that request is
+    // a stale route, and its verdict belongs to the worker's route-invalidating
+    // [HG018] bind check — a domain refusal naming a model the client never
+    // asked for would wedge the route forever (Fable r5). Fail-on-revert:
+    // gating on the worker's identity alone refuses this too.
+    assert!(
+        higgs
+            .local
+            .chat_handle(worker, "some/other-model")
+            .await
+            .is_ok(),
+        "a mismatched model must fall through to the worker's own HG018 check"
+    );
 }
 
 /// Turbotune (Benchmark mode) refuses a non-generative model UP-FRONT with the

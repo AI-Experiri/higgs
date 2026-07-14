@@ -114,7 +114,7 @@ async fn an_embedding_model_is_refused_for_chat_and_never_advertised() {
     );
 
     // ── …and the catalog badges it for what it is. ──
-    // It IS discovered — this test is about how it is CLASSIFIED, not about hiding it — this test is about how it is CLASSIFIED, not about hiding it
+    // It IS discovered — this test is about how it is CLASSIFIED, not about hiding it
     // from the catalog. A user must still see it on disk (and, later, embed with it).
     let entries = higgs.model_entries().await.expect("model entries");
     let entry = entries

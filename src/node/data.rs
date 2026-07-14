@@ -42,7 +42,10 @@ pub(crate) async fn relay_chat(
             return;
         }
     };
-    let lease = match rt.chat_handle(WorkerId(params.worker_id)).await {
+    let lease = match rt
+        .chat_handle(WorkerId(params.worker_id), &params.model)
+        .await
+    {
         Ok(s) => s,
         Err(e) => {
             reply_err(send, req.id, -32000, e.to_string(), hg_data(&e)).await;

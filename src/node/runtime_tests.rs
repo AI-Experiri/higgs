@@ -529,7 +529,7 @@ async fn in_flight_chat_prevents_idle_reap() {
     );
     let (id, _) = load(&rt, "org/m").await;
     // Hold a chat lease across the whole idle window — the worker must NOT be reaped.
-    let lease = rt.chat_handle(id).await.expect("lease");
+    let lease = rt.chat_handle(id, "org/m").await.expect("lease");
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     assert_eq!(
         rt.worker_ids().await.len(),
@@ -605,7 +605,7 @@ async fn chat_lease_drives_the_stateful_chat_path() {
     use crate::worker::M_CHAT;
     let (rt, _dir) = stateful_runtime_with_models(&["org/chat"]);
     let (id, _) = rt.load(load_params("org/chat")).await.expect("load");
-    let lease = rt.chat_handle(id).await.expect("lease");
+    let lease = rt.chat_handle(id, "org/chat").await.expect("lease");
     // Deref the lease to the Supervisor and run one chat — the fake streams chunks then
     // a final response carrying the content + token counts.
     let resp = lease
@@ -711,7 +711,7 @@ async fn successful_load_during_shutdown_is_reaped_and_refused() {
 async fn chat_end_for_unloaded_worker_drops_bookkeeping() {
     let (rt, _dir) = fake_runtime_with_models(&["org/m"]);
     let (id, _) = load(&rt, "org/m").await;
-    let lease = rt.chat_handle(id).await.expect("lease");
+    let lease = rt.chat_handle(id, "org/m").await.expect("lease");
     // Unload while the chat lease is still held — the worker leaves the registry.
     rt.unload(id).await.expect("unload");
     assert!(rt.worker_ids().await.is_empty(), "worker gone after unload");

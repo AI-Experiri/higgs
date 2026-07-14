@@ -2482,7 +2482,7 @@ impl Higgs {
             // the worker's last-activity on acquire and (on drop) re-stamps + drops the
             // in-flight reference, so the node's idle reaper never unloads a worker
             // mid-chat. A dead/unloaded worker here is a mapped error.
-            let lease = self.local.chat_handle(worker).await?;
+            let lease = self.local.chat_handle(worker, &raw_model).await?;
             // Apply the model's tuned/card-recommended sampling as the BASE, then
             // overlay the per-request fields the client sent. This is where "HF-card
             // recommended sampling actually applies": a `tune` persisted the

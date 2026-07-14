@@ -1,18 +1,21 @@
-//! A REMOTE embedding worker refuses relayed chat — the node-side [HG079] gate.
+//! A remote embedding worker is refused over the REAL wire — end to end.
 //!
-//! The hub's `resolve_loaded` is deliberately permissive about remote models (it
-//! has not scanned the remote node's files), and the node's `relay_chat` takes a
-//! `ChatHandle` lease directly — no `resolve_loaded` runs anywhere on the relay
-//! path. The ONLY thing standing between a hub-side client and fluent garbage
-//! from a remote embedding model is the node actor's `ChatHandle` domain gate,
-//! reading the domain captured when the load resolved the file.
+//! A REAL `higgs --node` child loads a REAL embedding GGUF (bge-small — an
+//! actual encoder with `bert.pooling_type=2` / `attention.causal=false`, which
+//! real llama.cpp loads happily), then a chat against it is driven over the
+//! hub's real `/v1` HTTP surface and must come back `400` carrying `[HG079]` —
+//! not a `200` of sampled nonsense, which is what the ORIGINAL bug produced
+//! over this exact wire.
 //!
-//! This test proves that gate over the full wire: a REAL `higgs --node` child
-//! loads a REAL embedding GGUF (bge-small — an actual encoder with
-//! `bert.pooling_type=2` / `attention.causal=false`, which real llama.cpp loads
-//! happily), then a chat against it is driven over the hub's real `/v1` HTTP
-//! surface and must come back `400` carrying `[HG079]` — not a `200` of sampled
-//! nonsense, which is exactly what reverting the gate produces.
+//! What a green run proves (r5 doc truth-up): since r3, `HubFleet::load`
+//! refreshes the inventory, so the FIRST defense to fire here is the hub's own
+//! pre-dispatch refusal (`resolve_loaded`'s remote arm reading the
+//! node-reported inventory domain) — reverting the node's ChatHandle gate ALONE
+//! does not fail this test. The node gate — the enforcement of last resort for
+//! stale/absent hub knowledge — is pinned separately by the in-process fleet
+//! test (`a_non_generative_remote_worker_is_unadvertised_but_still_refused_on_
+//! the_wire`, which dispatches `fleet.chat` directly past the facade). This
+//! test pins the STACK end to end against a real engine and real iroh.
 //!
 //! Skips when the real embedding GGUF is absent (`HIGGS_TEST_EMBED_GGUF`, else
 //! the HF-cache bge-small path).
@@ -177,9 +180,9 @@ async fn a_remote_embedding_worker_refuses_relayed_chat() {
         "the embedding model is remote-routable"
     );
 
-    // Chat against it over the hub's real /v1 surface. The refusal must come
-    // from the NODE's ChatHandle gate (nothing hub-side stands in the way) and
-    // map back to the same 400 [HG079] a local refusal produces.
+    // Chat against it over the hub's real /v1 surface. The first defense to fire
+    // is the hub's inventory-informed pre-dispatch refusal (see the module doc);
+    // either layer of the stack must map to the same 400 [HG079].
     let (base, _guard) = serve_v1_local(higgs.clone()).await;
     let resp = reqwest::Client::new()
         .post(format!("{base}/v1/chat/completions"))
