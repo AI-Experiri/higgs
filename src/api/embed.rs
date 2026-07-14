@@ -77,13 +77,18 @@ impl Higgs {
         // re-checked AFTER the awaited resident lookup (a bench can make its
         // candidate transiently resident during the await), mirroring `ensure_loaded`.
         let local_bench_candidate = match self.local_loaded_info(model).await {
-            // Resident, but embedding-only: refuse [HG079] instead of generating from a
-            // pooling head. This arm is reachable — a model can be loaded explicitly
-            // (Load Model / a tune) without ever passing the JIT gate below.
-            Some(loaded) if loaded.domain == Some(ModelDomain::Embedding) => {
+            // Resident, but non-generative (embedding/reranker): refuse [HG079] instead
+            // of generating from a pooling head. This arm is reachable — a model can be
+            // loaded explicitly (Load Model / a tune) without ever passing the JIT gate
+            // below. A fast-path courtesy only: the LOAD-TIME domain gate at the node
+            // actor's `ChatHandle` (the dispatch choke point) is the enforcement, and
+            // holds even when this scan-derived read goes permissive (file deleted
+            // after load, enrichment failure).
+            Some(loaded) if loaded.domain.is_some_and(|d| d != ModelDomain::Llm) => {
                 return Err(HiggsError::ModelNotChatCapable {
                     id: model.to_owned(),
                     arch: loaded.arch.unwrap_or_else(|| "unknown".into()),
+                    domain: loaded.domain.unwrap_or(ModelDomain::Embedding),
                 });
             }
             Some(loaded) if !self.is_benchmarking(model) => return Ok(loaded),
@@ -141,10 +146,11 @@ impl Higgs {
         // …and it must be able to chat. Refuse BEFORE the load: JIT-loading an embedding
         // model to then generate nonsense from it is the exact failure [HG079] exists to
         // stop, and the refusal costs the caller nothing (no worker spawned).
-        if candidate.domain == ModelDomain::Embedding {
+        if candidate.domain != ModelDomain::Llm {
             return Err(HiggsError::ModelNotChatCapable {
                 id: model.to_owned(),
                 arch: candidate.arch.clone().unwrap_or_else(|| "unknown".into()),
+                domain: candidate.domain,
             });
         }
 
@@ -909,9 +915,9 @@ impl Higgs {
         // the enforcement either way.
         if let Ok(scanned) = self.scan().await {
             ids.retain(|id| {
-                !scanned.iter().any(|m| {
-                    &m.id == id && m.domain == crate::worker::models::ModelDomain::Embedding
-                })
+                !scanned
+                    .iter()
+                    .any(|m| &m.id == id && m.domain != crate::worker::models::ModelDomain::Llm)
             });
         }
         // Advertise servable (JIT-loadable) catalog ids too, but ONLY while JIT is

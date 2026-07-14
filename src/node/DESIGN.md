@@ -100,6 +100,15 @@ mailbox — no mutex, so concurrent ops can't interleave across an `.await`.
   which sleeps `reap_interval(ttl)` OR wakes immediately on change — so a Server-Settings TTL /
   on-off toggle takes effect without a restart. The reaper holds a `WeakHandle` so it never
   keeps an idle actor alive.
+- **Domain gate at the dispatch choke point.** Every generation — the local `/v1` path, the
+  in-process embed API, AND the hub relay (`data.rs relay_chat`, which never runs the facade's
+  `resolve_loaded`) — takes its lease from the `ChatHandle` handler. That handler refuses the
+  lease with `[HG079]` when the worker's `LoadFacts.domain` (captured when `do_load` RESOLVED
+  the file, alongside its arch) is not `Llm`: llama.cpp will happily sample fluent nonsense
+  from an embedding/reranker head, so the refusal must live where every dispatch converges,
+  on load-time facts a post-load file deletion or scan failure can't reopen. The facade's own
+  scan-derived `[HG079]` arms in `resolve_loaded` are fast-path courtesies, not the
+  enforcement. Refusal is not a chat: no activity stamp, no in-flight hold, no `ChatStart`.
 
 ### `HubFleet` (`fleet.rs`)
 

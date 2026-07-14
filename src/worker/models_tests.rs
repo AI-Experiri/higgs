@@ -1264,6 +1264,16 @@ fn embedding_headers_scan_as_the_embedding_domain() {
             ),
         ],
     );
+    // A reranker: llama.cpp's RANK pooling (4). Its own domain — chat-refused like
+    // an embedder, but NOT an /v1/embeddings target (it scores pairs, not vectors).
+    write_gguf(
+        &dir,
+        "rr/bge-reranker/model-Q8_0.gguf",
+        &[
+            ("general.architecture", T::String, gguf_str("bert")),
+            ("bert.pooling_type", T::U32, 4u32.to_le_bytes().to_vec()),
+        ],
+    );
     // A generative model that explicitly declares pooling NONE (0) stays an LLM —
     // presence of the key is not the signal, a non-zero value is.
     write_gguf(
@@ -1295,6 +1305,11 @@ fn embedding_headers_scan_as_the_embedding_domain() {
         domain("dec/qwen3emb"),
         ModelDomain::Embedding,
         "a non-zero pooling_type is an embedding declaration EVEN WITH a chat template"
+    );
+    assert_eq!(
+        domain("rr/bge-reranker"),
+        ModelDomain::Reranker,
+        "RANK pooling (4) is a reranker declaration, not an embedder"
     );
     assert_eq!(
         domain("gen/llama"),

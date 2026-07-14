@@ -199,6 +199,9 @@ pub(crate) fn http_status(err: &HiggsError) -> StatusCode {
             }
             // HG016: a remote chat that timed out, propagated as a worker code.
             Some("HG016") => StatusCode::GATEWAY_TIMEOUT,
+            // HG079: a remote node's ChatHandle refused a non-generative worker —
+            // the same 400 as the direct `ModelNotChatCapable` arm above.
+            Some("HG079") => StatusCode::BAD_REQUEST,
             // Worker/node→hub→HTTP propagated codes keep their direct-arm status
             // (explicit, not the 500 default, for parity).
             Some("HG037") => StatusCode::NOT_IMPLEMENTED,

@@ -42,7 +42,29 @@ higgs_const_enum! {
         /// Embedding-only: the header declares a pooling head and/or non-causal
         /// attention. Not a chat target (see [`crate::diagnostic::HiggsError::ModelNotChatCapable`]);
         /// a future `/v1/embeddings` is what serves it.
+        ///
+        /// KNOWN residual: a diffusion LM (Dream/LLaDA — non-causal attention, no
+        /// pooling head) lands here too. The label is imprecise for those, but the
+        /// REFUSAL is still right — higgs's decode loop is autoregressive and cannot
+        /// serve diffusion generation either. Revisit if diffusion decode is adopted.
         Embedding,
+        /// Reranker: the header declares llama.cpp's `RANK` pooling (`pooling_type`
+        /// = 4) — it scores query/document pairs through the embeddings API. Not a
+        /// chat target, and ALSO not an `/v1/embeddings` target (a future
+        /// `/v1/rerank` is what serves it) — which is why it is not folded into
+        /// [`ModelDomain::Embedding`].
+        Reranker,
+    }
+}
+
+impl std::fmt::Display for ModelDomain {
+    /// The lowercase noun diagnostics interpolate (`[HG079]`): what the model IS.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ModelDomain::Llm => "llm",
+            ModelDomain::Embedding => "embedding",
+            ModelDomain::Reranker => "reranker",
+        })
     }
 }
 
@@ -373,9 +395,15 @@ fn enrich_from_gguf(model: &mut HiggsModel, mmap: &memmap2::Mmap) {
 /// this classifier only ever demotes a model on a POSITIVE declaration, so a sparse or
 /// unreadable header never hides a chat model from the catalog.
 fn read_domain(gguf: &GGuf, arch: &str) -> ModelDomain {
-    let pooled = gguf
-        .get_usize(&format!("{arch}.pooling_type"))
-        .is_ok_and(|p| p != 0);
+    // llama.cpp's pooling enum: 0 NONE, 1 MEAN, 2 CLS, 3 LAST, 4 RANK. RANK is a
+    // reranker's declaration (scores, not vectors) — its own domain, so a future
+    // /v1/embeddings does not mistake it for an embedder.
+    const POOLING_RANK: usize = 4;
+    let pooling = gguf.get_usize(&format!("{arch}.pooling_type")).ok();
+    if pooling == Some(POOLING_RANK) {
+        return ModelDomain::Reranker;
+    }
+    let pooled = pooling.is_some_and(|p| p != 0);
     let bidirectional = gguf
         .get_bool(&format!("{arch}.attention.causal"))
         .is_ok_and(|causal| !causal);

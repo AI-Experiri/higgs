@@ -2692,4 +2692,26 @@ async fn a_resident_embedding_model_is_refused_and_unlisted() {
             .contains(&"org/embed".to_owned()),
         "a resident embedding model must not be advertised as a chat target"
     );
+
+    // THE choke point: the node actor's `ChatHandle` refuses the lease itself, on
+    // the domain captured at LOAD time. This is the arm that also guards the hub
+    // relay (`relay_chat` takes the same lease with no `resolve_loaded` in front)
+    // and survives a post-load file deletion — neither is reachable through
+    // `prepare_chat` above, so pin it directly.
+    let (worker, _) = higgs
+        .local
+        .instances()
+        .await
+        .pop()
+        .expect("the load left a resident worker");
+    match higgs.local.chat_handle(worker).await {
+        Err(err) => assert!(
+            matches!(
+                err,
+                crate::diagnostic::HiggsError::ModelNotChatCapable { .. }
+            ),
+            "expected [HG079] from the ChatHandle gate, got: {err}"
+        ),
+        Ok(_) => panic!("the actor must refuse a chat lease on an embedding worker"),
+    }
 }

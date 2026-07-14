@@ -333,6 +333,13 @@ struct LoadFacts {
     gpu_layers: Option<crate::worker::engine::GpuLayers>,
     threads: Option<u32>,
     loaded_at_ms: u64,
+    /// The model's capability class, read from its GGUF header WHEN THE LOAD
+    /// RESOLVED THE FILE. `ChatHandle` gates on this — not on a fresh scan — so a
+    /// post-load file deletion, enrichment failure, or id collision cannot re-open
+    /// the chat door for a non-generative worker ([HG079]).
+    domain: crate::worker::models::ModelDomain,
+    /// The GGUF arch at load time, for the [HG079] diagnostic.
+    arch: Option<String>,
 }
 
 /// Wall-clock ms since the Unix epoch (0 if the clock predates it).
@@ -548,6 +555,27 @@ impl Actor for NodeActor {
             }
             NodeMsg::ChatHandle { id, reply } => {
                 let lease = match self.registry.get(id).cloned() {
+                    // THE dispatch choke point: every generation — local `/v1`,
+                    // in-process, AND the hub relay (`relay_chat`, which never runs
+                    // `resolve_loaded`) — takes its lease here. A worker whose
+                    // LOAD-TIME domain is not `Llm` cannot chat ([HG079]); gating on
+                    // the facts captured when the load resolved the file means a
+                    // post-load deletion, enrichment failure, or id collision cannot
+                    // re-open the door. No activity stamp, no in-flight hold, no
+                    // ChatStart emit — the refusal is not a chat.
+                    Some(sup)
+                        if self.load_facts.get(&id).is_some_and(|f| {
+                            f.domain != crate::worker::models::ModelDomain::Llm
+                        }) =>
+                    {
+                        // The gate above proved the facts exist.
+                        let facts = &self.load_facts[&id];
+                        Err(HiggsError::ModelNotChatCapable {
+                            id: sup.loaded_model_id().unwrap_or_default(),
+                            arch: facts.arch.clone().unwrap_or_else(|| "unknown".into()),
+                            domain: facts.domain,
+                        })
+                    }
                     Some(sup) => {
                         // Stamp activity + take an in-flight reference for the whole chat.
                         self.last_activity.insert(id, Instant::now());
@@ -817,27 +845,45 @@ fn no_worker(id: WorkerId) -> HiggsError {
 /// they never stall the control-plane executor. `get` only returns cataloged models found
 /// UNDER the roots, and the resolved path must canonicalize to within a root (symlink-
 /// escape guard, [HG015]). `[HG002]` if absent.
-async fn resolve_model(
-    config: &NodeConfig,
-    id: &str,
-) -> Result<(String, u64, Option<u64>), HiggsError> {
+/// What `resolve_model` reads off the node's own scan for one load: the file's
+/// location/size, the trained context, and the header facts the actor must
+/// retain for the worker's lifetime (`domain`/`arch` → [`LoadFacts`], where the
+/// `ChatHandle` gate reads them independent of any later scan).
+struct ResolvedModel {
+    path: String,
+    size_bytes: u64,
+    ctx_train: Option<u64>,
+    domain: crate::worker::models::ModelDomain,
+    arch: Option<String>,
+}
+
+async fn resolve_model(config: &NodeConfig, id: &str) -> Result<ResolvedModel, HiggsError> {
     let id = id.to_string();
     let (lmstudio, hf, ollama) = config.model_dirs();
     tokio::task::spawn_blocking(move || {
         let mut store = ModelStore::default();
         store.scan(&lmstudio, &hf, &ollama)?;
-        let (path, size_bytes, ctx_train) = store
+        let resolved = store
             .get(&id)
-            .map(|m| (m.path.clone(), m.size_bytes, m.ctx_train))
+            .map(|m| ResolvedModel {
+                path: m.path.clone(),
+                size_bytes: m.size_bytes,
+                ctx_train: m.ctx_train,
+                domain: m.domain,
+                arch: m.arch.clone(),
+            })
             .ok_or_else(|| HiggsError::ModelNotFound { id: id.clone() })?;
         let roots: Vec<PathBuf> = lmstudio.into_iter().chain(hf).chain(ollama).collect();
-        if !crate::api::path_within_roots(&path, &roots) {
+        if !crate::api::path_within_roots(&resolved.path, &roots) {
             return Err(HiggsError::InvalidModelId {
                 id,
-                reason: format!("resolved path {path} is outside every configured scan directory"),
+                reason: format!(
+                    "resolved path {} is outside every configured scan directory",
+                    resolved.path
+                ),
             });
         }
-        Ok((path, size_bytes, ctx_train))
+        Ok(resolved)
     })
     .await
     .map_err(|e| HiggsError::WorkerDead {
@@ -945,9 +991,9 @@ async fn do_load(
     config: Arc<NodeConfig>,
     relay: broadcast::Sender<(WorkerId, String)>,
 ) -> Result<(Arc<Supervisor>, Value, LoadFacts), LoadFailure> {
-    let (path, size_bytes, ctx_train) = resolve_model(&config, &params.id).await?;
+    let resolved = resolve_model(&config, &params.id).await?;
     // Reject before spawning a worker if the model can't fit (mirrors Higgs::load).
-    crate::api::guard_memory_headroom(&params.id, size_bytes)?;
+    crate::api::guard_memory_headroom(&params.id, resolved.size_bytes)?;
 
     // Each worker gets its OWN LogBus so its stderr can be relayed tagged with the worker's
     // id (the node has no UI of its own; the shared bus can't distinguish workers).
@@ -987,10 +1033,10 @@ async fn do_load(
         guard.commit();
         return Err(fail(e));
     }
-    let (ctx_len, ctx_allocated) = effective_ctx(params.ctx_len, ctx_train);
+    let (ctx_len, ctx_allocated) = effective_ctx(params.ctx_len, resolved.ctx_train);
     let load_params = worker_load_params(
         &params.id,
-        &path,
+        &resolved.path,
         ctx_len,
         params.gpu_layers,
         params.threads,
@@ -1012,6 +1058,8 @@ async fn do_load(
         gpu_layers: params.gpu_layers,
         threads: params.threads.filter(|t| *t > 0),
         loaded_at_ms: unix_ms(),
+        domain: resolved.domain,
+        arch: resolved.arch,
     };
     Ok((sup, loaded, facts))
 }

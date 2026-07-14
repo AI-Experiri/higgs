@@ -4,8 +4,9 @@
 export const ModelDomain = {
     Llm       : "llm",
     Embedding : "embedding",
+    Reranker  : "reranker",
 } as const;
 
-export const { Llm, Embedding } = ModelDomain;
+export const { Llm, Embedding, Reranker } = ModelDomain;
 
 export type ModelDomain = (typeof ModelDomain)[keyof typeof ModelDomain];

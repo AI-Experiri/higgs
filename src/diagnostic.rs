@@ -46,11 +46,15 @@ pub enum HiggsError {
     /// samples the embedding head and returns fluent nonsense, so this gate exists to
     /// turn silently-wrong output into a refusal the client can act on.
     #[snafu(display(
-        "[HG079] {id} is an embedding model ({arch}) — it cannot serve chat; pick a \
-         generative model"
+        "[HG079] {id} is a non-generative model (domain: {domain}, arch: {arch}) — it \
+         cannot serve chat; pick a generative model"
     ))]
     #[diagnostic(code(HG079), severity(Error))]
-    ModelNotChatCapable { id: String, arch: String },
+    ModelNotChatCapable {
+        id: String,
+        arch: String,
+        domain: crate::worker::models::ModelDomain,
+    },
 
     /// Chat requested for a model that is not loaded — JIT auto-load is off, or a
     /// transient race (a restart/reap window) left it unloaded.
