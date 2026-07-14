@@ -402,6 +402,26 @@ fn http_status_mapping_table() {
         http_status(&HiggsError::ModelNotFound { id: "x".into() }),
         StatusCode::NOT_FOUND
     );
+    // [HG079] is 400 on BOTH arrival paths: the direct variant (the facade's own
+    // gates) and the worker_code relay (a node's ChatHandle refusal riding a
+    // WorkerRpc). Losing the relay arm demotes a permanent refusal to the 500
+    // default — a retryable class OpenAI clients retry-loop (Fable r8).
+    assert_eq!(
+        http_status(&HiggsError::ModelNotChatCapable {
+            id: "x".into(),
+            arch: "bert".into(),
+            domain: crate::worker::models::ModelDomain::Embedding,
+        }),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        http_status(&HiggsError::WorkerRpc {
+            method: "higgs/chat".into(),
+            message: "[HG079] refused".into(),
+            worker_code: Some("HG079".into()),
+        }),
+        StatusCode::BAD_REQUEST
+    );
     assert_eq!(
         http_status(&HiggsError::ModelNotLoaded { id: "x".into() }),
         StatusCode::NOT_FOUND

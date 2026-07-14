@@ -2851,6 +2851,32 @@ async fn a_shadow_file_cannot_flip_a_resident_models_chat_verdict() {
             .contains(&"org/shadow".to_owned()),
         "the resident generative model stays advertised despite the shadow file"
     );
+
+    // The WIRE domain agrees: with BOTH sources present (facts say Llm, the
+    // scan's first variant says Embedding), the load-time fact must WIN — this
+    // is the conflicting-Some case the vanished-file test cannot pin (there the
+    // scan side is None, so either `.or()` order passes; Fable r8). jigglebot's
+    // picker gates sends on exactly this field.
+    let status = higgs.status().await.expect("status");
+    let info = status
+        .loaded_all
+        .iter()
+        .find(|l| l.id == "org/shadow")
+        .expect("resident");
+    assert_eq!(
+        info.domain,
+        Some(crate::worker::models::ModelDomain::Llm),
+        "status: the load-time fact outranks the shadow's scan verdict"
+    );
+    assert_eq!(
+        higgs
+            .local_loaded_info("org/shadow")
+            .await
+            .expect("resident")
+            .domain,
+        Some(crate::worker::models::ModelDomain::Llm),
+        "local_loaded_info agrees"
+    );
 }
 
 /// `servable_model_ids` judges each id by its FIRST scan variant — the file a
@@ -2960,5 +2986,73 @@ async fn loaded_info_domain_survives_the_file_vanishing() {
         info.domain,
         Some(crate::worker::models::ModelDomain::Embedding),
         "local_loaded_info agrees"
+    );
+}
+
+/// A RERANKER (RANK pooling) is refused at every gate an embedder is — the
+/// comparisons are `!= Llm`, never `== Embedding`. The embedding fixtures alone
+/// cannot catch that mutation (Fable r8: weakening any gate to `== Embedding`
+/// survived the whole suite); this test kills the mutant class at the tune
+/// gate, the JIT/resident chat gates, the actor choke point, and the listing.
+#[tokio::test]
+async fn a_reranker_is_refused_at_every_gate() {
+    let dir = tempfile::TempDir::new().unwrap();
+    crate::serve::test_support::write_reranker_gguf_fixture(dir.path(), "org/rr");
+    let higgs = fake_higgs(vec![dir.path().to_path_buf()]);
+    seed_fresh_profile(&higgs, "org/rr", CtxLen::Fixed { n: 512 }).await;
+
+    // Turbotune refuses up-front (before any load).
+    let err = higgs
+        .tune(TuneRequest {
+            id: "org/rr".to_owned(),
+            mode: Some(TuneMode::Benchmark),
+            budget: None,
+            pins: None,
+        })
+        .await
+        .expect_err("benchmark mode refuses a reranker");
+    assert!(matches!(
+        err,
+        crate::diagnostic::HiggsError::ModelNotChatCapable { .. }
+    ));
+
+    // JIT chat refuses (unloaded, scanned) …
+    let err = higgs
+        .prepare_chat("org/rr", None, "[]")
+        .await
+        .expect_err("JIT refuses a reranker");
+    assert!(matches!(
+        err,
+        crate::diagnostic::HiggsError::ModelNotChatCapable { .. }
+    ));
+    // …and it is never advertised as servable.
+    assert!(!higgs
+        .servable_model_ids()
+        .await
+        .contains(&"org/rr".to_owned()));
+
+    // Explicit load is allowed; the RESIDENT gates refuse too.
+    higgs.load("org/rr", None).await.expect("explicit load");
+    let err = higgs
+        .prepare_chat("org/rr", None, "[]")
+        .await
+        .expect_err("the resident reranker is refused");
+    assert!(matches!(
+        err,
+        crate::diagnostic::HiggsError::ModelNotChatCapable { .. }
+    ));
+    let (worker, _) = higgs
+        .local
+        .instances()
+        .await
+        .pop()
+        .expect("resident worker");
+    assert!(
+        higgs.local.chat_handle(worker, "org/rr").await.is_err(),
+        "the actor choke point refuses a reranker lease"
+    );
+    assert!(
+        !higgs.chat_model_ids().await.contains(&"org/rr".to_owned()),
+        "a resident reranker is not advertised"
     );
 }

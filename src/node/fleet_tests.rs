@@ -2558,4 +2558,13 @@ async fn a_stale_inventory_row_does_not_unadvertise_a_reused_worker_id() {
         actor.routed_models().is_empty(),
         "a matching non-generative row still filters its own route"
     );
+
+    // A RERANKER row filters too — the comparison is `!= Llm`, not
+    // `== Embedding` (Fable r8 mutation probe).
+    actor.inventories.get_mut("nodeA").unwrap().0.workers[0].domain =
+        crate::worker::models::ModelDomain::Reranker;
+    assert!(
+        actor.routed_models().is_empty(),
+        "a matching reranker row filters its own route"
+    );
 }

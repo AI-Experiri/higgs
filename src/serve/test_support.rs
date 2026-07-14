@@ -259,6 +259,34 @@ pub(crate) fn write_embedding_gguf_fixture_named(root: &std::path::Path, id: &st
     write_named(root, id, filename, buf.into_inner());
 }
 
+/// A header-only RERANKER GGUF fixture (llama.cpp `RANK` pooling, `pooling_type`
+/// = 4, causal attention — the bge-reranker shape). The [HG079] gates refuse ANY
+/// non-Llm domain; tests use this to pin that the comparisons are `!= Llm`, not
+/// `== Embedding` (a mutation the embedding fixtures alone cannot catch).
+pub(crate) fn write_reranker_gguf_fixture(root: &std::path::Path, id: &str) {
+    use ggus::{GGufFileHeader, GGufFileWriter, GGufMetaDataValueType as T};
+    use std::io::Cursor;
+    fn gguf_string(s: &str) -> Vec<u8> {
+        let bytes = s.as_bytes();
+        let mut out = Vec::with_capacity(8 + bytes.len());
+        out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        out.extend_from_slice(bytes);
+        out
+    }
+    let kvs: Vec<(&str, T, Vec<u8>)> = vec![
+        ("general.architecture", T::String, gguf_string("bert")),
+        ("bert.context_length", T::U32, 512u32.to_le_bytes().to_vec()),
+        ("bert.pooling_type", T::U32, 4u32.to_le_bytes().to_vec()),
+    ];
+    let mut buf = Cursor::new(Vec::<u8>::new());
+    let mut w = GGufFileWriter::new(&mut buf, GGufFileHeader::new(3, 0, kvs.len() as u64)).unwrap();
+    for (k, t, v) in &kvs {
+        w.write_meta_kv(k, *t, v).unwrap();
+    }
+    w.finish::<Vec<u8>>(false).finish().unwrap();
+    write_named(root, id, "model-Q8_0.gguf", buf.into_inner());
+}
+
 fn write_named(root: &std::path::Path, id: &str, filename: &str, bytes: Vec<u8>) {
     let path = root.join(id).join(filename);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();

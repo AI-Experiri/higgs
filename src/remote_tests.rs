@@ -42,6 +42,10 @@ fn legacy_inventory_worker_decodes_without_stats() {
             .expect("legacy row decodes");
     assert_eq!(w.worker_id, 3);
     assert!(w.ctx_len.is_none() && w.loaded_at_ms.is_none() && w.in_flight.is_none());
+    // The old-node PERMISSIVE contract: a domain-less legacy row reads as `Llm`
+    // (the pre-domain behaviour) — any other default would drop every old
+    // node's workers from /v1/models and pre-refuse their chats (Fable r8).
+    assert_eq!(w.domain, crate::worker::models::ModelDomain::Llm);
     // And a CURRENT row round-trips its stats.
     let full: InventoryWorker = serde_json::from_value(serde_json::json!({
         "worker_id": 4, "model": "org/m", "ctx_len": 256,
