@@ -1869,14 +1869,21 @@ async fn tune_benchmark_honors_request_pins_end_to_end() {
 /// (fits any dev host with free RAM). No llama.cpp — only the staleness anchors and
 /// the load params matter to the readiness math.
 async fn seed_fresh_profile(higgs: &Higgs, id: &str, ctx: CtxLen) {
-    use crate::worker::engine::LoadParams;
-    let hw = higgs.hardware().await;
     let path = higgs
         .scan()
         .await
         .ok()
         .and_then(|ms| ms.into_iter().find(|m| m.id == id).map(|m| m.path))
         .expect("fixture model is scannable");
+    seed_fresh_profile_at(higgs, id, ctx, &path).await;
+}
+
+/// [`seed_fresh_profile`] anchored to an EXPLICIT file — `profile_stale` keys
+/// freshness on the file signature, so a multi-variant id needs the record to
+/// name which variant it was tuned against.
+async fn seed_fresh_profile_at(higgs: &Higgs, id: &str, ctx: CtxLen, path: &str) {
+    use crate::worker::engine::LoadParams;
+    let hw = higgs.hardware().await;
     let store = higgs.models_store().expect("open models store");
     store.put_tuning(
         id,
@@ -1888,7 +1895,7 @@ async fn seed_fresh_profile(higgs: &Higgs, id: &str, ctx: CtxLen) {
             bench_tps: None,
             tuned_at_ms: 1,
             hw_fingerprint: hw.fingerprint(),
-            model_file_sig: file_sig(&path),
+            model_file_sig: file_sig(path),
         },
     );
     store.flush().expect("persist seeded profile");
@@ -2829,5 +2836,115 @@ async fn a_shadow_file_cannot_flip_a_resident_models_chat_verdict() {
             .await
             .contains(&"org/shadow".to_owned()),
         "the resident generative model stays advertised despite the shadow file"
+    );
+}
+
+/// `servable_model_ids` judges each id by its FIRST scan variant — the file a
+/// JIT load actually resolves. A tuned generative SECOND variant behind an
+/// embedding first file must not advertise an id every chat then refuses
+/// ([HG079]). Fail-on-revert: evaluating every variant re-advertises it.
+#[tokio::test]
+async fn a_second_variant_cannot_advertise_an_id_the_load_wont_serve() {
+    let dir = tempfile::TempDir::new().unwrap();
+    // Embedding first ("model-0-…" sorts before "model-Q4_K_M.gguf"), generative second.
+    crate::serve::test_support::write_embedding_gguf_fixture_named(
+        dir.path(),
+        "org/mixed",
+        "model-0-embed.gguf",
+    );
+    crate::serve::test_support::write_gguf_fixture(dir.path(), "org/mixed");
+    let higgs = fake_higgs(vec![dir.path().to_path_buf()]);
+    // One tuning record per ID, anchored to the GENERATIVE second variant's file
+    // — so THAT variant is genuinely prepared, fresh, and fitting (Servable on
+    // its own terms). Only the first-variant rule withholds the id.
+    let gen_path = dir
+        .path()
+        .join("org/mixed/model-Q4_K_M.gguf")
+        .to_string_lossy()
+        .into_owned();
+    seed_fresh_profile_at(&higgs, "org/mixed", CtxLen::Fixed { n: 512 }, &gen_path).await;
+
+    // Precondition for the fail-on-revert claim: evaluated ON ITS OWN, the
+    // generative second variant reads Servable — the first-variant rule is the
+    // ONLY thing keeping the id out of the advertisement.
+    {
+        let scan = higgs.scan().await.expect("scan");
+        let second = scan
+            .iter()
+            .find(|m| m.id == "org/mixed" && m.path == gen_path)
+            .expect("generative variant scanned");
+        let hw = higgs.hardware().await;
+        let tuning = higgs.tuning_records().expect("tuning");
+        let (readiness, _) = higgs.model_readiness(second, &[], &hw, &tuning);
+        assert_eq!(
+            readiness,
+            crate::serve::readiness::ModelReadiness::Servable,
+            "the second variant is Servable on its own terms"
+        );
+    }
+
+    assert!(
+        !higgs
+            .servable_model_ids()
+            .await
+            .contains(&"org/mixed".to_owned()),
+        "the id's JIT target is the embedding first variant — advertising it \
+         promises a chat that always refuses"
+    );
+    // …and the JIT gate agrees with the non-advertisement.
+    let err = higgs
+        .prepare_chat("org/mixed", None, "[]")
+        .await
+        .expect_err("JIT resolves the embedding first variant");
+    assert!(matches!(
+        err,
+        crate::diagnostic::HiggsError::ModelNotChatCapable { .. }
+    ));
+}
+
+/// The wire `LoadedInfo.domain` — what jigglebot's picker gates sends on — must
+/// survive the FILE disappearing after the load: it reads the worker's
+/// LOAD-TIME facts, with the scan only as a no-facts fallback. Fail-on-revert:
+/// a scan-derived fill goes `None` (permissive) when the file is deleted, and
+/// the picker would offer a resident embedding model whose every send refuses.
+#[tokio::test]
+async fn loaded_info_domain_survives_the_file_vanishing() {
+    let dir = tempfile::TempDir::new().unwrap();
+    crate::serve::test_support::write_embedding_gguf_fixture(dir.path(), "org/embed");
+    crate::serve::test_support::write_embedding_gguf_fixture(dir.path(), "org/embed2");
+    let higgs = fake_higgs(vec![dir.path().to_path_buf()]);
+    seed_fresh_profile(&higgs, "org/embed", CtxLen::Fixed { n: 512 }).await;
+    seed_fresh_profile(&higgs, "org/embed2", CtxLen::Fixed { n: 512 }).await;
+    // TWO residents: org/embed becomes the PRIMARY (live-probed), org/embed2 a
+    // SECONDARY (stub path) — the two loaded_all arms fill domains differently,
+    // and both must survive the files vanishing.
+    higgs.load("org/embed", None).await.expect("load");
+    higgs.load("org/embed2", None).await.expect("load 2");
+
+    // The files vanish AFTER the loads (the workers still serve their mmaps).
+    std::fs::remove_file(dir.path().join("org/embed/model-f16.gguf")).expect("delete");
+    std::fs::remove_file(dir.path().join("org/embed2/model-f16.gguf")).expect("delete 2");
+
+    let status = higgs.status().await.expect("status");
+    for id in ["org/embed", "org/embed2"] {
+        let info = status
+            .loaded_all
+            .iter()
+            .find(|l| l.id == id)
+            .expect("still resident");
+        assert_eq!(
+            info.domain,
+            Some(crate::worker::models::ModelDomain::Embedding),
+            "{id}: the wire domain is the LOAD-TIME fact, not a re-scan of a vanished file"
+        );
+    }
+    let info = higgs
+        .local_loaded_info("org/embed")
+        .await
+        .expect("resident");
+    assert_eq!(
+        info.domain,
+        Some(crate::worker::models::ModelDomain::Embedding),
+        "local_loaded_info agrees"
     );
 }

@@ -2198,9 +2198,18 @@ impl Higgs {
         // live ctx/gpu/threads come as a stub for now; per-worker live stats are the T9 follow-up.)
         let primary_status = self.local.status(primary).await;
         let worker_alive = primary_status.is_ok();
+        // The workers' LOAD-TIME domains (the ChatHandle gate's own facts): the
+        // wire `domain` every consumer reads (jigglebot's picker gates sends on
+        // it) must not flip when the file is deleted or shadowed after the load
+        // — the scan fill below is only the fallback for a worker with no facts.
+        let worker_domains = self.local.worker_domains().await;
         let primary_info = primary_status
             .ok()
-            .and_then(|v| self.loaded_info_from(&v, &scan));
+            .and_then(|v| self.loaded_info_from(&v, &scan))
+            .map(|mut i| {
+                i.domain = worker_domains.get(&primary).copied().or(i.domain);
+                i
+            });
 
         // `loaded` (back-compat) = the primary's SUCCESSFUL probe ONLY — `None` when it failed or
         // was malformed, preserving the legacy `/api/higgs/status.loaded` contract (a stub must
@@ -2236,6 +2245,8 @@ impl Higgs {
             } else {
                 self.loaded_info_stub(served_id, worker.0, raw, &scan, &records)
             };
+            let mut info = info;
+            info.domain = worker_domains.get(worker).copied().or(info.domain);
             loaded_all.push(info);
         }
 
@@ -2667,11 +2678,14 @@ impl Higgs {
     pub async fn local_loaded_info(&self, served: &str) -> Option<LoadedInfo> {
         let (worker, raw) = self.local_served().await.remove(served)?;
         let scan = self.scan().await.unwrap_or_default();
+        // LOAD-TIME domain, like `status` — the scan fill is only the no-facts fallback.
+        let domain = self.local.worker_domains().await.get(&worker).copied();
         match self.local.status(worker).await {
             Ok(v) => {
                 let mut info = self.loaded_info_from(&v, &scan)?;
                 info.id = served.to_owned();
                 info.worker_id = worker.0;
+                info.domain = domain.or(info.domain);
                 Some(info)
             }
             Err(_) => {
@@ -2681,13 +2695,15 @@ impl Higgs {
                 // no surviving record they're `None`, which the gate treats as permissive —
                 // the chat QUEUES behind the generation and the worker's [HG005] stays
                 // authoritative. `None` replaced the old `ctx_len = u32::MAX` sentinel.
-                Some(self.loaded_info_stub(
+                let mut info = self.loaded_info_stub(
                     served.to_owned(),
                     worker.0,
                     &raw,
                     &scan,
                     &self.model_records(),
-                ))
+                );
+                info.domain = domain.or(info.domain);
+                Some(info)
             }
         }
     }
@@ -3023,8 +3039,16 @@ impl Higgs {
             .map(|(_, m)| m)
             .collect();
         let hw = self.hardware().await;
+        // FIRST variant per id only (the scan is (id, path)-sorted): a JIT load
+        // resolves `ModelStore::get`'s first match, so a LATER same-id variant's
+        // readiness must not advertise an id whose actual load target is a
+        // different file — e.g. a tuned generative second file behind an
+        // embedding first file would advertise an id every chat then refuses
+        // ([HG079], codex r4).
+        let mut seen = std::collections::HashSet::new();
         models
             .into_iter()
+            .filter(|m| seen.insert(m.id.clone()))
             .filter(|m| {
                 let (readiness, _) = self.model_readiness(m, &loaded_set, &hw, &tuning);
                 readiness == crate::serve::readiness::ModelReadiness::Servable

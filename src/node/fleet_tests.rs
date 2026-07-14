@@ -2356,3 +2356,106 @@ async fn the_hub_refuses_a_remote_non_generative_chat_before_dispatch() {
         "a DIRECT [HG079] from the hub's own gate (not a relayed WorkerRpc): {err}"
     );
 }
+
+/// `RemoteDomain` reports a verdict ONLY when the cached inventory row matches
+/// the routed MODEL, not just the worker id: a node restart can reuse a worker
+/// id for a different file, and a wrong-model verdict would pre-refuse [HG079]
+/// where dispatch would have surfaced the stale route ([HG018] eviction).
+/// Fail-on-revert: matching by worker id alone reports the reused worker's
+/// embedding domain for the generative route.
+#[tokio::test]
+async fn a_reused_worker_id_does_not_lend_its_domain_to_a_stale_route() {
+    let mut node_ids = NodeIdAllocator::new();
+    node_ids.assign("nodeA");
+    let mut actor = FleetActor {
+        nodes: HashMap::new(),
+        routes: HashMap::new(),
+        node_ids,
+        inventories: HashMap::new(),
+        chat_refreshes: HashMap::new(),
+        chat_refresh_gen: 0,
+        software_versions: HashMap::new(),
+        event_nodes: std::collections::HashSet::new(),
+        events_tx: tokio::sync::broadcast::channel(8).0,
+        pending_pushes: HashMap::new(),
+        fallback_inflight: HashMap::new(),
+        fallback_gen: 0,
+        versions: HashMap::new(),
+        epochs: HashMap::new(),
+        bus: Arc::new(crate::log_bus::LogBus::new()),
+        admit_gen: 0,
+    };
+    // The STALE route: "org/gen" is believed to live at worker 1…
+    actor
+        .routes
+        .insert(("nodeA".to_string(), WorkerId(1)), "org/gen".to_string());
+    // …but the node restarted and worker 1 now serves an EMBEDDING model.
+    let inv = crate::remote::NodeInventory {
+        hostname: "host".into(),
+        os: "macos".into(),
+        workers: vec![crate::remote::InventoryWorker {
+            worker_id: 1,
+            model: "org/embed".into(),
+            served_id: String::new(),
+            ctx_len: Some(256),
+            gpu_layers: None,
+            threads: None,
+            loaded_at_ms: Some(1),
+            idle_ms: Some(0),
+            in_flight: Some(0),
+            domain: crate::worker::models::ModelDomain::Embedding,
+        }],
+        snapshot_seq: Some(1),
+        hardware: crate::system::HardwareInfo {
+            cpu_name: String::new(),
+            arch: String::new(),
+            cpu_cores: 0,
+            ram_total_bytes: 0,
+            ram_used_bytes: 0,
+            cpu_usage_percent: 0.0,
+            gpus: vec![],
+            vram_total_bytes: 0,
+        },
+        runtime: crate::system::RuntimeInfo {
+            engine: String::new(),
+            backend: String::new(),
+            version: String::new(),
+            binding: String::new(),
+        },
+    };
+    actor
+        .inventories
+        .insert("nodeA".to_string(), (inv, PulledAt::now()));
+
+    // Model mismatch → NO verdict (permissive): the embedding worker must not
+    // lend its domain to the stale generative route.
+    let (tx, rx) = oneshot::channel();
+    actor
+        .handle(FleetMsg::RemoteDomain {
+            node: "nodeA".to_string(),
+            worker: WorkerId(1),
+            model: "org/gen".to_string(),
+            reply: tx,
+        })
+        .await;
+    assert_eq!(
+        rx.await.unwrap(),
+        None,
+        "no row matches (worker, MODEL) → unknown, never a verdict about a different file"
+    );
+
+    // The MATCHING model does get its verdict — the guard filters, not blinds.
+    let (tx, rx) = oneshot::channel();
+    actor
+        .handle(FleetMsg::RemoteDomain {
+            node: "nodeA".to_string(),
+            worker: WorkerId(1),
+            model: "org/embed".to_string(),
+            reply: tx,
+        })
+        .await;
+    assert_eq!(
+        rx.await.unwrap(),
+        Some(crate::worker::models::ModelDomain::Embedding)
+    );
+}

@@ -187,10 +187,15 @@ enum FleetMsg {
         reply: oneshot::Sender<bool>,
     },
     /// The cached-inventory domain for one (node, worker) — `None` when no
-    /// inventory/row is cached (see `HubFleet::remote_domain`).
+    /// inventory/row is cached, OR when the row's model is not the routed
+    /// `model`: a node restart can reuse a worker id for a DIFFERENT file, and a
+    /// verdict about the wrong model would pre-refuse [HG079] where dispatch
+    /// would have surfaced the stale route ([HG018] eviction). Mismatch →
+    /// permissive; the node's own gate enforces (see `HubFleet::remote_domain`).
     RemoteDomain {
         node: NodeKey,
         worker: WorkerId,
+        model: String,
         reply: oneshot::Sender<Option<crate::worker::models::ModelDomain>>,
     },
     RoutedModels {
@@ -825,12 +830,13 @@ impl Actor for FleetActor {
             FleetMsg::RemoteDomain {
                 node,
                 worker,
+                model,
                 reply,
             } => {
                 let domain = self.inventories.get(&node).and_then(|(inv, _)| {
                     inv.workers
                         .iter()
-                        .find(|w| w.worker_id == worker.0)
+                        .find(|w| w.worker_id == worker.0 && w.model == model)
                         .map(|w| w.domain)
                 });
                 let _ = reply.send(domain);
@@ -2159,10 +2165,11 @@ impl HubFleet {
     /// node's own `ChatHandle` gate remains the enforcement. `Some` lets the hub
     /// refuse a non-generative remote target BEFORE committing a response stream.
     pub async fn remote_domain(&self, served: &str) -> Option<crate::worker::models::ModelDomain> {
-        let (node, worker) = self.resolve(served).await?;
+        let (node, worker, model) = self.require_served(served).await.ok()?;
         self.ask(|reply| FleetMsg::RemoteDomain {
             node,
             worker,
+            model,
             reply,
         })
         .await
