@@ -2715,3 +2715,70 @@ async fn a_resident_embedding_model_is_refused_and_unlisted() {
         Ok(_) => panic!("the actor must refuse a chat lease on an embedding worker"),
     }
 }
+
+/// Turbotune (Benchmark mode) refuses a non-generative model UP-FRONT with the
+/// true reason ([HG079]) — its measurement is a CHAT generation, which the
+/// dispatch gate refuses, so without this check every candidate would load,
+/// fail, and burn a rung before surfacing a misleading "all candidates failed"
+/// [HG063]. Fail-on-revert: remove the gate and this errors HG063, not HG079.
+/// (The ANALYTICAL tune — plain Prepare — still works for these models; the
+/// resident-embedding test above depends on exactly that.)
+#[tokio::test]
+async fn turbotune_refuses_a_non_generative_model_up_front() {
+    let dir = tempfile::TempDir::new().unwrap();
+    crate::serve::test_support::write_embedding_gguf_fixture(dir.path(), "org/embed");
+    let higgs = fake_higgs(vec![dir.path().to_path_buf()]);
+    let err = higgs
+        .tune(TuneRequest {
+            id: "org/embed".to_owned(),
+            mode: Some(TuneMode::Benchmark),
+            budget: None,
+            pins: None,
+        })
+        .await
+        .expect_err("benchmark mode must refuse an embedding model");
+    assert!(
+        matches!(
+            err,
+            crate::diagnostic::HiggsError::ModelNotChatCapable { .. }
+        ),
+        "expected the up-front [HG079], got: {err}"
+    );
+}
+
+/// An id collision across scan variants must not hide a resident GENERATIVE
+/// model: two GGUF files can share one catalog id (e.g. two quant files in one
+/// model dir), and the LOAD path resolves the FIRST scanned variant
+/// (`ModelStore::get`), so the advertising filter must judge the id by that
+/// SAME variant — not by `any` same-id file being non-generative.
+#[tokio::test]
+async fn an_id_collision_does_not_hide_the_resident_generative_variant() {
+    let dir = tempfile::TempDir::new().unwrap();
+    // Two files, ONE id ("org/dual"). Scan sorts by (id, path):
+    // "model-Q4_K_M.gguf" (generative) < "model-f16.gguf" (embedding), so the
+    // generative variant is the one `ModelStore::get` — and any load — resolves.
+    crate::serve::test_support::write_gguf_fixture(dir.path(), "org/dual");
+    crate::serve::test_support::write_embedding_gguf_fixture(dir.path(), "org/dual");
+    let higgs = fake_higgs(vec![dir.path().to_path_buf()]);
+
+    // Precondition: BOTH variants scanned under the one id, generative first.
+    let scanned = higgs.scan().await.expect("scan");
+    let variants: Vec<_> = scanned.iter().filter(|m| m.id == "org/dual").collect();
+    assert_eq!(variants.len(), 2, "both files share the id");
+    assert_eq!(
+        variants[0].domain,
+        crate::worker::models::ModelDomain::Llm,
+        "the FIRST variant (what a load resolves) is the generative one"
+    );
+
+    seed_fresh_profile(&higgs, "org/dual", CtxLen::Fixed { n: 512 }).await;
+    higgs.load("org/dual", None).await.expect("load");
+    assert!(
+        higgs
+            .chat_model_ids()
+            .await
+            .contains(&"org/dual".to_owned()),
+        "the resident generative variant stays advertised despite the same-id \
+         embedding file"
+    );
+}

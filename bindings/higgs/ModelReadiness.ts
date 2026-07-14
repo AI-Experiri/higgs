@@ -9,8 +9,9 @@ export const ModelReadiness = {
     NeedsRetune : "needs_retune",
     Loaded      : "loaded",
     Embedding   : "embedding",
+    Reranker    : "reranker",
 } as const;
 
-export const { Discovered, Profiled, Servable, Unservable, NeedsRetune, Loaded, Embedding } = ModelReadiness;
+export const { Discovered, Profiled, Servable, Unservable, NeedsRetune, Loaded, Embedding, Reranker } = ModelReadiness;
 
 export type ModelReadiness = (typeof ModelReadiness)[keyof typeof ModelReadiness];

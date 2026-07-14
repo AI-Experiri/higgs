@@ -28,6 +28,11 @@ higgs_const_enum! {
         /// is refused ([HG079]). A terminal classification, not a step toward
         /// `Servable`: no amount of tuning or free memory makes it generate.
         Embedding,
+        /// Reranker (llama.cpp `RANK` pooling): scores query/document pairs. As
+        /// terminal as `Embedding` for the chat ladder — chat is refused ([HG079]) —
+        /// but a DISTINCT state: a reranker is not an embedder, and reporting it as
+        /// one would misdirect both the UI badge and a future `/v1/embeddings`.
+        Reranker,
     }
 }
 
@@ -47,9 +52,10 @@ pub struct ReadinessInputs {
     pub fits: bool,
     /// Serving is enabled on this node.
     pub serving: bool,
-    /// The model can generate text at all — its GGUF header does not declare it
-    /// embedding-only ([`crate::worker::models::ModelDomain::Llm`]).
-    pub chat_capable: bool,
+    /// The model's capability class from its GGUF header. Anything but
+    /// [`crate::worker::models::ModelDomain::Llm`] short-circuits the chat ladder to
+    /// its own terminal state.
+    pub domain: crate::worker::models::ModelDomain,
 }
 
 /// Does an estimated footprint fit the model into the resources free **right
@@ -86,9 +92,13 @@ pub fn derive_readiness(i: &ReadinessInputs) -> ModelReadiness {
     // Ahead of `loaded`: the chat-serving ladder (Discovered → … → Servable) does not
     // apply to a model that cannot chat, and residency does not change that. A resident
     // embedding model is still `Embedding` — reporting it `Loaded` would put it back in
-    // the picker as a chat target, which is the bug this state exists to close.
-    if !i.chat_capable {
-        return ModelReadiness::Embedding;
+    // the picker as a chat target, which is the bug this state exists to close. Each
+    // non-chat domain keeps ITS OWN state — collapsing a reranker into `Embedding`
+    // would misreport what the model is.
+    match i.domain {
+        crate::worker::models::ModelDomain::Embedding => return ModelReadiness::Embedding,
+        crate::worker::models::ModelDomain::Reranker => return ModelReadiness::Reranker,
+        crate::worker::models::ModelDomain::Llm => {}
     }
     if i.loaded {
         return ModelReadiness::Loaded;

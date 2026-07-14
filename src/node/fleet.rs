@@ -743,11 +743,34 @@ impl FleetActor {
         let mut v: Vec<_> = self
             .served_ids()
             .into_iter()
-            .filter(|(_, (node, _))| self.nodes.contains_key(node))
+            .filter(|(_, (node, worker))| {
+                // Advertise only what chat can actually reach: connected, AND not a
+                // worker the node's inventory declares non-generative — chatting one
+                // is a guaranteed [HG079]. Advertising-only: routing/dispatch is
+                // untouched, so a client that still names the id gets the node's own
+                // refusal, not a hub-side guess.
+                self.nodes.contains_key(node) && self.worker_chat_capable(node, *worker)
+            })
             .map(|(served, _)| served)
             .collect();
         v.sort();
         v
+    }
+
+    /// The cached inventory's verdict on whether `(node, worker)` can chat.
+    /// Permissive on absence — no cached inventory, or no row for the worker,
+    /// reads as capable: the node-side `ChatHandle` gate is the enforcement, and
+    /// the hub must not hide a model over data it merely hasn't pulled yet. An
+    /// OLDER node never reports a domain (`serde(default)` = `Llm`), so its
+    /// embedding workers stay advertised and can still return garbage — an
+    /// accepted residual the hub cannot see; upgrading the node closes it.
+    fn worker_chat_capable(&self, node: &NodeKey, worker: WorkerId) -> bool {
+        self.inventories.get(node).is_none_or(|(inv, _)| {
+            inv.workers
+                .iter()
+                .find(|w| w.worker_id == worker.0)
+                .is_none_or(|w| w.domain == crate::worker::models::ModelDomain::Llm)
+        })
     }
 }
 

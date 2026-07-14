@@ -1360,6 +1360,7 @@ async fn pushed_worker_snapshot_merges_under_the_seq_guard() {
     }
     fn worker(in_flight: u32) -> crate::remote::InventoryWorker {
         crate::remote::InventoryWorker {
+            domain: Default::default(),
             worker_id: 1,
             model: "org/m".into(),
             served_id: String::new(),
@@ -1644,6 +1645,7 @@ async fn pushes_from_a_replaced_connection_are_dropped() {
         kind: crate::remote::FleetEventKind::ChatEnd,
         snapshot_seq: seq,
         workers: vec![crate::remote::InventoryWorker {
+            domain: Default::default(),
             worker_id: 1,
             model: "org/m".into(),
             served_id: String::new(),
@@ -1855,6 +1857,7 @@ async fn a_pre_cache_push_is_retained_and_replayed_over_an_older_pull() {
                 hostname: "h".into(),
                 os: "macos".into(),
                 workers: vec![crate::remote::InventoryWorker {
+                    domain: Default::default(),
                     worker_id: 1,
                     model: "org/reaped".into(),
                     served_id: String::new(),
@@ -2270,4 +2273,54 @@ async fn an_unknown_event_kind_still_applies_its_snapshot() {
         "unknown-kind snapshot applied: {inv:?}"
     );
     assert_eq!(inv.workers[0].worker_id, 9);
+}
+
+/// A remote worker the node's inventory declares non-generative is dropped from
+/// `routed_models` (the `/v1/models` advertising set) — chatting it is a
+/// guaranteed [HG079] — while ROUTING is untouched: the id still resolves, and a
+/// chat dispatched anyway comes back with the NODE's own refusal over the wire.
+/// That last assertion is the relay-propagation contract in ordinary CI — no
+/// external model file needed (the real-engine version lives in
+/// tests/embedding_remote.rs and skips without its fixture).
+#[tokio::test]
+async fn a_non_generative_remote_worker_is_unadvertised_but_still_refused_on_the_wire() {
+    let (fleet, node_key, model_id, root) = fleet_with_one_node().await;
+    crate::serve::test_support::write_embedding_gguf_fixture(root.path(), "org/embed");
+
+    fleet.load(&node_key, &model_id, None).await.unwrap();
+    fleet.load(&node_key, "org/embed", None).await.unwrap();
+    // Commit a fresh inventory so the hub KNOWS both workers' domains — the
+    // filter is deliberately permissive while no inventory is cached.
+    fleet.refresh_inventory(&node_key).await.unwrap();
+
+    let routed = fleet.routed_models().await;
+    assert!(
+        routed.contains(&model_id),
+        "the generative worker stays advertised; routed: {routed:?}"
+    );
+    assert!(
+        !routed.contains(&"org/embed".to_owned()),
+        "a non-generative remote worker must not be advertised; routed: {routed:?}"
+    );
+    // Routing untouched: the id still resolves remotely (advertising-only filter)…
+    assert!(
+        fleet.is_remote("org/embed").await,
+        "the route survives — only the advertising filters"
+    );
+    // …and a chat dispatched anyway is refused BY THE NODE, over the real relay
+    // wire, with the [HG079] code intact.
+    let err = match fleet
+        .chat("org/embed", "[]".into(), 8, 0.0, None, None)
+        .await
+    {
+        Ok((_rx, fut)) => match fut.await {
+            Ok(v) => panic!("a relayed chat against an embedding worker must fail, got: {v}"),
+            Err(e) => e,
+        },
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("HG079"),
+        "the node's refusal code survives the relay: {err}"
+    );
 }

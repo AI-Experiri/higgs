@@ -915,9 +915,15 @@ impl Higgs {
         // the enforcement either way.
         if let Ok(scanned) = self.scan().await {
             ids.retain(|id| {
-                !scanned
+                // FIRST match, not `any`: on an id collision across stores the load
+                // path (`ModelStore::get`) resolves to the first scanned variant, so
+                // the resident worker IS that variant — judging the id by any other
+                // same-id file would hide a resident generative model because some
+                // other store carries an embedding conversion under the same name.
+                scanned
                     .iter()
-                    .any(|m| &m.id == id && m.domain != crate::worker::models::ModelDomain::Llm)
+                    .find(|m| &m.id == id)
+                    .is_none_or(|m| m.domain == crate::worker::models::ModelDomain::Llm)
             });
         }
         // Advertise servable (JIT-loadable) catalog ids too, but ONLY while JIT is

@@ -393,6 +393,7 @@ impl NodeActor {
                         ctx_len: facts.and_then(|f| f.ctx_len),
                         gpu_layers: facts.and_then(|f| f.gpu_layers),
                         threads: facts.and_then(|f| f.threads),
+                        domain: facts.map(|f| f.domain).unwrap_or_default(),
                         loaded_at_ms: facts.map(|f| f.loaded_at_ms),
                         idle_ms: self
                             .last_activity

@@ -297,6 +297,14 @@ pub struct InventoryWorker {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub gpu_layers: Option<crate::worker::engine::GpuLayers>,
+    /// The worker's capability class, captured at LOAD time on the node
+    /// (`LoadFacts.domain`). The hub reads it to keep non-generative remote
+    /// workers out of the `/v1/models` chat union — the node's own `ChatHandle`
+    /// [HG079] gate stays the enforcement. `serde(default)` = `Llm`: an OLDER
+    /// node never reports it, and the hub deliberately stays permissive about
+    /// what it cannot see (additive, no protocol bump).
+    #[serde(default)]
+    pub domain: crate::worker::models::ModelDomain,
     /// Generation threads the load requested (absent = the worker default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]

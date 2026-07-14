@@ -2915,6 +2915,20 @@ impl Higgs {
         //    surfaces [HG063]. Suggest mode skips this entirely.
         let mut bench_tps = None;
         if req.mode.unwrap_or_default() == TuneMode::Benchmark {
+            // Turbotune measures CHAT decode throughput. A non-generative model
+            // cannot take the measurement lease (the ChatHandle gate refuses it,
+            // [HG079]) — without this check every candidate would LOAD, fail its
+            // measurement, and burn a full rung before surfacing a misleading
+            // "all candidates failed" [HG063]. Refuse up-front with the true reason.
+            // The ANALYTICAL tune (above) still runs for these models — it never
+            // generates, and a load profile is exactly what /v1/embeddings will need.
+            if model.domain != crate::worker::models::ModelDomain::Llm {
+                return Err(HiggsError::ModelNotChatCapable {
+                    id: id.clone(),
+                    arch: model.arch.clone().unwrap_or_else(|| "unknown".into()),
+                    domain: model.domain,
+                });
+            }
             let pins = req.pins.clone().unwrap_or_default();
             let (benchmarked_load, bench) = self
                 .turbotune_bench(&id, &meta, &hw, &budget, &suggestion, &pins)
@@ -3057,7 +3071,7 @@ impl Higgs {
             loaded,
             fits,
             serving,
-            chat_capable: model.domain == crate::worker::models::ModelDomain::Llm,
+            domain: model.domain,
         });
         (readiness, fit)
     }

@@ -11,7 +11,7 @@ fn inputs(profiled: bool, stale: bool, loaded: bool, fits: bool, serving: bool) 
         loaded,
         fits,
         serving,
-        chat_capable: true,
+        domain: crate::worker::models::ModelDomain::Llm,
     }
 }
 
@@ -134,7 +134,7 @@ fn missing_on_disk_is_discovered_fallback() {
 #[test]
 fn an_embedding_model_never_climbs_the_chat_ladder() {
     let embedding = |profiled, stale, loaded, fits, serving| ReadinessInputs {
-        chat_capable: false,
+        domain: crate::worker::models::ModelDomain::Embedding,
         ..inputs(profiled, stale, loaded, fits, serving)
     };
     // Profiled, fresh, fits, serving on — would be `Servable` if it could chat.
@@ -152,8 +152,15 @@ fn an_embedding_model_never_climbs_the_chat_ladder() {
         derive_readiness(&embedding(false, false, false, false, true)),
         ModelReadiness::Embedding
     );
+    // A reranker keeps ITS OWN terminal state — never collapsed into `Embedding`
+    // (that would misreport what the model is), never `Loaded`.
+    let reranker = ReadinessInputs {
+        domain: crate::worker::models::ModelDomain::Reranker,
+        ..inputs(true, false, true, true, true)
+    };
+    assert_eq!(derive_readiness(&reranker), ModelReadiness::Reranker);
     // The same flags on a chat-capable model DO reach `Servable` — proving the
-    // demotion above comes from `chat_capable` and nothing else.
+    // demotion above comes from the domain and nothing else.
     assert_eq!(
         derive_readiness(&inputs(true, false, false, true, true)),
         ModelReadiness::Servable
