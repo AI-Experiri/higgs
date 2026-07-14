@@ -940,6 +940,22 @@ impl Higgs {
     /// omit fleet-routed remotes and (JIT-off) local-served ids, silently shrinking
     /// the picker — hence this method, not that call.
     pub async fn chat_model_ids(&self) -> Vec<String> {
+        let entries = self.model_entries().await.unwrap_or_default();
+        self.chat_model_ids_for(&entries).await
+    }
+
+    /// [`chat_model_ids`](Self::chat_model_ids) from rows the caller ALREADY scanned.
+    ///
+    /// A scan is blocking I/O (`read_dir` + `mmap` of every GGUF header) and is not
+    /// cached, so a caller that needs both the rows and the reachable set — the
+    /// `models` control op, which ships them together as `HiggsModelsResponse` —
+    /// must not pay for two. It also makes the pair CONSISTENT: both come from one
+    /// scan, so a load landing mid-call cannot leave the rows and the set disagreeing.
+    ///
+    /// The servable (JIT-loadable) ids are read back off those rows rather than
+    /// re-derived: `readiness` is exactly what `servable_model_ids` computes per row,
+    /// from the same inputs.
+    pub async fn chat_model_ids_for(&self, entries: &[HiggsModelEntry]) -> Vec<String> {
         // A RESIDENT non-generative model is served by a worker (explicit loads are
         // allowed — only chat is refused, [HG079]) but is NOT chat-reachable, so it
         // must not be advertised. Judged by each worker's LOAD-TIME domain — the
@@ -973,7 +989,7 @@ impl Higgs {
         // would promise — the r9 rule's mirror image (Fable r10). Unknown remote
         // domains stay permissive, as everywhere.
         if self.jit_enabled() {
-            for id in self.servable_model_ids().await {
+            for id in Self::servable_ids_from_entries(entries) {
                 if ids.contains(&id) {
                     continue;
                 }

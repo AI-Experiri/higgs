@@ -8,7 +8,6 @@
 //! so there is no separate idle-supervisor seam anymore. Shared by both surfaces'
 //! test modules via `super::test_support::*`.
 
-use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -16,7 +15,6 @@ use axum::body::Body;
 use axum::http::Request;
 use axum::response::Response;
 use axum::Router;
-use ggus::{GGufFileHeader, GGufFileWriter, GGufMetaDataValueType};
 use http_body_util::BodyExt;
 
 use super::v1_router;
@@ -92,39 +90,6 @@ pub(crate) async fn make_app_with_lmstudio_prepared(dir: PathBuf, id: &str) -> R
     app_for(higgs)
 }
 
-/// Seed a fresh tuning profile DIRECTLY into the store — NOT `Higgs::tune`, which
-/// runs a bounded HF card fetch (`fetch_card_bounded`) that stalls ~10s on offline
-/// or firewalled CI. Anchored to the CURRENT hardware + model file so
-/// `profile_state` reads it as `Ready` (the JIT gate admits it), exactly like a
-/// real Prepare. The serve tests use FAKE workers, so the profile's params don't
-/// need to load llama.cpp — only the staleness anchors matter. Keeps these unit
-/// tests hermetic and fast.
-async fn seed_prepared_profile(higgs: &Higgs, id: &str) {
-    use crate::worker::engine::{CtxLen, GpuLayers, LoadParams};
-    let hw = higgs.hardware().await;
-    let path = higgs
-        .scan()
-        .await
-        .ok()
-        .and_then(|ms| ms.into_iter().find(|m| m.id == id).map(|m| m.path))
-        .expect("fixture model is scannable");
-    let store = higgs.models_store().expect("open models store");
-    store.put_tuning(
-        id,
-        crate::tune::store::TuneRecord {
-            profile: LoadParams::base(CtxLen::Auto, GpuLayers::All, 8),
-            sampling: crate::worker::engine::SamplingParams::default(),
-            budget: crate::tune::ResourceBudget::default(),
-            provenance: crate::tune::TuneProvenance::Heuristic,
-            bench_tps: None,
-            tuned_at_ms: 0,
-            hw_fingerprint: hw.fingerprint(),
-            model_file_sig: crate::api::file_sig(&path),
-        },
-    );
-    store.flush().expect("persist seeded profile");
-}
-
 /// The serve router with JIT turned OFF — for the `/v1` tests that assert the
 /// explicit-load HG003 404 path (chat against an unloaded model).
 pub(crate) fn make_app_jit_off() -> Router {
@@ -141,123 +106,14 @@ pub(crate) fn make_app_serving_off() -> Router {
     v1_router(higgs)
 }
 
-/// Write a minimal valid GGUF file (arch=llama, ctx=4096, chat template) at
-/// `<root>/<id>/model-Q4_K_M.gguf` so a host-side scan discovers `id` with
-/// enriched metadata. Returns nothing; the caller owns the temp dir.
-pub(crate) fn write_gguf_fixture(root: &std::path::Path, id: &str) {
-    fn gguf_string(s: &str) -> Vec<u8> {
-        let bytes = s.as_bytes();
-        let mut out = Vec::with_capacity(8 + bytes.len());
-        out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-        out.extend_from_slice(bytes);
-        out
-    }
-
-    let header = GGufFileHeader::new(3, 0, 3);
-    let mut buf = Cursor::new(Vec::<u8>::new());
-    let mut writer = GGufFileWriter::new(&mut buf, header).unwrap();
-    writer
-        .write_meta_kv(
-            "general.architecture",
-            GGufMetaDataValueType::String,
-            &gguf_string("llama"),
-        )
-        .unwrap();
-    writer
-        .write_meta_kv(
-            "llama.context_length",
-            GGufMetaDataValueType::U32,
-            &4096u32.to_le_bytes(),
-        )
-        .unwrap();
-    writer
-        .write_meta_kv(
-            "tokenizer.chat_template",
-            GGufMetaDataValueType::String,
-            &gguf_string("{% for m in messages %}{{ m.content }}{% endfor %}"),
-        )
-        .unwrap();
-    writer.finish::<Vec<u8>>(false).finish().unwrap();
-
-    let path = root.join(id).join("model-Q4_K_M.gguf");
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(&path, buf.into_inner()).unwrap();
-}
-
-/// Write a header-only EMBEDDING-model GGUF fixture under `root/{id}/` — the
-/// arch-scoped keys declare a pooling head and non-causal attention, the two
-/// header shapes `read_domain` classifies as [`crate::worker::models::ModelDomain::Embedding`]
-/// (bge-small's actual declarations). For tests of the chat-vs-embedding gate
-/// ([HG079]) that need a scannable embedding model without a real weights file.
-pub(crate) fn write_embedding_gguf_fixture(root: &std::path::Path, id: &str) {
-    write_embedding_gguf_fixture_named(root, id, "model-f16.gguf");
-}
-
-/// [`write_embedding_gguf_fixture`] with a caller-chosen FILENAME — scan order
-/// inside one model dir is path-lexical, so tests that need the embedding
-/// variant to sort before/after a sibling control the order through the name.
-/// THE one in-crate source of the fixture bytes (the unnamed helper delegates
-/// here). `tests/common/mod.rs`'s `stage_embedding_model` necessarily carries
-/// its own copy — integration tests cannot see `pub(crate)` helpers — keep the
-/// two kv lists in sync when the shape changes (Fable r10).
-pub(crate) fn write_embedding_gguf_fixture_named(root: &std::path::Path, id: &str, filename: &str) {
-    use ggus::{GGufFileHeader, GGufFileWriter, GGufMetaDataValueType as T};
-    use std::io::Cursor;
-    fn gguf_string(s: &str) -> Vec<u8> {
-        let bytes = s.as_bytes();
-        let mut out = Vec::with_capacity(8 + bytes.len());
-        out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-        out.extend_from_slice(bytes);
-        out
-    }
-    let kvs: Vec<(&str, T, Vec<u8>)> = vec![
-        ("general.architecture", T::String, gguf_string("bert")),
-        ("bert.context_length", T::U32, 512u32.to_le_bytes().to_vec()),
-        ("bert.pooling_type", T::U32, 2u32.to_le_bytes().to_vec()),
-        ("bert.attention.causal", T::Bool, vec![0u8]),
-    ];
-    let mut buf = Cursor::new(Vec::<u8>::new());
-    let mut w = GGufFileWriter::new(&mut buf, GGufFileHeader::new(3, 0, kvs.len() as u64)).unwrap();
-    for (k, t, v) in &kvs {
-        w.write_meta_kv(k, *t, v).unwrap();
-    }
-    w.finish::<Vec<u8>>(false).finish().unwrap();
-    write_named(root, id, filename, buf.into_inner());
-}
-
-/// A header-only RERANKER GGUF fixture (llama.cpp `RANK` pooling, `pooling_type`
-/// = 4, causal attention — the bge-reranker shape). The [HG079] gates refuse ANY
-/// non-Llm domain; tests use this to pin that the comparisons are `!= Llm`, not
-/// `== Embedding` (a mutation the embedding fixtures alone cannot catch).
-pub(crate) fn write_reranker_gguf_fixture(root: &std::path::Path, id: &str) {
-    use ggus::{GGufFileHeader, GGufFileWriter, GGufMetaDataValueType as T};
-    use std::io::Cursor;
-    fn gguf_string(s: &str) -> Vec<u8> {
-        let bytes = s.as_bytes();
-        let mut out = Vec::with_capacity(8 + bytes.len());
-        out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-        out.extend_from_slice(bytes);
-        out
-    }
-    let kvs: Vec<(&str, T, Vec<u8>)> = vec![
-        ("general.architecture", T::String, gguf_string("bert")),
-        ("bert.context_length", T::U32, 512u32.to_le_bytes().to_vec()),
-        ("bert.pooling_type", T::U32, 4u32.to_le_bytes().to_vec()),
-    ];
-    let mut buf = Cursor::new(Vec::<u8>::new());
-    let mut w = GGufFileWriter::new(&mut buf, GGufFileHeader::new(3, 0, kvs.len() as u64)).unwrap();
-    for (k, t, v) in &kvs {
-        w.write_meta_kv(k, *t, v).unwrap();
-    }
-    w.finish::<Vec<u8>>(false).finish().unwrap();
-    write_named(root, id, "model-Q8_0.gguf", buf.into_inner());
-}
-
-fn write_named(root: &std::path::Path, id: &str, filename: &str, bytes: Vec<u8>) {
-    let path = root.join(id).join(filename);
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(&path, bytes).unwrap();
-}
+// The GGUF fixture bytes live in ONE place — `crate::fixtures` (also reachable by
+// an embedder's tests through the `test-support` feature) — so the [HG079] domain
+// fixtures cannot drift between the two suites. Re-exported here under the names
+// the serve/api tests already use.
+pub(crate) use crate::fixtures::{
+    seed_prepared_profile, write_embedding_gguf_fixture, write_embedding_gguf_fixture_named,
+    write_gguf_fixture, write_reranker_gguf_fixture,
+};
 
 /// A `GET` request to `uri`. Carries a loopback `Host` so it passes the
 /// serve-layer DNS-rebinding guard (`host_guard`).

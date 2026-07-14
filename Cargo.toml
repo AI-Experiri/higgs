@@ -38,6 +38,15 @@ unnecessary_to_owned = "warn"
 # llama.cpp build (Apple default), so no feature is needed there.
 cuda = ["llama-cpp-2/cuda"]
 
+# GGUF fixtures + profile seeding (`higgs::fixtures`) for the tests of a crate
+# that EMBEDS higgs. jigglebot's control-op tests need a facade whose
+# `chat_model_ids` is NON-EMPTY: a test asserting that list is "forwarded
+# verbatim" is vacuous while it is empty (Fable r12 proved a hardcoded
+# `Vec::new()` in the op survives it). Off by default — nothing under this
+# feature reaches a production build; enable it in the embedder's
+# `[dev-dependencies]` only.
+test-support = []
+
 [dependencies]
 # higgs's own proc-macros (TsConstEnum — const-object TS enums, consistent with jigglebot).
 higgs-macros = { path = "higgs-macros" }

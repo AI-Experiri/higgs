@@ -824,34 +824,19 @@ impl Higgs {
             .unwrap_or_default()
     }
 
-    /// Every saved tuning record (from `models.json`), keyed by model id. Loaded
-    /// ONCE per `/api/higgs/models` pass and threaded into `model_readiness` so
-    /// the listing doesn't reopen + reparse the store per model.
+    /// Every model's `(active, analytical, bench)` tuning triple — the models list
+    /// fills the dual "Tuned"/"Benchmarked" wire fields from this, and readiness
+    /// reads the ACTIVE record out of it via
+    /// [`active_records`](crate::serve::control::active_records). The ONE accessor:
+    /// deriving readiness from a second, separately-read map is how the rows and the
+    /// advertised set drift apart.
     ///
-    /// A store-OPEN failure (models.json exists but is unreadable — a directory,
-    /// bad perms) is surfaced as `PersistenceFailed`, NOT collapsed to "no
-    /// profiles": otherwise the listing would badge every prepared model
-    /// `discovered` exactly in the persistence-failure case, contradicting the JIT
-    /// path's HG040 and telling the user to Prepare again (which would also fail).
-    /// A MISSING store is not an error — `models_store()` returns an empty store,
-    /// so a fresh node lists fine.
-    pub(crate) fn tuning_records(
-        &self,
-    ) -> Result<std::collections::BTreeMap<String, crate::tune::store::TuneRecord>, HiggsError>
-    {
-        let store = self
-            .models_store()
-            .map_err(|e| HiggsError::PersistenceFailed {
-                store: "models".into(),
-                path: "models.json".into(),
-                source: e,
-            })?;
-        Ok(store.all_tuning())
-    }
-
-    /// Every model's `(active, analytical, bench)` tuning triple — the models
-    /// list fills the dual "Tuned"/"Benchmarked" wire fields from this. Same
-    /// error posture as [`Self::tuning_records`].
+    /// A store-OPEN failure (models.json exists but is unreadable — a directory, bad
+    /// perms) is surfaced as `PersistenceFailed`, NOT collapsed to "no profiles":
+    /// otherwise the listing would badge every prepared model `discovered` exactly in
+    /// the persistence-failure case, contradicting the JIT path's HG040 and telling
+    /// the user to Prepare again (which would also fail). A MISSING store is not an
+    /// error — `models_store()` returns an empty store, so a fresh node lists fine.
     #[allow(clippy::type_complexity)]
     pub(crate) fn tuning_profiles(
         &self,
@@ -3025,35 +3010,30 @@ impl Higgs {
     /// Best-effort: any scan/store/hardware failure yields an empty list rather
     /// than failing the listing (resident models are still returned by the caller).
     pub async fn servable_model_ids(&self) -> Vec<String> {
-        let Ok(models) = self.scan().await else {
+        let Ok(entries) = self.model_entries().await else {
             return Vec::new();
         };
-        let Ok(tuning) = self.tuning_records() else {
-            return Vec::new();
-        };
-        let loaded_set: Vec<String> = self
-            .local
-            .instances()
-            .await
-            .into_iter()
-            .map(|(_, m)| m)
-            .collect();
-        let hw = self.hardware().await;
-        // FIRST variant per id only (the scan is (id, path)-sorted): a JIT load
-        // resolves `ModelStore::get`'s first match, so a LATER same-id variant's
-        // readiness must not advertise an id whose actual load target is a
-        // different file — e.g. a tuned generative second file behind an
-        // embedding first file would advertise an id every chat then refuses
-        // ([HG079], codex r4).
+        Self::servable_ids_from_entries(&entries)
+    }
+
+    /// THE servable rule, applied to already-scanned rows — the one place it lives
+    /// (`servable_model_ids` and `chat_model_ids_for`'s JIT leg both come here, so
+    /// the two cannot drift).
+    ///
+    /// FIRST variant per id only (the scan is (id, path)-sorted): a JIT load resolves
+    /// `ModelStore::get`'s first match, so a LATER same-id variant's readiness must
+    /// not advertise an id whose actual load target is a different file — e.g. a
+    /// tuned generative second file behind an embedding first file would advertise an
+    /// id every chat then refuses ([HG079], codex r4).
+    pub(crate) fn servable_ids_from_entries(
+        entries: &[crate::serve::wire::HiggsModelEntry],
+    ) -> Vec<String> {
         let mut seen = std::collections::HashSet::new();
-        models
-            .into_iter()
-            .filter(|m| seen.insert(m.id.clone()))
-            .filter(|m| {
-                let (readiness, _) = self.model_readiness(m, &loaded_set, &hw, &tuning);
-                readiness == crate::serve::readiness::ModelReadiness::Servable
-            })
-            .map(|m| m.id)
+        entries
+            .iter()
+            .filter(|e| seen.insert(e.model.id.clone()))
+            .filter(|e| e.readiness == crate::serve::readiness::ModelReadiness::Servable)
+            .map(|e| e.model.id.clone())
             .collect()
     }
 

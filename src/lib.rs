@@ -18,6 +18,10 @@ pub mod config;
 pub mod delta_queue;
 pub mod diagnostic;
 pub mod download;
+/// GGUF fixtures + profile seeding for tests — including an EMBEDDER's tests, via
+/// the `test-support` feature. Never compiled into a production build.
+#[cfg(any(test, feature = "test-support"))]
+pub mod fixtures;
 pub mod home;
 pub mod hub;
 pub mod keys;

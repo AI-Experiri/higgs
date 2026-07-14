@@ -1924,7 +1924,8 @@ async fn servable_readiness_reflects_serving_and_residency() {
         .find(|m| m.id == "org/model")
         .expect("scanned");
     let hw = higgs.hardware().await;
-    let tuning = higgs.tuning_records().expect("tuning records");
+    let tuning =
+        crate::serve::control::active_records(&higgs.tuning_profiles().expect("tuning profiles"));
 
     // Servable: profiled, fresh, fits free resources, serving on, not resident.
     let (readiness, fit) = higgs.model_readiness(&model, &[], &hw, &tuning);
@@ -1996,7 +1997,8 @@ async fn model_readiness_discovered_and_needs_retune() {
     let hw = higgs.hardware().await;
 
     // No profile → Discovered, not servable.
-    let tuning = higgs.tuning_records().expect("tuning records");
+    let tuning =
+        crate::serve::control::active_records(&higgs.tuning_profiles().expect("tuning profiles"));
     let (readiness, fit) = higgs.model_readiness(&model, &[], &hw, &tuning);
     assert_eq!(
         readiness,
@@ -2027,7 +2029,8 @@ async fn model_readiness_discovered_and_needs_retune() {
     );
     store.flush().expect("flush");
 
-    let tuning = higgs.tuning_records().expect("tuning records");
+    let tuning =
+        crate::serve::control::active_records(&higgs.tuning_profiles().expect("tuning profiles"));
     let (readiness, fit) = higgs.model_readiness(&model, &[], &hw, &tuning);
     assert_eq!(
         readiness,
@@ -2982,7 +2985,9 @@ async fn a_second_variant_cannot_advertise_an_id_the_load_wont_serve() {
             .find(|m| m.id == "org/mixed" && m.path == gen_path)
             .expect("generative variant scanned");
         let hw = higgs.hardware().await;
-        let tuning = higgs.tuning_records().expect("tuning");
+        let tuning = crate::serve::control::active_records(
+            &higgs.tuning_profiles().expect("tuning profiles"),
+        );
         let (readiness, _) = higgs.model_readiness(second, &[], &hw, &tuning);
         assert_eq!(
             readiness,
