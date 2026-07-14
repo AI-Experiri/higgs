@@ -184,6 +184,54 @@ pub(crate) fn write_gguf_fixture(root: &std::path::Path, id: &str) {
     std::fs::write(&path, buf.into_inner()).unwrap();
 }
 
+/// Write a header-only EMBEDDING-model GGUF fixture under `root/{id}/` — the
+/// arch-scoped keys declare a pooling head and non-causal attention, the two
+/// header shapes `read_domain` classifies as [`crate::worker::models::ModelDomain::Embedding`]
+/// (bge-small's actual declarations). For tests of the chat-vs-embedding gate
+/// ([HG079]) that need a scannable embedding model without a real weights file.
+pub(crate) fn write_embedding_gguf_fixture(root: &std::path::Path, id: &str) {
+    fn gguf_string(s: &str) -> Vec<u8> {
+        let bytes = s.as_bytes();
+        let mut out = Vec::with_capacity(8 + bytes.len());
+        out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        out.extend_from_slice(bytes);
+        out
+    }
+
+    let header = GGufFileHeader::new(3, 0, 4);
+    let mut buf = Cursor::new(Vec::<u8>::new());
+    let mut writer = GGufFileWriter::new(&mut buf, header).unwrap();
+    writer
+        .write_meta_kv(
+            "general.architecture",
+            GGufMetaDataValueType::String,
+            &gguf_string("bert"),
+        )
+        .unwrap();
+    writer
+        .write_meta_kv(
+            "bert.context_length",
+            GGufMetaDataValueType::U32,
+            &512u32.to_le_bytes(),
+        )
+        .unwrap();
+    writer
+        .write_meta_kv(
+            "bert.pooling_type",
+            GGufMetaDataValueType::U32,
+            &2u32.to_le_bytes(),
+        )
+        .unwrap();
+    writer
+        .write_meta_kv("bert.attention.causal", GGufMetaDataValueType::Bool, &[0u8])
+        .unwrap();
+    writer.finish::<Vec<u8>>(false).finish().unwrap();
+
+    let path = root.join(id).join("model-f16.gguf");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, buf.into_inner()).unwrap();
+}
+
 /// A `GET` request to `uri`. Carries a loopback `Host` so it passes the
 /// serve-layer DNS-rebinding guard (`host_guard`).
 pub(crate) fn get(uri: &str) -> Request<Body> {

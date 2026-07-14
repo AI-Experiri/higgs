@@ -902,6 +902,18 @@ impl Higgs {
     /// the picker — hence this method, not that call.
     pub async fn chat_model_ids(&self) -> Vec<String> {
         let mut ids = self.local_served_ids().await;
+        // A RESIDENT embedding model is served by a worker (explicit loads are
+        // allowed — only chat is refused, [HG079]) but is NOT chat-reachable, so it
+        // must not be advertised here. Best-effort: a failed scan keeps the id — the
+        // same permissive read as the chat gate's `domain: None`, and the gate is
+        // the enforcement either way.
+        if let Ok(scanned) = self.scan().await {
+            ids.retain(|id| {
+                !scanned.iter().any(|m| {
+                    &m.id == id && m.domain == crate::worker::models::ModelDomain::Embedding
+                })
+            });
+        }
         // Advertise servable (JIT-loadable) catalog ids too, but ONLY while JIT is
         // on — with JIT off an unloaded servable model is not reachable.
         if self.jit_enabled() {

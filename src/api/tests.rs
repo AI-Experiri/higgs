@@ -2646,3 +2646,50 @@ async fn unload_one_refuses_between_candidates() {
         "expected HG068 BenchInProgress, got {err:?}"
     );
 }
+
+/// A RESIDENT embedding model is refused for chat and not advertised. Explicit
+/// loads of an embedding model are ALLOWED (the domain gate is a chat gate, not a
+/// load gate — a future /v1/embeddings serves it), so residency is a reachable
+/// state — and it must not re-open the chat door the scan-time classification
+/// closed. Pins the two spots the integration test cannot reach with its
+/// header-only fixture (which no real engine can load): the resident-path
+/// `[HG079]` arm of `resolve_loaded`, and the `chat_model_ids` retain that drops
+/// a served-but-embedding id from `/v1/models`. Fail-on-revert for both.
+#[tokio::test]
+async fn a_resident_embedding_model_is_refused_and_unlisted() {
+    let dir = tempfile::TempDir::new().unwrap();
+    crate::serve::test_support::write_embedding_gguf_fixture(dir.path(), "org/embed");
+    let higgs = fake_higgs(vec![dir.path().to_path_buf()]);
+    seed_fresh_profile(&higgs, "org/embed", CtxLen::Fixed { n: 512 }).await;
+
+    // Explicit load succeeds — an embedding model may be resident.
+    higgs.load("org/embed", None).await.expect("explicit load");
+    assert_eq!(
+        higgs.local_served_ids().await,
+        vec!["org/embed".to_owned()],
+        "the worker really serves it (residency is what makes this test non-vacuous)"
+    );
+
+    // Chat against the RESIDENT model → [HG079], from the resident arm (no JIT).
+    let err = higgs
+        .prepare_chat("org/embed", None, "[]")
+        .await
+        .expect_err("chat against a resident embedding model must be refused");
+    assert!(
+        matches!(
+            err,
+            crate::diagnostic::HiggsError::ModelNotChatCapable { .. }
+        ),
+        "expected [HG079] ModelNotChatCapable, got: {err}"
+    );
+
+    // …and `/v1/models` (the chat_model_ids union) does not advertise it, even
+    // though local_served_ids does — served ≠ chat-reachable for this domain.
+    assert!(
+        !higgs
+            .chat_model_ids()
+            .await
+            .contains(&"org/embed".to_owned()),
+        "a resident embedding model must not be advertised as a chat target"
+    );
+}
