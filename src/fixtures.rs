@@ -124,6 +124,12 @@ pub fn write_reranker_gguf_fixture(root: &Path, id: &str) {
 /// readiness reads it as prepared — `Servable` when serving is on, which is what
 /// puts the id in `chat_model_ids`' JIT leg.
 ///
+/// **Set `HIGGS_HOME` to a temp dir before calling this.** It writes a `TuneRecord`
+/// into the models store rooted at `HIGGS_HOME` — with the default home that is the
+/// developer's real `~/.higgs/models.json`. A test that forgets to redirect it would
+/// clobber that file. (This is compiled only under `test`/`test-support`, so a
+/// production build can never reach it — but an embedder's test can.)
+///
 /// Panics if `id` is not scannable — seeding a profile for a model that does not
 /// exist on disk is always a test bug.
 pub async fn seed_prepared_profile(higgs: &Higgs, id: &str) {
