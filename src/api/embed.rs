@@ -65,8 +65,8 @@ impl Higgs {
     ///   benchmark candidate (fall through to the remote check, then `[HG068]`).
     /// - Remote-resident → a permissive placeholder [`LoadedInfo`] (the fleet routes
     ///   it; the remote worker's `[HG005]` is the prompt-fit backstop).
-    /// - Resident-but-embedding-only, or a scanned embedding-only JIT candidate →
-    ///   `[HG079]` `ModelNotChatCapable` (refused BEFORE any load).
+    /// - Resident-but-non-generative, or a scanned non-generative (embedding/reranker)
+    ///   JIT candidate → `[HG079]` `ModelNotChatCapable` (refused BEFORE any load).
     /// - Benchmark-owned and not remote → `[HG068]` `BenchInProgress`.
     /// - Not loaded, JIT OFF → `[HG003]` `ModelNotLoaded`.
     /// - Not loaded, JIT ON → must be a scanned id (`[HG002]` else), Prepared
@@ -935,10 +935,12 @@ impl Higgs {
     /// The exact set of model ids chat can REACH — the `serve::v1::v1_models` union
     /// lifted onto the facade: `local_served_ids()` (always) ∪ `servable_model_ids()`
     /// (ONLY when `jit_enabled()`) ∪ `fleet().routed_models()` (remote-routed),
-    /// deduped, minus any model whose only local candidate is transiently benchmarking
-    /// (unless a remote node also serves it). Using `servable_model_ids()` alone would
-    /// omit fleet-routed remotes and (JIT-off) local-served ids, silently shrinking
-    /// the picker — hence this method, not that call.
+    /// deduped, minus a RESIDENT worker whose load-time domain is non-generative
+    /// (`[HG079]` — the exclusion this whole feature exists for) and minus any model
+    /// whose only local candidate is transiently benchmarking (unless a remote node
+    /// also serves it). Using `servable_model_ids()` alone would omit fleet-routed
+    /// remotes and (JIT-off) local-served ids, silently shrinking the picker — hence
+    /// this method, not that call.
     pub async fn chat_model_ids(&self) -> Vec<String> {
         let entries = self.model_entries().await.unwrap_or_default();
         self.chat_model_ids_for(&entries).await

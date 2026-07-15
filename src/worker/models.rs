@@ -380,8 +380,9 @@ fn enrich_from_gguf(model: &mut HiggsModel, mmap: &memmap2::Mmap) {
 
 /// Read the capability class ([`ModelDomain`]) out of the arch-scoped GGUF header.
 ///
-/// Two independent header declarations mark a model as embedding-only, and BOTH are
-/// needed — neither alone covers the field:
+/// Two independent header declarations mark a model as non-generative, and BOTH are
+/// needed — neither alone covers the field (the `pooling_type` case further splits a
+/// reranker off from an embedder below):
 ///
 /// - `{arch}.pooling_type` non-zero. `0` is llama.cpp's `NONE` (no pooling head), so a
 ///   generative model that happens to carry the key stays [`ModelDomain::Llm`]. This is

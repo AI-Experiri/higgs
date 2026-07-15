@@ -40,11 +40,11 @@ pub enum HiggsError {
     #[diagnostic(code(HG002))]
     ModelNotFound { id: String },
 
-    /// Chat requested for a model whose GGUF header declares it embedding-only (a
-    /// pooling head and/or non-causal attention — see
-    /// [`crate::worker::models::ModelDomain`]). The engine would NOT fail on it: it
-    /// samples the embedding head and returns fluent nonsense, so this gate exists to
-    /// turn silently-wrong output into a refusal the client can act on.
+    /// Chat requested for a model whose GGUF header declares it non-generative — an
+    /// embedder or a reranker (a pooling head and/or non-causal attention — see
+    /// [`crate::worker::models::ModelDomain`]). The engine would NOT reliably fail on
+    /// it (an embedder samples its pooling head and returns fluent nonsense), so this
+    /// gate exists to turn silently-wrong output into a refusal the client can act on.
     #[snafu(display(
         "[HG079] {id} is a non-generative model (domain: {domain}, arch: {arch}) — it \
          cannot serve chat; pick a generative model"

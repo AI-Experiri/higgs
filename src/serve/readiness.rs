@@ -84,10 +84,11 @@ pub fn footprint_fits_free(
 
 /// Collapse the facts into one state.
 ///
-/// Precedence: not chat-capable → `Embedding` (terminal — outranks residency, because
-/// a resident embedding model is still not a chat target) > `Loaded` (resident — true
-/// regardless of staleness/fit) > not on disk or not profiled → `Discovered` > stale →
-/// `NeedsRetune` > serving off → `Profiled` > fits → `Servable` else `Unservable`.
+/// Precedence: not chat-capable → its own non-generative terminal state (`Embedding`
+/// or `Reranker`, by domain — outranks residency, because a resident non-generative
+/// model is still not a chat target) > `Loaded` (resident — true regardless of
+/// staleness/fit) > not on disk or not profiled → `Discovered` > stale → `NeedsRetune`
+/// > serving off → `Profiled` > fits → `Servable` else `Unservable`.
 pub fn derive_readiness(i: &ReadinessInputs) -> ModelReadiness {
     // Ahead of `loaded`: the chat-serving ladder (Discovered → … → Servable) does not
     // apply to a model that cannot chat, and residency does not change that. A resident
