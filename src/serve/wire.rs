@@ -208,6 +208,28 @@ higgs_ts! {
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         pub bench_tps: Option<f32>,
+        /// The largest useful `max_tokens` a chat on this model can honor, per its
+        /// TUNED metrics: the benchmark (`benched_load`) window when it is concrete,
+        /// else the analytical (`tuned_load`) one — then min'd with the ACTIVE
+        /// record's fixed window when one exists (the active profile is what a JIT
+        /// load actually pins, so after a bare load demotes it to a smaller window
+        /// the tuned number alone would overpromise) — and capped at the absolute
+        /// output cap (`MAX_OUTPUT_TOKENS`: the `/v1` surface rejects a request
+        /// asking for more outright (`400 [HG013]`), and the in-process path clamps
+        /// to it — either way no request can DELIVER more). `None` = the model has
+        /// NO tuned/benchmarked metrics — a bare load's Heuristic active record
+        /// does not gate (modulo the pre-dual-store grandfathering documented on
+        /// `TuneProfileViews`, whose lone-record Residual A this field inherits),
+        /// and neither does a profile whose window was explicitly pinned `Auto`.
+        ///
+        /// This is a CEILING, not a guarantee: each request's output is still
+        /// bounded by `loaded window − prompt` (the facade's silent clamp). An
+        /// embedder gating its provider setup on "tuned models only" keys on
+        /// `Some`-ness and prefills its max-tokens field from the value —
+        /// consuming it verbatim, never re-deriving from the `LoadParams`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub tuned_max_tokens: Option<u32>,
     }
 }
 

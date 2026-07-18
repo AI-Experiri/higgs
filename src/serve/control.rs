@@ -73,6 +73,27 @@ pub(crate) fn model_entry(
         benched_load: tune.bench.map(|t| t.profile.clone()),
         tune_provenance: tune.active.map(|t| t.provenance),
         bench_tps: tune.bench.and_then(|t| t.bench_tps),
+        // The first CONCRETE tuned window, bench (measured) preferred — an
+        // Auto-pinned bench falls through to the analytical slot rather than
+        // hiding it. Slot-presence is the "tuned/benchmarked" predicate: the
+        // ACTIVE record never GATES, because a bare load demotes it to a
+        // Heuristic that is not a tune (see `TuneProfileViews`) — but when that
+        // demoted record pins a SMALLER fixed window, the value is min'd with it,
+        // since the active record is what a JIT load actually pins: shipping the
+        // bigger tuned number would promise output the serving window can't
+        // hold (Fable mt-r1). Normally active == a slot record, so the min is a
+        // no-op.
+        tuned_max_tokens: [tune.bench, tune.analytical]
+            .into_iter()
+            .flatten()
+            .find_map(|t| t.profile.ctx_len().fixed_n())
+            .map(|n| {
+                let n = match tune.active.and_then(|t| t.profile.ctx_len().fixed_n()) {
+                    Some(active_n) => n.min(active_n),
+                    None => n, // Auto active: the trained window, never below a tune
+                };
+                n.min(crate::serve::MAX_OUTPUT_TOKENS)
+            }),
         model,
     }
 }

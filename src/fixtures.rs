@@ -133,7 +133,26 @@ pub fn write_reranker_gguf_fixture(root: &Path, id: &str) {
 /// Panics if `id` is not scannable — seeding a profile for a model that does not
 /// exist on disk is always a test bug.
 pub async fn seed_prepared_profile(higgs: &Higgs, id: &str) {
-    use crate::worker::engine::{CtxLen, GpuLayers, LoadParams};
+    seed_profile_with_ctx(higgs, id, crate::worker::engine::CtxLen::Auto).await;
+}
+
+/// [`seed_prepared_profile`] with a FIXED context window — the tuned-metrics
+/// shape whose concrete window surfaces as `HiggsModelEntry::tuned_max_tokens`.
+/// `put_tuning` routes the Heuristic record into the analytical history slot, so
+/// the entry reads as genuinely TUNED (Servable AND a concrete window), where
+/// the Auto-window [`seed_prepared_profile`] is merely prepared (Servable but no
+/// tuned metrics — an embedder's tuned-models-only provider gate excludes it).
+/// The same **`HIGGS_HOME` warning** applies — redirect it to a temp dir first.
+pub async fn seed_tuned_profile(higgs: &Higgs, id: &str, ctx: u32) {
+    // `CtxLen::fixed(0)` normalizes to Auto — that would silently seed the
+    // merely-prepared shape this fixture exists to contrast with. A test that
+    // wants Auto calls `seed_prepared_profile`.
+    assert_ne!(ctx, 0, "seed_tuned_profile needs a non-zero window");
+    seed_profile_with_ctx(higgs, id, crate::worker::engine::CtxLen::fixed(ctx)).await;
+}
+
+async fn seed_profile_with_ctx(higgs: &Higgs, id: &str, ctx: crate::worker::engine::CtxLen) {
+    use crate::worker::engine::{GpuLayers, LoadParams};
     let hw = higgs.hardware().await;
     let path = higgs
         .scan()
@@ -145,7 +164,7 @@ pub async fn seed_prepared_profile(higgs: &Higgs, id: &str) {
     store.put_tuning(
         id,
         crate::tune::store::TuneRecord {
-            profile: LoadParams::base(CtxLen::Auto, GpuLayers::All, 8),
+            profile: LoadParams::base(ctx, GpuLayers::All, 8),
             sampling: crate::worker::engine::SamplingParams::default(),
             budget: crate::tune::ResourceBudget::default(),
             provenance: crate::tune::TuneProvenance::Heuristic,

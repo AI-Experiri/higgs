@@ -311,6 +311,143 @@ fn model_entry_carries_tune_provenance_and_bench_tps() {
     assert!(json.get("bench_tps").is_none());
 }
 
+/// `tuned_max_tokens` is the first CONCRETE tuned window — bench slot preferred,
+/// Auto falls through, min'd with the ACTIVE record's fixed window (what a JIT
+/// load actually pins — Fable mt-r1), capped at `MAX_OUTPUT_TOKENS`, and GATED
+/// on the history slots only (a post-dual demoted Heuristic active never grants).
+/// Fail-on-revert, per branch: hardcoding `None` fails the bench case; preferring
+/// the analytical slot fails the bench-wins assert (1111 ≠ 2222); dropping the
+/// Auto fall-through fails the auto-bench case; GATING on `active` instead of
+/// the slots fails the demoted-Heuristic-no-slots case; dropping the active-min
+/// fails the demoted-smaller-window case (8192 ≠ 2048); dropping the cap fails
+/// the over-cap case.
+#[test]
+fn tuned_max_tokens_is_the_first_concrete_tuned_window() {
+    use crate::worker::engine::CtxLen;
+    let model = model_with_template(None);
+    let rec = |ctx: CtxLen, prov: crate::tune::TuneProvenance| crate::tune::store::TuneRecord {
+        profile: crate::worker::engine::LoadParams::llamacpp(
+            crate::worker::engine::llamacpp::params::LlamaCppParams {
+                ctx_len: ctx,
+                ..Default::default()
+            },
+        ),
+        sampling: Default::default(),
+        budget: Default::default(),
+        provenance: prov,
+        bench_tps: None,
+        tuned_at_ms: 1,
+        hw_fingerprint: String::new(),
+        model_file_sig: String::new(),
+    };
+    let entry_for = |triple: Option<&(_, _, _)>| {
+        super::model_entry(
+            model.clone(),
+            &[],
+            None,
+            crate::serve::readiness::ModelReadiness::Discovered,
+            None,
+            super::TuneProfileViews::from_triple(triple),
+        )
+    };
+    let heur = crate::tune::TuneProvenance::Heuristic;
+    let bench = crate::tune::TuneProvenance::Bench;
+
+    // Bench (measured) wins over analytical.
+    let both = (
+        Some(rec(CtxLen::Fixed { n: 2222 }, bench)),
+        Some(rec(CtxLen::Fixed { n: 1111 }, heur)),
+        Some(rec(CtxLen::Fixed { n: 2222 }, bench)),
+    );
+    assert_eq!(entry_for(Some(&both)).tuned_max_tokens, Some(2222));
+
+    // Analytical only.
+    let analytical_only = (
+        Some(rec(CtxLen::Fixed { n: 1111 }, heur)),
+        Some(rec(CtxLen::Fixed { n: 1111 }, heur)),
+        None,
+    );
+    assert_eq!(
+        entry_for(Some(&analytical_only)).tuned_max_tokens,
+        Some(1111)
+    );
+
+    // An Auto-pinned bench window falls through to the analytical one rather
+    // than hiding it.
+    let auto_bench = (
+        Some(rec(CtxLen::Auto, bench)),
+        Some(rec(CtxLen::Fixed { n: 1111 }, heur)),
+        Some(rec(CtxLen::Auto, bench)),
+    );
+    assert_eq!(entry_for(Some(&auto_bench)).tuned_max_tokens, Some(1111));
+
+    // A bare load demoted the active record to a BIGGER fixed window than the
+    // tune: the value stays the TUNED slot's (the min is a min, not
+    // active-wins — "per its TUNED metrics" caps at the tune even when the
+    // serving window is roomier; Fable mt-r4 killed the `active-fixed-wins`
+    // mutant with this case).
+    let demoted_bigger = (
+        Some(rec(CtxLen::Fixed { n: 16_384 }, heur)),
+        None,
+        Some(rec(CtxLen::Fixed { n: 8192 }, bench)),
+    );
+    assert_eq!(
+        entry_for(Some(&demoted_bigger)).tuned_max_tokens,
+        Some(8192)
+    );
+
+    // Post-dual store, bare load demoted the active record to a Heuristic and
+    // NO history slot holds a real tune → not tuned (the active is never read).
+    let demoted_rec = rec(CtxLen::Fixed { n: 9999 }, heur);
+    let demoted = super::TuneProfileViews {
+        active: Some(&demoted_rec),
+        analytical: None,
+        bench: None,
+    };
+    let entry = super::model_entry(
+        model.clone(),
+        &[],
+        None,
+        crate::serve::readiness::ModelReadiness::Discovered,
+        None,
+        demoted,
+    );
+    assert_eq!(entry.tuned_max_tokens, None);
+
+    // A bare load DEMOTED the active record to a SMALLER fixed window than the
+    // bench tune: the value follows the active window (what a JIT load actually
+    // pins — advertising the bench 8192 would promise output a 2048-window
+    // serving can't hold), while the SLOTS still gate (the model stays tuned).
+    let demoted_smaller = (
+        Some(rec(CtxLen::Fixed { n: 2048 }, heur)),
+        Some(rec(CtxLen::Fixed { n: 1111 }, heur)),
+        Some(rec(CtxLen::Fixed { n: 8192 }, bench)),
+    );
+    assert_eq!(
+        entry_for(Some(&demoted_smaller)).tuned_max_tokens,
+        Some(2048)
+    );
+
+    // Untuned → None, and absent from the JSON wire.
+    let entry = entry_for(None);
+    assert_eq!(entry.tuned_max_tokens, None);
+    let json = serde_json::to_value(&entry).unwrap();
+    assert!(json.get("tuned_max_tokens").is_none());
+
+    // A tuned window above the absolute output cap is capped — `/v1` rejects a
+    // request asking for more ([HG013]) and the in-process path clamps to it,
+    // so advertising more would promise output no request can deliver.
+    let huge = (
+        Some(rec(CtxLen::Fixed { n: 40_000 }, heur)),
+        Some(rec(CtxLen::Fixed { n: 40_000 }, heur)),
+        None,
+    );
+    assert_eq!(
+        entry_for(Some(&huge)).tuned_max_tokens,
+        Some(crate::serve::MAX_OUTPUT_TOKENS)
+    );
+}
+
 /// G4 bootstrap-race defense at the SEAM ([codex r9]): `decide_mint` derives
 /// `bootstrap` from the LOCKED store it is handed, so the empty-store window
 /// cannot be raced — a second unauthenticated mint that reaches the lock after
