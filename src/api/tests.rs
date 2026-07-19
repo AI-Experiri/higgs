@@ -118,10 +118,10 @@ async fn load_persists_model_record() {
     assert!(rec.last_loaded_ms > 0, "load stamps a timestamp");
 }
 
-/// `load_inner` with `from_request = false` is a REUSE — it loads the given
+/// `load_inner` with `LoadPersist::ReuseSaved` is a REUSE — it loads the given
 /// profile but does NOT re-write the saved tuning record. This is the JIT path's
 /// no-resync seam: the JIT load passes the profile the readiness gate VALIDATED
-/// (`from_request = false`), so it can't silently default-load if `models.json`
+/// (`ReuseSaved`), so it can't silently default-load if `models.json`
 /// changes after the check (the check-then-load race), and doesn't churn the
 /// saved profile on every JIT load. Fails-on-revert: have JIT load via the public
 /// `load(.., None)` (re-read + reuse) and this seam is unused / the saved profile
@@ -159,7 +159,7 @@ async fn load_inner_reuse_does_not_resync_saved_profile() {
                 GpuLayers::All,
                 2,
             )),
-            false,
+            LoadPersist::ReuseSaved,
         )
         .await
         .expect("reuse load");
@@ -175,6 +175,124 @@ async fn load_inner_reuse_does_not_resync_saved_profile() {
         "a reuse load did NOT re-write the saved profile"
     );
     assert_eq!(saved.tuned_at_ms, 111, "a reuse load did NOT re-stamp it");
+}
+
+/// `load_ephemeral` persists NOTHING: the saved tuning profile is untouched
+/// (different params notwithstanding) AND no `config.json` last-load record is
+/// written. This is the benchmark/probe seam — a one-off load must leave the
+/// user's stores byte-identical. Fails-on-revert: route `load_ephemeral`
+/// through `LoadPersist::Explicit` (or restore the old `from_request` bool) and
+/// the profile re-syncs / a model record appears.
+#[tokio::test]
+async fn load_ephemeral_persists_nothing() {
+    use crate::worker::engine::{CtxLen, GpuLayers, LoadParams};
+    let dir = tempfile::TempDir::new().unwrap();
+    crate::serve::test_support::write_gguf_fixture(dir.path(), "org/model");
+    let higgs = fake_higgs(vec![dir.path().to_path_buf()]);
+
+    // Seed a known saved profile (ctx 4096, tuned_at 111).
+    let store = higgs.models_store().expect("open store");
+    store.put_tuning(
+        "org/model",
+        crate::tune::store::TuneRecord {
+            profile: LoadParams::base(CtxLen::Fixed { n: 4096 }, GpuLayers::All, 8),
+            sampling: Default::default(),
+            budget: Default::default(),
+            provenance: crate::tune::TuneProvenance::Heuristic,
+            bench_tps: None,
+            tuned_at_ms: 111,
+            hw_fingerprint: String::new(),
+            model_file_sig: String::new(),
+        },
+    );
+    store.flush().expect("flush seed");
+
+    // Ephemeral load with DIFFERENT params succeeds…
+    higgs
+        .load_ephemeral(
+            "org/model",
+            LoadParams::base(CtxLen::Fixed { n: 1024 }, GpuLayers::All, 2),
+        )
+        .await
+        .expect("ephemeral load");
+
+    // …and the saved profile is byte-identical to the seed…
+    let saved = higgs
+        .models_store()
+        .expect("reopen store")
+        .tuning("org/model")
+        .expect("profile still present");
+    assert_eq!(
+        saved.profile.ctx_len(),
+        CtxLen::Fixed { n: 4096 },
+        "an ephemeral load did NOT re-write the saved profile"
+    );
+    assert_eq!(
+        saved.tuned_at_ms, 111,
+        "an ephemeral load did NOT re-stamp it"
+    );
+    // …and NO last-load record was written (`load` would have written one).
+    assert!(
+        higgs.model_records().is_empty(),
+        "an ephemeral load wrote no config.json model record"
+    );
+}
+
+/// An EPHEMERAL load is "EXACTLY these params or fail": the OOM degrade ladder
+/// is SKIPPED — a degraded config would be one the caller never pinned, and (by
+/// the ephemeral contract) nothing about it would be persisted or reported. The
+/// first OOM surfaces as the load error, and the stores stay untouched.
+/// Fails-on-revert: route Ephemeral through `run_oom_ladder` and the OOM-twice
+/// fake DEGRADES to a successful load, so the `expect_err` fails.
+#[tokio::test]
+async fn ephemeral_load_fails_on_oom_instead_of_degrading() {
+    use crate::worker::engine::{CtxLen, GpuLayers, LoadParams};
+    let dir = tempfile::TempDir::new().unwrap();
+    crate::serve::test_support::write_gguf_fixture(dir.path(), "org/model");
+    let higgs = fake_higgs_oom_twice(vec![dir.path().to_path_buf()]);
+
+    higgs
+        .load_ephemeral(
+            "org/model",
+            LoadParams::base(CtxLen::Auto, GpuLayers::All, 8),
+        )
+        .await
+        .expect_err("an OOMing ephemeral load fails instead of degrading");
+
+    assert!(
+        higgs.models_store().unwrap().tuning("org/model").is_none(),
+        "a failed ephemeral load wrote no tuning profile"
+    );
+    assert!(
+        higgs.model_records().is_empty(),
+        "a failed ephemeral load wrote no config.json model record"
+    );
+}
+
+/// An EPHEMERAL load of an already-RESIDENT model is refused ([HG080]): the
+/// resident worker keeps its CURRENT params, so a silent no-op "success" would
+/// hand the caller a config it never pinned. Fails-on-revert: drop the
+/// Ephemeral check before the resident no-op and this returns Ok, failing the
+/// `expect_err`.
+#[tokio::test]
+async fn ephemeral_load_refuses_a_resident_model() {
+    use crate::worker::engine::{CtxLen, GpuLayers, LoadParams};
+    let dir = tempfile::TempDir::new().unwrap();
+    crate::serve::test_support::write_gguf_fixture(dir.path(), "org/model");
+    let higgs = fake_higgs(vec![dir.path().to_path_buf()]);
+    higgs.load("org/model", None).await.expect("resident load");
+
+    let err = higgs
+        .load_ephemeral(
+            "org/model",
+            LoadParams::base(CtxLen::Fixed { n: 1024 }, GpuLayers::All, 2),
+        )
+        .await
+        .expect_err("ephemeral load of a resident model is refused");
+    assert!(
+        matches!(err, HiggsError::EphemeralResident { .. }),
+        "expected [HG080] EphemeralResident, got {err}"
+    );
 }
 
 /// `status.loading` surfaces an in-flight load (for the UI progress bar) and is
@@ -1133,7 +1251,7 @@ async fn sync_saved_profile_survives_flush_failure() {
     *higgs.config_path.lock() = Some(home.join("config.json"));
     std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o500)).unwrap();
 
-    // A load WITH request params triggers `sync_saved_profile` (from_request = true).
+    // A load WITH request params triggers `sync_saved_profile` (`Explicit`).
     let res = higgs
         .load(
             "org/model",
@@ -2399,7 +2517,7 @@ fn fake_higgs_oom_twice(dirs: Vec<PathBuf>) -> Higgs {
     Higgs::with_local(Arc::new(node), cfg)
 }
 
-/// A REUSE load (a saved profile, `from_request = false`) that the OOM ladder has to
+/// A REUSE load (a saved profile, `ReuseSaved`) that the OOM ladder has to
 /// DEGRADE must write the FITTING config back to the saved tuning profile — else every
 /// reload re-reads the OOMing profile and re-walks the ladder (codex r10). Fail-on-revert:
 /// restore `if let Some(anchors) { sync }` (sync only for explicit loads) and the degraded
@@ -2428,7 +2546,7 @@ async fn degraded_reuse_load_persists_the_fitting_profile() {
     store.flush().unwrap();
     // REUSE the saved profile: OOMs twice, then the ladder loads a DEGRADED rung.
     higgs
-        .load_inner("org/model", Some(seed.clone()), false)
+        .load_inner("org/model", Some(seed.clone()), LoadPersist::ReuseSaved)
         .await
         .expect("degraded reuse load succeeds");
     let rec = higgs

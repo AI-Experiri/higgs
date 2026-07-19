@@ -169,7 +169,45 @@ impl Higgs {
             });
         }
 
-        // JIT path: the id must be a scanned model (never load an unknown id).
+        // JIT path from here on. Announce `Queued` NOW — before the gate's scan
+        // and profile checks, which mmap every model's GGUF header and can take
+        // whole seconds on a large catalog. Emitting only inside `load_inner`
+        // (as before) left the UI with NOTHING to render for that whole window:
+        // a chat-triggered JIT load looked stalled until the scan finished
+        // (user report, 2026-07-18). The guard below turns any gate REFUSAL
+        // into a terminal `Failed` so the early pill can never strand; it is
+        // disarmed before `load_inner`, whose own Queued→terminal bracketing
+        // then owns the lifecycle (the duplicate `Queued` is idempotent for
+        // subscribers — same id, same phase).
+        struct JitGateGuard<'a> {
+            higgs: &'a super::Higgs,
+            id: &'a str,
+            armed: bool,
+        }
+        impl Drop for JitGateGuard<'_> {
+            fn drop(&mut self) {
+                // `code: None` by necessity: Drop cannot see WHICH error is
+                // propagating. The chat response still carries the coded
+                // diagnostic; only the event stream's Failed is uncoded here —
+                // the trade for the guarantee that no refusal path can strand
+                // the early pill (Fable r2).
+                if self.armed {
+                    self.higgs.emit_load_phase(
+                        self.id,
+                        crate::api::types::ModelLoadPhase::Failed,
+                        None,
+                    );
+                }
+            }
+        }
+        self.emit_load_phase(model, crate::api::types::ModelLoadPhase::Queued, None);
+        let mut gate_guard = JitGateGuard {
+            higgs: self,
+            id: model,
+            armed: true,
+        };
+
+        // The id must be a scanned model (never load an unknown id).
         let scanned = self.scan().await?;
         let Some(candidate) = scanned.iter().find(|m| m.id == model) else {
             return Err(HiggsError::ModelNotFound {
@@ -204,7 +242,11 @@ impl Higgs {
         };
 
         tracing::info!("higgs: JIT loading {model}");
-        self.load_inner(model, Some(profile), false).await?;
+        // Hand the event lifecycle to `load_inner` (its TerminalGuard brackets
+        // the load with its own terminal from here).
+        gate_guard.armed = false;
+        self.load_inner(model, Some(profile), crate::api::LoadPersist::ReuseSaved)
+            .await?;
 
         // Re-resolve: the requested model must now be resident.
         self.local_loaded_info(model).await.ok_or_else(|| {

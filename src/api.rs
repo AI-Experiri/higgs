@@ -669,6 +669,23 @@ fn default_config_path_override() -> Option<std::path::PathBuf> {
     )
 }
 
+/// What a load is allowed to PERSIST. Models the three load intents as states
+/// instead of the old `from_request: bool` (whose false case conflated
+/// "reuse the saved profile" with "touch nothing").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoadPersist {
+    /// Explicit user load with request params: sync them to the saved profile
+    /// on success and record the last load in `config.json`.
+    Explicit,
+    /// Plain reload / JIT reuse of the saved profile: record the last load;
+    /// write the profile back ONLY when the OOM ladder degraded it (else every
+    /// reload re-walks the ladder — codex r10).
+    ReuseSaved,
+    /// One-off load (benchmarks, config probes): persist NOTHING — the user's
+    /// tuned profiles and `config.json` stay byte-identical.
+    Ephemeral,
+}
+
 impl Higgs {
     /// Construct the facade WITHOUT spawning the llama.cpp worker, owning a fresh
     /// [`LogBus`]. The serve-layer [`HiggsLogLayer`](crate::log_bus::HiggsLogLayer)
@@ -1679,22 +1696,50 @@ impl Higgs {
     /// autoload can reload it the same way. Persistence is best-effort: a config
     /// write failure is logged, never failing an otherwise-successful load.
     pub async fn load(&self, id: &str, params: Option<LoadParams>) -> Result<(), HiggsError> {
-        let from_request = params.is_some();
-        self.load_inner(id, params, from_request).await
+        let persist = if params.is_some() {
+            LoadPersist::Explicit
+        } else {
+            LoadPersist::ReuseSaved
+        };
+        self.load_inner(id, params, persist).await
     }
 
-    /// `load` core, parameterized by `from_request` — whether to PERSIST `params`
-    /// as the saved profile after a successful load. The public [`load`] derives it
-    /// from `params.is_some()`. The JIT path passes a VALIDATED profile with
-    /// `from_request = false`: a no-resync REUSE that loads exactly the profile the
-    /// readiness gate just checked, with NO second `models.json` read — closing the
-    /// check-then-load race where the profile could vanish and fall back to dumb
-    /// defaults.
+    /// Load `id` with explicit `params` WITHOUT touching any persisted state:
+    /// no saved-profile sync (even on an OOM-ladder degrade) and no
+    /// `config.json` last-load record. For callers that need a one-off
+    /// configuration — benchmarking harnesses, embedders probing a config —
+    /// while the user's tuned profiles stay exactly as they were.
+    ///
+    /// Unlike [`load`](Self::load), an ephemeral load is "EXACTLY these params
+    /// or fail": an already-resident model is REFUSED ([HG080] — the resident
+    /// worker would keep its current params, not these), and the OOM degrade
+    /// ladder is skipped (a degraded config would be a config the caller never
+    /// pinned — an OOM surfaces as its error instead). The [HG068] benchmark
+    /// gate applies as usual.
+    ///
+    /// The pin lasts until the worker is unloaded: the idle reaper (on by
+    /// default) ejects it after the idle TTL, and a later chat would then
+    /// JIT-reload with the SAVED profile — pair with
+    /// [`set_auto_unload_idle(false)`](Self::set_auto_unload_idle) when the
+    /// pin must outlive idle periods (the bundled `serve` example does).
+    pub async fn load_ephemeral(&self, id: &str, params: LoadParams) -> Result<(), HiggsError> {
+        self.load_inner(id, Some(params), LoadPersist::Ephemeral)
+            .await
+    }
+
+    /// `load` core, parameterized by [`LoadPersist`] — what a successful load is
+    /// allowed to persist. The public [`load`] picks `Explicit` (params from the
+    /// request) or `ReuseSaved` (none). The JIT path passes a VALIDATED profile
+    /// with `ReuseSaved`: a no-resync REUSE that loads exactly the profile the
+    /// readiness gate just checked, with NO second `models.json` read — closing
+    /// the check-then-load race where the profile could vanish and fall back to
+    /// dumb defaults. [`load_ephemeral`](Self::load_ephemeral) passes `Ephemeral`:
+    /// exact params, nothing persisted, no degrade ladder.
     pub(crate) async fn load_inner(
         &self,
         id: &str,
         params: Option<LoadParams>,
-        from_request: bool,
+        persist: LoadPersist,
     ) -> Result<(), HiggsError> {
         use crate::api::types::ModelLoadPhase;
         // PUSH the load lifecycle to `watch_events` subscribers. `Queued`
@@ -1732,7 +1777,7 @@ impl Higgs {
             id,
             armed: true,
         };
-        let result = self.load_inner_impl(id, params, from_request).await;
+        let result = self.load_inner_impl(id, params, persist).await;
         term.armed = false; // reached a real terminal — the guard must not also fire
         match &result {
             Ok(()) => self.emit_load_phase(id, ModelLoadPhase::Ready, None),
@@ -1751,7 +1796,7 @@ impl Higgs {
         &self,
         id: &str,
         params: Option<LoadParams>,
-        from_request: bool,
+        persist: LoadPersist,
     ) -> Result<(), HiggsError> {
         use crate::api::types::ModelLoadPhase;
         // Serialize concurrent loads at the facade so two racing JIT loads of the
@@ -1790,6 +1835,11 @@ impl Higgs {
         // dedup IN-FLIGHT loads, changing its additive contract (used by the remote
         // path); deferred as not worth that for a self-healing, memory-bounded race.
         if self.local.instances().await.iter().any(|(_, m)| m == id) {
+            // An EPHEMERAL load must apply exactly the requested params; the
+            // resident no-op below would silently keep the CURRENT ones ([HG080]).
+            if matches!(persist, LoadPersist::Ephemeral) {
+                return Err(HiggsError::EphemeralResident { id: id.to_owned() });
+            }
             // Idempotent no-op: the model stays loaded with its CURRENT params — the
             // request params are NOT applied to the resident worker here. So we also do
             // NOT sync them to the saved profile: persisting params that were never
@@ -1807,9 +1857,10 @@ impl Higgs {
         // `models.json`) is reused — "tune once, loads that way every time"; else
         // (`None`) the node's default_load / ctx-cap path. (The `autotune_on_load`
         // suggester branch slots between saved-profile and default_load — P1.5.)
-        // Track explicit-vs-reused (`from_request`, a parameter): an EXPLICIT load
+        // Track explicit-vs-reused (`persist`, a parameter): an EXPLICIT load
         // (request carried params — a fresh suggestion or an accepted edit) updates
-        // the saved profile below; a load that REUSED a profile leaves it unchanged.
+        // the saved profile below; a load that REUSED a profile leaves it unchanged;
+        // an EPHEMERAL load never touches it.
         let params = match params {
             Some(p) => Some(p),
             // Reusing the saved profile: a STALE one hard-blocks (same contract as
@@ -1846,12 +1897,12 @@ impl Higgs {
                 None => None,
             },
         };
-        // A REUSE load of a SAVED profile (JIT / a plain reload passes the profile with
-        // `from_request = false`). If the OOM ladder has to DEGRADE such a load, the
+        // A REUSE load of a SAVED profile (JIT / a plain reload passes the profile
+        // with `ReuseSaved`). If the OOM ladder has to DEGRADE such a load, the
         // fitting config it discovers must be written back to the saved profile — else
         // every reload re-reads the original OOMing profile and re-walks the ladder
         // (codex r10). A default load (`params = None`) is NOT a profile reuse.
-        let reused_profile = !from_request && params.is_some();
+        let reused_profile = matches!(persist, LoadPersist::ReuseSaved) && params.is_some();
         // Map the host `LoadParams` onto the node's `NodeLoadParams`. The base
         // fields (id/ctx_len/gpu_layers/threads) drive the node's resolve/ctx-cap;
         // the FULL engine override set rides `params` and is applied by the worker
@@ -1910,7 +1961,7 @@ impl Higgs {
         // `tune` avoids). Captured for an explicit load AND a reuse load (the latter so
         // a DEGRADED reuse can re-anchor the fitting config it discovered); a pure
         // default load never syncs, so it captures nothing.
-        let anchors = if from_request || reused_profile {
+        let anchors = if matches!(persist, LoadPersist::Explicit) || reused_profile {
             let hw_fp = self.hardware().await.fingerprint();
             let sig = self
                 .scan()
@@ -1957,14 +2008,23 @@ impl Higgs {
             .and_then(|ms| ms.into_iter().find(|m| m.id == id))
             .and_then(|m| m.block_count);
         let requested_np = np.clone();
-        let loaded_np = run_oom_ladder(
-            id,
-            np,
-            layer_count,
-            crate::load_robustness::SETTLE_BEFORE_RETRY,
-            |p| async move { self.local.load(p).await.map(|_| ()) },
-        )
-        .await?;
+        // An EPHEMERAL load is "EXACTLY these params or fail": the OOM degrade
+        // ladder would load a DIFFERENT config and (by the ephemeral contract)
+        // persist nothing about it — the caller would silently measure/serve a
+        // config it never pinned. One attempt; an OOM surfaces as its error.
+        let loaded_np = if matches!(persist, LoadPersist::Ephemeral) {
+            self.local.load(np.clone()).await?;
+            np
+        } else {
+            run_oom_ladder(
+                id,
+                np,
+                layer_count,
+                crate::load_robustness::SETTLE_BEFORE_RETRY,
+                |p| async move { self.local.load(p).await.map(|_| ()) },
+            )
+            .await?
+        };
         // Whether the OOM ladder had to DEGRADE — the loaded rung differs from what was
         // requested. A degraded REUSE load must write the fitting config back to the
         // saved profile (below), or every reload re-walks the ladder (codex r10).
@@ -1999,7 +2059,10 @@ impl Higgs {
         };
         // Persist the per-model load record (best-effort — never fail a good load).
         let now = now_unix_ms();
-        if let Err(e) = self.with_config_mut(|c| c.record_load(id, effective.clone(), now)) {
+        if matches!(persist, LoadPersist::Ephemeral) {
+            // Ephemeral load: by contract NOTHING is persisted — no last-load
+            // record, and `anchors` above is `None` so no profile sync either.
+        } else if let Err(e) = self.with_config_mut(|c| c.record_load(id, effective.clone(), now)) {
             tracing::warn!(id, error = %e, "higgs: failed to persist load record to config.json");
         }
         // Keep the saved tuning profile in sync with the config that ACTUALLY loaded:
@@ -2014,7 +2077,7 @@ impl Higgs {
         // an explicitly edited reload (r12); an as-requested reload of the tuned params
         // keeps them.
         if let Some((hw_fp, sig)) = anchors {
-            if from_request || degraded {
+            if matches!(persist, LoadPersist::Explicit) || degraded {
                 self.sync_saved_profile(id, &effective, &hw_fp, &sig).await;
             }
         }

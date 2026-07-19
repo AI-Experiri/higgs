@@ -644,6 +644,16 @@ pub enum HiggsError {
     #[diagnostic(code(HG068), severity(Error))]
     BenchInProgress { id: String },
 
+    /// An EPHEMERAL load (`load_ephemeral`) targeted an already-resident model.
+    /// The resident worker keeps its CURRENT params, so silently "succeeding"
+    /// would hand the caller a config it did not pin — the exact failure an
+    /// ephemeral load exists to prevent. Eject the model first.
+    #[snafu(display(
+        "[HG080] {id} is already loaded — an ephemeral load applies EXACTLY the requested params, so eject the resident model first"
+    ))]
+    #[diagnostic(code(HG080), severity(Error))]
+    EphemeralResident { id: String },
+
     /// Startup refused: a non-loopback bind with keys present but NONE holding the
     /// `Admin` scope. Auth would be ON, but every Admin-scoped operation
     /// (mint/revoke) is then rejected — the operator can't manage keys on the

@@ -203,6 +203,45 @@ async fn prepare_chat_jit_on_unprepared_refuses() {
     );
 }
 
+/// The JIT path announces `Queued` BEFORE the gate's scan/profile checks (which
+/// can take seconds on a big catalog) and brackets a gate REFUSAL with a
+/// terminal `Failed` — so the UI pill appears the instant a chat-triggered load
+/// is attempted and can never strand on refusal. Fails-on-revert: move the
+/// `Queued` emit back inside `load_inner` (or drop the JitGateGuard) and a
+/// refused JIT attempt emits no events at all.
+#[tokio::test]
+async fn jit_gate_emits_queued_then_failed_on_refusal() {
+    use crate::api::types::ModelLoadPhase;
+    let (higgs, _dir) = fake_higgs_with_fixture();
+    assert!(higgs.jit_enabled(), "JIT is on by default");
+    let mut events = higgs.subscribe_load_events();
+
+    // Scanned but un-Prepared → the readiness gate refuses ([HG046]).
+    higgs
+        .prepare_chat("org/model", Some(16), &user_msg("hi"))
+        .await
+        .expect_err("JIT on + un-prepared refuses");
+
+    let first = events
+        .try_recv()
+        .expect("Queued emitted BEFORE the gate walk");
+    assert_eq!(first.id, "org/model");
+    assert_eq!(first.phase, ModelLoadPhase::Queued, "first event is Queued");
+    let last = events
+        .try_recv()
+        .expect("a refusal is bracketed with a terminal");
+    assert_eq!(last.id, "org/model");
+    assert_eq!(
+        last.phase,
+        ModelLoadPhase::Failed,
+        "the gate refusal emits Failed so the early pill cannot strand"
+    );
+    assert!(
+        events.try_recv().is_err(),
+        "no further events after the terminal"
+    );
+}
+
 #[tokio::test]
 async fn prepare_chat_unknown_model_jit_on_not_found() {
     let (higgs, _dir) = fake_higgs_with_fixture();

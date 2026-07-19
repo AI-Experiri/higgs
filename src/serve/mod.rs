@@ -133,6 +133,11 @@ pub(crate) fn http_status(err: &HiggsError) -> StatusCode {
         // Benchmark refused because the model is loaded ([HG067]) — a conflict the
         // client resolves by unloading first.
         HiggsError::BenchModelLoaded { .. } => StatusCode::CONFLICT,
+        // An ephemeral load refused because the model is already resident
+        // ([HG080]) — same conflict class as BenchModelLoaded: eject first.
+        // No serve endpoint calls load_ephemeral today; the arm keeps this
+        // choke point exhaustive for when one does.
+        HiggsError::EphemeralResident { .. } => StatusCode::CONFLICT,
         // Load/chat refused because a benchmark owns the model ([HG068]) — a
         // transient capacity condition; retry after the benchmark finishes.
         HiggsError::BenchInProgress { .. } => StatusCode::SERVICE_UNAVAILABLE,
