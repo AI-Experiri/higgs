@@ -67,14 +67,13 @@ impl ContextEstimator for Analytical {
         // if the fixed cost ALONE already exceeds the budget — otherwise a tight RAM cap
         // below the fixed overhead would be silently ignored.
         let invert = |budget: u64, base: u64, slope: u64| -> u32 {
-            if slope == 0 {
-                if base <= budget {
-                    u32::MAX
-                } else {
-                    0
-                }
-            } else {
-                (budget.saturating_sub(base) / slope).min(u32::MAX as u64) as u32
+            // `checked_div` folds the slope==0 guard: None ⇒ no per-token growth
+            // (unlimited context if the fixed cost fits, else zero); Some(q) ⇒ the
+            // largest n that fits, clamped to u32.
+            match budget.saturating_sub(base).checked_div(slope) {
+                Some(n) => n.min(u32::MAX as u64) as u32,
+                None if base <= budget => u32::MAX,
+                None => 0,
             }
         };
         let max_vram = invert(vram_budget, vram0, vram1.saturating_sub(vram0));
