@@ -16,13 +16,14 @@ description: Current request-keyed routing design and deferred parallel-executio
 
 | Layer | Behaviour |
 |---|---|
-| Worker process | Spawn-on-load / kill-on-unload — at most one worker, named `higgs(<model>)`; zero process when nothing loaded |
+| Worker process | Spawn-on-load / kill-on-unload — **at most one local worker**, named `higgs(<model>)`; zero process when nothing loaded. (A remote *node* hosts many workers concurrently — see [Remote Fleet](/remote-fleet/#multi-worker-nodes).) |
 | Lifecycle serialisation | A `tokio::sync::Mutex` serialises `load` / `unload` / `stop` so spawn-on-load and kill-on-unload never interleave |
 | Worker execution | Single-threaded stdin loop — one `higgs/chat` at a time |
 | Supervisor routing | Per-request `mpsc::unbounded_channel` keyed by `request_id` |
 | Concurrent callers | Accepted; serialised at the worker; each caller's deltas are isolated |
-| Control RPC bound | `scan`/`load`/`status`/`unload` capped at 120 s; chat is unbounded (capped by `max_tokens`) |
-| Rejection policy | None — no 409, no busy signal. Chat for an unloaded model: JIT on (default) → on-demand load (only-keep-last swap) then serve; JIT off → `404 [HG003]`; unknown id → `404 [HG002]` |
+| Control RPC bound | `load`/`status`/`unload` worker RPCs are under the 120 s HTTP control-route timeout; `scan` is host-side (`spawn_blocking`, no worker RPC); chat is bounded by a 600 s RPC timeout (`CHAT_RPC_TIMEOUT`) and by `max_tokens` |
+| Admission gate | Concurrent inference is capped at `MAX_CONCURRENT_INFERENCE = 8`; the 9th in-flight chat is rejected with `[HG014]` |
+| Rejection policy | Chat for an unloaded model: JIT on (default) → on-demand load (only-keep-last swap) then serve; JIT off → `404 [HG003]`; unknown id → `404 [HG002]` |
 
 ### Request-keyed routing flow
 
@@ -139,8 +140,10 @@ Two approaches:
 - omlx: return HTTP 503 (`{"error": "all slots busy"}`) when every slot is active.
 - This is the only place a rejection is reference-grounded; it is a capacity
   signal, not a concurrency prohibition.
-- In higgs terms: emit `HG012` (or a new code) only when `active >= N`
-  and `N > 1`; with `N=1` the current serialise-and-queue behaviour is retained.
+- In higgs terms: emit a dedicated busy code only when `active >= N` and `N > 1`
+  (host-level admission already returns `[HG014]` at `MAX_CONCURRENT_INFERENCE`;
+  do **not** reuse `HG012`, which is `ForbiddenHost`). With `N=1` the current
+  serialise-and-queue behaviour is retained.
 
 ### Migration path (when this work is picked up)
 
@@ -150,4 +153,5 @@ Two approaches:
    that feeds tokens into the shared batch loop.
 4. The supervisor's keyed sink map (`chat_sinks`) is already correct for N>1;
    no routing changes needed.
-5. Add overflow rejection (HG012 or new code) only when all slots are active.
+5. Add overflow rejection (`HG014` or a new busy code — never `HG012`, which is
+   `ForbiddenHost`) only when all slots are active.

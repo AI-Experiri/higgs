@@ -1,0 +1,34 @@
+# release-check — validates that a PR which would cut a release is well-formed.
+#
+# Runs scripts/release/check-release.sh on every PR to main. That script mirrors
+# release.yml's gate and shifts it LEFT: if the PR's Cargo.toml version is untagged
+# (so merging would cut a release), it enforces the release requirements — valid
+# semver, a dated CHANGELOG section, Cargo.lock in sync, and a pinned signing key —
+# otherwise it is a no-op pass. Content-only, no secrets, so it is safe on fork PRs.
+#
+# Make this a REQUIRED status check in branch protection to block a malformed release
+# from merging.
+#
+# Security: no untrusted event input (PR title/body/branch) is interpolated into any
+# run: script, so this workflow is not exposed to GitHub Actions script injection.
+
+name: release-check
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  requirements:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Validate release requirements
+        run: scripts/release/check-release.sh

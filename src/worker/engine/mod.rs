@@ -1,4 +1,22 @@
 //! Engine abstraction. v1: llama.cpp. Future: MLX (mlxcel cxx pattern), other runtimes.
+//!
+//! # Adding a new engine (three steps, no other file changes)
+//!
+//! The worker talks to inference backends ONLY through the [`HiggsEngine`] trait, and picks
+//! one at startup from the [`REGISTRY`]. To add an engine — say `mlx`:
+//!
+//! 1. **Create a submodule** `engine/mlx/mod.rs` with a type implementing [`HiggsEngine`]
+//!    (`load`/`unload`/`is_loaded`/`chat`/`probe`/`devices`). Keep every backend-specific
+//!    dependency (FFI, crates) confined to that submodule — the trait is the only thing the
+//!    rest of higgs sees. Declare it here: `pub mod mlx;`.
+//! 2. **Register it** by adding ONE line to [`REGISTRY`]:
+//!    `EngineEntry { name: "mlx", build: || Box::new(mlx::MlxEngine::default()) }`.
+//! 3. **Select it** at runtime with `HIGGS_ENGINE=mlx` (the worker reads this; the first
+//!    registry entry is the default). Per-model selection can layer on top later.
+//!
+//! That's the whole contract: implement the trait, add a registry line. No edits to the
+//! worker dispatch, the supervisor, the node runtime, or the serve layer — they are all
+//! engine-agnostic above [`HiggsEngine`].
 
 pub mod llamacpp;
 
@@ -8,100 +26,116 @@ use crate::diagnostic::HiggsError;
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GenParams {
     pub max_tokens: usize,
-    pub temperature: f32,
+    /// The full sampler set for this request (engine umbrella; the `LlamaCpp`
+    /// variant carries temperature/top_k/top_p/min_p/penalties/…). The decode loop
+    /// builds the ordered `LlamaSampler` chain from it. `temperature <= 0` ⇒ greedy.
+    pub sampling: SamplingParams,
     /// OpenAI-compatible `tools` array serialized to a JSON string, or `None`
     /// when the request carries no tools. Fed verbatim to the GGUF chat
     /// template alongside the messages; the crate's vendored `common_chat`
     /// renders the tool grammar and selects the matching tool-call parser. We
     /// invent no parser of our own.
     pub tools_json: Option<String>,
+    /// llama.cpp-style per-request chat-template kwargs as a JSON-object
+    /// string (e.g. `{"enable_thinking":false}`), or `None`. Passed verbatim
+    /// to the template apply; the template decides what the keys mean.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_template_kwargs: Option<String>,
 }
 
 higgs_ts! {
-    /// Parameters fixed at load time.
+    /// Engine-tagged **load-parameter umbrella**. `LoadParams::LlamaCpp(LlamaCppParams)`
+    /// today; a future `Mlx(MlxParams)` slots beside it. "All are `LoadParams`."
     ///
-    /// The three base fields (`ctx_len`/`gpu_layers`/`threads`) are always
-    /// present — the quick-load / `default_load` path fills them. Every other
-    /// field is `Option`: absent (`None`) means "use the engine default", which
-    /// reproduces the pre-expansion behavior exactly. Each optional maps to a
-    /// real `llama-cpp-2` 0.1.139 builder call, applied only inside `llamacpp.rs`
-    /// (the sole file allowed to name `llama_cpp_2`).
-    #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-    #[serde(default)]
-    pub struct LoadParams {
-        #[ts(type = "number")]
-        pub ctx_len: u32,
-        /// Layers offloaded to GPU; u32::MAX = all (LM Studio "max" semantics).
-        #[ts(type = "number")]
-        pub gpu_layers: u32,
-        #[ts(type = "number")]
-        pub threads: u32,
-        /// Memory-map the GGUF instead of reading it into RAM. `None` = engine
-        /// default. Applied via `LlamaModelParams::with_use_mmap`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[ts(optional)]
-        pub use_mmap: Option<bool>,
-        /// Lock model pages in RAM (prevent swap). `None` = engine default.
-        /// Applied via `LlamaModelParams::with_use_mlock`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[ts(optional)]
-        pub use_mlock: Option<bool>,
-        /// Logical batch size for prompt decode. `None` keeps the current
-        /// default (`ctx_len.max(1)` — one-shot prefill). Applied via
-        /// `LlamaContextParams::with_n_batch`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[ts(type = "number")]
-        #[ts(optional)]
-        pub n_batch: Option<u32>,
-        /// Physical (micro) batch size. `None` = engine default. Applied via
-        /// `LlamaContextParams::with_n_ubatch`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[ts(type = "number")]
-        #[ts(optional)]
-        pub n_ubatch: Option<u32>,
-        /// Offload the KV cache & KQV ops to the GPU. `None` = engine default.
-        /// Applied via `LlamaContextParams::with_offload_kqv`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[ts(optional)]
-        pub offload_kqv: Option<bool>,
-        /// RoPE base frequency override. `None` = use the GGUF's trained value.
-        /// Applied via `LlamaContextParams::with_rope_freq_base`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[ts(type = "number")]
-        #[ts(optional)]
-        pub rope_freq_base: Option<f32>,
-        /// RoPE frequency scale (context extension). `None` = trained value.
-        /// Applied via `LlamaContextParams::with_rope_freq_scale`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[ts(type = "number")]
-        #[ts(optional)]
-        pub rope_freq_scale: Option<f32>,
-        /// Flash-attention policy. `None` = engine default. Applied via
-        /// `LlamaContextParams::with_flash_attention_policy`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[ts(optional)]
-        pub flash_attn: Option<FlashAttn>,
-        /// KV cache key data type. `None` = engine default (F16). Applied via
-        /// `LlamaContextParams::with_type_k`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[ts(optional)]
-        pub type_k: Option<KvCacheKind>,
-        /// KV cache value data type. `None` = engine default (F16). Applied via
-        /// `LlamaContextParams::with_type_v`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[ts(optional)]
-        pub type_v: Option<KvCacheKind>,
-        /// Sampler RNG seed. `None` keeps the current behavior: a fresh random
-        /// seed per request (`LlamaSampler::dist(rand::random())`). When set,
-        /// generation is reproducible. Greedy decoding (temperature 0) ignores it.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[ts(type = "number")]
-        #[ts(optional)]
-        pub seed: Option<u32>,
+    /// Serialized **internally tagged** on the `engine` field, so the JSON is the
+    /// flattened llama.cpp payload plus `"engine":"LlamaCpp"`. The worker dispatches
+    /// on the variant; the suggester (`src/tune/`) derives the concrete payload.
+    /// The concrete fields live in [`llamacpp::params::LlamaCppParams`] (full
+    /// `llama-cpp-2` 0.1.139 coverage) — applied only inside `llamacpp/mod.rs`.
+    #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+    #[serde(tag = "engine")]
+    pub enum LoadParams {
+        /// The llama.cpp engine's load parameters.
+        LlamaCpp(llamacpp::params::LlamaCppParams),
+    }
+}
+
+impl Default for LoadParams {
+    fn default() -> Self {
+        LoadParams::LlamaCpp(llamacpp::params::LlamaCppParams::default())
+    }
+}
+
+impl LoadParams {
+    /// Wrap llama.cpp params in the umbrella.
+    pub fn llamacpp(p: llamacpp::params::LlamaCppParams) -> Self {
+        LoadParams::LlamaCpp(p)
+    }
+
+    /// Build the umbrella from just the three base llama.cpp fields (the
+    /// quick-load shape; every optional left at its engine default).
+    pub fn base(ctx_len: CtxLen, gpu_layers: GpuLayers, threads: u32) -> Self {
+        LoadParams::LlamaCpp(llamacpp::params::LlamaCppParams::base(
+            ctx_len, gpu_layers, threads,
+        ))
+    }
+
+    /// The llama.cpp payload (the only engine variant today).
+    pub fn as_llamacpp(&self) -> &llamacpp::params::LlamaCppParams {
+        match self {
+            LoadParams::LlamaCpp(p) => p,
+        }
+    }
+
+    /// Base-field accessor: context window ([`CtxLen::Auto`] = the trained context).
+    pub fn ctx_len(&self) -> CtxLen {
+        self.as_llamacpp().ctx_len
+    }
+
+    /// Base-field accessor: GPU layers ([`GpuLayers::All`] = every layer).
+    pub fn gpu_layers(&self) -> GpuLayers {
+        self.as_llamacpp().gpu_layers
+    }
+
+    /// Base-field accessor: generation threads.
+    pub fn threads(&self) -> u32 {
+        self.as_llamacpp().threads
     }
 }
 
 higgs_ts! {
+    /// Engine-tagged **sampling-parameter umbrella**, mirroring [`LoadParams`].
+    /// `SamplingParams::LlamaCpp(LlamaCppSamplingParams)` today. Carried by
+    /// [`GenParams`] and persisted alongside a tuning profile.
+    #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+    #[serde(tag = "engine")]
+    pub enum SamplingParams {
+        /// The llama.cpp engine's sampler parameters.
+        LlamaCpp(llamacpp::params::LlamaCppSamplingParams),
+    }
+}
+
+impl Default for SamplingParams {
+    fn default() -> Self {
+        SamplingParams::LlamaCpp(llamacpp::params::LlamaCppSamplingParams::default())
+    }
+}
+
+impl SamplingParams {
+    /// Wrap llama.cpp sampling params in the umbrella.
+    pub fn llamacpp(p: llamacpp::params::LlamaCppSamplingParams) -> Self {
+        SamplingParams::LlamaCpp(p)
+    }
+
+    /// The llama.cpp payload (the only engine variant today).
+    pub fn as_llamacpp(&self) -> &llamacpp::params::LlamaCppSamplingParams {
+        match self {
+            SamplingParams::LlamaCpp(p) => p,
+        }
+    }
+}
+
+higgs_const_enum! {
     /// Flash-attention policy, mirroring llama.cpp's `llama_flash_attn_type`
     /// (AUTO = -1, DISABLED = 0, ENABLED = 1). Engine-agnostic at this layer;
     /// mapped to the raw `llama_cpp_sys_2` value only inside `llamacpp.rs`.
@@ -117,7 +151,7 @@ higgs_ts! {
     }
 }
 
-higgs_ts! {
+higgs_const_enum! {
     /// KV-cache element type (the LM Studio subset of GGML types usable for the
     /// K/V cache). Engine-agnostic here; mapped to `llama_cpp_2`'s `KvCacheType`
     /// only inside `llamacpp.rs`.
@@ -137,6 +171,316 @@ higgs_ts! {
         Q4_1,
         /// 4-bit, block size 0 — smallest cache.
         Q4_0,
+    }
+}
+
+higgs_ts! {
+    /// How many model layers to offload to the GPU. Replaces the old `gpu_layers: u32`
+    /// where `u32::MAX` was a sentinel for "all" — the intent now lives in the type, not a
+    /// magic number. A data enum (carries `n`), so it is a ts-rs tagged union (the documented
+    /// exception to the const-enum rule), internally tagged on `kind`:
+    /// `{"kind":"all"}` / `{"kind":"count","n":32}`. Mapped to the raw `with_n_gpu_layers`
+    /// int ONLY inside `llamacpp/mod.rs`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    pub enum GpuLayers {
+        /// Offload every layer to the GPU (LM Studio "max").
+        All,
+        /// Offload exactly `n` layers; `n == 0` is CPU-only.
+        Count {
+            /// Number of layers offloaded.
+            #[ts(type = "number")]
+            n: u32,
+        },
+    }
+}
+
+impl Default for GpuLayers {
+    /// Preserves the pre-enum derived default (`gpu_layers: 0`, i.e. CPU-only).
+    fn default() -> Self {
+        GpuLayers::Count { n: 0 }
+    }
+}
+
+impl GpuLayers {
+    /// Every layer offloaded (the old `gpu_layers == u32::MAX`).
+    pub fn all() -> Self {
+        GpuLayers::All
+    }
+
+    /// Offload exactly `n` layers (`n == 0` → CPU-only).
+    pub fn count(n: u32) -> Self {
+        GpuLayers::Count { n }
+    }
+
+    /// `true` when every layer is offloaded.
+    pub fn is_all(&self) -> bool {
+        matches!(self, GpuLayers::All)
+    }
+
+    /// `true` when no layers are offloaded (CPU-only) — the old `gpu_layers == 0`.
+    pub fn is_cpu_only(&self) -> bool {
+        matches!(self, GpuLayers::Count { n: 0 })
+    }
+
+    /// The raw `with_n_gpu_layers` value for the llama.cpp FFI: `u32::MAX` for
+    /// [`GpuLayers::All`] (llama.cpp treats an over-large count as "all" — exactly the
+    /// old sentinel), else the explicit count. Called ONLY at the FFI boundary in
+    /// `llamacpp/mod.rs`.
+    pub fn to_n_gpu_layers(&self) -> u32 {
+        match self {
+            GpuLayers::All => u32::MAX,
+            GpuLayers::Count { n } => *n,
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for GpuLayers {
+    /// Lenient: accept EITHER a bare integer (the legacy/persisted form, `u32::MAX` = all)
+    /// or the canonical tagged object (`{"kind":"all"}` / `{"kind":"count","n":N}`).
+    /// [`Serialize`] always emits the tagged object, so a config.json written before this
+    /// change still reads, and migrates forward to the tagged form on its next save.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Num(u64),
+            Tagged(Tagged),
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum Tagged {
+            All,
+            Count { n: u32 },
+        }
+        Ok(match Wire::deserialize(deserializer)? {
+            // `u32::MAX` is the legacy "all" sentinel; any other int is an explicit count.
+            // Reject an out-of-u32-range legacy int — the old `gpu_layers: u32` field did too
+            // (a number > u32::MAX failed to deserialize); `as u32` would silently wrap it.
+            Wire::Num(n) => {
+                let n = u32::try_from(n).map_err(serde::de::Error::custom)?;
+                if n == u32::MAX {
+                    GpuLayers::All
+                } else {
+                    GpuLayers::Count { n }
+                }
+            }
+            Wire::Tagged(Tagged::All) => GpuLayers::All,
+            Wire::Tagged(Tagged::Count { n }) => GpuLayers::Count { n },
+        })
+    }
+}
+
+higgs_ts! {
+    /// The context window to load with. Replaces the old `ctx_len: u32` where `0` was a
+    /// sentinel for "AUTO" (let the engine pick the model's trained context, capped) — the
+    /// intent now lives in the type. A data enum, so a ts-rs tagged union (the const-enum
+    /// exception), internally tagged on `kind`: `{"kind":"auto"}` / `{"kind":"fixed","n":4096}`.
+    /// Mapped to the raw `with_n_ctx` int ONLY inside `llamacpp/mod.rs`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    pub enum CtxLen {
+        /// Let the engine pick — the model's trained context, capped at `DEFAULT_CTX_CAP`
+        /// (the old `ctx_len == 0`).
+        Auto,
+        /// A fixed context window of `n` tokens.
+        Fixed {
+            /// Window size in tokens.
+            #[ts(type = "number")]
+            n: u32,
+        },
+    }
+}
+
+impl Default for CtxLen {
+    /// Preserves the pre-enum derived default (`ctx_len: 0`, i.e. AUTO).
+    fn default() -> Self {
+        CtxLen::Auto
+    }
+}
+
+impl CtxLen {
+    /// A fixed `n`-token window — but `n == 0` normalizes to [`CtxLen::Auto`]: a 0-token
+    /// window is meaningless and `0` has ALWAYS meant "auto" (the trained context), so the
+    /// numeric `0` and the tagged `{"kind":"fixed","n":0}` map to the same Auto.
+    pub fn fixed(n: u32) -> Self {
+        if n == 0 {
+            CtxLen::Auto
+        } else {
+            CtxLen::Fixed { n }
+        }
+    }
+
+    /// `true` when the engine picks the window (the old `ctx_len == 0`).
+    pub fn is_auto(&self) -> bool {
+        matches!(self, CtxLen::Auto)
+    }
+
+    /// The fixed window in tokens, or `None` for [`CtxLen::Auto`].
+    pub fn fixed_n(&self) -> Option<u32> {
+        match self {
+            CtxLen::Auto => None,
+            CtxLen::Fixed { n } => Some(*n),
+        }
+    }
+
+    /// The raw `with_n_ctx` value for the llama.cpp FFI: `0` for [`CtxLen::Auto`]
+    /// (`NonZeroU32::new(0) == None` → llama.cpp uses the trained context — exactly the
+    /// old sentinel), else the fixed window. Called ONLY at the FFI boundary.
+    pub fn to_n_ctx(&self) -> u32 {
+        match self {
+            CtxLen::Auto => 0,
+            CtxLen::Fixed { n } => *n,
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for CtxLen {
+    /// Lenient: accept EITHER a bare integer (the legacy/persisted form, `0` = auto) or the
+    /// canonical tagged object. [`Serialize`] always emits the tagged object, so a config.json
+    /// written before this change still reads and migrates forward on its next save.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Num(u64),
+            Tagged(Tagged),
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum Tagged {
+            Auto,
+            Fixed { n: u32 },
+        }
+        Ok(match Wire::deserialize(deserializer)? {
+            // `0` is the legacy "auto" sentinel; any other int is an explicit window.
+            // Reject an out-of-u32-range legacy int — the old `ctx_len: u32` field did too;
+            // `as u32` would silently wrap it (e.g. 4294967296 -> 0).
+            Wire::Num(0) => CtxLen::Auto,
+            Wire::Num(n) => CtxLen::Fixed {
+                n: u32::try_from(n).map_err(serde::de::Error::custom)?,
+            },
+            Wire::Tagged(Tagged::Auto) => CtxLen::Auto,
+            // `{"kind":"fixed","n":0}` normalizes to Auto via `fixed()`, matching numeric 0.
+            Wire::Tagged(Tagged::Fixed { n }) => CtxLen::fixed(n),
+        })
+    }
+}
+
+/// Which stream a chat delta belongs to. The engine's incremental parse
+/// (the crate's `common_chat` PEG parser) splits the generation into the
+/// assistant-visible answer, model thinking, and tool-call fragments; every
+/// hop above the engine (worker RPC → supervisor demux → serve SSE / fleet
+/// relay) carries this tag so the `/v1` stream can emit `delta.content`,
+/// `delta.reasoning_content`, and `delta.tool_calls` chunks — never a bare
+/// string that loses the distinction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatDeltaKind {
+    /// Assistant answer text (`delta.content` on `/v1`).
+    Content,
+    /// Model thinking (`delta.reasoning_content` on `/v1`).
+    Reasoning,
+    /// One OpenAI tool-call fragment (`delta.tool_calls[…]` on `/v1`); the
+    /// text is the fragment's JSON, produced by the crate's streaming parse.
+    ToolCall,
+}
+
+impl ChatDeltaKind {
+    /// Parse the wire `kind` value; absent/unknown ⇒ `Content` (old-peer default).
+    pub(crate) fn from_wire(kind: Option<&str>) -> Self {
+        match kind {
+            Some("reasoning") => ChatDeltaKind::Reasoning,
+            Some("tool_call") => ChatDeltaKind::ToolCall,
+            _ => ChatDeltaKind::Content,
+        }
+    }
+}
+
+/// One owned streamed chat delta — the item type of every chat delta channel
+/// (supervisor demux, `Higgs::chat_stream`, fleet relay).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatDelta {
+    pub kind: ChatDeltaKind,
+    /// The delta payload: answer/thinking text, or (for
+    /// [`ChatDeltaKind::ToolCall`]) the OpenAI tool-call fragment JSON.
+    pub text: String,
+}
+
+impl ChatDelta {
+    /// Encode one delta as `N_CHAT_CHUNK` notification params. The shape is
+    /// ADDITIVE over the pre-reasoning wire (`{request_id, delta}`):
+    /// - Content   → `{request_id, delta}` (unchanged — old peers just work)
+    /// - Reasoning → `{request_id, delta, kind:"reasoning"}` (old peers show
+    ///   the thinking as content — the pre-feature behavior)
+    /// - ToolCall  → `{request_id, delta:"", kind:"tool_call", tool:<json>}`
+    ///   (the fragment rides `tool`, NOT `delta`, so an old peer reading only
+    ///   `delta` forwards a harmless empty chunk instead of leaking call JSON)
+    pub(crate) fn encode_chunk_params(
+        request_id: &serde_json::Value,
+        kind: ChatDeltaKind,
+        text: &str,
+    ) -> serde_json::Value {
+        match kind {
+            ChatDeltaKind::Content => {
+                serde_json::json!({"request_id": request_id, "delta": text})
+            }
+            ChatDeltaKind::Reasoning => {
+                serde_json::json!({"request_id": request_id, "delta": text, "kind": "reasoning"})
+            }
+            ChatDeltaKind::ToolCall => serde_json::json!({
+                "request_id": request_id, "delta": "", "kind": "tool_call", "tool": text
+            }),
+        }
+    }
+
+    /// Decode a delta from `N_CHAT_CHUNK` params (the inverse of
+    /// [`encode_chunk_params`](Self::encode_chunk_params)); `None` when the
+    /// payload field is missing/malformed (chunk dropped, matching the old
+    /// behavior for a missing `delta`).
+    pub(crate) fn decode_chunk_params(params: &serde_json::Value) -> Option<ChatDelta> {
+        let kind = ChatDeltaKind::from_wire(params.get("kind").and_then(|v| v.as_str()));
+        let text = match kind {
+            ChatDeltaKind::ToolCall => params.get("tool")?.as_str()?,
+            _ => params.get("delta")?.as_str()?,
+        };
+        Some(ChatDelta {
+            kind,
+            text: text.to_owned(),
+        })
+    }
+}
+
+/// One borrowed chat delta as the engine emits it into the sink (zero-copy;
+/// the worker serializes it straight onto the RPC wire).
+#[derive(Debug, Clone, Copy)]
+pub enum EngineDelta<'a> {
+    /// Assistant answer text.
+    Content(&'a str),
+    /// Model thinking.
+    Reasoning(&'a str),
+    /// OpenAI tool-call fragment JSON from the streaming parse.
+    ToolCall(&'a str),
+}
+
+impl EngineDelta<'_> {
+    pub fn text(&self) -> &str {
+        match self {
+            EngineDelta::Content(s) | EngineDelta::Reasoning(s) | EngineDelta::ToolCall(s) => s,
+        }
+    }
+
+    pub fn kind(&self) -> ChatDeltaKind {
+        match self {
+            EngineDelta::Content(_) => ChatDeltaKind::Content,
+            EngineDelta::Reasoning(_) => ChatDeltaKind::Reasoning,
+            EngineDelta::ToolCall(_) => ChatDeltaKind::ToolCall,
+        }
     }
 }
 
@@ -160,6 +504,11 @@ pub struct ChatResult {
     pub prompt_tokens: u32,
     /// Number of tokens emitted during the decode loop.
     pub completion_tokens: u32,
+    /// Model thinking extracted by the parse (`reasoning_content` on the OpenAI
+    /// message), or `None` when the model emitted none / the template has no
+    /// reasoning markers. Truncation mid-think is NOT an error: `content` may be
+    /// empty while this carries the partial thinking (lenient parse).
+    pub reasoning_content: Option<String>,
 }
 
 /// A local inference engine able to host one loaded model (v1).
@@ -171,8 +520,10 @@ pub trait HiggsEngine: Send {
     /// True when a model is resident.
     fn is_loaded(&self) -> bool;
     /// Render the GGUF-embedded chat template over `messages_json` and stream
-    /// completion deltas into `sink`. Returns a [`ChatResult`] with the full
-    /// text, finish reason, and prompt/completion token counts.
+    /// completion deltas into `sink` — each tagged content / reasoning /
+    /// tool-call ([`EngineDelta`]) by the engine's incremental parse. Returns a
+    /// [`ChatResult`] with the full text, finish reason, reasoning, and
+    /// prompt/completion token counts.
     ///
     /// `messages_json` is the request's OpenAI `messages` array serialized
     /// verbatim — including assistant `tool_calls` and tool `tool_call_id`, so
@@ -188,23 +539,164 @@ pub trait HiggsEngine: Send {
         &mut self,
         messages_json: &str,
         params: &GenParams,
-        sink: &mut dyn FnMut(&str),
+        sink: &mut dyn FnMut(EngineDelta<'_>),
     ) -> Result<ChatResult, HiggsError>;
-
-    /// Attempt to load the GGUF at `path` into a throwaway model handle to learn
-    /// whether THIS engine can load it (Gate 1 — "can our llama.cpp load it").
-    ///
-    /// Probe-only: the loaded handle is dropped immediately and never stored as
-    /// the resident model, so a probe never disturbs a model already being
-    /// served (`&self`, no resident-slot mutation). Returns `(true, None)` when
-    /// the load succeeds, or `(false, Some(reason))` carrying the engine's
-    /// verbatim error string (e.g. `"unknown model architecture: 'gemma4'"`)
-    /// when it fails — that exact reason is what the UI shows as the mismatch.
-    fn probe(&self, path: &str) -> (bool, Option<String>);
 
     /// Enumerate the host's compute devices (CPU/GPU/accel) as this engine sees
     /// them. Cheap and read-only — no model load, no resident-state mutation —
     /// so it is safe to call at any time, including on a fresh worker. Returns an
     /// empty vec when the engine exposes no devices.
     fn devices(&self) -> Vec<crate::system::GpuDevice>;
+}
+
+/// One compiled-in engine: a stable selector name + a zero-arg constructor. The build
+/// closure is a plain `fn` pointer so the registry is a `const` table (no allocation, usable
+/// in tests and tooling).
+pub struct EngineEntry {
+    /// The `HIGGS_ENGINE` value that selects this engine (lowercase, stable).
+    pub name: &'static str,
+    /// Construct a fresh, model-less instance of this engine.
+    pub build: fn() -> Box<dyn HiggsEngine>,
+}
+
+/// Every engine compiled into this build. The FIRST entry is the default. Adding an engine
+/// is one line here (see the module docs) — nothing else in higgs needs to change.
+pub const REGISTRY: &[EngineEntry] = &[EngineEntry {
+    name: "llamacpp",
+    build: || Box::new(llamacpp::LlamaCppEngine::default()),
+}];
+
+/// The default engine's name (the first [`REGISTRY`] entry). Const-true that the registry is
+/// never empty would be nice, but `REGISTRY[0]` already enforces it at build time.
+pub fn default_engine_name() -> &'static str {
+    REGISTRY[0].name
+}
+
+/// The set of selectable engine names, for diagnostics / `--help`.
+pub fn engine_names() -> Vec<&'static str> {
+    REGISTRY.iter().map(|e| e.name).collect()
+}
+
+/// Build the engine selected by `name` (case-insensitive). `None` or an unknown name falls
+/// back to the default (first registry entry); the chosen name is returned so the caller can
+/// log it and warn on an unknown request.
+pub fn build_engine(name: Option<&str>) -> (Box<dyn HiggsEngine>, &'static str) {
+    let requested = name.map(str::trim).filter(|s| !s.is_empty());
+    if let Some(req) = requested {
+        if let Some(entry) = REGISTRY.iter().find(|e| e.name.eq_ignore_ascii_case(req)) {
+            return ((entry.build)(), entry.name);
+        }
+        tracing::warn!(
+            requested = req,
+            default = default_engine_name(),
+            available = ?engine_names(),
+            "higgs: unknown HIGGS_ENGINE; falling back to default"
+        );
+    }
+    let entry = &REGISTRY[0];
+    ((entry.build)(), entry.name)
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+
+    #[test]
+    fn default_is_llamacpp_and_registry_nonempty() {
+        assert!(
+            !engine_names().is_empty(),
+            "at least one engine is registered"
+        );
+        assert_eq!(default_engine_name(), "llamacpp");
+        assert!(engine_names().contains(&"llamacpp"));
+    }
+
+    #[test]
+    fn build_selects_by_name_case_insensitively() {
+        let (_e, name) = build_engine(Some("LlamaCpp"));
+        assert_eq!(name, "llamacpp", "case-insensitive match");
+    }
+
+    #[test]
+    fn build_falls_back_to_default_for_unknown_or_absent() {
+        assert_eq!(build_engine(None).1, "llamacpp");
+        assert_eq!(build_engine(Some("")).1, "llamacpp");
+        assert_eq!(
+            build_engine(Some("nope")).1,
+            "llamacpp",
+            "unknown → default"
+        );
+    }
+
+    #[test]
+    fn gpu_layers_deserialize_is_lenient_and_range_checked() {
+        use serde_json::{from_value, json};
+        // Legacy bare int: u32::MAX = "all", else an explicit count.
+        assert_eq!(
+            from_value::<GpuLayers>(json!(u32::MAX)).unwrap(),
+            GpuLayers::All
+        );
+        assert_eq!(
+            from_value::<GpuLayers>(json!(32)).unwrap(),
+            GpuLayers::Count { n: 32 }
+        );
+        // Canonical tagged object.
+        assert_eq!(
+            from_value::<GpuLayers>(json!({"kind": "all"})).unwrap(),
+            GpuLayers::All
+        );
+        assert_eq!(
+            from_value::<GpuLayers>(json!({"kind": "count", "n": 8})).unwrap(),
+            GpuLayers::Count { n: 8 }
+        );
+        // An out-of-u32-range legacy int is REJECTED, not silently wrapped to 0 (the old
+        // `gpu_layers: u32` field rejected it too). Fails if the deserialize reverts to `as u32`.
+        assert!(from_value::<GpuLayers>(json!(4_294_967_296u64)).is_err());
+        // Serialize ALWAYS emits the canonical tagged object.
+        assert_eq!(
+            serde_json::to_value(GpuLayers::All).unwrap(),
+            json!({"kind": "all"})
+        );
+        assert_eq!(
+            serde_json::to_value(GpuLayers::Count { n: 5 }).unwrap(),
+            json!({"kind": "count", "n": 5})
+        );
+    }
+
+    #[test]
+    fn ctx_len_deserialize_is_lenient_and_range_checked() {
+        use serde_json::{from_value, json};
+        // Legacy bare int: 0 = auto, else an explicit window.
+        assert_eq!(from_value::<CtxLen>(json!(0)).unwrap(), CtxLen::Auto);
+        assert_eq!(
+            from_value::<CtxLen>(json!(4096)).unwrap(),
+            CtxLen::Fixed { n: 4096 }
+        );
+        // Canonical tagged object.
+        assert_eq!(
+            from_value::<CtxLen>(json!({"kind": "auto"})).unwrap(),
+            CtxLen::Auto
+        );
+        assert_eq!(
+            from_value::<CtxLen>(json!({"kind": "fixed", "n": 2048})).unwrap(),
+            CtxLen::Fixed { n: 2048 }
+        );
+        // An out-of-u32-range legacy int is REJECTED, not silently wrapped to Fixed{0}.
+        assert!(from_value::<CtxLen>(json!(4_294_967_296u64)).is_err());
+        // A 0-token Fixed window normalizes to Auto, matching the numeric-0 = auto sentinel
+        // (so a hand-crafted `{"kind":"fixed","n":0}` doesn't persist a misleading Fixed{0}).
+        assert_eq!(
+            from_value::<CtxLen>(json!({"kind": "fixed", "n": 0})).unwrap(),
+            CtxLen::Auto
+        );
+        // Serialize ALWAYS emits the canonical tagged object.
+        assert_eq!(
+            serde_json::to_value(CtxLen::Auto).unwrap(),
+            json!({"kind": "auto"})
+        );
+        assert_eq!(
+            serde_json::to_value(CtxLen::Fixed { n: 9 }).unwrap(),
+            json!({"kind": "fixed", "n": 9})
+        );
+    }
 }

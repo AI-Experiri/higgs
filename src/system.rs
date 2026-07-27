@@ -1,4 +1,5 @@
-//! Host hardware + inference-runtime info for `GET /api/higgs/system`.
+//! Host hardware + inference-runtime info for the `system` control-op (formerly
+//! `GET /api/higgs/system`).
 //!
 //! Mirrors the panels LM Studio shows (Hardware, Runtime): CPU/RAM/usage from
 //! the `sysinfo` crate, and the engine/backend higgs runs on. All values are
@@ -11,7 +12,7 @@ use sysinfo::System;
 use crate::api::HiggsServerConfig;
 use crate::LLAMA_CPP_2_VERSION;
 
-higgs_ts! {
+higgs_const_enum! {
     /// Kind of compute device, mirroring ggml's `ggml_backend_dev_type`
     /// (`GGML_BACKEND_DEVICE_TYPE_{CPU,GPU,ACCEL}`). The worker maps the raw
     /// FFI enum to this engine-agnostic shape; the mapping lives only in
@@ -53,7 +54,7 @@ higgs_ts! {
 
 higgs_ts! {
     /// Host hardware snapshot.
-    #[derive(Debug, Clone, Serialize)]
+    #[derive(Debug, Clone, Serialize, serde::Deserialize)]
     pub struct HardwareInfo {
         /// CPU brand string (e.g. `"Apple M3 Max"`).
         pub cpu_name: String,
@@ -82,7 +83,7 @@ higgs_ts! {
 
 higgs_ts! {
     /// Inference engine/runtime identity.
-    #[derive(Debug, Clone, Serialize)]
+    #[derive(Debug, Clone, Serialize, serde::Deserialize)]
     pub struct RuntimeInfo {
         /// Engine name — always `"llama.cpp"` in v1.
         pub engine: String,
@@ -98,7 +99,8 @@ higgs_ts! {
 }
 
 higgs_ts! {
-    /// Response for `GET /api/higgs/system`: hardware + runtime + server config.
+    /// The `system` control-op response (formerly `GET /api/higgs/system`):
+    /// hardware + runtime + server config.
     #[derive(Debug, Clone, Serialize)]
     pub struct SystemInfo {
         /// Host hardware (CPU, RAM, live load).
@@ -107,6 +109,67 @@ higgs_ts! {
         pub runtime: RuntimeInfo,
         /// Read-only effective server config (scan dirs, load defaults, bind host).
         pub config: HiggsServerConfig,
+    }
+}
+
+/// Best-effort host name (empty string when unavailable). Single source for both the friendly
+/// instance name ([`crate::config::name_or_init`]) and a node's `M_NODE_INVENTORY` hostname.
+pub fn hostname() -> String {
+    System::host_name().unwrap_or_default()
+}
+
+impl HardwareInfo {
+    /// Stable signature over the facts that change a tuned profile: total VRAM,
+    /// total RAM, CPU core count (the tuner derives `threads`/`n_threads_batch`
+    /// from it — see `tune::derive`), and the GPU roster (name + per-device VRAM).
+    /// Excludes volatile fields (usage %, free bytes) so it flips only on a real
+    /// hardware change — used to detect a stale tuning profile
+    /// (`ModelReadiness::NeedsRetune`).
+    pub fn fingerprint(&self) -> String {
+        use std::fmt::Write as _;
+        let mut s = String::new();
+        let _ = write!(
+            s,
+            "v{}r{}c{}n{}",
+            self.vram_total_bytes,
+            self.ram_total_bytes,
+            self.cpu_cores,
+            self.gpus.len()
+        );
+        for g in &self.gpus {
+            let _ = write!(s, "|{}:{}", g.name, g.vram_total_bytes);
+        }
+        s
+    }
+
+    /// Free VRAM across GPU devices ONLY. A CPU/accel device reports *system*
+    /// memory as its `vram_free_bytes`, so summing every device would overstate
+    /// GPU headroom — the same reason `vram_total_bytes` is GPU-filtered in
+    /// `gather_hardware_runtime`. Used by the readiness fit check so a profiled
+    /// model isn't marked `Servable` when actual GPU free memory is insufficient.
+    pub fn free_vram_bytes(&self) -> u64 {
+        self.gpus
+            .iter()
+            .filter(|g| g.kind == DeviceKind::Gpu)
+            .map(|g| g.vram_free_bytes)
+            .sum()
+    }
+
+    /// True on a UNIFIED-memory system (Apple Silicon), where the GPU's "VRAM" is
+    /// the same physical pool as system RAM. The readiness fit check must then SUM
+    /// the VRAM + RAM footprints against one free pool rather than checking them
+    /// independently (which would double-count the shared memory and over-report
+    /// `Servable`).
+    ///
+    /// Signalled by a Metal GPU on an `aarch64` host: Intel Macs ALSO run Metal
+    /// but with a DISCRETE AMD GPU (separate VRAM), so a bare "Metal" name isn't
+    /// enough — gate on the arm64 arch too.
+    pub fn is_unified_memory(&self) -> bool {
+        self.arch == "aarch64"
+            && self
+                .gpus
+                .iter()
+                .any(|g| g.kind == DeviceKind::Gpu && g.name == "Metal")
     }
 }
 
@@ -123,6 +186,18 @@ impl SystemInfo {
     /// folded into the hardware snapshot and its GPU totals summed into
     /// `vram_total_bytes`. Pass an empty vec when no worker could be reached.
     pub fn gather(config: HiggsServerConfig, gpus: Vec<GpuDevice>) -> Self {
+        let (hardware, runtime) = Self::gather_hardware_runtime(gpus);
+        SystemInfo {
+            hardware,
+            runtime,
+            config,
+        }
+    }
+
+    /// Sample just the host hardware + runtime (no server config) — used by a node, which
+    /// has no `HiggsServerConfig` but still reports cpu/ram/gpu over `M_NODE_SYSINFO`.
+    /// Blocking (samples CPU over a short interval); call from a blocking context.
+    pub fn gather_hardware_runtime(gpus: Vec<GpuDevice>) -> (HardwareInfo, RuntimeInfo) {
         let mut sys = System::new();
         sys.refresh_memory();
         // CPU usage needs two samples spaced by the platform minimum interval.
@@ -144,29 +219,34 @@ impl SystemInfo {
             .map(|d| d.vram_total_bytes)
             .sum();
 
-        SystemInfo {
-            hardware: HardwareInfo {
-                cpu_name,
-                arch: std::env::consts::ARCH.to_string(),
-                cpu_cores: sys.cpus().len() as u32,
-                ram_total_bytes: sys.total_memory(),
-                ram_used_bytes: sys.used_memory(),
-                cpu_usage_percent: sys.global_cpu_usage(),
-                gpus,
-                vram_total_bytes,
+        let hardware = HardwareInfo {
+            cpu_name,
+            arch: std::env::consts::ARCH.to_string(),
+            cpu_cores: sys.cpus().len() as u32,
+            ram_total_bytes: sys.total_memory(),
+            ram_used_bytes: sys.used_memory(),
+            cpu_usage_percent: sys.global_cpu_usage(),
+            gpus,
+            vram_total_bytes,
+        };
+        let runtime = RuntimeInfo {
+            engine: "llama.cpp".to_string(),
+            // Report the backend llama.cpp was actually COMPILED with. macOS links
+            // Metal; a Linux release built `--features cuda` (→ `llama-cpp-2/cuda`)
+            // links CUDA; everything else is a CPU build. A plain `target_os` check
+            // mislabelled CUDA builds as "CPU", misleading the `system` control-op + node
+            // inventory (and any remote scheduling/diagnostics keyed on this field).
+            backend: if cfg!(target_os = "macos") {
+                "Metal".to_string()
+            } else if cfg!(feature = "cuda") {
+                "CUDA".to_string()
+            } else {
+                "CPU".to_string()
             },
-            runtime: RuntimeInfo {
-                engine: "llama.cpp".to_string(),
-                backend: if cfg!(target_os = "macos") {
-                    "Metal".to_string()
-                } else {
-                    "CPU".to_string()
-                },
-                version: crate::worker::engine::llamacpp::engine_version(),
-                binding: LLAMA_CPP_2_VERSION.to_string(),
-            },
-            config,
-        }
+            version: crate::worker::engine::llamacpp::engine_version(),
+            binding: LLAMA_CPP_2_VERSION.to_string(),
+        };
+        (hardware, runtime)
     }
 }
 
@@ -214,83 +294,5 @@ pub fn fits_vram(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A scripted CPU device — the shape `FakeEngine::devices` and these tests
-    /// use so the VRAM-sum and fit logic run without real FFI.
-    fn cpu_device() -> GpuDevice {
-        GpuDevice {
-            name: "CPU".into(),
-            description: "test cpu".into(),
-            kind: DeviceKind::Cpu,
-            vram_total_bytes: 0,
-            vram_free_bytes: 0,
-        }
-    }
-
-    #[test]
-    fn vram_total_sums_only_gpu_devices() {
-        let cfg = crate::api::Higgs::new(crate::HiggsConfig::default()).server_config();
-        let gpus = vec![
-            cpu_device(),
-            GpuDevice {
-                name: "Metal".into(),
-                description: "Apple GPU".into(),
-                kind: DeviceKind::Gpu,
-                vram_total_bytes: 16_000_000_000,
-                vram_free_bytes: 8_000_000_000,
-            },
-        ];
-        let info = SystemInfo::gather(cfg, gpus);
-        // CPU device's memory must NOT contribute to the VRAM total.
-        assert_eq!(info.hardware.vram_total_bytes, 16_000_000_000);
-        assert_eq!(info.hardware.gpus.len(), 2);
-    }
-
-    #[test]
-    fn fits_vram_fits_wont_fit_and_no_gpu() {
-        // Fits: 8 GB model under 0.8 * 16 GB = 12.8 GB budget.
-        let a = fits_vram(8_000_000_000, 16_000_000_000, 0.8);
-        assert!(a.fits);
-        assert_eq!(a.needed_bytes, 8_000_000_000);
-        assert_eq!(a.available_bytes, 12_800_000_000);
-
-        // Won't fit: 14 GB model over the 12.8 GB budget.
-        assert!(!fits_vram(14_000_000_000, 16_000_000_000, 0.8).fits);
-
-        // No GPU (vram_total 0): budget is 0, so nothing fits — caller falls
-        // back to the system-RAM headroom guard.
-        let none = fits_vram(1, 0, 0.8);
-        assert!(!none.fits);
-        assert_eq!(none.available_bytes, 0);
-    }
-
-    #[test]
-    fn gather_reports_plausible_hardware() {
-        let cfg = crate::api::Higgs::new(crate::HiggsConfig::default()).server_config();
-        let info = SystemInfo::gather(cfg, vec![cpu_device()]);
-        assert!(!info.hardware.cpu_name.is_empty(), "cpu name present");
-        assert!(info.hardware.cpu_cores >= 1, "at least one core");
-        assert!(info.hardware.ram_total_bytes > 0, "ram total > 0");
-        assert!(
-            info.hardware.ram_used_bytes <= info.hardware.ram_total_bytes,
-            "used ram does not exceed total"
-        );
-        assert!(
-            (0.0..=100.0).contains(&info.hardware.cpu_usage_percent),
-            "cpu usage in 0..=100, got {}",
-            info.hardware.cpu_usage_percent
-        );
-        assert_eq!(info.runtime.engine, "llama.cpp");
-        assert!(!info.runtime.backend.is_empty());
-        // Read-only server config is folded in: bind host is the fixed loopback
-        // invariant and the auto ctx cap is the DEFAULT_CTX_CAP const.
-        assert_eq!(info.config.bind_host, crate::api::BIND_HOST);
-        assert_eq!(info.config.default_ctx_cap, crate::api::DEFAULT_CTX_CAP);
-        // The gathered devices are carried through verbatim; a CPU-only list
-        // contributes nothing to the VRAM total.
-        assert_eq!(info.hardware.gpus.len(), 1);
-        assert_eq!(info.hardware.vram_total_bytes, 0);
-    }
-}
+#[path = "system_tests.rs"]
+mod tests;
