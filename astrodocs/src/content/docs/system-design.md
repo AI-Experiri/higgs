@@ -8,9 +8,11 @@ description: higgs architecture — crate API, worker model, engine trait, model
 higgs is a **standalone Rust crate** with zero dependency edges to any other jigglebot crate.
 A host application constructs a `Higgs` facade, mounts the router, and talks to it through the Rust API or over HTTP.
 
-In production the host is the jigglebot server itself (`backend/server/src/higgs/`
-launcher), which constructs `Higgs`, serves the router on an ephemeral
-`127.0.0.1` port, and stores that origin in `config.higgs_base_url`.
+The host can be the standalone `higgs` binary (`src/bin/higgs.rs` →
+`run_standalone`, binding `127.0.0.1:11434` by default) or any app that embeds the
+crate. As one external example, the jigglebot server embeds higgs in-process,
+serves the router on an ephemeral `127.0.0.1` port, and stores that origin in its
+own config (see [Example integration](#example-integration-an-embedded-host-jigglebot)).
 
 ```
 ┌──────────────────────────────────────────────┐
@@ -29,7 +31,7 @@ launcher), which constructs `Higgs`, serves the router on an ephemeral
 │  serve/      Axum router (/v1 + /api/higgs/) │  PURE RUST
 │  rpc.rs      NDJSON JSON-RPC 2.0 codec       │  (cannot crash
 │  worker/     Re-exec'd subprocess            │   the host)
-│  diagnostic  HiggsError HG001–HG020       │
+│  diagnostic  HiggsError HG001–HG028       │
 └───────────────────┬──────────────────────────┘
                     │ stdio (NDJSON JSON-RPC 2.0)
                     │ ONLY while a model is loaded
@@ -53,7 +55,7 @@ launcher), which constructs `Higgs`, serves the router on an ephemeral
 | Owner | State |
 |-------|-------|
 | `Higgs` (facade, `api.rs`) | the live `HiggsConfig`, the load/unload/stop **lifecycle mutex**, the **inference admission gate** (semaphore), the **`last_activity`** idle stamp |
-| `Supervisor` (`supervisor.rs`) | the worker **process** handle, **RPC correlation** (`pending`), per-request **chat sinks**, the stderr **ring**, the **`last_load`** replay params, the `stopped`/`running` lifetime flags |
+| `Supervisor` (`supervisor.rs`) | the worker **process** handle, **RPC correlation** (`pending`), per-request **chat sinks**, an `Arc<LogBus>` it pushes worker stderr into (the **per-source rings live on `LogBus`**, not here), the **`last_load`** replay params, the `stopped`/`running` lifetime flags |
 
 **Event ownership is split too** (deliberate, so each event is emitted exactly
 once at its true origin):
@@ -69,15 +71,15 @@ once at its true origin):
 | `Higgs::new(config)` | Construct without spawning the worker (builds its own internal `LogBus` — worker stderr only, no serve-event capture) |
 | `Higgs::with_log_bus(config, bus)` | Construct sharing a caller-supplied `Arc<LogBus>` — used when the caller also installs `HiggsLogLayer` on its tracing subscriber so serve-layer events reach the dev logs |
 | `start()` | Near-no-op — control surface only; spawns **no** worker |
-| `stop()` | Kill the worker (2 s graceful timeout) + clear load-replay state |
+| `stop()` | Stop the worker (2 s `higgs/shutdown` RPC, then up to 5 s for exit before SIGKILL) + clear load-replay state |
 | `scan()` | Host-side scan of model dirs (no worker), return `Vec<HiggsModel>` |
 | `load(id, params?)` | Resolve GGUF path host-side, **spawn** the worker, send M_LOAD |
 | `unload()` | M_UNLOAD then **kill** the worker |
 | `status()` | `HiggsStatus { worker_alive, loaded, models_on_disk }` |
-| `chat_stream(messages, max_tokens, temp)` | Returns `(delta_rx, outcome_handle)` |
+| `chat_stream(model, messages_json, max_tokens, temperature, tools_json)` | Returns `(delta_rx, outcome_handle)` |
 | `events()` | Subscribe to `HiggsEvent` broadcast |
-| `logs(n)` | Last n developer-log lines (`LogBus` snapshot) |
-| `subscribe_logs()` | Live `broadcast::Receiver<String>` of new developer-log lines |
+| `logs(n, filter)` | Last n developer-log lines (`LogBus` snapshot), optional `LogSource` filter |
+| `subscribe_logs()` | Live `broadcast::Receiver<LogLine>` of new developer-log lines |
 
 ---
 
@@ -86,6 +88,30 @@ once at its true origin):
 The llama.cpp FFI runs inside a **re-exec'd copy of the host binary** launched with `--higgs-worker`.
 The supervisor communicates with it over stdio using NDJSON JSON-RPC 2.0.
 
+```mermaid
+flowchart TB
+  subgraph host[" HOST PROCESS · pure Rust "]
+    direction TB
+    facade["Higgs facade"]
+    sup["Supervisor<br/><small>RPC correlation · chat sinks<br/>restart + replay last load</small>"]
+    facade -->|"load / chat / unload"| sup
+  end
+  subgraph child[" WORKER CHILD · re-exec --higgs-worker "]
+    direction TB
+    loop["JSON-RPC dispatch loop"]
+    engine["HiggsEngine<br/><small>llama.cpp FFI</small>"]
+    loop --> engine
+    engine --> gguf[("GGUF")]
+  end
+  sup <-->|"NDJSON JSON-RPC 2.0 over stdio<br/>M_LOAD · M_CHAT · M_STATUS · N_CHAT_CHUNK"| loop
+  classDef pure fill:#1f2547,stroke:#818cf8,stroke-width:1.5px,color:#c7d2fe;
+  classDef native fill:#3a2a12,stroke:#fbbf24,stroke-width:1.5px,color:#fde68a;
+  classDef store fill:#0c2e23,stroke:#34d399,stroke-width:1.5px,color:#a7f3d0;
+  class facade,sup,loop pure;
+  class engine native;
+  class gguf store;
+```
+
 The worker is **spawned on load and killed on unload** — there is no idle worker.
 `start()` spawns nothing. `load(M)` spawns a worker (argv0 `higgs(<M>)`, ≤64
 chars) then sends M_LOAD; `unload()` sends M_UNLOAD then kills it. With nothing
@@ -93,16 +119,23 @@ loaded, zero higgs worker processes exist. A failed load tears the worker back
 down. A `tokio` lifecycle mutex serialises load/unload/stop so spawn-on-load and
 kill-on-unload never interleave.
 
-```
-UNEXPECTED DEATH (stdout EOF / read error, NOT a deliberate stop):
-  deliberate stop?  → do nothing, no event
-  unexpected        → single respawn (1 s backoff)
-                          argv0 re-stamped higgs(<loaded id>); old child reaped
-                          replay higgs/load (bounded RPC timeout) → emit ModelLoaded
-                          emit WorkerRestarted
-                          (scan is host-side — NO scan replay)
-
-FACTORY FAILURE on respawn → emit WorkerDied, no further retry
+```mermaid
+flowchart TB
+  death(["worker stdout EOF / read error"])
+  death --> q{"deliberate stop?"}
+  q -->|yes| noop["do nothing — no event"]
+  q -->|no| respawn["single respawn (1 s backoff)<br/><small>re-stamp argv0 higgs(&lt;id&gt;) · reap old child</small>"]
+  respawn --> evt["emit WorkerRestarted"]
+  evt --> replay["replay higgs/load<br/><small>bounded RPC timeout · scan is host-side, not replayed</small>"]
+  replay -->|ok| loaded["emit ModelLoaded"]
+  replay -->|fails| dead["emit WorkerDied"]
+  respawn -.->|factory failure| dead2["emit WorkerDied — no further retry"]
+  classDef pure fill:#1f2547,stroke:#818cf8,stroke-width:1.5px,color:#c7d2fe;
+  classDef good fill:#0c2e23,stroke:#34d399,stroke-width:1.5px,color:#a7f3d0;
+  classDef bad fill:#3a1212,stroke:#f87171,stroke-width:1.5px,color:#fecaca;
+  class respawn,evt,replay,noop pure;
+  class loaded good;
+  class dead,dead2 bad;
 ```
 
 The mpsc channel between `Supervisor::request()` callers and the writer task serialises
@@ -121,14 +154,20 @@ trait HiggsEngine: Send {
     fn is_loaded(&self) -> bool;
     fn chat(
         &mut self,
-        messages: &[EngineMessage],
+        messages_json: &str,          // the OpenAI `messages` array, verbatim
         params: &GenParams,
         sink: &mut dyn FnMut(&str),   // token callback
-    ) -> Result<(String, &'static str), HiggsError>;
-    fn probe(&self, path: &str) -> (bool, Option<String>);
+    ) -> Result<ChatResult, HiggsError>;  // { content, finish_reason, prompt/completion tokens }
     fn devices(&self) -> Vec<GpuDevice>;  // ggml backend-device enumeration
 }
 ```
+
+`chat` takes the OpenAI `messages` JSON **verbatim** (including assistant
+`tool_calls` and tool results), so each engine renders it by its own means — the
+template-apply mechanism never crosses above this trait. Engines are registered in
+a compile-time table and one is selected at startup by name via `HIGGS_ENGINE`
+(default `llamacpp`); adding a backend is implementing this trait plus one
+registry line.
 
 ### Hardware enumeration — M_SYSINFO
 
@@ -141,12 +180,13 @@ workers. The **M_SYSINFO** RPC (`higgs/sysinfo`) replies `{ gpus: [GpuDevice, �
 it is cheap, read-only, and never mutates the resident-model slot.
 
 The host runs M_SYSINFO in a **separate, transient, crash-isolated worker**
-(`Supervisor::sysinfo`, same pattern as `probe_paths`), never the serving worker,
+(`Supervisor::sysinfo`), never the serving worker,
 and `Higgs::sysinfo()` caches the result (hardware is static-ish). On
 spawn/EOF/timeout the device list is empty (HG021) — `GET /api/higgs/system` still
 returns hardware/runtime. The host-side `fits_vram(model_size, vram_total,
-headroom)` decision is built from the summed GPU VRAM using the existing
-`MEMORY_HEADROOM_FRACTION`.
+headroom)` helper is built from the summed GPU VRAM using the existing
+`MEMORY_HEADROOM_FRACTION` — it is a provided decision helper; the **enforced**
+pre-load guard is the RAM headroom check in `Higgs::load` (`guard_memory_headroom`).
 
 v1 ships `LlamaCppEngine`. The trait exists so future backends (MLX, etc.) can be
 swapped without touching the RPC or supervisor layers.
@@ -222,88 +262,30 @@ ModelStore::scan(lmstudio_roots, hf_roots, ollama_roots)   (host process)
 
 ## Model Support Detection
 
-Each scanned model carries a **two-gate support verdict** so the UI can show
-exactly whether higgs can serve it — and, if not, the precise reason. The two
-gates are independent: Gate 1 proves the engine can LOAD the model, Gate 2 proves
-higgs can PARSE its tool calls.
+Each scanned model carries a **host-side support verdict** so the UI can show
+whether higgs can parse its tool calls — and, if not, why. The scan is **pure
+host-side and fast**: it never loads a GGUF to test it.
 
 ```
 HiggsModelEntry
   │
-  ├─ loadable  ── Gate 1 ── engine CAN load (probe of (arch,quant))
-  ├─ tool_calls ─ Gate 2 ── a tool-call parser matches the template
+  ├─ tool_calls ─ a tool-call parser matches the template (host-side sniff)
   └─ support_reason (optional)
-        │  !loadable            → engine's VERBATIM load error
-        │  loadable && !tool_calls → "no tool-call parser matches this model's template"
-        └─ fully supported      → omitted
+        │  !tool_calls → "no tool-call parser matches this model's template"
+        └─ otherwise   → omitted
 ```
 
-### Gate 1 — engine loadability (transient probe worker)
+### Engine loadability — learned at load time, not pre-probed
 
-Loadability is proved by actually asking the engine to load the GGUF — but never
-in the serving worker. A **separate transient probe worker** is spawned (re-exec
-of the same binary, `production_factory(bus, "probe")`), crash-isolated exactly
-like the serving worker. The probe loads the GGUF into a throwaway handle and
-drops it immediately.
+higgs does **not** pre-probe engine loadability at scan time. There is no
+scan-time/at-open load-to-test, no probe worker, and no support-verdict cache.
+Whether the llama.cpp engine can actually load a model is learned at **actual
+load time**: `POST /api/higgs/models/load` returns the engine's **verbatim**
+error if the load fails. `support_reason` never carries an engine load error.
 
-```
-Higgs                              probe worker (re-exec, "probe")
-  │  M_PROBE { path }                       │
-  ├────────────────────────────────────────▶ LlamaModel::load_from_file(
-  │                                          │     path, with_vocab_only(true))
-  │                                          │  handle DROPPED immediately —
-  │                                          │  NEVER stored as resident
-  │  { loadable, reason, engine_version }    │
-  ◀────────────────────────────────────────┤
-  │
-  └─ crash / timeout / spawn-fail ⇒ (false, Some("<context>"))   [HG020]
-```
+### Tool-call parsing (host-side, zero FFI)
 
-- The handle is **dropped immediately** and **never stored as resident**, so a
-  probe never disturbs a model being served.
-- The verbatim engine error string becomes `support_reason` when `loadable` is
-  false.
-- **Vocab-only caveat:** the pinned llama-cpp-2 0.1.139 lacks `no_alloc`. A
-  `with_vocab_only(true)` probe validates the architecture/header but **cannot**
-  catch a quant/tensor mismatch — that needs a later llama-cpp-2. So Gate 1 today
-  proves "the engine recognizes this arch and header," not "every tensor loads."
-
-### Verdict caching — per `(arch, quant, engine_version)`, not per file
-
-A probe is expensive (a process spawn + a model load), so verdicts are cached by
-the **combo**, not the file. One probe per distinct `(architecture, quant)`; every
-model sharing that combo inherits the verdict.
-
-```
-key = (architecture, quant, engine_version)
-        │
-        ├─ hit  → reuse verdict, no probe
-        └─ miss → spawn probe worker → cache (loadable, reason)
-
-store: Mutex<HashMap<key, verdict>> on Higgs   (in-memory; no persistence yet)
-engine_version: comes from the probe worker's OWN M_PROBE reply
-                (the probing binary is the version source)
-```
-
-The `engine_version` component of the key is supplied by the probe worker itself
-(its M_PROBE reply), so the key tracks the binary that actually performed the
-probe.
-
-### The M_PROBE RPC
-
-```
-request:  { path }
-reply:    { loadable, reason, engine_version }
-
-per-path timeout
-crash / timeout / spawn-fail  ⇒  (false, Some("<context>"))
-                                  never a panic, never a hang
-                                  diagnostic HG020 ProbeWorkerFailed
-```
-
-### Gate 2 — tool-call parsing (host-side, zero FFI)
-
-Gate 2 is pure Rust on the host — no worker, no FFI:
+The tool-call verdict is pure Rust on the host — no worker, no FFI:
 
 ```
 ToolParserRegistry::with_defaults()
@@ -313,14 +295,19 @@ ToolParserRegistry::with_defaults()
 
 It selects a parser from the model's chat template against the same
 `ToolParserRegistry` the worker's fallback path uses (see **Tool calling**). A
-match means higgs can turn that model's emitted calls into OpenAI `tool_calls`.
+match means higgs can turn that model's emitted calls into OpenAI `tool_calls`;
+no match sets `tool_calls = false` and `support_reason` to the fixed string
+`"no tool-call parser matches this model's template"`.
 
 ---
 
 ## Developer Logs (LogBus)
 
-`LogBus` (`log_bus.rs`) is the **single home** for every developer-log line. Two
-sources feed it; two endpoints read it.
+`LogBus` (`log_bus.rs`) is the **single home** for every developer-log line.
+Sources feed it — the local worker's stderr, the serve-layer tracing layer, and
+(on a hub) **relayed remote-worker stderr** tagged `RemoteWorker { node, worker }`
+— and two endpoints read it. Each source has its own ring, and `?source=` filters
+the read by `serve`, `worker`, or `node:<node-id>:<worker-id>`.
 
 ```
 SOURCES                            LogBus                       ENDPOINTS
@@ -340,14 +327,17 @@ Before this, only worker stderr reached the dev logs. `HiggsLogLayer` is a
 `tracing_subscriber::Layer` that captures events whose target starts with
 `higgs`, formats each as `YYYY-MM-DD HH:MM:SS [LEVEL] message`, and pushes it
 into the bus — so serve-layer request events (e.g. `higgs: GET /v1/models`) now
-appear in the Developer Logs. Only the tracing `message` field is captured (no
-structured fields, no prompt content — redaction-safe).
+appear in the Developer Logs. **By default** only the tracing `message` is
+captured (no structured fields, no prompt content — redaction-safe); the
+`show_log_fields` toggle appends a tracing event's structured field values, which
+can surface prompt content (an explicit opt-in).
 
 ### Verbose serve logging (runtime toggle)
 
-Serving logs are gated behind a runtime **verbose** toggle — an `AtomicBool` on
-the `Higgs` facade, default `false`, **not** persisted to disk/config, flipped via
-`PUT /api/higgs/logs/settings` (read back with `GET /api/higgs/logs/settings`).
+Serving logs are gated behind a runtime **verbose** toggle — an `AtomicBool` whose
+single home is the `LogBus` (`Higgs::verbose()` delegates to it), default `false`,
+**not** persisted to disk/config, flipped via `PUT /api/higgs/logs/settings` (read
+back with `GET /api/higgs/logs/settings`).
 
 When verbose is ON, every completed chat completion on `POST
 /v1/chat/completions` — **both** the streaming and non-streaming paths — emits one
@@ -365,7 +355,8 @@ request-entry line (`higgs: POST /v1/chat/completions`) appears.
 
 A second `AtomicBool` on the `Higgs` facade, `log_incoming_tokens` — default
 `false`, **not** persisted, set via the same `PUT /api/higgs/logs/settings`
-(which carries both flags). When ON, every chat request emits one extra INFO line
+(which carries all three flags: `verbose`, `log_incoming_tokens`,
+`show_log_fields`). When ON, every chat request emits one extra INFO line
 on the `higgs` target carrying the flattened incoming prompt CONTENT, capped to
 the first 800 chars (`…` suffix when longer) so one request can't flood the log
 ring:
@@ -469,9 +460,24 @@ end of stream:  tool_calls parsed from the FULL generation (pipeline above)
                 → finish chunk with finish_reason "tool_calls"
 ```
 
+**Known limitation:** the `ToolCallStreamFilter` is installed **only when a
+registry parser matches** the model's template (built-in families: Gemma, Qwen,
+GLM, DeepSeek, Mistral/Ministral, Nemotron).
+A format the underlying crate's primary `parse_response_oaicompat` handles but the
+registry does not match (e.g. Llama-3's `<|python_tag|>`) gets no filter, so its
+tool-call markup can stream raw as content deltas — the final structured
+`tool_calls` is still returned, and non-streaming `content` is unaffected
+(internally empty when `tool_calls` are present; the `/v1` response serializes a
+pure tool-call turn's `content` as `null`). A general fix (suppress on the union of all known
+open markers) is deferred since the target models are covered.
+
 ---
 
-## How higgs works with jigglebot
+## Example integration: an embedded host (jigglebot)
+
+This section walks through one concrete embedder, jigglebot, as a worked example
+of the embedding model — the patterns generalize to any Axum host (see
+[Embedding higgs in any host app](#embedding-higgs-in-any-host-app)).
 
 higgs runs **embedded in-process** inside the jigglebot server. The only module
 that imports the higgs crate is the launcher (`backend/server/src/higgs/`); it
@@ -589,11 +595,16 @@ pane-driven load is a future enhancement.
 
 ## Security / HTTP hardening
 
-higgs has **no auth** — there are no API keys, no tokens, no sessions. The threat
-model is therefore "a no-auth HTTP server on a shared host," and the entire serve
-layer is built to keep that surface loopback-only. The hardening follows
-established ollama/vllm practice; the layers wrap **every** request on both
-surfaces.
+higgs is **open by default** and becomes **API-key gated** the moment the first
+key is added (see [Securing the API](#securing-the-api) below): Bearer tokens with
+`chat` / `models` / `admin` scopes, stored only as SHA-256 digests in
+`~/.higgs/api_keys.json`. The standalone server loads keys at startup and **fails
+closed** if the file is present but unreadable.
+
+With no keys configured the surface has no auth, so the baseline threat model is
+"an open HTTP server on a shared host," and the serve layer is built to keep that
+surface loopback-only regardless. The hardening below follows established
+ollama/vllm practice and wraps **every** request on both surfaces (auth or not).
 
 ```
 request
@@ -610,8 +621,9 @@ request
 ├─────────────────────────────────────────────────────────────┤
 │ DefaultBodyLimit       MAX_BODY_BYTES = 32 MB → 413          │
 ├─────────────────────────────────────────────────────────────┤
-│ TimeoutLayer 120 s     ONLY /api/higgs/* + /v1/models        │
-│                        NOT /v1/chat/completions (SSE)        │
+│ TimeoutLayer 120 s     non-streaming /api/higgs/* + /v1/models│
+│                        NOT the SSE routes: /v1/chat/completions│
+│                        and /api/higgs/logs/stream             │
 └─────────────────────────────────────────────────────────────┘
   │
   ▼
@@ -674,9 +686,11 @@ await rule.
 
 ### Log redaction on the /v1 boundary
 
-The `/v1` surface is the untrusted OpenAI-interop boundary. No prompt CONTENT is
-logged at `info` on that path — only the model id, the stream flag, and
-lengths/ids. Every client-facing `/v1` error message is `redact_paths`-sanitized:
+The `/v1` surface is the untrusted OpenAI-interop boundary. **By default** no
+prompt CONTENT is logged at `info` on that path — only the model id, the stream
+flag, and lengths/ids — unless the `log_incoming_tokens` / `show_log_fields`
+opt-ins are enabled. Every client-facing `/v1` error message is
+`redact_paths`-sanitized:
 absolute filesystem paths and `host:port` bind addresses are replaced with
 `<redacted>`, so the host's directory layout and listen address never leak in
 error text. Diagnostic codes (`[HG004]`), model ids (`org/model`), and human
@@ -690,7 +704,8 @@ For a loopback no-auth server the dominant attack is **DNS rebinding**: a page i
 the user's browser resolves an attacker-controlled hostname to `127.0.0.1` and
 fires requests at higgs with the browser's implicit trust. The guard defeats this
 by requiring the request's `Host` header host portion (sans `:port`) to be a
-loopback name — `127.0.0.1`, `localhost`, `::1`, or `[::1]`. A non-loopback or
+loopback name — any IPv4 in `127.0.0.0/8` (`127.*`), `localhost`, `::1`, or
+`[::1]`. A non-loopback or
 **missing** Host is a `403 [HG012] ForbiddenHost` (matching ollama). The browser
 cannot forge the `Host` header, so a rebound origin is blocked before it reaches
 any handler.
@@ -714,10 +729,13 @@ jigglebot path) is unreachable off-box.
 ### Control timeout, but never the SSE stream
 
 ```
-/api/higgs/* , /v1/models  ──▶ TimeoutLayer(120s)  ──▶ 408 if exceeded
-/v1/chat/completions        ──▶ (no HTTP timeout)  ──▶ bounded by the
-                                                        worker chat-RPC timeout
-                                                        CHAT_RPC_TIMEOUT = 600 s
+non-streaming /api/higgs/*  ──▶ TimeoutLayer(120s)  ──▶ 408 if exceeded
+  + /v1/models
+
+SSE routes (own router, no HTTP timeout):
+  /v1/chat/completions       ──▶ bounded by the worker chat-RPC timeout
+                                  CHAT_RPC_TIMEOUT = 600 s
+  /api/higgs/logs/stream     ──▶ unbounded by design (live log tail)
 ```
 
 Control endpoints are bounded request/response, so a 120 s cap is safe. A chat
@@ -780,9 +798,10 @@ terms. The control surface still tells the truth about the worker — `GET
 ### JIT (just-in-time) loading
 
 JIT is a runtime `AtomicBool` on the `Higgs` facade, **ON by default** and
-toggled via `PUT /api/higgs/settings` (`HiggsRuntimeSettings { jit_enabled }`),
-read via `GET /api/higgs/settings`. It is **not** persisted to disk/config — it
-resets to `true` on restart.
+toggled via `PUT /api/higgs/settings` (`HiggsRuntimeSettings { jit_enabled,
+auto_unload_idle, idle_ttl_minutes, serving_enabled }`), read via
+`GET /api/higgs/settings`. It is **not** persisted to disk/config — it resets to
+`true` on restart.
 
 ```
 POST /v1/chat/completions, model not resident
@@ -856,6 +875,26 @@ worker. The two must not be conflated.
   dirs), else `HG015` → `400`. A symlink or `..` escape therefore never reaches
   the worker FFI loader.
 
+### Securing the API
+
+The HTTP surface is open by default. Add API keys to require authentication — the
+gate turns on as soon as the first key exists:
+
+```bash
+higgs keys add ci chat,models   # mint a key (scopes: chat | models | admin)
+#   token (shown ONCE …): hgk_…
+higgs keys list
+higgs keys remove ci
+```
+
+Clients then send `Authorization: Bearer hgk_…`. Scopes map to surfaces: `chat`
+(POST `/v1/chat/completions`), `models` (model listing), `admin` (everything,
+including management). Tokens are stored only as a SHA-256 digest. The standalone
+server loads keys at startup and **fails closed** if the file is present but
+unreadable; **restart higgs** for key changes to take effect. `/health` is always
+open. The iroh remote control plane is gated separately by the pairing allowlist —
+see [Remote Fleet](/remote-fleet/#securing-a-hub).
+
 ### /health readiness
 
 `GET /health` and `GET /api/higgs/health` answer "is the server reachable?" with a
@@ -867,10 +906,11 @@ behind the same hardening stack.
 
 The standalone `higgs` binary honors `HIGGS_BIND`. A **non-loopback**
 value (e.g. `0.0.0.0`) is allowed but logs a prominent startup **SECURITY
-WARNING**: higgs has no auth, and the Host guard + CORS only protect *browser*
-clients — any non-browser client on the network can reach the API directly. The
-**embedded jigglebot path always binds an ephemeral `127.0.0.1` port** and never
-takes this risk.
+WARNING**: unless API keys are configured the surface is unauthenticated, and the
+Host guard + CORS only protect *browser* clients — any non-browser client on the
+network can reach the API directly. Gate a non-loopback bind with API keys (see
+[Securing the API](#securing-the-api)). An **embedded host that binds an ephemeral
+`127.0.0.1` port** never takes this risk.
 
 ---
 

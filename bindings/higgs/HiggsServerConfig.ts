@@ -3,8 +3,8 @@ import type { HiggsLimits } from "./HiggsLimits";
 import type { LoadParams } from "./LoadParams";
 
 /**
- * Read-only snapshot of the server's effective configuration, surfaced at
- * `GET /api/higgs/system` so the UI can show the real scan dirs, load
+ * Read-only snapshot of the server's effective configuration, surfaced by the
+ * `system` control-op so the UI can show the real scan dirs, load
  * defaults, bind host, and safety limits without inventing anything. Derived
  * entirely from [`HiggsConfig`] plus the fixed invariants ([`BIND_HOST`],
  * [`DEFAULT_CTX_CAP`]) and the documented serve-layer limit consts; carries
@@ -12,7 +12,10 @@ import type { LoadParams } from "./LoadParams";
  */
 export type HiggsServerConfig = { 
 /**
- * Loopback host the listener binds to — always [`BIND_HOST`] (localhost).
+ * The `/v1` listener's bound address. Once serving this is the RECORDED
+ * live address (`ip:port` — the embedder owns the listener and may bind
+ * loopback or `0.0.0.0` for LAN mode); before any serve it is the
+ * built-in loopback default [`BIND_HOST`] (host only).
  */
 bind_host: string, 
 /**

@@ -1,15 +1,15 @@
 ---
 title: higgs
-description: jigglebot's in-app local model runtime
+description: A self-contained local LLM runtime in Rust — OpenAI-compatible serving over llama.cpp, crash-isolated worker processes, pluggable engines, and an optional peer-to-peer remote fleet.
 template: splash
 hero:
-  tagline: OpenAI-compatible local inference over llama.cpp, crash-isolated in a worker process.
+  tagline: A self-contained local LLM runtime in Rust — OpenAI-compatible serving over llama.cpp, crash-isolated worker processes, pluggable engines, and an optional peer-to-peer remote fleet.
   actions:
+    - text: What is higgs?
+      link: /overview/
+      icon: right-arrow
     - text: System Design
       link: /system-design/
-      icon: right-arrow
-    - text: Endpoints
-      link: /endpoints/
       icon: document
       variant: minimal
     - text: How to Use
@@ -21,16 +21,22 @@ hero:
 import { Card, CardGrid } from '@astrojs/starlight/components';
 
 <CardGrid stagger>
-  <Card title="Embedded, standalone crate" icon="puzzle">
-    higgs imports nothing from any jigglebot crate. In production it runs in-process inside jigglebot; mount it in any Axum app with one call.
-  </Card>
-  <Card title="Spawn-on-load worker" icon="warning">
-    The llama.cpp engine runs in a re-exec'd subprocess spawned on load and killed on unload — zero idle process. A crash mid-use restarts automatically, replaying the last load.
-  </Card>
   <Card title="OpenAI-compatible" icon="approve-check">
-    `/v1/chat/completions` speaks the OpenAI wire protocol verbatim — stream or non-stream.
+    `/v1/chat/completions` and `/v1/models` speak the OpenAI wire verbatim — streaming or not, with tool calling, temperature + token-budget controls, and usage accounting. Existing SDKs point at higgs unchanged.
   </Card>
-  <Card title="Three model stores" icon="list-format">
-    Discovers GGUF files from LM Studio, HuggingFace cache, and Ollama layouts automatically.
+  <Card title="Crash-isolated worker" icon="warning">
+    The llama.cpp engine runs in a separate process, spawned on load and reaped on unload — zero idle worker. A crash kills the worker, not your app; the supervisor restarts it and replays the last load.
+  </Card>
+  <Card title="Embeddable or standalone" icon="puzzle">
+    Imports nothing from its host. Mount it into any Axum router with one call, or run the standalone `higgs` binary — same `/v1/*` + `/api/higgs/*` surface either way.
+  </Card>
+  <Card title="Finds your models" icon="list-format">
+    Discovers GGUF files from LM Studio, HuggingFace cache, and Ollama layouts automatically — with just-in-time load, an idle reaper, and a pre-load RAM-fit guard.
+  </Card>
+  <Card title="Peer-to-peer remote fleet" icon="rocket">
+    Pair other machines and route inference to their GPUs over an encrypted iroh QUIC link — no central server, no open ports. Durable routes, a live fleet view, and relayed remote-worker logs.
+  </Card>
+  <Card title="Pluggable engines" icon="setting">
+    One `HiggsEngine` trait is the only seam to a backend. Add a new engine (e.g. MLX) by implementing the trait and adding one registry line; select it with `HIGGS_ENGINE`.
   </Card>
 </CardGrid>

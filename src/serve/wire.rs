@@ -1,10 +1,11 @@
-//! Request/response wire structs for higgs's `/api/higgs/*` control surface.
+//! Request/response wire structs for higgs's control surface — the in-process
+//! `Higgs` facade methods (formerly the `/api/higgs/*` HTTP routes).
 //!
 //! Each type is ts-rs exported to `frontend/src/lib/generated/higgs/` and
 //! re-exported from `frontend/src/lib/types.ts`. The `/v1` surface uses
 //! `async-openai` wire types verbatim, so only the control shapes live here.
 
-use crate::worker::engine::{FlashAttn, KvCacheKind};
+use crate::worker::engine::{FlashAttn, KvCacheKind, LoadParams};
 use crate::worker::models::HiggsModel;
 
 higgs_ts! {
@@ -35,21 +36,27 @@ impl Default for HiggsOk {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::HiggsOk;
+#[path = "wire_tests.rs"]
+mod tests;
 
-    /// `HiggsOk::default()` (the `Default` impl) yields the same `{"status":"ok"}`
-    /// body as `new()`, and both serialize to the canonical wire shape.
-    #[test]
-    fn higgs_ok_default_matches_new_and_serializes() {
-        let from_default = HiggsOk::default();
-        let from_new = HiggsOk::new();
-        assert_eq!(from_default.status, "ok");
-        assert_eq!(from_default.status, from_new.status);
-        assert_eq!(
-            serde_json::to_value(&from_default).unwrap(),
-            serde_json::json!({ "status": "ok" }),
-        );
+higgs_ts! {
+    /// The `hub` control-op status response (formerly `GET /api/higgs/hub`): whether
+    /// this server is a fleet hub right now.
+    ///
+    /// `enabled` is false when hub mode is off (no hub installed) — the Fleet tab shows a
+    /// "hub mode off" panel instead of inferring it from a `/pair` 409. When enabled, `hub_id`
+    /// is the hub's stable iroh endpoint id and `node_count` is how many nodes it has admitted
+    /// (connected or not).
+    #[derive(Debug, Clone, serde::Serialize)]
+    pub struct HiggsHubStatus {
+        /// True when this server runs as a fleet hub (accepting node dials).
+        pub enabled: bool,
+        /// The hub's stable id (iroh endpoint id); `None` when hub mode is off.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub hub_id: Option<String>,
+        /// Nodes admitted to the fleet (connected or not); 0 when hub mode is off.
+        pub node_count: u32,
     }
 }
 
@@ -69,7 +76,8 @@ higgs_ts! {
 }
 
 higgs_ts! {
-    /// Response for `GET /api/higgs/models`: live scan results plus the loaded id.
+    /// The `models` control-op response (`Higgs::model_entries`, formerly
+    /// `GET /api/higgs/models`): live scan results plus the loaded id.
     #[derive(Debug, serde::Serialize)]
     pub struct HiggsModelsResponse {
         /// Models discovered by a live scan of the configured directories.
@@ -78,12 +86,50 @@ higgs_ts! {
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         pub loaded_id: Option<String>,
+        /// The ids chat can actually reach — `Higgs::chat_model_ids`, the SAME set
+        /// `/v1/models` advertises and the dispatch gates accept.
+        ///
+        /// A UI must gate its model picker on THIS list and never re-derive one
+        /// from `models[].readiness`: readiness is a per-scan-row verdict keyed by
+        /// id, while reachability is decided by the LOADED worker's facts and the
+        /// fleet's routes. The two legitimately disagree — a resident embedding
+        /// worker under an id whose first scan variant is a generative file reads
+        /// `Loaded` on that row, yet every chat to it is refused ([HG079]). Only
+        /// the crate can join those sources, so it ships the answer.
+        pub chat_model_ids: Vec<String>,
     }
 }
 
 higgs_ts! {
-    /// Per-model entry in `GET /api/higgs/models`: enriches [`HiggsModel`] with
-    /// request-derived fields computed by the control handler.
+    /// The analytical resource fit for a model's saved profile against the node's
+    /// CURRENT free resources — the numbers behind the `Servable`/`Unservable`
+    /// badge, so the UI can say "≈22 GB needed, 18 GB free" instead of a bare
+    /// verdict. Present only when a profile was actually evaluated for fit
+    /// (i.e. the model is `servable` or `unservable`); `None` otherwise.
+    ///
+    /// ADVISORY: `free_*` come from the cached device snapshot (a live refresh
+    /// would spawn a sysinfo worker per poll), so render the figures as "≈".
+    #[derive(Debug, Clone, serde::Serialize)]
+    pub struct ModelFit {
+        /// Estimated VRAM the profile needs to load + serve.
+        #[ts(type = "number")]
+        pub needed_vram_bytes: u64,
+        /// Estimated system RAM the profile needs.
+        #[ts(type = "number")]
+        pub needed_ram_bytes: u64,
+        /// GPU free VRAM at the last device snapshot.
+        #[ts(type = "number")]
+        pub free_vram_bytes: u64,
+        /// System free RAM at the last device snapshot.
+        #[ts(type = "number")]
+        pub free_ram_bytes: u64,
+    }
+}
+
+higgs_ts! {
+    /// Per-model entry in the `models` control-op response (`Higgs::model_entries`,
+    /// formerly `GET /api/higgs/models`): enriches [`HiggsModel`] with
+    /// request-derived fields computed by the control helper.
     #[derive(Debug, serde::Serialize)]
     pub struct HiggsModelEntry {
         /// All canonical model fields (id, path, size_bytes, quant, source, arch, ctx_train, has_chat_template).
@@ -93,19 +139,15 @@ higgs_ts! {
         pub state: String,
         /// File format — always `"gguf"` for higgs-discovered models.
         pub format: String,
-        /// Gate 1: whether our llama.cpp engine can LOAD this model, as proved by
-        /// a real probe of a representative GGUF for this `(arch, quant)`. `false`
-        /// means a load attempt failed; `support_reason` carries the verbatim
-        /// engine reason.
-        pub loadable: bool,
         /// Gate 2: whether higgs has a tool-call parser that matches this model's
-        /// chat template. `false` means the model loads but tool calls can't be
-        /// parsed; `support_reason` explains.
+        /// chat template. `false` means the model can be served but tool calls
+        /// can't be parsed; `support_reason` explains. (There is no scan-time
+        /// load probe — engine loadability is learned only at actual load.)
         pub tool_calls: bool,
-        /// The exact reason this model isn't fully supported, or `None` when it is.
-        /// When `!loadable`, this is the engine's VERBATIM load error (e.g.
-        /// `"unknown model architecture: 'gemma4'"`). When `loadable && !tool_calls`,
-        /// it is `"no tool-call parser matches this model's template"`.
+        /// The fixed Gate-2 message when `!tool_calls`
+        /// (`"no tool-call parser matches this model's template"`), else `None`.
+        /// There is no scan-time load probe, so this never carries an engine load
+        /// error — a failed load is reported by the load endpoint itself.
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         ///
@@ -113,25 +155,99 @@ higgs_ts! {
         /// mismatch to a specific header field — rides the flattened
         /// [`HiggsModel`] (its single home); it is not re-declared here.
         pub support_reason: Option<String>,
+        /// The params this model was last successfully loaded with on THIS instance,
+        /// persisted in `config.json` (`None` if it has never been loaded here).
+        /// Lets the UI show "last loaded with ctx=…, gpu_layers=…" for any scanned
+        /// model — replacing the removed scan-time load probe with real load history.
+        /// A `ctx_len` of `0` means AUTO (the engine picks the model's trained
+        /// context, capped) — the UI should render that as "auto", not "0".
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub last_load: Option<LoadParams>,
+        /// Readiness state for this model on THIS node — the contract the UI badges
+        /// and (future) autonomous agents read. Derived from profile presence,
+        /// staleness, residency, live resource fit, and the serving toggle.
+        pub readiness: crate::serve::readiness::ModelReadiness,
+        /// The resource fit numbers behind a `servable`/`unservable` readiness —
+        /// `Some` only when a profile was evaluated for fit, so the UI can show
+        /// the needed-vs-free gap. `None` for the other states.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub fit: Option<ModelFit>,
+        /// The last ANALYTICAL tune's load params (the engine-tagged umbrella).
+        /// Together with `benched_load` these are the two selectable saved
+        /// param sets both load surfaces offer; `tune_provenance` says which
+        /// one is the ACTIVE profile (the JIT/readiness default). `None` when
+        /// no analytical tune has run.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub tuned_load: Option<LoadParams>,
+        /// The last TURBOTUNE (measured benchmark) config's load params — the
+        /// "Benchmarked" selectable set; `bench_tps` is its measured decode
+        /// throughput. `None` when the model was never benchmarked.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub benched_load: Option<LoadParams>,
+        /// How the ACTIVE ("latest") saved tune profile — the JIT/readiness
+        /// default — was produced: `Heuristic` (analytical), `Card` (model-card
+        /// sampling), or `Bench` (turbotune-measured). Informational about the
+        /// active record's origin; NOT a guaranteed selector into `tuned_load` /
+        /// `benched_load`, because a bare load with edited params demotes the
+        /// active record to a `Heuristic` distinct from both saved sets (its
+        /// params ride `last_load`). `None` when the model has no tune record yet.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub tune_provenance: Option<crate::tune::TuneProvenance>,
+        /// Measured decode throughput (tokens/sec) of the `benched_load` set —
+        /// the winning turbotune candidate's speed, read from the same saved
+        /// benchmark record as `benched_load` (NOT from the active profile, so a
+        /// later bare load editing the active params does not disturb it).
+        /// Present whenever that record carries a measured throughput; a fresh
+        /// turbotune replaces it and `benched_load` together. `None` when the
+        /// model was never benchmarked.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub bench_tps: Option<f32>,
+        /// The largest useful `max_tokens` a chat on this model can honor, per its
+        /// TUNED metrics: the benchmark (`benched_load`) window when it is concrete,
+        /// else the analytical (`tuned_load`) one — then min'd with the ACTIVE
+        /// record's fixed window when one exists (the active profile is what a JIT
+        /// load actually pins, so after a bare load demotes it to a smaller window
+        /// the tuned number alone would overpromise) — and capped at the absolute
+        /// output cap (`MAX_OUTPUT_TOKENS`: the `/v1` surface rejects a request
+        /// asking for more outright (`400 [HG013]`), and the in-process path clamps
+        /// to it — either way no request can DELIVER more). `None` = the model has
+        /// NO tuned/benchmarked metrics — a bare load's Heuristic active record
+        /// does not gate (modulo the pre-dual-store grandfathering documented on
+        /// `TuneProfileViews`, whose lone-record Residual A this field inherits),
+        /// and neither does a profile whose window was explicitly pinned `Auto`.
+        ///
+        /// This is a CEILING, not a guarantee: each request's output is still
+        /// bounded by `loaded window − prompt` (the facade's silent clamp). An
+        /// embedder gating its provider setup on "tuned models only" keys on
+        /// `Some`-ness and prefills its max-tokens field from the value —
+        /// consuming it verbatim, never re-deriving from the `LoadParams`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub tuned_max_tokens: Option<u32>,
     }
 }
 
 higgs_ts! {
-    /// Request body for `POST /api/higgs/models/load`.
+    /// Request body for the `load` control-op (`Higgs::load_flat`, formerly
+    /// `POST /api/higgs/models/load`).
     ///
     /// Absent load parameters fall back to the host-configured defaults.
     #[derive(Debug, serde::Deserialize)]
     pub struct HiggsLoadRequest {
         /// HuggingFace repo id of the model to load.
         pub id: String,
-        /// Context window size in tokens.
-        #[ts(type = "number")]
+        /// Context window ([`CtxLen::Auto`] = trained context; `Fixed { n }` = pinned).
         #[ts(optional)]
-        pub ctx_len: Option<u32>,
-        /// GPU layers to offload; u32::MAX means all.
-        #[ts(type = "number")]
+        pub ctx_len: Option<crate::worker::engine::CtxLen>,
+        /// GPU layers to offload (`GpuLayers::All` = every layer; `Count { n }` = explicit).
         #[ts(optional)]
-        pub gpu_layers: Option<u32>,
+        pub gpu_layers: Option<crate::worker::engine::GpuLayers>,
         /// Worker threads used during generation.
         #[ts(type = "number")]
         #[ts(optional)]
@@ -185,18 +301,32 @@ higgs_ts! {
         #[ts(type = "number")]
         #[ts(optional)]
         pub seed: Option<u32>,
-        /// Per-load idle-TTL override in minutes. When set, the idle reaper uses
-        /// this instead of the global TTL for THIS loaded model. Absent = use
-        /// global. HOST-SIDE only — never forwarded to the worker/engine.
+        /// Per-load idle-TTL override in minutes. RESERVED / forward-compat: per-load
+        /// idle-TTL enforcement is a deferred follow-up, so this is currently ACCEPTED
+        /// but NOT enforced — the node reaper applies one per-node TTL to every worker
+        /// (the global TTL, `HiggsRuntimeSettings`), and the host neither stores nor
+        /// surfaces this value. It will take effect once the reaper honors per-worker
+        /// overrides (host-side only either way — never forwarded to the worker/engine).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(type = "number")]
         #[ts(optional)]
         pub idle_ttl_minutes: Option<u64>,
+        /// The FULL engine load params, as the engine-tagged [`LoadParams`] umbrella
+        /// (`{"engine":"LlamaCpp", …}`) — an accepted autotune suggestion or a manual
+        /// edit of the complete §4/§5 surface. When present it SUPERSEDES the flat
+        /// fields above (kept for back-compat); its base fields are used as-is. This
+        /// is what the frontend sends after `[Tune params]` fills the pane — and the
+        /// engine tag means a future MLX engine sends `{"engine":"Mlx", …}` here
+        /// without a new wire field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub params: Option<LoadParams>,
     }
 }
 
 higgs_ts! {
-    /// Response for `POST /api/higgs/models/load`: `{"status":"ok","id":…}`.
+    /// Response for the `load` control-op (formerly `POST /api/higgs/models/load`):
+    /// `{"status":"ok","id":…}`.
     #[derive(Debug, serde::Serialize)]
     pub struct HiggsLoadResponse {
         /// Confirmation status; always `{"status":"ok"}` on success.
@@ -208,7 +338,9 @@ higgs_ts! {
 }
 
 higgs_ts! {
-    /// Response for `GET /api/higgs/logs`: `{"lines":[…]}`.
+    /// The `logs` control-op response — the worker log tail (formerly
+    /// `GET /api/higgs/logs`): `{"lines":[…]}`. The live stream now rides the
+    /// `/ws` watch_logs subscription, not this batched tail.
     #[derive(Debug, serde::Serialize)]
     pub struct HiggsLogsResponse {
         /// Worker stderr tail, oldest first.
@@ -217,9 +349,10 @@ higgs_ts! {
 }
 
 higgs_ts! {
-    /// Body for `GET`/`PUT /api/higgs/logs/settings`: the runtime Developer-Log
-    /// toggles. `GET` returns the current state of both; `PUT` carries both and
-    /// sets both. The log settings higgs actually backs.
+    /// Body for the log-settings control-ops (`Higgs::logs_settings` reads,
+    /// `Higgs::set_logs_settings` writes; formerly `GET`/`PUT /api/higgs/logs/settings`):
+    /// the runtime Developer-Log toggles. The read returns the current state of both;
+    /// the write carries both and sets both. The log settings higgs actually backs.
     #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
     pub struct LogSettings {
         /// Whether the serve-layer verbose serving line is enabled — when `true`,
@@ -241,9 +374,10 @@ higgs_ts! {
 }
 
 higgs_ts! {
-    /// Body for `GET`/`PUT /api/higgs/settings`: the runtime server-behavior
-    /// flags higgs actually backs. `GET` returns the current state; `PUT` carries
-    /// it and sets it. Distinct from [`LogSettings`] (Developer-Log toggles) —
+    /// Body for the `settings` control-op (the runtime-settings read/write facade;
+    /// formerly `GET`/`PUT /api/higgs/settings`): the runtime server-behavior
+    /// flags higgs actually backs. The read returns the current state; the write
+    /// carries it and sets it. Distinct from [`LogSettings`] (Developer-Log toggles) —
     /// this is the server-behavior namespace, designed to grow as more runtime
     /// flags (e.g. a server on/off) are added.
     #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -266,10 +400,54 @@ higgs_ts! {
         pub idle_ttl_minutes: u64,
         /// Whether the `/v1` inference surface is serving (default `true`). When
         /// `false`, the `/v1` inference endpoints return `[HG019]` → 503 while the
-        /// `/api/higgs/*` control surface stays reachable so the server can be
+        /// in-process control surface stays reachable so the server can be
         /// re-enabled. Read by the chat boundary on each request, so a change
         /// takes effect without a restart.
         pub serving_enabled: bool,
+    }
+}
+
+higgs_ts! {
+    /// Body for the `cors_settings` control-op — the extra CORS-origins allowlist
+    /// beyond the built-in loopback/tauri set (exact-match against the request
+    /// `Origin`). CORS only protects BROWSER clients; non-browser access is gated
+    /// by API keys, not this list.
+    ///
+    /// The extra origins are read ONCE when the server builds its CORS layer at
+    /// serve start, so a change to the persisted list takes effect only on the
+    /// next restart (a live rebind of the running CORS layer is a separate,
+    /// deferred feature). This type makes that honest: [`origins`](Self::origins)
+    /// is what's persisted in `config.json` right now, [`applied_origins`](Self::applied_origins)
+    /// is what the RUNNING server was booted with, and
+    /// [`restart_required`](Self::restart_required) is `true` exactly when they
+    /// differ (a restart is needed to apply the persisted change).
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    pub struct HiggsCorsSettings {
+        /// The extra allowed origins persisted in `config.json` (`cors_origins`)
+        /// right now — validated, exact-match `scheme://host[:port]` values. This
+        /// is the desired state; it becomes live on the next restart.
+        pub origins: Vec<String>,
+        /// The extra allowed origins the RUNNING server's CORS layer was actually
+        /// built with at serve start. Empty before the server has been served.
+        ///
+        /// An embedder may run SEVERAL `/v1` listeners on one instance; this
+        /// discloses the PRIMARY (first-registered) one's list — a single field
+        /// cannot describe more, and one listener is the common case. See
+        /// [`restart_required`](Self::restart_required), which considers them all.
+        pub applied_origins: Vec<String>,
+        /// `true` when the persisted [`origins`](Self::origins) differ from the list
+        /// ANY live listener's CORS layer was actually built with — the persisted
+        /// list has changed and a restart is required for it to take effect.
+        /// Compared as SETS: order is meaningless to an exact-match allowlist, so a
+        /// reordered save is not a change.
+        ///
+        /// With several listeners this can be `true` while `origins ==
+        /// applied_origins`: a NON-primary listener is the one running the stale
+        /// list. That asymmetry is deliberate — the flag must never under-report a
+        /// pending restart. Always `false` before any listener has served: there is
+        /// nothing live to diverge from, and the first serve start applies the
+        /// persisted list.
+        pub restart_required: bool,
     }
 }
 
@@ -284,7 +462,8 @@ higgs_ts! {
 }
 
 higgs_ts! {
-    /// Response for `GET /api/higgs/version`.
+    /// Response for the `version` control-op (`Higgs::version`, formerly
+    /// `GET /api/higgs/version`).
     #[derive(Debug, serde::Serialize)]
     pub struct HiggsVersionResponse {
         /// Higgs crate version from Cargo.toml (`CARGO_PKG_VERSION`).
@@ -298,5 +477,81 @@ higgs_ts! {
         pub binding: String,
         /// File formats this runtime supports.
         pub supported_formats: Vec<String>,
+    }
+}
+
+higgs_ts! {
+    /// One configured API key as the management surface lists it: label,
+    /// scopes, and a short digest prefix as its display identifier. NEVER the
+    /// plaintext token (shown once at mint) and never the full digest.
+    #[derive(Debug, Clone, serde::Serialize)]
+    pub struct HiggsKeyEntry {
+        pub label: String,
+        pub scopes: Vec<crate::keys::Scope>,
+        /// First 12 hex chars of the stored SHA-256 digest.
+        pub sha256_prefix: String,
+        /// Unix-ms the key was minted; `None` for keys from a pre-timestamp
+        /// store (render as unknown).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional, type = "number")]
+        pub created_at_ms: Option<u64>,
+        /// Unix-ms of the last successful authorization, `None` if never used.
+        /// Served from the LIVE store (lags at most the ~1-min touch throttle).
+        /// Usage is best-effort history: it reaches disk only when a later
+        /// mint/revoke persists the store, so a restart shows the stamps as of
+        /// that last mutation ("never" if none since).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional, type = "number")]
+        pub last_used_ms: Option<u64>,
+    }
+}
+
+higgs_ts! {
+    /// The `keys` list control-op response (formerly `GET /api/higgs/keys`) — the
+    /// configured keys plus whether auth is currently gating the surface (false ⇔
+    /// zero keys ⇔ open).
+    #[derive(Debug, Clone, serde::Serialize)]
+    pub struct HiggsKeysList {
+        pub auth_enabled: bool,
+        pub keys: Vec<HiggsKeyEntry>,
+    }
+}
+
+higgs_ts! {
+    /// The key-mint control-op request (`Higgs::mint_key`, formerly
+    /// `POST /api/higgs/keys`): mint a key. Omitted `scopes` defaults to
+    /// `[chat, models]` (the CLI's default) — pass `["admin"]` explicitly for a
+    /// management key.
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    pub struct HiggsMintKeyRequest {
+        pub label: String,
+        #[ts(optional)]
+        pub scopes: Option<Vec<crate::keys::Scope>>,
+    }
+}
+
+higgs_ts! {
+    /// The key-mint control-op response (`Higgs::mint_key`, formerly
+    /// `POST /api/higgs/keys`). `token` is the plaintext — shown THIS
+    /// ONCE, never persisted, never logged; the caller must store it now.
+    #[derive(Debug, Clone, serde::Serialize)]
+    pub struct HiggsMintKeyResponse {
+        pub label: String,
+        pub scopes: Vec<crate::keys::Scope>,
+        pub token: String,
+    }
+}
+
+higgs_ts! {
+    /// The key-revoke control-op response (`Higgs::revoke_key`, formerly
+    /// `DELETE /api/higgs/keys/{label}`): how many keys the label matched.
+    /// Revoking the last key turns auth OFF on a LOOPBACK bind only; a
+    /// LAN-exposed server REFUSES last-key revocation outright ([HG059], 409) —
+    /// the runtime counterpart of the [HG058] startup guarantee.
+    #[derive(Debug, Clone, serde::Serialize)]
+    pub struct HiggsKeyRemoved {
+        #[ts(type = "number")]
+        pub removed: u64,
+        pub auth_enabled: bool,
     }
 }

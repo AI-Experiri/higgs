@@ -1,0 +1,1578 @@
+//! `NodeRuntime` — the net-new multi-worker orchestrator (DESIGN-remote.md §5.4a),
+//! an **actor** (P1 of `docs/superpowers/specs/2026-06-22-actor-runtime-design.md`).
+//!
+//! The worker registry is **private actor state** (no mutex): one owning task processes
+//! a typed mailbox, so concurrent ops can't interleave across `.await` points. Per
+//! `CLAUDE.md`, the actor's `handle` does only fast synchronous state work; slow
+//! downstream RPCs (`resolve` + spawn + `M_LOAD`, `stop`, `M_STATUS`, sysinfo, scan,
+//! inventory) run in a spawned task. `load` — the one op that mutates state AFTER a slow
+//! RPC — uses the spawn-and-commit pattern: it reserves an id synchronously, runs the
+//! slow load detached, then applies the registry insert via a `LoadCommit` message. So a
+//! slow load never head-of-line-blocks an unload/retire.
+//!
+//! `NodeRuntime` is a thin handle wrapping the mailbox; its methods send a message and
+//! await a oneshot reply.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use serde_json::{json, Value};
+use tokio::sync::{broadcast, oneshot};
+
+use crate::actor::{spawn_actor_with, Actor, Handle, WeakHandle};
+use crate::diagnostic::HiggsError;
+use crate::log_bus::{LogBus, LogSource};
+use crate::node::worker_id::{WorkerId, WorkerRegistry};
+use crate::remote::NodeLoadParams;
+use crate::supervisor::{HiggsEvent, Supervisor};
+use crate::worker::models::ModelStore;
+use crate::worker::{M_LOAD, M_STATUS};
+
+/// How a node spawns a fresh Supervisor. `Arc` (not `Box`) so the spawn-and-commit load
+/// task can clone it off the actor thread. Production: `Supervisor::spawn`; tests inject a
+/// fake-worker-backed Supervisor so the registry/ops can be exercised without llama.cpp.
+pub(crate) type SupervisorSpawner = Arc<dyn Fn(Arc<LogBus>) -> Supervisor + Send + Sync>;
+
+/// Default idle auto-unload TTL: a worker with no chat activity for this long is reaped by
+/// the node's idle reaper. 60 minutes (the uniform local+remote default); configurable per
+/// node via [`NodeConfig::idle_ttl`].
+pub const DEFAULT_IDLE_TTL: Duration = Duration::from_secs(60 * 60);
+
+/// How often the idle reaper wakes, derived from the TTL: a quarter of it, clamped to
+/// `[50ms, 60s]`. So a 60-min TTL polls once a minute (cheap); a tiny test TTL polls fast.
+fn reap_interval(ttl: Duration) -> Duration {
+    (ttl / 4).clamp(Duration::from_millis(50), Duration::from_secs(60))
+}
+
+/// Runtime-mutable idle auto-unload policy, shared (via `Arc`) between the wrapper's setters
+/// and the actor's reaper, which reads it on EVERY tick — so the engine's Server-Settings
+/// toggles (auto-unload on/off, TTL) take effect live without a restart, exactly as the old
+/// engine-level reaper did. Plain atomics, set/read in isolation.
+pub struct IdleConfig {
+    /// TTL in MILLISECONDS (not seconds — sub-second TTLs are used in tests and truncating to
+    /// seconds would make a 120ms TTL read back as 0 and reap instantly).
+    ttl_millis: AtomicU64,
+    enabled: AtomicBool,
+    /// Notified on any change so the reaper can interrupt an in-progress sleep and re-evaluate
+    /// at the new cadence immediately — a lowered TTL takes effect now, not after the old sleep.
+    changed: tokio::sync::Notify,
+}
+
+impl IdleConfig {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            ttl_millis: AtomicU64::new(ttl.as_millis() as u64),
+            enabled: AtomicBool::new(true),
+            changed: tokio::sync::Notify::new(),
+        }
+    }
+    /// Current idle TTL.
+    pub fn ttl(&self) -> Duration {
+        Duration::from_millis(self.ttl_millis.load(Ordering::Relaxed))
+    }
+    /// Set the idle TTL (live; the reaper re-evaluates immediately).
+    pub fn set_ttl(&self, ttl: Duration) {
+        self.ttl_millis
+            .store(ttl.as_millis() as u64, Ordering::Relaxed);
+        self.changed.notify_one();
+    }
+    /// Whether auto-unload is on.
+    pub fn enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+    /// Turn auto-unload on/off (live; the reaper re-evaluates immediately).
+    pub fn set_enabled(&self, on: bool) {
+        self.enabled.store(on, Ordering::Relaxed);
+        self.changed.notify_one();
+    }
+}
+
+/// Node configuration: the model roots the node scans (it owns its own disk), the shared log
+/// bus, and the idle auto-unload TTL.
+pub struct NodeConfig {
+    pub bus: Arc<LogBus>,
+    pub lmstudio_dirs: Vec<PathBuf>,
+    pub hf_dirs: Vec<PathBuf>,
+    pub ollama_dirs: Vec<PathBuf>,
+    /// Idle auto-unload TTL: a worker idle (no chat) this long is reaped. [`DEFAULT_IDLE_TTL`].
+    pub idle_ttl: Duration,
+}
+
+impl NodeConfig {
+    /// The three model roots `(lmstudio, hf, ollama)`, cloned for a `spawn_blocking` scan
+    /// that must own them. Shared by `resolve_model` and `scan`.
+    fn model_dirs(&self) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
+        (
+            self.lmstudio_dirs.clone(),
+            self.hf_dirs.clone(),
+            self.ollama_dirs.clone(),
+        )
+    }
+}
+
+/// Cancellation-safety guard: a dropped `Supervisor` does NOT reap its child, so if a
+/// lifecycle future is cancelled mid-await the worker would orphan (RAM/VRAM held, no id
+/// to stop it). This guard fires a detached `stop()` on drop unless `commit()` defuses it.
+struct StopOnDrop(Option<Arc<Supervisor>>);
+
+impl StopOnDrop {
+    fn new(sup: Arc<Supervisor>) -> Self {
+        Self(Some(sup))
+    }
+    /// Defuse: the worker was handed off (inserted) or already stopped — don't re-stop.
+    fn commit(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        if let Some(sup) = self.0.take() {
+            // Best-effort, detached: we can't await in Drop. `stop()` is idempotent.
+            tokio::spawn(async move { sup.stop().await });
+        }
+    }
+}
+
+/// Capacity of the node→hub log relay broadcast. A hub that falls this far behind drops
+/// the gap (Lagged) and keeps streaming — log relay is best-effort, never back-pressures
+/// a worker.
+const LOG_RELAY_CAP: usize = 1024;
+
+/// Capacity of the lifecycle-event broadcast (ModelLoaded/ModelUnloaded). Small — events are
+/// discrete and consumers (UI/SSE) keep up; a lagging consumer drops the gap.
+const EVENT_CAP: usize = 256;
+
+/// The actor's typed mailbox. Each variant carries a oneshot `reply` the wrapper awaits.
+enum NodeMsg {
+    /// Spawn a new worker + load the model. Reserves an id synchronously, runs the slow
+    /// load detached, commits via `LoadCommit`.
+    Load {
+        params: NodeLoadParams,
+        reply: oneshot::Sender<Result<(WorkerId, Value), HiggsError>>,
+    },
+    /// Follow-up from the detached load task: apply the registry insert (or reap on
+    /// failure/cancellation) and answer the original caller.
+    LoadCommit {
+        id: WorkerId,
+        result: Result<(Arc<Supervisor>, Value, LoadFacts), LoadFailure>,
+        reply: oneshot::Sender<Result<(WorkerId, Value), HiggsError>>,
+    },
+    /// Graceful unload (and `Kill`, which is identical at this layer): remove from the
+    /// registry synchronously, then stop the worker on a tracked teardown task.
+    Unload {
+        id: WorkerId,
+        reply: oneshot::Sender<Result<(), HiggsError>>,
+    },
+    Kill {
+        id: WorkerId,
+        reply: oneshot::Sender<Result<(), HiggsError>>,
+    },
+    Status {
+        id: WorkerId,
+        reply: oneshot::Sender<Result<Value, HiggsError>>,
+    },
+    Scan {
+        reply: oneshot::Sender<Result<Value, HiggsError>>,
+    },
+    Sysinfo {
+        reply: oneshot::Sender<Result<Value, HiggsError>>,
+    },
+    Inventory {
+        reply: oneshot::Sender<Result<Value, HiggsError>>,
+    },
+    WorkerIds {
+        reply: oneshot::Sender<Vec<WorkerId>>,
+    },
+    /// The LOAD-TIME domain of every resident worker (`LoadFacts.domain`) — the
+    /// SAME facts the `ChatHandle` gate enforces, exposed so the facade's
+    /// advertising and pre-stream refusals agree with the gate instead of
+    /// re-deriving from the mutable scan (a shadow file added after the load
+    /// would otherwise flip the answer).
+    WorkerDomains {
+        reply: oneshot::Sender<
+            std::collections::HashMap<WorkerId, crate::worker::models::ModelDomain>,
+        >,
+    },
+    ChatHandle {
+        /// The RAW model id this chat is FOR. The domain gate below refuses only
+        /// when the worker actually serves this model — a mismatch (a stale hub
+        /// route to a reused worker id) must fall through to the worker's own
+        /// [HG018] model-bind check, which is route-invalidating and heals the
+        /// route; a domain verdict about a model the client never asked for
+        /// would 400 forever instead (Fable r5).
+        model: String,
+        id: WorkerId,
+        reply: oneshot::Sender<Result<ChatLease, HiggsError>>,
+    },
+    /// Posted by a [`ChatLease`] on drop: the chat finished (or was abandoned). Decrements the
+    /// worker's in-flight count and re-stamps its last-activity, so the idle reaper measures
+    /// from the END of a generation and never reaps a worker that's still generating.
+    ChatEnd {
+        id: WorkerId,
+    },
+    /// Periodic tick from the idle reaper: unload every resident worker with no in-flight chat
+    /// that has been idle past the TTL.
+    ReapIdle,
+    /// The full per-worker inventory snapshot (model + T9 stats), one atomic
+    /// actor read — the same rows `M_NODE_INVENTORY` carries, minus hardware.
+    /// Emit a FRESH `Resync` fleet event (current workers, current idle_ms,
+    /// next seq) — the relay's stream-failure recovery (T10 r25/r26), replacing
+    /// a stale resend whose frozen idle_ms would read falsely fresh at the hub
+    /// (and whose kind would misdescribe the newer snapshot).
+    FleetResnapshot,
+    WorkerSnapshot {
+        reply: oneshot::Sender<Vec<crate::remote::InventoryWorker>>,
+    },
+    /// Snapshot the resident instances as `(worker, raw model)` — the engine's input to the
+    /// global served-id derivation (P4b).
+    Instances {
+        reply: oneshot::Sender<Vec<(WorkerId, String)>>,
+    },
+    /// Enumerate host GPUs via a transient Supervisor (control-plane). Mirrors
+    /// `Supervisor::sysinfo`.
+    Gpus {
+        reply: oneshot::Sender<Vec<crate::system::GpuDevice>>,
+    },
+    ShutdownAll {
+        reply: oneshot::Sender<()>,
+    },
+    /// Quiesce for the update-restart drain (P4b (c)): refuse every chat lease requested AFTER
+    /// this message. Mailbox order is the barrier — see the `quiescing` field. One-way transition
+    /// (the process is about to re-exec or exit); workers stay resident and existing leases run
+    /// to completion.
+    QuiesceChats {
+        reply: oneshot::Sender<()>,
+    },
+    /// Posted by a worker-stop task once `Supervisor::stop()` has finished. Decrements the
+    /// in-flight-stop count (so `shutdown_all` can tell when every teardown is truly done)
+    /// and fires the op's own reply if it had one (e.g. the `unload`/`kill` caller).
+    ReapDone {
+        done: Option<oneshot::Sender<Result<(), HiggsError>>>,
+    },
+}
+
+/// A live handle to a worker's [`Supervisor`] for the duration of one chat. Deref-exposes the
+/// `Supervisor` so the relay drives it directly; on drop it posts [`NodeMsg::ChatEnd`] back to
+/// the actor (decrement in-flight + re-stamp activity). Holding the lease for the whole
+/// generation keeps the idle reaper from unloading a worker mid-chat.
+pub(crate) struct ChatLease {
+    sup: Arc<Supervisor>,
+    id: WorkerId,
+    actor: WeakHandle<NodeMsg>,
+}
+
+impl std::ops::Deref for ChatLease {
+    type Target = Supervisor;
+    fn deref(&self) -> &Supervisor {
+        &self.sup
+    }
+}
+
+impl Drop for ChatLease {
+    fn drop(&mut self) {
+        // Best-effort, non-blocking: the actor may already be gone (shutdown).
+        if let Some(h) = self.actor.upgrade() {
+            let _ = h.send(NodeMsg::ChatEnd { id: self.id });
+        }
+    }
+}
+
+/// Private actor state: N concurrent Supervisors (one child each) behind a mailbox.
+struct NodeActor {
+    /// Owned outright — NOT behind a mutex. Only the actor task touches it.
+    registry: WorkerRegistry<Arc<Supervisor>>,
+    spawner: SupervisorSpawner,
+    config: Arc<NodeConfig>,
+    /// Fan-out of every resident worker's stderr line, tagged with its `WorkerId`, to the
+    /// CURRENT hub connection's relay task. Persists across reconnects with the runtime; a
+    /// line emitted while no hub is connected is dropped (no subscriber).
+    log_tx: broadcast::Sender<(WorkerId, String)>,
+    /// Self-reference for posting `LoadCommit`/`ReapDone` back. A `WeakHandle` so an idle
+    /// actor still shuts down when the last external handle drops.
+    self_handle: WeakHandle<NodeMsg>,
+    /// A STRONG self-handle held ONLY while work is in flight (`inflight_loads +
+    /// inflight_stops > 0`). It keeps the mailbox open across the load→commit→reap→done
+    /// chain even if every external handle drops mid-op, so that chain drains in-actor
+    /// (no orphan) before `on_stop` runs. Cleared the instant both counters hit 0, so an
+    /// idle actor never stays alive. (`Drop`-then-immediate-`process::exit` without a
+    /// `shutdown_all` is the sole residual — `Drop` can't be async; the daemon always calls
+    /// `shutdown_all` first, which IS fully awaited.)
+    keepalive: Option<Handle<NodeMsg>>,
+    /// Set once `ShutdownAll` (or `on_stop`) begins draining. Makes shutdown terminal: a
+    /// `Load` that is still in flight when shutdown starts must NOT commit a new worker
+    /// afterwards (it would survive the drain), so once this is set `Load` is rejected and
+    /// a late `LoadCommit` reaps its worker instead of inserting it.
+    shutting_down: bool,
+    /// Loads spawned but not yet committed/reaped. `ShutdownAll` waits for this to reach 0
+    /// so a worker still being brought up can't outlive the drain (and orphan on process
+    /// exit). Bumped when a `Load` is accepted, dropped in every `LoadCommit`.
+    inflight_loads: usize,
+    /// Worker-stop tasks spawned but not yet finished (`ReapDone` pending). EVERY stop —
+    /// unload/kill, cancel/failure reap, and the shutdown drain — goes through `reap`, so
+    /// this counts all teardown in flight. `shutdown_all` waits for this to reach 0, so it
+    /// can't return while ANY worker (even one stopped by a racing unload) is still alive.
+    inflight_stops: usize,
+    /// `ShutdownAll` callers parked until every load AND every stop has drained.
+    shutdown_waiters: Vec<oneshot::Sender<()>>,
+    /// Per-worker last chat activity (stamped on load, and on chat start + end). The idle
+    /// reaper unloads a worker whose entry is older than `idle_ttl` with no in-flight chat.
+    last_activity: HashMap<WorkerId, Instant>,
+    /// Per-worker APPLIED load facts, cached at commit (T9): the effective ctx
+    /// (post trained-cap defaulting), the gpu/threads as sent, and the load
+    /// wall-clock. Feeds `snapshot_workers` so inventory carries per-worker
+    /// stats WITHOUT an RPC to a possibly-busy worker.
+    load_facts: HashMap<WorkerId, LoadFacts>,
+    /// Monotonic inventory-snapshot sequence (T14 r17) — see `NodeMsg::Inventory`.
+    snapshot_seq: u64,
+    /// Per-worker count of in-flight chats (held via [`ChatLease`]). A worker with a non-zero
+    /// count is never idle-reaped, so a generation longer than the TTL is not killed mid-chat.
+    in_flight: HashMap<WorkerId, u32>,
+    /// Set by [`NodeMsg::QuiesceChats`] (the update-restart drain, P4b (c)): refuse every NEW
+    /// chat lease from that point on. The actor's mailbox ORDER is the barrier — a `ChatHandle`
+    /// already queued ahead of the quiesce takes its lease normally (and the drain waits for it
+    /// via `in_flight`); one arriving after is refused, closing the accepted-M_CHAT-but-not-yet-
+    /// leased window that polling `in_flight` alone cannot see.
+    quiescing: bool,
+    /// Runtime-mutable idle auto-unload policy (TTL + on/off), read by the reaper each tick.
+    idle: Arc<IdleConfig>,
+    /// Set once the drain has fully completed. A `ShutdownAll` arriving afterwards answers
+    /// immediately (no in-flight work remains to release a fresh waiter).
+    shutdown_done: bool,
+    /// Lifecycle event fan-out (ModelLoaded/ModelUnloaded), so the engine's event stream works
+    /// the same for a local NodeRuntime as it did for the single Supervisor (P4b).
+    events_tx: broadcast::Sender<HiggsEvent>,
+    /// Fleet-event fan-out (T10): a typed worker-state change + the post-change worker
+    /// snapshot, sequenced by `snapshot_seq` IN THE SAME ACTOR TURN as the change — so
+    /// mailbox order stays data order across pushes and `Inventory` pulls (T14 r17).
+    /// `serve_node`'s relay drains this onto a dedicated uni stream as `N_FLEET_EVENT`;
+    /// with no hub connected (no subscriber) the send is a dropped no-op.
+    fleet_tx: broadcast::Sender<crate::remote::NodeFleetEvent>,
+}
+
+/// The APPLIED facts of one worker's load, captured where `do_load` resolved
+/// them — the effective context (post trained-cap defaulting: the operative
+/// window the worker pins), the offload/threads as sent (absent = worker
+/// defaults), and the wall-clock load time.
+#[derive(Debug, Clone)]
+struct LoadFacts {
+    ctx_len: Option<u32>,
+    gpu_layers: Option<crate::worker::engine::GpuLayers>,
+    threads: Option<u32>,
+    loaded_at_ms: u64,
+    /// The model's capability class, read from its GGUF header WHEN THE LOAD
+    /// RESOLVED THE FILE. `ChatHandle` gates on this — not on a fresh scan — so a
+    /// post-load file deletion, enrichment failure, or id collision cannot re-open
+    /// the chat door for a non-generative worker ([HG079]).
+    ///
+    /// RESIDUAL (accepted, codex r3): a supervisor crash-restart replays the
+    /// recorded `M_LOAD` by PATH without re-reading these facts — a file REPLACED
+    /// in place across that window loads the new content under the old facts.
+    /// That window inherits a pre-existing identity hazard (the replayed "model X"
+    /// is silently different weights, domain aside), so it is not closed here.
+    domain: crate::worker::models::ModelDomain,
+    /// The GGUF arch at load time, for the [HG079] diagnostic.
+    arch: Option<String>,
+}
+
+/// Wall-clock ms since the Unix epoch (0 if the clock predates it).
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+impl NodeActor {
+    /// Best-effort lifecycle event emit (no subscribers ⇒ dropped).
+    fn emit(&self, ev: HiggsEvent) {
+        let _ = self.events_tx.send(ev);
+    }
+
+    /// Best-effort fleet-event emit (T10): bump the shared snapshot sequence and capture
+    /// the post-change worker snapshot in THIS actor turn, so the event's seq totally
+    /// orders it against every other push and `Inventory` pull. Cheap — `snapshot_workers`
+    /// reads only actor-owned bookkeeping (no hardware probe, no worker RPC). Call AFTER
+    /// the state change it reports.
+    fn emit_fleet(&mut self, kind: crate::remote::FleetEventKind) {
+        if self.fleet_tx.receiver_count() == 0 {
+            return; // no hub relay subscribed — skip the snapshot work entirely
+        }
+        self.snapshot_seq += 1;
+        let _ = self.fleet_tx.send(crate::remote::NodeFleetEvent {
+            kind,
+            snapshot_seq: self.snapshot_seq,
+            workers: self.snapshot_workers(),
+        });
+    }
+
+    /// Snapshot resident workers (id → model) synchronously off the registry — the fast
+    /// state read that precedes the slow `hardware_runtime` fetch in `inventory`.
+    fn snapshot_workers(&self) -> Vec<crate::remote::InventoryWorker> {
+        self.registry
+            .ids()
+            .into_iter()
+            .filter_map(|id| {
+                self.registry.get(id).map(|sup| {
+                    let facts = self.load_facts.get(&id);
+                    crate::remote::InventoryWorker {
+                        worker_id: id.0,
+                        model: sup.loaded_model_id().unwrap_or_default(),
+                        // The node does not know its hub-assigned served id; the hub
+                        // fills this in when it folds the inventory into the fleet view.
+                        served_id: String::new(),
+                        // T9 stats — straight from the actor's own bookkeeping, no
+                        // RPC to a possibly-busy worker.
+                        ctx_len: facts.and_then(|f| f.ctx_len),
+                        gpu_layers: facts.and_then(|f| f.gpu_layers),
+                        threads: facts.and_then(|f| f.threads),
+                        domain: facts.map(|f| f.domain).unwrap_or_default(),
+                        loaded_at_ms: facts.map(|f| f.loaded_at_ms),
+                        idle_ms: self
+                            .last_activity
+                            .get(&id)
+                            .map(|t| t.elapsed().as_millis() as u64),
+                        in_flight: Some(self.in_flight.get(&id).copied().unwrap_or(0)),
+                    }
+                })
+            })
+            .collect()
+    }
+}
+
+impl Actor for NodeActor {
+    type Msg = NodeMsg;
+
+    async fn handle(&mut self, msg: NodeMsg) {
+        match msg {
+            NodeMsg::Load { params, reply } => {
+                if self.shutting_down {
+                    let _ = reply.send(Err(shutting_down()));
+                    return;
+                }
+                // Reserve the id NOW (sync), run the slow load detached, commit later.
+                let id = self.registry.reserve();
+                self.inflight_loads += 1;
+                self.refresh_keepalive();
+                let spawner = self.spawner.clone();
+                let config = self.config.clone();
+                let relay = self.log_tx.clone();
+                let self_handle = self.self_handle.clone();
+                tokio::spawn(async move {
+                    let result = do_load(id, params, spawner, config, relay).await;
+                    // The keepalive (held while any work is in flight) keeps the actor alive,
+                    // so this upgrade succeeds and the commit is handled on-thread — UNLESS
+                    // the runtime was dropped without shutdown_all (accepted Drop residual),
+                    // in which case the None branch reaps best-effort.
+                    match self_handle.upgrade() {
+                        Some(h) => {
+                            let _ = h.send(NodeMsg::LoadCommit { id, result, reply });
+                        }
+                        None => {
+                            // Runtime gone (Drop without shutdown_all): best-effort detached
+                            // reap so a built worker can't orphan.
+                            let sup = match result {
+                                Ok((sup, _, _)) => Some(sup),
+                                Err(LoadFailure { sup, .. }) => sup,
+                            };
+                            if let Some(sup) = sup {
+                                tokio::spawn(async move { sup.stop().await });
+                            }
+                        }
+                    }
+                });
+            }
+            NodeMsg::LoadCommit { id, result, reply } => {
+                match result {
+                    Ok((sup, loaded, facts)) => {
+                        if self.shutting_down {
+                            // Shutdown started while this load was in flight — reap the worker
+                            // (tracked, so shutdown_all awaits it) and refuse the load.
+                            self.reap(id, sup, None);
+                            let _ = reply.send(Err(shutting_down()));
+                        } else {
+                            // Deliver the result FIRST, then commit only if the caller is
+                            // still listening. Both run synchronously in this handler (no
+                            // await between), so a cancel can't wedge a committed-but-unacked
+                            // worker, and any follow-up op still observes the insert. If the
+                            // caller vanished mid-commit, reap (tracked) instead of keeping a
+                            // worker nobody asked to keep.
+                            match reply.send(Ok((id, loaded))) {
+                                Ok(()) => {
+                                    let model = sup.loaded_model_id().unwrap_or_default();
+                                    self.registry.insert_reserved(id, sup);
+                                    // Start the idle clock now (a loaded-but-unused model is
+                                    // idle from load time).
+                                    self.last_activity.insert(id, Instant::now());
+                                    self.load_facts.insert(id, facts);
+                                    self.emit(HiggsEvent::ModelLoaded { id: model });
+                                    self.emit_fleet(crate::remote::FleetEventKind::WorkerLoaded);
+                                }
+                                Err(_) => self.reap(id, sup, None),
+                            }
+                        }
+                    }
+                    Err(LoadFailure { sup, error }) => {
+                        // Reserved id is a harmless gap. A worker spawned before the failure is
+                        // reaped (tracked), so a racing shutdown_all still awaits its stop.
+                        if let Some(sup) = sup {
+                            self.reap(id, sup, None);
+                        }
+                        let _ = reply.send(Err(error));
+                    }
+                }
+                // This load is resolved; a waiting shutdown may now be able to finish.
+                self.inflight_loads -= 1;
+                self.refresh_keepalive();
+                self.maybe_finish_shutdown();
+            }
+            NodeMsg::Unload { id, reply } | NodeMsg::Kill { id, reply } => {
+                match self.registry.remove(id) {
+                    // Removed from the registry synchronously (already invisible); the stop is
+                    // tracked so a later shutdown_all awaits it, and the caller's reply fires
+                    // when the stop actually completes.
+                    Some(sup) => {
+                        let model = sup.loaded_model_id().unwrap_or_default();
+                        self.forget_activity(id);
+                        self.reap(id, sup, Some(reply));
+                        self.emit(HiggsEvent::ModelUnloaded { id: model });
+                        self.emit_fleet(crate::remote::FleetEventKind::WorkerUnloaded);
+                    }
+                    None => {
+                        let _ = reply.send(Err(no_worker(id)));
+                    }
+                }
+            }
+            NodeMsg::Status { id, reply } => match self.registry.get(id).cloned() {
+                Some(sup) => {
+                    tokio::spawn(async move {
+                        let _ = reply.send(sup.request(M_STATUS, Value::Null).await);
+                    });
+                }
+                None => {
+                    let _ = reply.send(Err(no_worker(id)));
+                }
+            },
+            NodeMsg::Scan { reply } => {
+                let config = self.config.clone();
+                tokio::spawn(async move {
+                    let _ = reply.send(do_scan(&config).await);
+                });
+            }
+            NodeMsg::Sysinfo { reply } => {
+                // The GPU probe spawns a TRANSIENT worker that `Supervisor::sysinfo` reaps
+                // itself (closes stdin → waits/kills) before returning — see supervisor.rs.
+                // It holds no model/VRAM and is gone by the time this task completes, so it
+                // needs no shutdown-barrier tracking (unlike resident model workers).
+                let spawner = self.spawner.clone();
+                let bus = self.config.bus.clone();
+                tokio::spawn(async move {
+                    let _ = reply.send(do_sysinfo(&spawner, &bus).await);
+                });
+            }
+            NodeMsg::Inventory { reply } => {
+                // Same as Sysinfo: the hardware probe's transient worker self-reaps.
+                // The seq is assigned HERE, on the actor, in the same turn as the
+                // worker snapshot — mailbox order IS data order (T14 r17), which
+                // hub-side pull stamps cannot guarantee under QUIC reordering.
+                self.snapshot_seq += 1;
+                let seq = self.snapshot_seq;
+                let workers = self.snapshot_workers();
+                let spawner = self.spawner.clone();
+                let bus = self.config.bus.clone();
+                tokio::spawn(async move {
+                    let _ = reply.send(do_inventory(workers, seq, &spawner, &bus).await);
+                });
+            }
+            NodeMsg::WorkerIds { reply } => {
+                let _ = reply.send(self.registry.ids());
+            }
+            NodeMsg::WorkerDomains { reply } => {
+                let _ = reply.send(
+                    self.load_facts
+                        .iter()
+                        .map(|(id, f)| (*id, f.domain))
+                        .collect(),
+                );
+            }
+            NodeMsg::ChatHandle { id, model, reply } => {
+                // Update-restart quiesce (P4b (c)): once draining, every NEW lease is refused —
+                // the generation would only be truncated moments later by the restart's
+                // `shutdown_all`; a clean refusal now beats a torn stream then. Mailbox order
+                // makes this exact: leases granted before the QuiesceChats message drain via
+                // `in_flight`; requests after it land here.
+                if self.quiescing {
+                    let _ = reply.send(Err(shutting_down()));
+                    return;
+                }
+                let lease = match self.registry.get(id).cloned() {
+                    // THE dispatch choke point: every generation — local `/v1`,
+                    // in-process, AND the hub relay (`relay_chat`, which never runs
+                    // `resolve_loaded`) — takes its lease here. A worker whose
+                    // LOAD-TIME domain is not `Llm` cannot chat ([HG079]); gating on
+                    // the facts captured when the load resolved the file means a
+                    // post-load deletion, enrichment failure, or id collision cannot
+                    // re-open the door. No activity stamp, no in-flight hold, no
+                    // ChatStart emit — the refusal is not a chat.
+                    //
+                    // ONLY when the worker serves the REQUESTED model: a mismatch is
+                    // a stale route, and the verdict for it belongs to the worker's
+                    // route-invalidating [HG018] bind check — not to a permanent
+                    // [HG079] about a model the client never named (Fable r5).
+                    Some(sup)
+                        if sup.loaded_model_id().as_deref() == Some(model.as_str())
+                            && self.load_facts.get(&id).is_some_and(|f| {
+                                f.domain != crate::worker::models::ModelDomain::Llm
+                            }) =>
+                    {
+                        // The gate above proved the facts exist.
+                        let facts = &self.load_facts[&id];
+                        Err(HiggsError::ModelNotChatCapable {
+                            id: sup.loaded_model_id().unwrap_or_default(),
+                            arch: facts.arch.clone().unwrap_or_else(|| "unknown".into()),
+                            domain: facts.domain,
+                        })
+                    }
+                    Some(sup) => {
+                        // Stamp activity + take an in-flight reference for the whole chat.
+                        self.last_activity.insert(id, Instant::now());
+                        *self.in_flight.entry(id).or_insert(0) += 1;
+                        Ok(ChatLease {
+                            sup,
+                            id,
+                            actor: self.self_handle.clone(),
+                        })
+                    }
+                    None => Err(no_worker(id)),
+                };
+                let started = lease.is_ok();
+                let _ = reply.send(lease);
+                if started {
+                    self.emit_fleet(crate::remote::FleetEventKind::ChatStart);
+                }
+            }
+            NodeMsg::ChatEnd { id } => {
+                if self.registry.get(id).is_some() {
+                    if let Some(c) = self.in_flight.get_mut(&id) {
+                        *c = c.saturating_sub(1);
+                    }
+                    // Measure idle from the END of the generation.
+                    self.last_activity.insert(id, Instant::now());
+                    self.emit_fleet(crate::remote::FleetEventKind::ChatEnd);
+                } else {
+                    // Worker was unloaded mid-chat — drop its bookkeeping rather than leak it.
+                    self.forget_activity(id);
+                }
+            }
+            NodeMsg::ReapIdle => {
+                // Skip while draining (shutdown reaps everything anyway) or when auto-unload
+                // is turned off at runtime.
+                if !self.shutting_down && self.idle.enabled() {
+                    let ttl = self.idle.ttl();
+                    let idle: Vec<WorkerId> = self
+                        .registry
+                        .ids()
+                        .into_iter()
+                        .filter(|id| {
+                            self.in_flight.get(id).copied().unwrap_or(0) == 0
+                                && self
+                                    .last_activity
+                                    .get(id)
+                                    .is_some_and(|t| t.elapsed() >= ttl)
+                        })
+                        .collect();
+                    let mut reaped = false;
+                    for id in idle {
+                        if let Some(sup) = self.registry.remove(id) {
+                            let model = sup.loaded_model_id().unwrap_or_default();
+                            self.forget_activity(id);
+                            self.reap(id, sup, None);
+                            self.emit(HiggsEvent::ModelUnloaded { id: model });
+                            reaped = true;
+                        }
+                    }
+                    if reaped {
+                        // One event for the whole sweep — the snapshot already
+                        // reflects every reaped worker.
+                        self.emit_fleet(crate::remote::FleetEventKind::WorkerUnloaded);
+                    }
+                }
+            }
+            NodeMsg::FleetResnapshot => {
+                // A relay recovering from a stream failure asks for a FRESH event
+                // instead of resending its stale copy (T10 r25): the retained
+                // event's idle_ms froze at capture, so re-delivering it after a
+                // long stall would let the hub stamp old data as fresh (the one
+                // error direction the T14 freshness design forbids). Emitted as
+                // Resync (r26) — a whole-state re-sync, never the lost event's
+                // kind, which would misdescribe this newer snapshot.
+                self.emit_fleet(crate::remote::FleetEventKind::Resync);
+            }
+            NodeMsg::WorkerSnapshot { reply } => {
+                let _ = reply.send(self.snapshot_workers());
+            }
+            NodeMsg::Instances { reply } => {
+                let _ = reply.send(
+                    self.registry
+                        .ids()
+                        .into_iter()
+                        .filter_map(|id| {
+                            self.registry
+                                .get(id)
+                                .map(|sup| (id, sup.loaded_model_id().unwrap_or_default()))
+                        })
+                        .collect(),
+                );
+            }
+            NodeMsg::Gpus { reply } => {
+                // Transient Supervisor enumerates GPUs and self-reaps; off the actor thread.
+                let spawner = self.spawner.clone();
+                let bus = self.config.bus.clone();
+                tokio::spawn(async move {
+                    let sup = (spawner)(bus);
+                    let _ = reply.send(sup.sysinfo().await);
+                });
+            }
+            NodeMsg::ShutdownAll { reply } => {
+                if self.shutdown_done {
+                    let _ = reply.send(()); // already fully drained; nothing to wait for.
+                    return;
+                }
+                self.shutdown_waiters.push(reply);
+                if self.shutting_down {
+                    return; // a drain is already running; this caller waits for the same one.
+                }
+                // Terminal: block any in-flight load from committing after this drain. Reap
+                // every committed worker (tracked). The waiters fire once `inflight_loads`
+                // AND `inflight_stops` both reach 0 — i.e. every load resolved and every stop
+                // (these + any racing unload/kill + late in-flight loads) has finished.
+                self.shutting_down = true;
+                for (id, sup) in self.drain() {
+                    self.reap(id, sup, None);
+                }
+                self.maybe_finish_shutdown(); // handle the no-workers / nothing-in-flight case
+            }
+            NodeMsg::QuiesceChats { reply } => {
+                // One-way: the update restart is committed; from the NEXT message on, no new
+                // chat lease is granted. Workers stay resident (existing leases finish; the
+                // restart's shutdown_all tears down afterwards).
+                self.quiescing = true;
+                let _ = reply.send(());
+            }
+            NodeMsg::ReapDone { done } => {
+                self.inflight_stops -= 1;
+                if let Some(done) = done {
+                    let _ = done.send(Ok(()));
+                }
+                self.refresh_keepalive();
+                self.maybe_finish_shutdown();
+            }
+        }
+    }
+
+    async fn on_stop(&mut self) {
+        // Backstop for committed workers when the last handle is dropped without a
+        // `shutdown_all`: a dropped `Supervisor` does not reap its child. Unlike `Drop` this
+        // runs in async context, so we await the teardown directly. (Stops already spawned by
+        // `reap` can't message back — their `WeakHandle` upgrade fails — but each still runs
+        // its own `sup.stop()` to completion; this is the best-effort drop path. The awaited
+        // guarantee is `shutdown_all`, which the daemon uses.)
+        self.shutting_down = true;
+        for (id, sup) in self.drain() {
+            sup.stop().await;
+            self.config.bus.evict_local(id);
+        }
+    }
+}
+
+impl NodeActor {
+    /// Remove every resident worker from the registry, returning them for teardown.
+    fn drain(&mut self) -> Vec<(WorkerId, Arc<Supervisor>)> {
+        let out = self
+            .registry
+            .ids()
+            .into_iter()
+            .filter_map(|id| self.registry.remove(id).map(|sup| (id, sup)))
+            .collect();
+        self.last_activity.clear();
+        self.in_flight.clear();
+        // Same lifecycle as the activity books: a drained registry must not
+        // strand load facts (today both callers are terminal — shutting_down
+        // blocks any later snapshot — but a future non-terminal drain would
+        // otherwise serve stale facts for re-used worker ids).
+        self.load_facts.clear();
+        out
+    }
+
+    /// Drop a worker's idle bookkeeping (called whenever it leaves the registry).
+    /// Its per-worker log ring is reclaimed by [`reap`](Self::reap) AFTER the stop
+    /// completes, not here (evicting before the stop would let shutdown stderr
+    /// recreate the ring).
+    fn forget_activity(&mut self, id: WorkerId) {
+        self.last_activity.remove(&id);
+        self.load_facts.remove(&id);
+        self.in_flight.remove(&id);
+    }
+
+    /// Stop a worker on a tracked task. EVERY teardown funnels through here so `shutdown_all`
+    /// can wait for all of them: bumps `inflight_stops`, runs `sup.stop()` off-thread, then
+    /// posts `ReapDone` to decrement and (optionally) answer the op's caller. `done` carries
+    /// the `unload`/`kill` reply so it fires only once the stop has actually completed.
+    /// The worker's per-worker log ring on the node bus is reclaimed AFTER the stop —
+    /// evicting earlier would let shutdown-time stderr recreate the ring, and worker ids
+    /// are never reused, so a recreated ring would linger forever.
+    fn reap(
+        &mut self,
+        id: WorkerId,
+        sup: Arc<Supervisor>,
+        done: Option<oneshot::Sender<Result<(), HiggsError>>>,
+    ) {
+        self.inflight_stops += 1;
+        self.refresh_keepalive();
+        let self_handle = self.self_handle.clone();
+        let bus = self.config.bus.clone();
+        tokio::spawn(async move {
+            sup.stop().await;
+            // Process reaped (stderr pipe closed) — reclaim its log ring. RESIDUAL:
+            // a line already in flight in the async relay chain can land after this
+            // and recreate a tiny ring; bounded at a few lines, accepted over
+            // serializing eviction against the relay.
+            bus.evict_local(id);
+            // The keepalive keeps the actor alive until this completes, so the upgrade
+            // succeeds and the count/reply are handled on-thread — UNLESS the runtime was
+            // dropped without shutdown_all (accepted Drop residual), where the stop has
+            // already run and there's nothing left to track.
+            match self_handle.upgrade() {
+                Some(h) => {
+                    let _ = h.send(NodeMsg::ReapDone { done });
+                }
+                None => drop(done),
+            }
+        });
+    }
+
+    /// Keep a strong self-handle exactly while work is in flight: take one when the first
+    /// load/stop starts, drop it the moment the last finishes. This keeps the mailbox open
+    /// across an in-flight chain even if every external handle drops, without ever pinning an
+    /// idle actor alive.
+    ///
+    /// `upgrade()` is `Some` whenever a strong handle still exists — which is the case for
+    /// any op whose caller is still awaiting (it holds `&NodeRuntime`). It is `None` ONLY
+    /// when the runtime was already fully dropped before this message ran (a cancelled op
+    /// whose message was still queued, then `NodeRuntime` dropped without `shutdown_all`).
+    /// That is the accepted Drop residual: there is nothing left to keep alive, and the
+    /// task's own `None` branch reaps any worker detached/best-effort.
+    fn refresh_keepalive(&mut self) {
+        let active = self.inflight_loads + self.inflight_stops > 0;
+        if active {
+            if self.keepalive.is_none() {
+                self.keepalive = self.self_handle.upgrade();
+            }
+        } else {
+            self.keepalive = None;
+        }
+    }
+
+    /// Release the parked `shutdown_all` callers once the drain is truly complete: shutting
+    /// down, with no load still resolving and no worker still stopping.
+    fn maybe_finish_shutdown(&mut self) {
+        if self.shutting_down
+            && !self.shutdown_done
+            && self.inflight_loads == 0
+            && self.inflight_stops == 0
+        {
+            self.shutdown_done = true;
+            for waiter in self.shutdown_waiters.drain(..) {
+                let _ = waiter.send(());
+            }
+        }
+    }
+}
+
+/// Returned to a `load` that races a shutdown — the runtime is draining, so it refuses to
+/// bring up a worker that would outlive the drain.
+fn shutting_down() -> HiggsError {
+    HiggsError::WorkerDead {
+        context: "node runtime shutting down".into(),
+    }
+}
+
+/// The "no such worker" error shared by the registry lookups.
+fn no_worker(id: WorkerId) -> HiggsError {
+    HiggsError::WorkerDead {
+        context: format!("no worker {id}"),
+    }
+}
+
+/// Resolve `id` to its on-disk GGUF `(path, size_bytes, ctx_train)` by scanning the
+/// node's model roots. The blocking FS scan + canonicalization run on a blocking thread so
+/// they never stall the control-plane executor. `get` only returns cataloged models found
+/// UNDER the roots, and the resolved path must canonicalize to within a root (symlink-
+/// escape guard, [HG015]). `[HG002]` if absent.
+/// What `resolve_model` reads off the node's own scan for one load: the file's
+/// location/size, the trained context, and the header facts the actor must
+/// retain for the worker's lifetime (`domain`/`arch` → [`LoadFacts`], where the
+/// `ChatHandle` gate reads them independent of any later scan).
+struct ResolvedModel {
+    path: String,
+    size_bytes: u64,
+    ctx_train: Option<u64>,
+    domain: crate::worker::models::ModelDomain,
+    arch: Option<String>,
+}
+
+async fn resolve_model(config: &NodeConfig, id: &str) -> Result<ResolvedModel, HiggsError> {
+    let id = id.to_string();
+    let (lmstudio, hf, ollama) = config.model_dirs();
+    tokio::task::spawn_blocking(move || {
+        let mut store = ModelStore::default();
+        store.scan(&lmstudio, &hf, &ollama)?;
+        let resolved = store
+            .get(&id)
+            .map(|m| ResolvedModel {
+                path: m.path.clone(),
+                size_bytes: m.size_bytes,
+                ctx_train: m.ctx_train,
+                domain: m.domain,
+                arch: m.arch.clone(),
+            })
+            .ok_or_else(|| HiggsError::ModelNotFound { id: id.clone() })?;
+        let roots: Vec<PathBuf> = lmstudio.into_iter().chain(hf).chain(ollama).collect();
+        if !crate::api::path_within_roots(&resolved.path, &roots) {
+            return Err(HiggsError::InvalidModelId {
+                id,
+                reason: format!(
+                    "resolved path {} is outside every configured scan directory",
+                    resolved.path
+                ),
+            });
+        }
+        Ok(resolved)
+    })
+    .await
+    .map_err(|e| HiggsError::WorkerDead {
+        context: format!("model scan task failed: {e}"),
+    })?
+}
+
+/// A failed load. `sup` is `Some` only when the worker was already spawned before the
+/// failure (start / `M_LOAD`) — the actor then reaps it through the teardown coordinator
+/// during shutdown (so `shutdown_all` awaits its stop) or detached otherwise. `None` for
+/// pre-spawn failures (resolve / headroom), where there is nothing to reap.
+struct LoadFailure {
+    sup: Option<Arc<Supervisor>>,
+    error: HiggsError,
+}
+
+impl From<HiggsError> for LoadFailure {
+    /// Pre-spawn failure: no worker exists yet.
+    fn from(error: HiggsError) -> Self {
+        LoadFailure { sup: None, error }
+    }
+}
+
+/// The slow load: resolve the GGUF, run the pre-spawn RAM headroom guard ([HG017]), spawn
+/// a fresh Supervisor, start its child, and send `M_LOAD`. On success the `Arc<Supervisor>`
+/// is returned for the actor to commit under the reserved `id`. On a POST-spawn failure the
+/// worker is returned in [`LoadFailure::sup`] so the ACTOR owns its teardown — the reap is
+/// then awaited by `shutdown_all` (never a detached, un-awaited stop that could orphan on
+/// process exit). Runs OFF the actor thread.
+///
+/// NOTE: the cross-worker VRAM fit-check (§4.2b) is pending; the RAM headroom guard here
+/// is the existing local capacity check, reused.
+/// Build the worker `M_LOAD` params json from the node-resolved base fields + the
+/// optional rich override payload. ABSENT base fields are OMITTED (not serialized
+/// as `null`): the worker deserializes this whole object into `LlamaCppParams`,
+/// where the base fields are required `u32`, so a `null` would FAIL that deser and
+/// silently drop every merged rich override (flash_attn/type_k/cpu_moe/…). On an
+/// absent base field the worker re-derives it from its own `u32_param` defaults.
+fn worker_load_params(
+    id: &str,
+    path: &str,
+    ctx_len: Option<u32>,
+    gpu_layers: Option<crate::worker::engine::GpuLayers>,
+    threads: Option<u32>,
+    extra: &Option<crate::worker::engine::llamacpp::params::LlamaCppParams>,
+) -> Value {
+    let mut load = json!({ "id": id, "path": path });
+    let obj = load
+        .as_object_mut()
+        .expect("json! object is always an object");
+    if let Some(c) = ctx_len {
+        obj.insert("ctx_len".into(), c.into());
+    }
+    if let Some(g) = gpu_layers {
+        obj.insert(
+            "gpu_layers".into(),
+            serde_json::to_value(g).expect("GpuLayers serializes"),
+        );
+    }
+    // ONE zero policy across every count field: zero reads as ABSENT (the
+    // engine/worker default applies — 4 threads here), matching the ctx and
+    // rich-field handling below. Nothing validates the wire value upstream,
+    // and an explicit `threads: 0` would otherwise reach `with_n_threads(0)`
+    // unclamped (GGML assert territory).
+    if let Some(t) = threads.filter(|t| *t > 0) {
+        obj.insert("threads".into(), t.into());
+    }
+    // Merge the rich engine overrides (type_k, flash_attn, cpu_moe, n_seq_max, …) the
+    // worker applies. The base fields stay authoritative (the node owns ctx-cap /
+    // gpu_layers / threads resolution), so they (and any null) are skipped here.
+    if let Some(p) = extra {
+        if let Ok(Value::Object(map)) = serde_json::to_value(p) {
+            for (k, v) in map {
+                if matches!(k.as_str(), "ctx_len" | "gpu_layers" | "threads") || v.is_null() {
+                    continue;
+                }
+                // Zero thread/batch counts are the same GGML-assert territory
+                // as the base `threads: 0` SKIPPED above — one zero policy:
+                // ABSENCE (the engine default) is the only reading of "0".
+                // Deferred-to-first-chat crashes (with_n_threads_batch(0)
+                // etc.) never leave this node. NB the HUB strips these same
+                // zeros before its fleet sends (fleet.rs normalization), but
+                // this arm still catches RAW M_NODE_LOAD requests AND the
+                // LOCAL in-process path (node_params_for filters on
+                // has_overrides only, no zero-stripping) — the node must not
+                // trust its callers to normalize.
+                if matches!(
+                    k.as_str(),
+                    "n_threads_batch" | "n_batch" | "n_ubatch" | "n_seq_max"
+                ) && v.as_u64() == Some(0)
+                {
+                    continue;
+                }
+                obj.insert(k, v);
+            }
+        }
+    }
+    load
+}
+
+async fn do_load(
+    id: WorkerId,
+    params: NodeLoadParams,
+    spawner: SupervisorSpawner,
+    config: Arc<NodeConfig>,
+    relay: broadcast::Sender<(WorkerId, String)>,
+) -> Result<(Arc<Supervisor>, Value, LoadFacts), LoadFailure> {
+    let resolved = resolve_model(&config, &params.id).await?;
+    // Reject before spawning a worker if the model can't fit (mirrors Higgs::load).
+    crate::api::guard_memory_headroom(&params.id, resolved.size_bytes)?;
+
+    // Each worker gets its OWN LogBus so its stderr can be relayed tagged with the worker's
+    // id (the node has no UI of its own; the shared bus can't distinguish workers).
+    // Subscribe BEFORE start so load-time output is captured, then republish each line to
+    // the node-level relay tagged with `id`.
+    let wbus = Arc::new(LogBus::new());
+    // Inherit the node's verbose setting so the relayed lines match a local worker's.
+    wbus.set_verbose(config.bus.verbose());
+    let mut worker_logs = wbus.subscribe();
+    let sup = Arc::new((spawner)(wbus));
+    // Start the relay BEFORE `M_LOAD` — the verbose load-time stderr burst can far exceed
+    // the broadcast capacity, so a relay spawned only after load returns would `Lagged` and
+    // drop most of the dump. Draining concurrently keeps it flowing to the hub.
+    tokio::spawn(async move {
+        loop {
+            match worker_logs.recv().await {
+                Ok(line) if matches!(line.source, LogSource::Worker) => {
+                    let _ = relay.send((id, line.text));
+                }
+                Ok(_) => {} // non-worker line on a worker bus: ignore
+                Err(broadcast::error::RecvError::Lagged(_)) => {} // dropped gap; keep going
+                Err(broadcast::error::RecvError::Closed) => break, // worker gone
+            }
+        }
+    });
+    // Panic-safety net only: if this task is dropped between spawning the worker and an
+    // explicit return below (e.g. a panic), reap the child. Every NORMAL exit defuses it —
+    // success and post-spawn failure both hand `sup` back to the actor, which owns the reap.
+    let guard = StopOnDrop::new(sup.clone());
+    // Carry the worker out on a post-spawn failure so the actor (not a detached task) reaps
+    // it — that keeps the reap awaitable by `shutdown_all`.
+    let fail = |error: HiggsError| LoadFailure {
+        sup: Some(sup.clone()),
+        error,
+    };
+    if let Err(e) = sup.start_for(&params.id) {
+        guard.commit();
+        return Err(fail(e));
+    }
+    let (ctx_len, ctx_allocated) = effective_ctx(params.ctx_len, resolved.ctx_train);
+    let load_params = worker_load_params(
+        &params.id,
+        &resolved.path,
+        ctx_len,
+        params.gpu_layers,
+        params.threads,
+        &params.params,
+    );
+    let loaded = match sup.request(M_LOAD, load_params.clone()).await {
+        Ok(v) => v,
+        Err(e) => {
+            guard.commit();
+            return Err(fail(e));
+        }
+    };
+    // Record the load so the Supervisor's restart FSM replays it on an unexpected respawn —
+    // otherwise the replacement child would come back model-less.
+    sup.record_last_load(load_params);
+    guard.commit(); // handed back to the actor — don't reap
+    let facts = LoadFacts {
+        ctx_len: Some(ctx_allocated),
+        gpu_layers: params.gpu_layers,
+        threads: params.threads.filter(|t| *t > 0),
+        loaded_at_ms: unix_ms(),
+        domain: resolved.domain,
+        arch: resolved.arch,
+    };
+    Ok((sup, loaded, facts))
+}
+
+/// The context window for a load: what goes on the `M_LOAD` wire, and the
+/// OPERATIVE window the worker will run with (the inventory's `ctx_len`
+/// claim — the value the worker pins and every fit-check enforces; llama.cpp
+/// may pad its internal allocation upward, which no higgs surface observes).
+///
+/// Wire value: the caller's explicit ctx when non-zero, else the model's
+/// trained context capped at `DEFAULT_CTX_CAP` (mirrors `Higgs::load`) —
+/// rather than the worker's hardcoded fallback. A `ctx_len: 0` reads as
+/// ABSENT (one consistent auto spelling, like the zero thread/batch skips),
+/// and a degenerate trained context of 0 (malformed GGUF metadata) is
+/// filtered the same way instead of riding the wire as a literal `0` — the
+/// worker coerces both shapes to the same [`crate::worker::DEFAULT_WORKER_CTX`], so the
+/// wire behavior is unchanged; only the lie ("ctx 0" in the inventory for a
+/// 4096 allocation) is gone.
+///
+/// Allocated value: the wire value when present, else [`crate::worker::DEFAULT_WORKER_CTX`]
+/// — the exact coercion `handle_load` applies to an absent/zero ctx (shared
+/// const, can't drift).
+fn effective_ctx(requested: Option<u32>, ctx_train: Option<u64>) -> (Option<u32>, u32) {
+    let wire = requested.filter(|c| *c > 0).or_else(|| {
+        ctx_train
+            .map(|t| (t as u32).min(crate::api::DEFAULT_CTX_CAP))
+            .filter(|c| *c > 0)
+    });
+    let allocated = wire.unwrap_or(crate::worker::DEFAULT_WORKER_CTX);
+    (wire, allocated)
+}
+
+/// Node-level model catalog (`{ "models": [HiggsModel, …] }`) from a fresh scan. Read-only.
+async fn do_scan(config: &NodeConfig) -> Result<Value, HiggsError> {
+    let (lmstudio, hf, ollama) = config.model_dirs();
+    tokio::task::spawn_blocking(move || {
+        let mut store = ModelStore::default();
+        store.scan(&lmstudio, &hf, &ollama)?;
+        Ok::<Value, HiggsError>(json!({ "models": store.models() }))
+    })
+    .await
+    .map_err(|e| HiggsError::WorkerDead {
+        context: format!("scan task failed: {e}"),
+    })?
+}
+
+/// Enumerate GPUs via a transient worker, then fold them with sampled CPU/RAM/load into
+/// the `(hardware, runtime)` snapshot off the executor. Shared by `do_sysinfo` and
+/// `do_inventory`; `context` names the caller for the task-join error message.
+async fn hardware_runtime(
+    spawner: &SupervisorSpawner,
+    bus: &Arc<LogBus>,
+    context: &str,
+) -> Result<(crate::system::HardwareInfo, crate::system::RuntimeInfo), HiggsError> {
+    let sup = (spawner)(bus.clone());
+    let gpus = sup.sysinfo().await;
+    tokio::task::spawn_blocking(move || crate::system::SystemInfo::gather_hardware_runtime(gpus))
+        .await
+        .map_err(|e| HiggsError::WorkerDead {
+            context: format!("{context} task failed: {e}"),
+        })
+}
+
+/// Node-level system info: `{ "hardware": HardwareInfo, "runtime": RuntimeInfo }`.
+async fn do_sysinfo(spawner: &SupervisorSpawner, bus: &Arc<LogBus>) -> Result<Value, HiggsError> {
+    let (hardware, runtime) = hardware_runtime(spawner, bus, "sysinfo").await?;
+    Ok(json!({ "hardware": hardware, "runtime": runtime }))
+}
+
+/// Full node self-description for `M_NODE_INVENTORY`: host identity + every resident worker
+/// (snapshot taken on the actor thread) + the hardware/runtime snapshot.
+async fn do_inventory(
+    workers: Vec<crate::remote::InventoryWorker>,
+    snapshot_seq: u64,
+    spawner: &SupervisorSpawner,
+    bus: &Arc<LogBus>,
+) -> Result<Value, HiggsError> {
+    let (hardware, runtime) = hardware_runtime(spawner, bus, "inventory").await?;
+    let inventory = crate::remote::NodeInventory {
+        hostname: crate::system::hostname(),
+        os: std::env::consts::OS.to_string(),
+        workers,
+        hardware,
+        runtime,
+        snapshot_seq: Some(snapshot_seq),
+    };
+    serde_json::to_value(inventory).map_err(|e| HiggsError::WorkerDead {
+        context: format!("inventory serialize failed: {e}"),
+    })
+}
+
+/// The node orchestrator handle: a thin wrapper over the actor's mailbox. Cloning the
+/// underlying `Handle` keeps the actor alive; dropping the last one triggers `on_stop`.
+pub struct NodeRuntime {
+    handle: Handle<NodeMsg>,
+    /// Kept on the wrapper too so `subscribe_logs` needs no mailbox round-trip.
+    log_tx: broadcast::Sender<(WorkerId, String)>,
+    /// Lifecycle-event fan-out, mirrored on the wrapper so `events()` needs no round-trip.
+    events_tx: broadcast::Sender<HiggsEvent>,
+    /// The node's shared Developer-Log bus (P4b: the local engine reads/configures it here).
+    bus: Arc<LogBus>,
+    /// Runtime-mutable idle policy, shared with the reaper.
+    idle: Arc<IdleConfig>,
+    /// Fleet-event fan-out (T10), mirrored on the wrapper so `subscribe_fleet_events`
+    /// needs no mailbox round-trip.
+    fleet_tx: broadcast::Sender<crate::remote::NodeFleetEvent>,
+    /// Live hub-opened stream handlers (P4b (c)): `serve_node` wraps each spawned per-stream
+    /// handler in a [`StreamGuard`], so the update-restart drain can wait for the handlers
+    /// themselves — a chat's `in_flight` count drops when the GENERATION ends, but the detached
+    /// handler may still be flushing buffered chunks + the final response frame to the hub;
+    /// re-execing at that instant would truncate a completed generation's tail.
+    active_streams: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// RAII count of one live hub-stream handler (see `NodeRuntime::active_streams`). Created by
+/// [`NodeRuntime::stream_guard`] around each spawned handler; the count drops when the handler
+/// future finishes (or is cancelled) and the guard drops with it.
+pub struct StreamGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for StreamGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl NodeRuntime {
+    /// Production runtime (spawns real child workers).
+    pub fn new(config: NodeConfig) -> Self {
+        Self::with_spawner(config, Arc::new(Supervisor::spawn))
+    }
+
+    /// Runtime with an injected supervisor spawner (tests). Spawns the actor task — must be
+    /// called from within a Tokio runtime.
+    pub(crate) fn with_spawner(config: NodeConfig, spawner: SupervisorSpawner) -> Self {
+        let (log_tx, _) = broadcast::channel(LOG_RELAY_CAP);
+        let (events_tx, _) = broadcast::channel(EVENT_CAP);
+        let (fleet_tx, _) = broadcast::channel(EVENT_CAP);
+        let fleet_for_actor = fleet_tx.clone();
+        let config = Arc::new(config);
+        let bus = config.bus.clone();
+        let relay = log_tx.clone();
+        let events_for_actor = events_tx.clone();
+        let idle = Arc::new(IdleConfig::new(config.idle_ttl));
+        let idle_for_actor = idle.clone();
+        let idle_for_reaper = idle.clone();
+        let handle = spawn_actor_with(move |h| NodeActor {
+            registry: WorkerRegistry::new(),
+            spawner,
+            config,
+            log_tx: relay,
+            self_handle: h.downgrade(),
+            keepalive: None,
+            shutting_down: false,
+            inflight_loads: 0,
+            inflight_stops: 0,
+            shutdown_waiters: Vec::new(),
+            shutdown_done: false,
+            last_activity: HashMap::new(),
+            load_facts: HashMap::new(),
+            snapshot_seq: 0,
+            in_flight: HashMap::new(),
+            quiescing: false,
+            idle: idle_for_actor,
+            events_tx: events_for_actor,
+            fleet_tx: fleet_for_actor,
+        });
+        // Idle reaper: a WeakHandle so it never keeps the actor alive — it exits the tick the
+        // last real handle drops (upgrade fails). The cadence is ADAPTIVE — each iteration
+        // sleeps `reap_interval(idle.ttl())`, re-reading the live TTL — so a runtime TTL change
+        // (Server-Settings) is honored at the new cadence within one period, not frozen to the
+        // startup TTL.
+        let reaper = handle.downgrade();
+        tokio::spawn(async move {
+            loop {
+                // Wake on the cadence OR immediately when settings change, so a lowered TTL /
+                // re-enable takes effect without waiting out the prior sleep.
+                tokio::select! {
+                    _ = tokio::time::sleep(reap_interval(idle_for_reaper.ttl())) => {}
+                    _ = idle_for_reaper.changed.notified() => {}
+                }
+                match reaper.upgrade() {
+                    Some(h) => {
+                        if h.send(NodeMsg::ReapIdle).is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+        });
+        Self {
+            handle,
+            log_tx,
+            events_tx,
+            bus,
+            idle,
+            fleet_tx,
+            active_streams: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    /// The runtime-mutable idle auto-unload policy (TTL + on/off). The engine wires its
+    /// Server-Settings toggles to this; the reaper reads it live.
+    pub fn idle(&self) -> &Arc<IdleConfig> {
+        &self.idle
+    }
+
+    /// Error returned when the actor mailbox is gone (shutting down / loop ended).
+    fn actor_gone() -> HiggsError {
+        HiggsError::WorkerDead {
+            context: "node runtime stopped".into(),
+        }
+    }
+
+    /// Send a message carrying a `Result` reply and flatten the channel + op errors.
+    async fn call<T>(
+        &self,
+        make: impl FnOnce(oneshot::Sender<Result<T, HiggsError>>) -> NodeMsg,
+    ) -> Result<T, HiggsError> {
+        let (tx, rx) = oneshot::channel();
+        self.handle.send(make(tx)).map_err(|_| Self::actor_gone())?;
+        rx.await.map_err(|_| Self::actor_gone())?
+    }
+
+    /// Subscribe to the per-worker stderr relay (`(worker_id, line)`). The node's
+    /// `serve_node` drains this onto a uni stream to the hub as `N_LOG_LINE`.
+    pub fn subscribe_logs(&self) -> broadcast::Receiver<(WorkerId, String)> {
+        self.log_tx.subscribe()
+    }
+
+    /// Subscribe to lifecycle events (ModelLoaded/ModelUnloaded) — the engine's event stream.
+    pub fn events(&self) -> broadcast::Receiver<HiggsEvent> {
+        self.events_tx.subscribe()
+    }
+
+    /// Subscribe to fleet events (T10): typed worker-state changes carrying the
+    /// post-change worker snapshot, actor-sequenced. The node's `serve_node` drains
+    /// this onto a dedicated uni stream to the hub as `N_FLEET_EVENT`. The actor
+    /// skips the snapshot work entirely while there is no subscriber.
+    pub fn subscribe_fleet_events(&self) -> broadcast::Receiver<crate::remote::NodeFleetEvent> {
+        self.fleet_tx.subscribe()
+    }
+
+    /// Ask the actor for a FRESH fleet event of `kind` (T10 r25) — the relay's
+    /// stream-failure recovery. Best-effort: ignored if the actor is gone.
+    pub fn request_fleet_resnapshot(&self) {
+        let _ = self.handle.send(NodeMsg::FleetResnapshot);
+    }
+
+    /// The node's shared Developer-Log bus (Developer-Logs history + live stream + verbosity).
+    pub fn bus(&self) -> &Arc<LogBus> {
+        &self.bus
+    }
+
+    /// The full per-worker inventory rows (model + T9 runtime stats) in one
+    /// atomic actor read — what `M_NODE_INVENTORY` carries, minus hardware
+    /// (`served_id` left empty; the hub fills it). Empty if the actor has
+    /// stopped.
+    pub async fn worker_snapshot(&self) -> Vec<crate::remote::InventoryWorker> {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .handle
+            .send(NodeMsg::WorkerSnapshot { reply: tx })
+            .is_err()
+        {
+            return Vec::new();
+        }
+        rx.await.unwrap_or_default()
+    }
+
+    /// Resident `(worker, raw model)` pairs — the fast id/model read and the
+    /// engine's input to global served-id derivation. Empty if the actor has
+    /// stopped.
+    pub async fn instances(&self) -> Vec<(WorkerId, String)> {
+        let (tx, rx) = oneshot::channel();
+        if self.handle.send(NodeMsg::Instances { reply: tx }).is_err() {
+            return Vec::new();
+        }
+        rx.await.unwrap_or_default()
+    }
+
+    /// Enumerate host GPUs (control-plane; via a transient worker). Empty on failure.
+    pub async fn gpus(&self) -> Vec<crate::system::GpuDevice> {
+        let (tx, rx) = oneshot::channel();
+        if self.handle.send(NodeMsg::Gpus { reply: tx }).is_err() {
+            return Vec::new();
+        }
+        rx.await.unwrap_or_default()
+    }
+
+    /// Every resident worker's LOAD-TIME domain (empty if the actor has stopped).
+    /// See [`NodeMsg::WorkerDomains`] for why this exists next to the scan.
+    pub(crate) async fn worker_domains(
+        &self,
+    ) -> std::collections::HashMap<WorkerId, crate::worker::models::ModelDomain> {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .handle
+            .send(NodeMsg::WorkerDomains { reply: tx })
+            .is_err()
+        {
+            return Default::default();
+        }
+        rx.await.unwrap_or_default()
+    }
+
+    /// Live worker ids, ascending (empty if the actor has stopped).
+    pub async fn worker_ids(&self) -> Vec<WorkerId> {
+        let (tx, rx) = oneshot::channel();
+        if self.handle.send(NodeMsg::WorkerIds { reply: tx }).is_err() {
+            return Vec::new();
+        }
+        rx.await.unwrap_or_default()
+    }
+
+    /// Spawn a NEW worker for `params.id` and load the model (does NOT replace others). The
+    /// node resolves the GGUF path from its own disk; returns the new `WorkerId` and the
+    /// worker's `M_LOAD` result. A slow load runs concurrently and cannot block other ops.
+    pub async fn load(&self, params: NodeLoadParams) -> Result<(WorkerId, Value), HiggsError> {
+        self.call(|reply| NodeMsg::Load { params, reply }).await
+    }
+
+    /// Graceful unload: stop the worker, free the id.
+    pub async fn unload(&self, id: WorkerId) -> Result<(), HiggsError> {
+        self.call(|reply| NodeMsg::Unload { id, reply }).await
+    }
+
+    /// Force-kill ONE worker. Identical to [`unload`](Self::unload) at this layer.
+    pub async fn kill(&self, id: WorkerId) -> Result<(), HiggsError> {
+        self.call(|reply| NodeMsg::Kill { id, reply }).await
+    }
+
+    /// Per-worker status (forwards `M_STATUS` to that worker's Supervisor).
+    pub async fn status(&self, id: WorkerId) -> Result<Value, HiggsError> {
+        self.call(|reply| NodeMsg::Status { id, reply }).await
+    }
+
+    /// Node-level model catalog from a fresh scan of the node's roots.
+    pub async fn scan(&self) -> Result<Value, HiggsError> {
+        self.call(|reply| NodeMsg::Scan { reply }).await
+    }
+
+    /// Node-level system info: `{ "hardware": HardwareInfo, "runtime": RuntimeInfo }`.
+    pub async fn sysinfo(&self) -> Result<Value, HiggsError> {
+        self.call(|reply| NodeMsg::Sysinfo { reply }).await
+    }
+
+    /// Full node self-description for `M_NODE_INVENTORY`.
+    pub async fn inventory(&self) -> Result<Value, HiggsError> {
+        self.call(|reply| NodeMsg::Inventory { reply }).await
+    }
+
+    /// Lease a worker's Supervisor for one chat (idle-reaper-safe — see [`ChatLease`]). Hold
+    /// the returned lease for the whole generation; dropping it ends the chat's in-flight hold.
+    pub(crate) async fn chat_handle(
+        &self,
+        id: WorkerId,
+        model: &str,
+    ) -> Result<ChatLease, HiggsError> {
+        let model = model.to_owned();
+        self.call(|reply| NodeMsg::ChatHandle { id, model, reply })
+            .await
+    }
+
+    /// Graceful drain: stop every resident worker and empty the registry. The node daemon
+    /// calls this on shutdown so committed workers are reaped.
+    pub async fn shutdown_all(&self) {
+        let (tx, rx) = oneshot::channel();
+        if self.handle.send(NodeMsg::ShutdownAll { reply: tx }).is_ok() {
+            let _ = rx.await;
+        }
+    }
+
+    /// Total in-flight generations across every resident worker — one of the two drain signals
+    /// for the update-restart path (P4b (c)). Sums the same per-worker counters the fleet
+    /// inventory reports; `0` when idle or when the actor has already stopped (nothing left to
+    /// drain).
+    pub async fn in_flight_total(&self) -> u32 {
+        self.worker_snapshot()
+            .await
+            .iter()
+            .map(|w| w.in_flight.unwrap_or(0))
+            .sum()
+    }
+
+    /// Count one live hub-stream handler for the drain (P4b (c)) — `serve_node` holds the
+    /// returned guard across each spawned per-stream handler; the count drops with the guard.
+    pub fn stream_guard(&self) -> StreamGuard {
+        self.active_streams
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        StreamGuard(self.active_streams.clone())
+    }
+
+    /// Live hub-stream handlers (guards outstanding) — the second drain signal: a generation's
+    /// `in_flight` drops when it ENDS, but its handler may still be flushing the response tail.
+    pub fn active_streams(&self) -> usize {
+        self.active_streams
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Refuse every chat lease requested after this returns (mailbox order is the barrier — see
+    /// `NodeMsg::QuiesceChats`). One-way; part of the update-restart drain. A no-op if the actor
+    /// is already gone.
+    pub async fn quiesce_chats(&self) {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .handle
+            .send(NodeMsg::QuiesceChats { reply: tx })
+            .is_ok()
+        {
+            let _ = rx.await;
+        }
+    }
+
+    /// The update-restart drain (P4b (c)), BOUNDED. In order:
+    /// 1. QUIESCE: no chat lease is granted from here on (a lease the actor granted first drains
+    ///    below; a request arriving after is cleanly refused rather than truncated moments later)
+    ///    — closing the window where a hub stream was ACCEPTED before the serve loop broke but
+    ///    had not yet taken its lease, which polling `in_flight` alone cannot see.
+    /// 2. Poll until BOTH signals are zero — no in-flight generation AND no live stream handler
+    ///    (a generation's `in_flight` drops at its END, but the detached handler may still be
+    ///    flushing buffered chunks + the final response frame to the hub) — or `deadline`
+    ///    elapses (returns `false`; the caller proceeds to `shutdown_all`, which then truncates
+    ///    only the stragglers, exactly the pre-drain behavior).
+    ///
+    /// SIGTERM has already broken the serve loop, so no NEW streams arrive (`serve_node`'s
+    /// accept loop is gone) while the DETACHED per-stream handlers finish.
+    pub async fn drain_until_idle(
+        &self,
+        poll_every: std::time::Duration,
+        deadline: std::time::Duration,
+    ) -> bool {
+        self.quiesce_chats().await;
+        let started = tokio::time::Instant::now();
+        loop {
+            if self.in_flight_total().await == 0 && self.active_streams() == 0 {
+                return true;
+            }
+            if started.elapsed() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(poll_every).await;
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "runtime_tests.rs"]
+mod tests;

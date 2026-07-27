@@ -1,27 +1,28 @@
-//! HTTP surfaces for higgs, split by concern:
+//! The higgs HTTP surface. higgs is library-first, so the ONLY thing served over
+//! a socket is the strict OpenAI `/v1` (chat + models):
 //!
-//! - [`v1`]      — strict OpenAI `/v1` (chat + models), `async-openai` types verbatim
-//! - [`control`] — higgs's own `/api/higgs/*` surface (load/unload/status/…)
-//! - [`wire`]    — the control request/response structs (ts-rs exported)
-//! - [`stream`]  — SSE assembly for streaming chat
+//! - [`v1`] — strict OpenAI `/v1` (chat + models), `async-openai` types verbatim.
+//! - [`wire`] — higgs's own ts-rs-exported control request/response structs (still
+//!   the crate-API return shapes the facade builds).
+//! - [`stream`] — SSE assembly for streaming chat.
+//! - [`control`] — the SHARED control helpers the [`Higgs`] facade delegates to
+//!   (row formatting, mint/revoke decisions, hub-status snapshot). There is no
+//!   longer a `/api/higgs/*` HTTP surface — control runs in-process via the crate API.
 //!
-//! This module owns only the cross-cutting pieces: the [`router`], graceful
-//! [`serve_with_shutdown`], CORS, and the shared [`http_status`] mapping.
-//!
-//! ## Adding a control endpoint
-//!
-//! 1. Add the response struct to `wire.rs` wrapped in `higgs_ts! { … }` (the
-//!    macro injects the `ts_rs::TS` derive + export into
-//!    `frontend/src/lib/generated/higgs/`) and re-export it from
-//!    `frontend/src/lib/types.ts` via `./generated/higgs/<Name>`.
-//! 2. Add `async fn control_<name>` to `control.rs`.
-//! 3. Register it in [`router`] under `/api/higgs/<name>`.
+//! This module owns the cross-cutting pieces: the `/v1` [`v1_router`], graceful
+//! [`serve_v1`], CORS, and the shared [`http_status`] mapping.
 
-mod control;
+pub(crate) mod control;
+// `pub` (not `pub(crate)`) because `ModelReadiness` is a field type on the
+// publicly re-exported `wire::HiggsModelEntry` (`pub use wire::*`), matching the
+// other wire field types' modules (`pub mod engine` / `pub mod models`). Keeps
+// the public `serve` surface self-consistent — every wire field type is nameable.
+pub mod readiness;
 mod stream;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod v1;
+mod v1_wire;
 pub(crate) mod wire;
 
 use std::sync::Arc;
@@ -53,13 +54,28 @@ use crate::diagnostic::HiggsError;
 /// ours is larger because a long conversation transcript is legitimately big.)
 pub const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 
-/// Whole-request timeout for the **non-streaming control surface**
-/// (`/api/higgs/*`). Generous (a cold model load can take seconds), but bounded
-/// so a wedged control request can't pin a connection forever. Deliberately
+/// Whole-request timeout for the **non-streaming `/v1` routes** (models list
+/// and friends — named "control" from when it bounded the deleted
+/// `/api/higgs/*` surface; also reported in `system` info as
+/// `control_timeout_secs`). Generous (a cold model load can take seconds), but
+/// bounded so a wedged request can't pin a connection forever. Deliberately
 /// **not** applied to `/v1/chat/completions`: a long SSE stream must outlive any
 /// per-request timeout (its duration is bounded separately by the worker
 /// chat-RPC timeout, a different layer).
 pub const CONTROL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Whole-request timeout for the LONG model ops (load and tune — formerly the
+/// `/api/higgs/models/load` and `/models/tune` routes), exempt from the tighter
+/// [`CONTROL_TIMEOUT`]. A **load** can walk the G5 OOM degrade-retry ladder (the
+/// initial load plus several rungs, each a worker load bounded by the control-RPC
+/// timeout, with a `SETTLE_BEFORE_RETRY` pause between); a Turbotune **benchmark**
+/// loads + measures several candidate configs back-to-back. On a normal-size model
+/// both easily exceed two minutes — under `CONTROL_TIMEOUT` the request would be
+/// cancelled (408) before the ladder returns [HG060] / a profile is saved. This
+/// generous cap is still a backstop: each underlying load/decode is independently
+/// bounded by the worker load/RPC timeouts, so a wedged op can't run forever. The
+/// fast analytical Suggest mode and a fits-first-time load complete well within it.
+pub const LONG_OP_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 
 /// Upper cap on a chat request's generation budget (`max_tokens` /
 /// `max_completion_tokens`). A request asking for more is rejected with
@@ -91,105 +107,183 @@ pub const PROMPT_BYTES_PER_TOKEN: usize = 4;
 // ts-rs export path), so re-export them at `crate::serve::*`.
 pub use wire::*;
 
-/// Map a `HiggsError` to its HTTP status — the single status table shared by
-/// both surfaces and the SSE path: HG002/HG003 → 404, HG005/HG013/HG015 → 400,
-/// HG006/HG007/HG014/HG017/HG018/HG019 → 503, HG016 → 504, else 500.
+/// Map a `HiggsError` to its HTTP status — the single status table shared by the
+/// `/v1` surface and the SSE path: HG002/HG003 → 404, HG005/HG013/HG015 → 400,
+/// HG006/HG007/HG014/HG017/HG018/HG019 → 503, HG016 → 504, HG037 → 501,
+/// HG038/HG039 → 502, and the internal/persistence/admin/chat-task faults
+/// (HG040–HG044) → 500 (the default).
 pub(crate) fn http_status(err: &HiggsError) -> StatusCode {
     match err {
         HiggsError::ModelNotFound { .. } | HiggsError::ModelNotLoaded { .. } => {
             StatusCode::NOT_FOUND
         }
+        // The id exists and is loadable — it just isn't a chat model ([HG079]). The
+        // request is well-formed but asks the wrong capability of it, so 400, not the
+        // 404 of an absent/unloaded id: re-issuing it against this id can never work.
+        HiggsError::ModelNotChatCapable { .. } => StatusCode::BAD_REQUEST,
+        // Missing/insufficient API key.
+        HiggsError::Unauthorized => StatusCode::UNAUTHORIZED,
+        // Refused state transition (last-key revoke on a LAN bind): the
+        // request is well-formed but conflicts with the server's live
+        // exposure state — mint a replacement first.
+        HiggsError::LastKeyOnLan { .. } => StatusCode::CONFLICT,
+        // Revoking the last Admin key while other keys remain would lock out the
+        // key-management surface ([HG066]) — a conflict with the current key set.
+        HiggsError::LastAdminKey { .. } => StatusCode::CONFLICT,
+        // Benchmark refused because the model is loaded ([HG067]) — a conflict the
+        // client resolves by unloading first.
+        HiggsError::BenchModelLoaded { .. } => StatusCode::CONFLICT,
+        // An ephemeral load refused because the model is already resident
+        // ([HG080]) — same conflict class as BenchModelLoaded: eject first.
+        // No serve endpoint calls load_ephemeral today; the arm keeps this
+        // choke point exhaustive for when one does.
+        HiggsError::EphemeralResident { .. } => StatusCode::CONFLICT,
+        // Load/chat refused because a benchmark owns the model ([HG068]) — a
+        // transient capacity condition; retry after the benchmark finishes.
+        HiggsError::BenchInProgress { .. } => StatusCode::SERVICE_UNAVAILABLE,
+        // A Turbotune benchmark cancelled by a concurrent load/unload/stop — a
+        // transient conflict; re-run when idle.
+        HiggsError::BenchCancelled => StatusCode::CONFLICT,
         // Client-side request errors caught at the boundary before dispatch.
         HiggsError::ContextOverflow { .. }
         | HiggsError::InvalidSamplingParam { .. }
-        | HiggsError::InvalidModelId { .. } => StatusCode::BAD_REQUEST,
+        | HiggsError::InvalidModelId { .. }
+        | HiggsError::InvalidRequest { .. }
+        // HG072: a keystore request (mint/revoke) that failed validation — same
+        // 400 class as HG049, split only so the message doesn't hand a token
+        // mint advice about the chat schema.
+        | HiggsError::InvalidKeyRequest { .. }
+        // A model that isn't Prepared (or whose profile is stale) is a client
+        // precondition failure — the caller must Prepare/Re-tune first.
+        | HiggsError::NotPrepared { .. }
+        | HiggsError::ProfileStale { .. }
+        // HG050: the prompt could not be BUILT for this request+model (e.g.
+        // the template rejects `tools`); an identical retry fails identically,
+        // but a changed request (drop tools) may succeed → client error.
+        | HiggsError::TemplateRenderFailed { .. } => StatusCode::BAD_REQUEST,
         // Capacity / infrastructure-down — retryable.
         HiggsError::WorkerSpawnFailed { .. }
         | HiggsError::WorkerDead { .. }
         | HiggsError::ServerBusy { .. }
         | HiggsError::InsufficientMemory { .. }
+        // A load that OOM'd through the whole degrade ladder — the machine is
+        // out of memory right now; freeing VRAM or a smaller footprint may fix
+        // it, so it's a retryable capacity signal, not a client error.
+        | HiggsError::LoadOomExhausted { .. }
+        // A Turbotune benchmark that found no fitting config — same retryable
+        // capacity signal (free VRAM / lower the budget and re-run).
+        | HiggsError::BenchExhausted { .. }
+        // A retired/unreachable remote node is infrastructure-down — retryable.
+        | HiggsError::NodeUnreachable { .. }
         | HiggsError::ServingDisabled => StatusCode::SERVICE_UNAVAILABLE,
         // A wedged-but-alive worker that didn't finish generation in time.
         HiggsError::ChatTimeout { .. } => StatusCode::GATEWAY_TIMEOUT,
+        // An unimplemented RPC method = a protocol this server doesn't speak → 501.
+        HiggsError::RpcMethodNotFound { .. } => StatusCode::NOT_IMPLEMENTED,
+        // An upstream PEER (a node/worker we relay to) misbehaved or rejected us —
+        // we are a faulty gateway to it, not the origin of the fault → 502.
+        HiggsError::ProtocolViolation { .. } | HiggsError::HubRequestRejected { .. } => {
+            StatusCode::BAD_GATEWAY
+        }
         // A worker-reported error carries the worker's origin diagnostic code;
-        // map by it so a worker-side HG002/HG003/HG005/HG006/HG007 reaches the
-        // client as its true status instead of a generic 500.
+        // map by it so a worker-side code (local OR propagated from a remote node)
+        // reaches the client as its true status instead of a generic 500.
         HiggsError::WorkerRpc { worker_code, .. } => match worker_code.as_deref() {
             Some("HG002") | Some("HG003") => StatusCode::NOT_FOUND,
-            Some("HG005") => StatusCode::BAD_REQUEST,
-            // HG006/HG007: worker down. HG018: the resolved model was swapped
-            // out by a concurrent JIT load before generation (transient) — the
-            // client should retry, which re-JITs the requested model.
-            Some("HG006") | Some("HG007") | Some("HG018") => StatusCode::SERVICE_UNAVAILABLE,
+            // HG050: template render failed in the worker — same client-error
+            // reasoning as the direct arm above.
+            Some("HG005") | Some("HG050") => StatusCode::BAD_REQUEST,
+            // HG006/HG007: worker down. HG017: remote node couldn't fit the model.
+            // HG018: the resolved model was swapped out by a concurrent JIT load
+            // (transient) — the client should retry, which re-JITs the model.
+            // HG060: a REMOTE node's load exhausted the OOM ladder — the same
+            // retryable capacity signal as the direct `LoadOomExhausted` arm,
+            // propagated back as a worker code (codex r19).
+            Some("HG006") | Some("HG007") | Some("HG017") | Some("HG018") | Some("HG060") => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+            // HG016: a remote chat that timed out, propagated as a worker code.
+            Some("HG016") => StatusCode::GATEWAY_TIMEOUT,
+            // HG079: a remote node's ChatHandle refused a non-generative worker —
+            // the same 400 as the direct `ModelNotChatCapable` arm above.
+            Some("HG079") => StatusCode::BAD_REQUEST,
+            // Worker/node→hub→HTTP propagated codes keep their direct-arm status
+            // (explicit, not the 500 default, for parity).
+            Some("HG037") => StatusCode::NOT_IMPLEMENTED,
+            Some("HG038") => StatusCode::BAD_GATEWAY,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         },
+        // Internal faults (HG042), local persistence (HG040/HG041), fleet-admin
+        // (HG043), and an aborted chat task (HG044) are all server-side 500s.
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
 /// Cheap readiness probe: returns `200 OK` as soon as the HTTP server is up,
 /// without any worker RPC. "Server is reachable" — not "a model is loaded".
-/// Mirrors vllm's `/health`. Served at both `/health` and `/api/higgs/health`.
+/// Mirrors vllm's `/health`. Served at `/health`.
 async fn health() -> StatusCode {
     StatusCode::OK
 }
 
-/// Build the higgs router: OpenAI-compatible `/v1` + `/api/higgs/*` control.
+/// Build the `/v1`-ONLY router: the OpenAI-compatible chat + models surface,
+/// with NO `/api/higgs/*` control routes at all. This is the surface an external
+/// app (a non-embedding client) reaches over HTTP; control lives on the
+/// in-process crate API, not on any socket.
 ///
-/// The host serves this on its own listener; all state flows through the shared
-/// [`Higgs`] facade. Hardening (established ollama/vllm practice) layered here:
+/// Routes: `POST /v1/chat/completions` (streaming — no whole-request timeout),
+/// `GET /v1/models`, and the cheap `GET /health` probe. There is deliberately no
+/// `/api/higgs/health` here — this router never carried the `/api/higgs/*`
+/// namespace, so every such path 404s by construction (not by deletion).
 ///
-/// - **DNS-rebinding host guard** ([`host_guard`]) on every request — rejects a
-///   `Host` header that isn't loopback, so a malicious page can't rebind a
-///   hostname to `127.0.0.1` and reach this no-auth server.
-/// - **Body-size limit** ([`MAX_BODY_BYTES`]) → `413` on oversized bodies.
-/// - **Panic recovery** ([`CatchPanicLayer`]) → a handler panic becomes a `500`
-///   instead of dropping the connection.
-/// - **Control timeout** ([`CONTROL_TIMEOUT`]) on `/api/higgs/*` only — the
-///   streaming `/v1/chat/completions` is left un-timed at the HTTP layer so a
-///   long SSE stream is never aborted mid-flight.
-pub fn router(higgs: Arc<Higgs>) -> Router {
-    // Streaming surface: NO whole-request timeout (an SSE stream must outlive
-    // any per-request bound). The chat duration is bounded separately by the
-    // worker chat-RPC timeout; the live log stream is unbounded by design.
-    let streaming = Router::new()
-        .route("/v1/chat/completions", post(v1::v1_chat_completions))
-        .route("/api/higgs/logs/stream", get(control::control_logs_stream));
+/// The layer stack is `DefaultBodyLimit` → `CatchPanicLayer` → [`auth_guard`] →
+/// [`host_guard`] → [`local_cors`] → `with_state`. Embedded hosts bind loopback,
+/// so the DNS-rebinding Host guard is on.
+pub fn v1_router(higgs: Arc<Higgs>) -> Router {
+    // The CORS layer reads the facade's LIVE allowlist per request (G7), so a
+    // mounted router honors `set_cors_origins` changes immediately, exactly
+    // like a `serve_v1` listener. Disclosure semantics for a mounted router
+    // stay pre-serve (`Higgs::cors_settings` keys "live" off registered
+    // listeners, and a mounted router never registers): higgs cannot know
+    // when a mounted router goes live.
+    v1_router_with_host_policy(higgs, true)
+}
 
-    // Control + non-streaming surface: a generous whole-request timeout is safe
-    // and prevents a wedged request pinning a connection.
-    let control = Router::new()
-        .route("/v1/models", get(v1::v1_models))
-        .route("/api/higgs/models", get(control::control_models))
-        .route("/api/higgs/models/load", post(control::control_load))
-        .route("/api/higgs/models/unload", post(control::control_unload))
-        .route("/api/higgs/models/{*id}", get(control::control_model_by_id))
-        .route("/api/higgs/status", get(control::control_status))
-        .route("/api/higgs/system", get(control::control_system))
-        .route("/api/higgs/logs", get(control::control_logs))
-        .route(
-            "/api/higgs/logs/settings",
-            get(control::control_logs_settings).put(control::control_set_logs_settings),
-        )
-        .route(
-            "/api/higgs/settings",
-            get(control::control_settings).put(control::control_set_settings),
-        )
-        .route("/api/higgs/worker/stop", post(control::control_worker_stop))
-        .route("/api/higgs/version", get(control::control_version))
-        .layer(TimeoutLayer::with_status_code(
-            StatusCode::REQUEST_TIMEOUT,
-            CONTROL_TIMEOUT,
-        ));
+/// [`v1_router`] with the Host-guard policy made explicit. `enforce_loopback_host`
+/// is `true` for a loopback bind (keep the DNS-rebinding defense) and `false` for
+/// a deliberate non-loopback bind (which [HG058] guarantees is key-gated, so LAN
+/// clients' natural `Host: <lan-ip>:<port>` must not 403 before auth).
+///
+/// `pub(crate)` — NOT `pub`: the relaxed (`false`) policy must be reachable ONLY
+/// through [`serve_v1`], which runs the [HG058] keyless-LAN and [HG069] no-Admin
+/// refusals and arms `lan_exposed` BEFORE building it. A `pub` relaxed
+/// constructor would let an out-of-crate embedder serve unauthenticated on a LAN
+/// with the Host guard off.
+pub(crate) fn v1_router_with_host_policy(higgs: Arc<Higgs>, enforce_loopback_host: bool) -> Router {
+    // Streaming surface: NO whole-request timeout (an SSE stream must outlive any
+    // per-request bound). The chat duration is bounded separately by the worker
+    // chat-RPC timeout.
+    let streaming = Router::new().route("/v1/chat/completions", post(v1::v1_chat_completions));
+
+    // `/v1/models` is a cheap non-streaming call; a generous whole-request
+    // timeout ([`CONTROL_TIMEOUT`]) keeps a wedged request from pinning a
+    // connection.
+    let models = Router::new().route("/v1/models", get(v1::v1_models)).layer(
+        TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, CONTROL_TIMEOUT),
+    );
 
     streaming
-        .merge(control)
+        .merge(models)
         .route("/health", get(health))
-        .route("/api/higgs/health", get(health))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(CatchPanicLayer::new())
-        .layer(middleware::from_fn(host_guard))
-        .layer(local_cors())
+        // Auth runs AFTER the host guard (outer layers run first): reject a non-loopback
+        // Host before doing any key work. `from_fn_with_state` gives the guard the keystore.
+        .layer(middleware::from_fn_with_state(higgs.clone(), auth_guard))
+        .layer(middleware::from_fn(move |req, next| {
+            host_guard(enforce_loopback_host, req, next)
+        }))
+        .layer(local_cors(higgs.clone()))
         .with_state(higgs)
 }
 
@@ -199,7 +293,13 @@ pub fn router(higgs: Arc<Higgs>) -> Router {
 /// DNS-rebind its own hostname to `127.0.0.1` and reach this server from the
 /// victim's browser. A missing `Host` header is rejected (ollama behavior). On
 /// rejection: `403` carrying the `[HG012]` diagnostic.
-async fn host_guard(req: Request, next: Next) -> Response {
+async fn host_guard(enforce_loopback_host: bool, req: Request, next: Next) -> Response {
+    if !enforce_loopback_host {
+        // Keyed non-loopback bind: every data route is bearer-gated, so DNS
+        // rebinding gains nothing — and LAN clients legitimately send their
+        // server's LAN ip/hostname in `Host`.
+        return next.run(req).await;
+    }
     match host_allowed(req.headers()) {
         Ok(()) => next.run(req).await,
         Err(host) => {
@@ -208,6 +308,91 @@ async fn host_guard(req: Request, next: Next) -> Response {
             (StatusCode::FORBIDDEN, err.to_string()).into_response()
         }
     }
+}
+
+/// API-key auth (P5): when keys are configured, require a `Authorization: Bearer hgk_…`
+/// with the scope the route needs. An empty keystore disables auth (embedded host). Health
+/// checks are always open. On failure: `401` with an OpenAI-style error envelope +
+/// `WWW-Authenticate: Bearer`.
+async fn auth_guard(
+    axum::extract::State(higgs): axum::extract::State<Arc<Higgs>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let Some(required) = required_scope(req.uri().path()) else {
+        return next.run(req).await; // health / unmatched → open (routing handles it)
+    };
+    let keys = higgs.api_keys();
+    if keys.is_empty() {
+        // No keys configured ⇒ auth OFF (keyless-loopback-open). This is the
+        // local-dev default: an empty keystore means the surface is open, which is
+        // safe only because a keyless bind is loopback-only (the non-loopback [HG058]
+        // refusal in `serve_v1` guarantees it). An embedder that wants auth mints
+        // real keys (`Higgs::mint_key` / `register_internal_token`); once ANY key
+        // exists the store is non-empty and every request — embedder and external
+        // app alike — goes through the bearer check below on equal footing.
+        return next.run(req).await;
+    }
+    match bearer_token(req.headers()).and_then(|tok| keys.authorizing_sha(&tok, required)) {
+        Some(sha) => {
+            // Record last-used on the matched key (throttled, best-effort).
+            higgs.touch_api_key(&sha);
+            next.run(req).await
+        }
+        None => unauthorized(),
+    }
+}
+
+/// The scope a request needs, or `None` for an always-open path (health). Reads:
+/// chat → `Chat`, model listing → `Models`, everything else under `/v1` → `Admin`.
+/// Only the `/v1` surface is served now, so there are no `/api/higgs/*` arms (and
+/// the method no longer disambiguates a scope, so it is not read).
+fn required_scope(path: &str) -> Option<crate::keys::Scope> {
+    use crate::keys::Scope;
+    if path == "/health" {
+        return None;
+    }
+    if path == "/v1/chat/completions" {
+        return Some(Scope::Chat);
+    }
+    if path == "/v1/models" {
+        return Some(Scope::Models);
+    }
+    if path.starts_with("/v1/") {
+        return Some(Scope::Admin);
+    }
+    None
+}
+
+/// Extract the bearer token from an `Authorization: Bearer <token>` header.
+fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    let v = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
+    v.strip_prefix("Bearer ")
+        .or_else(|| v.strip_prefix("bearer "))
+        .map(|t| t.trim().to_string())
+}
+
+/// The `401` envelope (OpenAI-style `error` object) for a missing/insufficient key.
+/// The message is the coded [`HiggsError::Unauthorized`] display ("[HG048] …"),
+/// so the `401` carries a diagnostic code + resolution like every other reply,
+/// while the OpenAI `code: "unauthorized"` stays for client compatibility.
+pub(super) fn unauthorized() -> Response {
+    let body = axum::Json(serde_json::json!({
+        "error": {
+            "message": HiggsError::Unauthorized.to_string(),
+            "type": "invalid_request_error",
+            "code": "unauthorized",
+        }
+    }));
+    let mut resp = (StatusCode::UNAUTHORIZED, body).into_response();
+    resp.headers_mut().insert(
+        axum::http::header::WWW_AUTHENTICATE,
+        HeaderValue::from_static("Bearer"),
+    );
+    resp
 }
 
 /// Validate the `Host` header: the host portion (sans `:port`) must be a
@@ -230,9 +415,9 @@ fn host_allowed(headers: &HeaderMap) -> Result<(), String> {
 /// Whether a `Host`-header value (`host` or `host:port`) names a loopback host:
 /// `localhost`, any IPv4 in `127.0.0.0/8`, or IPv6 `::1` / `[::1]`. The host
 /// portion is the part before the final `:port`, with IPv6 brackets handled
-/// (`[::1]:11434`). The `127.0.0.0/8` acceptance matches `is_loopback_bind` in
-/// the `higgs` binary, so any loopback bind the binary permits without a
-/// warning is also reachable through the Host guard.
+/// (`[::1]:11434`). The `127.0.0.0/8` acceptance matches the loopback-bind rule
+/// [`serve_v1`] enforces on the REAL bound address, so any loopback listener the
+/// server permits is also reachable through the Host guard.
 fn is_loopback_host(host_port: &str) -> bool {
     // Bracketed IPv6: `[::1]` or `[::1]:port`.
     let host = if let Some(rest) = host_port.strip_prefix('[') {
@@ -258,21 +443,113 @@ fn is_loopback_host(host_port: &str) -> bool {
     false
 }
 
-/// Serve the higgs router on `listener`, shutting down **gracefully** when
-/// `shutdown` resolves: in-flight requests drain, then the worker is stopped
-/// via [`Higgs::stop`]. The single graceful-shutdown entry point for any host —
-/// the `higgs` binary wires it to SIGTERM/Ctrl-C; tests pass their own
-/// future. Returns the serve I/O error, if any.
-pub async fn serve_with_shutdown(
+/// Serve the `/v1`-ONLY router ([`v1_router`]) on `listener`, shutting down
+/// **gracefully** when `shutdown` resolves: in-flight requests drain, then the
+/// worker is stopped via [`Higgs::stop`]. The single graceful-serve entry point —
+/// the only HTTP surface higgs exposes. Control no longer lives on any socket; an
+/// external app reaches chat + models here, and an embedder drives control through
+/// the in-process crate API.
+///
+/// The [HG058] keyless-LAN and [HG069] no-Admin refusals below are the surface's
+/// last line of defense: a non-loopback listener with an empty keystore, or one
+/// whose keys are all non-Admin, is refused before it can serve — because on such
+/// a bind auth would be off AND the Host guard relaxed, exposing the whole surface
+/// to the network. This runs on the REAL bound address, so a library/embedded
+/// caller handing us its own listener can't bypass it.
+pub async fn serve_v1(
     higgs: Arc<Higgs>,
     listener: tokio::net::TcpListener,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
-    let app = router(Arc::clone(&higgs));
-    axum::serve(listener, app)
+    // The Host-guard policy follows the REAL bound address: loopback keeps the
+    // DNS-rebinding defense; a deliberate non-loopback bind (key-gated per
+    // [HG058]) must accept LAN `Host` values or the mode is unusable.
+    let enforce_loopback_host = listener
+        .local_addr()
+        .map(|a| a.ip().is_loopback())
+        .unwrap_or(true); // unknowable ⇒ fail CLOSED (strictest policy)
+                          // Register BEFORE the startup guards, UNARMED, under the serve-lifecycle lock.
+                          //
+                          // BEFORE the guards: a refusal must decide "was I the ONLY serve on this facade?"
+                          // to know whether tearing it down would strand a sibling, and
+                          // `ServeGuard::release()` answers that atomically under the registry lock.
+                          //
+                          // Under the LIFECYCLE lock: a concurrent last-listener exit does `release()` then
+                          // `stop()` as two steps, and `stop()` is TERMINAL (`shutting_down` never resets).
+                          // Registering in that gap would leave this listener serving a facade the departing
+                          // one is about to drain for good.
+    let serve_guard = {
+        let _lifecycle = higgs.serve_lifecycle().await;
+        higgs.register_serve(false, listener.local_addr().ok())
+    };
+    // Refusing to serve, but an embedded caller may have already `start()`ed this
+    // facade (spawning a worker). Tear it down before the early return so the
+    // rejected serve doesn't LEAK the worker/runtime (codex r11) — but ONLY when
+    // this was the sole serve; a sibling owns the facade and its workers. The
+    // lifecycle lock makes release-then-stop atomic against a registration.
+    macro_rules! refuse {
+        ($err:expr) => {{
+            let _lifecycle = higgs.serve_lifecycle().await;
+            if serve_guard.release() {
+                higgs.stop().await;
+            }
+            return Err(std::io::Error::other($err.to_string()));
+        }};
+    }
+    // THE non-loopback enforcement point. [HG058] (a LAN listener needs at least one
+    // key — else auth is off AND the Host guard below is relaxed, exposing the whole
+    // surface) and [HG069] (…at least one ADMIN key, else the key-management API is
+    // locked out) are checked, and this listener's LAN exposure is ARMED, together
+    // under the keystore lock. They MUST be atomic with a key revoke: otherwise a
+    // concurrent `revoke_key` reads `lan_exposed() == false`, this serve passes its
+    // key check against the not-yet-published store, and the revoke then empties it —
+    // a KEYLESS listener on a LAN. Serialized, one always loses. This is the last
+    // line for library/embedded callers who hand us their own listener.
+    if !enforce_loopback_host {
+        let bind = listener
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| "<unknown>".into());
+        if let Err(e) = higgs.arm_lan_serve(&serve_guard, &bind) {
+            refuse!(e);
+        }
+    }
+    // Publish the persisted allowlist as the LIVE one (G7): every listener's
+    // layer reads the shared live list per request, so this listener starting
+    // brings the file's current contents into force for ALL listeners — the
+    // one honest interpretation when layers no longer own snapshots. The
+    // refresh is ATOMIC (disk read under the live-list write lock), so a
+    // concurrent `set_cors_origins` linearizes against it — a stale disk
+    // read here can never overwrite the setter's just-confirmed publish.
+    higgs.refresh_live_cors_from_disk();
+    let app = v1_router_with_host_policy(Arc::clone(&higgs), enforce_loopback_host);
+    let served = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
-        .await?;
-    higgs.stop().await;
+        .await;
+    // Deregister IMMEDIATELY — before the terminal worker drain below, which can take
+    // seconds. A listener that has stopped accepting must not keep disclosing itself
+    // (`server_config`/`cors_settings` reporting a dead `ip:port` or a stale applied
+    // snapshot) nor keep forcing the [HG059] last-key-revoke refusal while workers
+    // shut down. (On CANCELLATION this line never runs and the guard's `Drop` does it.)
+    //
+    // Only the LAST listener owns the facade teardown. `serve_v1` is public and an
+    // embedder may run several listeners on one `Arc<Higgs>` (e.g. loopback + LAN);
+    // draining the shared local node when just ONE of them stops would strand the
+    // siblings still accepting requests on a facade whose workers are gone and whose
+    // next load hits the node-runtime shutdown path.
+    //
+    // The lifecycle lock spans release-and-stop so an incoming `serve_v1` cannot
+    // register in between and inherit the terminal `stop()` a departing last
+    // listener is about to run. Teardown runs on BOTH exits (graceful shutdown and
+    // a fatal `axum::serve` error) — the listener is equally gone either way, so
+    // `served?` must not skip the drain and leak workers.
+    {
+        let _lifecycle = higgs.serve_lifecycle().await;
+        if serve_guard.release() {
+            higgs.stop().await;
+        }
+    }
+    served?;
     Ok(())
 }
 
@@ -284,12 +561,19 @@ pub async fn serve_with_shutdown(
 /// here). Rather than enumerate ports, allow any localhost/127.0.0.1 origin
 /// plus the tauri webview origins. higgs is localhost/webview only — not a
 /// public surface — so trusting any loopback origin matches its threat model.
-fn local_cors() -> CorsLayer {
+fn local_cors(higgs: Arc<Higgs>) -> CorsLayer {
     CorsLayer::new()
-        .allow_origin(AllowOrigin::predicate(|origin: &HeaderValue, _req| {
+        .allow_origin(AllowOrigin::predicate(move |origin: &HeaderValue, _req| {
+            // The extra allowlist is read from the facade's LIVE list on EVERY
+            // check (G7): a `set_cors_origins` write applies to running
+            // listeners immediately, no rebind. Lazily initialized from the
+            // persisted config on the first check of a mounted router.
             is_local_origin(origin)
+                || origin
+                    .to_str()
+                    .is_ok_and(|o| higgs.live_cors_or_init().iter().any(|e| e == o))
         }))
-        .allow_methods([Method::GET, Method::POST, Method::PUT])
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
         .allow_headers(tower_http::cors::Any)
 }
 
@@ -313,253 +597,5 @@ fn is_local_origin(origin: &HeaderValue) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{host_allowed, http_status, is_local_origin, is_loopback_host};
-    use axum::http::{HeaderMap, HeaderValue, StatusCode};
-
-    use crate::diagnostic::HiggsError;
-
-    #[test]
-    fn loopback_host_matcher() {
-        for h in [
-            "127.0.0.1",
-            "127.0.0.1:11434",
-            "127.0.0.5", // 127.0.0.0/8 — matches is_loopback_bind acceptance
-            "127.0.0.5:11434",
-            "localhost",
-            "localhost:5173",
-            "::1",
-            "[::1]",
-            "[::1]:11434",
-        ] {
-            assert!(is_loopback_host(h), "should allow Host {h}");
-        }
-        for h in [
-            "evil.example.com",
-            "evil.example.com:11434",
-            "10.0.0.5:11434",
-            "0.0.0.0",
-            "169.254.169.254",
-            "[2001:db8::1]",
-        ] {
-            assert!(!is_loopback_host(h), "should reject Host {h}");
-        }
-    }
-
-    #[test]
-    fn host_guard_allows_loopback_and_rejects_others() {
-        let mut ok = HeaderMap::new();
-        ok.insert("host", HeaderValue::from_static("127.0.0.1:11434"));
-        assert!(host_allowed(&ok).is_ok());
-
-        let mut bad = HeaderMap::new();
-        bad.insert("host", HeaderValue::from_static("evil.example.com"));
-        assert_eq!(host_allowed(&bad), Err("evil.example.com".to_string()));
-
-        // Missing Host is rejected (ollama behavior).
-        let missing = HeaderMap::new();
-        assert_eq!(host_allowed(&missing), Err("<missing>".to_string()));
-    }
-
-    /// End-to-end through the real router: a foreign `Host` → 403, an oversized
-    /// body → 413, and a loopback `Host` with a small body passes the guard.
-    #[tokio::test]
-    async fn router_host_guard_and_body_limit() {
-        use super::test_support::{make_app, make_supervisor};
-        use axum::body::Body;
-        use axum::http::Request;
-        use tower::ServiceExt;
-
-        let (sup, _w, _r, _ring) = make_supervisor();
-        let app = make_app(sup);
-
-        // Foreign Host → 403 (HG012), before any handler runs.
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/higgs/status")
-                    .header("host", "evil.example.com")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-
-        // Oversized body (loopback Host) → 413.
-        let big = vec![b'x'; super::MAX_BODY_BYTES + 1];
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/higgs/models/load")
-                    .header("host", "127.0.0.1:11434")
-                    .header("content-type", "application/json")
-                    .body(Body::from(big))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
-    }
-
-    /// `/health` returns 200 without a worker RPC.
-    #[tokio::test]
-    async fn health_is_cheap_200() {
-        use super::test_support::{make_app, make_supervisor};
-        use axum::body::Body;
-        use axum::http::Request;
-        use tower::ServiceExt;
-
-        let (sup, _w, _r, _ring) = make_supervisor();
-        let app = make_app(sup);
-        for uri in ["/health", "/api/higgs/health"] {
-            let resp = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .uri(uri)
-                        .header("host", "127.0.0.1")
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
-        }
-    }
-
-    #[test]
-    fn local_origin_matcher() {
-        let yes = [
-            "tauri://localhost",
-            "http://tauri.localhost",
-            "http://localhost:5173",
-            "http://127.0.0.1:5173",
-            "http://localhost:8081", // gateway-embedded SPA on an arbitrary port
-            "http://127.0.0.1",      // no port
-        ];
-        let no = [
-            "https://localhost:5173", // non-loopback scheme (TLS not served locally)
-            "http://example.com",
-            "http://evil.localhost.attacker.com",
-            "http://10.0.0.5:5173",
-        ];
-        for o in yes {
-            assert!(
-                is_local_origin(&HeaderValue::from_static(o)),
-                "should allow {o}"
-            );
-        }
-        for o in no {
-            assert!(
-                !is_local_origin(&HeaderValue::from_static(o)),
-                "should reject {o}"
-            );
-        }
-    }
-
-    #[test]
-    fn http_status_mapping_table() {
-        assert_eq!(
-            http_status(&HiggsError::ModelNotFound { id: "x".into() }),
-            StatusCode::NOT_FOUND
-        );
-        assert_eq!(
-            http_status(&HiggsError::ModelNotLoaded { id: "x".into() }),
-            StatusCode::NOT_FOUND
-        );
-        assert_eq!(
-            http_status(&HiggsError::ContextOverflow {
-                prompt_tokens: 10,
-                max_gen: 5,
-                n_ctx: 8,
-            }),
-            StatusCode::BAD_REQUEST
-        );
-        assert_eq!(
-            http_status(&HiggsError::WorkerDead {
-                context: "gone".into(),
-            }),
-            StatusCode::SERVICE_UNAVAILABLE
-        );
-        assert_eq!(
-            http_status(&HiggsError::WorkerSpawnFailed {
-                source: std::io::Error::other("boom"),
-            }),
-            StatusCode::SERVICE_UNAVAILABLE
-        );
-        // Phase A2 hardening codes.
-        assert_eq!(
-            http_status(&HiggsError::InvalidSamplingParam {
-                param: "top_p".into(),
-                detail: "must be in (0, 1]".into(),
-            }),
-            StatusCode::BAD_REQUEST
-        );
-        assert_eq!(
-            http_status(&HiggsError::InvalidModelId {
-                id: "../x".into(),
-                reason: "traversal".into(),
-            }),
-            StatusCode::BAD_REQUEST
-        );
-        assert_eq!(
-            http_status(&HiggsError::ServerBusy {
-                in_flight: 8,
-                max: 8,
-            }),
-            StatusCode::SERVICE_UNAVAILABLE
-        );
-        assert_eq!(
-            http_status(&HiggsError::ChatTimeout {
-                elapsed: std::time::Duration::from_secs(600),
-            }),
-            StatusCode::GATEWAY_TIMEOUT
-        );
-        // Phase B: insufficient-memory load refusal is a retryable capacity 503.
-        assert_eq!(
-            http_status(&HiggsError::InsufficientMemory {
-                id: "org/model".into(),
-                needed_bytes: 8_000_000_000,
-                available_bytes: 4_000_000_000,
-                headroom_fraction: 0.8,
-            }),
-            StatusCode::SERVICE_UNAVAILABLE
-        );
-        // Serving disabled is a retryable capacity 503 (re-enable then retry).
-        assert_eq!(
-            http_status(&HiggsError::ServingDisabled),
-            StatusCode::SERVICE_UNAVAILABLE
-        );
-    }
-
-    #[test]
-    fn worker_rpc_maps_by_worker_code() {
-        // A worker-reported error maps to its origin code's status, not 500.
-        let rpc = |code: Option<&str>| HiggsError::WorkerRpc {
-            method: "higgs/chat".into(),
-            message: "x".into(),
-            worker_code: code.map(ToOwned::to_owned),
-        };
-        assert_eq!(http_status(&rpc(Some("HG002"))), StatusCode::NOT_FOUND);
-        assert_eq!(http_status(&rpc(Some("HG003"))), StatusCode::NOT_FOUND);
-        assert_eq!(http_status(&rpc(Some("HG005"))), StatusCode::BAD_REQUEST);
-        assert_eq!(
-            http_status(&rpc(Some("HG007"))),
-            StatusCode::SERVICE_UNAVAILABLE
-        );
-        // HG018: resident-model swap (worker refused) → retryable 503.
-        assert_eq!(
-            http_status(&rpc(Some("HG018"))),
-            StatusCode::SERVICE_UNAVAILABLE
-        );
-        // Unknown / absent code falls back to 500.
-        assert_eq!(
-            http_status(&rpc(Some("HG011"))),
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
-        assert_eq!(http_status(&rpc(None)), StatusCode::INTERNAL_SERVER_ERROR);
-    }
-}
+#[path = "mod_tests.rs"]
+mod tests;

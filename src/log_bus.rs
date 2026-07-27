@@ -1,8 +1,9 @@
 //! The single home for higgs Developer-Log lines.
 //!
-//! A [`LogBus`] holds a bounded history ring PER source (the snapshot source for
-//! `GET /api/higgs/logs`) and a live broadcast tap (the source for the
-//! `GET /api/higgs/logs/stream` SSE endpoint). Every line — worker child stderr
+//! A [`LogBus`] holds a bounded history ring PER source (the snapshot the
+//! `logs` control op returns — formerly `GET /api/higgs/logs`) and a live
+//! broadcast tap (the `watch_logs` stream — formerly the `/logs/stream` SSE
+//! endpoint). Every line — worker child stderr
 //! ([`LogSource::Worker`]) AND higgs serve-layer `tracing` events
 //! ([`LogSource::Serve`]) — enters through [`LogBus::push`], which appends to
 //! that source's ring and sends the tagged line on the broadcast. Separate rings
@@ -27,7 +28,7 @@
 //! already owns and wires the subscriber. No process global, no `common`
 //! dependency.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use parking_lot::Mutex;
 use tokio::sync::broadcast;
@@ -36,8 +37,14 @@ use tracing::{Event, Subscriber};
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::Layer;
 
+use crate::node::node_id::NodeId;
+use crate::node::worker_id::WorkerId;
+
 /// History-ring capacity (lines). Matches the prior `stderr_ring` cap.
 const RING_CAP: usize = 2000;
+
+/// One source's bounded history ring: `(seq, text)` entries, oldest first.
+type Ring = VecDeque<(u64, String)>;
 
 /// Live-broadcast channel capacity (lines). A slow SSE subscriber that falls
 /// this far behind is dropped to `Lagged`; the SSE handler skips the gap and
@@ -51,25 +58,58 @@ const HIGGS_TARGET_PREFIX: &str = "higgs";
 
 /// Origin of a Developer-Log line, so the worker's output can be streamed
 /// separately from higgs's own control-plane lines (e.g. a Worker-only debug
-/// console). higgs runs one worker at a time today, so `Worker` carries no id;
-/// when remote / multi-worker supervision lands this extends to a per-worker
-/// label and the `?source=` filter to a per-worker selector.
+/// console). The hub's LOCAL child stderr is `Worker`; a REMOTE node's worker
+/// stderr (relayed over iroh, P4) is `RemoteWorker { node, worker }` so two
+/// nodes' workers stay separable. Stays `Copy` (both ids are `u32` newtypes) so
+/// it can ride the broadcast/ring cheaply.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LogSource {
     /// higgs serve-layer / control-plane tracing (the `higgs: …` lines).
     Serve,
-    /// The model worker process's stderr (llama.cpp / ggml output).
+    /// The LOCAL model worker process's stderr (llama.cpp / ggml output),
+    /// legacy UNKEYED form. Kept as the union FILTER selector (`?source=worker`
+    /// matches every local worker) and for push sites that have no worker id
+    /// (the transient sysinfo/GPU probes).
     Worker,
+    /// One LOCAL worker's stderr, keyed by its [`WorkerId`] so each loaded
+    /// model's console can be streamed on its own tab (`?source=worker:<id>`).
+    LocalWorker { worker: WorkerId },
+    /// A remote node's worker stderr, relayed over iroh and keyed by which node +
+    /// which worker on it (`?source=node:<node>:<worker>`).
+    RemoteWorker { node: NodeId, worker: WorkerId },
 }
 
 impl LogSource {
     /// Parse a `?source=` query value; `None` (absent/unknown) means all sources.
+    /// Local per-worker form: `worker:<worker-id>` (e.g. `worker:3`). Remote
+    /// selector form: `node:<node-id>:<worker-id>` (e.g. `node:1:2`).
     pub fn parse(s: &str) -> Option<LogSource> {
         match s {
             "serve" => Some(LogSource::Serve),
             "worker" => Some(LogSource::Worker),
-            _ => None,
+            _ => {
+                if let Some(w) = s.strip_prefix("worker:") {
+                    return Some(LogSource::LocalWorker {
+                        worker: WorkerId(w.parse().ok()?),
+                    });
+                }
+                let rest = s.strip_prefix("node:")?;
+                let (n, w) = rest.split_once(':')?;
+                Some(LogSource::RemoteWorker {
+                    node: NodeId(n.parse().ok()?),
+                    worker: WorkerId(w.parse().ok()?),
+                })
+            }
         }
+    }
+
+    /// Whether a line tagged `self` should pass a `?source=` filter of `filter`.
+    /// Exact match, plus one union rule: filter [`Worker`](LogSource::Worker)
+    /// matches every [`LocalWorker`](LogSource::LocalWorker) line, so the legacy
+    /// "worker" console shows all local workers' output interleaved.
+    pub fn matches_filter(self, filter: LogSource) -> bool {
+        self == filter
+            || (filter == LogSource::Worker && matches!(self, LogSource::LocalWorker { .. }))
     }
 }
 
@@ -83,8 +123,16 @@ pub struct LogLine {
     pub text: String,
 }
 
+/// Append `(seq, text)` to a history ring, evicting the oldest at `RING_CAP`.
+fn push_ring(ring: &mut Ring, seq: u64, text: String) {
+    while ring.len() >= RING_CAP {
+        ring.pop_front();
+    }
+    ring.push_back((seq, text));
+}
+
 /// Up to `n` most-recent line texts from one history ring (oldest first).
-fn last_n(ring: &VecDeque<(u64, String)>, n: usize) -> Vec<String> {
+fn last_n(ring: &Ring, n: usize) -> Vec<String> {
     let skip = ring.len().saturating_sub(n);
     ring.iter().skip(skip).map(|(_, t)| t.clone()).collect()
 }
@@ -104,9 +152,18 @@ fn last_n(ring: &VecDeque<(u64, String)>, n: usize) -> Vec<String> {
 pub struct LogBus {
     /// Serve-layer history ring (`(seq, text)`, oldest first). `parking_lot`
     /// mutex held only for push/read — never across `.await`.
-    serve: Mutex<VecDeque<(u64, String)>>,
-    /// Worker-stderr history ring (`(seq, text)`, oldest first).
-    worker: Mutex<VecDeque<(u64, String)>>,
+    serve: Mutex<Ring>,
+    /// Worker-stderr history ring (`(seq, text)`, oldest first) — the legacy
+    /// UNKEYED ring, still fed by push sites without a worker id (transient probes).
+    worker: Mutex<Ring>,
+    /// Per-LOCAL-worker stderr history rings, created on a worker's first line and
+    /// reclaimed by [`evict_local`](Self::evict_local) on unload/idle-reap so a dead
+    /// worker's ring doesn't leak. Each ring is independently `RING_CAP`-bounded.
+    local: Mutex<HashMap<WorkerId, Ring>>,
+    /// Per-(node,worker) remote-stderr history rings, created on the first relayed
+    /// line and reclaimed by [`evict_remote`](Self::evict_remote) on unload/kill/retire
+    /// so a dead worker's ring doesn't leak. Each ring is independently `RING_CAP`-bounded.
+    remote: Mutex<HashMap<(NodeId, WorkerId), Ring>>,
     /// Monotonic line counter — stamps every push so an unfiltered (`None`)
     /// snapshot can re-interleave the two rings in arrival order.
     seq: std::sync::atomic::AtomicU64,
@@ -133,6 +190,8 @@ impl LogBus {
         Self {
             serve: Mutex::new(VecDeque::with_capacity(RING_CAP)),
             worker: Mutex::new(VecDeque::with_capacity(RING_CAP)),
+            local: Mutex::new(HashMap::new()),
+            remote: Mutex::new(HashMap::new()),
             seq: std::sync::atomic::AtomicU64::new(0),
             tx,
             show_fields: std::sync::atomic::AtomicBool::new(false),
@@ -173,42 +232,118 @@ impl LogBus {
     // `.to_string()` on the live path. Skipped — no net win without reworking
     // the String-typed log stream channel.
     pub fn push(&self, source: LogSource, text: String) {
-        let seq = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        {
-            let mut ring = match source {
-                LogSource::Serve => self.serve.lock(),
-                LogSource::Worker => self.worker.lock(),
-            };
-            while ring.len() >= RING_CAP {
-                ring.pop_front();
+        // Assign `seq` UNDER the destination ring's lock, not before it: the seq stamp and
+        // the `push_back` must be atomic per ring. Otherwise two concurrent pushes to the
+        // same source could stamp seq=N / seq=N+1 but insert in the opposite order (the
+        // seq=N thread stalls between the fetch_add and the lock), leaving that ring's seqs
+        // out of order vs. insertion — which `snapshot(None)` (sorts by seq) and
+        // `snapshot(source)` (insertion order) would then disagree on.
+        match source {
+            LogSource::Serve => {
+                let mut ring = self.serve.lock();
+                push_ring(&mut ring, self.next_seq(), text.clone());
             }
-            ring.push_back((seq, text.clone()));
+            LogSource::Worker => {
+                let mut ring = self.worker.lock();
+                push_ring(&mut ring, self.next_seq(), text.clone());
+            }
+            LogSource::LocalWorker { worker } => {
+                let mut local = self.local.lock();
+                let seq = self.next_seq();
+                let ring = local.entry(worker).or_default();
+                push_ring(ring, seq, text.clone());
+            }
+            LogSource::RemoteWorker { node, worker } => {
+                let mut remote = self.remote.lock();
+                let seq = self.next_seq();
+                let ring = remote.entry((node, worker)).or_default();
+                push_ring(ring, seq, text.clone());
+            }
         }
         // Err means zero subscribers — fine; the ring already has the line.
         let _ = self.tx.send(LogLine { source, text });
     }
 
+    /// Next monotonic sequence stamp. Call WHILE holding the destination ring's lock so the
+    /// stamp and the ring insertion are atomic per ring (see [`push`](Self::push)).
+    fn next_seq(&self) -> u64 {
+        self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Reclaim a LOCAL worker's history ring (called when the worker leaves the node
+    /// registry: unload, kill, or idle-reap), so a dead worker's lines don't linger
+    /// forever. A no-op if it never logged. Called AFTER the worker's stop completes
+    /// (its stderr pipe is closed), so only a line already in flight in the async
+    /// relay chain can recreate a tiny ring — bounded at a few lines, accepted
+    /// rather than serializing eviction against the relay task.
+    pub fn evict_local(&self, worker: WorkerId) {
+        self.local.lock().remove(&worker);
+    }
+
+    /// Reclaim a remote worker's history ring (called on remote unload/kill), so a finished
+    /// worker's lines don't linger forever. A no-op if it never logged.
+    pub fn evict_remote(&self, node: NodeId, worker: WorkerId) {
+        self.remote.lock().remove(&(node, worker));
+    }
+
+    /// Reclaim ALL of a node's remote rings (called on node retire) — including those of
+    /// workers no longer on a current route (e.g. a worker displaced by a reload), which a
+    /// per-worker eviction would miss.
+    pub fn evict_node(&self, node: NodeId) {
+        self.remote.lock().retain(|(n, _), _| *n != node);
+    }
+
     /// Up to `n` most-recent line texts (oldest first), restricted to one
     /// [`LogSource`] or, with `None`, the two rings re-interleaved by arrival.
     pub fn snapshot(&self, n: usize, filter: Option<LogSource>) -> Vec<String> {
+        /// Merge several rings' `(seq, text)` entries by seq and keep the last `n`.
+        fn merged<'a, I: Iterator<Item = &'a (u64, String)>>(iter: I, n: usize) -> Vec<String> {
+            let mut all: Vec<(u64, &str)> = iter.map(|(q, t)| (*q, t.as_str())).collect();
+            all.sort_by_key(|(q, _)| *q);
+            let skip = all.len().saturating_sub(n);
+            all.into_iter()
+                .skip(skip)
+                .map(|(_, t)| t.to_owned())
+                .collect()
+        }
         match filter {
             Some(LogSource::Serve) => last_n(&self.serve.lock(), n),
-            Some(LogSource::Worker) => last_n(&self.worker.lock(), n),
+            // `worker` is the UNION selector: the legacy unkeyed ring plus every
+            // local per-worker ring, re-interleaved by arrival (seq).
+            Some(LogSource::Worker) => {
+                let worker = self.worker.lock();
+                let local = self.local.lock();
+                merged(
+                    worker.iter().chain(local.values().flat_map(|r| r.iter())),
+                    n,
+                )
+            }
+            Some(LogSource::LocalWorker { worker }) => self
+                .local
+                .lock()
+                .get(&worker)
+                .map(|ring| last_n(ring, n))
+                .unwrap_or_default(),
+            Some(LogSource::RemoteWorker { node, worker }) => self
+                .remote
+                .lock()
+                .get(&(node, worker))
+                .map(|ring| last_n(ring, n))
+                .unwrap_or_default(),
             None => {
-                // Always lock serve then worker (consistent order — no deadlock).
+                // Always lock in a consistent order (serve, worker, local, remote) — no deadlock.
                 let serve = self.serve.lock();
                 let worker = self.worker.lock();
-                let mut all: Vec<(u64, &str)> = serve
-                    .iter()
-                    .chain(worker.iter())
-                    .map(|(q, t)| (*q, t.as_str()))
-                    .collect();
-                all.sort_by_key(|(q, _)| *q);
-                let skip = all.len().saturating_sub(n);
-                all.into_iter()
-                    .skip(skip)
-                    .map(|(_, t)| t.to_owned())
-                    .collect()
+                let local = self.local.lock();
+                let remote = self.remote.lock();
+                merged(
+                    serve
+                        .iter()
+                        .chain(worker.iter())
+                        .chain(local.values().flat_map(|r| r.iter()))
+                        .chain(remote.values().flat_map(|r| r.iter())),
+                    n,
+                )
             }
         }
     }
@@ -366,188 +501,5 @@ pub fn log_filter() -> tracing_subscriber::filter::Targets {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
-
-    #[test]
-    fn push_writes_ring_and_broadcast() {
-        let bus = Arc::new(LogBus::new());
-        let mut rx = bus.subscribe();
-        bus.push(LogSource::Serve, "line-1".to_owned());
-        // Ring captured it (snapshot history).
-        assert_eq!(bus.snapshot(10, None), vec!["line-1".to_owned()]);
-        // Broadcast delivered the same line to the live subscriber.
-        assert_eq!(rx.try_recv().unwrap().text, "line-1");
-    }
-
-    #[test]
-    fn snapshot_returns_last_n_oldest_first() {
-        let bus = LogBus::new();
-        for i in 0..5 {
-            bus.push(LogSource::Serve, format!("l{i}"));
-        }
-        assert_eq!(
-            bus.snapshot(2, None),
-            vec!["l3".to_owned(), "l4".to_owned()]
-        );
-        assert_eq!(bus.snapshot(0, None), Vec::<String>::new());
-    }
-
-    #[test]
-    fn snapshot_filters_by_source() {
-        let bus = LogBus::new();
-        bus.push(LogSource::Serve, "serve-1".to_owned());
-        bus.push(LogSource::Worker, "worker-1".to_owned());
-        bus.push(LogSource::Serve, "serve-2".to_owned());
-        assert_eq!(bus.snapshot(10, None).len(), 3, "no filter = all sources");
-        assert_eq!(
-            bus.snapshot(10, Some(LogSource::Worker)),
-            vec!["worker-1".to_owned()]
-        );
-        assert_eq!(
-            bus.snapshot(10, Some(LogSource::Serve)),
-            vec!["serve-1".to_owned(), "serve-2".to_owned()]
-        );
-    }
-
-    #[test]
-    fn worker_flood_does_not_evict_serve_history() {
-        // The bug: a single shared ring let worker model-load spam evict every
-        // serve line, leaving the Developer Logs console empty. Per-source rings
-        // keep each console's history independent.
-        let bus = LogBus::new();
-        bus.push(LogSource::Serve, "higgs: GET /v1/models".to_owned());
-        bus.push(LogSource::Serve, "higgs: loading model".to_owned());
-        for i in 0..(RING_CAP + 500) {
-            bus.push(LogSource::Worker, format!("ggml line {i}"));
-        }
-        // Serve history survives the worker flood intact.
-        assert_eq!(
-            bus.snapshot(10, Some(LogSource::Serve)),
-            vec![
-                "higgs: GET /v1/models".to_owned(),
-                "higgs: loading model".to_owned()
-            ],
-            "serve lines must not be evicted by worker output"
-        );
-        // The worker ring is still bounded (capped, not unbounded).
-        assert_eq!(
-            bus.snapshot(usize::MAX, Some(LogSource::Worker)).len(),
-            RING_CAP
-        );
-    }
-
-    #[test]
-    fn ring_evicts_oldest_at_capacity() {
-        let bus = LogBus::new();
-        for i in 0..(RING_CAP + 5) {
-            bus.push(LogSource::Worker, format!("l{i}"));
-        }
-        let snap = bus.snapshot(RING_CAP + 100, None);
-        assert_eq!(snap.len(), RING_CAP);
-        // Oldest 5 were evicted; first surviving line is l5.
-        assert_eq!(snap[0], "l5");
-    }
-
-    #[test]
-    fn subscriber_only_sees_lines_after_subscribe() {
-        let bus = LogBus::new();
-        bus.push(LogSource::Serve, "before".to_owned());
-        let mut rx = bus.subscribe();
-        bus.push(LogSource::Serve, "after".to_owned());
-        // "before" is NOT delivered live (it predates the subscription); it is
-        // only available via the snapshot replay.
-        assert_eq!(rx.try_recv().unwrap().text, "after");
-        assert!(rx.try_recv().is_err());
-        assert_eq!(
-            bus.snapshot(10, None),
-            vec!["before".to_owned(), "after".to_owned()]
-        );
-    }
-
-    #[tokio::test]
-    async fn lagged_subscriber_reports_lagged_then_recovers() {
-        let bus = LogBus::new();
-        let mut rx = bus.subscribe();
-        // Overflow the broadcast channel without draining — the slow subscriber
-        // falls behind and the next recv reports Lagged rather than crashing.
-        for i in 0..(BROADCAST_CAP + 10) {
-            bus.push(LogSource::Worker, format!("l{i}"));
-        }
-        match rx.recv().await {
-            Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                assert!(skipped > 0, "expected a positive lagged count");
-            }
-            other => panic!("expected Lagged, got {other:?}"),
-        }
-        // After Lagged the receiver recovers and yields the still-buffered tail.
-        let next = rx.recv().await.expect("recovers after lag");
-        assert!(next.text.starts_with('l'));
-    }
-
-    #[test]
-    fn layer_captures_error_field_and_redacts_other_fields() {
-        use tracing_subscriber::layer::SubscriberExt;
-        let bus = Arc::new(LogBus::new());
-        let subscriber = tracing_subscriber::registry().with(HiggsLogLayer::new(bus.clone()));
-        tracing::subscriber::with_default(subscriber, || {
-            // A higgs-target load failure: the typed reason rides the `error` field.
-            tracing::warn!(
-                target: "higgs::test",
-                error = "[HG004] engine failed to load m.gguf: out of memory",
-                prompt = "secret user prompt content",
-                "higgs: load failed"
-            );
-            // Wrong target — must be dropped entirely.
-            tracing::info!(target: "not_higgs", "should be ignored");
-        });
-        let snap = bus.snapshot(10, None);
-        assert_eq!(snap.len(), 1, "only the higgs-target event is captured");
-        let line = &snap[0];
-        assert!(
-            line.contains("higgs: load failed"),
-            "message present: {line}"
-        );
-        assert!(
-            line.contains("[HG004] engine failed to load m.gguf: out of memory"),
-            "error field appended so failures are debuggable: {line}"
-        );
-        assert!(
-            !line.contains("secret user prompt content"),
-            "non-error fields stay redacted by default (no prompt content): {line}"
-        );
-    }
-
-    #[test]
-    fn layer_show_fields_unredacts_for_debug() {
-        use tracing_subscriber::layer::SubscriberExt;
-        let bus = Arc::new(LogBus::new());
-        bus.set_show_fields(true); // DEBUG mode on
-        let subscriber = tracing_subscriber::registry().with(HiggsLogLayer::new(bus.clone()));
-        tracing::subscriber::with_default(subscriber, || {
-            tracing::info!(
-                target: "higgs::test",
-                prompt = "the actual user prompt",
-                "higgs: chat"
-            );
-        });
-        let snap = bus.snapshot(10, None);
-        assert_eq!(snap.len(), 1);
-        assert!(
-            snap[0].contains("prompt=the actual user prompt"),
-            "show mode appends other fields incl. prompt content: {}",
-            snap[0]
-        );
-    }
-
-    #[test]
-    fn timestamp_has_expected_shape() {
-        let ts = timestamp();
-        // "YYYY-MM-DD HH:MM:SS" — 19 chars.
-        assert_eq!(ts.len(), 19, "got {ts:?}");
-        assert_eq!(&ts[4..5], "-");
-        assert_eq!(&ts[10..11], " ");
-        assert_eq!(&ts[13..14], ":");
-    }
-}
+#[path = "log_bus_tests.rs"]
+mod tests;

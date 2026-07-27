@@ -1,14 +1,16 @@
 [package]
 name = "higgs"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 edition = "2021"
 description = "In-app local model runtime: OpenAI-compatible serving over llama.cpp with crash-isolated worker"
 license = "MIT"
 
-# higgs is its own single-crate workspace (extracted from jigglebot). This makes
+# higgs is its own workspace (extracted from jigglebot). This makes
 # `[lints] workspace = true` resolve standalone and lets the crate build/release
 # on its own; embedders (jigglebot) depend on it via a path/git dependency.
+# `higgs-macros` is a proc-macro member (TsConstEnum: const-object TS enum emitter).
 [workspace]
+members = ["higgs-macros"]
 
 [profile.dev]
 incremental = false
@@ -29,11 +31,33 @@ implicit_clone = "warn"
 # Perf
 unnecessary_to_owned = "warn"
 
+[features]
+# CUDA GPU acceleration for the llama.cpp engine. Used by the Linux release build
+# (`cargo build --release --features cuda`); requires the CUDA toolkit at build
+# time and a CUDA runtime at run time. macOS gets Metal automatically from the
+# llama.cpp build (Apple default), so no feature is needed there.
+cuda = ["llama-cpp-2/cuda"]
+
+# GGUF fixtures + profile seeding (`higgs::fixtures`) for the tests of a crate
+# that EMBEDS higgs. jigglebot's control-op tests need a facade whose
+# `chat_model_ids` is NON-EMPTY: a test asserting that list is "forwarded
+# verbatim" is vacuous while it is empty (Fable r12 proved a hardcoded
+# `Vec::new()` in the op survives it). Off by default — nothing under this
+# feature reaches a production build; enable it in the embedder's
+# `[dev-dependencies]` only.
+test-support = []
+
 [dependencies]
+# higgs's own proc-macros (TsConstEnum — const-object TS enums, consistent with jigglebot).
+higgs-macros = { path = "higgs-macros" }
 # full: supervisor needs rt+sync+time+io, worker needs rt+process+io — Tasks 2-12 use all of it
 tokio = { version = "1", features = ["full"] }
 # Default OS-specific directories (home, config, cache, data). 246M downloads.
 dirs = "5"
+# iroh p2p QUIC transport for the remote-worker feature (hub↔node). 1.0, vetted §3.0.
+iroh = "1.0"
+iroh-base = "1.0"
+iroh-tickets = "1.0"
 axum = { version = "0.8" }
 # OpenAI wire types ONLY (no HTTP client): /v1 request/response/chunk shapes
 # come from this crate verbatim — never hand-rolled.
@@ -48,14 +72,25 @@ rand = "0.8"
 miette = "7"
 tracing = "0.1"
 parking_lot = "0.12"
-ts-rs = { version = "10", features = ["serde-compat", "serde-json-impl"] }
-llama-cpp-2 = "0.1"
+ts-rs = { version = "12", features = ["serde-compat", "serde-json-impl"] }
+# AI-Experiri FORK of llama-cpp-rs: upstream 0.1.147 removed the OpenAI-compat
+# chat API (template apply + tool-call/reasoning parse over llama.cpp's
+# common/chat.cpp); the fork restores it — see the fork's README.fork.md for
+# the update-from-upstream playbook. Pinned to a rev on the
+# `higgs-restore-oaicompat` branch; bump by merging upstream in the fork,
+# pushing, and updating this rev.
+llama-cpp-2 = { git = "https://github.com/AI-Experiri/llama-cpp-rs.git", rev = "fab021552fabeb464a34aaa8ac229071bd5eecf7" }
 # Raw FFI for the engine version string — the safe `llama-cpp-2` crate wraps
-# neither `ggml_version()` nor `llama_print_system_info()`. Pinned to match the
-# `llama-cpp-2` resolution so both link the same vendored llama.cpp.
-llama-cpp-sys-2 = "0.1"
+# neither `ggml_version()` nor `llama_print_system_info()`. Same fork rev so
+# both link the same vendored llama.cpp.
+llama-cpp-sys-2 = { git = "https://github.com/AI-Experiri/llama-cpp-rs.git", rev = "fab021552fabeb464a34aaa8ac229071bd5eecf7" }
 # token_to_piece (the crate's non-deprecated detokenizer) takes &mut encoding_rs::Decoder
 encoding_rs = "0.8"
+# WHATWG URL parser — canonicalizes the extra CORS-origins allowlist to the exact
+# ASCII string a browser puts in the `Origin` header (lowercased host, default
+# port stripped, IPv6/port validation), so the exact-match allowlist can match.
+# Already in the tree transitively via iroh; a direct dep here pins the API we use.
+url = "2.5.8"
 # Header-only GGUF metadata reading (memory-maps the file; weights are never loaded)
 ggus = "0.5.1"
 memmap2 = "0.9"
@@ -71,8 +106,49 @@ sysinfo = "0.32"
 tower-http = { version = "0.6", features = ["cors", "catch-panic", "limit", "timeout"] }
 # Structured logs for the `higgs` binary.
 tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
+# API-key auth (P5): SHA-256 hashing of bearer tokens at rest + constant-time
+# compare so a stored key digest never leaks via timing.
+sha2 = "0.10"
+# Constant-time digest comparison for API-token auth (keys.rs).
+subtle = "2"
+# Passwd-database lookups for `higgs node install-service` (the service must be
+# pinned to the OPERATOR's user/home — under sudo that is SUDO_USER's passwd
+# entry, which $HOME/$USER cannot reliably provide). Integration tests also use
+# it to SIGTERM spawned servers (coverage flush).
+libc = "0.2"
+# Verify-only minisign: checks release-CI signatures on update manifests against
+# the pubkeys pinned in the binary (src/update.rs, DESIGN-remote.md §9). Verify
+# HALF only — the signing half lives in release CI (the minisign CLI) and the
+# full `minisign` crate below is dev-only, so a shipped binary cannot sign.
+minisign-verify = "0.2"
+# Streaming HTTP client for the model downloader (P4b, M_PULL) and the FALLBACK
+# path of the HF client (`src/hub.rs`): pulls a GGUF / card file from the
+# HuggingFace resolve URL with progress. rustls to avoid a system OpenSSL dependency.
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "blocking"] }
+# Official HuggingFace Hub client — PRIMARY path for model downloads + card/config
+# fetch (`src/hub.rs`), with the hand-rolled `reqwest` path above as a fail-open
+# FALLBACK. Pinned to a commit (the crate is pre-1.0, not on crates.io, "APIs may
+# change without notice"); `default-features = false` keeps `xet`/`hf-xet`/`sha2`
+# out. Note: it pulls reqwest 0.13 (a second client+TLS stack alongside our 0.12).
+huggingface-hub = { git = "https://github.com/huggingface/huggingface_hub_rust.git", rev = "c9749ef76a294d5e97acae6b644071e39854aeb8", default-features = false }
+# Self-update eligibility (`src/node/self_update.rs`, DESIGN-remote.md §9 P3):
+# semver precedence to compare a signed manifest's `version` against the running
+# binary's `CARGO_PKG_VERSION` (downgrade refusal, prerelease-aware) — the manifest
+# version is CI-controlled but parsing it correctly (prerelease/build metadata)
+# is subtler than a numeric-tuple compare, so use the canonical implementation.
+semver = "1"
+# In-process unpack of a verified update tarball (`higgs-v<ver>-<suffix>.tar.gz`)
+# during self-update. The bytes are already sha256-authenticated against the signed
+# manifest BEFORE unpacking, and unpacking runs in-process (no shell-out to a
+# `tar` that PATH could resolve to a planted binary — the very class P2b hardened).
+tar = "0.4"
+flate2 = "1"
 
 [dev-dependencies]
+# Full minisign (keygen + SIGNING) so update-verification tests can mint a
+# throwaway keypair and sign manifests in-process — the production dep above is
+# verify-only on purpose. Dev-only: never in a shipped binary.
+minisign = "0.7"
 # test-util: paused-clock control (tokio::time::advance) so the 600 s chat-RPC
 # timeout test elapses instantly instead of waiting in real time.
 tokio = { version = "1", features = ["full", "test-util"] }
@@ -82,9 +158,6 @@ http-body-util = "0.1"
 # HTTP client for the black-box integration tests (spawn higgs, drive /v1
 # + /api/higgs over real HTTP). rustls to avoid a system OpenSSL dependency.
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
-# SIGTERM the spawned server for graceful shutdown (so its coverage profile
-# flushes — a hard SIGKILL would drop it).
-libc = "0.2"
 
 [lints]
 workspace = true
