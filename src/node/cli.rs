@@ -552,9 +552,16 @@ fn ensure_rw_log(node_log: &Path) -> std::io::Result<()> {
 /// (EIO, ENOSPC, …) is a REAL storage failure that left the unit's rename
 /// non-durable, so the install must abort before the destructive manager commands.
 fn dir_fsync_should_abort(raw_os_error: Option<i32>) -> bool {
+    // ENOTSUP and EOPNOTSUPP are the SAME value on Linux (distinct on macOS), so a
+    // `Some(ENOTSUP) | Some(EOPNOTSUPP)` pattern is an unreachable-arm error there.
+    // Compare by value in a guard instead — correct whether or not they coincide.
     !matches!(
         raw_os_error,
-        Some(libc::ENOTSUP) | Some(libc::EOPNOTSUPP) | Some(libc::EINVAL) | Some(libc::EBADF)
+        Some(e)
+            if e == libc::ENOTSUP
+                || e == libc::EOPNOTSUPP
+                || e == libc::EINVAL
+                || e == libc::EBADF
     )
 }
 
