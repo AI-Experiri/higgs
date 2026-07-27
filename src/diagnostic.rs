@@ -280,10 +280,11 @@ pub enum HiggsError {
     #[diagnostic(code(HG027))]
     NodeUnreachable { endpoint_id: String, detail: String },
 
-    /// A peer requested `M_UPDATE` but this build ships only the update *handshake* stub —
-    /// no real updater yet (signature-verified self-update is a later task, §9). The
-    /// capability is advertised as `false`, so a well-behaved peer never sends it; this is
-    /// the typed refusal for one that does anyway.
+    /// A node that does NOT ship the signature-verified self-update receiver (a LEGACY build that
+    /// predates REL-P4, or a build compiled without it) was sent an `M_UPDATE` push and refuses it
+    /// with this typed error. The CURRENT build ships the full receiver+applier ([`crate::node::
+    /// self_update`]) and advertises the `update` capability `true`, so it never emits this for its
+    /// own `M_NODE_UPDATE` handling — a bad manifest/artifact fails later with HG081-HG088 instead.
     #[snafu(display("[HG026] software update not supported by this build: {detail}"))]
     #[diagnostic(code(HG026))]
     UpdateUnsupported { detail: String },
@@ -653,6 +654,95 @@ pub enum HiggsError {
     ))]
     #[diagnostic(code(HG080), severity(Error))]
     EphemeralResident { id: String },
+
+    /// An update manifest named a `pinned_key_id` this binary does not pin in
+    /// [`crate::update::HIGGS_UPDATE_PUBKEYS`] (or the table is empty). Fails
+    /// CLOSED: an unpinned key can never authorize an update. Two honest
+    /// causes: this binary predates a key rotation (the remedy is one manual
+    /// update to a release that pins the new key), or nobody has populated the
+    /// table yet (self-update is simply not enabled for this build).
+    #[snafu(display(
+        "[HG081] update refused: release key {key_id:?} is not pinned in this binary — update manually once to a build that pins it (`crate::update::HIGGS_UPDATE_PUBKEYS`)"
+    ))]
+    #[diagnostic(code(HG081), severity(Error))]
+    UpdateKeyUnknown { key_id: String },
+
+    /// An update manifest's minisign signature did not verify against the
+    /// pinned release key (or the key/signature text itself was malformed).
+    /// The manifest is untrusted input until this check passes, so nothing in
+    /// it was read; `detail` states which step rejected it.
+    #[snafu(display("[HG082] update refused: {detail}"))]
+    #[diagnostic(code(HG082), severity(Error))]
+    UpdateSignatureInvalid { detail: String },
+
+    /// An update manifest passed signature verification but is not a manifest
+    /// this binary can use: unparseable JSON, or a schema it does not know
+    /// ([`crate::update::UPDATE_MANIFEST_SCHEMA`]). A schema mismatch means
+    /// release CI moved ahead of this binary — update manually once.
+    #[snafu(display("[HG083] update refused: {detail}"))]
+    #[diagnostic(code(HG083), severity(Error))]
+    UpdateManifestInvalid { detail: String },
+
+    /// A downloaded update artifact does not match the sha256 its VERIFIED
+    /// manifest promises — a truncated/corrupted download or a courier serving
+    /// the wrong bytes. The artifact must be discarded, never unpacked.
+    #[snafu(display(
+        "[HG084] update refused: artifact {file} hashes to {got} but its signed manifest promises {expected} — discard the download and re-fetch"
+    ))]
+    #[diagnostic(code(HG084), severity(Error))]
+    UpdateArtifactMismatch {
+        file: String,
+        expected: String,
+        got: String,
+    },
+
+    /// Self-update ELIGIBILITY refused a manifest that AUTHENTICATED fine (§9 P3,
+    /// `src/node/self_update.rs`): its `version` is not newer than the running
+    /// binary's. Authenticity (`src/update.rs`) proves "release CI built this",
+    /// never "this is an upgrade" — a genuine OLD release, replayed by a courier,
+    /// still verifies, so the updater refuses a downgrade unless `--allow-downgrade`
+    /// is passed. `from`/`to` are both authenticated version strings.
+    #[snafu(display(
+        "[HG085] self-update refused: manifest version {to} is not newer than the running {from} — a STRICTLY older version needs --allow-downgrade; the SAME version cannot be self-updated (reinstall via install.sh to repair it)"
+    ))]
+    #[diagnostic(code(HG085), severity(Error))]
+    UpdateNotNewer { from: String, to: String },
+
+    /// Self-update eligibility refused a manifest whose `target` triple or
+    /// acceleration `variant` does not match the running binary (§9 P3). A CUDA
+    /// build on a CPU-only box (or an `x86_64` artifact on `aarch64`) fails to even
+    /// load, so applying it would brick the node — refused before any download is
+    /// swapped in. Both fields are authenticated; `field` names which mismatched.
+    #[snafu(display(
+        "[HG086] self-update refused: manifest {field} {manifest:?} does not match this binary's {running:?} — this artifact is for a different build and would not run here"
+    ))]
+    #[diagnostic(code(HG086), severity(Error))]
+    UpdateTargetMismatch {
+        field: String,
+        manifest: String,
+        running: String,
+    },
+
+    /// Self-update failed at an APPLY step AFTER authentication+eligibility passed
+    /// (§9 P3): unpack, the post-stage `--version` smoke test, the atomic `current`
+    /// flip, a filesystem error under `<prefix>/bin`, a rollback/prune op, or the
+    /// single-update lock being held by a concurrent run. Nothing partial is left
+    /// live: staging happens off to the side and `current` is flipped atomically, so
+    /// a failure here leaves the previously-installed binary running. `detail` names
+    /// the step.
+    #[snafu(display("[HG087] self-update failed: {detail}"))]
+    #[diagnostic(code(HG087), severity(Error))]
+    UpdateApplyFailed { detail: String },
+
+    /// Self-update could not FETCH the manifest/signature/artifact over the network
+    /// (§9 P4): a malformed/insecure URL (non-`https` to a non-loopback host), an HTTP
+    /// error, a connect/read timeout, or a response exceeding the size cap. This is a
+    /// TRANSPORT failure BEFORE any authentication — the fetched bytes are still verified
+    /// against the pinned key (HG081-084) before anything is applied, so a fetch never
+    /// bypasses the signature. `detail` names the URL/step.
+    #[snafu(display("[HG088] self-update fetch failed: {detail}"))]
+    #[diagnostic(code(HG088), severity(Error))]
+    UpdateFetchFailed { detail: String },
 
     /// Startup refused: a non-loopback bind with keys present but NONE holding the
     /// `Admin` scope. Auth would be ON, but every Admin-scoped operation

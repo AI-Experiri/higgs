@@ -143,6 +143,8 @@ async fn real_node_pushes_fleet_events_the_hub_rebroadcasts() {
             Some(2),
             None,
             fleet_events,
+            None,
+            true,
         )
         .await;
     next_event(&mut events, &peer, FleetEventKind::NodeConnected).await;

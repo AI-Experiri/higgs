@@ -824,3 +824,121 @@ async fn dropping_runtime_stops_the_idle_reaper() {
 // surface these graceful-empty fallbacks are not reachable without dropping the wrapper's
 // handle. Covered here only to the extent the happy path exercises them (above); the
 // actor-gone fallbacks are reported unreachable.
+
+// ── P4b (c): in-flight total + the bounded update-restart drain ─────────────────────────
+
+/// `in_flight_total` sums the per-worker counters and `drain_until_idle` waits for them —
+/// bounded. Idle → total 0 + drain returns true immediately; a held `ChatLease` → total 1 +
+/// drain hits its deadline (false, never hangs); lease dropped → drain true again. Reverting
+/// the sum (a hardcoded 0) makes the held-lease total assert fail; reverting the deadline
+/// check makes the held-lease drain hang past the test timeout.
+#[tokio::test]
+async fn drain_until_idle_waits_for_in_flight_and_is_bounded() {
+    let (rt, _dir) = fake_runtime_with_models(&["org/m"]);
+    let (id, _) = load(&rt, "org/m").await;
+    assert_eq!(rt.in_flight_total().await, 0, "idle after load");
+
+    // Take the lease BEFORE any drain call — `drain_until_idle` QUIESCES (one-way), so a lease
+    // requested after it would be refused by design (pinned in the quiesce test below).
+    // A held lease = one in-flight generation: the drain must WAIT and then give up at the
+    // deadline (bounded), never hang.
+    let lease = rt.chat_handle(id, "org/m").await.expect("lease");
+    assert_eq!(rt.in_flight_total().await, 1, "the lease counts in-flight");
+    assert!(
+        !rt.drain_until_idle(
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_millis(150),
+        )
+        .await,
+        "an in-flight generation holds the drain until the deadline"
+    );
+
+    // Generation ends → the drain completes.
+    drop(lease);
+    assert!(
+        rt.drain_until_idle(
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_secs(5),
+        )
+        .await,
+        "the drain completes once the generation ends"
+    );
+    rt.shutdown_all().await;
+
+    // An IDLE node drains immediately (a fresh runtime — the one above is quiesced).
+    let (rt2, _dir2) = fake_runtime_with_models(&["org/m"]);
+    assert!(
+        rt2.drain_until_idle(
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_millis(200),
+        )
+        .await,
+        "an idle node drains immediately"
+    );
+    rt2.shutdown_all().await;
+}
+
+/// The update-restart quiesce (P4b (c)): after `quiesce_chats`, a NEW lease is refused (a clean
+/// error beats a generation truncated moments later by the restart) while a lease granted BEFORE
+/// the quiesce drains normally via `in_flight`. Reverting the `quiescing` gate in the ChatHandle
+/// arm hands out the post-quiesce lease and this fails.
+#[tokio::test]
+async fn quiesce_refuses_new_leases_but_drains_existing() {
+    let (rt, _dir) = fake_runtime_with_models(&["org/m"]);
+    let (id, _) = load(&rt, "org/m").await;
+    let pre = rt
+        .chat_handle(id, "org/m")
+        .await
+        .expect("pre-quiesce lease");
+    rt.quiesce_chats().await;
+    assert!(
+        rt.chat_handle(id, "org/m").await.is_err(),
+        "a lease requested after the quiesce is refused"
+    );
+    assert_eq!(
+        rt.in_flight_total().await,
+        1,
+        "the pre-quiesce generation still counts (it drains, not truncates)"
+    );
+    drop(pre);
+    assert!(
+        rt.drain_until_idle(
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_secs(5),
+        )
+        .await,
+        "the drain completes once the pre-quiesce generation ends"
+    );
+    rt.shutdown_all().await;
+}
+
+/// A live STREAM HANDLER also holds the drain (P4b (c)): a generation's `in_flight` drops at its
+/// END, but the detached handler may still be flushing the response tail to the hub — re-execing
+/// then would truncate a COMPLETED generation. The drain must wait for the handler guards too.
+/// Reverting the `active_streams() == 0` conjunct in `drain_until_idle` returns true here while
+/// the guard is held.
+#[tokio::test]
+async fn drain_waits_for_live_stream_handlers() {
+    let (rt, _dir) = fake_runtime_with_models(&["org/m"]);
+    let guard = rt.stream_guard(); // a handler still flushing (no chat lease held)
+    assert_eq!(rt.active_streams(), 1);
+    assert!(
+        !rt.drain_until_idle(
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_millis(150),
+        )
+        .await,
+        "a live stream handler holds the drain (in_flight alone reads 0)"
+    );
+    drop(guard);
+    assert_eq!(rt.active_streams(), 0, "the guard released the count");
+    assert!(
+        rt.drain_until_idle(
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_secs(5),
+        )
+        .await,
+        "the drain completes once the handler finishes"
+    );
+    rt.shutdown_all().await;
+}

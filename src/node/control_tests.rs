@@ -68,12 +68,62 @@ async fn load_missing_model_maps_hg002() {
 }
 
 #[tokio::test]
-async fn update_is_recognized_but_refused_hg026() {
-    let rt = fake_runtime();
-    let resp = dispatch_node_control(&rt, req(1, M_NODE_UPDATE, json!({}))).await;
-    let e = resp.error.expect("update refused");
-    assert_eq!(e.code, INTERNAL_ERROR);
-    assert_eq!(e.data.unwrap()["code"], "HG026", "typed update-unsupported");
+async fn update_rejects_empty_params_but_accepts_well_formed_ones() {
+    // `accept_node_update` builds the reply + a DEFERRED apply; `handle_node_stream` runs the
+    // deferred ONLY after the reply is written (so a lost reply never applies). No deferred here
+    // is exercised — we assert the reply shape + that a well-formed push yields a deferred apply.
+    // Empty params: needs manifest + manifest_sig + artifact_url → INVALID_PARAMS, NO deferred.
+    let (resp, deferred) = accept_node_update(&req(1, "higgs/node/update", json!({})));
+    let e = resp.error.expect("empty params refused");
+    assert_eq!(e.code, INVALID_PARAMS);
+    assert!(deferred.is_none(), "a rejected push has nothing to apply");
+    // Well-formed params reply "accepted" + carry a deferred apply (the caller spawns it after
+    // the reply is on the wire; the apply itself fails closed HG081/HG087 async).
+    let (resp, deferred) = accept_node_update(&req(
+        2,
+        "higgs/node/update",
+        json!({
+            "manifest": "{}",
+            "manifest_sig": "sig",
+            "artifact_url": "https://example.com/higgs.tar.gz"
+        }),
+    ));
+    assert!(
+        resp.error.is_none(),
+        "well-formed push is accepted: {resp:?}"
+    );
+    assert_eq!(resp.result.unwrap()["status"], "accepted");
+    assert!(
+        deferred.is_some(),
+        "a well-formed push carries a deferred apply"
+    );
+    // Drop the deferred WITHOUT spawning — this test must not launch the detached apply.
+    drop(deferred);
+}
+
+#[tokio::test]
+async fn update_rejects_an_oversized_inline_manifest_synchronously() {
+    // A paired-but-compromised hub could push a huge inline manifest to OOM the node. The
+    // handler caps it SYNCHRONOUSLY (before building any deferred apply) and refuses in the
+    // reply — the push is NOT "accepted" and there is NO deferred. Dropping the precheck lets
+    // this reply "accepted".
+    let big = "x".repeat(70 * 1024); // > MAX_MANIFEST_BYTES (64 KiB)
+    let (resp, deferred) = accept_node_update(&req(
+        1,
+        "higgs/node/update",
+        json!({
+            "manifest": big,
+            "manifest_sig": "sig",
+            "artifact_url": "https://example.com/higgs.tar.gz"
+        }),
+    ));
+    assert!(
+        resp.result.is_none(),
+        "an oversized push is never accepted: {resp:?}"
+    );
+    assert!(deferred.is_none(), "an oversized push has nothing to apply");
+    let e = resp.error.expect("oversized push refused in the reply");
+    assert_eq!(e.code, INTERNAL_ERROR, "size cap maps through err_from");
 }
 
 #[tokio::test]

@@ -492,6 +492,55 @@ impl Higgs {
         }
     }
 
+    /// Push a signature-verified self-update to ONE node (REL-P4e, the hub "release courier").
+    /// The operator supplies the EXACT manifest URL for THAT node's build; the courier SSRF-vets
+    /// it, async-fetches the (tiny) manifest + its sibling `.minisig`, derives the DIRECT artifact
+    /// URL from the manifest's `file`, and pushes `M_NODE_UPDATE`. The hub is only a courier — the
+    /// node re-verifies the CI signature against its COMPILED-IN pins and re-hashes the artifact
+    /// before applying, so a bad manifest/URL can never forge a binary. A hub push is UPGRADE-ONLY
+    /// (the node always refuses a downgrade) — rollback is the node's own local job. Returns the
+    /// node's `{status:"accepted", target_version}` receipt (the update's real outcome is the
+    /// node's next HELLO). HG-coded per the failure.
+    ///
+    /// Gated on the HUB being ENABLED (`self.hub()`), NOT merely on a fleet existing — the kill
+    /// switch keeps the fleet but drops the hub, so this must fail `not_a_hub` BEFORE any outbound
+    /// fetch when the hub is disabled.
+    pub async fn node_update(&self, node: &str, manifest_url: &str) -> Result<Value, HiggsError> {
+        if self.hub().is_none() {
+            return Err(not_a_hub_error("nodes/update"));
+        }
+        let fleet = self
+            .fleet()
+            .ok_or_else(|| not_a_hub_error("nodes/update"))?;
+        crate::node::release_courier::node_update(&fleet, node, manifest_url).await
+    }
+
+    /// Push a signature-verified self-update to EVERY connected, update-capable node (REL-P4e),
+    /// each from its OWN per-(target, variant) release asset under `release_base_url`. This must be a
+    /// DIRECT STATIC HTTPS ORIGIN serving the `.manifest`/`.minisig`/`.tar.gz` as static siblings
+    /// (no redirect, no query), whose last path segment is the `v<version>` release dir
+    /// (`https://mirror.example/higgs/v1.2.3/`). The GitHub `…/releases/download/v<ver>/…` URL does
+    /// NOT work — it 302-redirects a release asset to storage (the courier follows no redirects, an
+    /// SSRF defence) and the storage URL carries a query — so mirror the signed release assets to a
+    /// static origin. The courier derives each node's manifest name from the CI `higgs-v<ver>-<suffix>`
+    /// convention, binds each fetched manifest to that requested version, resolves + pushes with
+    /// bounded concurrency OFF the FleetActor, and collects a per-node `{node, status, …}` report — a
+    /// single node's failure never fails the fleet. A node that did not advertise `update`, never
+    /// reported its build target/variant, or reconnected mid-update is SKIPPED. A hub push is
+    /// UPGRADE-ONLY (the node always refuses a downgrade; rollback is the node's own local job).
+    ///
+    /// Gated on the HUB being ENABLED (`self.hub()`) so a disabled hub returns `not_a_hub` instead
+    /// of an empty "success" — BEFORE any fetch.
+    pub async fn fleet_update(&self, release_base_url: &str) -> Result<Value, HiggsError> {
+        if self.hub().is_none() {
+            return Err(not_a_hub_error("nodes/update"));
+        }
+        let fleet = self
+            .fleet()
+            .ok_or_else(|| not_a_hub_error("nodes/update"))?;
+        crate::node::release_courier::fleet_update(&fleet, release_base_url).await
+    }
+
     /// Fire one short test prompt at a served instance on a SPECIFIC node and
     /// return what came back — the Fleet view's "prove the iroh link" action.
     ///

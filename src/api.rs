@@ -2699,8 +2699,15 @@ impl Higgs {
             inventory_age_ms: None,
             // This process's own build; the local card has no HELLO to report from.
             software_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            // The local node is not hub-pushed (it self-updates via the CLI), so it never
+            // reports an update failure through the fleet.
+            update_failed: None,
             // No wire, no negotiation — protocol is meaningless locally.
             protocol: None,
+            // This process's own build identity (REL-P4e) — accurate for the local card, though
+            // the hub never pushes an update to itself.
+            target: Some(env!("HIGGS_BUILD_TARGET").to_string()),
+            variant: Some(crate::node::self_update::CURRENT_VARIANT.to_string()),
         }
     }
 

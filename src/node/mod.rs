@@ -12,8 +12,11 @@ pub mod fleet;
 pub mod hub;
 pub mod identity;
 pub mod node_id;
+pub mod release_courier;
 pub mod runtime;
+pub mod self_update;
 pub mod served;
+pub mod service;
 pub mod transport;
 pub mod worker_id;
 
@@ -79,6 +82,28 @@ pub enum GateOutcome {
         /// it will push `N_FLEET_EVENT` worker-state changes on a uni stream, so the
         /// hub can skip its chat-end debounced inventory re-pull for it.
         fleet_events: bool,
+        /// Whether the node's HELLO advertised the `update_reporting` capability (P4b (d)):
+        /// it reports its last self-update failure in `update_failed`. When set, a `None`
+        /// report is AUTHORITATIVE (no failure) and clears a stored one; when absent (a
+        /// legacy/dev/non-managed binary that cannot report), a `None` PRESERVES the stored
+        /// failure so a non-reporting reconnect cannot erase one the operator has not seen.
+        reports_update_failures: bool,
+        /// The node's last self-update FAILURE from its HELLO, re-sanitized at this trust
+        /// boundary. Surfaced in the fleet view so the operator learns WHY a pushed update did
+        /// not take (vs. inferring it from `software_version` never advancing). `None` = the last
+        /// update succeeded or none was attempted.
+        update_failed: Option<crate::remote::UpdateFailed>,
+        /// The node's build TARGET triple from its HELLO (sanitized), for release-asset selection
+        /// when the hub pushes a self-update. `None` = a legacy node that did not report it (the
+        /// hub then cannot pick an asset for it and `fleet_update` skips it).
+        target: Option<String>,
+        /// The node's acceleration VARIANT from its HELLO (sanitized) — the other half of the
+        /// asset selector. `None` = a legacy node that did not report it.
+        variant: Option<String>,
+        /// Whether the node's HELLO advertised the `update` capability — it ships the
+        /// signature-verified self-update PUSH handler, so the hub may push it a signed update.
+        /// `fleet_update` pre-filters on this (a node without it is skipped, not push-and-failed).
+        update_capable: bool,
     },
     /// Rejected; `code` is the HG diagnostic that explains why (logged at origin).
     Rejected { code: &'static str },
@@ -100,6 +125,41 @@ pub(crate) fn worker_origin_code_data(e: &HiggsError) -> Option<serde_json::Valu
     e.code()
         .map(|c| serde_json::json!({ "code": c.to_string() }))
 }
+
+/// Maximum size of ONE inbound control/data frame (request line) the node will buffer from a
+/// hub-opened stream. A hub is a PAIRED, authenticated peer, but a compromised/buggy one must
+/// not be able to OOM a small (2–4 GiB Pi/Jetson) node by streaming gigabytes on a single line
+/// before [`rpc::decode`] runs — the same DoS the self-update size caps bound for the inline
+/// manifest/artifact.
+///
+/// This is the FLEET ingress bound, DELIBERATELY DECOUPLED from the HTTP `/v1` body limit
+/// ([`crate::serve::MAX_BODY_BYTES`]). It is NOT a function of that limit: an `M_CHAT` frame is
+/// not the HTTP body verbatim — `NodeTransport::chat` passes the messages as a pre-serialised
+/// `messages_json` STRING (plus `tools_json`/`chat_template_kwargs`) embedded as a JSON
+/// `Value::String`, so the body is PARSED and RE-SERIALISED (which can canonicalise/expand values,
+/// e.g. `1e15` → `1000000000000000.0`) AND then escaped a second time. The blow-up factor of body
+/// → frame is therefore NOT bounded by any small constant, so there is no honest "covers every
+/// valid body" invariant to assert. Instead we pick a fixed 64 MiB ceiling purely as an
+/// OOM bound: it is far above any REALISTIC chat frame (a 64 MiB frame is a multi-million-token
+/// transcript) yet well under the 256 MiB the update path (`MAX_ARTIFACT_BYTES`) already buffers,
+/// so a compromised hub cannot OOM a small (2–4 GiB) node with one frame. A chat whose serialised
+/// `M_CHAT` frame nonetheless exceeds this — a pathologically-crafted or genuinely enormous
+/// request — is rejected at the fleet ingress (its bidi stream is dropped; the node keeps
+/// serving). That is intentional: the fleet ingress is a distinct boundary from HTTP, not a
+/// mirror of it. (FOLLOW-UP: embedding chat JSON as a `Value` instead of a re-escaped STRING would
+/// remove the double-encode and shrink the frame — a transport-efficiency change, out of scope.)
+/// Shared read for ALL hub→node methods (chat, pull, control); an `M_NODE_UPDATE` manifest is far
+/// smaller (capped at 64 KiB) and its artifact is fetched OUT of band.
+///
+/// SCOPE: this bounds ONE frame. It does NOT bound the AGGREGATE across many concurrent streams
+/// ([`serve_node`] spawns a handler per accepted bidi stream), so a compromised hub opening N
+/// streams each buffering near the cap costs ~N × 64 MiB. That aggregate is one facet of the
+/// broader "a compromised PAIRED hub directs the node's workload and can exhaust its resources
+/// many ways" surface (it can equally flood chats or model loads); a general per-connection
+/// admission-control / resource-quota is a separate `serve_node` hardening (FOLLOW-UP), not the
+/// per-frame concern here. Note this per-frame cap already IMPROVED the aggregate — before it,
+/// each stream's `.lines()` read was itself unbounded.
+const MAX_CONTROL_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 /// Write one RPC frame as an NDJSON line to a stream.
 pub(crate) async fn write_frame(
@@ -147,9 +207,9 @@ pub(crate) struct Handshake {
 /// stream. FAST and lock-safe: it only buffers the small frame + queues the FIN — the same
 /// kind of post-auth write the admit path already does under the lock — and never waits on
 /// the peer. Pair with [`close_after_reject`], which does the slow grace-close OUTSIDE any
-/// held lock. Used by every post-HELLO gate rejection: version (HG023), bad token (HG022),
-/// not-allowlisted (HG024), persist failure (HG040). (Handshake-stalled HG028 has no open
-/// stream, so it closes directly.)
+/// held lock. Used by the post-HELLO gate rejections that reply with a typed frame: version
+/// (HG023), bad token (HG022), not-allowlisted (HG024), persist failure (HG040). (Handshake-
+/// stalled HG028 and the identity/role-mismatch HG024 close directly, with no frame.)
 async fn send_reject_frame(
     send: &mut iroh::endpoint::SendStream,
     id: u64,
@@ -359,6 +419,39 @@ pub(crate) async fn gate_admit(
         // feature — absent/other shapes read as "doesn't push" (legacy node).
         fleet_events: hello.capabilities.get("fleet_events")
             == Some(&serde_json::Value::Bool(true)),
+        // Same rule: an explicit `true` means the node reports its update failures (so a `None` is
+        // authoritative); absent/other → a non-reporting node whose `None` must not erase a stored
+        // failure.
+        reports_update_failures: hello.capabilities.get("update_reporting")
+            == Some(&serde_json::Value::Bool(true)),
+        // Re-sanitize the peer-supplied failure at the trust boundary (same as software_version):
+        // both versions are semver-safe, the reason is display-safe.
+        update_failed: hello
+            .update_failed
+            .as_ref()
+            .map(|f| crate::remote::UpdateFailed {
+                from: crate::remote::sanitize_version(&f.from),
+                to: crate::remote::sanitize_version(&f.to),
+                reason: crate::remote::sanitize_display(&f.reason),
+            }),
+        // Sanitize the build identity at the trust boundary: both flow into a release-asset
+        // FILENAME (`higgs-v<ver>-<target>.manifest`) the hub fetches, so `sanitize_version`'s
+        // charset (alphanumerics + `.+-_`, cap 64) both preserves a real target triple / variant
+        // AND strips any `/`, whitespace, or path metacharacter a hostile node might inject. An
+        // input that sanitizes away entirely is treated as ABSENT (the hub then skips the node).
+        target: hello
+            .target
+            .as_deref()
+            .map(crate::remote::sanitize_version)
+            .filter(|s| !s.is_empty()),
+        variant: hello
+            .variant
+            .as_deref()
+            .map(crate::remote::sanitize_version)
+            .filter(|s| !s.is_empty()),
+        // Capability map rule (same as fleet_events): only an explicit boolean `true` advertises
+        // the self-update push handler.
+        update_capable: hello.capabilities.get("update") == Some(&serde_json::Value::Bool(true)),
     }
 }
 
@@ -439,6 +532,24 @@ pub async fn connect_node(
     let conn = endpoint.connect(target, ALPN).await.map_err(Error::other)?;
     let (mut send, recv) = conn.open_bi().await.map_err(Error::other)?;
 
+    // Report the last self-update FAILURE so the hub learns WHY a pushed update did not take — a
+    // boot-guard rollback ran at boot, before this connection existed. This is re-reported on EVERY
+    // HELLO (report-until-resolved): a valid HELLO reply does NOT prove the hub stored it (a
+    // stale-generation admission stores nothing; a one-shot pairing hub discards the field), so
+    // clearing on the reply would silently lose the only copy. `reportable_update_failure` is a PURE
+    // READ that reports the marker only while its `from` matches the running build and filters a
+    // stale one (never deleting it — that would race a detached apply). See its docs.
+    let update_bin = crate::node::cli::self_update_bin_dir();
+    // `(report, conclusive)`: `conclusive` is false for a non-managed launch (no marker to read) or a
+    // managed launch whose marker read was inconclusive (a transient read error).
+    let (update_failed, marker_conclusive) = match update_bin.as_deref() {
+        Some(bin) => crate::node::self_update::reportable_update_failure(bin),
+        None => (None, false),
+    };
+    // The compiled-in build identity the hub uses to pick a matching release asset when it
+    // pushes a self-update (`fleet_update`). All three fields are compile-time constants — nothing
+    // is read off disk, so a tampered install dir cannot lie about what is running.
+    let build = crate::node::self_update::BuildIdentity::current();
     let params = HelloParams {
         role: "node".into(),
         node_id: self_id,
@@ -447,7 +558,14 @@ pub async fn connect_node(
         protocol_versions: PROTOCOL_VERSIONS.to_vec(),
         min_supported: MIN_SUPPORTED,
         software_version: env!("CARGO_PKG_VERSION").into(),
-        capabilities: node_capabilities(),
+        update_failed,
+        target: Some(build.target),
+        variant: Some(build.variant),
+        // Advertise `update_reporting` ONLY when this is a managed install AND the marker read was
+        // CONCLUSIVE — so the hub trusts a `None` as authoritative only when the node could actually
+        // confirm it. A non-managed/dev launch (can't inspect the marker) or an inconclusive read
+        // (transient error) omits the capability, so its `None` PRESERVES a stored failure.
+        capabilities: node_capabilities(update_bin.is_some() && marker_conclusive),
     };
     let req = RpcRequest {
         jsonrpc: "2.0".into(),
@@ -496,6 +614,11 @@ pub async fn connect_node(
     };
     // Validate the hub's HELLO before trusting it (see [`validate_hub_hello`]).
     validate_hub_hello(&result, &conn.remote_id().to_string())?;
+    // NOTE: the update-failure marker is deliberately NOT cleared here. A valid HELLO reply proves
+    // the hub answered, not that it STORED the failure (a stale-generation admission stores nothing;
+    // a one-shot pairing hub discards the field), so the node re-reports it on every HELLO until it
+    // genuinely resolves — a successful apply clears it, or it becomes stale (the node advanced onto
+    // a different build) and `reportable_update_failure` filters it out of the report.
     Ok((conn, result))
 }
 
@@ -611,7 +734,18 @@ pub async fn serve_node(conn: Connection, rt: std::sync::Arc<crate::node::runtim
     while let Ok((send, recv)) = conn.accept_bi().await {
         let rt = rt.clone();
         let conn = conn.clone();
-        tokio::spawn(handle_node_stream(rt, conn, send, recv));
+        // Count the handler for the update-restart drain (P4b (c)): a chat's `in_flight`
+        // drops when the GENERATION ends, but this detached handler may still be flushing
+        // buffered chunks + the final response frame — the drain waits for the guard too,
+        // so a re-exec cannot truncate a completed generation's tail. The guard drops when
+        // the handler finishes (or is cancelled); `handle_node_stream` awaits the peer's ACK
+        // of all buffered data (finish + stopped) before returning, so guard release means
+        // DELIVERED, not merely written.
+        let guard = rt.stream_guard();
+        tokio::spawn(async move {
+            let _guard = guard;
+            handle_node_stream(rt, conn, send, recv).await;
+        });
     }
     // Both relays abort via their drop guards — on this normal exit AND on a
     // cancelled `serve_node` future alike. The per-stream handlers spawned above
@@ -748,8 +882,11 @@ async fn handle_node_stream(
     mut send: iroh::endpoint::SendStream,
     recv: iroh::endpoint::RecvStream,
 ) {
-    let mut lines = BufReader::new(recv).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
+    // Bounded frame read (NOT `.lines()`, which grows one line UNBOUNDED): a huge single frame
+    // from a compromised hub returns an error here → the `while let Ok(Some(..))` exits → this
+    // stream is dropped, but the node survives (see `MAX_CONTROL_FRAME_BYTES`).
+    let mut reader = BufReader::new(recv);
+    while let Ok(Some(line)) = rpc::read_bounded_frame(&mut reader, MAX_CONTROL_FRAME_BYTES).await {
         let req = match rpc::decode(&line) {
             Ok(RpcFrame::Request(r)) => r,
             _ => continue, // ignore non-request frames on this direction
@@ -763,6 +900,28 @@ async fn handle_node_stream(
         if req.method == crate::remote::M_NODE_PULL {
             // DATA plane: download a GGUF into ~/.higgs/models/, streaming N_PROGRESS.
             crate::node::data::relay_pull(&conn, &mut send, req).await;
+            continue;
+        }
+        if req.method == crate::remote::M_NODE_UPDATE {
+            // Hub-PUSHED self-update: write the `"accepted"` reply FIRST, then start applying — the
+            // apply is a DEFERRED side effect that must not precede its own reply. A successful
+            // `write_frame` means the reply was BUFFERED to QUIC, NOT that the hub RECEIVED it
+            // (Quinn's `flush` is a no-op; we do not await a transport ACK), so this is NOT a
+            // delivery guarantee — it only skips the apply when the write ERRORS (a clearly-dead
+            // stream). The AUTHORITATIVE outcome is EVENTUAL: the node's next HELLO
+            // `software_version` (which the fleet tracks) reflects whether the update took. A hub
+            // that never receives the reply treats it as OUTCOME-UNKNOWN and retries; the apply is
+            // IDEMPOTENT — `apply_pushed_update` refuses an equal/older version and refuses stacking
+            // on an unconfirmed trial — so a retry after the node already applied is safely refused.
+            let (resp, deferred) = crate::node::control::accept_node_update(&req);
+            let reply_buffered = write_frame(&mut send, &RpcFrame::Response(resp))
+                .await
+                .is_ok();
+            if reply_buffered {
+                if let Some(update) = deferred {
+                    update.spawn();
+                }
+            }
             continue;
         }
         let resp = if req.method.starts_with("higgs/node/") {
@@ -793,6 +952,18 @@ async fn handle_node_stream(
             break; // stream gone
         }
     }
+    // The update-restart drain (P4b (c)) waits on this handler's stream guard so a re-exec cannot
+    // truncate a completed generation's tail. But a dropped `SendStream` only keeps retransmitting
+    // buffered data UNTIL the connection closes (quinn `SendStream` docs) — and the re-exec closes
+    // it. `write_frame`'s `flush` is a no-op and awaits no transport ACK, so at this point the tail
+    // may be buffered-but-unacknowledged. FINISH the stream and await the peer's acknowledgement of
+    // ALL data before returning — the guard drops only after delivery, so the drain (and the
+    // re-exec it precedes) waits for the tail to actually land. On a severed/reset stream `finish`
+    // and `stopped` return promptly with an error we ignore — nothing is left to deliver. The wait
+    // is bounded by the caller's drain deadline (the handler is detached; an unresponsive peer just
+    // holds `active_streams` until the 60s deadline, then the pre-drain truncation applies as ever).
+    let _ = send.finish();
+    let _ = send.stopped().await;
 }
 
 #[cfg(test)]

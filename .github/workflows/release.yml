@@ -15,6 +15,15 @@
 # without the CUDA runtime, and the Rust llama.cpp wrapper has no dynamic-backend
 # loading, so CPU and CUDA ship as separate artifacts — CPU is the universal one.
 #
+# Signing: every artifact ships with an UPDATE MANIFEST (`<name>.manifest`,
+# JSON binding version+target+variant+sha256) and its minisign signature
+# (`<name>.manifest.minisig`), BOTH minted by the release job with the
+# MINISIGN_SECRET_KEY Actions secret — never by the build jobs, whose outputs
+# are allowlisted and re-hashed before anything is signed. Node binaries pin
+# the matching public keys (src/update.rs HIGGS_UPDATE_PUBKEYS) and verify
+# BEFORE trusting a manifest — the self-update trust anchor (DESIGN-remote.md
+# §9). The "Mint and sign update manifests" step documents the one-time key setup.
+#
 # NOTE: the repo `.cargo/config.toml` carries a macOS-dev `[env]` (a hardcoded
 # Xcode SDK + an `arm64-apple-darwin` bindgen target) and a dev-only lld linker.
 # Those are correct on a dev Mac but WRONG on CI runners, so each build job
@@ -27,8 +36,27 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Trusted computing base, stated plainly: these guarantees hold WITHIN GitHub
+# Actions — the runner VMs, the artifact-transfer service between jobs, and
+# GitHub's control plane execute this pipeline and hold the signing key while
+# it runs, so they are trusted by construction (nothing in-pipeline can check
+# them). Everything else is NOT trusted and is checked: dependency build
+# scripts (--locked, tokenless jobs), action tags (SHA-pinned below), repo
+# writers (environment + required reviewer), couriers of published bytes
+# (signatures verified end-to-end, published set re-verified after upload).
+#
+# Supply chain: every `uses:` is pinned to a full commit SHA (the trailing
+# comment names the tag it was audited at) — a mutable tag can be retargeted
+# by a compromised upstream, and the release job holds the signing key. Bump
+# pins deliberately, never back to a floating tag.
+#
+# Least privilege: gate/build jobs run arbitrary dependency build scripts
+# (build.rs/cmake) and must not hold a token that can touch releases — a
+# contents:write token in a build job could DELETE published assets so that a
+# later retry sees an EMPTY row and signs rebuilt (attacker-built) bytes.
+# Only the release job gets contents:write, via its own permissions block.
 permissions:
-  contents: write
+  contents: read
 
 # Serialize release runs (do NOT cancel an in-flight one): a queued run re-reads
 # the version gate, so once a release is cut, the next run is a clean no-op.
@@ -43,10 +71,13 @@ jobs:
       version: ${{ steps.v.outputs.version }}
       should_release: ${{ steps.v.outputs.should_release }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
           fetch-tags: true
+          # The token must not outlive the checkout — nothing in this job
+          # needs authenticated git after it.
+          persist-credentials: false
       - id: v
         shell: bash
         env:
@@ -57,23 +88,37 @@ jobs:
           set -euo pipefail
           # First `^version = "…"` is the [package] version ([package] is the
           # first table in Cargo.toml; the [workspace] table has no version key).
-          version="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/^version = "(.*)"/\1/')"
-          if [ -z "$version" ]; then
-            echo "::error::could not read [package] version from Cargo.toml"; exit 1
+          # The capture stops at the FIRST closing quote and the whole line is
+          # consumed, then the result must pass a STRICT semver allowlist:
+          # this value becomes a job output that later (secret-bearing) steps
+          # consume, so nothing outside [0-9A-Za-z.+-] may ever flow through —
+          # a trailing TOML comment like `# $(…)` in a crafted version line
+          # would otherwise ride the output into a shell as script injection.
+          version="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/^version = "([^"]*)".*$/\1/')"
+          if ! printf '%s' "$version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'; then
+            echo "::error::Cargo.toml [package] version is not a plain semver string; refusing to release"; exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
           if git rev-parse "refs/tags/v$version" >/dev/null 2>&1; then
-            # The tag exists. The publish step (softprops/action-gh-release) creates the
-            # tag TOGETHER with the release + assets, which is NOT atomic — a partial
-            # failure can leave the tag with an incomplete release. On a PUSH, treat an
-            # existing tag as "already released" (a clean no-op, so an unchanged version
-            # never re-releases). But a MANUAL workflow_dispatch is an explicit RETRY:
-            # let it proceed so the idempotent publish step UPDATES the existing release
-            # and uploads any missing assets — otherwise a half-failed release would be
-            # permanently stuck behind this gate (the operator would have to delete the
-            # tag by hand to recover).
+            # The tag exists — publish stages a DRAFT and finalizes only after
+            # every asset is up, so an existing tag means a release finished
+            # (or a crash landed between finalize and the verify step). On a
+            # PUSH, treat an existing tag as "already released" (a clean no-op,
+            # so an unchanged version never re-releases). A MANUAL
+            # workflow_dispatch is an explicit RETRY: let it proceed so the
+            # id-keyed publish completes/refreshes whatever is missing.
             if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-              echo "tag v$version exists — manual re-run: re-publishing to complete/refresh the release"
+              # A retry signs binaries as v$version, so it must BUILD the same
+              # commit the tag names — dispatching from a moved main would
+              # otherwise sign different sources under the released version
+              # (target_commitish cannot fix this: GitHub ignores it once the
+              # tag exists). Dispatch the workflow ON THE TAG to retry.
+              tag_commit="$(git rev-parse "refs/tags/v$version^{}")"
+              if [ "$tag_commit" != "$GITHUB_SHA" ]; then
+                echo "::error::tag v$version points at $tag_commit but this run is building $GITHUB_SHA — retry ON THE TAG: gh workflow run release.yml --ref v$version (the release environment's deployment policy must allow v* tags)"
+                exit 1
+              fi
+              echo "tag v$version exists — manual re-run on the tag commit: re-publishing to complete/refresh the release"
               echo "should_release=true" >> "$GITHUB_OUTPUT"
             else
               echo "tag v$version already exists — nothing to release (push)"
@@ -88,6 +133,19 @@ jobs:
     needs: gate
     if: needs.gate.outputs.should_release == 'true'
     timeout-minutes: 120
+    # Each matrix leg exports the ARTIFACT ID its upload step created, through
+    # job outputs (workflow-controlled plumbing a build script cannot rewrite
+    # after the fact). The release job downloads by these exact ids: the
+    # artifact-service credential inside a compromised sibling job can delete
+    # and recreate a same-named artifact, but the recreation gets a NEW id —
+    # so cross-job artifact replacement fails the download instead of being
+    # signed. The ternary keeps each leg writing only its own key; if the
+    # aggregation ever leaves a key empty, the release job hard-fails before
+    # downloading (fail closed, never fail open).
+    outputs:
+      id-aarch64-apple-darwin: ${{ matrix.suffix == 'aarch64-apple-darwin' && steps.up.outputs.artifact-id || '' }}
+      id-x86_64-unknown-linux-gnu: ${{ matrix.suffix == 'x86_64-unknown-linux-gnu' && steps.up.outputs.artifact-id || '' }}
+      id-x86_64-unknown-linux-gnu-cuda: ${{ matrix.suffix == 'x86_64-unknown-linux-gnu-cuda' && steps.up.outputs.artifact-id || '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -109,16 +167,27 @@ jobs:
             suffix: x86_64-unknown-linux-gnu-cuda
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
+          # Dependency build scripts (build.rs/cmake) execute in this job;
+          # they must find no usable credential on disk.
+          persist-credentials: false
+
+      # SHA-pinned, so the toolchain rides the `toolchain` input (the action
+      # otherwise reads it from the mutable ref name).
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch 2026-07
+        with:
+          toolchain: stable
           targets: ${{ matrix.target }}
 
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: release-${{ matrix.suffix }}
+      # NO build cache, deliberately. rust-cache restores ~/.cargo/bin
+      # executables and dependency target/ artifacts from PRIOR runs — and
+      # build jobs run before the release environment's approval, so a
+      # rejected (or merely earlier) run by a hostile writer could poison the
+      # cache (a planted `tar` in cargo's bin, a doctored dependency .rlib)
+      # that a later CLEAN, APPROVED run would restore and bake into the
+      # signed artifact. Release builds are infrequent; a from-scratch build
+      # is the price of signing only what this run actually compiled.
 
       # --- macOS: Metal (system) + OpenMP (the llama-cpp-2 default feature) ---
       - name: Install macOS build deps
@@ -128,7 +197,7 @@ jobs:
       # --- Linux: CUDA toolkit (CUDA build only) + bindgen/cmake deps (both Linux) ---
       - name: Install CUDA toolkit (Linux CUDA build)
         if: matrix.features == 'cuda'
-        uses: Jimver/cuda-toolkit@v0.2.19
+        uses: Jimver/cuda-toolkit@4bd727d5619dc6fa323b1e76c3aa5dca94f5ec6d # v0.2.19
         with:
           cuda: "12.5.0"
           method: network
@@ -182,15 +251,18 @@ jobs:
 
       - name: Package
         shell: bash
+        env:
+          VER: ${{ needs.gate.outputs.version }}
         run: |
           set -euo pipefail
-          ver="${{ needs.gate.outputs.version }}"
+          ver="$VER"
           name="higgs-v${ver}-${{ matrix.suffix }}"
           mkdir -p dist
           tar -C "target/${{ matrix.target }}/release" -czf "dist/${name}.tar.gz" higgs
           ( cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256" )
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        id: up
         with:
           name: higgs-${{ matrix.suffix }}
           path: dist/*
@@ -200,22 +272,402 @@ jobs:
     needs: [gate, build]
     if: needs.gate.outputs.should_release == 'true'
     runs-on: ubuntu-latest
+    # The only job allowed to touch releases.
+    permissions:
+      contents: write
+    # Store MINISIGN_SECRET_KEY as an ENVIRONMENT secret of `release` (not a
+    # repository secret): a plain repository secret is readable by ANY branch
+    # workflow a repo writer dispatches. What actually stops a hostile WRITER
+    # from reaching the environment secret is a REQUIRED REVIEWER on the
+    # environment (a human sees the ref+commit before the key is released to
+    # the run; ref policies alone match names, not content — a writer can
+    # point a fresh `v*` tag at a malicious workflow commit). PLAN CAVEATS,
+    # stated honestly: on PRIVATE repositories, environment SECRETS need
+    # GitHub Pro/Team/Enterprise, and required REVIEWERS need Enterprise. On
+    # a Free private repo this environment cannot hold the secret at all —
+    # the fallback is a plain repository secret, acceptable ONLY under the
+    # single-writer model (the collaborator list is then the entire
+    # boundary). On any plan below Enterprise there is no reviewer gate, so
+    # grant write access only to people you would hand the signing key — or
+    # move signing out of CI entirely (operator signs CI-built manifests
+    # locally) if that ever stops holding. Also give
+    # the environment a deployment policy allowing BOTH the `main` branch AND
+    # `v*` tags (branch and tag rules are configured separately) — retries of
+    # an existing version must be dispatched ON THE TAG (the gate enforces
+    # it), and a main-only policy would lock such retries out. Referencing
+    # the environment here auto-creates it on first run; reviewer + policy +
+    # secret placement are one-time operator steps in the repo settings.
+    environment: release
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
-      - uses: actions/download-artifact@v4
+      # Every leg's artifact id must have survived the matrix-output
+      # aggregation — an empty id means we cannot bind that artifact to its
+      # producing job, and downloading by name instead would reopen the
+      # cross-job replacement hole. Refuse instead.
+      - name: Assert build artifact identities
+        shell: bash
+        env:
+          ID_MAC: ${{ needs.build.outputs.id-aarch64-apple-darwin }}
+          ID_CPU: ${{ needs.build.outputs.id-x86_64-unknown-linux-gnu }}
+          ID_CUDA: ${{ needs.build.outputs.id-x86_64-unknown-linux-gnu-cuda }}
+        run: |
+          set -euo pipefail
+          for pair in "mac:$ID_MAC" "cpu:$ID_CPU" "cuda:$ID_CUDA"; do
+            if [ -z "${pair#*:}" ]; then
+              echo "::error::build artifact id for ${pair%%:*} is empty — cannot bind the artifact to its producing job; re-run the workflow"; exit 1
+            fi
+          done
+          echo "artifact ids: mac=$ID_MAC cpu=$ID_CPU cuda=$ID_CUDA"
+
+      # Download BY ID (producer-bound), one directory per artifact, NO merge:
+      # merged downloads resolve duplicate filenames last-writer-wins, and
+      # name-based downloads would fetch whatever currently wears the name.
+      # Each directory is additionally validated in isolation below before
+      # anything reaches dist/.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          path: dist
-          merge-multiple: true
+          path: artifacts
+          artifact-ids: ${{ needs.build.outputs.id-aarch64-apple-darwin }},${{ needs.build.outputs.id-x86_64-unknown-linux-gnu }},${{ needs.build.outputs.id-x86_64-unknown-linux-gnu-cuda }}
+
+      # Mint AND sign one update manifest per artifact — in THIS job, never the
+      # build jobs. Build jobs execute arbitrary dependency build scripts
+      # (build.rs/cmake), so nothing they upload is trusted as metadata: this
+      # step allowlists dist/ against the exact expected artifact set (any
+      # surprise file fails the release — it would otherwise be published),
+      # recomputes every sha256 from the tarball bytes it actually has, and
+      # only then writes + signs the manifest (src/update.rs UpdateManifest,
+      # schema 1). The manifest binds version+target+variant+sha256 under ONE
+      # signature so a signed artifact can't be replayed as another version or
+      # target (the bare .sha256 file authenticates nothing). A node verifies
+      # the .manifest.minisig against the pubkeys PINNED in its binary
+      # (src/update.rs HIGGS_UPDATE_PUBKEYS) before believing a word of it.
+      # HARD-FAILS when the signing secret is missing — an unsigned release
+      # looks fine today but is silently un-verifiable the day self-update
+      # ships, so refuse loudly instead.
+      #
+      # One-time operator setup (the key is minted by the operator, never by CI):
+      #   minisign -G -W -p minisign.pub -s minisign.key   # -W: no password (CI)
+      #   → Settings ▸ Environments ▸ release ▸ Environment secrets:
+      #     MINISIGN_SECRET_KEY = minisign.key file content. An ENVIRONMENT
+      #     secret, never a repository secret — a repository secret is
+      #     readable by any branch workflow a writer dispatches (see the
+      #     `environment: release` comment on this job).
+      #   → add a `higgs-release-1 <base64 line of minisign.pub>` line to
+      #     .github/release-pubkeys.txt — the ONLY place keys live
+      #     (src/update.rs embeds this file at compile time) — then release
+      #     the pinning build.
+      - name: Mint and sign update manifests
+        id: mint
+        shell: bash
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          # For adopting already-published assets on a manual retry (gh CLI).
+          GH_TOKEN: ${{ github.token }}
+          VER: ${{ needs.gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
+            echo "::error::MINISIGN_SECRET_KEY is not configured — mint a keypair with 'minisign -G -W -p minisign.pub -s minisign.key', store minisign.key's content as the MINISIGN_SECRET_KEY Actions secret, and pin the pubkey in src/update.rs HIGGS_UPDATE_PUBKEYS"
+            exit 1
+          fi
+          ver="$VER"
+          # The complete artifact set a release may contain (suffix:target:variant).
+          # Must mirror the build matrix above — a matrix change without a row
+          # here fails the release on the allowlist, on purpose.
+          table="aarch64-apple-darwin:aarch64-apple-darwin:metal
+          x86_64-unknown-linux-gnu:x86_64-unknown-linux-gnu:cpu
+          x86_64-unknown-linux-gnu-cuda:x86_64-unknown-linux-gnu:cuda"
+
+          # 0a) Assemble dist/ from the PER-JOB artifacts, each validated in
+          #     ISOLATION: an artifact may contain EXACTLY its own row's
+          #     tarball + checksum, nothing else. This is what makes cross-row
+          #     forgery structurally impossible — a compromised build job can
+          #     only corrupt its OWN row (whose binary it builds anyway),
+          #     never impersonate a sibling target's artifact.
+          mkdir -p dist
+          while IFS=: read -r suffix _target _variant; do
+            suffix="$(echo "$suffix" | xargs)"; [ -n "$suffix" ] || continue
+            name="higgs-v${ver}-${suffix}"
+            dir="artifacts/higgs-${suffix}"
+            if [ ! -d "$dir" ]; then
+              echo "::error::missing build artifact directory ${dir}"; exit 1
+            fi
+            actual="$(cd "$dir" && find . -type f | sed 's|^\./||' | LC_ALL=C sort)"
+            expected="$(printf '%s\n' "${name}.tar.gz" "${name}.tar.gz.sha256" | LC_ALL=C sort)"
+            if [ "$actual" != "$expected" ]; then
+              echo "::error::build artifact higgs-${suffix} must contain exactly ${name}.tar.gz + its .sha256 — it contains:"; printf '%s\n' "$actual"; exit 1
+            fi
+            cp "$dir/${name}.tar.gz" "$dir/${name}.tar.gz.sha256" dist/
+          done <<< "$table"
+
+          # 0b) PUBLISHED ASSETS ARE IMMUTABLE, AND NOTHING GITHUB HOLDS IS EVER
+          #    SIGNED. A manual retry exists to recover a release job that
+          #    failed BEFORE uploading (config errors, a missing secret, an
+          #    allowlist refusal) — never to replace or complete bytes already
+          #    on GitHub: Rust builds are not reproducible, and signing bytes
+          #    ADOPTED from GitHub storage would promote a courier to an
+          #    authorship authority (anyone with asset-upload rights could
+          #    plant a tarball in a partial release and have a retry sign it).
+          #
+          #    The lookup enumerates ALL releases for the tag INCLUDING DRAFTS:
+          #    our publish flow stages a draft, uploads, then finalizes — a
+          #    crash mid-upload leaves a DRAFT the tags endpoint does not
+          #    return. Any lookup/download failure aborts (fail closed).
+          #
+          #    ACCEPTED RESIDUAL (documented, not fixable by any snapshot
+          #    check): an actor who ERASES OR DISGUISES this evidence — by
+          #    deleting release assets/releases, RETAGGING a release to a
+          #    different tag_name, or RENAMING its assets — can make a retry
+          #    sign rebuilt bytes for a version whose old statement someone
+          #    may still hold (equivocation). All of those need repo WRITE —
+          #    on this single-operator repo that is the operator (build-job
+          #    tokens are read-only and non-persisted, see the workflow
+          #    permissions block). The lazy retag case IS detected below (our
+          #    asset names embed the version), but a rename hides that too.
+          #    Closing the class against a hostile writer would take
+          #    platform-immutable releases or an external append-only ledger;
+          #    node-side first-seen pinning is a self-update-task candidate.
+          # Exact-name set (never substring matching on a joined string — a
+          # planted filename CONTAINING a space could impersonate two adjacent
+          # entries of a delimited list).
+          declare -A adopted_set=()
+          # --paginate applies --jq PER PAGE, so emit one object per line and
+          # slurp into a single array (pipefail makes a gh failure abort).
+          releases_json="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" --jq '.[]' | jq -s "[.[] | select(.tag_name == \"v${ver}\")]")" \
+            || { echo "::error::could not list releases for v${ver} — refusing to risk double-signing a version"; exit 1; }
+          # A retagged release keeps its assets: our asset names embed the
+          # version, so ANY release under a FOREIGN tag carrying one of THIS
+          # version's EXACT asset names means its history was disguised
+          # rather than deleted — refuse to double-sign it. Exact names, not
+          # a version prefix: `higgs-v1.2.3-` would also match the legitimate
+          # v1.2.3-beta.1 prerelease's assets (semver prereleases extend the
+          # version with a dash) and brick every stable-after-prerelease
+          # release. (Asset RENAMING can still hide evidence; see the
+          # residual note above.)
+          expected_assets="$(while IFS=: read -r suffix _t _v; do
+            suffix="$(echo "$suffix" | xargs)"; [ -n "$suffix" ] || continue
+            for ext in tar.gz tar.gz.sha256 manifest manifest.minisig; do
+              printf '%s\n' "higgs-v${ver}-${suffix}.${ext}"
+            done
+          done <<< "$table" | jq -R . | jq -s .)"
+          foreign="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" --jq '.[]' \
+            | jq -r --arg tag "v${ver}" --argjson names "$expected_assets" \
+                'select(.tag_name != $tag) | select(any(.assets[]; .name as $n | ($names | index($n)) != null)) | .tag_name')" \
+            || { echo "::error::could not sweep releases for retagged v${ver} evidence"; exit 1; }
+          if [ -n "$foreign" ]; then
+            echo "::error::release(s) tagged ${foreign} carry v${ver}'s exact asset names — v${ver} appears to have been RETAGGED rather than released fresh; signing again would put two authentic statements for one version into the wild. Investigate before any retry."; exit 1
+          fi
+          match_count="$(printf '%s' "$releases_json" | jq 'length')"
+          release_id=""
+          if [ "$match_count" -gt 1 ]; then
+            echo "::error::found ${match_count} releases (drafts included) tagged v${ver} — ambiguous state; delete the stale drafts and re-run"; exit 1
+          elif [ "$match_count" -eq 1 ]; then
+            release_id="$(printf '%s' "$releases_json" | jq -r '.[0].id')"
+            echo "release v${ver} already exists ($(printf '%s' "$releases_json" | jq -r '.[0] | if .draft then "draft" else "published" end')) — adopting its assets"
+            mkdir -p remote
+            printf '%s' "$releases_json" | jq -r '.[0].assets[] | "\(.id)\t\(.name)"' > asset_list.tsv
+            while IFS="$(printf '\t')" read -r asset_id asset_name; do
+              [ -n "$asset_id" ] || continue
+              gh api -H "Accept: application/octet-stream" \
+                "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" > "remote/${asset_name}"
+              echo "adopting existing asset: $asset_name"
+              cp -f "remote/${asset_name}" "dist/${asset_name}"
+              adopted_set["$asset_name"]=1
+            done < asset_list.tsv
+          else
+            echo "no release or draft tagged v${ver} — first publish"
+          fi
+          # The publish step reuses EXACTLY this discovery — never re-finding
+          # the release by tag (which could miss the draft and mint a
+          # duplicate).
+          echo "release_id=${release_id}" >> "$GITHUB_OUTPUT"
+
+          # 1) dist/ must hold EXACTLY the expected files: one tarball + one
+          #    .sha256 per table row (manifest + signature optionally adopted
+          #    from the published release), nothing more, nothing missing.
+          #    Exact-name set membership, same rationale as adopted_set.
+          declare -A allowed_set=()
+          while IFS=: read -r suffix _target _variant; do
+            suffix="$(echo "$suffix" | xargs)"   # strip YAML indent
+            [ -n "$suffix" ] || continue
+            name="higgs-v${ver}-${suffix}"
+            for f in "${name}.tar.gz" "${name}.tar.gz.sha256"; do
+              [ -f "dist/$f" ] || { echo "::error::missing expected artifact dist/$f"; exit 1; }
+            done
+            for f in "${name}.tar.gz" "${name}.tar.gz.sha256" "${name}.manifest" "${name}.manifest.minisig"; do
+              allowed_set["$f"]=1
+            done
+          done <<< "$table"
+          for f in dist/*; do
+            base="$(basename "$f")"
+            if [ -z "${allowed_set[$base]:-}" ]; then
+              echo "::error::unexpected file in dist/: $base — outside the release set; refusing to sign or publish"; exit 1
+            fi
+          done
+
+          # 2) Per artifact row, exactly THREE states are legal:
+          #
+          #    FULL    all four remote files adopted (tarball, .sha256,
+          #            manifest, .minisig) and mutually consistent → keep
+          #            verbatim, sign nothing. Inconsistency → hard fail.
+          #    EMPTY   nothing adopted for the row → mint + sign from the
+          #            tarball THIS RUN built (the only bytes whose authorship
+          #            this job can vouch for).
+          #    PARTIAL anything else → the version is BURNED: hard-fail and
+          #            bump [package] version. Completing a partial row would
+          #            either sign GitHub-held bytes (authorship laundering) or
+          #            put a second authentic statement for the same
+          #            version/target into the wild next to one somebody may
+          #            already hold (equivocation) — and no replacement window
+          #            is crash-safe. Burning is never wrong, only cautious;
+          #            a version bump is cheap.
+          # Digest-pinned signer: the signing tool runs in the ONE job that
+          # holds the key, so it gets the same treatment as the SHA-pinned
+          # actions — a fixed release tarball verified against a hardcoded
+          # sha256, never whatever APT happens to serve today.
+          curl -fsSL -o minisign.tar.gz \
+            https://github.com/jedisct1/minisign/releases/download/0.12/minisign-0.12-linux.tar.gz
+          echo "9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d9822957e73  minisign.tar.gz" | sha256sum -c -
+          tar -xzf minisign.tar.gz
+          minisign() { ./minisign-linux/x86_64/minisign "$@"; }
+          umask 077
+          keyfile="$(mktemp)"
+          trap 'rm -f "$keyfile"' EXIT
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$keyfile"
+          # Public half derived from the signing secret — used to VERIFY any
+          # adopted signature before a FULL row is accepted (four well-named,
+          # hash-consistent files with a garbage or planted .minisig must not
+          # let a release complete "fully signed" while every node would
+          # refuse it). A verify failure here also catches an adopted set
+          # signed by a rotated-away key — nothing to complete there either.
+          minisign -R -f -s "$keyfile" -p derived.pub
+          # THE SECRET MUST MATCH A PIN IN THE SOURCE BEING RELEASED: a
+          # release signed by a key no shipped binary pins is silently
+          # un-verifiable (and a mistyped/prematurely-rotated secret would
+          # later burn the version when a corrected retry rejects its FULL
+          # rows). This enforces the documented order — mint key → pin pubkey
+          # in src/update.rs → release. While the pin table is EMPTY,
+          # releases are blocked on purpose: pin first.
+          #
+          # ROTATION ORDER (this gate cannot check what DEPLOYED nodes pin —
+          # only the operator knows the field): the bridge release pins
+          # old+new and is SIGNED WITH THE OLD KEY (deployed binaries pin
+          # only old; a bridge signed with new would be rejected by every one
+          # of them). Switch the secret to the new key only for releases
+          # AFTER the bridge.
+          #
+          # Pins are read from .github/release-pubkeys.txt — the SAME file
+          # src/update.rs embeds at compile time (include_str!), so the keys
+          # this gate accepts and the pins every shipped binary verifies
+          # against are one artifact by construction; nothing is duplicated,
+          # nothing can drift. Lines are `<key_id> <base64>`; column 2 is the
+          # key material.
+          # This awk mirrors src/update.rs parse_pubkeys_file EXACTLY: trim
+          # BOTH ends first ([[:space:]] covers \r, so a CRLF-committed pin
+          # line cannot pass the binary yet block CI), then drop '#'
+          # comments, then accept only two-field lines — an indented comment
+          # must be a comment to both parsers, or CI could sign with a key
+          # the binary treats as commented out (unit tests pin the Rust side
+          # of this parity).
+          # PRINTABLE ASCII ONLY (plus tab/LF/CR), enforced on both sides:
+          # Rust's `trim` understands Unicode whitespace where byte-oriented
+          # awk does not, and a NUL is silently dropped by shell command
+          # substitution while Rust keeps it in the embedded pin — either
+          # class of byte could make the binary and this gate disagree, so
+          # anything outside \t \n \r and 0x20-0x7E refuses outright (the
+          # unit tests enforce the same rule pre-merge; this guard also
+          # covers a commit that never ran them).
+          # The offending bytes are COUNTED inside the pipeline (wc -c) and
+          # only the decimal count crosses the $() boundary — capturing the
+          # bytes themselves would silently drop NULs (bash command
+          # substitution discards them), letting a NUL-poisoned file pass.
+          bad_bytes="$(LC_ALL=C tr -d '\011\012\015\040-\176' < .github/release-pubkeys.txt | wc -c | tr -d ' ')"
+          if [ "$bad_bytes" -ne 0 ]; then
+            echo "::error::.github/release-pubkeys.txt contains ${bad_bytes} byte(s) outside printable ASCII (+tab/LF/CR) — NULs, control bytes, or Unicode would desync the CI and binary pin parsers"; exit 1
+          fi
+          derived_b64="$(sed -n 2p derived.pub)"
+          pinned="$(awk '{ sub(/^[[:space:]]+/, ""); sub(/[[:space:]]+$/, "") } /^#/ { next } NF == 2 { print $2 }' .github/release-pubkeys.txt || true)"
+          if ! printf '%s\n' "$pinned" | grep -qxF "$derived_b64"; then
+            echo "::error::the MINISIGN_SECRET_KEY's public key ($derived_b64) is not listed in .github/release-pubkeys.txt at the commit being released — a release must be verifiable by the binary it ships. Pin the pubkey (keep old pins during a rotation), or fix the secret."
+            exit 1
+          fi
+          while IFS=: read -r suffix target variant; do
+            suffix="$(echo "$suffix" | xargs)"; target="$(echo "$target" | xargs)"; variant="$(echo "$variant" | xargs)"
+            [ -n "$suffix" ] || continue
+            name="higgs-v${ver}-${suffix}"
+            have=0
+            for piece in "${name}.tar.gz" "${name}.tar.gz.sha256" "${name}.manifest" "${name}.manifest.minisig"; do
+              if [ -n "${adopted_set[$piece]:-}" ]; then have=$((have + 1)); fi
+            done
+            if [ "$have" -eq 4 ]; then
+              # The FULL check must be AT LEAST as strict as the binary
+              # verifier, or a retry can bless a release every node refuses.
+              # (a) format: nodes verify with allow_legacy=false, but the
+              # minisign CLI happily accepts legacy-format signatures — the
+              # prehashed format's alg prefix base64-encodes to "RU".
+              if ! sed -n 2p "dist/${name}.manifest.minisig" | grep -q '^RU'; then
+                echo "::error::release v${ver}: the published signature for ${name} is legacy-format — every node rejects it (allow_legacy=false); bump [package] version and release anew"; exit 1
+              fi
+              if ! minisign -V -p derived.pub -m "dist/${name}.manifest" -x "dist/${name}.manifest.minisig" >/dev/null 2>&1; then
+                echo "::error::release v${ver}: the published signature for ${name} does not verify under the current signing key (a rotated-away key, or a planted file) — nothing can be completed here; bump [package] version if a new release is needed"; exit 1
+              fi
+              sha="$(shasum -a 256 "dist/${name}.tar.gz" | cut -d' ' -f1)"
+              # Canonical BYTE compare, not a hash-field compare: a sidecar
+              # reading `<correct_sha>  wrong-file` would pass a field check
+              # yet make a user's `shasum -c` verify the wrong path.
+              printf '%s  %s.tar.gz\n' "$sha" "$name" > expected.sha256
+              if ! cmp -s expected.sha256 "dist/${name}.tar.gz.sha256"; then
+                echo "::error::release v${ver}: the published ${name}.tar.gz.sha256 is not byte-identical to the canonical checksum of its tarball ($(cat "dist/${name}.tar.gz.sha256")) — refusing to touch it; bump [package] version and release anew"; exit 1
+              fi
+              # (b) fields: every manifest this pipeline mints is the CANONICAL
+              # printf below, so the strongest possible check is byte equality
+              # against a regenerated expected manifest — no JSON parser
+              # leniency (jq treats 1.0 == 1 and tolerates multi-document
+              # input; serde does not) can drift from the binary's rules.
+              printf '{"schema":1,"version":"%s","commit":"%s","file":"%s.tar.gz","target":"%s","variant":"%s","sha256":"%s"}\n' \
+                "$ver" "$GITHUB_SHA" "$name" "$target" "$variant" "$sha" > expected.manifest
+              if ! cmp -s expected.manifest "dist/${name}.manifest"; then
+                echo "::error::release v${ver} carries an INCONSISTENT signed set for ${name} — the published manifest is not byte-identical to the canonical manifest this pipeline mints ($(cat "dist/${name}.manifest")); bump [package] version and release anew"; exit 1
+              fi
+              echo "keeping the complete published set for ${name} (signature verified)"
+              continue
+            elif [ "$have" -ne 0 ]; then
+              echo "::error::release v${ver} is BURNED for ${name}: only ${have}/4 of its files are on the release — completing it would sign bytes this run did not build, or issue a second statement for a version somebody may already hold; bump [package] version and release anew"; exit 1
+            fi
+            # EMPTY row: these are THIS RUN's bytes — the sidecar must agree
+            # with the tarball (a disagreement means a corrupted or tampered
+            # artifact transfer between the build job and here).
+            sha="$(shasum -a 256 "dist/${name}.tar.gz" | cut -d' ' -f1)"
+            # Same canonical byte compare as the FULL branch — the sidecar is
+            # a published file; its NAME field matters as much as its hash.
+            printf '%s  %s.tar.gz\n' "$sha" "$name" > expected.sha256
+            if ! cmp -s expected.sha256 "dist/${name}.tar.gz.sha256"; then
+              echo "::error::dist/${name}.tar.gz.sha256 is not the canonical checksum file for its tarball ($(cat "dist/${name}.tar.gz.sha256")) — corrupted, tampered, or malformed by the build job"; exit 1
+            fi
+            # `commit` binds the artifact to the exact sources CI built —
+            # a moved tag cannot re-home a signed artifact's provenance.
+            printf '{"schema":1,"version":"%s","commit":"%s","file":"%s.tar.gz","target":"%s","variant":"%s","sha256":"%s"}\n' \
+              "$ver" "$GITHUB_SHA" "$name" "$target" "$variant" "$sha" > "dist/${name}.manifest"
+            # -t: the TRUSTED (signed) comment — belt-and-braces binding of the
+            # release version + file name outside the manifest body.
+            minisign -S -s "$keyfile" -m "dist/${name}.manifest" \
+              -t "higgs v${ver} ${name}.manifest" \
+              -x "dist/${name}.manifest.minisig"
+          done <<< "$table"
+          ls -l dist/
 
       - name: Extract release notes from CHANGELOG
         id: notes
         shell: bash
+        env:
+          VER: ${{ needs.gate.outputs.version }}
         run: |
           set -euo pipefail
-          ver="${{ needs.gate.outputs.version }}"
+          ver="$VER"
           # Grab the body of the `## [<ver>] …` section (up to the next `## [`).
           notes="$(awk -v v="$ver" '
             $0 ~ ("^## \\[" v "\\]") {grab=1; next}
@@ -230,17 +682,125 @@ jobs:
             echo "have_notes=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v${{ needs.gate.outputs.version }}
-          # Tag the exact merged commit, not whatever main points at when this runs.
-          target_commitish: ${{ github.sha }}
-          name: higgs v${{ needs.gate.outputs.version }}
-          body_path: ${{ steps.notes.outputs.have_notes == 'true' && 'release_notes.md' || '' }}
-          generate_release_notes: ${{ steps.notes.outputs.have_notes != 'true' }}
-          # Any semver pre-release (a version with a '-', e.g. 0.1.0-beta.1) is
-          # published as a GitHub pre-release.
-          prerelease: ${{ contains(needs.gate.outputs.version, '-') }}
-          files: dist/*
-          fail_on_unmatched_files: true
+      # Publish by EXPLICIT release id — never by tag rediscovery. The
+      # adoption sweep above already found the release/draft exhaustively
+      # (drafts included, full pagination); delegating publish to an action
+      # that re-finds the release by tag could miss the very draft we adopted
+      # (the tag endpoint returns published releases only, and bounded scans
+      # stop early) and mint a DUPLICATE release under the same tag. One
+      # id-keyed path instead: create a DRAFT when nothing exists (the tag
+      # appears only at finalize, so no tag ever names a half-uploaded
+      # release), upload whatever the release is missing — artifacts strictly
+      # BEFORE the manifests that attest them, sequentially — then finalize
+      # with target_commitish pinned to this run's commit (also corrects an
+      # adopted asset-less draft created at an older commit; once a tag
+      # exists GitHub ignores the field, and the Verify step below re-checks
+      # the tag's peeled commit regardless).
+      - name: Publish release by id
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.mint.outputs.release_id }}
+          HAVE_NOTES: ${{ steps.notes.outputs.have_notes }}
+          PRERELEASE: ${{ contains(needs.gate.outputs.version, '-') }}
+          VER: ${{ needs.gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          ver="$VER"
+          release_id="$RELEASE_ID"
+          if [ -z "$release_id" ]; then
+            args=(-f "tag_name=v${ver}" -f "target_commitish=${GITHUB_SHA}" -f "name=higgs v${ver}" -F draft=true -F "prerelease=${PRERELEASE}")
+            if [ "$HAVE_NOTES" = "true" ]; then
+              release_id="$(gh api -X POST "repos/${GITHUB_REPOSITORY}/releases" "${args[@]}" -f "body=$(cat release_notes.md)" --jq '.id')"
+            else
+              release_id="$(gh api -X POST "repos/${GITHUB_REPOSITORY}/releases" "${args[@]}" -F generate_release_notes=true --jq '.id')"
+            fi
+            echo "created draft release id ${release_id} for v${ver}"
+          fi
+          existing="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}" --jq '[.assets[].name]')"
+          upload() {
+            local name="$1"
+            if printf '%s' "$existing" | jq -e --arg n "$name" 'index($n)' >/dev/null; then
+              echo "already published: ${name}"
+            else
+              # @uri-encode: a semver build-metadata '+' in the version (and
+              # hence the file name) would otherwise be parsed as query
+              # syntax and land under a normalized, different asset name.
+              local encoded; encoded="$(jq -rn --arg v "$name" '$v|@uri')"
+              gh api -X POST \
+                -H "Content-Type: application/octet-stream" \
+                "https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets?name=${encoded}" \
+                --input "dist/${name}" --jq '.id' >/dev/null
+              echo "uploaded: ${name}"
+            fi
+          }
+          for f in dist/*.tar.gz dist/*.tar.gz.sha256; do upload "$(basename "$f")"; done
+          for f in dist/*.manifest dist/*.manifest.minisig; do upload "$(basename "$f")"; done
+          gh api -X PATCH "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
+            -f "target_commitish=${GITHUB_SHA}" -F draft=false --jq '.draft' >/dev/null
+          echo "release v${ver} finalized (id ${release_id})"
+
+      # The release as PUBLISHED must be byte-identical to what this run
+      # intended (dist/). Everything is re-downloaded fresh and compared:
+      # this catches upload races (an expected-name asset planted between the
+      # adoption snapshot and the publish is never overwritten — uploads skip
+      # existing names), partial uploads, and storage divergence — failing
+      # THIS run loudly
+      # instead of reporting success on a release every node would refuse.
+      - name: Verify published release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VER: ${{ needs.gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          ver="$VER"
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" --jq '.[]' \
+            | jq -s "[.[] | select(.tag_name == \"v${ver}\")]" > rel.json
+          if [ "$(jq 'length' rel.json)" -ne 1 ]; then
+            echo "::error::expected exactly one release tagged v${ver} after publish"; exit 1
+          fi
+          jq -r '.[0].assets[] | "\(.id)\t\(.name)"' rel.json > verify_assets.tsv
+          mkdir -p verify
+          declare -A dist_set=()
+          for f in dist/*; do dist_set["$(basename "$f")"]=1; done
+          count=0
+          while IFS="$(printf '\t')" read -r aid aname; do
+            [ -n "$aid" ] || continue
+            count=$((count + 1))
+            if [ -z "${dist_set[$aname]:-}" ]; then
+              echo "::error::published asset ${aname} is not part of this run's release set"; exit 1
+            fi
+            gh api -H "Accept: application/octet-stream" \
+              "repos/${GITHUB_REPOSITORY}/releases/assets/${aid}" > "verify/${aname}"
+            if ! cmp -s "verify/${aname}" "dist/${aname}"; then
+              echo "::error::published asset ${aname} differs from the bytes this run built and verified"; exit 1
+            fi
+          done < verify_assets.tsv
+          expected="$(ls dist | wc -l | xargs)"
+          if [ "$count" -ne "$expected" ]; then
+            echo "::error::release v${ver} carries ${count} assets but this run expected ${expected}"; exit 1
+          fi
+          # The tag must still name the commit these binaries were built from
+          # (a writer moving v${ver} mid-run would re-home the release: the
+          # publish action ignores target_commitish once the tag exists).
+          ref_json="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/v${ver}")"
+          obj_sha="$(printf '%s' "$ref_json" | jq -r '.object.sha')"
+          obj_type="$(printf '%s' "$ref_json" | jq -r '.object.type')"
+          # Peel annotated tags RECURSIVELY (a tag can point at another tag;
+          # git's ^{} peels all the way, so this must too), bounded so a
+          # pathological tag chain cannot loop the job.
+          peels=0
+          while [ "$obj_type" = "tag" ]; do
+            peels=$((peels + 1))
+            if [ "$peels" -gt 10 ]; then
+              echo "::error::tag v${ver} nests more than 10 annotated tags — refusing"; exit 1
+            fi
+            tag_json="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${obj_sha}")"
+            obj_sha="$(printf '%s' "$tag_json" | jq -r '.object.sha')"
+            obj_type="$(printf '%s' "$tag_json" | jq -r '.object.type')"
+          done
+          if [ "$obj_sha" != "$GITHUB_SHA" ]; then
+            echo "::error::tag v${ver} now points at ${obj_sha} but this run built ${GITHUB_SHA} — the tag moved during the run; the release does not describe its own sources"; exit 1
+          fi
+          echo "published release verified: ${count} assets byte-identical, tag anchored to ${GITHUB_SHA}"

@@ -113,3 +113,77 @@ fn wrong_jsonrpc_version_decodes_softly() {
     let frame = decode(line).expect("soft version check must not reject the frame");
     assert!(matches!(frame, RpcFrame::Request(_)));
 }
+
+#[tokio::test]
+async fn read_bounded_frame_matches_lines_semantics() {
+    // Sequential frames, a CRLF-terminated line (the `\r` stripped), a final line WITHOUT a
+    // trailing newline, then a clean EOF → None. This is the `tokio::io::Lines` contract the
+    // node's serve loop relied on before the cap was added.
+    let data = b"first\nwith-crlf\r\nlast-no-newline";
+    let mut r = tokio::io::BufReader::new(&data[..]);
+    assert_eq!(
+        read_bounded_frame(&mut r, 1024).await.unwrap().as_deref(),
+        Some("first")
+    );
+    assert_eq!(
+        read_bounded_frame(&mut r, 1024).await.unwrap().as_deref(),
+        Some("with-crlf"),
+        "a preceding CR is stripped like Lines"
+    );
+    assert_eq!(
+        read_bounded_frame(&mut r, 1024).await.unwrap().as_deref(),
+        Some("last-no-newline"),
+        "a final newline-less line is returned"
+    );
+    assert_eq!(
+        read_bounded_frame(&mut r, 1024).await.unwrap(),
+        None,
+        "a clean EOF is None"
+    );
+}
+
+#[tokio::test]
+async fn read_bounded_frame_preserves_a_bare_cr_on_an_unterminated_final_line() {
+    // A CR is stripped ONLY as part of a CRLF terminator; a bare trailing CR on a final line
+    // with NO newline (EOF) is preserved — exactly like `tokio::io::Lines::next_line`. (Benign
+    // for JSON decode either way, but the reader's Lines-parity claim must hold precisely.)
+    let data = b"tail\r";
+    let mut r = tokio::io::BufReader::new(&data[..]);
+    assert_eq!(
+        read_bounded_frame(&mut r, 1024).await.unwrap().as_deref(),
+        Some("tail\r"),
+    );
+}
+
+#[tokio::test]
+async fn read_bounded_frame_accepts_a_frame_at_exactly_the_cap() {
+    // 8 content bytes with cap 8 is allowed (the boundary is inclusive); one more is not
+    // (asserted separately) — so a legitimate max-size frame is never falsely rejected.
+    let data = b"12345678\n";
+    let mut r = tokio::io::BufReader::new(&data[..]);
+    assert_eq!(
+        read_bounded_frame(&mut r, 8).await.unwrap().as_deref(),
+        Some("12345678")
+    );
+}
+
+#[tokio::test]
+async fn read_bounded_frame_rejects_a_frame_over_the_cap_before_its_newline() {
+    // 20 bytes then a newline, cap 8 → the newline-branch cap check fires with InvalidData.
+    // Reverting that check reads the whole line as Ok(Some(..)) → unwrap_err panics (mutant).
+    let data = b"xxxxxxxxxxxxxxxxxxxx\n";
+    let mut r = tokio::io::BufReader::new(&data[..]);
+    let err = read_bounded_frame(&mut r, 8).await.unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[tokio::test]
+async fn read_bounded_frame_rejects_a_long_newlineless_stream() {
+    // 100 KiB with NO newline exceeds `BufReader`'s internal chunk, so the ACCUMULATE-branch
+    // cap check (not the newline branch) must fire — proving a peer cannot grow the buffer
+    // unbounded by simply never sending a newline. cap 32 KiB → InvalidData.
+    let data = vec![b'x'; 100 * 1024];
+    let mut r = tokio::io::BufReader::new(&data[..]);
+    let err = read_bounded_frame(&mut r, 32 * 1024).await.unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+}

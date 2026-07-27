@@ -35,6 +35,7 @@ mod shutdown;
 pub mod supervisor;
 pub mod system;
 pub mod tune;
+pub mod update;
 pub mod worker;
 
 pub use api::{Higgs, HiggsConfig};

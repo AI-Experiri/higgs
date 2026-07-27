@@ -242,6 +242,11 @@ pub fn spawn_accept_loop(
                         agreed_version,
                         software_version,
                         fleet_events,
+                        update_failed,
+                        reports_update_failures,
+                        target,
+                        variant,
+                        update_capable,
                     } => {
                         tracing::info!(node = %peer, "higgs hub: node admitted");
                         // add_node runs UNDER the allowlist lock (held here) so it's mutually
@@ -249,14 +254,26 @@ pub fn spawn_accept_loop(
                         // Gated on THIS loop's admission generation: if the kill switch disabled
                         // (bumped the gen) since this loop started, the admit is refused.
                         let conn_for_requests = conn.clone();
+                        let transport = Arc::new(NodeTransport::new(conn));
+                        // Admit the node AND record its build identity + self-update capability from
+                        // the SAME HELLO in ONE atomic message, so `fleet_update` can pick the
+                        // matching release asset and skip non-capable nodes — and a `fleet_update`
+                        // reacting to `NodeConnected` never sees this update-capable node before its
+                        // identity is set (REL-P4e, codex r5 #2). Runs under the allowlist lock held
+                        // here (retire, the only remover, takes the same lock).
                         fleet
-                            .add_node(
+                            .add_node_with_identity(
                                 peer.clone(),
-                                Arc::new(NodeTransport::new(conn)),
+                                transport.clone(),
                                 Some(admit_gen),
                                 Some(agreed_version),
                                 Some(software_version),
                                 fleet_events,
+                                update_failed,
+                                reports_update_failures,
+                                target,
+                                variant,
+                                update_capable,
                             )
                             .await;
                         // Accept node→hub requests (self-`leave`) on this connection. Holds the

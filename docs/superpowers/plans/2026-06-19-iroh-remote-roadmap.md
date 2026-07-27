@@ -28,7 +28,7 @@ No phase is "done" until the gate is green AND the codex review loop has converg
 | **P4b** | #15b | done | `src/download.rs` HF downloader (injectable `Fetcher` + `HttpFetcher`, `HIGGS_HF_ENDPOINT`) → `~/.higgs/models/` ONLY, scanner-layout enforced, atomic; `M_NODE_PULL` data relay + `N_PROGRESS`; HG025. e2e `tests/pull.rs` (local HTTP server, offline). | `reqwest` | **DONE** |
 | **P5** | #16 | done | `src/keys.rs` `api_keys.json` (SHA-256 + constant-time, scopes chat\|models\|admin); serve bearer middleware + 401 envelope; `keys` CLI; standalone fails-closed. e2e `tests/auth.rs`. | `sha2`, `subtle` | **DONE** |
 | **P6** | #17 | backend done | `GET /api/higgs/nodes` fleet view + `POST /api/higgs/pair` shipped (P3/P4). The Svelte UI panel + QR + ts-rs exports live in the **jigglebot** repo (this standalone crate exposes the API contract). | `qrcode` (UI repo) | **backend DONE** |
-| **#18** | #18 | done | `M_NODE_UPDATE` recognized + refused with typed `HG026` (`UpdateUnsupported`); `update` capability stays `false`. Real signed updater = later task. | — | **DONE (stub)** |
+| **#18** | #18 | done | `M_NODE_UPDATE` SHIPPED (REL-P1..P4e): CI-signed manifests + pinned keys, node receive+verify+stage+trial-flip+re-exec + boot-guard rollback, hub courier, drain, `update_failed`-over-HELLO, jigglebot UI. `update` capability `true`; a legacy node refuses `HG026`. | — | **DONE** |
 
 ---
 

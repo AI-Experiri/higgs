@@ -240,9 +240,9 @@ crates this feature needs are transport (`iroh`) and model download (`hf-hub`)**
 
 Crate versions (verified against docs.rs, iroh 1.0.0): `iroh = "1.0"`, `iroh-tickets = "1.0"`,
 `iroh-base = "1.0"`. MSRV 1.91. **No `quinn`, no `irpc`, no `quic-rpc`** — our NDJSON `RpcFrame`
-rides raw `open_bi`/`accept_bi` streams directly (confirmed VIABLE, §2.4, §3.3). `Cargo.toml`
-deps must be added — none present today (verified: `Cargo.toml` `[dependencies]` has no
-iroh/quinn/iroh-tickets/iroh-base). **`iroh-tickets` is a SEPARATE crate** — `EndpointTicket`
+rides raw `open_bi`/`accept_bi` streams directly (confirmed VIABLE, §2.4, §3.3). The
+`Cargo.toml` deps are PRESENT (`[dependencies]` carries iroh/iroh-base/iroh-tickets — and
+`minisign-verify` for §9). **`iroh-tickets` is a SEPARATE crate** — `EndpointTicket`
 is NOT re-exported by iroh core (§3.2).
 
 ### 3.0 Vetted dependencies (Crate-First)
@@ -262,7 +262,7 @@ Every net-new crate was checked on crates.io (2026-06-19) per the Crate-First ru
 | `sha2` | API-key SHA-256 hash | 695M | P5 |
 | `subtle` | constant-time key compare | 541M | P5 |
 | `qrcode` *(optional)* | pairing QR (else plain ticket string) | 15.5M | P6 |
-| `minisign-verify` *(deferred)* | update-artifact signature verify | 8.2M | #18 |
+| `minisign-verify` | update-manifest signature verify (`src/update.rs`, §9) | 8.2M | #18 |
 
 **Deliberately NO crate (use a primitive / existing dep) — each also closes a risk:**
 - **`WorkerId` = `u32` newtype** (`Copy`) — *not* `smol_str`/`compact_str`. Wire carries it as a
@@ -494,14 +494,16 @@ the single anchor that makes M_UPDATE (§9) purely additive.
   "protocol_versions": [1, 2],               // every wire-protocol major this peer can SPEAK
   "min_supported": 1,                      // lowest major it will still ACCEPT
   "software_version": "0.4.2",            // higgs build (semver) — informational + M_UPDATE gating
-  "capabilities": { "chat": true, "download": true, "log_stream": true, "update": false } }
+  "capabilities": { "chat": true, "download": true, "log_stream": true, "fleet_events": true, "update": true } }
+  // (a managed install also advertises "update_reporting": true; the node ALSO sends top-level
+  //  "target"/"variant" build-identity fields + a last "update_failed", all serde(default) — §9)
 
 // hub → node : RpcResponse { id:1, result: HelloResult }
 { "role": "hub",
   "node_id": "z32-endpoint-id-of-hub",
   "agreed_version": 2,                     // the single major both sides pin for this session
   "software_version": "0.4.2",
-  "capabilities": { "update_push": true, "log_aggregate": true },
+  "capabilities": { "update_push": true, "log_aggregate": true, "fleet_events": true },
   "assigned_label": "studio-mac" }         // hub's human label for this node (UI + LogSource)
 ```
 
@@ -523,8 +525,9 @@ New constants live in a new `remote` module, namespaced `higgs/node/*` to stay
 unmistakably distinct from the local worker `higgs/*` methods.
 
 > **Two layers, two dispatchers.** `higgs/node/*` control RPCs terminate at the **node's
-> `NodeRuntime` dispatch** (a new dispatch in `src/node.rs`, §5.4a) — they NEVER reach
-> `WorkerState::dispatch`. `WorkerState` (`worker/mod.rs:110-114`) owns only `engine` +
+> `NodeRuntime` dispatch** (a new dispatch in `src/node.rs`, §5.4a) — except `M_NODE_UPDATE`,
+> special-cased in `handle_node_stream` so its detached apply runs only after its own reply
+> (§9) — and they NEVER reach `WorkerState::dispatch`. `WorkerState` (`worker/mod.rs:110-114`) owns only `engine` +
 > `loaded`: a *single* llama.cpp child, no `ModelStore`, no HF-download, no multi-worker
 > registry. It physically cannot serve scan/pull/load-across-workers/kill-one-worker. The
 > ONLY thing reused on `serve_state`/`WorkerState` is the per-worker **data** stream
@@ -622,6 +625,7 @@ operation, then replies. **None reach `WorkerState`** — they live one layer up
 | `M_SCAN` | `higgs/node/scan` | `{}` | `{ "models": [HiggsModel…] }` | the node's on-disk catalog (read-only scan); inventory is the SEPARATE `M_INVENTORY` op |
 | `M_SYSINFO` | `higgs/node/sysinfo` | `{}` | `{ "hardware":HardwareInfo, "runtime":RuntimeInfo }` | `SystemInfo::gather(config, Higgs::sysinfo)` — see fix C below |
 | `M_PULL` | `higgs/node/pull` | `NodePullParams { request_id, repo, file, revision? }` | `N_PROGRESS` stream, then `{ "path" }` | AS SHIPPED: single-file pull with streamed progress (`remote.rs`) |
+| `M_NODE_UPDATE` | `higgs/node/update` | `NodeUpdateParams` | `{ "status":"accepted", "target_version" }` | special-cased in `handle_node_stream` (reply first, then detached apply) — §9 |
 
 > **`M_LOAD` = orchestrator spawns a NEW worker (multi-worker, net-new).** The node may
 > already host other workers; `M_LOAD` does NOT replace them. `NodeRuntime` spawns a fresh
@@ -731,8 +735,8 @@ no new bus mechanism. `N_PROGRESS` is part of the **net-new** `M_PULL` downloade
 
 ## 5. The higgs Seam — file:line
 
-All anchors are in the crate at `feat/iroh-remote`. Cargo deps `[dependencies]` have
-**no iroh/quinn** yet — add them (§3).
+All anchors are in the crate at `feat/iroh-remote`. Cargo deps `[dependencies]` carry
+**iroh/iroh-base/iroh-tickets** (present; still no `quinn` — §3).
 
 ### 5.1 The `HalvesFactory` seam — add a second factory
 
@@ -855,7 +859,9 @@ if std::env::args().skip(1).any(|a| a == "--higgs-worker") { higgs::worker::work
 
 `higgs/node/*` control RPCs arrive on the node's **control** stream and terminate in a **new
 `NodeRuntime` dispatch in `src/node.rs`** that operates on the `HashMap<WorkerId,
-Arc<Supervisor>>` registry + the node's `ModelStore`. They NEVER enter `WorkerState::dispatch`
+Arc<Supervisor>>` registry + the node's `ModelStore` (except `M_NODE_UPDATE`, special-cased in
+`handle_node_stream` so its detached apply runs only after its own reply — §9). They NEVER
+enter `WorkerState::dispatch`
 — `WorkerState` (`worker/mod.rs:110-114`) has only `engine` + `loaded` (one child). Constants
 live in a new `remote` module:
 
@@ -869,6 +875,7 @@ live in a new `remote` module:
 | `M_KILL` | look up `worker_id` → `Supervisor::stop()` (force-reap ONE) → remove → drop ring | reuse `Supervisor::stop` (NOT `M_SHUTDOWN`) |
 | `M_SYSINFO` | `SystemInfo::gather(config, Higgs::sysinfo)` (fix C) | `Higgs::sysinfo`=`Vec<GpuDevice>` (`api.rs:996`) folded by `gather` (`system.rs:125`) |
 | `M_PULL` | **NEW HF downloader** → `~/.higgs/models/` (fix D) | NET-NEW; progress on data plane (§4.4) |
+| `M_NODE_UPDATE` | (NOT a `NodeRuntime` arm — special-cased in `handle_node_stream`: reply `accepted` first, then detached apply, §9) | `accept_node_update` + `DeferredUpdate::spawn` → `self_update::apply_pushed_update` |
 
 > **`WorkerId` — NEW newtype, the per-node worker key. LOCKED: `u32` (fix, multi-worker).**
 > Single home = the node's `NodeRuntime` registry. Decided via Crate-First (§3.0): a `u32`
@@ -1057,11 +1064,12 @@ each its own code — no "two auth rejections" miscount:
 | HG023 | `VersionMismatch` | `[HG023] no agreed protocol version: peer speaks {peer:?}, we accept {ours:?}` | **fatal** `severity(Error)` (typed close) | `node.rs` (HELLO negotiation, §4.1) |
 | HG024 | `NotAllowlisted` | `[HG024] peer {endpoint_id} is not in the allowlist and presented no valid pairing token` | non-fatal | `node.rs` (post-HELLO gate, §3.2) |
 | HG025 | `DownloadFailed` | `[HG025] model download failed: {repo}: {detail}` | non-fatal | `node.rs` (`M_PULL` HF download, §4.4) |
-| HG026 | `NotImplemented` | `[HG026] not implemented: {method}` | non-fatal | `node.rs` (`M_UPDATE` stub today, §9) |
+| HG026 | `UpdateUnsupported` | `[HG026] software update not supported by this build: {detail}` | non-fatal | a LEGACY node (no self-update receiver) refusing an `M_UPDATE` push; the current build ships the receiver, §9 |
 | HG027 | `NodeUnreachable` | AS SHIPPED: `[HG027] node {endpoint_id} unreachable: {detail} — …recovers once it reconnects` (routes KEPT; retire is a separate explicit op) | non-fatal | `node.rs` (conn-closed / dial failure / wedged-worker escalation, §3.4, §3.4.1) |
 | HG028 | `HandshakeStalled` | `[HG028] peer {endpoint_id} completed QUIC but sent no HELLO within {window}s; dropped` | non-fatal | `node.rs` (post-HELLO timeout, §3.2.1) |
 
-> **HG026 use-site note.** HG026 = `NotImplemented`, used by the `M_UPDATE` stub (§9). The two
+> **HG026 use-site note.** HG026 = `UpdateUnsupported`, a LEGACY node's typed refusal of an
+> `M_UPDATE` push (the current build ships the receiver, §9). The two
 > auth-gate *rejections* are HG022 (bad token) and HG024 (not allowlisted); HG023 (version) is a
 > fatal close, HG028 (handshake-stalled) is the new pre-auth-DoS guard. No spare auth code is
 > needed — four codes for four outcomes, no miscount.
@@ -1117,7 +1125,7 @@ higgs keys remove X
 ```
   BINARY  (the higgs executable)               HOME  (~/.higgs, persisted state)
   ──────────────────────────────              ──────────────────────────────────
-  swapped by an updater (M_UPDATE, later)     migrated in place by the running binary
+  swapped by the updater (M_UPDATE, REL-P4)   migrated in place by the running binary
   signed, pinned-key verified                 endpoint.key NEVER rotated on update
   re-exec to apply                            pairings/api_keys survive every swap
   bumps software_version (HELLO)              schema versioned independently
@@ -1126,29 +1134,128 @@ The persisted `SecretKey` (`endpoint.key`) means a node keeps its `EndpointId` a
 swaps — it stays in the hub's allowlist with no re-pairing. The home is the durable identity;
 the binary is replaceable.
 
-**`M_UPDATE` reserved now (additive, gated off):**
+**`M_UPDATE` — IMPLEMENTED (node receive + apply; hub courier, REL-P4e):**
 ```rust
-pub const M_UPDATE: &str = "higgs/node/update";   // hub → node
-// HELLO capabilities already carry { "update": <node self-updates>, "update_push": <hub pushes> }
+pub const M_NODE_UPDATE: &str = "higgs/node/update";   // hub → node
+// HELLO capabilities carry { "update": <node self-updates> } (node) / { "update_push" } (hub);
+// a node ALSO reports its build identity in HELLO: { "target": <triple>, "variant": metal|cpu|cuda }.
 ```
 ```jsonc
-// M_UPDATE params (reserved — handler returns HG026 NotImplemented today)
-{ "target_version":"0.5.0",
-  "artifact_url":"https://…/higgs-0.5.0-aarch64-apple-darwin.tar.gz",
-  "signature":"minisign:RWS…",          // detached sig over the artifact
-  "pinned_key_id":"higgs-release-2026" } // which pinned pubkey must verify it
+// M_NODE_UPDATE params (NodeUpdateParams)
+{ "manifest":"{…}",                      // the CI-signed update manifest (JSON text, below), INLINE
+  "manifest_sig":"untrusted comment…",   // its .minisig file content, INLINE
+  "artifact_url":"https://…/higgs-v0.5.0-aarch64-apple-darwin.tar.gz",  // DIRECT (node follows no redirects)
+  "target_version":"0.5.0",              // informational (the manifest is authoritative)
+  "pinned_key_id":"higgs-release-1" }    // informational (node tries all pinned keys)
 ```
-Ship a `const HIGGS_UPDATE_PUBKEYS: &[(&str,&str)]` (key_id → pubkey) compiled into the
-binary today (empty-capable). A node that later self-updates verifies `signature` against
-`pinned_key_id` before swapping its binary — no TOFU on the update itself. **Why it's free
-now:** HELLO already advertises `software_version` + `update`/`update_push`, so a hub knows
-which nodes *could* accept a push without a new handshake. The later updater only fills the
-`M_UPDATE` body and populates the pubkey table — zero wire change, capabilities are an open map.
+A hub push is **UPGRADE-ONLY**: there is NO `allow_downgrade` on the wire, and the node ALWAYS applies
+with downgrade REFUSED (`evaluate_eligibility`), so a compromised paired hub can never replay an OLD
+signed release to downgrade a node. Rolling back is the node's own LOCAL job (`higgs node
+self-update --rollback` or the boot-guard auto-rollback on a crash-loop), never a hub push.
+The node ACKs `{status:"accepted", target_version}` and applies DETACHED (verify manifest sig →
+eligibility → fetch artifact → verify sha256 → stage → smoke → atomic flip → boot-guarded
+rollback), so the ACK is a receipt of the
+PUSH, not of a successful update — the authoritative outcome is the node's next HELLO (`software_version`
+advanced, or `update_failed`).
 
-**Update sequence (later):** `drain → swap → rejoin`:
+**Hub courier (`Higgs::node_update` / `Higgs::fleet_update`, `src/node/release_courier.rs`):** the hub
+is ONLY a courier — it cannot forge a binary (the node re-verifies the signature against its
+COMPILED-IN pins and re-hashes the artifact). `node_update` takes an operator-supplied EXACT manifest
+URL; `fleet_update` takes a release BASE URL — a DIRECT STATIC HTTPS ORIGIN serving the `.manifest`/
+`.minisig`/`.tar.gz` as static siblings with NO redirect and NO query, whose last path segment is the
+`v<ver>` release dir (`https://mirror.example/higgs/v<ver>`). (The GitHub `…/releases/download/v<ver>`
+URL does NOT work: it 302-redirects to storage, which the courier refuses as an SSRF defence, and the
+storage URL carries a query — so mirror the signed release assets to a static origin.) For each CONNECTED,
+update-capable node, derives its per-`(target, variant)` manifest name from the CI `release.yml`
+naming — `higgs-v<ver>-<suffix>`, where `<suffix>` is the target triple for the sole/default variant
+(`metal`/`cpu`) and `<triple>-cuda` for CUDA — using the `target`/`variant` the node reported in HELLO.
+The courier async-fetches the (tiny) manifest + its sibling `.minisig` (size-capped, time-bounded, NO
+redirects) and derives the DIRECT `artifact_url` as the sibling named by the manifest's bare `file`.
+The manifest fetch is SSRF-vetted (the hub now makes an outbound fetch): `https` to any host, or
+`http` to a LITERAL loopback IP (on-box mirror / test; the NAME `localhost` is NOT a shortcut — it
+resolves and is SSRF-vetted like any domain), and a non-loopback host is resolved + refused if any
+address is non-global (the SAME `is_ssrf_prone_ip` classifier the node applies to the pushed artifact,
+with the client PINNED to the vetted addresses against DNS rebind). `fleet_update` BINDS each fetched
+manifest to the base URL's requested `v<ver>` (an origin serving a validly-signed but OLDER/DIFFERENT
+manifest at the expected path is refused, not pushed), and PINS each push to the transport that supplied
+the node's `(target, variant)` — if the node reconnected mid-update (possibly onto a different build,
+making the selected asset wrong), it is reported `skipped`, never a bogus `accepted`. Both facades gate
+on the HUB being ENABLED (not merely a fleet existing), so a disabled hub returns `not_a_hub` before any
+outbound fetch. `fleet_update` runs the per-node fetch+push OFF the FleetActor with bounded concurrency
+and returns a `{node, status: accepted|skipped|error}` report — a node that did not advertise `update`,
+or never reported its build identity, is skipped (the courier cannot pick an asset for it), and one
+node's failure never fails the fleet.
+Also IMPLEMENTED (this section + code): (c) node drain+re-exec (the graceful-restart on a staged
+update — `finish in-flight chats` then re-exec, `request_self_restart`), (d) `update_failed`-over-HELLO
+surfacing on a managed install (`HelloParams::update_failed` → `NodeView::update_failed`), and the
+jigglebot Fleet-Update UI. Remaining refinements are tracked separately (bound the shared transport's
+open/write for ALL control ops; RFC-7050 network-specific-Pref64 discovery in `is_ssrf_prone_ip`).
+**What is signed (SHIPPED, release.yml + `src/update.rs`):** the RELEASE job (not the
+build jobs, which run arbitrary dependency build scripts and are treated as untrusted
+producers: their `dist/` is allowlisted against the exact expected artifact set and every
+sha256 is recomputed from the tarball bytes) mints one `higgs-v<ver>-<suffix>.manifest`
+per artifact — JSON binding `{schema, version, commit, file, target, variant, sha256}`
+(`commit` = the CI build's source SHA, so a moved tag cannot re-home a signed artifact) — and signs
+the MANIFEST (not the raw artifact) into `…manifest.minisig` with the
+`MINISIGN_SECRET_KEY` Actions secret. A raw detached sig over the tarball would prove
+provenance but bind no version/target — a courier could replay an older signed artifact
+(downgrade) or hand a CUDA build to a CPU node. The manifest binds all four under one
+signature; the artifact is then authenticated by its `sha256` (`verify_artifact_sha256`,
+HG084).
+
+`static HIGGS_UPDATE_PUBKEYS` (key_id → pubkey pairs, parsed from the compile-time-embedded
+`.github/release-pubkeys.txt`) is compiled into the binary
+(`src/update.rs`, empty-capable — empty table = every verify fails closed, HG081). A
+self-updating node verifies the manifest with `verify_manifest_any` (tries every
+compiled-in pin — `pinned_key_id` on the wire is informational only) before
+swapping its binary — no TOFU on the update itself. Refusals are typed: HG081 unpinned key,
+HG082 bad signature, HG083 bad/unknown-schema manifest, HG084 artifact≠sha256. Key rotation: the
+BRIDGE release pins BOTH keys but is still signed with the OLD key (deployed nodes pin
+only old); releases after the bridge sign with the new key. **Why it's free now:** HELLO
+already advertises `software_version` + `update`/`update_push`, so a hub knows which nodes
+*could* accept a push without a new handshake — no capability RENEGOTIATION (the capabilities are an
+open map). The updater (REL-P4) added the `M_UPDATE` body (`NodeUpdateParams`) plus a few ADDITIVE,
+`serde(default)` HELLO fields a node reports — `target`/`variant` (the release-asset selector the
+courier matches) and `update_failed` (P4b (d)) — all backward-compatible (an older peer omits them),
+so no protocol-version bump was needed.
+
+**Install + service (SHIPPED, REL-P2):** `install.sh` (repo root) installs a release on a
+machine — from a scp'd tarball (`--tarball`) or the private repo over plain REST with a
+fine-grained Contents:read PAT (`HIGGS_GITHUB_TOKEN`; never `gh auth login` on a node) —
+verifying the `.sha256` (and, with `--pubkey`, the §9 signed manifest AND that its
+version/file/target/variant match the request — a signed OLD manifest cannot be replayed
+under a new name), staging then renaming into `~/.higgs/bin/v<ver>/` (install.sh NEVER
+EXECUTES the artifact — it verifies + places; the binary runs only when the operator
+installs the service, whose `Type=exec` unit fails loudly on a broken binary) (a
+reinstall never truncates a running binary), and ATOMICALLY flipping `~/.higgs/bin/current`
+(temp symlink + rename(2); rollback = re-install the old version, every version dir is
+kept). The download PAT is dropped the moment fetching ends, before any child process runs.
+`higgs node install-service` (src/node/service.rs) then installs the node service behind
+ONE cross-platform dial (`ServiceScope`): the DEFAULT is USER-SPACE and LOGIN-BOUND — a
+macOS LaunchAgent in `~/Library/LaunchAgents` (gui/<uid> domain, no sudo; stops at logout)
+or a Linux systemd user unit with NO linger — and `--system` (SurvivesLogout) opts into
+always-on: a macOS LaunchDaemon pinned to the operator via `UserName` (REQUIRES root; the
+log dir + node.log are created AS THE OPERATOR — uid/gid-dropped, never chowned — so no
+ancestor symlink can be followed to a system path; a leftover login-bound agent is torn
+down so a scope switch never runs two nodes) or the SAME Linux user unit plus best-effort
+`loginctl enable-linger`. The Linux unit is written to a stable path
+in the operator's tree and installed by ENABLING IT BY ABSOLUTE PATH
+(`systemctl --user enable <abspath>` — links-if-outside-a-search-dir, else just enables; systemd
+decides the search dir — no `$XDG_CONFIG_HOME` guessing) + enable-linger with
+`Restart=always`/`StartLimitIntervalSec=0` (REFUSES root — a root-run `systemctl --user`
+targets the wrong manager); every privileged subprocess uses a pinned root-owned `PATH` so a
+bare `systemctl`/`launchctl` can't resolve to a planted binary under sudo; both exec through
+`current`, so a later self-update swaps binaries without touching PATH or service files.
+
+**Update sequence (SHIPPED, REL-P4):** `apply-while-serving → drain → swap-activate → rejoin`. The
+node ACKs the push, then applies DETACHED — it keeps SERVING throughout the minutes-long download —
+and drains only at the very end, when it re-execs:
 ```
-hub M_UPDATE ─▶ node: verify sig → finish in-flight chats (drain) → download+swap binary
-            ─▶ node re-execs → re-binds same endpoint.key (same EndpointId) → re-dials hub
+hub M_UPDATE ─▶ node ACKs {accepted} → detached apply: verify sig + eligibility → download
+                artifact → verify sha256 → stage → smoke (`--version`) → atomic flip `current`
+                (still serving)
+            ─▶ request restart → drain in-flight chats → re-exec → re-bind same endpoint.key
+                (same EndpointId) → re-dial hub
             ─▶ HELLO with new software_version → allowlist passes (id unchanged) → rejoin
 ```
 
@@ -1234,8 +1341,11 @@ P6  UI                    (#17)  /api/higgs/nodes panel (fleet view from NodeVie
                                  for NodeView + NodeInventory + NodePath / HelloResult / LogSource.
                                  Verify (Playwright): pair a node, load 2 workers, chat, see logs.
 
-(#18  M_UPDATE)                  Reserved this design (§9): const + capability + pubkey table +
-                                 HG026 stub. Real updater is a later, separate task.
+ #18  M_UPDATE            (REL-P4)  SHIPPED (see §9): CI-signed manifests + pinned pubkeys (P1);
+    ─────────────────────────    node receive+verify+stage+trial-flip+re-exec + boot-guard rollback
+                                 (P3); hub courier node_update/fleet_update (P4e); graceful
+                                 drain+re-exec (c); update_failed-over-HELLO on NodeView (d);
+                                 jigglebot Fleet-Update UI. Upgrade-only; a legacy node refuses HG026.
 ```
 
 ---
@@ -1269,6 +1379,8 @@ RuntimeInfo :86; both gain `Deserialize` for remote inventory, §4.2.1) +
 (role selector :33; bin = `higgs`), `src/serve/control.rs` (logs filter :44),
 `src/diagnostic.rs` (HG codes — max HG021 at :185, remote adds HG022–HG028), **new
 `src/node.rs`** (Endpoint + `NodeRuntime` registry + per-node iroh transport + remote_factory),
-**new `src/auth.rs`** (pairings.json / api_keys.json), `Cargo.toml` (add — all vetted ≥100k dl,
-§3.0: iroh + iroh-base + iroh-tickets 1.0 [P1], toml [P2], hf-hub [P4b], sha2 + subtle [P5],
-qrcode optional [P6], minisign-verify deferred [#18]; `WorkerId`=u32 + node-IP need NO crate).
+**new `src/auth.rs`** (pairings.json / api_keys.json), `Cargo.toml` (all added — vetted ≥100k dl,
+§3.0: iroh + iroh-base + iroh-tickets 1.0 [P1], sha2 + subtle [P5],
+minisign-verify [#18, shipped — `src/update.rs` §9]; the shipped updater also uses
+semver/tar/flate2/reqwest/libc, all present; HF pulls landed on the `huggingface-hub` crate
+rather than `hf-hub`; `WorkerId`=u32 + node-IP need NO crate).

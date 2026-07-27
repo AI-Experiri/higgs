@@ -169,6 +169,8 @@ async fn two_nodes_same_model_two_served_ids_stream_each_then_retire_one() {
             None,
             None,
             false,
+            None,
+            true,
         )
         .await;
     let (conn2, peer2) = admit_node(&hub, &mut allow, &mut tokens, &hub_id).await;
@@ -180,6 +182,8 @@ async fn two_nodes_same_model_two_served_ids_stream_each_then_retire_one() {
             None,
             None,
             false,
+            None,
+            true,
         )
         .await;
     assert_ne!(peer1, peer2, "two distinct nodes paired");
@@ -337,6 +341,8 @@ async fn hub_v1_chat_routes_to_remote_node() {
             None,
             None,
             false,
+            None,
+            true,
         )
         .await;
 
@@ -569,6 +575,8 @@ async fn node_reconnects_and_route_survives() {
             None,
             None,
             false,
+            None,
+            true,
         )
         .await;
     fleet
@@ -592,6 +600,8 @@ async fn node_reconnects_and_route_survives() {
             None,
             None,
             false,
+            None,
+            true,
         )
         .await;
     assert_eq!(

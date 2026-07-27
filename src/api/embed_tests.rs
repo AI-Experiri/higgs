@@ -427,6 +427,8 @@ async fn add_fake_remote_node(
             Some(2),
             Some(env!("CARGO_PKG_VERSION").to_string()),
             false,
+            None,
+            true,
         )
         .await;
     fleet

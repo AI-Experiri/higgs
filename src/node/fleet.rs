@@ -51,8 +51,9 @@ use crate::node::node_id::{NodeId, NodeIdAllocator};
 use crate::node::transport::NodeTransport;
 use crate::node::worker_id::WorkerId;
 use crate::remote::{
-    FleetEventKind, InventoryWorker, NodeFleetEvent, NodeInventory, M_NODE_INVENTORY, M_NODE_KILL,
-    M_NODE_LOAD, M_NODE_SCAN, M_NODE_UNLOAD, N_FLEET_EVENT, N_LOG_LINE,
+    FleetEventKind, InventoryWorker, NodeFleetEvent, NodeInventory, NodeUpdateParams,
+    M_NODE_INVENTORY, M_NODE_KILL, M_NODE_LOAD, M_NODE_SCAN, M_NODE_UNLOAD, M_NODE_UPDATE,
+    N_FLEET_EVENT, N_LOG_LINE,
 };
 use crate::rpc::{self, RpcFrame};
 
@@ -114,6 +115,14 @@ pub struct NodeView {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub software_version: Option<String>,
+    /// The node's LAST self-update FAILURE, re-reported in its HELLO on every admission until it
+    /// resolves (P4b (d)) — surfaced so the operator sees WHY a pushed update did not take (vs.
+    /// inferring it from `software_version` never advancing). Absent = the last update succeeded or
+    /// none was attempted; cleared once the node reports no failure while ALSO advancing off the
+    /// failed build (a same-version `None` from a legacy/dev binary does not erase it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub update_failed: Option<crate::remote::UpdateFailed>,
     /// The HELLO-negotiated wire-protocol major for the node's CURRENT admission
     /// (T14) — the same slot the per-load params gate reads ([HG078]). Absent =
     /// the admission predates version reporting (effectively the floor, 1) or
@@ -121,7 +130,51 @@ pub struct NodeView {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub protocol: Option<u32>,
+    /// The node's build TARGET triple from its HELLO (REL-P4e) — what the hub matches a release
+    /// asset against when it pushes a self-update. Refreshed per (re)admission, cleared at
+    /// retire. Absent for a legacy node that did not report it, or the local card.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub target: Option<String>,
+    /// The node's acceleration VARIANT from its HELLO (`metal`/`cpu`/`cuda`) — the second half of
+    /// the release-asset selector. Same lifecycle as `target`; absent for a legacy node or the
+    /// local card.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub variant: Option<String>,
 }
+}
+
+/// One CONNECTED node's self-update push descriptor (REL-P4e), as the release courier
+/// (`Higgs::fleet_update`) needs it: the node key plus the build identity + capability it
+/// advertised in its CURRENT HELLO, PLUS the exact transport that supplied them. Not a wire type —
+/// an in-crate hand-off from the fleet (which holds the per-node admission facts) to the courier
+/// (which resolves a per-node manifest URL from them). `target`/`variant` are `None` for a legacy
+/// node that did not report them; `update_capable` is `false` for a node whose HELLO omitted the
+/// `update` capability — the courier reports both as skipped rather than pushing. `transport` pins
+/// the supplying connection so [`HubFleet::push_update_pinned`] can refuse to push a `(target,
+/// variant)`-selected asset if the node RECONNECTED (possibly onto a different build) since this
+/// snapshot. (No `Debug`/`Eq`: `NodeTransport` is an opaque live connection.)
+#[derive(Clone)]
+pub struct NodeUpdateTarget {
+    pub node: NodeKey,
+    pub target: Option<String>,
+    pub variant: Option<String>,
+    pub update_capable: bool,
+    /// The node's CURRENT transport at the moment of the snapshot — the CAS key for the push.
+    pub transport: Arc<NodeTransport>,
+}
+
+/// Outcome of a transport-PINNED self-update push ([`HubFleet::push_update_pinned`], REL-P4e): the
+/// node accepted it, or it RECONNECTED/dropped since the courier snapshotted its build identity, so
+/// the `(target, variant)`-selected asset was NOT sent (a reconnect could be a different build — the
+/// asset would be wrong). Distinct from an `Err` (transport dead / node refusal) so the courier can
+/// report a clean "skipped: reconnected" instead of a bogus "accepted".
+pub enum PinnedPush {
+    /// The node accepted the push — its `{status, target_version}` reply.
+    Accepted(Value),
+    /// The node is no longer the connection that supplied the snapshot — nothing was sent.
+    Reconnected,
 }
 
 higgs_ts! {
@@ -216,6 +269,12 @@ enum FleetMsg {
         node: NodeKey,
         reply: oneshot::Sender<Option<u32>>,
     },
+    /// The push targets for a fleet-wide self-update (REL-P4e): one entry per CURRENTLY-CONNECTED
+    /// node, carrying the build identity + `update` capability it advertised. The courier
+    /// resolves a per-node release asset from these off the actor.
+    UpdateTargets {
+        reply: oneshot::Sender<Vec<NodeUpdateTarget>>,
+    },
     Epoch {
         node: NodeKey,
         reply: oneshot::Sender<u64>,
@@ -249,6 +308,23 @@ enum FleetMsg {
         /// re-pull is demoted to a legacy fallback for it. Same lifecycle as the
         /// version facts: refreshed per (re)admission, cleared at retire.
         fleet_events: bool,
+        /// The node's last self-update FAILURE from its HELLO (P4b (d)), for the Fleet view.
+        /// Re-reported on every admission until it resolves; a `None` clears the stored one only
+        /// when the node ALSO advertises `reports_update_failures` (below).
+        update_failed: Option<crate::remote::UpdateFailed>,
+        /// Whether the node's HELLO advertised the `update_reporting` capability (P4b (d)): it
+        /// reports its update failures, so a `None` from it is AUTHORITATIVE (clears a stored
+        /// failure). A node WITHOUT it (legacy/dev/non-managed) cannot report, so its `None`
+        /// PRESERVES a stored failure it can't speak to.
+        reports_update_failures: bool,
+        /// The node's build identity + self-update capability from the SAME HELLO (REL-P4e), set
+        /// ATOMICALLY with admission (before `NodeConnected` fires) so a `fleet_update` reacting to
+        /// `NodeConnected` never sees a freshly-admitted update-capable node as not-yet-identified.
+        /// `target`/`variant` = the release-asset selector (`None` clears any prior connection's);
+        /// `update_capable` = whether its HELLO advertised the `update` capability.
+        target: Option<String>,
+        variant: Option<String>,
+        update_capable: bool,
         #[allow(clippy::type_complexity)]
         reply: oneshot::Sender<Option<(NodeId, Option<Arc<NodeTransport>>)>>,
     },
@@ -514,11 +590,28 @@ struct FleetActor {
     /// reconnects — the HELLO is the only source), cleared at retire. Absent for a
     /// node admitted by a pre-T14 caller path.
     software_versions: HashMap<NodeKey, String>,
+    /// The node's LAST self-update FAILURE (P4b (d)), per node — surfaced in the Fleet view so
+    /// the operator learns WHY a pushed update did not take. Set on the (re)admission whose HELLO
+    /// carried it; a later admission with no failure CLEARS it (the update took, or a fresh one
+    /// is in flight); cleared at retire.
+    update_failures: HashMap<NodeKey, crate::remote::UpdateFailed>,
     /// Nodes whose CURRENT admission advertised the `fleet_events` capability (T10).
     /// Membership decides whether the chat-end debounced re-pull is scheduled at all
     /// (event-pushing nodes keep the hub cache fresh themselves). Refreshed per
     /// (re)admission, cleared at retire — same lifecycle as the version facts.
     event_nodes: HashSet<NodeKey>,
+    /// The node's build TARGET triple from its HELLO (REL-P4e) — half of the release-asset
+    /// selector the courier (`fleet_update`) matches a manifest against. Set ATOMICALLY by
+    /// `AdmitNode` (from `add_node_with_identity`); cleared at (re)admission and retire (never
+    /// inherit a prior process's build, exactly like the version facts).
+    targets: HashMap<NodeKey, String>,
+    /// The node's acceleration VARIANT from its HELLO (`metal`/`cpu`/`cuda`) — the other half of
+    /// the selector. Same lifecycle as `targets`.
+    variants: HashMap<NodeKey, String>,
+    /// Nodes whose CURRENT admission advertised the `update` capability (REL-P4e): they ship the
+    /// signature-verified self-update push handler, so `fleet_update` pushes to them. Same
+    /// per-admission lifecycle as `event_nodes`.
+    update_capable: HashSet<NodeKey>,
     /// Per-node lifecycle generation, bumped on every load/unload/kill/route-drop. A
     /// `refresh_inventory` only commits its (possibly stale) result if this is unchanged
     /// since it started — so a slow connect-time fetch can't clobber a newer state.
@@ -688,7 +781,11 @@ impl FleetActor {
         self.inventories.remove(node);
         self.versions.remove(node);
         self.software_versions.remove(node);
+        self.update_failures.remove(node);
         self.event_nodes.remove(node);
+        self.targets.remove(node);
+        self.variants.remove(node);
+        self.update_capable.remove(node);
         self.pending_pushes.remove(node);
         self.fallback_inflight.remove(node);
         // Drop any chat-refresh debounce slot too: a retired node needs no
@@ -743,6 +840,9 @@ impl FleetActor {
                     inventory_age_ms,
                     software_version: self.software_versions.get(&endpoint_id).cloned(),
                     protocol: self.versions.get(&endpoint_id).copied(),
+                    update_failed: self.update_failures.get(&endpoint_id).cloned(),
+                    target: self.targets.get(&endpoint_id).cloned(),
+                    variant: self.variants.get(&endpoint_id).cloned(),
                     endpoint_id,
                 }
             })
@@ -874,6 +974,23 @@ impl Actor for FleetActor {
             FleetMsg::NodeProtocol { node, reply } => {
                 let _ = reply.send(self.versions.get(&node).copied());
             }
+            FleetMsg::UpdateTargets { reply } => {
+                // One descriptor per CURRENTLY-CONNECTED node (a push needs a live transport):
+                // its build identity + `update` capability + the CURRENT transport that supplied
+                // them (the CAS key), for the courier to resolve + pin an asset.
+                let targets = self
+                    .nodes
+                    .iter()
+                    .map(|(node, transport)| NodeUpdateTarget {
+                        node: node.clone(),
+                        target: self.targets.get(node).cloned(),
+                        variant: self.variants.get(node).cloned(),
+                        update_capable: self.update_capable.contains(node),
+                        transport: transport.clone(),
+                    })
+                    .collect();
+                let _ = reply.send(targets);
+            }
             FleetMsg::SeedNode { node, reply } => {
                 self.node_ids.assign(&node);
                 let _ = reply.send(());
@@ -885,6 +1002,11 @@ impl Actor for FleetActor {
                 agreed_version,
                 software_version,
                 fleet_events,
+                update_failed,
+                reports_update_failures,
+                target,
+                variant,
+                update_capable,
                 reply,
             } => {
                 if matches!(gen, Some(g) if g != self.admit_gen) {
@@ -930,6 +1052,23 @@ impl Actor for FleetActor {
                             self.software_versions.remove(&node);
                         }
                     }
+                    // Last update-failure (P4b (d)): the node RE-REPORTS the failure on every HELLO
+                    // until it genuinely resolves (report-until-resolved), so a Some refreshes the
+                    // stored value. A None clears the stored failure ONLY when this node advertises
+                    // `reports_update_failures` — then its None is AUTHORITATIVE (it genuinely has
+                    // no failure). A None from a node WITHOUT that capability (a legacy binary that
+                    // omits the additive field, or a dev/non-managed launch at the SAME identity
+                    // that cannot inspect the marker) is NOT authoritative and PRESERVES the stored
+                    // failure, so a non-reporting reconnect can't erase one the operator hasn't seen.
+                    match update_failed {
+                        Some(f) => {
+                            self.update_failures.insert(node.clone(), f);
+                        }
+                        None if reports_update_failures => {
+                            self.update_failures.remove(&node);
+                        }
+                        None => {}
+                    }
                     // A retained pre-cache push and its fallback slot belong to the
                     // PREVIOUS connection's data order — never replay them into the
                     // new process's cache (T10 r5 #1).
@@ -942,6 +1081,28 @@ impl Actor for FleetActor {
                         self.event_nodes.insert(node.clone());
                     } else {
                         self.event_nodes.remove(&node);
+                    }
+                    // Set the node's build identity + update capability ATOMICALLY with admission
+                    // (REL-P4e, codex r5 #2): a node can restart onto a different build, so this
+                    // NEVER inherits the prior connection's values — a `Some` overwrites, a `None`
+                    // clears (a legacy node that omits them stays absent). Doing it HERE, in the same
+                    // message that inserts the transport and emits `NodeConnected` below, closes the
+                    // window where a `fleet_update` reacting to `NodeConnected` could see a freshly
+                    // admitted update-capable node as not-yet-identified and skip it. No transport CAS
+                    // is needed (unlike the old `SetBuildIdentity`): this IS the admission that
+                    // installs the transport, so the identity can never be a stale connection's.
+                    match target {
+                        Some(t) => self.targets.insert(node.clone(), t),
+                        None => self.targets.remove(&node),
+                    };
+                    match variant {
+                        Some(v) => self.variants.insert(node.clone(), v),
+                        None => self.variants.remove(&node),
+                    };
+                    if update_capable {
+                        self.update_capable.insert(node.clone());
+                    } else {
+                        self.update_capable.remove(&node);
                     }
                     let replaced = self.nodes.insert(node.clone(), transport);
                     // Announced HERE, atomic with the insert (T10 r4 #1) — a
@@ -1452,7 +1613,11 @@ impl HubFleet {
             chat_refreshes: HashMap::new(),
             chat_refresh_gen: 0,
             software_versions: HashMap::new(),
+            update_failures: HashMap::new(),
             event_nodes: HashSet::new(),
+            targets: HashMap::new(),
+            variants: HashMap::new(),
+            update_capable: HashSet::new(),
             versions: HashMap::new(),
             epochs: HashMap::new(),
             bus: bus_for_actor,
@@ -1515,6 +1680,10 @@ impl HubFleet {
     /// Register/replace a paired node's transport (after the hub admits its HELLO). Routes
     /// are KEPT across reconnect (the node's workers persist). Closes any prior transport
     /// and spawns a watcher that drops the transport (only) when its connection closes.
+    // The admission facts are the node's HELLO fields (version/capabilities/failure); they are
+    // passed positionally to mirror `GateOutcome::Admitted`, matching the crate's convention for
+    // the other wide HELLO-carrying signatures (transport.rs/api.rs).
+    #[allow(clippy::too_many_arguments)]
     pub async fn add_node(
         self: &Arc<Self>,
         node: NodeKey,
@@ -1523,13 +1692,85 @@ impl HubFleet {
         agreed_version: Option<u32>,
         software_version: Option<String>,
         fleet_events: bool,
+        update_failed: Option<crate::remote::UpdateFailed>,
+        reports_update_failures: bool,
     ) {
-        // Atomically admit: assign the stable NodeId, insert the transport, and bump the epoch in
-        // ONE actor message, gated by the admission generation. If the kill switch bumped the
-        // generation (a disable raced this admission), the admit is REFUSED — close the transport
-        // and skip ALL per-connection bookkeeping, so a disabled hub neither connects nor seeds
-        // the node into the fleet view. `admit_gen = None` admits unconditionally (direct/test
-        // callers that aren't the kill-switch-gated accept loop).
+        // No build identity (a legacy/direct/test admission): the node reports no
+        // target/variant/update capability, so it is admitted as not-update-capable.
+        self.admit_inner(
+            node,
+            transport,
+            admit_gen,
+            agreed_version,
+            software_version,
+            fleet_events,
+            update_failed,
+            reports_update_failures,
+            None,
+            None,
+            false,
+        )
+        .await
+    }
+
+    /// [`add_node`](Self::add_node) that ALSO records the node's build identity + `update`
+    /// capability from the SAME HELLO (REL-P4e), set ATOMICALLY with admission (before
+    /// `NodeConnected` fires) so a `fleet_update` reacting to `NodeConnected` can never see a
+    /// freshly-admitted update-capable node as not-yet-identified and skip it. Used by the hub
+    /// accept loop. `target`/`variant` are the release-asset selector; `update_capable` is whether
+    /// the HELLO advertised the `update` capability.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn add_node_with_identity(
+        self: &Arc<Self>,
+        node: NodeKey,
+        transport: Arc<NodeTransport>,
+        admit_gen: Option<u64>,
+        agreed_version: Option<u32>,
+        software_version: Option<String>,
+        fleet_events: bool,
+        update_failed: Option<crate::remote::UpdateFailed>,
+        reports_update_failures: bool,
+        target: Option<String>,
+        variant: Option<String>,
+        update_capable: bool,
+    ) {
+        self.admit_inner(
+            node,
+            transport,
+            admit_gen,
+            agreed_version,
+            software_version,
+            fleet_events,
+            update_failed,
+            reports_update_failures,
+            target,
+            variant,
+            update_capable,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn admit_inner(
+        self: &Arc<Self>,
+        node: NodeKey,
+        transport: Arc<NodeTransport>,
+        admit_gen: Option<u64>,
+        agreed_version: Option<u32>,
+        software_version: Option<String>,
+        fleet_events: bool,
+        update_failed: Option<crate::remote::UpdateFailed>,
+        reports_update_failures: bool,
+        target: Option<String>,
+        variant: Option<String>,
+        update_capable: bool,
+    ) {
+        // Atomically admit: assign the stable NodeId, insert the transport, record the build
+        // identity, and bump the epoch in ONE actor message, gated by the admission generation. If
+        // the kill switch bumped the generation (a disable raced this admission), the admit is
+        // REFUSED — close the transport and skip ALL per-connection bookkeeping, so a disabled hub
+        // neither connects nor seeds the node into the fleet view. `admit_gen = None` admits
+        // unconditionally (direct/test callers that aren't the kill-switch-gated accept loop).
         let admitted = self
             .ask(|reply| FleetMsg::AdmitNode {
                 node: node.clone(),
@@ -1538,6 +1779,11 @@ impl HubFleet {
                 agreed_version,
                 software_version,
                 fleet_events,
+                update_failed,
+                reports_update_failures,
+                target,
+                variant,
+                update_capable,
                 reply,
             })
             .await
@@ -1593,6 +1839,123 @@ impl HubFleet {
         match transport.request(M_NODE_SCAN, json!({})).await {
             Ok(v) => Ok(v),
             Err(e) => Err(self.handle_op_error(node, &transport, e).await),
+        }
+    }
+
+    /// The self-update push targets (REL-P4e): one descriptor per CURRENTLY-CONNECTED node,
+    /// carrying the build identity + capability it advertised. The courier (`Higgs::fleet_update`)
+    /// resolves a per-node manifest URL from each OFF the actor.
+    pub async fn update_targets(&self) -> Vec<NodeUpdateTarget> {
+        self.ask(|reply| FleetMsg::UpdateTargets { reply })
+            .await
+            .unwrap_or_default()
+    }
+
+    /// SENDER half of the hub-pushed self-update (`M_NODE_UPDATE`, REL-P4e): deliver an already
+    /// -assembled [`NodeUpdateParams`] (manifest + `.minisig` inline, a direct `artifact_url`) to
+    /// `node` and return its reply (`{ status: "accepted", target_version }`). The node ACKs
+    /// BEFORE it verifies + applies (a detached, minutes-long job), so this reply is a receipt of
+    /// the PUSH, not of a successful update — the authoritative outcome is the node's next HELLO
+    /// (`software_version` advanced, or `update_failed`). Mirrors [`scan_node`](Self::scan_node):
+    /// it mutates the node's BINARY, not its routes, so it deliberately does NOT bump the epoch or
+    /// touch the route table. A dead transport is remapped to HG027 (and dropped) via
+    /// [`handle_op_error`](Self::handle_op_error). Only a SYNCHRONOUS refusal — a legacy node with no
+    /// update handler (HG026), a malformed-param rejection, or HG027 — comes back in this reply and is
+    /// REPORTED per node. Post-acceptance verify/apply failures (bad signature HG081, bad manifest
+    /// HG083, hash HG084, artifact fetch HG088) happen in the node's DETACHED job AFTER it ACKs, so
+    /// they surface on the node's next HELLO `update_failed`, NOT here.
+    pub async fn push_update(
+        &self,
+        node: &str,
+        params: NodeUpdateParams,
+    ) -> Result<Value, HiggsError> {
+        let transport = self.transport(node).await?;
+        self.send_update(node, &transport, params).await
+    }
+
+    /// [`push_update`](Self::push_update) PINNED to `expected` (REL-P4e Fix 4): send the update ONLY
+    /// while `expected` is STILL the node's current transport — the connection whose HELLO
+    /// `(target, variant)` the courier selected this asset from. If the node RECONNECTED (a
+    /// different transport now) or DROPPED (no transport) since that snapshot, return
+    /// [`PinnedPush::Reconnected`] and send nothing: the asset could be for the node's OLD build,
+    /// which it would ACK and then fail eligibility on, mis-reporting "accepted". Because the send
+    /// rides `expected` (== the verified current transport), even a reconnect racing between the
+    /// check and the send delivers to the now-closed old connection (→ HG027), never the new
+    /// process. `fleet_update` uses this; the single-node `push_update` (exact operator URL, no
+    /// per-node asset derivation) does not need it.
+    ///
+    /// RESIDUAL (codex REL-P4e r3 #1, accepted): the `ptr_eq` is a check-then-send with the RPC
+    /// `.await` in between, not an actor-held lease. If the node reconnects in that window but its
+    /// OLD connection is still draining (not yet closed by the reconnect path), that old connection
+    /// can accept + reply, so we report `Accepted` while `self.transport(node)` already points at the
+    /// new one. This degrades SAFELY: the asset was derived from the OLD connection's `(target,
+    /// variant)`, so the OLD process — the one that actually received it — gets its CORRECT asset (no
+    /// wrong-asset push to the new process). The only imprecision is the `Accepted`-vs-`Reconnected`
+    /// label on a transient reconnect, and BOTH are non-authoritative anyway (the push reply is a
+    /// receipt, not an outcome — the node's next HELLO is the truth). A transport-generation lease to
+    /// close the µs-window is not warranted for a label that never gates correctness.
+    pub async fn push_update_pinned(
+        &self,
+        node: &str,
+        expected: &Arc<NodeTransport>,
+        params: NodeUpdateParams,
+    ) -> Result<PinnedPush, HiggsError> {
+        let Ok(current) = self.transport(node).await else {
+            // No current transport: the node dropped since the snapshot — never a bogus "accepted".
+            return Ok(PinnedPush::Reconnected);
+        };
+        if !Arc::ptr_eq(&current, expected) {
+            return Ok(PinnedPush::Reconnected);
+        }
+        self.send_update(node, &current, params)
+            .await
+            .map(PinnedPush::Accepted)
+    }
+
+    /// Encode + deliver `M_NODE_UPDATE` on `transport` and return the node's reply. Mirrors
+    /// [`scan_node`](Self::scan_node): it mutates the node's BINARY, not its routes, so it
+    /// deliberately does NOT bump the epoch or touch the route table. The node ACKs BEFORE it
+    /// verifies + applies (a detached, minutes-long job), so the reply is a receipt of the PUSH,
+    /// not of a successful update — the authoritative outcome is the node's next HELLO
+    /// (`software_version` advanced, or `update_failed`). A dead transport is remapped to HG027
+    /// (and dropped) via [`handle_op_error`](Self::handle_op_error). Only a SYNCHRONOUS refusal
+    /// (HG026 legacy no-handler, malformed params, HG027) rides back in this reply for the courier to
+    /// REPORT per node; post-acceptance verify/apply failures (HG081/HG083/HG084/HG088) run in the
+    /// node's detached job after the ACK and surface on its next HELLO `update_failed`, not here.
+    async fn send_update(
+        &self,
+        node: &str,
+        transport: &Arc<NodeTransport>,
+        params: NodeUpdateParams,
+    ) -> Result<Value, HiggsError> {
+        // Bound the WHOLE push — `open_bi` + `write` + the reply. `NodeTransport::request`
+        // time-limits ONLY the reply read, so a paired node that withholds hub-initiated bidi-stream
+        // credit while keeping the connection alive could hang `open_bi`/`write` indefinitely; in
+        // `fleet_update`'s fan-out that one node would stall the entire run and hold a
+        // `buffer_unordered` slot. An outer deadline turns it into a per-node HG027 — dropped +
+        // reported, never fatal (REL-P4e codex r7 #1). Bounding the shared transport's own open/write
+        // for every control op is a separate follow-up.
+        const NODE_PUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+        let payload = serde_json::to_value(&params).map_err(|e| HiggsError::InternalFault {
+            context: "encode NodeUpdateParams".into(),
+            detail: e.to_string(),
+        })?;
+        let outcome = match tokio::time::timeout(
+            NODE_PUSH_TIMEOUT,
+            transport.request(M_NODE_UPDATE, payload),
+        )
+        .await
+        {
+            Ok(r) => r,
+            // Treat a wedged open/write like any dead transport: `handle_op_error` drops it + maps to
+            // HG027 (the same treatment `NodeTransport::request`'s own read timeout gets).
+            Err(_) => Err(HiggsError::WorkerDead {
+                context: "node update push timed out before the node replied".into(),
+            }),
+        };
+        match outcome {
+            Ok(v) => Ok(v),
+            Err(e) => Err(self.handle_op_error(node, transport, e).await),
         }
     }
 

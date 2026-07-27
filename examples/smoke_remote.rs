@@ -142,6 +142,8 @@ async fn run() {
             None,
             None,
             false,
+            None,
+            true,
         )
         .await;
     println!("node admitted: {peer}");

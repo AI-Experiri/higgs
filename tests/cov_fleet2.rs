@@ -42,8 +42,8 @@ use higgs::node::fleet::HubFleet;
 use higgs::node::transport::NodeTransport;
 use higgs::node::{gate_connection, send_leave, GateOutcome, HubIdentity, HELLO_DEADLINE};
 use higgs::remote::{
-    node_capabilities, HelloParams, ALPN, M_HELLO, M_NODE_INVENTORY, M_NODE_LOAD, M_NODE_SCAN,
-    M_NODE_UNLOAD,
+    node_capabilities, HelloParams, UpdateFailed, ALPN, M_HELLO, M_NODE_INVENTORY, M_NODE_LOAD,
+    M_NODE_SCAN, M_NODE_UNLOAD, PROTOCOL_VERSIONS,
 };
 use higgs::rpc::{self, RpcError, RpcFrame, RpcNotification, RpcRequest, RpcResponse};
 use higgs::worker::{M_CHAT, N_CHAT_CHUNK};
@@ -248,7 +248,10 @@ async fn hub_gate_rejects_crafted_version_mismatch() {
         protocol_versions: vec![999],
         min_supported: 999,
         software_version: "9.9.9".into(),
-        capabilities: node_capabilities(),
+        update_failed: None,
+        target: None,
+        variant: None,
+        capabilities: node_capabilities(true),
     };
     let req = RpcRequest {
         jsonrpc: "2.0".into(),
@@ -281,6 +284,111 @@ async fn hub_gate_rejects_crafted_version_mismatch() {
         GateOutcome::Rejected { code: "HG023" },
         "an unsupported protocol-version HELLO is rejected with HG023"
     );
+}
+
+// ── 1b. hub gate: a HELLO carrying a self-update FAILURE is sanitized + surfaced ─────────────
+
+/// A node's HELLO may carry its last self-update FAILURE (P4b (d)) so the hub learns WHY a pushed
+/// update did not take (vs. inferring it from the version never advancing). The fields are
+/// peer-controlled and flow to a terminal + the fleet view, so `gate_admit` RE-SANITIZES them at
+/// the trust boundary and returns the scrubbed value in `GateOutcome::Admitted.update_failed`.
+/// A hand-built HELLO carries a spoofed version (spaces) and a reason with control bytes; the
+/// admitted outcome must show them stripped. Reverting the re-sanitize (or the field threading)
+/// in `gate_admit` fails this: the raw bytes survive, or the field comes back `None`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hub_gate_sanitizes_and_surfaces_a_hello_update_failure() {
+    let hub = minimal_ep().await;
+    let node = minimal_ep().await;
+    let hub_addr = hub.addr();
+    let hub_id = hub.id().to_string();
+    let node_id = node.id().to_string();
+
+    // Mint a token and MOVE the store into the gate task so it validates the node's `pairing_token`
+    // (admission by token, so only the update-failure sanitization is under test).
+    let mut tokens = PairingTokens::new();
+    let tok = tokens.mint(now_ms(), 600_000);
+
+    let gate = tokio::spawn(async move {
+        let mut allow = temp_allowlist("upd-fail");
+        let incoming = tokio::time::timeout(Duration::from_secs(10), hub.accept())
+            .await
+            .expect("node dialed within 10s")
+            .expect("incoming");
+        let conn = incoming.await.expect("connection");
+        let out = gate_connection(
+            &conn,
+            &mut allow,
+            &mut tokens,
+            now_ms(),
+            &HubIdentity::new(hub_id),
+            Some("cov".into()),
+            HELLO_DEADLINE,
+        )
+        .await;
+        // Keep the conn alive until the node has read its reply.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        out
+    });
+
+    let conn = node.connect(hub_addr, ALPN).await.expect("connect");
+    let (mut send, recv) = conn.open_bi().await.expect("open_bi");
+    let params = HelloParams {
+        role: "node".into(),
+        node_id: node_id.clone(),
+        name: String::new(),
+        pairing_token: Some(tok),
+        protocol_versions: PROTOCOL_VERSIONS.to_vec(),
+        min_supported: 1,
+        software_version: env!("CARGO_PKG_VERSION").into(),
+        update_failed: Some(UpdateFailed {
+            from: "1.0.0 spoof".into(), // space → stripped by sanitize_version
+            to: "2.0.0".into(),
+            reason: "HG084\nsha256\x07 mismatch".into(), // newline + BEL → stripped
+        }),
+        target: None,
+        variant: None,
+        capabilities: node_capabilities(true),
+    };
+    let req = RpcRequest {
+        jsonrpc: "2.0".into(),
+        id: 1,
+        method: M_HELLO.into(),
+        params: serde_json::to_value(params).expect("hello serializes"),
+    };
+    send.write_all(format!("{}\n", rpc::encode(&RpcFrame::Request(req))).as_bytes())
+        .await
+        .expect("write hello");
+    let _ = send.finish();
+
+    // Read the hub's HELLO reply so the gate's post-auth write completes before we assert.
+    let mut lines = BufReader::new(recv).lines();
+    let _reply = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .flatten();
+
+    let outcome = gate.await.expect("gate join");
+    match outcome {
+        GateOutcome::Admitted {
+            update_failed: Some(f),
+            ..
+        } => {
+            assert_eq!(f.from, "1.0.0spoof", "version re-sanitized at the boundary");
+            assert_eq!(f.to, "2.0.0");
+            assert!(
+                !f.reason.chars().any(char::is_control),
+                "control bytes scrubbed from the reason: {:?}",
+                f.reason
+            );
+            assert!(
+                f.reason.starts_with("HG084"),
+                "the visible reason text is kept: {:?}",
+                f.reason
+            );
+        }
+        other => panic!("expected Admitted with a sanitized update_failed, got {other:?}"),
+    }
 }
 
 // ── 2. NodeTransport: unexpected / truncated / undecodable replies ──────────────────────────
@@ -402,6 +510,8 @@ async fn hub_fleet_error_arms_over_mock_node() {
             None,
             None,
             false,
+            None,
+            true,
         )
         .await;
 
@@ -669,6 +779,8 @@ async fn params_load_payload_carries_ctx_at_protocol_two() {
             Some(2),
             None,
             false,
+            None,
+            true,
         )
         .await;
 
@@ -778,4 +890,319 @@ async fn params_load_payload_carries_ctx_at_protocol_two() {
         .load(&peer, "only/ctx", Some(partial))
         .await
         .expect("partial params-load dispatches");
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════════
+// REL-P4e + fleet-actor edge branches over the MOCK transport (no GGUF, no real worker).
+// ════════════════════════════════════════════════════════════════════════════════════════════
+use higgs::node::fleet::PinnedPush;
+use higgs::remote::{NodeLoadParams, NodeUpdateParams, M_NODE_UPDATE};
+
+fn upd_params() -> NodeUpdateParams {
+    NodeUpdateParams {
+        manifest: "{}".into(),
+        manifest_sig: "untrusted comment\nRWSig==\n".into(),
+        artifact_url: "https://mirror.example/higgs/v2.0.0/higgs-art.tar.gz".into(),
+        target_version: Some("2.0.0".into()),
+        pinned_key_id: None,
+    }
+}
+
+/// A params-load against a MAJOR-1 admission is REFUSED with HG078 BEFORE any M_NODE_LOAD send.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn params_load_at_protocol_one_is_hg078() {
+    let (dialer, acceptor, _eps) = connect_pair().await;
+    let peer = dialer.remote_id().to_string();
+    let _mock = tokio::spawn(serve_mock(acceptor, |_m, id, _p| {
+        Reply::Response(resp_err(id, "HG037", "must not be reached"))
+    }));
+    let fleet = Arc::new(HubFleet::new(Arc::new(LogBus::new())));
+    fleet
+        .add_node(
+            peer.clone(),
+            Arc::new(NodeTransport::new(dialer)),
+            None,
+            Some(1),
+            None,
+            false,
+            None,
+            true,
+        )
+        .await;
+    let params = NodeLoadParams {
+        id: "m/x".into(),
+        ctx_len: Some(2048),
+        gpu_layers: None,
+        threads: None,
+        params: None,
+    };
+    let e = fleet
+        .load(&peer, "m/x", Some(params))
+        .await
+        .expect_err("params refused at proto 1");
+    assert!(
+        matches!(e, HiggsError::NodeTooOldForParams { agreed: 1, .. }),
+        "{e:?}"
+    );
+}
+
+/// The hub-pushed self-update SENDER arms: Reconnected (ghost / stale transport), Accepted, and an
+/// undecodable reply mapped to HG027 through `handle_op_error`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn push_update_pinned_and_send_update_arms() {
+    let (dialer, acceptor, _eps) = connect_pair().await;
+    let peer = dialer.remote_id().to_string();
+    let _mock = tokio::spawn(serve_mock(acceptor, |m, id, _p| {
+        if m == M_NODE_UPDATE {
+            Reply::Response(resp_ok(
+                id,
+                json!({ "status": "accepted", "target_version": "2.0.0" }),
+            ))
+        } else {
+            Reply::Response(resp_err(id, "HG037", "unknown"))
+        }
+    }));
+    let fleet = Arc::new(HubFleet::new(Arc::new(LogBus::new())));
+    let transport = Arc::new(NodeTransport::new(dialer));
+    fleet
+        .add_node(
+            peer.clone(),
+            transport.clone(),
+            None,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .await;
+
+    // A never-registered node → Reconnected (no current transport at all).
+    let (d2, _a2, _e2) = connect_pair().await;
+    let stale = Arc::new(NodeTransport::new(d2));
+    assert!(matches!(
+        fleet
+            .push_update_pinned("ghost-node", &stale, upd_params())
+            .await
+            .unwrap(),
+        PinnedPush::Reconnected
+    ));
+    // The registered node but a STALE (ptr-mismatched) transport → Reconnected, nothing sent.
+    assert!(matches!(
+        fleet
+            .push_update_pinned(&peer, &stale, upd_params())
+            .await
+            .unwrap(),
+        PinnedPush::Reconnected
+    ));
+    // The registered node with its CURRENT transport → Accepted.
+    assert!(matches!(
+        fleet
+            .push_update_pinned(&peer, &transport, upd_params())
+            .await
+            .unwrap(),
+        PinnedPush::Accepted(_)
+    ));
+    // The single-node push is also accepted.
+    assert_eq!(
+        fleet.push_update(&peer, upd_params()).await.unwrap()["status"],
+        "accepted"
+    );
+
+    // A node whose M_NODE_UPDATE reply is undecodable → treated as a dead transport → HG027.
+    let (d3, a3, _e3) = connect_pair().await;
+    let peer3 = d3.remote_id().to_string();
+    let _mock3 = tokio::spawn(serve_mock(a3, |m, _id, _p| {
+        if m == M_NODE_UPDATE {
+            Reply::RawLine("not a json frame".into())
+        } else {
+            Reply::Silent
+        }
+    }));
+    fleet
+        .add_node(
+            peer3.clone(),
+            Arc::new(NodeTransport::new(d3)),
+            None,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .await;
+    let e = fleet
+        .push_update(&peer3, upd_params())
+        .await
+        .expect_err("undecodable reply → dead");
+    assert!(matches!(e, HiggsError::NodeUnreachable { .. }), "{e:?}");
+}
+
+/// A node admitted carrying a last self-update FAILURE has it recorded + surfaced on the fleet view.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admit_node_records_update_failed() {
+    let (dialer, acceptor, _eps) = connect_pair().await;
+    let peer = dialer.remote_id().to_string();
+    let _mock = tokio::spawn(serve_mock(acceptor, |_m, id, _p| {
+        Reply::Response(resp_err(id, "HG037", "x"))
+    }));
+    let fleet = Arc::new(HubFleet::new(Arc::new(LogBus::new())));
+    let uf = UpdateFailed {
+        from: "1.0.0".into(),
+        to: "2.0.0".into(),
+        reason: "HG084 artifact sha256 mismatch".into(),
+    };
+    fleet
+        .add_node(
+            peer.clone(),
+            Arc::new(NodeTransport::new(dialer)),
+            None,
+            None,
+            None,
+            false,
+            Some(uf),
+            true,
+        )
+        .await;
+    let v = fleet.nodes_view().await;
+    assert!(
+        v.iter().any(|n| n.endpoint_id == peer
+            && n.update_failed
+                .as_ref()
+                .is_some_and(|f| f.reason.contains("HG084"))),
+        "the admitted node surfaces its update_failed: {v:?}"
+    );
+}
+
+/// `chat_pinned` refuses a served id that is unrouted, and one that resolves to a node other than
+/// the pin — both `ChatTestTargetMoved`, never a bogus dispatch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chat_pinned_refuses_unrouted_and_moved() {
+    let (dialer, acceptor, _eps) = connect_pair().await;
+    let peer = dialer.remote_id().to_string();
+    let _mock = tokio::spawn(serve_mock(acceptor, |m, id, _p| {
+        if m == M_NODE_LOAD {
+            Reply::Response(resp_ok(id, json!({ "worker_id": 1 })))
+        } else if m == M_NODE_INVENTORY {
+            Reply::Response(resp_ok(
+                id,
+                json!({ "hostname": "mock", "os": "mock", "workers": [],
+                        "hardware": { "cpu_name": "m", "cpu_cores": 1, "ram_total_bytes": 1,
+                                      "vram_total_bytes": 0, "gpus": [] },
+                        "runtime": { "engine": "mock", "version": "0", "backend": "cpu" } }),
+            ))
+        } else {
+            Reply::Response(resp_err(id, "HG037", "unknown"))
+        }
+    }));
+    let fleet = Arc::new(HubFleet::new(Arc::new(LogBus::new())));
+    fleet
+        .add_node(
+            peer.clone(),
+            Arc::new(NodeTransport::new(dialer)),
+            None,
+            Some(2),
+            None,
+            false,
+            None,
+            true,
+        )
+        .await;
+    // Unrouted served id → ChatTestTargetMoved.
+    let e = fleet
+        .chat_pinned("no/such-id", "any-pin", "[]".into(), 4, 0.0, None, None)
+        .await
+        .err()
+        .expect("unrouted id is refused");
+    assert!(matches!(e, HiggsError::ChatTestTargetMoved { .. }), "{e:?}");
+    // A routed id that resolves to `peer` but is pinned to a DIFFERENT node → ChatTestTargetMoved.
+    fleet
+        .load(&peer, "ok/model", None)
+        .await
+        .expect("load ok/model");
+    let e = fleet
+        .chat_pinned(
+            "ok/model",
+            "a-different-node",
+            "[]".into(),
+            4,
+            0.0,
+            None,
+            None,
+        )
+        .await
+        .err()
+        .expect("a moved pin is refused");
+    assert!(matches!(e, HiggsError::ChatTestTargetMoved { .. }), "{e:?}");
+}
+
+/// The hub kill-switch drain (`disconnect_all`) closes every transport — no node stays `connected`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disconnect_all_leaves_no_connected_node() {
+    let (dialer, acceptor, _eps) = connect_pair().await;
+    let peer = dialer.remote_id().to_string();
+    let _mock = tokio::spawn(serve_mock(acceptor, |_m, id, _p| {
+        Reply::Response(resp_err(id, "HG037", "x"))
+    }));
+    let fleet = Arc::new(HubFleet::new(Arc::new(LogBus::new())));
+    fleet
+        .add_node(
+            peer.clone(),
+            Arc::new(NodeTransport::new(dialer)),
+            None,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .await;
+    assert!(fleet
+        .nodes_view()
+        .await
+        .iter()
+        .any(|n| n.endpoint_id == peer && n.connected));
+    fleet.disconnect_all().await;
+    assert!(
+        !fleet.nodes_view().await.iter().any(|n| n.connected),
+        "disconnect_all leaves nothing connected"
+    );
+}
+
+/// A fleet-event subscriber receives `NodeConnected` when a node is admitted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subscribe_fleet_events_sees_node_connected() {
+    let (dialer, acceptor, _eps) = connect_pair().await;
+    let peer = dialer.remote_id().to_string();
+    let _mock = tokio::spawn(serve_mock(acceptor, |_m, id, _p| {
+        Reply::Response(resp_err(id, "HG037", "x"))
+    }));
+    let fleet = Arc::new(HubFleet::new(Arc::new(LogBus::new())));
+    let mut rx = fleet.subscribe_fleet_events();
+    fleet
+        .add_node(
+            peer.clone(),
+            Arc::new(NodeTransport::new(dialer)),
+            None,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .await;
+    let ev = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("an event within 2s")
+        .expect("recv ok");
+    // FleetEventKind is pub(crate); assert on the SERIALIZED shape instead.
+    let ev_json = serde_json::to_value(&ev).expect("serialize FleetEvent");
+    assert_eq!(
+        ev_json["endpoint_id"], peer,
+        "event names the admitted node: {ev:?}"
+    );
+    assert_eq!(
+        ev_json["kind"], "node_connected",
+        "admission emits NodeConnected: {ev:?}"
+    );
 }

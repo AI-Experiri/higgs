@@ -3303,6 +3303,8 @@ async fn a_remote_non_chat_route_suppresses_the_jit_ad() {
             None,
             None,
             false,
+            None,
+            true,
         )
         .await;
     fleet.load(&node_key, "org/dual4", None).await.unwrap();

@@ -165,6 +165,8 @@ async fn a_remote_embedding_worker_refuses_relayed_chat() {
             None,
             None,
             false,
+            None,
+            true,
         )
         .await;
 

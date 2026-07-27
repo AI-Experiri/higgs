@@ -5,7 +5,7 @@
 //!
 //! - The node CONTROL plane over a REAL `higgs --node`: every `higgs/node/*` dispatch
 //!   arm (`dispatch_node_control`) — bad params, unknown worker, the reserved
-//!   `update` refusal (HG026), unknown-method, plus the happy load/status/kill/unload
+//!   `update` push handler (HG087 no-layout), unknown-method, plus the happy load/status/kill/unload
 //!   Ok arms — driven through a raw `NodeTransport` (`node/control.rs`, `node/runtime.rs`
 //!   unload/kill/status arms, `node/transport.rs` request path, `node/mod.rs`
 //!   `handle_node_stream` unknown-method arm).
@@ -246,7 +246,9 @@ async fn misbehaving_hub_reply(conn: &iroh::endpoint::Connection, frame: Option<
 /// - bad-params `load`/`status` → INVALID_PARAMS (control parse-error arms);
 /// - unknown-worker `unload`/`kill`/`status` → the runtime's `no_worker` error (control Err
 ///   arms + `runtime` Unload/Kill `None` arm);
-/// - the reserved `update` method → typed HG026 refusal;
+/// - the `update` push method → HG087 without an install layout;
+/// - an OVERSIZED inbound frame (> the node's frame cap) → rejected by the serve loop's
+///   `rpc::read_bounded_frame`, and the node stays alive (the rest of this test proves it);
 /// - an unknown `higgs/node/*` method (control dispatch fallthrough) AND a non-namespaced
 ///   method (`handle_node_stream`'s method-not-found arm);
 /// - a real `load` → `status` → `kill` and a second `load` → chat (tools + kwargs) → `unload`
@@ -271,6 +273,43 @@ async fn remote_node_control_and_chat_rpc_arms() {
     let _node = spawn_node(&ticket, &token, node_home.path(), scan_root.path());
 
     let (conn, _peer) = admit_node(&hub, &mut allow, &mut tokens, &hub_id).await;
+
+    // A single inbound frame LARGER than the node's frame cap must be REJECTED by the serve loop
+    // (`handle_node_stream` reads via `rpc::read_bounded_frame`, NOT an unbounded `.lines()`), so
+    // a compromised hub cannot OOM a small node by streaming gigabytes on one line. We send a
+    // VALID `higgs/node/sysinfo` request padded PAST the cap: uncapped, the node would decode it
+    // (the extra field is ignored) and REPLY; capped, the read errors before decode and the node
+    // drops THAT stream with no reply. Reverting the cap makes the reply arrive → panic. The node
+    // STAYS ALIVE — proven by every subsequent request in this test succeeding on the SAME
+    // connection. The frame must exceed the node's fixed 64 MiB fleet-ingress cap
+    // (`MAX_CONTROL_FRAME_BYTES` in `src/node/mod.rs`); 65 MiB clears it with margin.
+    {
+        let pad = "x".repeat(65 * 1024 * 1024);
+        let big = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "higgs/node/sysinfo",
+            "params": { "pad": pad }
+        });
+        let frame = format!("{}\n", serde_json::to_string(&big).unwrap());
+        assert!(
+            frame.len() > 64 * 1024 * 1024,
+            "the test frame must exceed the node's 64 MiB frame cap"
+        );
+        let (mut send, recv) = conn.open_bi().await.expect("open oversized stream");
+        // The node STOP_SENDINGs once it hits the cap, so this write may error partway — fine.
+        let _ = send.write_all(frame.as_bytes()).await;
+        let _ = send.finish();
+        let mut reply = BufReader::new(recv).lines();
+        if let Ok(Ok(Some(line))) =
+            tokio::time::timeout(Duration::from_secs(20), reply.next_line()).await
+        {
+            panic!(
+                "node replied to a {}-byte frame — the frame cap was not enforced: {}",
+                frame.len(),
+                &line[..line.len().min(120)]
+            );
+        }
+    }
+
     let transport = NodeTransport::new(conn);
 
     // ── control-plane happy replies ──
@@ -330,15 +369,28 @@ async fn remote_node_control_and_chat_rpc_arms() {
             .is_err(),
         "status of an unknown worker fails"
     );
-    // the reserved update handshake → typed HG026 refusal.
-    let e = transport
-        .request(M_NODE_UPDATE, json!({}))
-        .await
-        .expect_err("update refused");
+    // M_UPDATE is now IMPLEMENTED (§9 push handler): empty params → INVALID_PARAMS (the
+    // manifest/manifest_sig/artifact_url are required).
     assert!(
-        matches!(&e, HiggsError::WorkerRpc { worker_code: Some(c), .. } if c == "HG026"),
-        "update → HG026 refusal, got {e:?}"
+        transport.request(M_NODE_UPDATE, json!({})).await.is_err(),
+        "update with no params fails"
     );
+    // Well-formed params reply IMMEDIATELY "accepted" — the apply runs DETACHED (it can take
+    // minutes; holding the reply would outrun the hub timeout). The apply itself fails closed
+    // (HG087 without an install layout / HG081 without a pinned key) asynchronously; the reply
+    // just confirms the push was accepted for application.
+    let v = transport
+        .request(
+            M_NODE_UPDATE,
+            json!({
+                "manifest": "{}",
+                "manifest_sig": "s",
+                "artifact_url": "https://example.com/higgs.tar.gz"
+            }),
+        )
+        .await
+        .expect("well-formed push is accepted");
+    assert_eq!(v["status"], "accepted", "update push accepted, got {v:?}");
     // an unknown higgs/node/* method → the control dispatch method-not-found arm.
     assert!(
         transport
@@ -448,6 +500,8 @@ async fn fleet_stale_admit_gen_is_refused() {
             None,
             None,
             false,
+            None,
+            true,
         )
         .await;
 
@@ -482,6 +536,8 @@ async fn fleet_admit_disconnect_all_then_retire() {
             None,
             None,
             false,
+            None,
+            true,
         )
         .await;
     assert_eq!(

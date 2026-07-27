@@ -40,14 +40,19 @@ iroh transport — `dispatch_node_control` — never an HTTP route:
                        ([HG075] unknown node) ─▶ fleet.served_on()+resolve()
                        ([HG074]/[HG076]) then fleet.chat_pinned() (always-remote, node-pinned at
                        dispatch — a re-homed id refuses [HG077], never mis-attests)
+  .node_update()/.fleet_update() ─▶ release_courier (fetch+verify the signed manifest,
+                       SSRF-vetted) ─▶ fleet.push_update()/push_update_pinned() (M_NODE_UPDATE)
   POST /v1/chat (serve::v1) ─▶ Higgs::chat_stream ─▶ fleet.is_remote()/resolve()/chat()
                                                         │
                                        transport::NodeTransport (one iroh bidi stream per RPC)
                                                         │  higgs/node/*  |  M_CHAT / M_NODE_PULL
+                                                        │  |  M_NODE_UPDATE
                                                         ▼
   on the NODE: mod::handle_node_stream fans each inbound method to the right plane:
         control ─▶ control::dispatch_node_control ─▶ NodeRuntime op
         data    ─▶ data::relay_chat / relay_pull   ─▶ Supervisor (via ChatLease) / GGUF download
+        update  ─▶ control::accept_node_update ─▶ reply "accepted", then DeferredUpdate::spawn
+                   ─▶ self_update::apply_pushed_update (detached)
 ```
 
 ## Core design decisions
@@ -60,7 +65,11 @@ iroh transport — `dispatch_node_control` — never an HTTP route:
   → `NodeRuntime`. Data (`M_CHAT` / `M_NODE_PULL`) → `data::relay_chat` / `relay_pull`. A control
   RPC never reaches `WorkerState`; chat is never multiplexed onto a control frame.
   `mod::handle_node_stream` is the node-side fan-out that routes each inbound method to the right
-  plane.
+  plane. `M_NODE_UPDATE` is a THIRD special case routed to NEITHER dispatcher:
+  `handle_node_stream` calls `control::accept_node_update`, writes the `accepted` reply itself,
+  and only then spawns the detached apply (`DeferredUpdate::spawn` →
+  `self_update::apply_pushed_update`) — reply-then-detached-apply, so the ACK is a receipt of
+  the push, never of the update outcome.
 - **Identity is cryptographic.** `EndpointId` = the ed25519 public key; QUIC/TLS proves the
   dialer holds the private key. Both directions validate self-declaration against the TLS
   `remote_id()`: hub-side `gate_read_hello` requires `hello.node_id == peer` and `role == "node"`;
@@ -118,6 +127,9 @@ mailbox — no mutex, so concurrent ops can't interleave across an `.await`.
 Private state = `nodes` (connected → transport), `routes` (`(node, worker) → raw model`),
 `node_ids`, `inventories` (+ dual `PulledAt` freshness stamps), `versions`/`software_versions`
 (T14), `event_nodes`/`pending_pushes`/`fallback_inflight` and the `FleetEvent` sender (T10),
+`update_failures` (the node's last HELLO-reported self-update failure, P4b (d)),
+`targets`/`variants` (the release-asset selector from HELLO) + `update_capable` (advertised
+the `update` capability) for the update push (REL-P4),
 `epochs`, `admit_gen` — all behind one mailbox. This dissolved the
 old 7-mutex TOCTOU class: compound transitions (`AdmitNode`, `RemoveInstanceIf`,
 `CommitInventory`, `Retire`, `DisconnectAll`) are each ONE message, applied all-or-nothing, and
@@ -243,7 +255,7 @@ through via `worker_origin_code_data`, they are not owned here):
 | HG023 | `gate_read_hello` / `validate_hub_hello` | protocol version mismatch (typed frame, then close) |
 | HG024 | `gate_read_hello` / `gate_admit` | identity/role spoof, or not-allowlisted with no token |
 | HG025 | `data::relay_pull` | GGUF download failure (per-fetcher classified) |
-| HG026 | `control` (`M_NODE_UPDATE`) | node update unsupported (this build ships no updater) |
+| HG026 | node (`M_NODE_UPDATE`) | a LEGACY node with no self-update receiver refuses the push (the current build ships it) |
 | HG027 | `fleet` (`NodeUnreachable`) | node not connected / dead transport |
 | HG028 | `gate_read_hello` | handshake stalled past `HELLO_DEADLINE` |
 | HG036 | `data::relay_pull` | both download fetchers exhausted |
@@ -253,6 +265,14 @@ through via `worker_origin_code_data`, they are not owned here):
 | HG040 | `gate_admit` / `hub::serve_node_requests` | pairings-store persistence failure (disk/permissions) |
 | HG051 | `transport::chat` reader | undecodable remote chat chunk dropped |
 | HG057 | `data::relay_chat` | relayed chat stream overflowed (backlog dropped; RPC fails loudly) |
+| HG083 | hub `release_courier` (`manifest_invalid`) | fetched manifest/signature invalid or mismatched for the requested release |
+| HG085 | node `self_update` (`evaluate_eligibility`) | manifest version not newer than the running binary (downgrade/same-version refused) |
+| HG086 | node `self_update` (`evaluate_eligibility`) | manifest target/variant does not match this build |
+| HG087 | node `self_update` | lock/stage/apply failure, or unmanaged-install refusal |
+| HG088 | node `self_update` | artifact/manifest fetch failed |
+
+(HG081/HG082/HG084 — unpinned key / bad signature / artifact≠sha256 — originate in
+`src/update.rs`, the trust anchor `self_update` builds on; they pass through here, not owned.)
 
 ## Invariants
 

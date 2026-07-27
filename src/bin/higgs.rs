@@ -46,6 +46,19 @@ fn main() {
         return;
     }
 
+    // Self-update boot-guard ROLLBACK check, run for the `--node` daemon path BEFORE any
+    // logging/tracing setup — the earliest stable point in a freshly-flipped binary — so a
+    // trial that already SPENT its budget rolls back here before this start even tries again.
+    // The paired boot-ATTEMPT record is taken at the top of `run_node_daemon_body`'s async
+    // block (the first point with a tokio context for the SIGTERM handler), BEFORE the risky
+    // bind/runtime/serve init, so an update that dies during that init accrues (see the
+    // boot-guard comment there). Exits so the service manager re-execs the now-current (old)
+    // binary on a rollback; a no-op with no pending self-update trial.
+    if args.first().map(String::as_str) == Some("--node") && higgs::node::cli::node_boot_preflight()
+    {
+        return;
+    }
+
     // Single home for Developer-Log lines (worker stderr + serve-layer events),
     // plus the terminal `fmt` layer. Installed ABOVE the subcommand dispatch so
     // the node/link/keys subcommands get higgs's own logging (previously the
@@ -87,6 +100,7 @@ fn main() {
          usage:\n  \
          higgs --node [<ticket> [token]]   join a hub as a worker node (persistent daemon)\n  \
          higgs node <connect|leave> …       one-shot node-side ops against a hub\n  \
+         higgs node install-service          node service — user-space, login-bound by default; --system = always-on\n  \
          higgs link <pair|status>           hub-side fleet pairing\n  \
          higgs keys <…>                      manage API keys\n  \
          higgs --version                     print the version"

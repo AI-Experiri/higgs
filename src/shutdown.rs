@@ -31,6 +31,34 @@ pub async fn shutdown_signal() {
     }
 }
 
+/// Like [`shutdown_signal`], but the OS signal handlers are installed SYNCHRONOUSLY at
+/// CALL time — the `signal(...)` constructors run in this function body, before the
+/// returned future is ever polled. `shutdown_signal` is an `async fn`, so its handler
+/// registration does not happen until the future is first polled; a caller that must not
+/// miss a signal delivered in the window BEFORE that first poll (the node daemon, which
+/// records a self-update boot attempt just before it starts awaiting the shutdown future
+/// — a SIGTERM in between would otherwise terminate by default and falsely spend the
+/// rollback budget) uses this instead. A signal delivered after construction but before
+/// `.recv()` is buffered by the `Signal` stream, so it is not lost.
+#[cfg(unix)]
+pub fn shutdown_listener() -> impl std::future::Future<Output = ()> {
+    use tokio::signal::unix::{signal, SignalKind};
+    // Constructing the streams registers the kernel handlers NOW (synchronously).
+    let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+    let mut intr = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+    async move {
+        tokio::select! {
+            _ = term.recv() => {},
+            _ = intr.recv() => {},
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub fn shutdown_listener() -> impl std::future::Future<Output = ()> {
+    shutdown_signal()
+}
+
 #[cfg(test)]
 #[path = "shutdown_tests.rs"]
 mod tests;

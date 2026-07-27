@@ -33,6 +33,26 @@ cd "$(dirname "$0")/.."
 # which the tiny test GGUF never fully exercises. Excluded here so the 80%
 # reflects integration-owned code (wiring, serving, process, remote, the tune
 # ROUTE + apply path) rather than pure-module branches.
+# (node/service.rs is NOT excluded: `tests/install_surface.rs` spawns the real
+# binary and its `--dry-run` renders the plist/systemd unit + plans, so the
+# SPAWNED process's coverage of service.rs IS attributed here — it measures
+# ~66% lines, well contributing to the gate, no exclusion needed.)
+#
+# EXCLUSION: node/self_update.rs — the self-update APPLY/boot/lock internals
+# (stage_and_flip, the four boot-guard hooks, UpdateLock, perform_trial_rollback,
+# the verify pipeline) are STRUCTURALLY unreachable from integration: a dev build
+# pins NO release key, so every `higgs node self-update` fails CLOSED at signature
+# verification (HG081) before `stage_and_flip` runs, and the boot hooks only fire
+# when the daemon runs from a real `bin/v<semver>/current` install layout (the
+# test binary is `target/debug/higgs`, so `self_update_bin_dir` returns None and
+# the record/rollback block is skipped). Wiring in a signing key or a fake install
+# layout would be exactly the test-only production knob CLAUDE.md forbids. This
+# code is instead exhaustively covered by the UNIT gate (~92% lines, 71 tests).
+# The REACHABLE surface is NOT excluded: `run_node_self_update` + the boot
+# preflight live in node/cli.rs (measured here — `tests/self_update_surface.rs`
+# spawns the real binary and drives arg parsing, the HG081 fail-closed path, and
+# --rollback/--prune dry-runs). So the 80% reflects integration-owned code, not
+# an apply path that cannot execute without a signed release.
 #
 # Enumerate every integration target explicitly (NOT --tests, which would also
 # pull in the lib unit tests and inflate the number). Keep in sync with tests/.
@@ -53,11 +73,14 @@ exec cargo llvm-cov \
   --test cov_remote \
   --test cov_serve \
   --test cov_worker \
+  --test courier_edges \
+  --test facade_hub_edges \
   --test download_errors \
   --test engine_variety \
   --test higgs_events \
   --test hub_server \
   --test inference \
+  --test install_surface \
   --test keys_api \
   --test load_params_variety \
   --test models_scan_ollama \
@@ -70,7 +93,9 @@ exec cargo llvm-cov \
   --test remote_load_params \
   --test remote_node_e2e \
   --test remote_pairing \
+  --test remote_update_push \
   --test scan_edges \
+  --test self_update_surface \
   --test serve_guard \
   --test stream_remote_chat \
   --test supervisor_lifecycle \
@@ -80,5 +105,5 @@ exec cargo llvm-cov \
   --test worker_exe_seam \
   --test worker_logs \
   --test worker_roundtrip \
-  --ignore-filename-regex '/tune/' \
+  --ignore-filename-regex '/tune/|/node/self_update\.rs$' \
   --fail-under-lines 80 "$@"

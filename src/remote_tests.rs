@@ -29,7 +29,45 @@ fn version_sanitizer_strips_terminal_control_and_keeps_semver() {
         sanitize_display("a\u{200B}b\u{2060}c\u{FEFF}d\u{E0041}"),
         "abcd"
     );
+    // LINE/PARAGRAPH separators (Zl/Zp) are NOT Cc — `is_control` misses them, but a JSON/JS/terminal
+    // renderer treats them as a newline, so an `update_failed.reason` like "HG084\u{2028}update
+    // succeeded" could forge a second line. They (and the soft hyphen + other Cf gaps) must drop.
+    assert_eq!(
+        sanitize_display("HG084\u{2028}spoof\u{2029}line\u{00AD}hyphen"),
+        "HG084spooflinehyphen"
+    );
+    assert_eq!(
+        sanitize_display("a\u{0600}b\u{06DD}c\u{070F}d\u{08E2}e\u{180E}f\u{FFF9}g"),
+        "abcdefg"
+    );
+    // The COMPLETE Cf set — including the deprecated/format chars and supplementary-plane format
+    // controls a piecemeal list keeps missing (U+206F, U+0890, U+110BD, U+13430, U+1BCA0, U+1D173).
+    assert_eq!(
+        sanitize_display("a\u{206F}b\u{0890}c\u{110BD}d\u{13430}e\u{1BCA0}f\u{1D173}g\u{E0041}h"),
+        "abcdefgh"
+    );
     assert_eq!(sanitize_display(&"x".repeat(300)).len(), 128);
+}
+
+/// P4b (d): a node advertises the `update_reporting` capability ONLY when it can actually inspect
+/// its `.update-lastfail` marker (a MANAGED install) — so the hub can trust a `None` from it as
+/// authoritative. A non-managed/dev launch must NOT advertise it (its always-`None` report would
+/// otherwise erase a stored failure it can't speak to).
+#[test]
+fn node_capabilities_gates_update_reporting_on_managed() {
+    let managed = node_capabilities(true);
+    assert_eq!(
+        managed.get("update_reporting"),
+        Some(&serde_json::Value::Bool(true)),
+        "a managed install advertises update_reporting"
+    );
+    let non_managed = node_capabilities(false);
+    assert!(
+        !non_managed.contains_key("update_reporting"),
+        "a non-managed launch must NOT advertise update_reporting"
+    );
+    // The other capabilities are unconditional either way.
+    assert!(non_managed.contains_key("chat") && managed.contains_key("update"));
 }
 
 /// T9 version-skew: a PRE-stats node's inventory (no per-worker stat keys)
@@ -95,7 +133,10 @@ fn sample_params() -> HelloParams {
         protocol_versions: vec![1],
         min_supported: 1,
         software_version: "0.4.2".into(),
-        capabilities: node_capabilities(),
+        update_failed: None,
+        target: Some("aarch64-apple-darwin".into()),
+        variant: Some("metal".into()),
+        capabilities: node_capabilities(true),
     }
 }
 

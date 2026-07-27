@@ -38,10 +38,19 @@ pub const M_NODE_STATUS: &str = "higgs/node/status";
 /// snapshot. The hub calls it after admit (and on refresh) to populate its fleet view
 /// (DESIGN-remote.md §4.2.1, P4). Takes `{}`.
 pub const M_NODE_INVENTORY: &str = "higgs/node/inventory";
-/// `higgs/node/update` — RESERVED handshake for a future signature-verified self-update
-/// (DESIGN-remote.md §9, #18). This build only recognizes the method and refuses it with a
-/// typed `HG026`; the real updater (minisign-verified download + swap) is a later task. The
-/// `update` capability is advertised `false` so a well-behaved peer never sends it.
+/// `higgs/node/update` — the hub PUSHES a signature-verified self-update to this node
+/// (DESIGN-remote.md §9, REL-P4e). This build SHIPS the receive+apply handler, so the `update`
+/// capability is advertised `true` ([`node_capabilities`]). The node is the authority: on receipt
+/// it re-verifies the CI-signed manifest against its COMPILED-IN pubkeys ([`crate::update`],
+/// `HIGGS_UPDATE_PUBKEYS`), re-hashes the artifact (sha256), enforces eligibility (target/variant
+/// match, UPGRADE-ONLY — never a downgrade), strict-SSRF-vets the artifact URL, then stages +
+/// trial-flips + re-execs with boot-guard rollback. It is dispatched in
+/// [`crate::node`]'s node-stream handler (`accept_node_update` → `DeferredUpdate::spawn` →
+/// `apply_pushed_update`), NOT the control-op table; the node ACKs the PUSH synchronously and
+/// verifies/applies in a detached job. A LEGACY node that predates this handler refuses with a
+/// typed `HG026`; a node NOT running from a managed `bin/v<ver>/current` install layout accepts
+/// then fails `HG087` (cannot locate its install dir, checked BEFORE any key check); a MANAGED dev
+/// build with no compiled-in pubkeys fails closed `HG081`.
 pub const M_NODE_UPDATE: &str = "higgs/node/update";
 /// `higgs/node/pull` — DATA-plane request to download a GGUF from HuggingFace into the node's
 /// own `~/.higgs/models/` (P4b). Streams [`N_PROGRESS`] then a final `{ path }`. `HG025` on
@@ -106,8 +115,32 @@ pub struct HelloParams {
     pub protocol_versions: Vec<u32>,
     /// Lowest major it will still accept.
     pub min_supported: u32,
-    /// higgs build (semver) — informational + future M_UPDATE gating.
+    /// higgs build (semver) — informational + M_UPDATE gating: it is how the hub observes a
+    /// pushed update's outcome (the next HELLO's version advanced, or `update_failed` below).
     pub software_version: String,
+    /// The node's LAST self-update FAILURE, RE-REPORTED on every HELLO until it genuinely resolves
+    /// (the node does not clear it on the reply — a valid reply does not prove the hub stored it).
+    /// A boot-guard rollback runs at BOOT, before any hub connection exists, so the reconnect
+    /// HELLO is the first chance to tell the hub WHY a pushed update did not take (the hub
+    /// otherwise only infers failure from `software_version` not advancing). Absent (`None`)
+    /// when the last update succeeded, the node advanced off the failed build, or none was
+    /// attempted. Additive: an older node omits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_failed: Option<UpdateFailed>,
+    /// The node's build TARGET triple (`BuildIdentity::current().target`, sourced from the
+    /// compiled-in `HIGGS_BUILD_TARGET`, e.g. `aarch64-apple-darwin`). The hub needs it to pick
+    /// the matching release asset when it pushes a self-update: `Higgs::fleet_update` derives the
+    /// per-node manifest name `higgs-v<ver>-<suffix>` from `(target, variant)` (the release.yml
+    /// naming). Additive: an older node omits it, and the hub then cannot choose an asset for it
+    /// (`fleet_update` reports it skipped rather than guessing). Sanitized at the trust boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// The node's acceleration VARIANT (`metal`/`cpu`/`cuda`, `BuildIdentity::current().variant`,
+    /// in the LOWERCASE manifest/`install.sh` spelling) — the second half of the release-asset
+    /// selector. A CUDA artifact on a CPU node fails to load, so the hub must match this before
+    /// pushing. Additive: an older node omits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant: Option<String>,
     /// Open capability map (e.g. `chat`, `download`, `log_stream`, `update`).
     /// Defaults to empty so a peer that omits it still parses.
     #[serde(default)]
@@ -117,20 +150,41 @@ pub struct HelloParams {
 /// Sanitize a peer-supplied DISPLAY NAME for a terminal (T14 r22/r23): names
 /// (`hub-<eid8>(<host>)`, friendly labels) legitimately contain spaces,
 /// punctuation, and non-ASCII hostnames, so unlike [`sanitize_version`] this
-/// strips only what can SPOOF a terminal — control characters (Cc: ANSI
-/// escapes, CR/LF) AND the bidi-override/format characters `is_control`
-/// misses (Cf: RLO/LRO/isolates/marks, which visually reorder a printed
-/// line) — and caps the length. Normal names pass intact.
+/// strips only what can SPOOF a terminal or a JSON/HTML renderer — control
+/// characters (Cc: ANSI escapes, CR/LF), the LINE/PARAGRAPH separators (Zl/Zp:
+/// U+2028/U+2029, which a JS/JSON renderer treats as a line break even though
+/// JSON allows them raw), AND the bidi-override/format characters `is_control`
+/// misses (Cf: RLO/LRO/isolates/marks/soft-hyphen, which visually reorder or
+/// hide printed text) — and caps the length. Normal names pass intact.
 pub fn sanitize_display(raw: &str) -> String {
+    // The COMPLETE Unicode 15.1 Format (Cf) category plus the Line/Paragraph separators (Zl/Zp)
+    // — the set `char::is_control` (Cc only) misses. Enumerated in full rather than piecemeal so
+    // the sanitizer can't be spoofed through an omitted format char (a renderer that honours these
+    // reorders/hides/line-breaks the display).
     fn is_invisible_format(c: char) -> bool {
         matches!(
             c,
-            '\u{200B}'..='\u{200F}'                          // ZWSP/ZWNJ/ZWJ/LRM/RLM
-            | '\u{061C}'                                      // ALM
+            '\u{2028}' | '\u{2029}'                          // Zl / Zp — line / paragraph separators
+            | '\u{00AD}'                                      // SOFT HYPHEN
+            | '\u{0600}'..='\u{0605}'                        // Arabic number/format signs
+            | '\u{061C}'                                      // ARABIC LETTER MARK
+            | '\u{06DD}'                                      // ARABIC END OF AYAH
+            | '\u{070F}'                                      // SYRIAC ABBREVIATION MARK
+            | '\u{0890}'..='\u{0891}'                        // Arabic pound / piastre marks
+            | '\u{08E2}'                                      // ARABIC DISPUTED END OF AYAH
+            | '\u{180E}'                                      // MONGOLIAN VOWEL SEPARATOR
+            | '\u{200B}'..='\u{200F}'                        // ZWSP/ZWNJ/ZWJ/LRM/RLM
             | '\u{202A}'..='\u{202E}'                        // LRE/RLE/PDF/LRO/RLO
-            | '\u{2060}'..='\u{2069}'                        // WJ/invisibles/isolates
+            | '\u{2060}'..='\u{2064}'                        // WJ + invisible operators
+            | '\u{2066}'..='\u{206F}'                        // bidi isolates + deprecated format
             | '\u{FEFF}'                                      // BOM/ZWNBSP
-            | '\u{E0000}'..='\u{E007F}'                      // tag characters
+            | '\u{FFF9}'..='\u{FFFB}'                        // interlinear annotation
+            | '\u{110BD}' | '\u{110CD}'                      // KAITHI number signs
+            | '\u{13430}'..='\u{1343F}'                      // Egyptian hieroglyph format controls
+            | '\u{1BCA0}'..='\u{1BCA3}'                      // Shorthand format controls
+            | '\u{1D173}'..='\u{1D17A}'                      // Musical symbol format controls
+            | '\u{E0001}'                                     // LANGUAGE TAG
+            | '\u{E0020}'..='\u{E007F}'                      // tag characters
         )
     }
     raw.chars()
@@ -154,23 +208,36 @@ pub fn sanitize_version(raw: &str) -> String {
         .collect()
 }
 
-/// The capabilities a node advertises in its HELLO. (P1 sends the set; decisions
-/// keyed on these arrive in later phases.)
-pub fn node_capabilities() -> Capabilities {
-    [
+/// The capabilities a node advertises in its HELLO. Decisions keyed on these:
+/// `update` → the hub pushes or skips a self-update (`HubFleet`'s `update_capable`);
+/// `update_reporting` → the hub treats a `None` `update_failed` as authoritative;
+/// `fleet_events` → the hub keys its debounced re-pull fallback on its ABSENCE.
+pub fn node_capabilities(reports_update_failures: bool) -> Capabilities {
+    let mut caps: Capabilities = [
         ("chat", true),
-        // `download` (M_PULL, P4b) and `log_stream` (N_LOG_LINE relay, P4) are now implemented;
-        // `update` (M_UPDATE) is still only a stub (#18), so it stays advertised false.
+        // `download` (M_PULL, P4b) and `log_stream` (N_LOG_LINE relay, P4) are implemented.
         ("download", true),
         ("log_stream", true),
         // `fleet_events` (T10): this node pushes N_FLEET_EVENT worker-state changes.
         // The hub keys its chat-end debounced re-pull fallback on the ABSENCE of this.
         ("fleet_events", true),
-        ("update", false),
+        // `update` (M_UPDATE, §9): this build ships the signature-verified self-update PUSH
+        // handler, so a hub may push a signed update (a dev build still fails closed HG081).
+        ("update", true),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), serde_json::Value::Bool(v)))
-    .collect()
+    .collect();
+    // `update_reporting` (P4b (d)) is advertised ONLY when this launch can actually inspect its
+    // `.update-lastfail` marker AND that read was CONCLUSIVE — a MANAGED install with a definitive
+    // marker read (the caller passes `self_update_bin_dir().is_some() && marker_conclusive`).
+    // The hub uses it to know a `None` report is AUTHORITATIVE (no failure) rather than one from a
+    // dev/non-managed/legacy binary that simply CANNOT report — advertising it unconditionally would
+    // let a copied binary at the same identity, which always reports `None`, erase a stored failure.
+    if reports_update_failures {
+        caps.insert("update_reporting".into(), serde_json::Value::Bool(true));
+    }
+    caps
 }
 
 /// The capabilities a hub advertises in its HELLO result.
@@ -265,6 +332,28 @@ pub struct WorkerRef {
 pub struct NodeLoadResult {
     pub worker_id: u32,
     pub loaded: serde_json::Value,
+}
+
+higgs_ts! {
+/// A node's LAST self-update FAILURE — the node reports it in its next HELLO
+/// ([`HelloParams::update_failed`]) and the hub surfaces it in the fleet view
+/// ([`crate::node::fleet::NodeView::update_failed`]) so the operator learns WHY a pushed update
+/// did not take (vs. inferring it from the version never advancing). Re-reported on EVERY HELLO
+/// until the failure genuinely resolves (a successful apply, or the node advancing off the failed
+/// version) — a valid HELLO reply does not prove the hub stored it, so the node never clears it on
+/// the reply alone.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdateFailed {
+    /// The version the node is running NOW — the one it rolled back to, or stayed on when the
+    /// apply failed before ever flipping `current`.
+    pub from: String,
+    /// The version the failed push TARGETED (from the manifest, or the push's `target_version`
+    /// when the failure preceded manifest parse). Empty if it could not be determined.
+    pub to: String,
+    /// A short, sanitized reason — an HG code + phase, e.g. `HG084 artifact sha256 mismatch` or
+    /// `crash-looped on boot — rolled back`. Never free-form peer text (see `sanitize_version`).
+    pub reason: String,
+}
 }
 
 higgs_ts! {
@@ -423,6 +512,36 @@ pub struct NodePullParams {
     pub file: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision: Option<String>,
+}
+
+/// Hub → node `M_NODE_UPDATE` params (DESIGN-remote §9): a signature-verified self-update
+/// PUSH. The (tiny) manifest + its `.minisig` are carried INLINE (`manifest` = the manifest
+/// JSON text, `manifest_sig` = the `.minisig` file text); only the (large) artifact is
+/// fetched, from the DIRECT `artifact_url` (redirects are not followed, so the hub supplies
+/// the final URL). `target_version` + `pinned_key_id` are informational — authenticity comes
+/// from verifying `manifest_sig` against the pubkeys compiled into the node, and the artifact
+/// from the manifest's `sha256`; a dev build pins no key and refuses (HG081). Not
+/// `deny_unknown_fields`: a newer hub may add optional fields an older node should ignore.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeUpdateParams {
+    /// The CI-signed update manifest, verbatim JSON text.
+    pub manifest: String,
+    /// The manifest's detached minisign signature (`.minisig` file text).
+    pub manifest_sig: String,
+    /// A DIRECT URL to the artifact tarball named by the manifest (fetched + sha256-checked).
+    pub artifact_url: String,
+    /// Informational: the version the hub believes it is pushing (the manifest is authoritative).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_version: Option<String>,
+    /// Informational: which pinned key the hub expects to verify it (the node tries all pinned
+    /// keys regardless).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_key_id: Option<String>,
+    // NOTE: there is deliberately NO `allow_downgrade` on the wire. A hub-pushed self-update is
+    // UPGRADE-ONLY — the node's `apply_pushed_update` always applies with downgrade REFUSED, so a
+    // compromised paired hub can never replay an OLD signed release to downgrade a node. Rolling
+    // back to a prior version is the node's own LOCAL job (`higgs node self-update --rollback`,
+    // or the boot-guard auto-rollback on a crash-loop), never a hub push (DESIGN-remote.md §9).
 }
 
 /// Hub → node `M_CHAT` (`higgs/chat`) params on a DATA stream: the worker selector +

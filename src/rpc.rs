@@ -100,6 +100,73 @@ pub fn encode(frame: &RpcFrame) -> String {
     .expect("rpc frames are always serializable")
 }
 
+/// Read ONE `\n`-terminated NDJSON frame from `reader`, rejecting a frame whose bytes exceed
+/// `max_bytes` BEFORE its newline arrives. Matches [`tokio::io::Lines::next_line`] otherwise:
+/// the terminator (`\n`, and a preceding `\r`) is stripped; a final line without a trailing
+/// `\n` is returned at EOF; a clean EOF (no pending bytes) returns `Ok(None)`.
+///
+/// The cap is the point: [`decode`] must first materialise the whole line as a `String`, and a
+/// bare `Lines`/`read_until` grows that buffer UNBOUNDED until the newline — so a peer that
+/// streams gigabytes on one line OOMs the process before `decode` ever runs. This reader stops
+/// and returns an `InvalidData` error the moment the accumulated bytes would exceed `max_bytes`
+/// (never allocating materially past the cap + one `fill_buf` chunk), so the caller can drop the
+/// stream instead of the whole node. `max_bytes` is a parameter (not a hard-coded const) so the
+/// unit tests can drive the cap edge with a small input; production passes a policy constant.
+pub(crate) async fn read_bounded_frame<R>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> std::io::Result<Option<String>>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt;
+    let oversize = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("frame exceeds the {max_bytes}-byte limit"),
+        )
+    };
+    let mut buf: Vec<u8> = Vec::new();
+    let terminated; // true iff we stopped at a '\n' (vs EOF on a newline-less final line)
+    loop {
+        let chunk = reader.fill_buf().await?;
+        if chunk.is_empty() {
+            // EOF: a clean end (nothing buffered) is None; buffered bytes are the final,
+            // newline-less line.
+            if buf.is_empty() {
+                return Ok(None);
+            }
+            terminated = false;
+            break;
+        }
+        if let Some(pos) = chunk.iter().position(|&b| b == b'\n') {
+            if buf.len() + pos > max_bytes {
+                return Err(oversize());
+            }
+            buf.extend_from_slice(&chunk[..pos]);
+            reader.consume(pos + 1);
+            terminated = true;
+            break;
+        }
+        // No newline in this chunk — check the cap BEFORE growing `buf`, so it never holds
+        // materially more than `max_bytes`.
+        if buf.len() + chunk.len() > max_bytes {
+            return Err(oversize());
+        }
+        let n = chunk.len();
+        buf.extend_from_slice(chunk);
+        reader.consume(n);
+    }
+    // Strip the CR of a CRLF terminator, matching `Lines::next_line`. A bare trailing CR on a
+    // final UNTERMINATED line (EOF, no LF) is PRESERVED — exactly like `Lines`.
+    if terminated && buf.last() == Some(&b'\r') {
+        buf.pop();
+    }
+    String::from_utf8(buf)
+        .map(Some)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
 /// Decode one NDJSON line into a frame.
 ///
 /// Fails with [HG008] when the line is not valid JSON-RPC 2.0.

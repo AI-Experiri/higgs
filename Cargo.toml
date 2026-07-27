@@ -111,18 +111,44 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 sha2 = "0.10"
 # Constant-time digest comparison for API-token auth (keys.rs).
 subtle = "2"
+# Passwd-database lookups for `higgs node install-service` (the service must be
+# pinned to the OPERATOR's user/home — under sudo that is SUDO_USER's passwd
+# entry, which $HOME/$USER cannot reliably provide). Integration tests also use
+# it to SIGTERM spawned servers (coverage flush).
+libc = "0.2"
+# Verify-only minisign: checks release-CI signatures on update manifests against
+# the pubkeys pinned in the binary (src/update.rs, DESIGN-remote.md §9). Verify
+# HALF only — the signing half lives in release CI (the minisign CLI) and the
+# full `minisign` crate below is dev-only, so a shipped binary cannot sign.
+minisign-verify = "0.2"
 # Streaming HTTP client for the model downloader (P4b, M_PULL) and the FALLBACK
 # path of the HF client (`src/hub.rs`): pulls a GGUF / card file from the
 # HuggingFace resolve URL with progress. rustls to avoid a system OpenSSL dependency.
-reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "blocking"] }
 # Official HuggingFace Hub client — PRIMARY path for model downloads + card/config
 # fetch (`src/hub.rs`), with the hand-rolled `reqwest` path above as a fail-open
 # FALLBACK. Pinned to a commit (the crate is pre-1.0, not on crates.io, "APIs may
 # change without notice"); `default-features = false` keeps `xet`/`hf-xet`/`sha2`
 # out. Note: it pulls reqwest 0.13 (a second client+TLS stack alongside our 0.12).
 huggingface-hub = { git = "https://github.com/huggingface/huggingface_hub_rust.git", rev = "c9749ef76a294d5e97acae6b644071e39854aeb8", default-features = false }
+# Self-update eligibility (`src/node/self_update.rs`, DESIGN-remote.md §9 P3):
+# semver precedence to compare a signed manifest's `version` against the running
+# binary's `CARGO_PKG_VERSION` (downgrade refusal, prerelease-aware) — the manifest
+# version is CI-controlled but parsing it correctly (prerelease/build metadata)
+# is subtler than a numeric-tuple compare, so use the canonical implementation.
+semver = "1"
+# In-process unpack of a verified update tarball (`higgs-v<ver>-<suffix>.tar.gz`)
+# during self-update. The bytes are already sha256-authenticated against the signed
+# manifest BEFORE unpacking, and unpacking runs in-process (no shell-out to a
+# `tar` that PATH could resolve to a planted binary — the very class P2b hardened).
+tar = "0.4"
+flate2 = "1"
 
 [dev-dependencies]
+# Full minisign (keygen + SIGNING) so update-verification tests can mint a
+# throwaway keypair and sign manifests in-process — the production dep above is
+# verify-only on purpose. Dev-only: never in a shipped binary.
+minisign = "0.7"
 # test-util: paused-clock control (tokio::time::advance) so the 600 s chat-RPC
 # timeout test elapses instantly instead of waiting in real time.
 tokio = { version = "1", features = ["full", "test-util"] }
@@ -132,9 +158,6 @@ http-body-util = "0.1"
 # HTTP client for the black-box integration tests (spawn higgs, drive /v1
 # + /api/higgs over real HTTP). rustls to avoid a system OpenSSL dependency.
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
-# SIGTERM the spawned server for graceful shutdown (so its coverage profile
-# flushes — a hard SIGKILL would drop it).
-libc = "0.2"
 
 [lints]
 workspace = true

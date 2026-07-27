@@ -69,6 +69,15 @@ async fn valid_token_pairs() {
             software_version: env!("CARGO_PKG_VERSION").to_string(),
             // A current node HELLO advertises the fleet_events push (T10).
             fleet_events: true,
+            update_failed: None,
+            // The in-process test node is NOT a managed install (self_update_bin_dir is None), so
+            // it does not advertise `update_reporting` — the P4b (d) capability gate at work.
+            reports_update_failures: false,
+            // A current node reports its compiled-in build identity (REL-P4e) and advertises the
+            // `update` capability — this test node IS this crate, so they match exactly.
+            target: Some(higgs::node::self_update::BuildIdentity::current().target),
+            variant: Some(higgs::node::self_update::BuildIdentity::current().variant),
+            update_capable: true,
         }
     );
     assert!(now_paired, "node added to allowlist after pairing");
@@ -253,6 +262,15 @@ async fn hello_exchanges_friendly_names() {
             software_version: env!("CARGO_PKG_VERSION").to_string(),
             // A current node HELLO advertises the fleet_events push (T10).
             fleet_events: true,
+            update_failed: None,
+            // The in-process test node is NOT a managed install (self_update_bin_dir is None), so
+            // it does not advertise `update_reporting` — the P4b (d) capability gate at work.
+            reports_update_failures: false,
+            // A current node reports its compiled-in build identity (REL-P4e) and advertises the
+            // `update` capability — this test node IS this crate, so they match exactly.
+            target: Some(higgs::node::self_update::BuildIdentity::current().target),
+            variant: Some(higgs::node::self_update::BuildIdentity::current().variant),
+            update_capable: true,
         }
     );
     assert_eq!(
@@ -314,6 +332,15 @@ async fn allowlisted_node_reconnects_without_token() {
             software_version: env!("CARGO_PKG_VERSION").to_string(),
             // A current node HELLO advertises the fleet_events push (T10).
             fleet_events: true,
+            update_failed: None,
+            // The in-process test node is NOT a managed install (self_update_bin_dir is None), so
+            // it does not advertise `update_reporting` — the P4b (d) capability gate at work.
+            reports_update_failures: false,
+            // A current node reports its compiled-in build identity (REL-P4e) and advertises the
+            // `update` capability — this test node IS this crate, so they match exactly.
+            target: Some(higgs::node::self_update::BuildIdentity::current().target),
+            variant: Some(higgs::node::self_update::BuildIdentity::current().variant),
+            update_capable: true,
         }
     );
     let _ = std::fs::remove_file(&path);

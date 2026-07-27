@@ -104,6 +104,11 @@ async fn params_load_applies_ctx_on_a_real_node() {
         agreed_version,
         software_version,
         fleet_events: _,
+        update_failed: _,
+        reports_update_failures: _,
+        target: _,
+        variant: _,
+        update_capable: _,
     } = outcome
     else {
         panic!("admitted: {outcome:?}");
@@ -127,6 +132,8 @@ async fn params_load_applies_ctx_on_a_real_node() {
             Some(agreed_version),
             Some(software_version.clone()),
             false,
+            None,
+            true,
         )
         .await;
 

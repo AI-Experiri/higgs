@@ -240,6 +240,13 @@ enum NodeMsg {
     ShutdownAll {
         reply: oneshot::Sender<()>,
     },
+    /// Quiesce for the update-restart drain (P4b (c)): refuse every chat lease requested AFTER
+    /// this message. Mailbox order is the barrier — see the `quiescing` field. One-way transition
+    /// (the process is about to re-exec or exit); workers stay resident and existing leases run
+    /// to completion.
+    QuiesceChats {
+        reply: oneshot::Sender<()>,
+    },
     /// Posted by a worker-stop task once `Supervisor::stop()` has finished. Decrements the
     /// in-flight-stop count (so `shutdown_all` can tell when every teardown is truly done)
     /// and fires the op's own reply if it had one (e.g. the `unload`/`kill` caller).
@@ -324,6 +331,12 @@ struct NodeActor {
     /// Per-worker count of in-flight chats (held via [`ChatLease`]). A worker with a non-zero
     /// count is never idle-reaped, so a generation longer than the TTL is not killed mid-chat.
     in_flight: HashMap<WorkerId, u32>,
+    /// Set by [`NodeMsg::QuiesceChats`] (the update-restart drain, P4b (c)): refuse every NEW
+    /// chat lease from that point on. The actor's mailbox ORDER is the barrier — a `ChatHandle`
+    /// already queued ahead of the quiesce takes its lease normally (and the drain waits for it
+    /// via `in_flight`); one arriving after is refused, closing the accepted-M_CHAT-but-not-yet-
+    /// leased window that polling `in_flight` alone cannot see.
+    quiescing: bool,
     /// Runtime-mutable idle auto-unload policy (TTL + on/off), read by the reaper each tick.
     idle: Arc<IdleConfig>,
     /// Set once the drain has fully completed. A `ShutdownAll` arriving afterwards answers
@@ -586,6 +599,15 @@ impl Actor for NodeActor {
                 );
             }
             NodeMsg::ChatHandle { id, model, reply } => {
+                // Update-restart quiesce (P4b (c)): once draining, every NEW lease is refused —
+                // the generation would only be truncated moments later by the restart's
+                // `shutdown_all`; a clean refusal now beats a torn stream then. Mailbox order
+                // makes this exact: leases granted before the QuiesceChats message drain via
+                // `in_flight`; requests after it land here.
+                if self.quiescing {
+                    let _ = reply.send(Err(shutting_down()));
+                    return;
+                }
                 let lease = match self.registry.get(id).cloned() {
                     // THE dispatch choke point: every generation — local `/v1`,
                     // in-process, AND the hub relay (`relay_chat`, which never runs
@@ -732,6 +754,13 @@ impl Actor for NodeActor {
                     self.reap(id, sup, None);
                 }
                 self.maybe_finish_shutdown(); // handle the no-workers / nothing-in-flight case
+            }
+            NodeMsg::QuiesceChats { reply } => {
+                // One-way: the update restart is committed; from the NEXT message on, no new
+                // chat lease is granted. Workers stay resident (existing leases finish; the
+                // restart's shutdown_all tears down afterwards).
+                self.quiescing = true;
+                let _ = reply.send(());
             }
             NodeMsg::ReapDone { done } => {
                 self.inflight_stops -= 1;
@@ -1204,6 +1233,23 @@ pub struct NodeRuntime {
     /// Fleet-event fan-out (T10), mirrored on the wrapper so `subscribe_fleet_events`
     /// needs no mailbox round-trip.
     fleet_tx: broadcast::Sender<crate::remote::NodeFleetEvent>,
+    /// Live hub-opened stream handlers (P4b (c)): `serve_node` wraps each spawned per-stream
+    /// handler in a [`StreamGuard`], so the update-restart drain can wait for the handlers
+    /// themselves — a chat's `in_flight` count drops when the GENERATION ends, but the detached
+    /// handler may still be flushing buffered chunks + the final response frame to the hub;
+    /// re-execing at that instant would truncate a completed generation's tail.
+    active_streams: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// RAII count of one live hub-stream handler (see `NodeRuntime::active_streams`). Created by
+/// [`NodeRuntime::stream_guard`] around each spawned handler; the count drops when the handler
+/// future finishes (or is cancelled) and the guard drops with it.
+pub struct StreamGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for StreamGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl NodeRuntime {
@@ -1242,6 +1288,7 @@ impl NodeRuntime {
             load_facts: HashMap::new(),
             snapshot_seq: 0,
             in_flight: HashMap::new(),
+            quiescing: false,
             idle: idle_for_actor,
             events_tx: events_for_actor,
             fleet_tx: fleet_for_actor,
@@ -1277,6 +1324,7 @@ impl NodeRuntime {
             bus,
             idle,
             fleet_tx,
+            active_streams: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -1449,6 +1497,78 @@ impl NodeRuntime {
         let (tx, rx) = oneshot::channel();
         if self.handle.send(NodeMsg::ShutdownAll { reply: tx }).is_ok() {
             let _ = rx.await;
+        }
+    }
+
+    /// Total in-flight generations across every resident worker — one of the two drain signals
+    /// for the update-restart path (P4b (c)). Sums the same per-worker counters the fleet
+    /// inventory reports; `0` when idle or when the actor has already stopped (nothing left to
+    /// drain).
+    pub async fn in_flight_total(&self) -> u32 {
+        self.worker_snapshot()
+            .await
+            .iter()
+            .map(|w| w.in_flight.unwrap_or(0))
+            .sum()
+    }
+
+    /// Count one live hub-stream handler for the drain (P4b (c)) — `serve_node` holds the
+    /// returned guard across each spawned per-stream handler; the count drops with the guard.
+    pub fn stream_guard(&self) -> StreamGuard {
+        self.active_streams
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        StreamGuard(self.active_streams.clone())
+    }
+
+    /// Live hub-stream handlers (guards outstanding) — the second drain signal: a generation's
+    /// `in_flight` drops when it ENDS, but its handler may still be flushing the response tail.
+    pub fn active_streams(&self) -> usize {
+        self.active_streams
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Refuse every chat lease requested after this returns (mailbox order is the barrier — see
+    /// `NodeMsg::QuiesceChats`). One-way; part of the update-restart drain. A no-op if the actor
+    /// is already gone.
+    pub async fn quiesce_chats(&self) {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .handle
+            .send(NodeMsg::QuiesceChats { reply: tx })
+            .is_ok()
+        {
+            let _ = rx.await;
+        }
+    }
+
+    /// The update-restart drain (P4b (c)), BOUNDED. In order:
+    /// 1. QUIESCE: no chat lease is granted from here on (a lease the actor granted first drains
+    ///    below; a request arriving after is cleanly refused rather than truncated moments later)
+    ///    — closing the window where a hub stream was ACCEPTED before the serve loop broke but
+    ///    had not yet taken its lease, which polling `in_flight` alone cannot see.
+    /// 2. Poll until BOTH signals are zero — no in-flight generation AND no live stream handler
+    ///    (a generation's `in_flight` drops at its END, but the detached handler may still be
+    ///    flushing buffered chunks + the final response frame to the hub) — or `deadline`
+    ///    elapses (returns `false`; the caller proceeds to `shutdown_all`, which then truncates
+    ///    only the stragglers, exactly the pre-drain behavior).
+    ///
+    /// SIGTERM has already broken the serve loop, so no NEW streams arrive (`serve_node`'s
+    /// accept loop is gone) while the DETACHED per-stream handlers finish.
+    pub async fn drain_until_idle(
+        &self,
+        poll_every: std::time::Duration,
+        deadline: std::time::Duration,
+    ) -> bool {
+        self.quiesce_chats().await;
+        let started = tokio::time::Instant::now();
+        loop {
+            if self.in_flight_total().await == 0 && self.active_streams() == 0 {
+                return true;
+            }
+            if started.elapsed() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(poll_every).await;
         }
     }
 }

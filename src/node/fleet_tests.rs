@@ -27,9 +27,63 @@ async fn fleet_with_one_node() -> (Arc<HubFleet>, NodeKey, String, tempfile::Tem
             None,
             None,
             false,
+            None,
+            true,
         )
         .await;
     (fleet, node_key, model_id, root)
+}
+
+/// `add_node_with_identity` records the node's build identity + `update` capability ATOMICALLY with
+/// admission (REL-P4e, codex r5 #2): the values are observable on `update_targets` the instant the
+/// call returns, in the SAME actor message that emits `NodeConnected` — so a `fleet_update` reacting
+/// to `NodeConnected` can never see a freshly-admitted update-capable node as not-yet-identified.
+/// Fail-on-revert: if the `AdmitNode` handler stops setting these from the message (the pre-fix
+/// remove-only behaviour that relied on a separate `SetBuildIdentity`), the node admits with no
+/// identity and these assertions fail.
+#[tokio::test]
+async fn add_node_with_identity_sets_the_build_identity_atomically() {
+    let (root, _model_id) = stage_dummy_model("higgs-test/m");
+    let hub = local_endpoint().await;
+    let node = local_endpoint().await;
+    let hub_addr = hub.addr();
+    let node_key = node.id().to_string();
+    let rt = Arc::new(fake_runtime(vec![root.path().to_path_buf()]));
+    tokio::spawn(async move {
+        let node_conn = node.connect(hub_addr, ALPN).await.expect("connect");
+        serve_node(node_conn, rt).await;
+    });
+    let conn = hub.accept().await.expect("incoming").await.expect("conn");
+    std::mem::forget(hub);
+
+    let fleet = Arc::new(HubFleet::new(Arc::new(crate::log_bus::LogBus::new())));
+    fleet
+        .add_node_with_identity(
+            node_key.clone(),
+            Arc::new(NodeTransport::new(conn)),
+            None,
+            None,
+            None,
+            false,
+            None,
+            true,
+            Some("aarch64-apple-darwin".to_string()),
+            Some("metal".to_string()),
+            true,
+        )
+        .await;
+
+    let targets = fleet.update_targets().await;
+    assert_eq!(targets.len(), 1, "the admitted node is a push target");
+    let t = &targets[0];
+    assert_eq!(t.node, node_key);
+    assert_eq!(t.target.as_deref(), Some("aarch64-apple-darwin"));
+    assert_eq!(t.variant.as_deref(), Some("metal"));
+    assert!(
+        t.update_capable,
+        "the node advertised the `update` capability"
+    );
+    drop(root);
 }
 
 /// A params-load against a MAJOR-2 admission passes the gate and dispatches
@@ -65,6 +119,8 @@ async fn params_load_reaches_the_node_at_protocol_two() {
             Some(2),
             Some("9.9.9-test".to_string()),
             false,
+            None,
+            true,
         )
         .await;
     assert_eq!(fleet.node_protocol(&node_key).await, Some(2));
@@ -236,6 +292,8 @@ async fn versionless_readmission_clears_the_stored_major() {
             Some(2),
             Some("9.9.9-test".to_string()),
             false,
+            None,
+            true,
         )
         .await;
     assert_eq!(fleet.node_protocol(&node_key).await, Some(2));
@@ -248,6 +306,8 @@ async fn versionless_readmission_clears_the_stored_major() {
             None,
             None,
             false,
+            None,
+            true,
         )
         .await;
     assert_eq!(
@@ -311,6 +371,8 @@ async fn versionless_readmission_clears_the_stored_major() {
             None,
             None,
             false,
+            None,
+            true,
         )
         .await;
     // ...then the "restarted" node's first pull (seq 1, fresh epoch) commits.
@@ -359,6 +421,118 @@ async fn versionless_readmission_clears_the_stored_major() {
     assert_eq!(
         row_after.software_version, None,
         "view semver cleared: {row_after:?}"
+    );
+}
+
+/// The hub surfaces a node's HELLO-reported self-update FAILURE (P4b (d)) in the fleet view. A
+/// later None-report clears it ONLY when the node advertises the `update_reporting` capability —
+/// then its None is AUTHORITATIVE (it genuinely has no failure). A None from a node WITHOUT the
+/// capability (a legacy/dev/non-managed binary at the same identity that cannot report) is NOT
+/// authoritative and PRESERVES the stored failure, so a non-reporting reconnect can't erase one the
+/// operator hasn't seen. Fail-on-revert for all three AdmitNode `update_failed` behaviors:
+/// - reverting the Some→insert leaves the view None on the first check;
+/// - reverting the capability-gate (removing on ANY None) drops the failure on the SECOND check;
+/// - reverting the None→remove-when-capable leaves the stale failure on the THIRD check.
+#[tokio::test]
+async fn update_failure_clears_only_on_an_authoritative_none() {
+    let hub = local_endpoint().await;
+    let node = local_endpoint().await;
+    let hub_addr = hub.addr();
+    let node_key = node.id().to_string();
+
+    // Three sequential dials from the SAME node identity (each needs a concurrent accept).
+    let (dial1, conn1) = tokio::join!(node.connect(hub_addr.clone(), ALPN), async {
+        hub.accept().await.expect("incoming").await.expect("conn 1")
+    });
+    let (dial2, conn2) = tokio::join!(node.connect(hub_addr.clone(), ALPN), async {
+        hub.accept().await.expect("incoming").await.expect("conn 2")
+    });
+    let (dial3, conn3) = tokio::join!(node.connect(hub_addr.clone(), ALPN), async {
+        hub.accept().await.expect("incoming").await.expect("conn 3")
+    });
+    let _keep = (
+        dial1.expect("dial 1"),
+        dial2.expect("dial 2"),
+        dial3.expect("dial 3"),
+    );
+    std::mem::forget(hub);
+
+    let fleet = Arc::new(HubFleet::new(Arc::new(crate::log_bus::LogBus::new())));
+    let failure = crate::remote::UpdateFailed {
+        from: "1.0.0".into(),
+        to: "2.0.0".into(),
+        reason: "crash-looped on boot — rolled back".into(),
+    };
+    let update_failed_row = |fleet: Arc<HubFleet>, key: String| async move {
+        fleet
+            .nodes_view()
+            .await
+            .into_iter()
+            .find(|n| n.endpoint_id == key)
+            .expect("node in the view")
+            .update_failed
+    };
+
+    // 1. A reporting node (capability = true) sends the failure → surfaced.
+    fleet
+        .add_node(
+            node_key.clone(),
+            Arc::new(NodeTransport::new(conn1)),
+            None,
+            Some(2),
+            Some("1.0.0".to_string()),
+            false,
+            Some(failure.clone()),
+            true,
+        )
+        .await;
+    assert_eq!(
+        update_failed_row(fleet.clone(), node_key.clone())
+            .await
+            .as_ref(),
+        Some(&failure),
+        "the view carries the HELLO's update failure"
+    );
+
+    // 2. A None from a NON-reporting binary (capability = false — a legacy/dev/non-managed reconnect
+    //    at the same identity) is NOT authoritative → the unresolved failure is PRESERVED.
+    fleet
+        .add_node(
+            node_key.clone(),
+            Arc::new(NodeTransport::new(conn2)),
+            None,
+            Some(2),
+            Some("1.0.0".to_string()),
+            false,
+            None,
+            false,
+        )
+        .await;
+    assert_eq!(
+        update_failed_row(fleet.clone(), node_key.clone())
+            .await
+            .as_ref(),
+        Some(&failure),
+        "a None from a non-reporting node does not erase the stored failure"
+    );
+
+    // 3. A None from a REPORTING binary (capability = true) is AUTHORITATIVE → the failure clears.
+    fleet
+        .add_node(
+            node_key.clone(),
+            Arc::new(NodeTransport::new(conn3)),
+            None,
+            Some(2),
+            Some("1.0.0".to_string()),
+            false,
+            None,
+            true,
+        )
+        .await;
+    assert_eq!(
+        update_failed_row(fleet.clone(), node_key.clone()).await,
+        None,
+        "an authoritative None (from a reporting node) clears the failure"
     );
 }
 
@@ -712,7 +886,11 @@ fn inventory_age_is_the_max_of_both_clocks_from_the_pull_start_stamp() {
         chat_refreshes: HashMap::new(),
         chat_refresh_gen: 0,
         software_versions: HashMap::new(),
+        update_failures: HashMap::new(),
         event_nodes: std::collections::HashSet::new(),
+        targets: HashMap::new(),
+        variants: HashMap::new(),
+        update_capable: std::collections::HashSet::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
         fallback_inflight: HashMap::new(),
@@ -755,7 +933,11 @@ fn inventory_age_is_the_max_of_both_clocks_from_the_pull_start_stamp() {
         chat_refreshes: HashMap::new(),
         chat_refresh_gen: 0,
         software_versions: HashMap::new(),
+        update_failures: HashMap::new(),
         event_nodes: std::collections::HashSet::new(),
+        targets: HashMap::new(),
+        variants: HashMap::new(),
+        update_capable: std::collections::HashSet::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
         fallback_inflight: HashMap::new(),
@@ -818,7 +1000,11 @@ async fn readmission_strips_the_previous_process_snapshot_seq() {
         chat_refreshes: HashMap::new(),
         chat_refresh_gen: 0,
         software_versions: HashMap::new(),
+        update_failures: HashMap::new(),
         event_nodes: std::collections::HashSet::new(),
+        targets: HashMap::new(),
+        variants: HashMap::new(),
+        update_capable: std::collections::HashSet::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
         fallback_inflight: HashMap::new(),
@@ -875,7 +1061,11 @@ async fn older_started_pull_never_overwrites_a_newer_snapshot() {
         chat_refreshes: HashMap::new(),
         chat_refresh_gen: 0,
         software_versions: HashMap::new(),
+        update_failures: HashMap::new(),
         event_nodes: std::collections::HashSet::new(),
+        targets: HashMap::new(),
+        variants: HashMap::new(),
+        update_capable: std::collections::HashSet::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
         fallback_inflight: HashMap::new(),
@@ -1119,7 +1309,11 @@ fn served_ids_are_collision_free_even_when_a_model_name_clashes_with_a_suffix() 
         chat_refreshes: HashMap::new(),
         chat_refresh_gen: 0,
         software_versions: HashMap::new(),
+        update_failures: HashMap::new(),
         event_nodes: std::collections::HashSet::new(),
+        targets: HashMap::new(),
+        variants: HashMap::new(),
+        update_capable: std::collections::HashSet::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
         fallback_inflight: HashMap::new(),
@@ -1321,7 +1515,11 @@ async fn pushed_worker_snapshot_merges_under_the_seq_guard() {
         chat_refreshes: HashMap::new(),
         chat_refresh_gen: 0,
         software_versions: HashMap::new(),
+        update_failures: HashMap::new(),
         event_nodes: std::collections::HashSet::new(),
+        targets: HashMap::new(),
+        variants: HashMap::new(),
+        update_capable: std::collections::HashSet::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
         fallback_inflight: HashMap::new(),
@@ -1476,6 +1674,8 @@ async fn node_pushed_events_update_the_cache_without_a_pull() {
             Some(2),
             None,
             true, // the HELLO advertised fleet_events
+            None, // no update-failed marker
+            true, // reports update failures
         )
         .await;
 
@@ -1595,7 +1795,16 @@ async fn pushes_from_a_replaced_connection_are_dropped() {
     let t2 = Arc::new(NodeTransport::new(conn2));
     let fleet = Arc::new(HubFleet::new(Arc::new(crate::log_bus::LogBus::new())));
     fleet
-        .add_node(node_key.clone(), t1.clone(), None, Some(2), None, true)
+        .add_node(
+            node_key.clone(),
+            t1.clone(),
+            None,
+            Some(2),
+            None,
+            true,
+            None,
+            true,
+        )
         .await;
     // Seed a cached inventory under the current epoch (as the connect pull would).
     let epoch = fleet
@@ -1638,7 +1847,16 @@ async fn pushes_from_a_replaced_connection_are_dropped() {
 
     // The node process restarts: re-admission on a NEW connection strips the seq.
     fleet
-        .add_node(node_key.clone(), t2.clone(), None, Some(2), None, true)
+        .add_node(
+            node_key.clone(),
+            t2.clone(),
+            None,
+            Some(2),
+            None,
+            true,
+            None,
+            true,
+        )
         .await;
 
     let push = |seq: u64, in_flight: u32| crate::remote::NodeFleetEvent {
@@ -1699,7 +1917,16 @@ async fn stale_pushes_are_silent_and_disconnect_all_announces_drops() {
     let fleet = Arc::new(HubFleet::new(Arc::new(crate::log_bus::LogBus::new())));
     let mut events = fleet.subscribe_fleet_events();
     fleet
-        .add_node(node_key.clone(), t.clone(), None, Some(2), None, true)
+        .add_node(
+            node_key.clone(),
+            t.clone(),
+            None,
+            Some(2),
+            None,
+            true,
+            None,
+            true,
+        )
         .await;
     assert_eq!(
         events.recv().await.unwrap().kind,
@@ -1808,7 +2035,11 @@ async fn a_pre_cache_push_is_retained_and_replayed_over_an_older_pull() {
         chat_refreshes: HashMap::new(),
         chat_refresh_gen: 0,
         software_versions: HashMap::new(),
+        update_failures: HashMap::new(),
         event_nodes: std::collections::HashSet::new(),
+        targets: HashMap::new(),
+        variants: HashMap::new(),
+        update_capable: std::collections::HashSet::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
         fallback_inflight: HashMap::new(),
@@ -1930,7 +2161,11 @@ async fn a_stale_fallback_owner_stands_down_before_pulling() {
         chat_refreshes: HashMap::new(),
         chat_refresh_gen: 0,
         software_versions: HashMap::new(),
+        update_failures: HashMap::new(),
         event_nodes: std::collections::HashSet::new(),
+        targets: HashMap::new(),
+        variants: HashMap::new(),
+        update_capable: std::collections::HashSet::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
         fallback_inflight: HashMap::new(),
@@ -2026,7 +2261,16 @@ async fn an_applied_push_drops_routes_of_vanished_workers() {
     let fleet = Arc::new(HubFleet::new(Arc::new(crate::log_bus::LogBus::new())));
     let t = Arc::new(NodeTransport::new(conn));
     fleet
-        .add_node(node_key.clone(), t.clone(), None, Some(2), None, true)
+        .add_node(
+            node_key.clone(),
+            t.clone(),
+            None,
+            Some(2),
+            None,
+            true,
+            None,
+            true,
+        )
         .await;
 
     // Load → route + cached inventory with the worker.
@@ -2087,6 +2331,8 @@ async fn fallback_give_up_finalizes_only_without_fresh_pending_data() {
             transport.clone(),
             None,
             Some(2),
+            None,
+            true,
             None,
             true,
         )
@@ -2187,7 +2433,16 @@ async fn an_unknown_event_kind_still_applies_its_snapshot() {
     let mut events = fleet.subscribe_fleet_events();
     let node_key = node.id().to_string();
     fleet
-        .add_node(node_key.clone(), t.clone(), None, Some(2), None, true)
+        .add_node(
+            node_key.clone(),
+            t.clone(),
+            None,
+            Some(2),
+            None,
+            true,
+            None,
+            true,
+        )
         .await;
     assert_eq!(
         events.recv().await.unwrap().kind,
@@ -2375,7 +2630,11 @@ async fn a_reused_worker_id_does_not_lend_its_domain_to_a_stale_route() {
         chat_refreshes: HashMap::new(),
         chat_refresh_gen: 0,
         software_versions: HashMap::new(),
+        update_failures: HashMap::new(),
         event_nodes: std::collections::HashSet::new(),
+        targets: HashMap::new(),
+        variants: HashMap::new(),
+        update_capable: std::collections::HashSet::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
         fallback_inflight: HashMap::new(),
@@ -2487,7 +2746,11 @@ async fn a_stale_inventory_row_does_not_unadvertise_a_reused_worker_id() {
         chat_refreshes: HashMap::new(),
         chat_refresh_gen: 0,
         software_versions: HashMap::new(),
+        update_failures: HashMap::new(),
         event_nodes: std::collections::HashSet::new(),
+        targets: HashMap::new(),
+        variants: HashMap::new(),
+        update_capable: std::collections::HashSet::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
         fallback_inflight: HashMap::new(),
@@ -2607,6 +2870,8 @@ async fn a_remote_route_does_not_resurrect_a_local_non_chat_id() {
             None,
             None,
             false,
+            None,
+            true,
         )
         .await;
 

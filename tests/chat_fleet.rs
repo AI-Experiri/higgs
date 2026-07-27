@@ -178,6 +178,8 @@ async fn fleet_e2e_tool_chat() {
             None,
             None,
             false,
+            None,
+            true,
         )
         .await;
 
