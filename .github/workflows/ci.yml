@@ -76,6 +76,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Disable OpenMP: ggml builds fine without it, and otherwise references
+          # libomp symbols the final link doesn't resolve (the macOS test link fails
+          # with "library 'omp' not found"). The sys crate forwards CMAKE_* env vars to
+          # CMake, so this makes find_package(OpenMP) miss — matching the dev build,
+          # which has no libomp and links cleanly.
+          echo "CMAKE_DISABLE_FIND_PACKAGE_OpenMP=ON" >> "$GITHUB_ENV"
           if [ "${{ matrix.os }}" = "macos-14" ]; then
             sdk="$(xcrun --sdk macosx --show-sdk-path)"
             {
