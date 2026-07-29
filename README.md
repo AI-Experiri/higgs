@@ -130,7 +130,12 @@ the router with `higgs::serve::v1_router(higgs.clone())` and merge it into your 
 Releases ship as minisign-signed tarballs (macOS arm64 `metal`, Linux x86_64 `cpu`/`cuda` —
 see [RELEASING.md](RELEASING.md)). The repo is private, so downloads authenticate with a
 **fine-grained PAT** (GitHub → Settings → Developer settings → Fine-grained tokens; scope it
-to this repo, permission **Contents: Read**). One token, two commands, no clone:
+to this repo, permission **Contents: Read**). One token, two commands, no clone.
+
+**Prerequisites on the target box:** `jq` (the GitHub download path needs it) and `minisign`
+(signature verification via `--pubkey`) — `brew install jq minisign` on macOS,
+`sudo apt-get install -y jq minisign` on Ubuntu/Debian. Without them `install.sh` refuses
+up front rather than installing unverified.
 
 ```bash
 export TOKEN=github_pat_…   # your fine-grained PAT (Contents: Read)
@@ -152,10 +157,11 @@ with a `-`) are skipped by the default "latest", so pin `--version` for a beta. 
 `--cuda` for the CUDA build. It lands in `~/.higgs/bin/v<ver>/`, flips `~/.higgs/bin/current`,
 and prints the `install-service` command to run it as a login-bound service.
 
-After the first install the token is no longer needed: nodes update themselves
-(`higgs node self-update`, one-step `--rollback`) or are pushed to from a hub — see
-[RELEASING.md](RELEASING.md) Part D. `uninstall.sh` (fetched the same way) tears the service
-down cleanly, keeping `~/.higgs` unless `--purge`.
+Updates never touch GitHub (so no token): nodes update from a mirrored static origin
+(`higgs node self-update`, one-step `--rollback`) or are pushed to from a hub — the signed
+assets are mirrored there with `scripts/release/mirror-assets.sh`, see
+[RELEASING.md](RELEASING.md) Parts B3/D. `uninstall.sh` (fetched the same way as install.sh)
+tears the service down cleanly, keeping `~/.higgs` unless `--purge`.
 
 ### Build from source
 
