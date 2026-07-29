@@ -1,0 +1,40 @@
+# crates-io — publish higgs to crates.io. PARKED / DISABLED.
+#
+# higgs ships as signed GitHub binaries (release.yml); crates.io is NOT used. This is a
+# disabled scaffold, kept only so the mechanism is ready if that ever changes:
+#   * it runs ONLY on manual dispatch, AND
+#   * the publish job is guarded by the repo variable CRATES_IO_PUBLISH — unset by
+#     default, so the job is SKIPPED. Nothing publishes until someone sets it to 'true'.
+# It is also currently IMPOSSIBLE: crates.io forbids git dependencies and higgs has three
+# (the llama-cpp fork + huggingface-hub). See RELEASING.md "Appendix — crates.io (parked)"
+# for the unblock steps (publish higgs-macros first, complete metadata, add a LICENSE file).
+
+name: crates-io
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    # DISABLED: the repo variable CRATES_IO_PUBLISH is unset, so this evaluates false and
+    # the job is skipped. To enable later: resolve the git-dep blocker (above), set the
+    # repo variable CRATES_IO_PUBLISH=true, add the CRATES_IO_TOKEN secret, and replace the
+    # placeholder step with the real publish commands shown in it.
+    if: ${{ vars.CRATES_IO_PUBLISH == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Publish (parked)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: |
+          # BLOCKED until higgs's git deps are on crates.io (RELEASING.md Appendix).
+          # When unblocked, replace this placeholder with — workspace member first:
+          #   cargo publish -p higgs-macros
+          #   cargo publish
+          echo "::error::crates.io publish is parked and blocked by git dependencies (see RELEASING.md)."
+          exit 1

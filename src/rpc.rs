@@ -1,4 +1,4 @@
-//! Newline-delimited JSON-RPC 2.0 frames for supervisor↔worker stdio (MCP wire).
+//! Newline-delimited JSON-RPC 2.0 frames for supervisor↔worker stdio.
 //! One JSON object per line; requests carry ids, notifications do not.
 //!
 //! Public for the worker round-trip integration test; internal wire detail, not a stability surface.
@@ -70,6 +70,26 @@ pub enum RpcFrame {
     Notification(RpcNotification),
 }
 
+/// Build a JSON-RPC "method not found" (`-32601`) error that carries the `HG037`
+/// origin code in `data.code`, so the receiving supervisor/hub/HTTP boundary can
+/// classify it (→ 501) instead of treating it as a transport fault. Shared by the
+/// worker, node-control, and hub dispatchers — `endpoint` names which side rejected
+/// the call (`worker`/`node`/`hub`).
+pub fn method_not_found(endpoint: &str, method: &str) -> RpcError {
+    use miette::Diagnostic;
+    let e = HiggsError::RpcMethodNotFound {
+        endpoint: endpoint.to_owned(),
+        method: method.to_owned(),
+    };
+    RpcError {
+        code: -32601,
+        message: e.to_string(),
+        data: e
+            .code()
+            .map(|c| serde_json::json!({ "code": c.to_string() })),
+    }
+}
+
 /// Encode one frame as a single NDJSON line (no trailing newline included).
 pub fn encode(frame: &RpcFrame) -> String {
     match frame {
@@ -78,6 +98,73 @@ pub fn encode(frame: &RpcFrame) -> String {
         RpcFrame::Notification(n) => serde_json::to_string(n),
     }
     .expect("rpc frames are always serializable")
+}
+
+/// Read ONE `\n`-terminated NDJSON frame from `reader`, rejecting a frame whose bytes exceed
+/// `max_bytes` BEFORE its newline arrives. Matches [`tokio::io::Lines::next_line`] otherwise:
+/// the terminator (`\n`, and a preceding `\r`) is stripped; a final line without a trailing
+/// `\n` is returned at EOF; a clean EOF (no pending bytes) returns `Ok(None)`.
+///
+/// The cap is the point: [`decode`] must first materialise the whole line as a `String`, and a
+/// bare `Lines`/`read_until` grows that buffer UNBOUNDED until the newline — so a peer that
+/// streams gigabytes on one line OOMs the process before `decode` ever runs. This reader stops
+/// and returns an `InvalidData` error the moment the accumulated bytes would exceed `max_bytes`
+/// (never allocating materially past the cap + one `fill_buf` chunk), so the caller can drop the
+/// stream instead of the whole node. `max_bytes` is a parameter (not a hard-coded const) so the
+/// unit tests can drive the cap edge with a small input; production passes a policy constant.
+pub(crate) async fn read_bounded_frame<R>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> std::io::Result<Option<String>>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt;
+    let oversize = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("frame exceeds the {max_bytes}-byte limit"),
+        )
+    };
+    let mut buf: Vec<u8> = Vec::new();
+    let terminated; // true iff we stopped at a '\n' (vs EOF on a newline-less final line)
+    loop {
+        let chunk = reader.fill_buf().await?;
+        if chunk.is_empty() {
+            // EOF: a clean end (nothing buffered) is None; buffered bytes are the final,
+            // newline-less line.
+            if buf.is_empty() {
+                return Ok(None);
+            }
+            terminated = false;
+            break;
+        }
+        if let Some(pos) = chunk.iter().position(|&b| b == b'\n') {
+            if buf.len() + pos > max_bytes {
+                return Err(oversize());
+            }
+            buf.extend_from_slice(&chunk[..pos]);
+            reader.consume(pos + 1);
+            terminated = true;
+            break;
+        }
+        // No newline in this chunk — check the cap BEFORE growing `buf`, so it never holds
+        // materially more than `max_bytes`.
+        if buf.len() + chunk.len() > max_bytes {
+            return Err(oversize());
+        }
+        let n = chunk.len();
+        buf.extend_from_slice(chunk);
+        reader.consume(n);
+    }
+    // Strip the CR of a CRLF terminator, matching `Lines::next_line`. A bare trailing CR on a
+    // final UNTERMINATED line (EOF, no LF) is PRESERVED — exactly like `Lines`.
+    if terminated && buf.last() == Some(&b'\r') {
+        buf.pop();
+    }
+    String::from_utf8(buf)
+        .map(Some)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
 /// Decode one NDJSON line into a frame.
@@ -121,68 +208,5 @@ pub fn decode(line: &str) -> Result<RpcFrame, HiggsError> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn request_roundtrip() {
-        let f = RpcFrame::Request(RpcRequest {
-            jsonrpc: "2.0".into(),
-            id: 7,
-            method: "higgs/load".into(),
-            params: json!({"id": "google/gemma-4-12b"}),
-        });
-        let line = encode(&f);
-        assert!(!line.contains('\n'));
-        assert_eq!(decode(&line).unwrap(), f);
-    }
-
-    #[test]
-    fn notification_roundtrip() {
-        let f = RpcFrame::Notification(RpcNotification {
-            jsonrpc: "2.0".into(),
-            method: "higgs/chat/chunk".into(),
-            params: json!({"request_id": 3, "delta": "hel"}),
-        });
-        assert_eq!(decode(&encode(&f)).unwrap(), f);
-    }
-
-    #[test]
-    fn response_roundtrip_both_arms() {
-        let ok = RpcFrame::Response(RpcResponse {
-            jsonrpc: "2.0".into(),
-            id: 9,
-            result: Some(json!({"loaded": true})),
-            error: None,
-        });
-        assert_eq!(decode(&encode(&ok)).unwrap(), ok);
-
-        let err = RpcFrame::Response(RpcResponse {
-            jsonrpc: "2.0".into(),
-            id: 10,
-            result: None,
-            error: Some(RpcError {
-                code: -32601,
-                message: "unknown method".into(),
-                data: None,
-            }),
-        });
-        assert_eq!(decode(&encode(&err)).unwrap(), err);
-    }
-
-    #[test]
-    fn garbage_is_hg008() {
-        let err = decode("{not json").unwrap_err();
-        assert!(err.to_string().starts_with("[HG008]"));
-    }
-
-    #[test]
-    fn wrong_jsonrpc_version_decodes_softly() {
-        // A mismatched version is logged (soft check) but still decodes — a hard
-        // reject would wedge the RPC loop since both peers are the same binary.
-        let line = r#"{"jsonrpc":"1.0","id":1,"method":"higgs/ping","params":null}"#;
-        let frame = decode(line).expect("soft version check must not reject the frame");
-        assert!(matches!(frame, RpcFrame::Request(_)));
-    }
-}
+#[path = "rpc_tests.rs"]
+mod tests;

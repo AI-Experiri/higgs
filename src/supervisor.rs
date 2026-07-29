@@ -4,10 +4,10 @@
 //! worker on death (one attempt per death), and re-loads the last model
 //! after restart.
 //!
-//! ## Transport shape — mirroring `mcp/registry.rs add_local`
+//! ## Transport shape — child-process stdio
 //!
-//! The reference implementation uses `tokio::process::Command` with owned
-//! stdio halves.  Higgs mirrors this directly:
+//! The worker is spawned with `tokio::process::Command` over owned
+//! stdio halves:
 //!
 //! ```text
 //!  production factory                  test factory
@@ -26,10 +26,8 @@
 //! ```
 //!
 //! No transport trait.  No mutex between writer and reader.  The mpsc channel
-//! serialises concurrent callers onto the single writer task — same pattern as
-//! rmcp's `TokioChildProcess` / LSP client writers.
+//! serialises concurrent callers onto the single writer task.
 
-use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -38,14 +36,14 @@ use parking_lot::Mutex;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc};
 use tracing::{info, warn};
 
 use crate::diagnostic::HiggsError;
 use crate::log_bus::{LogBus, LogLine, LogSource};
 use crate::rpc::{self, RpcFrame, RpcNotification, RpcRequest};
 use crate::system::GpuDevice;
-use crate::worker::{M_LOAD, M_LOG_LEVEL, M_PROBE, M_SHUTDOWN, M_SYSINFO, N_CHAT_CHUNK};
+use crate::worker::{M_LOAD, M_LOG_LEVEL, M_SHUTDOWN, M_SYSINFO, N_CHAT_CHUNK};
 
 /// How long `stop()` waits for the worker to exit on its own (after stdin
 /// closes) before SIGKILL-ing it. Generous enough for the child to free a
@@ -81,17 +79,10 @@ const CONTROL_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// lift.
 pub(crate) const CHAT_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
-/// Per-path bound on a single M_PROBE round-trip in [`Supervisor::probe_paths`].
-/// A probe is a header-only `with_no_alloc` load — fast — but it runs FFI inside
-/// the transient worker, so a pathological/corrupt GGUF that wedges the loader
-/// must not hang the support sweep. On expiry the path's verdict is
-/// `(false, Some("probe timed out loading <path>"))` and the sweep moves on.
-const PROBE_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-
 /// Bound on the single M_SYSINFO round-trip in [`Supervisor::sysinfo`]. Device
 /// enumeration is a cheap FFI registry read with no model load, so it completes
 /// near-instantly; the bound exists only so a wedged transient worker can never
-/// hang the `GET /api/higgs/system` handler. On expiry the device list is empty.
+/// hang the `system` control-op (`SystemInfo`) query. On expiry the device list is empty.
 const SYSINFO_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 higgs_ts! {
@@ -145,28 +136,26 @@ pub(crate) struct WorkerHalves {
 /// The `&str` model argument is the model id to be loaded; the production impl
 /// stamps it into the worker's argv0 (`higgs(<model>)`) so the process is
 /// identifiable in `ps`. It is cosmetic only — the model still loads via M_LOAD.
-type HalvesFactory =
+pub(crate) type HalvesFactory =
     Box<dyn Fn(Arc<LogBus>, &str) -> Result<WorkerHalves, HiggsError> + Send + Sync>;
 
 /// Shared supervisor state.
 struct Inner {
-    /// Pending request id → oneshot reply channel.
-    /// Lock held for insert/remove only — never across `.await`.
-    pending: Mutex<HashMap<u64, oneshot::Sender<rpc::RpcResponse>>>,
-    /// Per-request chat-chunk sinks keyed by the M_CHAT request id.
-    ///
-    /// When the worker emits an `N_CHAT_CHUNK` notification it echoes the
-    /// `request_id` from the original M_CHAT params.  Each concurrent caller
-    /// registers its own `mpsc::unbounded_channel` here before sending the
-    /// M_CHAT request; `route_notification` delivers each delta to the
-    /// matching sink.  Sinks are removed on completion or error.
-    ///
-    /// Worker execution is still serialised (single-threaded stdin loop); the
-    /// map just ensures each caller gets ONLY its own deltas with no clobber.
-    /// Lock held for insert/remove/lookup only — never across `.await`.
-    chat_sinks: Mutex<HashMap<u64, mpsc::UnboundedSender<String>>>,
+    /// RPC reply-demux: request-id → response correlation, plus per-request
+    /// chat-chunk sinks keyed by the M_CHAT `request_id`. The shared
+    /// [`crate::actor::ReplyDemux`] (the same demux the per-node iroh transport
+    /// reuses in P3). Each concurrent caller registers its own sink before sending
+    /// M_CHAT, so the worker's echoed-`request_id` `N_CHAT_CHUNK` notifications
+    /// route to ONLY that caller — worker execution stays serialised, the demux
+    /// just prevents cross-caller clobber.
+    demux: crate::actor::ReplyDemux,
     /// Monotonically increasing request id counter.
     next_id: AtomicU64,
+    /// Worker-lifetime generation, bumped by every `do_spawn`. A `reader_task` captures
+    /// its generation at spawn; if a later `do_spawn` (a `start_for` after this worker's
+    /// `stop()`) bumps it, the now-stale reader exits on its next death WITHOUT touching
+    /// the live worker's state — closes the stop()→start_for() stale-reader clobber race.
+    generation: AtomicU64,
     /// Broadcast channel for lifecycle events (cap 64).
     events_tx: broadcast::Sender<HiggsEvent>,
     /// Single home for Developer-Log lines: bounded history ring (the `logs(n)`
@@ -177,6 +166,11 @@ struct Inner {
     bus: Arc<LogBus>,
     /// Params of the last successful `higgs/load`; replayed after restart.
     last_load: Mutex<Option<Value>>,
+    /// Bumped on every `record_last_load`/`clear_last_load`. A crash-restart's async
+    /// `replay_load` captures this; if it changed before the replay fires, an explicit
+    /// load/unload superseded the captured model, so the replay is skipped rather than
+    /// resurrecting a stale model over a newer one.
+    load_epoch: AtomicU64,
     /// Set on `stop()` — suppresses respawn after death.
     stopped: AtomicBool,
     /// True for the entire lifetime of a live worker — from the spawn that
@@ -215,6 +209,73 @@ struct Inner {
 /// Concurrent callers are each routed their own deltas via the keyed sink map;
 /// the worker serialises execution (single-threaded stdin loop) so throughput
 /// is single-sequence but correctness is guaranteed for any number of callers.
+///
+/// ## Actor-model assessment (P2, per CLAUDE.md)
+///
+/// The Supervisor was assessed against the actor requirement and **already realizes
+/// the actor model**; a literal `spawn_actor` mailbox rewrite is deliberately NOT
+/// warranted:
+/// - The **`reader_task`** is a single owning task that loops on the read half and
+///   serially dispatches inbound frames, handles worker death, and drives the entire
+///   restart FSM — i.e. it *is* the supervisor's inbound actor loop. The
+///   single-reader invariant (`Inner::running`) guarantees exactly one such task.
+/// - The **`writer_task`** drains an mpsc of outbound lines and owns stdin — a
+///   textbook outbound mailbox; no mutex sits on the I/O path.
+/// - The **worker process** is the executor and serialises all generation.
+/// - **`ReplyDemux`** is the blessed RPC-client correlation map (see `actor.rs`): its
+///   locks guard *single-op* map insert/remove only — there is no await-spanning
+///   multi-step mutation of those maps, so they cannot exhibit the check-then-act /
+///   TOCTOU race class that makes `Mutex` state unsafe and mandates an actor. Routing
+///   responses/`N_CHAT_CHUNK` chunks directly through the demux (rather than a control
+///   mailbox) is the intended streaming bypass — token deltas must NOT serialize
+///   behind control messages (the P5 sink-handoff intent). The one ordering hazard —
+///   a `send_request` racing `on_worker_death` — is closed by clearing `write_tx`
+///   BEFORE `fail_all_pending` there, so a request issued during worker death fast-fails
+///   instead of waiting out its RPC timeout (see `on_worker_death`).
+/// - The only cross-task multi-step mutation — `stop()` versus the reader's
+///   `attempt_restart` — is serialized by the documented `stopped` (Release/Acquire) +
+///   `running` ordering (the F1/F2 hardening) plus the `generation` tag, not a lock-based
+///   check-then-act, so a stop can never race a respawn into resurrecting an unloaded
+///   worker, and a reader left over from a stopped lifetime can never clobber the next
+///   worker's state (it sees a bumped `generation` and exits).
+/// - `start_for`/`do_spawn` versus `stop()` is NOT internally guarded (do_spawn resets
+///   `stopped=false`); instead it is a **caller-enforced** precondition — the local
+///   `Higgs` serializes both under its `lifecycle` mutex, and the node runtime awaits
+///   `start_for` before committing the Supervisor, so the two never run concurrently on
+///   one Supervisor (see the `do_spawn` body comment). A new caller MUST preserve this.
+///
+/// **Accepted residual (safe-degrading, not a corruption race):** after a *crash*-driven
+/// restart, `replay_load` re-sends `M_LOAD` from a spawned task, so there is a sub-ms
+/// window where the respawned worker is visible (`write_tx` installed) but the model is
+/// not yet resident. A chat that races into that window is rejected `HG003 ModelNotLoaded`
+/// (retryable) rather than served — a transient model-availability window inherent to
+/// crash recovery, with no state corruption/hang/orphan. Closing it would mean
+/// pre-enqueuing the replay into the writer channel before publishing it, restructuring the
+/// hardened replay FSM for marginal gain; left as a documented residual.
+///
+/// A stronger hazard — a stale crash-replay overwriting a NEWER explicit load (resident
+/// model ≠ recorded model) — is closed by the `load_epoch`: `replay_load` captures it and
+/// skips if an explicit load/unload bumped it first. The remaining residual is the tight
+/// sub-window where the newer load's `record_last_load` has not landed when the replay
+/// checks; there the two in-flight `M_LOAD`s race on writer FIFO order. Fully closing that
+/// needs a single serialized load path (a follow-on if it ever matters in practice).
+///
+/// **Teardown-timeout residual class (safe-degrading):** because `stop()` touches
+/// `write_tx` (parking_lot lock) and `proc` (tokio lock) separately rather than under one
+/// guard, a request that races a `stop()` interleaved with a crash-restart can briefly see
+/// a `write_tx` published for an already-reaped child, and resolve via its BOUNDED RPC
+/// timeout instead of fast-failing. No corruption or orphan results — the child is always
+/// reaped, the `generation` guard stops any stale reader from clobbering the next worker,
+/// and the request returns a proper error (just later). Eliminating these sub-windows
+/// entirely requires a single serialized lifecycle owner (the full mailbox-actor
+/// conversion), which the assessment above judges not worth its cost/risk here.
+///
+/// Converting to a literal mailbox would fold the read-half-owning `reader_task` and
+/// the streaming chunk path behind a control mailbox — fighting the bypass design,
+/// rippling sync→async across ~20 `Higgs` (local-path) call sites, and risking the
+/// most-hardened lifecycle FSM — for no race-elimination gain. The genuine lock-based
+/// race class lives in `HubFleet` and is dissolved by folding it into the Engine actor
+/// (P3), which is where that work belongs.
 pub(crate) struct Supervisor {
     inner: Arc<Inner>,
 }
@@ -228,36 +289,34 @@ impl Supervisor {
     /// [`HiggsLogLayer`], so worker stderr and request-event lines land in one
     /// place.
     pub(crate) fn spawn(bus: Arc<LogBus>) -> Self {
-        let (events_tx, _) = broadcast::channel(64);
-        let inner = Arc::new(Inner {
-            pending: Mutex::new(HashMap::new()),
-            chat_sinks: Mutex::new(HashMap::new()),
-            next_id: AtomicU64::new(1),
-            events_tx,
-            bus,
-            last_load: Mutex::new(None),
-            stopped: AtomicBool::new(false),
-            running: AtomicBool::new(false),
-            write_tx: Mutex::new(None),
-            proc: tokio::sync::Mutex::new(None),
-            factory: Box::new(production_factory),
-        });
-        Self { inner }
+        // `None` exe ⇒ the factory re-execs `current_exe()` at each (re)spawn —
+        // the production default, byte-identical to the pre-seam behavior.
+        Self::from_factory(bus, Box::new(production_factory))
     }
 
-    /// Create a supervisor with an injected factory — for tests only.
+    /// Create a supervisor whose worker role is hosted by `exe` (the DI seam):
+    /// each (re)spawn re-execs `exe --higgs-worker` instead of `current_exe()`.
     ///
-    /// The factory is called once per (re)spawn.  A test that wants to simulate
-    /// EOF-then-factory-failure returns `Err(WorkerSpawnFailed)` on the second call.
-    #[cfg(test)]
-    pub(crate) fn with_factory(factory: HalvesFactory) -> Self {
+    /// Used by an embedder whose current executable cannot host the worker role
+    /// (e.g. an integration-test binary — libtest ignores `--higgs-worker`) — it
+    /// points at the real, worker-capable `higgs` binary. `spawn` (the `None`
+    /// [`HiggsConfig::worker_exe`] default) stays exactly as before.
+    pub(crate) fn spawn_with_exe(bus: Arc<LogBus>, exe: std::path::PathBuf) -> Self {
+        Self::from_factory(bus, worker_factory(exe))
+    }
+
+    /// Shared constructor: build the supervisor around `bus` + an injected
+    /// `factory`. Single home for the `Inner` field initialization so `spawn`,
+    /// `spawn_with_exe`, and the test `with_factory` all agree.
+    fn from_factory(bus: Arc<LogBus>, factory: HalvesFactory) -> Self {
         let (events_tx, _) = broadcast::channel(64);
         let inner = Arc::new(Inner {
-            pending: Mutex::new(HashMap::new()),
-            chat_sinks: Mutex::new(HashMap::new()),
+            demux: crate::actor::ReplyDemux::new(),
             next_id: AtomicU64::new(1),
+            generation: AtomicU64::new(0),
+            load_epoch: AtomicU64::new(0),
             events_tx,
-            bus: Arc::new(LogBus::new()),
+            bus,
             last_load: Mutex::new(None),
             stopped: AtomicBool::new(false),
             running: AtomicBool::new(false),
@@ -268,13 +327,33 @@ impl Supervisor {
         Self { inner }
     }
 
+    /// Create a supervisor with an injected factory — for tests only.
+    ///
+    /// The factory is called once per (re)spawn.  A test that wants to simulate
+    /// EOF-then-factory-failure returns `Err(WorkerSpawnFailed)` on the second call.
+    #[cfg(test)]
+    pub(crate) fn with_factory(factory: HalvesFactory) -> Self {
+        Self::from_factory(Arc::new(LogBus::new()), factory)
+    }
+
+    // ── Per-supervisor log/event/verbose accessors ─────────────────────────────
+    //
+    // After the P4b engine swap the `Higgs` facade reads the Developer-Log bus and
+    // lifecycle events from the LOCAL `NodeRuntime` (which owns per-worker buses +
+    // its own event fan-out), not from a single Supervisor. These delegators are
+    // kept — each has its own unit test below and they remain the natural per-worker
+    // API the node will surface for per-worker log routing — so `#[allow(dead_code)]`
+    // silences the unused-in-non-test-build warning without dropping the coverage.
+
     /// Subscribe to worker lifecycle events.
+    #[allow(dead_code)]
     pub fn events(&self) -> broadcast::Receiver<HiggsEvent> {
         self.inner.events_tx.subscribe()
     }
 
     /// Return up to `n` recent Developer-Log lines (oldest first), optionally
     /// restricted to one [`LogSource`] (`None` = worker stderr + serve events).
+    #[allow(dead_code)]
     pub fn logs(&self, n: usize, filter: Option<LogSource>) -> Vec<String> {
         self.inner.bus.snapshot(n, filter)
     }
@@ -282,17 +361,20 @@ impl Supervisor {
     /// Subscribe to live Developer-Log lines pushed after this call. Pair with
     /// [`logs`](Self::logs) for replay-then-live SSE delivery; filter by
     /// [`LogLine::source`].
+    #[allow(dead_code)]
     pub fn subscribe_logs(&self) -> broadcast::Receiver<LogLine> {
         self.inner.bus.subscribe()
     }
 
     /// The "Verbose Logging" toggle (single home on the [`LogBus`]). Read by the
     /// serve layer and the worker stderr drain.
+    #[allow(dead_code)]
     pub fn log_verbose(&self) -> bool {
         self.inner.bus.verbose()
     }
 
     /// Set the "Verbose Logging" toggle.
+    #[allow(dead_code)]
     pub fn set_log_verbose(&self, v: bool) {
         self.inner.bus.set_verbose(v);
     }
@@ -304,6 +386,7 @@ impl Supervisor {
     /// reply (if any) arrives id-less-of-pending and is harmlessly dropped. No
     /// worker → `write_tx` is `None` → nothing sent (the next spawn seeds the
     /// level from `HIGGS_WORKER_VERBOSE`).
+    #[allow(dead_code)]
     pub fn set_worker_verbose(&self, v: bool) {
         let line = rpc::encode(&RpcFrame::Request(RpcRequest {
             jsonrpc: "2.0".into(),
@@ -318,11 +401,13 @@ impl Supervisor {
 
     /// Whether Developer Logs are in un-redacted DEBUG mode (show structured
     /// fields incl. prompt content). Off by default.
+    #[allow(dead_code)]
     pub fn log_show_fields(&self) -> bool {
         self.inner.bus.show_fields()
     }
 
     /// Toggle the un-redacted DEBUG log mode.
+    #[allow(dead_code)]
     pub fn set_log_show_fields(&self, v: bool) {
         self.inner.bus.set_show_fields(v);
     }
@@ -359,7 +444,7 @@ impl Supervisor {
             Err(_) => {
                 // Timed out: drop the orphaned pending entry so it doesn't leak,
                 // and surface a worker-unavailable error rather than hanging.
-                self.inner.pending.lock().remove(&id);
+                self.inner.demux.remove_pending(id);
                 warn!(method, "higgs: control RPC timed out");
                 Err(HiggsError::WorkerDead {
                     context: format!("{method} timed out after {CONTROL_RPC_TIMEOUT:?}"),
@@ -384,7 +469,7 @@ impl Supervisor {
         match tokio::time::timeout(CHAT_RPC_TIMEOUT, self.send_request(id, method, params)).await {
             Ok(result) => result,
             Err(_) => {
-                self.inner.pending.lock().remove(&id);
+                self.inner.demux.remove_pending(id);
                 warn!(method, "higgs: chat RPC timed out");
                 Err(HiggsError::ChatTimeout {
                     elapsed: CHAT_RPC_TIMEOUT,
@@ -399,10 +484,8 @@ impl Supervisor {
     /// and returns `rx`.  Infallible: concurrent callers each get their own
     /// channel and their own deltas routed independently.  The caller must
     /// call [`remove_chat_sink`](Self::remove_chat_sink) when done.
-    pub(crate) fn register_chat_sink(&self, request_id: u64) -> mpsc::UnboundedReceiver<String> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        self.inner.chat_sinks.lock().insert(request_id, tx);
-        rx
+    pub(crate) fn register_chat_sink(&self, request_id: u64) -> crate::delta_queue::DeltaReceiver {
+        self.inner.demux.register_sink(request_id)
     }
 
     /// Remove the chat-chunk sink for `request_id`.
@@ -410,7 +493,7 @@ impl Supervisor {
     /// Called on completion or error to release the map entry.  The dropped
     /// sender closes the receiver, signalling end-of-stream to the consumer.
     pub(crate) fn remove_chat_sink(&self, request_id: u64) {
-        self.inner.chat_sinks.lock().remove(&request_id);
+        self.inner.demux.remove_sink(request_id);
     }
 
     /// Drive one chat (M_CHAT) request end to end, owning the full RPC plumbing.
@@ -438,10 +521,11 @@ impl Supervisor {
         model: String,
         messages_json: String,
         max_tokens: usize,
-        temperature: f32,
+        sampling: crate::worker::engine::SamplingParams,
         tools_json: Option<String>,
+        chat_template_kwargs: Option<String>,
     ) -> (
-        mpsc::UnboundedReceiver<String>,
+        crate::delta_queue::DeltaReceiver,
         impl std::future::Future<Output = Result<Value, HiggsError>>,
     ) {
         // One id for both the RPC frame `id` (response correlation) and the
@@ -468,8 +552,13 @@ impl Supervisor {
                         "model": model,
                         "messages_json": messages_json,
                         "max_tokens": max_tokens,
-                        "temperature": temperature,
+                        // Full sampler set (engine umbrella) as a sub-object — the
+                        // worker rebuilds the ordered sampler chain from it.
+                        "sampling": sampling,
                         "tools": tools_json,
+                        // Per-request template knobs (JSON-object string, e.g.
+                        // {"enable_thinking":false}); null when absent.
+                        "chat_template_kwargs": chat_template_kwargs,
                     }),
                 )
                 .await;
@@ -482,91 +571,8 @@ impl Supervisor {
         (rx, fut)
     }
 
-    /// Probe each GGUF path for engine loadability (Gate 1) in a SEPARATE,
-    /// transient worker — fully isolated from the serving worker (`self.inner`).
-    ///
-    /// Spawns one fresh worker via the same factory (`production_factory(bus,
-    /// "probe")`), runs an M_PROBE round-trip per path on its raw stdio (no
-    /// persistent reader/writer tasks, no `pending`/`chat_sinks` involvement),
-    /// then reaps the child. The serving worker is never touched, so a probe can
-    /// never evict a resident model or interfere with in-flight generation; and a
-    /// probe-worker crash is contained here.
-    ///
-    /// Returns, per input path, `(path, (loadable, reason, engine_version))`:
-    /// - On success the worker's reply supplies all three; `engine_version` keys
-    ///   the support cache (the probing binary is the correct version source).
-    /// - On spawn failure / EOF / per-path timeout the verdict is
-    ///   `(false, Some("<context>"), "")` — never a panic or hang ([HG020]).
-    pub(crate) async fn probe_paths(
-        &self,
-        paths: Vec<String>,
-    ) -> Vec<(String, (bool, Option<String>, String))> {
-        // Fresh worker, independent of the serving lifetime. Stamp argv0 "probe".
-        let halves = match (self.inner.factory)(self.inner.bus.clone(), "probe") {
-            Ok(h) => h,
-            Err(e) => {
-                warn!(error = %e, "higgs: probe worker spawn failed");
-                // Every path inherits the spawn failure as a non-fatal verdict.
-                return paths
-                    .into_iter()
-                    .map(|p| {
-                        (
-                            p,
-                            (
-                                false,
-                                Some(format!("probe worker spawn failed: {e}")),
-                                String::new(),
-                            ),
-                        )
-                    })
-                    .collect();
-            }
-        };
-        let mut write = halves.write;
-        let mut lines = BufReader::new(halves.read).lines();
-        let mut id: u64 = 0;
-
-        let mut out = Vec::with_capacity(paths.len());
-        for path in paths {
-            id += 1;
-            let verdict = match tokio::time::timeout(
-                PROBE_RPC_TIMEOUT,
-                probe_one(&mut write, &mut lines, id, &path),
-            )
-            .await
-            {
-                Ok(v) => v,
-                Err(_) => {
-                    warn!(path = %path, "higgs: probe timed out");
-                    (
-                        false,
-                        Some(format!("probe timed out loading {path}")),
-                        String::new(),
-                    )
-                }
-            };
-            out.push((path, verdict));
-        }
-
-        // Reap the transient worker: close stdin (EOF → worker exits its loop),
-        // then wait/kill so it never lingers as a zombie. `drop(write)` closes
-        // the child's stdin; `proc` is the OS handle (None under the test factory).
-        drop(write);
-        if let Some(mut child) = halves.proc {
-            match tokio::time::timeout(WORKER_EXIT_TIMEOUT, child.wait()).await {
-                Ok(_) => {}
-                Err(_) => {
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
-                }
-            }
-        }
-        out
-    }
-
     /// Enumerate the host's compute devices in a SEPARATE, transient worker —
-    /// fully isolated from the serving worker (`self.inner`), exactly like
-    /// [`probe_paths`](Self::probe_paths).
+    /// fully isolated from the serving worker (`self.inner`).
     ///
     /// Spawns one fresh worker via the same factory (`production_factory(bus,
     /// "sysinfo")`), runs a single M_SYSINFO round-trip on its raw stdio (no
@@ -597,8 +603,8 @@ impl Supervisor {
                 }
             };
 
-        // Reap the transient worker (same shape as `probe_paths`): close stdin so
-        // the worker exits its loop, then wait/kill so it never lingers.
+        // Reap the transient worker: close stdin so the worker exits its loop,
+        // then wait/kill so it never lingers.
         drop(write);
         if let Some(mut child) = halves.proc {
             match tokio::time::timeout(WORKER_EXIT_TIMEOUT, child.wait()).await {
@@ -655,19 +661,41 @@ impl Supervisor {
     /// Record the params of a successful `higgs/load` for post-restart replay.
     pub(crate) fn record_last_load(&self, params: Value) {
         *self.inner.last_load.lock() = Some(params);
+        // Bump so a stale crash-replay capturing an OLDER load is skipped.
+        self.inner.load_epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// The model id of the last recorded load (`None` if nothing is loaded). Used by the
+    /// node runtime to report each resident worker's model in `M_NODE_INVENTORY`.
+    pub(crate) fn loaded_model_id(&self) -> Option<String> {
+        self.inner
+            .last_load
+            .lock()
+            .as_ref()
+            .and_then(|p| p.get("id").and_then(Value::as_str).map(str::to_string))
     }
 
     /// Forget the recorded `higgs/load` replay params — called after an explicit
     /// unload so a later unexpected worker restart does NOT reload the model the
     /// user just unloaded.
+    ///
+    /// Post-P4b the node's `unload`/`shutdown_all` reaps the whole Supervisor (its
+    /// `last_load` dies with it), so nothing calls this anymore; kept (with its test)
+    /// as the per-supervisor primitive a future explicit-unload-without-kill path
+    /// would use.
+    #[allow(dead_code)]
     pub(crate) fn clear_last_load(&self) {
         *self.inner.last_load.lock() = None;
+        // Bump so a stale crash-replay capturing the now-cleared load is skipped.
+        self.inner.load_epoch.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Emit a lifecycle event on the broadcast channel.
     ///
-    /// Used by the [`Higgs`](crate::api::Higgs) facade to publish
-    /// `ModelLoaded` / `ModelUnloaded` after the corresponding RPC succeeds.
+    /// Post-P4b the LOCAL node owns the facade's event fan-out, so the `Higgs`
+    /// facade no longer emits through a Supervisor; kept (with its tests) as the
+    /// per-supervisor emit primitive the restart FSM's siblings use.
+    #[allow(dead_code)]
     pub(crate) fn emit(&self, event: HiggsEvent) {
         let _ = self.inner.events_tx.send(event);
     }
@@ -681,7 +709,7 @@ impl Supervisor {
     /// Return the number of active chat sinks (for test introspection).
     #[cfg(test)]
     pub(crate) fn chat_sinks_count(&self) -> usize {
-        self.inner.chat_sinks.lock().len()
+        self.inner.demux.active_sink_count()
     }
 
     // ── private ──────────────────────────────────────────────────────────────
@@ -697,10 +725,7 @@ impl Supervisor {
         method: &str,
         params: Value,
     ) -> Result<Value, HiggsError> {
-        let (tx, rx) = oneshot::channel();
-        {
-            self.inner.pending.lock().insert(id, tx);
-        }
+        let rx = self.inner.demux.register_pending(id);
         let line = rpc::encode(&RpcFrame::Request(RpcRequest {
             jsonrpc: "2.0".into(),
             id,
@@ -717,7 +742,7 @@ impl Supervisor {
             }
         };
         if send_result.is_err() {
-            self.inner.pending.lock().remove(&id);
+            self.inner.demux.remove_pending(id);
             return Err(HiggsError::WorkerDead {
                 context: "no worker running".into(),
             });
@@ -766,6 +791,17 @@ impl Supervisor {
         // Reset the deliberate-stop flag so the new worker's reader_task
         // will auto-restart on unexpected death (stop→start cycle fix).
         self.inner.stopped.store(false, Ordering::Relaxed);
+        // Bump the worker-lifetime generation NOW — before installing the new `write_tx`
+        // below — so that the instant this new lifetime begins, any reader left over from a
+        // prior (stopped) lifetime is already marked stale. If we bumped only after
+        // installing `write_tx`, an old reader hitting EOF in that window would see its own
+        // generation still current and clobber the freshly installed channel. A bump
+        // followed by a factory failure is harmless (generation only ever moves forward).
+        let gen = self
+            .inner
+            .generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
         let halves = match (self.inner.factory)(self.inner.bus.clone(), model) {
             Ok(h) => h,
             Err(e) => {
@@ -774,10 +810,20 @@ impl Supervisor {
                 return Err(e);
             }
         };
-        // Stash the child handle so stop() can wait on / kill it. No concurrent
-        // holder exists at (re)spawn time — stop() is terminal and never races a
-        // spawn — so a non-blocking lock is sufficient and avoids blocking_lock
-        // inside the async runtime.
+        // Stash the child handle so stop() can wait on / kill it. No concurrent holder
+        // exists at (re)spawn time because `start_for`/`do_spawn` is never concurrent
+        // with `stop()` on the same Supervisor — this is a CALLER-ENFORCED precondition,
+        // required because do_spawn's reset of `stopped=false` (above) would otherwise
+        // defeat a stop()'s `stopped=true`:
+        //   * local `Higgs` (api.rs) holds the `lifecycle` mutex across BOTH load()
+        //     (which calls start_for) and unload()/stop() (which call sup.stop());
+        //   * the node runtime (P1) awaits `start_for` fully inside `do_load` BEFORE the
+        //     Supervisor is committed to the registry, and only a committed Supervisor is
+        //     ever reaped/stopped.
+        // Given that, a non-blocking `try_lock` is sufficient and avoids blocking_lock
+        // inside the async runtime. (The reader's `attempt_restart` DOES race stop() — a
+        // worker can die at any time — which is why it carries its own post-factory
+        // `stopped` Acquire guard; do_spawn needs none under the precondition above.)
         if let Ok(mut guard) = self.inner.proc.try_lock() {
             *guard = halves.proc;
         }
@@ -787,94 +833,19 @@ impl Supervisor {
         // Exits when the sender half is dropped (stop() or do_spawn replacing it).
         tokio::spawn(writer_task(halves.write, write_rx));
         // Reader task: owns the read half, dispatches lines, triggers restart on EOF/error.
+        // Tagged with the generation bumped ABOVE (before write_tx install), so a reader from
+        // a prior lifetime is already stale by the time this worker is published.
         let inner = Arc::clone(&self.inner);
-        tokio::spawn(reader_task(inner, halves.read));
+        tokio::spawn(reader_task(inner, halves.read, gen));
         Ok(())
     }
 }
 
-/// One synchronous M_PROBE round-trip on the transient probe worker's raw stdio.
-///
-/// Encodes the request with the SAME `rpc` codec the persistent path uses,
-/// writes it to the worker's stdin, then reads lines until the matching response
-/// (by `id`) arrives — skipping any stray notifications the worker might emit.
-/// Returns `(loadable, reason, engine_version)`; a write/EOF/decode failure
-/// yields a non-fatal `(false, Some("<context>"), "")` verdict so the sweep
-/// continues rather than hanging ([HG020] semantics).
-async fn probe_one(
-    write: &mut WriteHalf,
-    lines: &mut tokio::io::Lines<BufReader<ReadHalf>>,
-    id: u64,
-    path: &str,
-) -> (bool, Option<String>, String) {
-    let line = rpc::encode(&RpcFrame::Request(RpcRequest {
-        jsonrpc: "2.0".into(),
-        id,
-        method: M_PROBE.to_string(),
-        params: serde_json::json!({ "path": path }),
-    }));
-    if write.write_all(line.as_bytes()).await.is_err()
-        || write.write_all(b"\n").await.is_err()
-        || write.flush().await.is_err()
-    {
-        return (
-            false,
-            Some(format!("probe worker pipe broken loading {path}")),
-            String::new(),
-        );
-    }
-    loop {
-        match lines.next_line().await {
-            Ok(Some(l)) if l.trim().is_empty() => continue,
-            Ok(Some(l)) => match rpc::decode(&l) {
-                // The probe worker only ever replies with a Response to M_PROBE.
-                Ok(RpcFrame::Response(resp)) if resp.id == id => {
-                    if let Some(err) = resp.error {
-                        return (false, Some(err.message), String::new());
-                    }
-                    let result = resp.result.unwrap_or(Value::Null);
-                    let loadable = result
-                        .get("loadable")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false);
-                    let reason = result
-                        .get("reason")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned);
-                    let engine_version = result
-                        .get("engine_version")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned();
-                    return (loadable, reason, engine_version);
-                }
-                // Stray frame (notification or other id) — keep reading.
-                Ok(_) => continue,
-                Err(_) => continue,
-            },
-            Ok(None) => {
-                return (
-                    false,
-                    Some(format!("probe worker exited before replying for {path}")),
-                    String::new(),
-                );
-            }
-            Err(e) => {
-                return (
-                    false,
-                    Some(format!("probe worker read error loading {path}: {e}")),
-                    String::new(),
-                );
-            }
-        }
-    }
-}
-
 /// One synchronous M_SYSINFO round-trip on the transient sysinfo worker's raw
-/// stdio. Mirrors [`probe_one`]: encodes the request with the same codec, writes
-/// it, then reads lines until the matching response (id 1), skipping strays.
-/// Returns the worker's `gpus` list, or an empty `Vec` on any write/EOF/decode
-/// failure ([HG021] semantics — never hangs the sweep).
+/// stdio. Encodes the request with the `rpc` codec the persistent path uses,
+/// writes it, then reads lines until the matching response (id 1), skipping
+/// strays. Returns the worker's `gpus` list, or an empty `Vec` on any
+/// write/EOF/decode failure ([HG021] semantics — never hangs the sweep).
 async fn sysinfo_one(
     write: &mut WriteHalf,
     lines: &mut tokio::io::Lines<BufReader<ReadHalf>>,
@@ -954,60 +925,55 @@ async fn writer_task(mut write: WriteHalf, mut rx: mpsc::UnboundedReceiver<Strin
 /// 3. If not stopped: waits 1 s, re-checks `stopped` after the sleep, then
 ///    attempts one respawn; on factory failure → broadcasts terminal `WorkerDied`
 ///    and exits.
-async fn reader_task(inner: Arc<Inner>, read: ReadHalf) {
+async fn reader_task(inner: Arc<Inner>, read: ReadHalf, gen: u64) {
     let mut reader = BufReader::new(read).lines();
 
     // Every terminal exit `break`s so the single post-loop clear releases the
     // `running` lifetime flag exactly once. A successful restart `continue`s the
-    // loop on the new transport without clearing it (the lifetime persists).
+    // loop on the new transport without clearing it (the lifetime persists). A STALE
+    // reader (a newer lifetime began) `return`s early WITHOUT clearing `running` — that
+    // flag now belongs to the live worker.
     loop {
-        let line_result = reader.next_line().await;
-        match line_result {
-            Ok(Some(line)) => dispatch(&inner, &line),
-            Ok(None) => {
-                // EOF — worker exited.
-                let deliberate = inner.stopped.load(Ordering::Relaxed);
-                // Pass `deliberate` so on_worker_death suppresses the event on clean stop.
-                on_worker_death(&inner, None, deliberate);
-                if deliberate {
-                    break;
-                }
-                // 1 s backoff, then re-check stopped before respawning.
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                if inner.stopped.load(Ordering::Relaxed) {
-                    break;
-                }
-                match attempt_restart(&inner).await {
-                    Some(new_read) => {
-                        reader = BufReader::new(new_read).lines();
-                        // Continue outer loop on the new transport.
-                    }
-                    None => break,
-                }
+        let reason = match reader.next_line().await {
+            Ok(Some(line)) => {
+                dispatch(&inner, &line);
+                continue;
             }
-            Err(e) => {
-                // I/O error on the read half.
-                let deliberate = inner.stopped.load(Ordering::Relaxed);
-                on_worker_death(&inner, Some(e.to_string()), deliberate);
-                if deliberate {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                // Re-check stopped after backoff sleep (F1: stop() may have raced).
-                if inner.stopped.load(Ordering::Relaxed) {
-                    break;
-                }
-                match attempt_restart(&inner).await {
-                    Some(new_read) => {
-                        reader = BufReader::new(new_read).lines();
-                    }
-                    None => break,
-                }
+            Ok(None) => None,              // EOF — worker exited.
+            Err(e) => Some(e.to_string()), // I/O error on the read half.
+        };
+        // Stale-reader guard: if a later `do_spawn` (a `start_for` after this worker's
+        // `stop()`) bumped the generation, this reader belongs to a replaced lifetime. Exit
+        // WITHOUT touching write_tx/pending/sinks/running — they are the live worker's now.
+        if inner.generation.load(Ordering::Acquire) != gen {
+            return;
+        }
+        let deliberate = inner.stopped.load(Ordering::Relaxed);
+        // Pass `deliberate` so on_worker_death suppresses the event on clean stop.
+        on_worker_death(&inner, reason, deliberate);
+        if deliberate {
+            break;
+        }
+        // 1 s backoff, then re-check stopped (F1: stop() may have raced) AND the generation
+        // (a start_for may have begun a new lifetime during the sleep) before respawning.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        if inner.stopped.load(Ordering::Relaxed) {
+            break;
+        }
+        if inner.generation.load(Ordering::Acquire) != gen {
+            return;
+        }
+        match attempt_restart(&inner).await {
+            Some(new_read) => {
+                reader = BufReader::new(new_read).lines();
+                // Continue outer loop on the new transport.
             }
+            None => break,
         }
     }
-    // Lifetime over (clean stop or respawn give-up): release the flag so a
-    // future start() can spawn a fresh worker. Idempotent with stop()'s clear.
+    // Current-lifetime reader exiting (clean stop or respawn give-up): release the flag so a
+    // future start() can spawn a fresh worker. Idempotent with stop()'s clear. (A stale
+    // reader returned above and never reaches here, so it can't clear the live worker's flag.)
     inner.running.store(false, Ordering::Release);
 }
 
@@ -1034,9 +1000,14 @@ async fn attempt_restart(inner: &Arc<Inner>) -> Option<ReadHalf> {
         reap_child(halves.proc).await;
         return None;
     }
-    // Step 3 — reap the OLD (dead) child and stash the new one so stop() can
-    // later wait on / SIGKILL it.
-    install_child(inner, halves.proc).await;
+    // Step 3 — reap the OLD (dead) child and stash the new one so stop() can later wait on /
+    // SIGKILL it. This re-checks `stopped` UNDER the proc lock (atomic with stop()'s reap):
+    // if a stop() raced in after Step 2's check, install_child abandons + reaps the new child
+    // and returns false — give up WITHOUT installing the writer or replaying, so a worker is
+    // never resurrected after stop().
+    if !install_child(inner, halves.proc).await {
+        return None;
+    }
     // Step 4 — install the new write channel + writer task (drops the old sender).
     install_writer(inner, halves.write);
     // Step 5 — announce the restart, then replay the last load (async, bounded).
@@ -1059,16 +1030,32 @@ fn spawn_replacement(inner: &Arc<Inner>) -> Result<WorkerHalves, HiggsError> {
     (inner.factory)(inner.bus.clone(), &model)
 }
 
+/// Wait for `child` to exit, bounded by [`WORKER_EXIT_TIMEOUT`]; SIGKILL + reap on timeout.
+///
+/// Used wherever a child is reaped while a lock is held (restart path): a worker that EOF'd
+/// its stdout but has not exited must NOT be able to wedge that lock indefinitely (which
+/// would block `stop()`). Normally the EOF means the process already exited, so the wait
+/// returns at once; the timeout+kill is the safety bound. Mirrors `stop()`'s reap.
+async fn wait_or_kill(child: &mut tokio::process::Child) {
+    if tokio::time::timeout(WORKER_EXIT_TIMEOUT, child.wait())
+        .await
+        .is_err()
+    {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+    }
+}
+
 /// Reap the OLD child currently stored in `inner.proc` (if any).
 ///
 /// Its EOF is what triggered this restart, so it has already exited — but
-/// `tokio::process::Child` does NOT reap on drop, so dropping it without
-/// `wait()` leaves a zombie. `wait()` returns immediately since the process is
-/// already gone.
+/// `tokio::process::Child` does NOT reap on drop, so dropping it without `wait()` leaves a
+/// zombie. The wait is bounded ([`wait_or_kill`]) so a not-yet-exited old worker can't wedge
+/// the proc lock.
 async fn reap_old_child(inner: &Arc<Inner>) {
     let mut proc_guard = inner.proc.lock().await;
     if let Some(mut old) = proc_guard.take() {
-        let _ = old.wait().await;
+        wait_or_kill(&mut old).await;
     }
 }
 
@@ -1084,16 +1071,34 @@ async fn reap_child(proc: Option<tokio::process::Child>) {
     }
 }
 
-/// Reap the OLD child, then stash the NEW one in `inner.proc`.
+/// Reap the OLD child, then stash the NEW one in `inner.proc`. Returns `false` if a
+/// concurrent `stop()` was observed and the new worker was abandoned instead of installed.
 ///
-/// `do_spawn` does this for the initial spawn; the respawn path must too, or a
-/// worker restarted after a death would be unreapable by `stop()`.
-async fn install_child(inner: &Arc<Inner>, new_proc: Option<tokio::process::Child>) {
+/// `do_spawn` does this for the initial spawn; the respawn path must too, or a worker
+/// restarted after a death would be unreapable by `stop()`.
+///
+/// **stop()-race close:** `attempt_restart`'s pre-factory `stopped` check is a check-then-
+/// act that races `stop()` across the `install_child` await — `stop()` sets `stopped=true`
+/// FIRST and then takes THIS proc lock to reap, so re-checking `stopped` here UNDER the
+/// proc lock makes install atomic with that reap. If `stop()` won the lock first we observe
+/// `stopped` and abandon (reap the new child) rather than resurrect a worker after stop; if
+/// we install first, `stop()`'s later proc-lock acquisition reaps the new child we stored.
+async fn install_child(inner: &Arc<Inner>, new_proc: Option<tokio::process::Child>) -> bool {
     let mut proc_guard = inner.proc.lock().await;
+    if inner.stopped.load(Ordering::Acquire) {
+        // A stop() raced this restart and already ran (or is mid-reap holding nothing yet).
+        // Do NOT resurrect: drop the lock, then reap the just-spawned child.
+        drop(proc_guard);
+        reap_child(new_proc).await;
+        return false;
+    }
     if let Some(mut old) = proc_guard.take() {
-        let _ = old.wait().await;
+        // Bounded reap: a worker that EOF'd but hasn't exited can't wedge this lock (and
+        // thereby block stop(), which contends for the same lock).
+        wait_or_kill(&mut old).await;
     }
     *proc_guard = new_proc;
+    true
 }
 
 /// Install a fresh write channel + writer task for the respawned worker.
@@ -1109,24 +1114,17 @@ fn install_writer(inner: &Arc<Inner>, write: WriteHalf) {
 /// Decode one line and dispatch to the appropriate handler.
 fn dispatch(inner: &Arc<Inner>, line: &str) {
     match rpc::decode(line) {
-        Ok(RpcFrame::Response(resp)) => correlate(inner, resp),
+        Ok(RpcFrame::Response(resp)) => inner.demux.correlate(resp),
         Ok(RpcFrame::Notification(notif)) => route_notification(inner, &notif),
         Ok(RpcFrame::Request(_)) => { /* workers never send requests */ }
         Err(e) => warn!(error = %e, "higgs: dropped malformed worker line"),
     }
 }
 
-/// Route a response to the waiting oneshot by id.
-fn correlate(inner: &Arc<Inner>, resp: rpc::RpcResponse) {
-    if let Some(tx) = inner.pending.lock().remove(&resp.id) {
-        let _ = tx.send(resp);
-    }
-}
-
 /// Route a `higgs/chat/chunk` notification to the matching per-request sink.
 ///
 /// The notification params carry `request_id` (echoed from the M_CHAT request)
-/// and `delta`.  The sink map is looked up by `request_id`; if no entry exists
+/// and `delta`.  The demux is looked up by `request_id`; if no entry exists
 /// (sink already removed or unknown id) the chunk is silently dropped.
 fn route_notification(inner: &Arc<Inner>, notif: &RpcNotification) {
     if notif.method != N_CHAT_CHUNK {
@@ -1139,14 +1137,15 @@ fn route_notification(inner: &Arc<Inner>, notif: &RpcNotification) {
     else {
         return;
     };
-    let Some(delta) = notif.params.get("delta").and_then(|v| v.as_str()) else {
+    // Additive wire shape: `kind` + (for tool fragments) `tool` ride next to
+    // `delta` — decode is tolerant, absent kind ⇒ content (old-worker default).
+    let Some(delta) = crate::worker::engine::ChatDelta::decode_chunk_params(&notif.params) else {
+        // A chunk with a missing/malformed payload would otherwise vanish as a
+        // silently missing word in the answer — leave a coded trace instead.
+        tracing::warn!(params = %notif.params, "[HG051] undecodable chat chunk dropped");
         return;
     };
-    let delta = delta.to_string();
-    let sinks = inner.chat_sinks.lock();
-    if let Some(tx) = sinks.get(&request_id) {
-        let _ = tx.send(delta);
-    }
+    inner.demux.route_chunk(request_id, delta);
 }
 
 /// Handle worker death: fail all pending requests, clear write channel, and
@@ -1157,15 +1156,19 @@ fn route_notification(inner: &Arc<Inner>, notif: &RpcNotification) {
 /// shutdown is not a death event). This enforces four-pillar pillar 3: log once
 /// at origin, not at every boundary that observes the same event.
 fn on_worker_death(inner: &Arc<Inner>, reason: Option<String>, deliberate: bool) {
-    // Drain and drop all pending senders — the rx.await in `request` sees Err.
-    let drained: Vec<_> = inner.pending.lock().drain().collect();
-    for (_id, tx) in drained {
-        drop(tx);
-    }
-    // Drop the write sender — the writer task exits when channel closes.
+    // ORDER MATTERS — close the send→register race with a concurrent `send_request`:
+    // clear `write_tx` FIRST, THEN fail pending. A racing send either (a) locks `write_tx`
+    // after this clear → sees `None` → fast-fails and removes its own pending entry, or
+    // (b) locked `write_tx` before the clear (so it registered its pending entry even
+    // earlier, in code order) → that entry is caught by the `fail_all_pending` below. Either
+    // way a request issued during worker death fails fast instead of waiting out its RPC
+    // timeout. (If these ran in the opposite order, a send could register after
+    // fail_all_pending yet still send through a not-yet-cleared `write_tx` and then block.)
     *inner.write_tx.lock() = None;
+    // Fail all pending requests — the rx.await in `request` sees Err.
+    inner.demux.fail_all_pending();
     // Drop all chat sinks — closes each receiver, ending all in-flight streams.
-    inner.chat_sinks.lock().clear();
+    inner.demux.clear_sinks();
 
     if deliberate {
         // Clean stop: no event, no warn — the shutdown was requested.
@@ -1193,6 +1196,9 @@ fn replay_load(inner: &Arc<Inner>) {
     let Some(load_params) = inner.last_load.lock().clone() else {
         return;
     };
+    // Capture the load epoch alongside the params: if an explicit load/unload bumps it
+    // before this async replay fires, the captured model is stale and the replay is skipped.
+    let captured_epoch = inner.load_epoch.load(Ordering::Acquire);
 
     let inner2 = Arc::clone(inner);
     tokio::spawn(async move {
@@ -1205,6 +1211,15 @@ fn replay_load(inner: &Arc<Inner>) {
         // also cleared `last_load` first, the `let Some` above already returned —
         // this covers the path where `stopped` flips without that clear.)
         if inner2.stopped.load(Ordering::Acquire) {
+            return;
+        }
+        // Stale-replay close: if an explicit load/unload superseded the captured model
+        // (epoch changed), do NOT resurrect the old model over the newer intent. (A tight
+        // residual remains: an explicit load whose `record_last_load` has not landed yet
+        // won't be observed — the FIFO ordering of that in-flight M_LOAD then decides; this
+        // narrows the window from "any delayed replay" to that sub-window. Documented in the
+        // Supervisor assessment.)
+        if inner2.load_epoch.load(Ordering::Acquire) != captured_epoch {
             return;
         }
         let id = load_params
@@ -1234,8 +1249,7 @@ async fn replay_rpc_await(
     params: Value,
 ) -> Result<Value, HiggsError> {
     let id = inner.next_id.fetch_add(1, Ordering::Relaxed);
-    let (tx, rx) = oneshot::channel();
-    inner.pending.lock().insert(id, tx);
+    let rx = inner.demux.register_pending(id);
 
     let line = rpc::encode(&RpcFrame::Request(RpcRequest {
         jsonrpc: "2.0".into(),
@@ -1252,7 +1266,7 @@ async fn replay_rpc_await(
         }
     };
     if send_result.is_err() {
-        inner.pending.lock().remove(&id);
+        inner.demux.remove_pending(id);
         return Err(HiggsError::WorkerDead {
             context: format!("replay {method}: no worker running"),
         });
@@ -1285,7 +1299,7 @@ async fn replay_rpc_await(
             context: format!("replay {method}: worker died before response"),
         }),
         Err(_) => {
-            inner.pending.lock().remove(&id);
+            inner.demux.remove_pending(id);
             warn!(method, "higgs: replay RPC timed out");
             Err(HiggsError::WorkerDead {
                 context: format!("replay {method} timed out after {CONTROL_RPC_TIMEOUT:?}"),
@@ -1302,14 +1316,35 @@ async fn replay_load_await(inner: &Arc<Inner>, params: Value) -> Result<(), Higg
     replay_rpc_await(inner, M_LOAD, params).await.map(|_| ())
 }
 
-/// Production factory: re-exec current binary with `--higgs-worker`.
+/// Production factory: re-exec the CURRENT binary with `--higgs-worker`.
 ///
-/// Spawns via `tokio::process::Command` with `stdin` + `stdout` piped.
-/// Takes owned `ChildStdin` and `ChildStdout` halves — independently owned
-/// by construction, no mutex between reader and writer.
-/// Wires a blocking stderr drain task to fill the ring.
+/// The `None` [`HiggsConfig::worker_exe`](crate::api::HiggsConfig) default. Resolves
+/// `current_exe()` at each (re)spawn and delegates to [`spawn_worker_process`], so
+/// this stays byte-identical to the pre-seam behavior.
 fn production_factory(bus: Arc<LogBus>, model: &str) -> Result<WorkerHalves, HiggsError> {
     let exe = std::env::current_exe().map_err(|e| HiggsError::WorkerSpawnFailed { source: e })?;
+    spawn_worker_process(exe, bus, model)
+}
+
+/// Build a [`HalvesFactory`] that hosts the worker role in `exe` (the DI seam):
+/// each (re)spawn re-execs `exe --higgs-worker` via [`spawn_worker_process`],
+/// identical to [`production_factory`] except the executable is fixed rather than
+/// re-resolved from `current_exe()`. Used by [`Supervisor::spawn_with_exe`].
+fn worker_factory(exe: std::path::PathBuf) -> HalvesFactory {
+    Box::new(move |bus, model| spawn_worker_process(exe.clone(), bus, model))
+}
+
+/// Spawn one worker process from `exe`: `tokio::process::Command` with `stdin` +
+/// `stdout` piped, owned `ChildStdin`/`ChildStdout` halves (independently owned —
+/// no mutex between reader and writer), the argv0 `higgs(<model>)` stamp, the
+/// `HIGGS_WORKER_VERBOSE` seed, and a blocking stderr drain task that fills the
+/// ring. Shared by [`production_factory`] (`current_exe()`) and [`worker_factory`]
+/// (a fixed exe) so both spawn IDENTICALLY apart from which executable is launched.
+fn spawn_worker_process(
+    exe: std::path::PathBuf,
+    bus: Arc<LogBus>,
+    model: &str,
+) -> Result<WorkerHalves, HiggsError> {
     let mut cmd = Command::new(exe);
     // Stamp argv0 as `higgs(<model>)` so the worker is identifiable in `ps`.
     // Cosmetic only — the model still loads via the M_LOAD RPC. `tokio::process::
@@ -1363,657 +1398,5 @@ fn production_factory(bus: Arc<LogBus>, model: &str) -> Result<WorkerHalves, Hig
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::worker::M_CHAT;
-    use serde_json::json;
-
-    // ── Test seam ─────────────────────────────────────────────────────────────
-    //
-    // `tokio::io::duplex(N)` yields a bidirectional pair.  We need two
-    // independent pairs:
-    //   sup_write → test_read   (supervisor writes requests; test reads them)
-    //   test_write → sup_read   (test writes responses; supervisor reads them)
-    //
-    // The factory returns `WorkerHalves { write: sup_write, read: sup_read }`.
-    // The test controls `test_write` (inject responses) and `test_read` (observe requests).
-
-    /// Build a supervisor plus test control handles.
-    ///
-    /// Returns `(supervisor, test_write, test_read)`.
-    /// - `test_write`: write responses/notifications here (supervisor reads them).
-    /// - `test_read`:  read requests the supervisor sent to the "worker".
-    fn make_supervisor() -> (
-        Supervisor,
-        tokio::io::DuplexStream, // test writes → supervisor reads
-        tokio::io::DuplexStream, // supervisor writes → test reads
-    ) {
-        // Pair A: supervisor write half ←→ test_read
-        let (sup_write, test_read) = tokio::io::duplex(64 * 1024);
-        // Pair B: test_write ←→ supervisor read half
-        let (test_write, sup_read) = tokio::io::duplex(64 * 1024);
-
-        // Wrap both halves in Arc<Mutex<Option<…>>> so the factory closure
-        // (Fn, not FnOnce) can hand them out exactly once.
-        let sup_write_cell = Arc::new(Mutex::new(Some(sup_write)));
-        let sup_read_cell = Arc::new(Mutex::new(Some(sup_read)));
-
-        let sup = Supervisor::with_factory(Box::new(move |_ring, _model| {
-            let write =
-                sup_write_cell
-                    .lock()
-                    .take()
-                    .ok_or_else(|| HiggsError::WorkerSpawnFailed {
-                        source: std::io::Error::other("mock: no more write halves"),
-                    })?;
-            let read =
-                sup_read_cell
-                    .lock()
-                    .take()
-                    .ok_or_else(|| HiggsError::WorkerSpawnFailed {
-                        source: std::io::Error::other("mock: no more read halves"),
-                    })?;
-            Ok(WorkerHalves {
-                write: Box::new(write),
-                read: Box::new(read),
-                proc: None,
-            })
-        }));
-
-        sup.start_for("test-model").expect("mock start failed");
-
-        (sup, test_write, test_read)
-    }
-
-    fn ok_response(id: u64, result: Value) -> String {
-        rpc::encode(&RpcFrame::Response(rpc::RpcResponse {
-            jsonrpc: "2.0".into(),
-            id,
-            result: Some(result),
-            error: None,
-        }))
-    }
-
-    fn err_response(id: u64, code: i64, message: &str) -> String {
-        rpc::encode(&RpcFrame::Response(rpc::RpcResponse {
-            jsonrpc: "2.0".into(),
-            id,
-            result: None,
-            error: Some(rpc::RpcError {
-                code,
-                message: message.into(),
-                data: None,
-            }),
-        }))
-    }
-
-    fn chunk_notif(request_id: u64, delta: &str) -> String {
-        rpc::encode(&RpcFrame::Notification(rpc::RpcNotification {
-            jsonrpc: "2.0".into(),
-            method: N_CHAT_CHUNK.into(),
-            params: json!({"request_id": request_id, "delta": delta}),
-        }))
-    }
-
-    /// Write a line into `stream`, appending `\n`, and flush.
-    async fn write_line(stream: &mut tokio::io::DuplexStream, line: &str) {
-        use tokio::io::AsyncWriteExt;
-        stream
-            .write_all(format!("{line}\n").as_bytes())
-            .await
-            .expect("test write_line");
-        stream.flush().await.expect("test flush");
-    }
-
-    // ─── Test 1: out-of-order response correlation ───────────────────────────
-
-    #[tokio::test]
-    async fn request_response_correlation() {
-        let (sup, mut test_write, _test_read) = make_supervisor();
-
-        // Issue two requests concurrently. The supervisor assigns ids 1 and 2.
-        let fut1 = sup.request("higgs/ping", json!({"n": 1}));
-        let fut2 = sup.request("higgs/ping", json!({"n": 2}));
-
-        // Give both requests time to register their pending entries.
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-
-        // Respond to id 2 first, then id 1.
-        write_line(&mut test_write, &ok_response(2, json!({"n": 2}))).await;
-        write_line(&mut test_write, &ok_response(1, json!({"n": 1}))).await;
-
-        let (r1, r2) = tokio::join!(fut1, fut2);
-        assert_eq!(r1.unwrap(), json!({"n": 1}));
-        assert_eq!(r2.unwrap(), json!({"n": 2}));
-    }
-
-    // ─── Test 1-a: spawn-on-start_for then kill-on-stop lifecycle ────────────
-    //
-    // No worker is live until start_for; a request then correlates. After stop()
-    // the write_tx is cleared so a subsequent request fails WorkerDead — proving
-    // stop() tears the worker down (kill-on-unload at the supervisor layer).
-
-    #[tokio::test]
-    async fn start_for_then_stop_lifecycle() {
-        let (sup_write, _test_read) = tokio::io::duplex(64 * 1024);
-        let (mut test_write, sup_read) = tokio::io::duplex(64 * 1024);
-        let sup_write_cell = Arc::new(Mutex::new(Some(sup_write)));
-        let sup_read_cell = Arc::new(Mutex::new(Some(sup_read)));
-
-        let sup = Supervisor::with_factory(Box::new(move |_ring, _model| {
-            Ok(WorkerHalves {
-                write: Box::new(sup_write_cell.lock().take().expect("one spawn")),
-                read: Box::new(sup_read_cell.lock().take().expect("one spawn")),
-                proc: None,
-            })
-        }));
-
-        // Before start_for: no write_tx → request fails immediately.
-        assert!(
-            sup.request("higgs/ping", json!({})).await.is_err(),
-            "no worker before start_for"
-        );
-
-        // start_for spawns a worker; a request now correlates. The pre-spawn
-        // request already consumed id 1, so this one is id 2.
-        sup.start_for("org/model").expect("spawn");
-        let fut = sup.request("higgs/ping", json!({}));
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        write_line(&mut test_write, &ok_response(2, json!({"ok": true}))).await;
-        assert_eq!(fut.await.unwrap(), json!({"ok": true}));
-
-        // stop() kills the worker; a later request fails WorkerDead.
-        sup.stop().await;
-        let err = sup.request("higgs/ping", json!({})).await.unwrap_err();
-        assert!(err.to_string().contains("[HG007]"), "display: {err}");
-    }
-
-    // ─── Test 1-b: redundant start() is an idempotent no-op ──────────────────
-    //
-    // The mock factory hands out exactly one set of duplex halves, so a second
-    // real spawn would fail (`mock: no more write halves`). The `running` guard
-    // means a `start()` on a live worker is never a second spawn — it returns
-    // Ok without touching the factory, preserving the single reader and the
-    // original transport. Guards the supervisor.rs:225 "start while running"
-    // race that would otherwise let an old reader clear the new write_tx.
-
-    #[tokio::test]
-    async fn redundant_start_is_noop() {
-        let (sup, mut test_write, _test_read) = make_supervisor();
-
-        // Already started by make_supervisor; a second start must not spawn.
-        sup.start_for("test-model")
-            .expect("redundant start is a no-op, not a second spawn");
-
-        // The original worker transport is intact: a request still correlates.
-        let fut = sup.request("higgs/ping", json!({}));
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        write_line(&mut test_write, &ok_response(1, json!({"ok": true}))).await;
-        assert_eq!(fut.await.unwrap(), json!({"ok": true}));
-    }
-
-    // ─── Test 2: chat-chunk routing (keyed) ──────────────────────────────────
-
-    #[tokio::test]
-    async fn chat_chunks_routed() {
-        let (sup, mut test_write, _test_read) = make_supervisor();
-
-        // Register a keyed sink; request_id=42 matches the notification.
-        let mut rx = sup.register_chat_sink(42);
-
-        let deltas = ["hello", " world", "!"];
-        for d in &deltas {
-            write_line(&mut test_write, &chunk_notif(42, d)).await;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-
-        for expected in &deltas {
-            let got = rx.try_recv().expect("delta expected");
-            assert_eq!(got, *expected);
-        }
-
-        sup.remove_chat_sink(42);
-    }
-
-    // ─── Test 2-b: two keyed sinks route independently ───────────────────────
-    //
-    // Registers sinks for request_id 1 and 2; feeds N_CHAT_CHUNK notifications
-    // for each; asserts each receiver gets ONLY its own deltas in order.
-
-    #[tokio::test]
-    async fn two_keyed_sinks_route_independently() {
-        let (sup, mut test_write, _test_read) = make_supervisor();
-
-        let mut rx1 = sup.register_chat_sink(1);
-        let mut rx2 = sup.register_chat_sink(2);
-
-        // Feed deltas for request_id 2 first, then request_id 1.
-        write_line(&mut test_write, &chunk_notif(2, "alpha")).await;
-        write_line(&mut test_write, &chunk_notif(1, "beta")).await;
-        write_line(&mut test_write, &chunk_notif(2, "gamma")).await;
-        write_line(&mut test_write, &chunk_notif(1, "delta")).await;
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        // rx1 must only see deltas tagged request_id=1.
-        let r1_a = rx1.try_recv().expect("rx1 first chunk");
-        let r1_b = rx1.try_recv().expect("rx1 second chunk");
-        assert_eq!(r1_a, "beta");
-        assert_eq!(r1_b, "delta");
-        assert!(rx1.try_recv().is_err(), "rx1 must have no more chunks");
-
-        // rx2 must only see deltas tagged request_id=2.
-        let r2_a = rx2.try_recv().expect("rx2 first chunk");
-        let r2_b = rx2.try_recv().expect("rx2 second chunk");
-        assert_eq!(r2_a, "alpha");
-        assert_eq!(r2_b, "gamma");
-        assert!(rx2.try_recv().is_err(), "rx2 must have no more chunks");
-
-        sup.remove_chat_sink(1);
-        sup.remove_chat_sink(2);
-    }
-
-    // ─── Test 3: EOF fails pending + emits WorkerDied ────────────────────────
-
-    #[tokio::test]
-    async fn eof_fails_pending_and_emits_died() {
-        // Factory: first call succeeds (using duplex), second call fails (no more halves).
-        let (sup_write_1, test_read_1) = tokio::io::duplex(64 * 1024);
-        let (test_write_1, sup_read_1) = tokio::io::duplex(64 * 1024);
-
-        let sup_write_cell = Arc::new(Mutex::new(Some(sup_write_1)));
-        let sup_read_cell = Arc::new(Mutex::new(Some(sup_read_1)));
-
-        let sup = Supervisor::with_factory(Box::new(move |_ring, _model| {
-            let write =
-                sup_write_cell
-                    .lock()
-                    .take()
-                    .ok_or_else(|| HiggsError::WorkerSpawnFailed {
-                        source: std::io::Error::other("mock: no more halves"),
-                    })?;
-            let read =
-                sup_read_cell
-                    .lock()
-                    .take()
-                    .ok_or_else(|| HiggsError::WorkerSpawnFailed {
-                        source: std::io::Error::other("mock: no more halves"),
-                    })?;
-            Ok(WorkerHalves {
-                write: Box::new(write),
-                read: Box::new(read),
-                proc: None,
-            })
-        }));
-        sup.start_for("test-model").expect("start");
-
-        let mut events = sup.events();
-
-        // Register a pending request directly (bypass the network send so
-        // the pending entry exists before EOF arrives).
-        let (reply_tx, reply_rx) = oneshot::channel::<rpc::RpcResponse>();
-        let pending_id = sup.inner.next_id.fetch_add(1, Ordering::Relaxed);
-        sup.inner.pending.lock().insert(pending_id, reply_tx);
-
-        // Give the reader task time to start.
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-
-        // Trigger EOF by dropping the test write end.
-        drop(test_write_1);
-        drop(test_read_1);
-
-        // The pending oneshot should be dropped (channel closed → Err).
-        let result = tokio::time::timeout(std::time::Duration::from_millis(500), reply_rx).await;
-        assert!(
-            matches!(result, Ok(Err(_))),
-            "pending request should fail on EOF"
-        );
-
-        // First WorkerDied must arrive (worker EOF).
-        let first_died = tokio::time::timeout(std::time::Duration::from_millis(2000), async {
-            loop {
-                match events.recv().await {
-                    Ok(HiggsEvent::WorkerDied) => return true,
-                    Ok(_) => continue,
-                    Err(_) => return false,
-                }
-            }
-        })
-        .await;
-        assert!(
-            matches!(first_died, Ok(true)),
-            "first WorkerDied event expected (EOF)"
-        );
-
-        // After the 1s respawn backoff, the factory fails (no more halves) →
-        // a second terminal WorkerDied must be broadcast before the reader task exits.
-        let second_died = tokio::time::timeout(std::time::Duration::from_millis(2000), async {
-            loop {
-                match events.recv().await {
-                    Ok(HiggsEvent::WorkerDied) => return true,
-                    Ok(_) => continue,
-                    Err(_) => return false,
-                }
-            }
-        })
-        .await;
-        assert!(
-            matches!(second_died, Ok(true)),
-            "second WorkerDied event expected (factory failure)"
-        );
-    }
-
-    // ─── Test 3-b: chat RPC times out → HG016 ChatTimeout ────────────────────
-    //
-    // Uses a paused clock so the 600 s CHAT_RPC_TIMEOUT elapses instantly. The
-    // worker never responds; request_with_id must remove its pending entry and
-    // return ChatTimeout (→ 504), not hang.
-
-    #[tokio::test(start_paused = true)]
-    async fn chat_rpc_times_out() {
-        let (sup, _test_write, _test_read) = make_supervisor();
-        // Pre-allocate the id the way the chat path does.
-        let id = sup.alloc_request_id();
-        let fut = sup.request_with_id(id, M_CHAT, json!({"request_id": id}));
-        // Advance past the chat-RPC timeout with no response written.
-        tokio::time::advance(CHAT_RPC_TIMEOUT + std::time::Duration::from_secs(1)).await;
-        let err = fut.await.expect_err("must time out");
-        assert!(matches!(err, HiggsError::ChatTimeout { .. }), "got {err}");
-        assert!(err.to_string().starts_with("[HG016]"));
-        // The orphaned pending entry was removed (no leak).
-        assert!(sup.inner.pending.lock().is_empty());
-    }
-
-    // ─── Test 4: worker RPC error maps to HG009 ──────────────────────────────
-
-    #[tokio::test]
-    async fn worker_error_maps_to_hg009() {
-        let (sup, mut test_write, _test_read) = make_supervisor();
-
-        let fut = sup.request(M_LOAD, json!({"id": "org/bad"}));
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        write_line(
-            &mut test_write,
-            &err_response(1, -32000, "model file corrupt"),
-        )
-        .await;
-
-        let err = fut.await.expect_err("should be an error");
-        let display = err.to_string();
-        assert!(display.contains("[HG009]"), "display: {display}");
-    }
-
-    // ─── Test 5: stderr ring caps at 2000 ────────────────────────────────────
-
-    #[tokio::test]
-    async fn logs_ring_caps() {
-        // The supervisor's log history caps at the LogBus ring capacity (2000);
-        // the production path fills it via the stderr drain task. Drive the same
-        // bus the supervisor exposes and confirm the cap + oldest-first tail.
-        let (sup, _tw, _tr) = make_supervisor();
-        for i in 0..2100usize {
-            sup.inner.bus.push(LogSource::Worker, format!("line-{i}"));
-        }
-        let snap = sup.logs(usize::MAX, None);
-        assert_eq!(snap.len(), 2000);
-        // 2100 pushed, 100 dropped → oldest remaining is line-100.
-        assert_eq!(snap.first().unwrap(), "line-100");
-    }
-
-    // ─── Test 6: restart replays the load (scan is host-side) + emits ModelLoaded ─
-    //
-    // The mock factory hands out two transport pairs:
-    //   pair-1: first worker lifetime (killed by dropping test_write_1)
-    //   pair-2: second worker lifetime (receives replayed RPCs; the test drives
-    //           it by reading the replayed higgs/load and writing back an OK)
-    //
-    // Duplex wiring — each pair (A, B) means writing to A comes out of B:
-    //   sup_write_1  ↔ _obs_rx_1  : supervisor writes requests; test ignores them
-    //   test_write_1 ↔ sup_read_1 : drop triggers EOF on supervisor's read half
-    //   sup_write_2  ↔ obs_rx_2   : supervisor writes replayed msgs; test reads here
-    //   test_tx_2    ↔ sup_read_2 : test writes mock OK responses back to supervisor
-
-    #[tokio::test]
-    async fn restart_replays_load() {
-        let (sup_write_1, _obs_rx_1) = tokio::io::duplex(64 * 1024);
-        let (test_write_1, sup_read_1) = tokio::io::duplex(64 * 1024);
-
-        let (sup_write_2, mut obs_rx_2) = tokio::io::duplex(64 * 1024);
-        let (mut test_tx_2, sup_read_2) = tokio::io::duplex(64 * 1024);
-
-        let cell_sup_write_1 = Arc::new(Mutex::new(Some(sup_write_1)));
-        let cell_sup_read_1 = Arc::new(Mutex::new(Some(sup_read_1)));
-        let cell_sup_write_2 = Arc::new(Mutex::new(Some(sup_write_2)));
-        let cell_sup_read_2 = Arc::new(Mutex::new(Some(sup_read_2)));
-
-        let call_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let call_count2 = Arc::clone(&call_count);
-
-        let sup =
-            Supervisor::with_factory(Box::new(move |_ring, _model| {
-                let n = call_count2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if n == 0 {
-                    let write = cell_sup_write_1.lock().take().unwrap();
-                    let read = cell_sup_read_1.lock().take().unwrap();
-                    Ok(WorkerHalves {
-                        write: Box::new(write),
-                        read: Box::new(read),
-                        proc: None,
-                    })
-                } else {
-                    let write = cell_sup_write_2.lock().take().ok_or_else(|| {
-                        HiggsError::WorkerSpawnFailed {
-                            source: std::io::Error::other(
-                                "mock: second factory call after cells exhausted",
-                            ),
-                        }
-                    })?;
-                    let read = cell_sup_read_2.lock().take().ok_or_else(|| {
-                        HiggsError::WorkerSpawnFailed {
-                            source: std::io::Error::other(
-                                "mock: second factory call after cells exhausted",
-                            ),
-                        }
-                    })?;
-                    Ok(WorkerHalves {
-                        write: Box::new(write),
-                        read: Box::new(read),
-                        proc: None,
-                    })
-                }
-            }));
-        sup.start_for("test-model").expect("start");
-
-        let mut events = sup.events();
-
-        // Record load so replay has something to send. Scan is host-side now —
-        // no scan replay; only the load is re-driven after restart.
-        sup.record_last_load(json!({"id": "org/model"}));
-
-        // Wait for the reader task to settle, then trigger EOF on first transport.
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        drop(test_write_1);
-
-        // After 1s backoff + restart, the second transport receives the replayed
-        // higgs/load (awaited). obs_rx_2 is the duplex peer of sup_write_2 — data
-        // written by the supervisor's writer task comes out here. The test reads
-        // the load RPC then replies OK so ModelLoaded is emitted.
-        let deadline = std::time::Duration::from_millis(3000);
-
-        use tokio::io::AsyncBufReadExt;
-        let load_line = tokio::time::timeout(deadline, async {
-            let mut lines = BufReader::new(&mut obs_rx_2).lines();
-            lines
-                .next_line()
-                .await
-                .unwrap()
-                .expect("load line expected")
-        })
-        .await
-        .expect("timeout waiting for replayed load message");
-
-        let load: serde_json::Value = serde_json::from_str(&load_line).expect("valid json");
-        assert_eq!(load["method"], M_LOAD, "replayed method must be higgs/load");
-        assert_eq!(load["params"], json!({"id": "org/model"}));
-
-        // Reply to the replayed higgs/load so ModelLoaded is emitted.
-        let load_id = load["id"].as_u64().expect("load request must carry an id");
-        let ok_line = ok_response(load_id, json!({"id": "org/model"}));
-        write_line(&mut test_tx_2, &ok_line).await;
-
-        // ModelLoaded must arrive on the event channel.
-        let got_loaded = tokio::time::timeout(std::time::Duration::from_millis(500), async {
-            loop {
-                match events.recv().await {
-                    Ok(HiggsEvent::ModelLoaded { id }) => return Some(id),
-                    Ok(_) => continue,
-                    Err(_) => return None,
-                }
-            }
-        })
-        .await
-        .expect("timeout waiting for ModelLoaded");
-
-        assert_eq!(
-            got_loaded.as_deref(),
-            Some("org/model"),
-            "ModelLoaded must carry the replayed model id"
-        );
-    }
-
-    /// Residual-TOCTOU close (#1): when `stopped` flips between the restart's
-    /// install guard and the async replay, `replay_load` must abort — no M_LOAD
-    /// frame may reach the (respawned) worker, since the user deliberately
-    /// stopped/unloaded. Drives `replay_load` directly with `stopped` already
-    /// set and asserts nothing is written to the worker transport.
-    #[tokio::test]
-    async fn replay_aborts_when_stopped_flips() {
-        let (sup, _test_write, test_read) = make_supervisor();
-
-        // A load is recorded (as after a normal load) so replay HAS something to
-        // send — proving the abort is driven by `stopped`, not an empty replay.
-        sup.record_last_load(json!({"id": "org/model"}));
-        // Deliberate stop/unload flipped the flag in the TOCTOU window.
-        sup.inner.stopped.store(true, Ordering::Release);
-
-        // Fire the replay: the spawned task re-checks `stopped` before the M_LOAD.
-        replay_load(&sup.inner);
-
-        // Give the spawned task time to run (and to NOT send anything).
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        // No frame must have been written to the worker. Read with a short
-        // timeout: a clean abort means the read times out (nothing arrived).
-        use tokio::io::AsyncBufReadExt;
-        let mut lines = BufReader::new(test_read).lines();
-        let got =
-            tokio::time::timeout(std::time::Duration::from_millis(100), lines.next_line()).await;
-        assert!(
-            got.is_err(),
-            "replay must send NO M_LOAD when stopped flipped, but a frame arrived"
-        );
-    }
-
-    /// `logs(n)` returns the tail of the stderr ring, oldest first, and clamps
-    /// to the ring length when fewer than `n` lines are present.
-    #[tokio::test]
-    async fn logs_tail_and_clamp() {
-        let (sup, _tw, _tr) = make_supervisor();
-        sup.inner.bus.push(LogSource::Worker, "a".to_owned());
-        sup.inner.bus.push(LogSource::Worker, "b".to_owned());
-        sup.inner.bus.push(LogSource::Worker, "c".to_owned());
-        // Tail of 2 → last two, oldest first.
-        assert_eq!(sup.logs(2, None), vec!["b".to_owned(), "c".to_owned()]);
-        // n larger than the ring → all lines, no panic.
-        assert_eq!(
-            sup.logs(100, None),
-            vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]
-        );
-        // n == 0 → empty.
-        assert!(sup.logs(0, None).is_empty());
-    }
-
-    /// `record_last_load` persists replay params, and `alloc_request_id` hands
-    /// out strictly increasing ids.
-    #[tokio::test]
-    async fn record_params_and_alloc_ids() {
-        let (sup, _tw, _tr) = make_supervisor();
-        assert!(sup.last_load_params().is_none(), "no load recorded yet");
-
-        sup.record_last_load(json!({"id": "org/model"}));
-        assert_eq!(sup.last_load_params(), Some(json!({"id": "org/model"})));
-
-        let a = sup.alloc_request_id();
-        let b = sup.alloc_request_id();
-        assert!(b > a, "ids strictly increase: {a} then {b}");
-    }
-
-    /// `register_chat_sink` then `remove_chat_sink` adds and releases the keyed
-    /// map entry; the dropped sender closes the receiver (end-of-stream).
-    #[tokio::test]
-    async fn chat_sink_register_and_remove() {
-        let (sup, _tw, _tr) = make_supervisor();
-        assert_eq!(sup.chat_sinks_count(), 0);
-
-        let mut rx = sup.register_chat_sink(42);
-        assert_eq!(sup.chat_sinks_count(), 1);
-
-        sup.remove_chat_sink(42);
-        assert_eq!(sup.chat_sinks_count(), 0);
-        // The dropped sender closes the receiver → recv yields None.
-        assert!(rx.recv().await.is_none(), "removed sink closes the stream");
-    }
-
-    /// A `route_notification` with an unrelated method, a missing `request_id`,
-    /// or a missing `delta` is a silent no-op (no sink delivery, no panic).
-    #[tokio::test]
-    async fn route_notification_ignores_malformed() {
-        let (sup, _tw, _tr) = make_supervisor();
-        let mut rx = sup.register_chat_sink(7);
-
-        // Wrong method.
-        route_notification(
-            &sup.inner,
-            &rpc::RpcNotification {
-                jsonrpc: "2.0".into(),
-                method: "higgs/other".into(),
-                params: json!({"request_id": 7, "delta": "x"}),
-            },
-        );
-        // Right method but no request_id.
-        route_notification(
-            &sup.inner,
-            &rpc::RpcNotification {
-                jsonrpc: "2.0".into(),
-                method: N_CHAT_CHUNK.into(),
-                params: json!({"delta": "x"}),
-            },
-        );
-        // Right method, request_id present, but no delta.
-        route_notification(
-            &sup.inner,
-            &rpc::RpcNotification {
-                jsonrpc: "2.0".into(),
-                method: N_CHAT_CHUNK.into(),
-                params: json!({"request_id": 7}),
-            },
-        );
-
-        // None of the above delivered anything to the sink.
-        assert!(
-            rx.try_recv().is_err(),
-            "malformed notifications deliver nothing"
-        );
-
-        // A well-formed one delivers.
-        route_notification(
-            &sup.inner,
-            &rpc::RpcNotification {
-                jsonrpc: "2.0".into(),
-                method: N_CHAT_CHUNK.into(),
-                params: json!({"request_id": 7, "delta": "hi"}),
-            },
-        );
-        assert_eq!(rx.try_recv().unwrap(), "hi");
-    }
-}
+#[path = "supervisor_tests.rs"]
+mod tests;

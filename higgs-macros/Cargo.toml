@@ -1,0 +1,17 @@
+[package]
+name = "higgs-macros"
+version = "0.1.0"
+edition = "2021"
+description = "Proc macros for higgs — TsConstEnum: TypeScript const-object emitter for ts-rs enums"
+license = "MIT"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
+
+[lints]
+workspace = true

@@ -13,8 +13,9 @@ export type HiggsLimits = {
  */
 max_body_bytes: number, 
 /**
- * Whole-request timeout for the `/api/higgs/*` control surface, in
- * seconds (`serve::CONTROL_TIMEOUT`). The streaming `/v1` chat path is
+ * Whole-request timeout for the non-streaming control surface, in
+ * seconds (`serve::CONTROL_TIMEOUT`; formerly the `/api/higgs/*` HTTP
+ * routes). The streaming `/v1` chat path is
  * deliberately un-timed at the HTTP layer.
  */
 control_timeout_secs: number, 
@@ -38,7 +39,10 @@ max_concurrent_inference: number,
  */
 memory_headroom_fraction: number, 
 /**
- * Idle minutes after which the loaded model is auto-unloaded
- * ([`IDLE_UNLOAD_TTL`]).
+ * Effective idle seconds after which an idle worker is auto-unloaded — the
+ * live value the node reaper enforces (default
+ * [`DEFAULT_IDLE_TTL`](crate::node::runtime::DEFAULT_IDLE_TTL), 60 min;
+ * runtime-mutable via the `settings` control-op). Always equals the runtime
+ * settings' `idle_ttl_minutes × 60`.
  */
 idle_unload_ttl_secs: number, };

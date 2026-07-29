@@ -1,0 +1,533 @@
+use super::*;
+use crate::system::{DeviceKind, GpuDevice};
+use crate::worker::engine::{CtxLen, GpuLayers};
+
+/// A hardware snapshot with `vram` bytes of GPU VRAM, 64 GiB RAM, 16 cores.
+fn hw_gpu(vram: u64) -> HardwareInfo {
+    HardwareInfo {
+        cpu_name: "test".into(),
+        arch: "aarch64".into(),
+        cpu_cores: 16,
+        ram_total_bytes: 64u64 << 30,
+        ram_used_bytes: 8u64 << 30,
+        cpu_usage_percent: 5.0,
+        gpus: vec![GpuDevice {
+            name: "Metal".into(),
+            description: "test gpu".into(),
+            kind: DeviceKind::Gpu,
+            vram_total_bytes: vram,
+            vram_free_bytes: vram,
+        }],
+        vram_total_bytes: vram,
+    }
+}
+
+fn dense_meta_8gb() -> ModelMeta {
+    ModelMeta {
+        id: "org/m".into(),
+        size_bytes: 8u64 << 30,
+        block_count: Some(32),
+        head_count: Some(32),
+        head_count_kv: Some(8),
+        embedding_length: Some(4096),
+        expert_count: Some(0),
+        ..Default::default()
+    }
+}
+
+fn all_gpu_load() -> LlamaCppParams {
+    LlamaCppParams {
+        ctx_len: CtxLen::Fixed { n: 8192 },
+        gpu_layers: GpuLayers::All,
+        type_k: Some(KvCacheKind::F16),
+        type_v: Some(KvCacheKind::F16),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn resolve_estimate_ctx_caps_auto_at_default() {
+    let cap = crate::api::DEFAULT_CTX_CAP;
+    // Auto with a trained window ABOVE the cap → capped to DEFAULT_CTX_CAP (the live
+    // estimate must match the node-capped load, not the full 1M trained window).
+    assert_eq!(
+        resolve_estimate_ctx(CtxLen::Auto, Some(1_048_576)),
+        CtxLen::Fixed { n: cap }
+    );
+    // Auto with a trained window BELOW the cap → the trained window (never over-caps).
+    assert_eq!(
+        resolve_estimate_ctx(CtxLen::Auto, Some(4096)),
+        CtxLen::Fixed { n: 4096 }
+    );
+    // Auto with no known trained window → the worker fallback (4096), NOT the cap —
+    // the metadata-less load uses 4096, so the estimate must too (no 8× over).
+    assert_eq!(
+        resolve_estimate_ctx(CtxLen::Auto, None),
+        CtxLen::Fixed { n: 4096 }
+    );
+    // A Fixed request passes through untouched, regardless of ctx_train.
+    assert_eq!(
+        resolve_estimate_ctx(CtxLen::Fixed { n: 2048 }, Some(1_048_576)),
+        CtxLen::Fixed { n: 2048 }
+    );
+}
+
+#[test]
+fn bench_fit_estimates_pinned_auto_ctx_at_the_node_cap_not_full_ctx_train() {
+    // A long-context model: trained window (1M) is far above the node's auto cap.
+    let meta = ModelMeta {
+        id: "org/long".into(),
+        size_bytes: 2u64 << 30,
+        block_count: Some(32),
+        head_count: Some(32),
+        head_count_kv: Some(8),
+        embedding_length: Some(4096),
+        expert_count: Some(0),
+        ctx_train: Some(1_048_576),
+        ..Default::default()
+    };
+    // Pin the context to Auto (representable on the wire) with full GPU offload.
+    let auto = LlamaCppParams {
+        ctx_len: CtxLen::Auto,
+        gpu_layers: GpuLayers::All,
+        type_k: Some(KvCacheKind::F16),
+        type_v: Some(KvCacheKind::F16),
+        ..Default::default()
+    };
+    let hw = hw_gpu(48u64 << 30);
+    // A 12 GiB VRAM cap: it holds the 2 GiB weights + KV at the 32k node cap
+    // (~4 GiB), but NOT KV at the full 1M trained window (~137 GiB).
+    let budget = ResourceBudget {
+        max_vram_bytes: Some(12u64 << 30),
+        ..Default::default()
+    };
+
+    // The benchmark fit must NOT reject the candidate: it is estimated against the
+    // node-capped window it will actually load at, not the full ctx_train.
+    let fit = bench_fit(&auto, &meta, &hw, &budget);
+    assert_ne!(
+        fit.verdict,
+        FitVerdict::Overflow,
+        "pinned Auto ctx judged at the node cap, not full ctx_train: {fit:?}"
+    );
+    // And it matches an EXPLICIT Fixed request at the same node cap — the two
+    // resolve to the identical estimated window.
+    let capped = LlamaCppParams {
+        ctx_len: CtxLen::Fixed {
+            n: crate::api::DEFAULT_CTX_CAP,
+        },
+        ..auto.clone()
+    };
+    assert_eq!(
+        bench_fit(&auto, &meta, &hw, &budget).verdict,
+        bench_fit(&capped, &meta, &hw, &budget).verdict,
+        "Auto and Fixed(cap) are the same fit"
+    );
+}
+
+#[test]
+fn benchmarked_fit_reports_normalize_auto_ctx_like_bench_fit() {
+    // Same long-context setup as the bench_fit filter test: the RESPONSE recompute
+    // of the benchmarked's fit must ALSO cap an Auto ctx at the node window, so a
+    // ctx=Auto benchmarked that passed the filter and loaded isn't reported as Overflow.
+    let meta = ModelMeta {
+        id: "org/long".into(),
+        size_bytes: 2u64 << 30,
+        block_count: Some(32),
+        head_count: Some(32),
+        head_count_kv: Some(8),
+        embedding_length: Some(4096),
+        expert_count: Some(0),
+        ctx_train: Some(1_048_576),
+        ..Default::default()
+    };
+    let auto_benchmarked = LlamaCppParams {
+        ctx_len: CtxLen::Auto,
+        gpu_layers: GpuLayers::All,
+        type_k: Some(KvCacheKind::F16),
+        type_v: Some(KvCacheKind::F16),
+        ..Default::default()
+    };
+    let hw = hw_gpu(48u64 << 30);
+    let budget = ResourceBudget {
+        max_vram_bytes: Some(12u64 << 30),
+        ..Default::default()
+    };
+
+    let (vram, ram) = benchmarked_fit_reports(&auto_benchmarked, &meta, &hw, &budget);
+    assert_ne!(
+        vram.verdict,
+        FitVerdict::Overflow,
+        "benchmarked VRAM fit judged at the node cap, not full ctx_train: {vram:?}"
+    );
+    assert_ne!(
+        ram.verdict,
+        FitVerdict::Overflow,
+        "benchmarked RAM fit: {ram:?}"
+    );
+    // Identical to the explicit Fixed(cap) benchmarked — the two resolve to one window.
+    let capped = LlamaCppParams {
+        ctx_len: CtxLen::Fixed {
+            n: crate::api::DEFAULT_CTX_CAP,
+        },
+        ..auto_benchmarked.clone()
+    };
+    let (vram_c, _) = benchmarked_fit_reports(&capped, &meta, &hw, &budget);
+    assert_eq!(vram.verdict, vram_c.verdict, "Auto and Fixed(cap) same fit");
+}
+
+#[test]
+fn vram_estimate_uses_gqa_kv_and_tiers() {
+    let meta = dense_meta_8gb();
+    let load = all_gpu_load();
+    let hw = hw_gpu(24u64 << 30);
+    let v = StaticVramEstimator.estimate(&load, &meta, &hw, &ResourceBudget::default());
+    // weights (8 GiB) + GQA KV (~1 GiB) + overhead — between 8 and 24 GiB.
+    assert!(v.needed_bytes > (8u64 << 30), "needed {} ", v.needed_bytes);
+    assert!(v.needed_bytes < (24u64 << 30));
+    assert_eq!(v.verdict, FitVerdict::Fits);
+
+    // A 6 GiB VRAM cap overflows the same model.
+    let capped = ResourceBudget {
+        max_vram_bytes: Some(6u64 << 30),
+        ..Default::default()
+    };
+    assert_eq!(
+        StaticVramEstimator
+            .estimate(&load, &meta, &hw, &capped)
+            .verdict,
+        FitVerdict::Overflow
+    );
+}
+
+#[test]
+fn kv_estimate_is_gqa_correct_not_query_heads() {
+    // Same model, but if we (wrongly) used the query head count (32) the KV term
+    // would be 4× larger. Pin that head_count_kv (8) drives the estimate.
+    let hw = hw_gpu(24u64 << 30);
+    let load = all_gpu_load();
+    let gqa =
+        StaticVramEstimator.estimate(&load, &dense_meta_8gb(), &hw, &ResourceBudget::default());
+
+    let mut no_gqa = dense_meta_8gb();
+    no_gqa.head_count_kv = Some(32); // pretend MHA
+    let mha = StaticVramEstimator.estimate(&load, &no_gqa, &hw, &ResourceBudget::default());
+
+    // The MHA KV is ~4× the GQA KV, so the MHA need is meaningfully larger.
+    assert!(
+        mha.needed_bytes > gqa.needed_bytes + (2u64 << 30),
+        "GQA {} vs MHA {}",
+        gqa.needed_bytes,
+        mha.needed_bytes
+    );
+}
+
+#[test]
+fn gpu_layers_within_budget_backs_off() {
+    let meta = dense_meta_8gb();
+    let hw = hw_gpu(24u64 << 30);
+    let load = all_gpu_load();
+    // A 0 cap → CPU-only (0 layers).
+    let zero = ResourceBudget {
+        max_vram_bytes: Some(0),
+        ..Default::default()
+    };
+    assert_eq!(gpu_layers_within_budget(&load, &meta, &hw, &zero), 0);
+    // A huge cap → all layers.
+    let big = ResourceBudget {
+        max_vram_bytes: Some(100u64 << 30),
+        ..Default::default()
+    };
+    assert_eq!(gpu_layers_within_budget(&load, &meta, &hw, &big), u32::MAX);
+    // A small (4 GiB) cap can't hold the 8 GiB weights → a PARTIAL offload.
+    let small = ResourceBudget {
+        max_vram_bytes: Some(4u64 << 30),
+        ..Default::default()
+    };
+    let n = gpu_layers_within_budget(&load, &meta, &hw, &small);
+    assert!(n > 0 && n < 32, "partial offload within the cap: {n}");
+}
+
+#[test]
+fn cpu_only_host_vram_fits_not_overflow() {
+    // No GPU + gpu_layers 0 → nothing lives in VRAM (needed == 0), so the VRAM
+    // verdict must read Fits, NOT a misleading Overflow (basis is also 0).
+    let cpu_load = LlamaCppParams {
+        ctx_len: CtxLen::Fixed { n: 8192 },
+        gpu_layers: GpuLayers::Count { n: 0 },
+        ..Default::default()
+    };
+    let v = StaticVramEstimator.estimate(
+        &cpu_load,
+        &dense_meta_8gb(),
+        &hw_gpu(0),
+        &ResourceBudget::default(),
+    );
+    assert_eq!(v.needed_bytes, 0, "CPU-only load uses no VRAM");
+    assert_eq!(v.verdict, FitVerdict::Fits);
+}
+
+#[test]
+fn ram_estimate_charges_cpu_when_not_offloaded() {
+    let meta = dense_meta_8gb();
+    let hw = hw_gpu(24u64 << 30);
+    // All on GPU → CPU RAM need is just overhead-ish (well under 64 GiB).
+    let on_gpu =
+        StaticRamEstimator.estimate(&all_gpu_load(), &meta, &hw, &ResourceBudget::default());
+    assert_eq!(on_gpu.verdict, FitVerdict::Fits);
+    assert!(on_gpu.needed_bytes < (2u64 << 30));
+
+    // gpu_layers = 0 (CPU-only) → all 8 GiB of weights land in RAM.
+    let cpu_load = LlamaCppParams {
+        ctx_len: CtxLen::Fixed { n: 8192 },
+        gpu_layers: GpuLayers::Count { n: 0 },
+        ..Default::default()
+    };
+    let on_cpu = StaticRamEstimator.estimate(&cpu_load, &meta, &hw, &ResourceBudget::default());
+    assert!(
+        on_cpu.needed_bytes > (8u64 << 30),
+        "needed {}",
+        on_cpu.needed_bytes
+    );
+}
+
+#[test]
+fn kv_type_bytes_scale_with_quantization() {
+    // F32 (4B) > F16 (2B) > Q8_0 (1B) > Q5 (0.6875B) > Q4 (0.5625B). A larger
+    // per-element KV type yields a strictly larger KV-cache estimate for the same
+    // model — drives the verdict, so each variant must be priced distinctly.
+    let meta = dense_meta_8gb();
+    let bytes_for = |k: KvCacheKind| {
+        let load = LlamaCppParams {
+            ctx_len: CtxLen::Fixed { n: 8192 },
+            gpu_layers: GpuLayers::All,
+            type_k: Some(k),
+            type_v: Some(k),
+            ..Default::default()
+        };
+        kv_cache_bytes(&load, &meta)
+    };
+    let kf32 = bytes_for(KvCacheKind::F32);
+    let kf16 = bytes_for(KvCacheKind::F16);
+    let q8 = bytes_for(KvCacheKind::Q8_0);
+    let q5_1 = bytes_for(KvCacheKind::Q5_1);
+    let q5_0 = bytes_for(KvCacheKind::Q5_0);
+    let q4_1 = bytes_for(KvCacheKind::Q4_1);
+    let q4_0 = bytes_for(KvCacheKind::Q4_0);
+    assert!(kf32 > kf16, "F32 {kf32} > F16 {kf16}");
+    assert!(kf16 > q8, "F16 {kf16} > Q8_0 {q8}");
+    assert!(q8 > q5_1, "Q8_0 {q8} > Q5_1 {q5_1}");
+    assert_eq!(q5_1, q5_0, "Q5_1 and Q5_0 share 0.6875 B/elem");
+    assert!(q5_1 > q4_1, "Q5 {q5_1} > Q4_1 {q4_1}");
+    assert_eq!(q4_1, q4_0, "Q4_1 and Q4_0 share 0.5625 B/elem");
+    // F32 is exactly twice F16 (4.0 vs 2.0 B/elem) — pins the arithmetic.
+    assert_eq!(kf32, kf16 * 2, "F32 is 2× F16");
+}
+
+#[test]
+fn gpu_layers_within_budget_zero_when_no_gpu() {
+    // No GPU at all → never offload, regardless of how generous the cap is.
+    let meta = dense_meta_8gb();
+    let load = all_gpu_load();
+    let big = ResourceBudget {
+        max_vram_bytes: Some(100u64 << 30),
+        ..Default::default()
+    };
+    assert_eq!(gpu_layers_within_budget(&load, &meta, &hw_gpu(0), &big), 0);
+}
+
+#[test]
+fn gpu_layers_within_budget_all_when_nothing_resident() {
+    // A zero-byte model with KV offload disabled has nothing to place on the GPU
+    // (per_frac == 0) → u32::MAX ("all layers fit") without dividing by zero.
+    let empty_meta = ModelMeta {
+        id: "org/empty".into(),
+        size_bytes: 0,
+        block_count: Some(32),
+        head_count: Some(32),
+        head_count_kv: Some(8),
+        embedding_length: Some(4096),
+        expert_count: Some(0),
+        ..Default::default()
+    };
+    let no_kv_load = LlamaCppParams {
+        ctx_len: CtxLen::Fixed { n: 8192 },
+        gpu_layers: GpuLayers::All,
+        offload_kqv: Some(false), // KV stays off the GPU → kv term is 0
+        ..Default::default()
+    };
+    let cap = ResourceBudget {
+        max_vram_bytes: Some(8u64 << 30),
+        ..Default::default()
+    };
+    assert_eq!(
+        gpu_layers_within_budget(&no_kv_load, &empty_meta, &hw_gpu(24u64 << 30), &cap),
+        u32::MAX,
+        "nothing resident → all layers fit"
+    );
+}
+
+#[test]
+fn gpu_layers_within_budget_cpu_moe_pulls_experts_off() {
+    // cpu_moe on an MoE model pulls the EXPERT_FRACTION of weights off the GPU, so
+    // a cap that can't hold all-GPU weights CAN hold the slimmed (experts-on-CPU)
+    // load → it fits more layers (or all) than the same load without cpu_moe.
+    let moe = ModelMeta {
+        expert_count: Some(8),
+        ..dense_meta_8gb()
+    };
+    let hw = hw_gpu(24u64 << 30);
+    let cap = ResourceBudget {
+        max_vram_bytes: Some(6u64 << 30),
+        ..Default::default()
+    };
+    let plain = LlamaCppParams {
+        ctx_len: CtxLen::Fixed { n: 8192 },
+        gpu_layers: GpuLayers::All,
+        offload_kqv: Some(false),
+        ..Default::default()
+    };
+    let with_moe = LlamaCppParams {
+        cpu_moe: Some(true),
+        ..plain.clone()
+    };
+    let n_plain = gpu_layers_within_budget(&plain, &moe, &hw, &cap);
+    let n_moe = gpu_layers_within_budget(&with_moe, &moe, &hw, &cap);
+    assert!(
+        n_moe > n_plain,
+        "cpu_moe slims GPU weights → more layers fit ({n_moe} > {n_plain})"
+    );
+}
+
+#[test]
+fn offload_kqv_false_removes_kv_from_vram() {
+    // With offload_kqv disabled the KV cache stays in host RAM: the VRAM need drops
+    // (no KV term) while the RAM need rises (the full KV is charged to the CPU).
+    let meta = dense_meta_8gb();
+    let hw = hw_gpu(24u64 << 30);
+    let with_kv = all_gpu_load();
+    let without_kv = LlamaCppParams {
+        offload_kqv: Some(false),
+        ..all_gpu_load()
+    };
+
+    let v_with = StaticVramEstimator.estimate(&with_kv, &meta, &hw, &ResourceBudget::default());
+    let v_without =
+        StaticVramEstimator.estimate(&without_kv, &meta, &hw, &ResourceBudget::default());
+    assert!(
+        v_without.needed_bytes < v_with.needed_bytes,
+        "no-KV-on-GPU is smaller in VRAM ({} < {})",
+        v_without.needed_bytes,
+        v_with.needed_bytes
+    );
+
+    let r_with = StaticRamEstimator.estimate(&with_kv, &meta, &hw, &ResourceBudget::default());
+    let r_without =
+        StaticRamEstimator.estimate(&without_kv, &meta, &hw, &ResourceBudget::default());
+    assert!(
+        r_without.needed_bytes > r_with.needed_bytes,
+        "KV charged to CPU raises RAM need ({} > {})",
+        r_without.needed_bytes,
+        r_with.needed_bytes
+    );
+}
+
+#[test]
+fn cpu_moe_charges_experts_to_ram() {
+    // cpu_moe on a GPU MoE load pulls the expert fraction off the GPU and onto the
+    // CPU: VRAM weights shrink, RAM weights grow vs the same load without cpu_moe.
+    let moe = ModelMeta {
+        expert_count: Some(8),
+        ..dense_meta_8gb()
+    };
+    let hw = hw_gpu(24u64 << 30);
+    let plain = all_gpu_load();
+    let with_moe = LlamaCppParams {
+        cpu_moe: Some(true),
+        ..all_gpu_load()
+    };
+    let v_plain = StaticVramEstimator.estimate(&plain, &moe, &hw, &ResourceBudget::default());
+    let v_moe = StaticVramEstimator.estimate(&with_moe, &moe, &hw, &ResourceBudget::default());
+    assert!(
+        v_moe.needed_bytes < v_plain.needed_bytes,
+        "cpu_moe shrinks GPU weights ({} < {})",
+        v_moe.needed_bytes,
+        v_plain.needed_bytes
+    );
+    let r_plain = StaticRamEstimator.estimate(&plain, &moe, &hw, &ResourceBudget::default());
+    let r_moe = StaticRamEstimator.estimate(&with_moe, &moe, &hw, &ResourceBudget::default());
+    assert!(
+        r_moe.needed_bytes > r_plain.needed_bytes,
+        "cpu_moe charges experts to RAM ({} > {})",
+        r_moe.needed_bytes,
+        r_plain.needed_bytes
+    );
+}
+
+#[test]
+fn explicit_budget_is_the_ceiling_no_double_headroom() {
+    // An EXPLICIT budget is the user's hard ceiling — they already carved their
+    // margin (e.g. 75% of free) — so higgs must NOT re-apply the 0.8 detected-total
+    // headroom on top (no `0.75 × 0.8` double-discount). Same byte basis, two roles:
+    // a DETECTED total applies the 0.8/0.95 tiers; an EXPLICIT budget fills to 100%.
+    let meta = dense_meta_8gb();
+    let load = all_gpu_load();
+    // Raw need against an unconstrained budget (weights + KV + overhead).
+    let need = StaticVramEstimator
+        .estimate(
+            &load,
+            &meta,
+            &hw_gpu(64u64 << 30),
+            &ResourceBudget::default(),
+        )
+        .needed_bytes;
+    // A basis where need ≈ 98% of it: above the 0.95 Tight ceiling, below 100%.
+    let basis = need + need / 50;
+
+    // As a DETECTED total → need (98%) exceeds the 0.95 ceiling → Overflow.
+    let detected =
+        StaticVramEstimator.estimate(&load, &meta, &hw_gpu(basis), &ResourceBudget::default());
+    assert_eq!(
+        detected.verdict,
+        FitVerdict::Overflow,
+        "detected total applies the 0.8/0.95 headroom (need {need} of {basis})"
+    );
+
+    // The SAME bytes as an EXPLICIT budget → the budget is the ceiling (fit=1.0) →
+    // need (98%) ≤ 100% → Fits. Fails if the explicit budget re-applies 0.8.
+    let explicit = StaticVramEstimator.estimate(
+        &load,
+        &meta,
+        &hw_gpu(64u64 << 30),
+        &ResourceBudget {
+            max_vram_bytes: Some(basis),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        explicit.verdict,
+        FitVerdict::Fits,
+        "an explicit budget fills to its ceiling — no double headroom (need {need} of {basis})"
+    );
+}
+
+#[test]
+fn kv_cache_bytes_saturates_on_absurd_metadata() {
+    // A corrupt/hostile GGUF header with absurd dims must not overflow the u64
+    // product (a debug panic / release garbage) — the estimate saturates instead.
+    let meta = ModelMeta {
+        id: "org/evil".into(),
+        block_count: Some(u32::MAX),
+        head_count: Some(u32::MAX),
+        head_count_kv: Some(u32::MAX),
+        embedding_length: Some(u32::MAX),
+        ctx_train: Some(u64::MAX),
+        ..Default::default()
+    };
+    let load = LlamaCppParams {
+        ctx_len: CtxLen::Auto, // → ctx from ctx_train (u64::MAX)
+        ..Default::default()
+    };
+    // Must NOT panic; saturates to a huge (finite) estimate.
+    assert!(kv_cache_bytes(&load, &meta) > 0);
+}

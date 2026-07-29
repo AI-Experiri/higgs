@@ -11,3 +11,5 @@ astrodocs/.astro
 
 # NOTE: bindings/ (generated TS types) IS committed — it's the published type
 # surface embedders (jigglebot) consume. Do not ignore it.
+
+docs/

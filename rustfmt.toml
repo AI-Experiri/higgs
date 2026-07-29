@@ -1,0 +1,9 @@
+# Formatting policy for higgs, enforced by scripts/quality.sh (`cargo fmt --check`).
+#
+# These are rustfmt's stable defaults, pinned explicitly so the gate is stable
+# across toolchain versions: `edition` is fixed here (not inferred per-invocation)
+# and `max_width` is locked at 100. The codebase predates this gate and used a
+# hand-rolled wider style; it was normalized to these settings in one reformat
+# commit. Keep changes formatted (`cargo fmt --all`) so the gate stays green.
+edition = "2021"
+max_width = 100

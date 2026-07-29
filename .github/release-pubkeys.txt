@@ -1,0 +1,17 @@
+# Release signing public keys -- THE single source of truth.
+#
+# One `<key_id> <minisign public key base64>` pair per line (the base64 line
+# of minisign.pub); '#' lines and blank lines are ignored. BOTH consumers
+# read this exact file, so they can never drift:
+#   - src/update.rs embeds it at compile time (include_str!) and parses it
+#     into HIGGS_UPDATE_PUBKEYS -- the pins every shipped binary verifies
+#     against;
+#   - the release workflow reads it to refuse signing with any key not
+#     listed here.
+# Unit tests validate that every line parses and key_ids are unique.
+#
+# Empty today (no key minted yet): releases are blocked until the one-time
+# pinning step -- see src/update.rs HIGGS_UPDATE_PUBKEYS for the procedure.
+# Example (after minting):
+#   higgs-release-1 RWTAAAA...base64 of minisign.pub...
+higgs-release-1 RWQF20Rd+9jIND7YdCJsl3btwZKBAvF1EzRyHWiR8MH7C0JHhRSRdzSC

@@ -1,0 +1,117 @@
+# higgs CI — runs on every PR and on pushes to main.
+#
+# Mirrors the local gate (`scripts/quality.sh`): rustfmt + clippy (-D warnings) +
+# the test suite, on the two release platforms (macOS arm64, Linux x86_64 CPU).
+# CUDA is NOT exercised here (toolkit + GPU only matter for release artifacts);
+# coverage is left to the local `scripts/coverage.sh` gate (integration tests need
+# a GGUF that CI does not provide, so they skip — coverage would collapse here).
+#
+# Like release.yml, each build job overrides the macOS-dev `.cargo/config.toml`
+# `[env]` (hardcoded Xcode SDK + arm64 bindgen target) and dev-only lld linker,
+# which are correct on a dev Mac but wrong on CI runners.
+#
+# Security: no step interpolates untrusted event input (PR title/body/branch,
+# commit messages, etc.) into a `run:` script — only the trusted `matrix.os`
+# literal — so this workflow is not exposed to GitHub Actions script injection.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  test:
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-${{ matrix.target }}
+
+      - name: Install macOS build deps
+        if: matrix.os == 'macos-14'
+        run: brew install libomp
+
+      - name: Install Linux build deps
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake clang libclang-dev
+
+      # Override the dev-only bits of .cargo/config.toml per platform (see header).
+      - name: Configure build env
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Disable OpenMP: ggml builds fine without it, and otherwise references
+          # libomp symbols the final link doesn't resolve (the macOS test link fails
+          # with "library 'omp' not found"). The sys crate forwards CMAKE_* env vars to
+          # CMake, so this makes find_package(OpenMP) miss — matching the dev build,
+          # which has no libomp and links cleanly.
+          echo "CMAKE_DISABLE_FIND_PACKAGE_OpenMP=ON" >> "$GITHUB_ENV"
+          if [ "${{ matrix.os }}" = "macos-14" ]; then
+            sdk="$(xcrun --sdk macosx --show-sdk-path)"
+            {
+              echo "SDKROOT=$sdk"
+              echo "BINDGEN_EXTRA_CLANG_ARGS=--target=arm64-apple-darwin -isysroot $sdk"
+              echo "RUSTFLAGS="
+              echo "OpenMP_ROOT=$(brew --prefix libomp)"
+            } >> "$GITHUB_ENV"
+          else
+            {
+              echo "SDKROOT="
+              echo "BINDGEN_EXTRA_CLANG_ARGS="
+            } >> "$GITHUB_ENV"
+          fi
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+      # Mirror scripts/quality.sh's bindings gate. `cargo test` above already wrote
+      # the ts-rs bindings (incl. a transient `"a"|"b"` UNION for each higgs_const_enum!
+      # type); this pass overwrites those with the const-OBJECT form (the #[ignore]d
+      # macro_run_* writers, which must run LAST to win). Then the working tree must
+      # match the committed bindings — a non-empty diff means a Rust wire-type change
+      # merged without its regenerated TypeScript, which would ship stale types to
+      # jigglebot. ts-rs output is platform-independent, so this holds on both legs.
+      - name: Regenerate const-object enum bindings
+        run: cargo test --locked macro_run -- --ignored
+
+      - name: Verify ts-rs bindings in sync
+        run: git diff --exit-code -- bindings/

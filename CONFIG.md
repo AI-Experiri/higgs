@@ -3,107 +3,119 @@
 ## Table of Contents
 - [Process & Environment](#process--environment)
 - [HiggsConfig Fields](#higgsconfig-fields)
+- [Per-load overrides (LoadParams)](#per-load-overrides-loadparams)
 - [Effective Config (read-only surface)](#effective-config-read-only-surface)
 - [Model Directory Layouts](#model-directory-layouts)
 - [Build Note: LIBCLANG_PATH](#build-note-libclang_path)
 - [Serve-Layer Limits & Hardening](#serve-layer-limits--hardening)
-- [Non-Configurable Defaults](#non-configurable-defaults)
+- [Runtime toggles & Non-Configurable Defaults](#runtime-toggles--non-configurable-defaults)
 - [Links](#links)
 
 ---
 
 ## Process & Environment
 
-**Production: higgs runs embedded in-process inside the jigglebot server.**
-The `backend/server/src/higgs/` launcher constructs `Higgs::new(HiggsConfig::
-default())`, binds an **ephemeral** `127.0.0.1:0` listener (the OS picks the
-port), and serves `higgs::serve::router` on it. The resolved origin is stored
-in `config.higgs_base_url` BEFORE the provider registry / `/api/meta` read it,
-and seeded as a runtime-only provider — see
-[server config](../server/src/config/CONFIG.md) and
-[`backend/server/src/higgs/CONFIG.md`](../server/src/higgs/CONFIG.md). The
-embedded path reads no `HIGGS_*` env vars and binds no fixed port (so it never
-collides with a separately-running higgs/Ollama on 11434).
+higgs is **library-first**. There are two ways it runs:
 
-**Standalone / dev: the `higgs-server` binary** (`src/bin/higgs-server.rs`) runs
-higgs as its own process with a fixed bind/port. It is NOT the production path.
-It reads three environment variables; everything else comes from
-`HiggsConfig::default()` (there is no config file at this layer).
+**Embedded (production).** A host app (jigglebot) constructs `Higgs::new(HiggsConfig::default())`
+(an `Arc`), calls `higgs.start().await`, binds a **loopback** `TcpListener`, and serves the strict
+OpenAI `/v1` surface on it with `higgs::serve::serve_v1(higgs, listener, shutdown)`. The embedder
+drives ALL control — load, chat, status, tune, keys, fleet — through the in-process `Higgs` facade
+(no HTTP control surface). The embedder chooses the bind address and port itself; higgs reads no
+`HIGGS_BIND`/`HIGGS_PORT`.
 
-| Env var | Default | Effect | Where |
-|---------|---------|--------|-------|
-| `HIGGS_BIND` | `127.0.0.1` | Bind address. A non-loopback value (`0.0.0.0`, a LAN IP) exposes the **no-auth** surface LAN-wide and logs a prominent `tracing::warn!` SECURITY WARNING at startup. | `higgs-server` only |
-| `HIGGS_PORT` | `11434` | Listen port. | `higgs-server` only |
-| `RUST_LOG` | `info` | tracing filter. | both |
+**Node daemon.** The `higgs` **binary** (`src/bin/higgs.rs`) is **node-only** — it serves no HTTP.
+It runs the `--higgs-worker` re-exec role and the fleet subcommands (`--node`, `node`, `link`,
+`keys`). A node worker scans models and relays its output to a hub over iroh.
+
+Environment variables actually read by the binary/worker (grep-verified):
+
+| Env var | Default | Effect | Read in |
+|---------|---------|--------|---------|
+| `HIGGS_HOME` | `~/.higgs` | Home dir for all identity/state files (`endpoint.key`, `pairings.json`, `api_keys.json`, `config.json`, `models/`, per-node `models.json`). | `home.rs` |
+| `HIGGS_MODEL_DIR` | — | Extra model scan root in LM-Studio layout (`<dir>/{org}/{model}/*.gguf`), honored by `--node`. | `node/cli.rs` |
+| `HIGGS_ENGINE` | first registry entry (`llamacpp`) | Selects the worker engine implementation. | `worker/mod.rs` |
+| `HIGGS_HF_ENDPOINT` | HuggingFace | HuggingFace mirror / enterprise proxy / test server base URL (primary + fallback fetch). | `hub.rs`, `download.rs` |
+| `HIGGS_VERBOSE` | `0` | `1`/`true` keeps the full llama.cpp per-load dump on a node worker. | `node/cli.rs` |
+| `HIGGS_WORKER_VERBOSE` | `0` | `1` raises the worker's own llama.cpp log verbosity. | `worker/engine/llamacpp/logging.rs` |
+| `HIGGS_IROH_LOCAL` | unset | Set ⇒ iroh uses a local/dev discovery+relay path (test/LAN); unset ⇒ the normal n0 discovery. | `node/hub.rs`, `node/identity.rs` |
+| `RUST_LOG` | `info` | tracing filter for the terminal `fmt` layer. | `bin/higgs.rs` |
 
 ```sh
-higgs-server                                      # 127.0.0.1:11434 (standalone)
-HIGGS_BIND=0.0.0.0 HIGGS_PORT=1234 higgs-server   # LAN-reachable on :1234
+# Node daemon (serves no HTTP itself):
+HIGGS_MODEL_DIR=/models higgs --node <ticket> <token>
 ```
 
-A host that embeds the crate directly (as jigglebot does) constructs its own
-`HiggsConfig` and passes it to `Higgs::new`; the fields below are that struct's
-defaults.
+There is **no config file at the process layer** — an embedding host constructs its own
+`HiggsConfig` (fields below) and passes it to `Higgs::new`. `~/.higgs/config.json` holds only
+per-instance identity/fleet state (friendly name, saved hubs, per-model load records, extra CORS
+origins — see `config.rs`), not the `HiggsConfig` defaults.
 
 ---
 
 ## HiggsConfig Fields
 
-Defaults from `HiggsConfig::default()` — what the `higgs-server` binary uses.
-An embedding host may override any field when it constructs `HiggsConfig`.
+Defaults from `HiggsConfig::default()` (`src/api/types.rs`). An embedding host may override any
+field when it constructs `HiggsConfig`.
 
 | Field | Type | Default | Notes |
 |-------|------|---------|-------|
-| `lmstudio_dirs` | `Vec<PathBuf>` | `[~/.lmstudio/models, ~/.cache/lm-studio/models]` | Both LM Studio < 0.3 and >= 0.3 paths are included by default; the host can narrow the list |
-| `hf_dirs` | `Vec<PathBuf>` | `[~/.cache/huggingface/hub]` | HuggingFace hardcodes `~/.cache` on ALL platforms — it does not follow XDG or macOS conventions. higgs resolves this as `dirs::home_dir().join(".cache/huggingface/hub")`, NOT `dirs::cache_dir()` |
+| `lmstudio_dirs` | `Vec<PathBuf>` | `[~/.lmstudio/models, ~/.cache/lm-studio/models]` | Both LM Studio < 0.3 and ≥ 0.3 paths; the host can narrow the list |
+| `hf_dirs` | `Vec<PathBuf>` | `[~/.cache/huggingface/hub]` | HuggingFace hardcodes `~/.cache` on ALL platforms — resolved as `dirs::home_dir().join(".cache/huggingface/hub")`, NOT `dirs::cache_dir()` |
 | `ollama_dirs` | `Vec<PathBuf>` | `[~/.ollama/models]` | |
-| `default_load.ctx_len` | `u32` | `4096` | Context window tokens for new loads when the caller does not supply params |
-| `default_load.gpu_layers` | `u32` | `u32::MAX` | `u32::MAX` means all layers offloaded (LM Studio "max" semantics) |
-| `default_load.threads` | `u32` | `available_cpus - 2` (min 1) | Worker threads during generation; computed from `std::thread::available_parallelism()` |
+| `default_load` | `LoadParams` | `LoadParams::base(CtxLen::Fixed { n: 4096 }, GpuLayers::All, threads)` | The engine-tagged load-params umbrella applied when a load request omits params (see below) |
+| `worker_exe` | `Option<PathBuf>` | `None` | The executable that hosts the `--higgs-worker` role. `None` ⇒ `std::env::current_exe()` (correct for the `higgs` binary and for an embedder whose own binary answers `--higgs-worker`). `#[serde(skip)]` + `#[ts(skip)]` — a runtime/embedder concern, off the wire |
 
-### Optional per-load overrides (`LoadParams`)
+`default_load` base fields (always present; the quick-load / `default_load` / suggester path fills
+them):
 
-Beyond the three base fields above, a load request may pin any of the following
-engine knobs. Each is `Option`: **absent = engine default = pre-expansion
-behavior**. Each maps to a single `llama-cpp-2` 0.1.139 call (applied only in
-`worker/engine/llamacpp.rs`).
+| Base field | Type | Default | Notes |
+|-------|------|---------|-------|
+| `ctx_len` | `CtxLen` | `Fixed { n: 4096 }` | Context window; `CtxLen` models the intent (`Fixed`/auto) rather than a magic-int sentinel |
+| `gpu_layers` | `GpuLayers` | `All` | `GpuLayers::All` offloads every layer (the old `u32::MAX` sentinel, now typed); `GpuLayers::Count { n }` pins an explicit count |
+| `threads` | `u32` | `available_cpus - 2` (min 1) | Worker generation threads, from `std::thread::available_parallelism()` |
 
-| Field | Type | Maps to | Default when absent |
-|-------|------|---------|---------------------|
-| `use_mmap` | `Option<bool>` | `LlamaModelParams::with_use_mmap` | engine default |
-| `use_mlock` | `Option<bool>` | `LlamaModelParams::with_use_mlock` | engine default |
-| `n_batch` | `Option<u32>` | `LlamaContextParams::with_n_batch` | `ctx_len.max(1)` |
-| `n_ubatch` | `Option<u32>` | `LlamaContextParams::with_n_ubatch` | engine default |
-| `offload_kqv` | `Option<bool>` | `LlamaContextParams::with_offload_kqv` | engine default |
-| `rope_freq_base` | `Option<f32>` | `LlamaContextParams::with_rope_freq_base` | GGUF trained value |
-| `rope_freq_scale` | `Option<f32>` | `LlamaContextParams::with_rope_freq_scale` | GGUF trained value |
-| `flash_attn` | `Option<FlashAttn>` (`auto`/`off`/`on`) | `with_flash_attention_policy` (-1/0/1) | engine default |
-| `type_k` | `Option<KvCacheKind>` (F32/F16/Q8_0/Q5_1/Q5_0/Q4_1/Q4_0) | `LlamaContextParams::with_type_k` | F16 |
-| `type_v` | `Option<KvCacheKind>` (same set) | `LlamaContextParams::with_type_v` | F16 |
-| `seed` | `Option<u32>` | `LlamaSampler::dist(seed)` | fresh random seed per request |
+---
 
-**Omitted / deferred** (invent nothing):
+## Per-load overrides (LoadParams)
 
-- **Unified KV cache** (`kv_unified`) — OMITTED: no safe setter in `llama-cpp-2`
-  0.1.139.
-- **Max concurrent sequences** (`n_seq_max > 1`) — DEFERRED: needs a decode-loop
-  rework; sequence handling is unchanged this pass.
+`LoadParams` is an **engine-tagged umbrella**; for the llama.cpp engine the payload is
+`LlamaCppParams` (`src/worker/engine/llamacpp/params.rs`, mapping to `llama-cpp-2`
+`0.1.151` — the bundled binding, `LLAMA_CPP_2_VERSION`). Beyond the three base fields, a load
+request may pin a broad set of **`Option`** knobs: **absent = engine default = pre-expansion
+behavior**. Each is applied only in `worker/engine/llamacpp.rs`.
+
+The knobs group as follows (the authoritative per-field reference — types, ranges, and the ⓘ
+tooltip text — is the `#[help]`-annotated `LlamaCppParams` struct and the generated `PARAM_HELP`):
+
+- **Model / placement:** `use_mmap`, `use_mlock`, `cpu_moe`, `split_mode`, `main_gpu`, `devices`.
+- **Context / batch:** `n_batch` (default `ctx_len.max(1)`), `n_ubatch`, `n_seq_max`,
+  `n_threads_batch`, `offload_kqv`, `swa_full`, `flash_attn` (`auto`/`off`/`on`).
+- **KV cache:** `type_k`, `type_v` (`KvCacheKind`: F32/F16/Q8_0/Q5_1/Q5_0/Q4_1/Q4_0; default F16).
+- **RoPE:** `rope_scaling_type`, `rope_freq_base`, `rope_freq_scale` (default = GGUF trained value).
+- **Sampler chain:** `temperature`, `dynatemp_range`/`dynatemp_exponent`, `top_k`, `top_p`,
+  `min_p`, `typical_p`, `top_n_sigma`, `xtc_probability`/`xtc_threshold`, the penalty knobs
+  (`penalty_last_n`/`penalty_repeat`/`penalty_freq`/`penalty_present`), `dry`, `mirostat`,
+  `grammar`, and `seed` (default = a fresh random seed per request).
+
+See `src/worker/engine/llamacpp/` (README + DESIGN) for the exhaustive field list and each knob's
+`llama-cpp-2` setter.
 
 ---
 
 ## Effective Config (read-only surface)
 
-The resolved config is surfaced **read-only** at `GET /api/higgs/system` as the
-`config: HiggsServerConfig` field (alongside `hardware` and `runtime`). It is
-built by `Higgs::server_config()` — a pure read, no worker RPC, no mutation;
-there is **no endpoint to change config**.
+The resolved config is surfaced **read-only** by the `Higgs::server_config()` facade method
+(`src/api.rs`) as a `HiggsServerConfig` (`src/api/types.rs`) — a pure read, no worker RPC, no
+mutation. There is no endpoint (and no facade method) to change it.
 
 | `HiggsServerConfig` field | Source |
 |---------------------------|--------|
-| `bind_host` | `BIND_HOST` const (`api.rs`) — always `"127.0.0.1"` |
-| `lmstudio_dirs` / `hf_dirs` / `ollama_dirs` | the configured scan dirs as path strings |
-| `default_load` | `HiggsConfig.default_load` (`ctx_len`, `gpu_layers`, `threads`) |
-| `default_ctx_cap` | `DEFAULT_CTX_CAP` const (`api.rs`) = `32768` |
+| `bind_host` | `BIND_HOST` const (`api/types.rs`) — always `"127.0.0.1"` |
+| `lmstudio_dirs` / `hf_dirs` / `ollama_dirs` | the configured scan dirs, as path strings |
+| `default_load` | `HiggsConfig.default_load` |
+| `default_ctx_cap` | `DEFAULT_CTX_CAP` const (`api/types.rs`) = `32768` |
+| `limits` | `HiggsLimits` — a read-only disclosure of the serve-layer hardening consts (body limit, control timeout, chat timeout, max output tokens, concurrency, RAM headroom, effective idle-TTL) |
 
 ---
 
@@ -133,79 +145,97 @@ higgs reads the following directory trees during a scan. **It never writes into 
   blobs/sha256-<hash>                          (GGUF blob)
 ```
 
-All roots are optional — a missing directory is silently skipped. An existing but unreadable root produces `[HG001] ModelDirUnreadable`.
+All roots are optional — a missing directory is silently skipped. An existing but unreadable root
+produces `[HG001] ModelDirUnreadable`. Models pulled via `M_PULL` land ONLY in `~/.higgs/models/`
+(`download.rs`) — never a scanned store.
 
 ---
 
 ## Build Note: LIBCLANG_PATH
 
-The `llama-cpp-2` crate requires `libclang` at compile time (bindgen dependency). On machines where libclang is not on the default path, set:
+The `llama-cpp-2` crate requires `libclang` at compile time (bindgen dependency). On machines where
+libclang is not on the default path, set:
 
 ```sh
 export LIBCLANG_PATH=/path/to/libclang/lib
 ```
 
-The project prefix `env -u LIBCLANG_PATH cargo …` unsets any stale value when the correct path is already on `PATH`. When building for the first time on a new machine, set `LIBCLANG_PATH` explicitly before running `cargo build`.
+The project prefix `env -u LIBCLANG_PATH cargo …` unsets any stale value when the correct path is
+already on `PATH`. When building for the first time on a new machine, set `LIBCLANG_PATH` explicitly
+before running `cargo build`.
 
 ---
 
 ## Serve-Layer Limits & Hardening
 
-The serve layer (`src/serve/mod.rs`) applies established ollama/vllm HTTP
-hardening. These are documented `const`s today (not yet config); a later phase
-lifts the user-facing ones into `HiggsConfig` + the Server Settings UI.
+The `/v1` serve layer (`src/serve/mod.rs`) applies established ollama/vllm HTTP hardening. These are
+documented `const`s today (not yet config); a later phase lifts the user-facing ones into
+`HiggsConfig`. The layer stack (outer runs first): `local_cors` → `host_guard` → `auth_guard` →
+`CatchPanicLayer` → `DefaultBodyLimit`, then per-route split.
 
-| Item | Value | Source const | Effect |
+| Item | Value | Source const/fn | Effect |
 |------|-------|--------------|--------|
-| Max request body | 32 MB | `serve::MAX_BODY_BYTES` | Oversized body ⇒ `413`. Caps `/v1/chat/completions` + control bodies (vllm uses ~4 MB; ours is larger for long transcripts). |
-| Control timeout | 120 s | `serve::CONTROL_TIMEOUT` | Whole-request timeout on `/api/higgs/*` + `/v1/models` only. **Not** applied to `/v1/chat/completions` — a long SSE stream must never be aborted at the HTTP layer (its duration is bounded by the worker chat-RPC timeout). |
-| Chat-RPC timeout | 600 s | `supervisor::CHAT_RPC_TIMEOUT` | Bounds a single chat/inference RPC round-trip — the layer that bounds streaming chat duration. A wedged-but-alive worker (no chunks, no final response) ⇒ `504 [HG016]`. Generous (long large-model generations); no reference fixes a chat-RPC ceiling (vllm/ollama bound per-request output via `max_tokens`). |
-| Max output tokens | 32768 | `serve::MAX_OUTPUT_TOKENS` | `max_tokens`/`max_completion_tokens` above this ⇒ `400 [HG013]`. Matches `DEFAULT_CTX_CAP`; bounds per-request generation regardless of the loaded model. |
-| Sampling validation | vllm ranges | `serve::v1::validate_sampling` | `temperature >= 0`, `top_p ∈ (0,1]`, `n >= 1`, `presence_penalty`/`frequency_penalty ∈ [-2,2]`, `max_tokens ∈ [1, MAX_OUTPUT_TOKENS]`. Out-of-range ⇒ `400 [HG013]` before dispatch. Ranges mirror vllm `SamplingParams._verify_args`. |
+| Max request body | 32 MB | `serve::MAX_BODY_BYTES` | Oversized body ⇒ `413`. Caps `/v1/chat/completions` (long transcripts) — vllm uses ~4 MB; ours is larger. |
+| Control timeout | 120 s | `serve::CONTROL_TIMEOUT` | Whole-request timeout on **`GET /v1/models` only**. **Not** applied to `POST /v1/chat/completions` — a long SSE stream must never be aborted at the HTTP layer (bounded instead by the worker chat-RPC timeout). |
+| Chat-RPC timeout | 600 s | `supervisor::CHAT_RPC_TIMEOUT` | Bounds a single chat/inference RPC round-trip. A wedged-but-alive worker (no chunks, no final response) ⇒ `504 [HG016]`. |
+| Max output tokens | 32768 | `serve::MAX_OUTPUT_TOKENS` | `max_tokens`/`max_completion_tokens` above this ⇒ `400 [HG013]`. Matches `DEFAULT_CTX_CAP`. |
+| Sampling validation | vllm ranges | `serve::v1::validate_sampling` | `temperature >= 0`, `top_p ∈ (0,1]`, `n >= 1`, `presence_penalty`/`frequency_penalty ∈ [-2,2]`, `max_tokens ∈ [1, MAX_OUTPUT_TOKENS]`. Out-of-range ⇒ `400 [HG013]` before dispatch. |
 | Prompt fit pre-check | 4 bytes/token | `serve::PROMPT_BYTES_PER_TOKEN` | Conservative early reject: `prompt_bytes/4 + max_tokens > ctx_len` ⇒ `400 [HG005]`. Lower-bound estimate (serve layer has no tokenizer); the worker's exact `[HG005]` check is the authoritative backstop. |
-| Inference admission gate | 8 | `api::MAX_CONCURRENT_INFERENCE` | At most 8 concurrent in-flight chat requests; a full gate ⇒ `503 [HG014]` (capacity signal, retryable). Scoped to the chat path only. Ollama's `OLLAMA_NUM_PARALLEL` default is 1, `OLLAMA_MAX_QUEUE` 512; 8 gives flood-proof headroom over the single-sequence worker. Distinct from the deferred worker-slot `max_concurrent_requests` in `concurrency.md`. |
-| Repo-id charset guard | alnum + `_-./:` | `api::validate_repo_id` | Load id charset mirrors ollama `types/model/name.go`; a `..` component, absolute path, NUL, or illegal char ⇒ `400 [HG015]`. |
-| Path-traversal guard | within scan roots | `api::path_within_roots` | The resolved GGUF path must canonicalize inside a configured scan dir, else `400 [HG015]` — a symlink/`..` escape never reaches the worker FFI loader. |
-| Host guard | loopback only | `serve::is_loopback_host` | DNS-rebinding defense. `Host` header (sans `:port`) must be `127.0.0.1` / `localhost` / `::1`, else `403 [HG012]`. Missing `Host` ⇒ `403` (ollama behavior). |
-| RAM headroom guard | 0.8 of available | `api::MEMORY_HEADROOM_FRACTION` | Pre-load: refuse a load whose GGUF file size exceeds `available_ram * 0.8` ⇒ `503 [HG017]` (capacity, retryable) — checked before spawning a worker so an oversized load fails fast instead of OOM-killing the worker. 0.8 is ollama's `freeMemory*80/100` placement rule (`server/sched.go`). |
-| Idle auto-unload enabled | `true` (default) | `Higgs::auto_unload_idle` (`AtomicBool`) | Master switch read by the reaper each tick; `false` ⇒ never reaps. Runtime-mutable via `PUT /api/higgs/settings` — **not** persisted. |
-| Idle auto-unload TTL | 5 min (default) | `Higgs::idle_ttl_minutes` (`AtomicU64`) | Runtime-mutable TTL (minutes) read by the reaper each tick, seeded from `api::IDLE_UNLOAD_TTL_MINUTES` / `api::IDLE_UNLOAD_TTL` (5 min = ollama's `keep_alive` default, `envconfig/config.go`). Settable via `PUT /api/higgs/settings` without restart — **not** persisted. Background reaper (spawned by `Higgs::start`) unloads the loaded model after this idle window; never unloads mid-generation (gated on a fully-open inference semaphore) or with nothing loaded. |
-| Idle reaper interval | 30 s | `api::IDLE_REAP_INTERVAL` | How often the reaper checks idle time vs. the TTL; bounds post-TTL unload latency. No reference fixes a poll cadence (ollama uses a per-model timer); 30 s is the documented higgs value. |
-| Log redaction | host paths / `host:port` | `serve::v1::redact_paths` | The client-facing `/v1` error envelope strips absolute filesystem paths and bind addresses (replaced with `<redacted>`). No prompt CONTENT is logged at `info` on the `/v1` path (only model id, stream flag, lengths/ids). Full unredacted Display (with paths) is still logged server-side at the origin and returned on the `/api/higgs/*` control surface (ours). |
-| Panic recovery | — | `CatchPanicLayer` | A handler panic returns a structured `500` instead of dropping the connection (ollama gin Recovery). |
-| CORS | loopback + tauri origins | `serve::local_cors` | Cross-origin only from loopback / Tauri webview origins. |
+| Inference admission gate | 8 | `api::MAX_CONCURRENT_INFERENCE` | At most 8 concurrent in-flight chat requests; a full gate ⇒ `503 [HG014]` (retryable). Scoped to the chat path. (A separate `remote_gate` of the same size covers fleet-routed chat.) |
+| Repo-id charset guard | alnum + `_-./:` | `api::guards::validate_repo_id` | Load id charset mirrors ollama `types/model/name.go`; a `..` component, absolute path, NUL, or illegal char ⇒ `400 [HG015]`. |
+| Path-traversal guard | within scan roots | `api::guards::path_within_roots` | The resolved GGUF path must canonicalize inside a configured scan dir, else `400 [HG015]` — a symlink/`..` escape never reaches the worker FFI loader. |
+| Host guard | loopback only | `serve::is_loopback_host` | DNS-rebinding defense. `Host` header (sans `:port`) must be `127.0.0.1` / `localhost` / `::1`, else `403 [HG012]`; missing `Host` ⇒ `403`. **Relaxed** on a keyed non-loopback bind (LAN clients send their server's own LAN host). |
+| RAM headroom guard | 0.8 of available | `api::MEMORY_HEADROOM_FRACTION` | Pre-load: refuse a load whose GGUF size exceeds `available_ram * 0.8` ⇒ `503 [HG017]` — checked before spawning a worker. 0.8 is ollama's `freeMemory*80/100` placement rule. |
+| Log redaction | host paths / `host:port` | `serve::v1::redact_paths` | The client-facing `/v1` error envelope strips absolute filesystem paths and bind addresses. No prompt CONTENT is logged at `info` on `/v1` (only model id, stream flag, lengths/ids). The in-process crate control methods return the full unredacted `HiggsError` Display to the embedder. |
+| Panic recovery | — | `CatchPanicLayer` | A handler panic returns a structured `500` instead of dropping the connection. |
+| CORS | loopback + tauri + configured | `serve::local_cors` | Cross-origin only from loopback / Tauri webview origins plus any `config.json` `cors_origins`. |
+| API-key auth | opt-in | `serve::auth_guard` + `keys.rs` | When keys are configured, the route's required scope must be met by a `Bearer hgk_…`, else `401 [HG048]`. Empty keystore ⇒ auth OFF (loopback-only, guaranteed by the `[HG058]` LAN refusal). |
+| Keyless-LAN refusal | — | `serve::serve_v1` | A non-loopback listener with zero keys ⇒ refuse to serve (`[HG058]`); with no Admin-capable key ⇒ refuse (`[HG069]`). Runs on the REAL bound address. |
 
-`GET /health` (and `/api/higgs/health`) is a cheap readiness probe: `200` as
-soon as the server is up, with **no** worker RPC ("server reachable", not "model
-loaded").
+`GET /health` is a cheap readiness probe: `200` as soon as the server is up, with **no** worker RPC
+("server reachable", not "model loaded").
 
-**No-auth threat model:** higgs has no authentication. The Host guard + CORS
-protect *browser* clients from DNS rebinding / cross-origin reads. They do **not**
-protect non-browser clients — which is why a non-loopback `HIGGS_BIND` logs a
-SECURITY WARNING. The embedded (jigglebot) path always binds ephemeral loopback.
+**Threat model:** the `/v1` surface is open by default and safe only because a keyless bind is
+loopback-only — the Host guard + CORS protect *browser* clients from DNS-rebinding / cross-origin
+reads, and `serve_v1` refuses a keyless non-loopback listener (`[HG058]`). To expose higgs on a LAN,
+mint API keys first (at least one Admin-capable); the bind is then bearer-gated on every data route.
 
 ---
 
-## Non-Configurable Defaults
+## Runtime toggles & Non-Configurable Defaults
+
+The runtime toggles are **facade state**, driven via the in-process crate API — **not** an HTTP
+route. They are `Atomic*` on `Higgs`, **not** persisted (each resets on restart). The
+`HiggsRuntimeSettings` / `LogSettings` wire structs (`src/serve/wire.rs`) are the SHAPES an embedder
+uses to read/write them in bulk.
+
+| Toggle | Default | Facade getter / setter | Effect |
+|--------|---------|------------------------|--------|
+| JIT (just-in-time) loading | `true` | `jit_enabled()` / `set_jit_enabled()` | When on, a `POST /v1/chat/completions` for a scanned-but-unloaded model triggers an on-demand load (only-keep-last swap) via the same `Higgs::load()` path — RAM-headroom (`[HG017]`), charset & path-within-roots (`[HG015]`) guards still apply; a failed JIT load surfaces the REAL mapped error, not `404`. Unknown id ⇒ `404 [HG002]`. When off, an unloaded model ⇒ `404 [HG003]`. |
+| Idle auto-unload | `true` | `auto_unload_idle()` / `set_auto_unload_idle()` | Master switch the node reaper reads each tick; `false` ⇒ never reaps. |
+| Idle TTL minutes | `60` | `idle_ttl_minutes()` / `set_idle_ttl_minutes()` | Seeded from `node::runtime::DEFAULT_IDLE_TTL` (60 min). The reaper reads it live (change takes effect without restart); never unloads mid-generation (gated on a fully-open inference semaphore) or with nothing loaded. |
+| Serving enabled | `true` | `serving_enabled()` / `set_serving_enabled()` | When `false`, `/v1` inference returns `[HG019]` → 503; read on each chat request. |
+| Verbose serve logging | `false` | `logs_settings()` / `set_logs_settings()` (`LogSettings.verbose`) | When on, each completed `POST /v1/chat/completions` emits one extra `higgs: served …` INFO line into the Developer Logs. |
+| Log incoming tokens | `false` | `logs_settings()` / `set_logs_settings()` (`LogSettings.log_incoming_tokens`) | Explicit opt-in that logs the flattened incoming prompt CONTENT (capped ~800 chars), overriding the redact-by-default policy. |
+
+Other non-configurable defaults:
 
 | Item | Value | Source |
 |------|-------|--------|
-| dev-log history ring cap | 2000 lines | `log_bus.rs` — `RING_CAP` (snapshot source for `/api/higgs/logs` + SSE replay) |
-| dev-log live broadcast cap | 256 | `log_bus.rs` — `BROADCAST_CAP` (live tap for `/api/higgs/logs/stream`) |
+| dev-log history ring cap | 2000 lines | `log_bus.rs` — `RING_CAP` (per-`LogSource` ring; the snapshot source for `Higgs::logs()`) |
+| dev-log live broadcast cap | 256 | `log_bus.rs` — `BROADCAST_CAP` (live tap for `Higgs::subscribe_logs()`) |
 | event broadcast channel cap | 64 | `supervisor.rs` — hardcoded |
 | respawn backoff | 1 second | `supervisor.rs` — hardcoded |
 | respawn attempts per death | 1 | supervisor restarts once; factory failure is terminal |
-| graceful stop timeout | 2 seconds | `Higgs::stop()` — hardcoded |
-| `/api/higgs/logs` + `/logs/stream` default tail / replay | 200 lines | `DEFAULT_LOG_LINES` (`LogsQuery.n` default) |
-| JIT (just-in-time) loading | `true` (default) | runtime `AtomicBool` on the `Higgs` facade — **not** persisted to disk/config (resets to `true` on restart); toggled at runtime via `PUT /api/higgs/settings` (`HiggsRuntimeSettings { jit_enabled }`), read via `GET /api/higgs/settings`. This **server-behavior** namespace is separate from `/api/higgs/logs/settings` and is designed to grow more flags. When on, a `POST /v1/chat/completions` for a scanned-but-unloaded model triggers an on-demand load (**only-keep-last** swap of any resident model) via the same `Higgs::load()` path — so the RAM-headroom (`[HG017]`), charset, and path-within-roots (`[HG015]`) guards still apply; a failed JIT load surfaces the real mapped error, not `404`. An unknown id is `404 [HG002]`. When off, an unloaded model is `404 [HG003]`. Emits one `higgs: JIT loading {model} (was {prev})` INFO line per JIT load. |
-| idle auto-unload | `true` (default) | runtime `AtomicBool` on the `Higgs` facade — **not** persisted (resets to `true` on restart); set via the same `PUT /api/higgs/settings` (`HiggsRuntimeSettings { jit_enabled, auto_unload_idle, idle_ttl_minutes }`), read via `GET /api/higgs/settings`. The idle reaper reads it each tick; `false` ⇒ never reaps. |
-| idle TTL minutes | `5` (default) | runtime `AtomicU64` on the `Higgs` facade, seeded from `api::IDLE_UNLOAD_TTL_MINUTES` / `IDLE_UNLOAD_TTL` — **not** persisted (resets to `5` on restart); set via the same `PUT /api/higgs/settings` (all three flags carried), read via `GET /api/higgs/settings`. The idle reaper uses this (minutes → `Duration`) as the TTL each tick, so a change takes effect without restart. |
-| verbose serve logging | `false` (default) | runtime `AtomicBool` on the `Higgs` facade — **not** persisted to disk/config; toggled at runtime via `PUT /api/higgs/logs/settings` (`LogSettings { verbose, log_incoming_tokens }`), read via `GET /api/higgs/logs/settings`. When on, each completed `POST /v1/chat/completions` (stream + non-stream) emits one extra `higgs: served …` INFO line into the Developer Logs. |
-| log incoming tokens | `false` (default) | second runtime `AtomicBool` on the `Higgs` facade — **not** persisted; set via the same `PUT /api/higgs/logs/settings` (both flags carried). When on, each chat request emits one extra `higgs: incoming …` INFO line carrying the flattened incoming prompt CONTENT, capped to 800 chars. **Explicit opt-in that logs prompt content, overriding the redact-by-default policy.** |
+| graceful stop timeout | 2 seconds | `supervisor.rs` `from_secs(2)` (reached via `Higgs::stop()`) — hardcoded |
+| idle reaper interval | derived from TTL | `node::runtime::reap_interval(ttl)` = `(ttl/4).clamp(50 ms, 60 s)` — a 60-min TTL polls once a minute |
+| default listen port | 31415 (pi) | `DEFAULT_PORT` const — a documented default for external clients; the node-only binary binds no port, and an embedder picks its own |
 
 ---
 
 ## Links
 
-- Root configuration reference: [CONFIG.md](../../CONFIG.md)
-- Full field reference (gateway / metrics / agent): [backend/server/src/config/CONFIG.md](../server/src/config/CONFIG.md)
+- Root orientation: [README.md](README.md)
+- Crate design & invariants: [DESIGN.md](DESIGN.md)
+- Engine params (full `LlamaCppParams` reference): `src/worker/engine/llamacpp/`
+- Remote fleet: `src/node/README.md`, [DESIGN-remote.md](DESIGN-remote.md)

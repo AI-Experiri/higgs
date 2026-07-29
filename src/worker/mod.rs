@@ -5,7 +5,6 @@
 
 pub mod engine;
 pub mod models;
-pub mod tool_parser;
 
 use std::io::{BufRead, Write};
 
@@ -21,13 +20,16 @@ pub const M_UNLOAD: &str = "higgs/unload";
 pub const M_STATUS: &str = "higgs/status";
 pub const M_CHAT: &str = "higgs/chat";
 pub const M_SHUTDOWN: &str = "higgs/shutdown";
-/// Probe a GGUF for engine loadability (Gate 1) without disturbing the resident
-/// model. Reply carries `{loadable, reason, engine_version}`.
-pub const M_PROBE: &str = "higgs/probe";
 /// Enumerate the host's compute devices via the engine's backend-device FFI.
 /// Cheap and read-only (no model load, no resident-state mutation). Reply
 /// carries `{gpus: [GpuDevice, …]}`.
 pub const M_SYSINFO: &str = "higgs/sysinfo";
+/// Context window the worker allocates when `M_LOAD` carries no usable
+/// `ctx_len` (absent or 0). ONE home for the fallback: `handle_load`'s
+/// coercion and the node's load-facts cache (`node/runtime.rs`) both read it,
+/// so the inventory's operative-window claim can't drift from the worker's
+/// real behavior.
+pub(crate) const DEFAULT_WORKER_CTX: u32 = 4096;
 /// Set the worker's log verbosity at runtime: `{verbose: bool}`. `false` (normal)
 /// = llama.cpp INFO+; `true` (verbose) = DEBUG+. Flips the engine-log level
 /// filter live so the user's "Verbose Logging" toggle takes effect without a
@@ -69,13 +71,16 @@ fn serve_state(mut state: WorkerState, reader: impl BufRead, mut writer: impl Wr
             Ok(_) => {} // worker never receives responses/notifications
             Err(e) => {
                 // Decode failure has no id: JSON-RPC null-id convention, we use 0.
+                // Keep the -32700 "parse error" numeric code, but ride the
+                // HiggsError's origin code (HG008) in `data.code` so the supervisor
+                // surfaces a classifiable reason instead of a bare string.
                 respond(
                     &mut writer,
                     0,
                     Err(RpcError {
                         code: -32700,
                         message: e.to_string(),
-                        data: None,
+                        data: e.code().map(|c| json!({ "code": c.to_string() })),
                     }),
                 );
             }
@@ -114,10 +119,13 @@ struct WorkerState {
 }
 
 impl WorkerState {
-    /// Production state: llama.cpp engine, nothing loaded.
+    /// Production state: the engine selected by `HIGGS_ENGINE` (default: the first registry
+    /// entry, `llamacpp`), nothing loaded.
     fn new() -> Self {
+        let (engine, name) = engine::build_engine(std::env::var("HIGGS_ENGINE").ok().as_deref());
+        tracing::info!(engine = name, "higgs: worker engine selected");
         Self {
-            engine: Box::new(engine::llamacpp::LlamaCppEngine::default()),
+            engine,
             loaded: None,
         }
     }
@@ -146,7 +154,6 @@ impl WorkerState {
                 Ok(json!({}))
             }
             M_CHAT => self.handle_chat(req, writer),
-            M_PROBE => Ok(self.handle_probe(req)),
             M_SYSINFO => Ok(self.handle_sysinfo()),
             M_LOG_LEVEL => {
                 let verbose = req
@@ -157,11 +164,9 @@ impl WorkerState {
                 engine::llamacpp::logging::set_engine_verbose(verbose);
                 Ok(json!({}))
             }
-            other => Err(RpcError {
-                code: -32601,
-                message: format!("unknown method {other}"),
-                data: None,
-            }),
+            // An unknown method = a protocol skew (HG037, → 501): the shared helper
+            // keeps the JSON-RPC -32601 code and rides HG037 in data.code.
+            other => Err(crate::rpc::method_not_found("worker", other)),
         }
     }
 
@@ -172,9 +177,9 @@ impl WorkerState {
         let loaded = self.loaded.as_ref().map(|(id, p)| {
             json!({
                 "id": id,
-                "ctx_len": p.ctx_len,
-                "gpu_layers": p.gpu_layers,
-                "threads": p.threads,
+                "ctx_len": p.ctx_len(),
+                "gpu_layers": p.gpu_layers(),
+                "threads": p.threads(),
             })
         });
         json!({ "loaded": loaded })
@@ -193,38 +198,32 @@ impl WorkerState {
         // (tokens + max_tokens > n_ctx) fail for every request, so the
         // model loads yet is unusable. Coerce 0 → default so the stored
         // window matches the real one.
-        let mut ctx_len = u32_param(&req.params, "ctx_len", 4096);
+        let mut ctx_len = u32_param(&req.params, "ctx_len", DEFAULT_WORKER_CTX);
         if ctx_len == 0 {
-            tracing::warn!("higgs: ctx_len=0 requested; using default 4096");
-            ctx_len = 4096;
+            tracing::warn!("higgs: ctx_len=0 requested; using default {DEFAULT_WORKER_CTX}");
+            ctx_len = DEFAULT_WORKER_CTX;
         }
-        // The three base fields keep their specific defaults (gpu_layers=all,
-        // threads=4) via `u32_param`; the optional overrides deserialize from
-        // the same params object (each is `#[serde(default)]` → `None` when
-        // absent, so a quick-load carries no overrides — current behavior).
-        let opts: engine::LoadParams = match serde_json::from_value(req.params.clone()) {
-            Ok(opts) => opts,
-            Err(e) => {
-                tracing::warn!(error = %e, "ignoring malformed higgs load overrides");
-                engine::LoadParams::default()
-            }
-        };
-        let params = engine::LoadParams {
-            ctx_len,
-            gpu_layers: u32_param(&req.params, "gpu_layers", u32::MAX),
-            threads: u32_param(&req.params, "threads", 4),
-            use_mmap: opts.use_mmap,
-            use_mlock: opts.use_mlock,
-            n_batch: opts.n_batch,
-            n_ubatch: opts.n_ubatch,
-            offload_kqv: opts.offload_kqv,
-            rope_freq_base: opts.rope_freq_base,
-            rope_freq_scale: opts.rope_freq_scale,
-            flash_attn: opts.flash_attn,
-            type_k: opts.type_k,
-            type_v: opts.type_v,
-            seed: opts.seed,
-        };
+        // The worker wire is FLAT (no engine tag): deserialize the engine-specific
+        // `LlamaCppParams` directly from the params object (each optional is
+        // `#[serde(default)]` → `None`/empty when absent), then wrap it in the
+        // umbrella for the engine. The three base fields keep their specific
+        // defaults (gpu_layers=all, threads=4) and the ctx_len==0 coercion above.
+        let mut opts: engine::llamacpp::params::LlamaCppParams =
+            match serde_json::from_value(req.params.clone()) {
+                Ok(opts) => opts,
+                Err(e) => {
+                    tracing::warn!(error = %e, "ignoring malformed higgs load overrides");
+                    engine::llamacpp::params::LlamaCppParams::default()
+                }
+            };
+        opts.ctx_len = engine::CtxLen::fixed(ctx_len);
+        opts.gpu_layers = req
+            .params
+            .get("gpu_layers")
+            .and_then(|v| serde_json::from_value::<engine::GpuLayers>(v.clone()).ok())
+            .unwrap_or(engine::GpuLayers::All);
+        opts.threads = u32_param(&req.params, "threads", 4);
+        let params = engine::LoadParams::llamacpp(opts);
         // Scan moved host-side: the host resolves the GGUF path and passes it in
         // `params.path`. The worker holds no catalog of its own.
         let path = req
@@ -249,29 +248,6 @@ impl WorkerState {
             .map_err(|e| to_rpc_error(&e))?;
         self.loaded = Some((id.to_string(), params));
         Ok(json!({ "id": id }))
-    }
-
-    /// Probe a GGUF for engine loadability (Gate 1) and report this worker's own
-    /// engine version. The probe loads into a throwaway handle (dropped at once,
-    /// never resident) so it never disturbs a model being served. The reply
-    /// carries `{loadable, reason, engine_version}`: `reason` is the engine's
-    /// VERBATIM error string when `loadable` is false, else `null`.
-    ///
-    /// `engine_version` is sourced from THIS probing binary's engine — the host
-    /// can't call the FFI version fn without pulling FFI in, so the worker that
-    /// actually runs the load is the correct source for the cache key.
-    fn handle_probe(&self, req: &RpcRequest) -> Value {
-        let path = req
-            .params
-            .get("path")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let (loadable, reason) = self.engine.probe(path);
-        json!({
-            "loadable": loadable,
-            "reason": reason,
-            "engine_version": engine::llamacpp::engine_version(),
-        })
     }
 
     /// Enumerate the host's compute devices via the engine's backend-device FFI
@@ -333,17 +309,35 @@ impl WorkerState {
                 data: None,
                 message: "missing messages_json".to_string(),
             })?;
+        // The full sampler set rides the params as a `sampling` sub-object — the
+        // serialized `SamplingParams` umbrella (`{"engine":"LlamaCpp", …}`). When it
+        // is absent or malformed, fall back to the legacy top-level `temperature`
+        // field (the pre-`sampling` M_CHAT shape the worker README documents) so a
+        // direct/older caller that pins only `temperature` still controls sampling
+        // instead of silently snapping to the 0.7 default. Neither present ⇒ an
+        // all-default set (the engine applies its own 0.7).
+        let sampling = req
+            .params
+            .get("sampling")
+            .and_then(|v| serde_json::from_value::<engine::SamplingParams>(v.clone()).ok())
+            .unwrap_or_else(|| {
+                let temperature = req
+                    .params
+                    .get("temperature")
+                    .and_then(Value::as_f64)
+                    .map(|t| t as f32);
+                engine::SamplingParams::llamacpp(engine::llamacpp::params::LlamaCppSamplingParams {
+                    temperature,
+                    ..Default::default()
+                })
+            });
         let gen = engine::GenParams {
             max_tokens: req
                 .params
                 .get("max_tokens")
                 .and_then(Value::as_u64)
                 .map_or(1024, |v| usize::try_from(v).unwrap_or(usize::MAX)),
-            temperature: req
-                .params
-                .get("temperature")
-                .and_then(Value::as_f64)
-                .map_or(0.7, |v| v as f32),
+            sampling,
             // OpenAI `tools` array, already serialized to a JSON string by
             // the serve layer; passed verbatim to the chat template.
             tools_json: req
@@ -351,13 +345,23 @@ impl WorkerState {
                 .get("tools")
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned),
+            chat_template_kwargs: req
+                .params
+                .get("chat_template_kwargs")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
         };
         let mut chunk_write_failed = false;
-        let mut sink = |delta: &str| {
+        let mut sink = |delta: engine::EngineDelta<'_>| {
+            // Additive wire shape (kind/tool keys) — see ChatDelta::encode_chunk_params.
             let note = RpcNotification {
                 jsonrpc: "2.0".into(),
                 method: N_CHAT_CHUNK.into(),
-                params: json!({"request_id": request_id.clone(), "delta": delta}),
+                params: engine::ChatDelta::encode_chunk_params(
+                    &request_id,
+                    delta.kind(),
+                    delta.text(),
+                ),
             };
             if writeln!(writer, "{}", encode(&RpcFrame::Notification(note))).is_err() {
                 chunk_write_failed = true;
@@ -376,6 +380,8 @@ impl WorkerState {
             "tool_calls": result.tool_calls,
             "prompt_tokens": result.prompt_tokens,
             "completion_tokens": result.completion_tokens,
+            // Additive: absent on old workers, tolerated by chat_outcome_from_value.
+            "reasoning_content": result.reasoning_content,
         }))
     }
 }
@@ -454,17 +460,6 @@ mod tests {
             self.loaded
         }
 
-        fn probe(&self, path: &str) -> (bool, Option<String>) {
-            self.calls.lock().push(format!("probe {path}"));
-            // Scripted verdict: a path containing "gemma4" is unsupported with a
-            // verbatim engine-style reason; everything else loads.
-            if path.contains("gemma4") {
-                (false, Some("unknown model architecture: 'gemma4'".into()))
-            } else {
-                (true, None)
-            }
-        }
-
         fn devices(&self) -> Vec<crate::system::GpuDevice> {
             self.calls.lock().push("devices".into());
             // Scripted single CPU device — no real FFI in the unit test.
@@ -480,12 +475,15 @@ mod tests {
         fn chat(
             &mut self,
             _messages_json: &str,
-            _params: &engine::GenParams,
-            sink: &mut dyn FnMut(&str),
+            params: &engine::GenParams,
+            sink: &mut dyn FnMut(engine::EngineDelta<'_>),
         ) -> Result<engine::ChatResult, HiggsError> {
-            self.calls.lock().push("chat".into());
-            sink("he");
-            sink("llo");
+            // Record the temperature the worker threaded out of the M_CHAT
+            // `sampling` sub-object, so a test can assert the deserialization.
+            let temp = params.sampling.as_llamacpp().temperature.unwrap_or(0.7);
+            self.calls.lock().push(format!("chat temp={temp}"));
+            sink(engine::EngineDelta::Content("he"));
+            sink(engine::EngineDelta::Content("llo"));
             Ok(engine::ChatResult {
                 content: "hello".into(),
                 finish_reason: "stop",
@@ -493,6 +491,7 @@ mod tests {
                 // Scripted counts: 5 prompt tokens, 2 completion tokens.
                 prompt_tokens: 5,
                 completion_tokens: 2,
+                reasoning_content: None,
             })
         }
     }
@@ -557,11 +556,18 @@ mod tests {
         };
         assert_eq!(resp.id, 2);
         let err = resp.error.as_ref().expect("expected error");
-        assert_eq!(err.code, -32601);
+        assert_eq!(err.code, -32601, "keeps the JSON-RPC method-not-found code");
         assert!(
-            err.message.contains("unknown method"),
+            err.message.contains("unknown RPC method"),
             "message was: {}",
             err.message
+        );
+        // The HG037 origin code now rides in data so the boundary can classify it (501).
+        assert_eq!(
+            err.data.as_ref().and_then(|d| d.get("code")),
+            Some(&json!("HG037")),
+            "method-not-found carries the HG037 code: {:?}",
+            err.data
         );
     }
 
@@ -611,7 +617,83 @@ mod tests {
         let calls = calls.lock();
         assert_eq!(calls.len(), 2, "calls: {calls:?}");
         assert_eq!(calls[0], format!("load {path}"), "calls: {calls:?}");
-        assert_eq!(calls[1], "chat");
+        // No `sampling` in the request → the engine sees the default temperature.
+        assert_eq!(calls[1], "chat temp=0.7", "calls: {calls:?}");
+    }
+
+    #[test]
+    fn chat_threads_sampling_sub_object_to_engine() {
+        // A chat whose params carry a `sampling` sub-object (the serialized
+        // SamplingParams umbrella) must reach the engine with that temperature —
+        // proving the worker deserializes `sampling` into GenParams.
+        let path = "/models/google/gemma-4-12b/gemma-4-12b-Q4_K_M.gguf";
+        let mut input = load_line(2, "google/gemma-4-12b", path, json!({}));
+        input.push_str(&req_line(
+            3,
+            M_CHAT,
+            json!({
+                "request_id": 7,
+                "model": "google/gemma-4-12b",
+                "messages_json": "[{\"role\":\"user\",\"content\":\"hi\"}]",
+                "sampling": { "engine": "LlamaCpp", "temperature": 0.2 },
+            }),
+        ));
+        let (_frames, calls) = serve_with_fake(&input);
+        let calls = calls.lock();
+        assert_eq!(
+            calls[1], "chat temp=0.2",
+            "the request sampling temperature reaches the engine: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn chat_legacy_top_level_temperature_is_honored() {
+        // Back-compat: an M_CHAT with NO `sampling` object but a legacy top-level
+        // `temperature` must still reach the engine with that temperature (not the
+        // 0.7 default) — preserving the pre-`sampling` worker protocol shape.
+        let path = "/models/google/gemma-4-12b/gemma-4-12b-Q4_K_M.gguf";
+        let mut input = load_line(2, "google/gemma-4-12b", path, json!({}));
+        input.push_str(&req_line(
+            3,
+            M_CHAT,
+            json!({
+                "request_id": 7,
+                "model": "google/gemma-4-12b",
+                "messages_json": "[{\"role\":\"user\",\"content\":\"hi\"}]",
+                "temperature": 0.0,
+            }),
+        ));
+        let (_frames, calls) = serve_with_fake(&input);
+        let calls = calls.lock();
+        assert_eq!(
+            calls[1], "chat temp=0",
+            "legacy top-level temperature reaches the engine: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn chat_with_malformed_sampling_degrades_to_default() {
+        // A `sampling` value that fails to deserialize must NOT fail the request —
+        // it degrades to the engine default (0.7), so an older/garbled relay still
+        // generates rather than 500ing.
+        let path = "/models/google/gemma-4-12b/gemma-4-12b-Q4_K_M.gguf";
+        let mut input = load_line(2, "google/gemma-4-12b", path, json!({}));
+        input.push_str(&req_line(
+            3,
+            M_CHAT,
+            json!({
+                "request_id": 7,
+                "model": "google/gemma-4-12b",
+                "messages_json": "[{\"role\":\"user\",\"content\":\"hi\"}]",
+                "sampling": "not-an-object",
+            }),
+        ));
+        let (_frames, calls) = serve_with_fake(&input);
+        let calls = calls.lock();
+        assert_eq!(
+            calls[1], "chat temp=0.7",
+            "malformed sampling falls back to the default: {calls:?}"
+        );
     }
 
     #[test]
@@ -693,7 +775,7 @@ mod tests {
         };
         let loaded = &loaded_status.result.as_ref().unwrap()["loaded"];
         assert_eq!(loaded["id"], "google/gemma-4-12b");
-        assert_eq!(loaded["ctx_len"], 2048);
+        assert_eq!(loaded["ctx_len"], json!({"kind": "fixed", "n": 2048}));
         assert_eq!(loaded["threads"], 4, "default threads");
 
         let RpcFrame::Response(final_status) = &frames[3] else {
@@ -723,45 +805,6 @@ mod tests {
             err.message
         );
         assert!(calls.lock().is_empty(), "engine must not load anything");
-    }
-
-    #[test]
-    fn probe_reports_loadable_and_engine_version() {
-        // Supported path: FakeEngine returns (true, None); the reply carries
-        // loadable=true, reason=null, and a non-empty engine_version string.
-        let ok = req_line(
-            2,
-            M_PROBE,
-            json!({"path": "/models/llama/llama-Q4_K_M.gguf"}),
-        );
-        // Unsupported path: FakeEngine returns the verbatim gemma4 reason.
-        let bad = req_line(3, M_PROBE, json!({"path": "/models/gemma4/x.gguf"}));
-        let (frames, calls) = serve_with_fake(&format!("{ok}{bad}"));
-        assert_eq!(frames.len(), 2);
-
-        let RpcFrame::Response(r_ok) = &frames[0] else {
-            panic!("expected response")
-        };
-        let res = r_ok.result.as_ref().unwrap();
-        assert_eq!(res["loadable"], true);
-        assert_eq!(res["reason"], Value::Null);
-        assert!(
-            res["engine_version"]
-                .as_str()
-                .is_some_and(|v| !v.is_empty()),
-            "engine_version present: {res:?}"
-        );
-
-        let RpcFrame::Response(r_bad) = &frames[1] else {
-            panic!("expected response")
-        };
-        let res = r_bad.result.as_ref().unwrap();
-        assert_eq!(res["loadable"], false);
-        assert_eq!(res["reason"], "unknown model architecture: 'gemma4'");
-
-        let calls = calls.lock();
-        assert_eq!(calls.len(), 2);
-        assert!(calls[0].starts_with("probe "));
     }
 
     #[test]

@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "playwright": {
+      "command": "docker",
+      "args": [
+        "run",
+        "--rm",
+        "-i",
+        "--network=playwright-network",
+        "-v", "./playwright/screenshots:/tmp/playwright-output",
+        "mcp-playwright-novnc:latest",
+        "mcp-proxy",
+        "http://playwright-display:3080/sse"
+      ]
+    }
+  }
+}

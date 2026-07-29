@@ -37,3 +37,26 @@ macro_rules! higgs_ts {
         $vis enum $name { $($body)* }
     };
 }
+
+/// Like [`higgs_ts!`] but for **unit-variant** enums that should emit a TypeScript
+/// const-OBJECT (usable as a VALUE — `Foo.Bar`) instead of a ts-rs `"a" | "b"`
+/// union — via [`higgs_macros::TsConstEnum`], consistent with jigglebot's enum
+/// bindings. Apply to plain C-style enums; a variant-with-fields enum stays on
+/// [`higgs_ts!`] (it needs ts-rs's discriminated-union output).
+///
+/// Keeps `ts_rs::TS` + `export_to` (so ts-rs resolves the type + import path for
+/// dependent structs) but NOT `#[ts(export)]`: that would make ts-rs write a
+/// competing union file racing TsConstEnum's writer. TsConstEnum emits a
+/// `#[ignore]`d `macro_run_*` test that writes the .ts; regenerate it via
+/// `cargo test macro_run -- --ignored` (wired into `scripts/quality.sh`).
+macro_rules! higgs_const_enum {
+    (
+        $(#[$meta:meta])*
+        $vis:vis enum $name:ident { $($body:tt)* }
+    ) => {
+        $(#[$meta])*
+        #[derive(ts_rs::TS, higgs_macros::TsConstEnum)]
+        #[ts(export_to = "higgs/")]
+        $vis enum $name { $($body)* }
+    };
+}

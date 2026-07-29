@@ -1,130 +1,58 @@
-//! The `/api/higgs/*` control surface — higgs's OWN shapes (see `wire`): scan,
-//! load/unload, status, system, logs, version, and worker lifecycle. Distinct
-//! from the strict-OpenAI `/v1` surface in `v1`.
+//! Shared control helpers the [`Higgs`] facade delegates to.
+//!
+//! higgs no longer serves a `/api/higgs/*` HTTP surface — control runs in-process
+//! via the crate API (`src/api/embed.rs`). What remains here are the PURE
+//! sub-primitives that assembly used to share with those handlers and that the
+//! facade methods now call directly: per-model row formatting ([`model_entry`] +
+//! the tune-view plumbing), the hub-status snapshot ([`hub_status`]), and the
+//! mint/revoke decision cores ([`decide_mint`] / [`decide_revoke`] +
+//! [`validate_key_label`] / [`keystore_io_error`]). One implementation, reached by
+//! its `pub(crate)` path from the facade.
 
-use std::convert::Infallible;
-use std::sync::Arc;
-
-use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
-use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::response::{IntoResponse, Response};
-use axum::Json;
-use futures::Stream;
-use serde::Deserialize;
-use tokio::sync::{broadcast, mpsc};
-
-use super::http_status;
-use super::wire::{
-    HiggsErrorResponse, HiggsLoadRequest, HiggsLoadResponse, HiggsLogsResponse, HiggsModelEntry,
-    HiggsModelsResponse, HiggsOk, HiggsRuntimeSettings, HiggsVersionResponse, LogSettings,
-};
+use super::wire::{HiggsHubStatus, HiggsModelEntry};
 use crate::api::Higgs;
 use crate::diagnostic::HiggsError;
-use crate::log_bus::LogSource;
-use crate::system::SystemInfo;
 use crate::worker::engine::LoadParams;
 use crate::worker::models::HiggsModel;
-use crate::LLAMA_CPP_2_VERSION;
 
-/// Query parameters for `GET /api/higgs/logs` and `/api/higgs/logs/stream`
-/// (`?n=200`).
-#[derive(Debug, Deserialize)]
-pub(super) struct LogsQuery {
-    /// Maximum number of history lines to return / replay (default 200).
-    n: Option<usize>,
-    /// Restrict to one origin: `serve` (higgs control plane) or `worker` (the
-    /// model worker's stderr). Absent/unknown = both merged.
-    source: Option<String>,
-}
-
-impl LogsQuery {
-    /// The parsed [`LogSource`] filter (`None` = all sources).
-    fn filter(&self) -> Option<LogSource> {
-        self.source.as_deref().and_then(LogSource::parse)
-    }
-}
-
-/// Default history depth for the logs snapshot and the SSE replay prefix.
-const DEFAULT_LOG_LINES: usize = 200;
-
-/// Control-route error response: mapped status + `{"error":"<display>"}` body.
-fn control_error(err: &HiggsError) -> (StatusCode, Json<HiggsErrorResponse>) {
-    (
-        http_status(err),
-        Json(HiggsErrorResponse {
-            error: err.to_string(),
-        }),
-    )
-}
-
-/// Host-side scan of all configured directories plus the currently loaded model
-/// id. The scan is pure Rust (no worker); only the `status()` call is a worker
-/// RPC. `Err(response)` carries the mapped control error on either failure.
-async fn scan_with_loaded(
-    higgs: &Arc<Higgs>,
-) -> Result<(Vec<HiggsModel>, Option<String>), Response> {
-    let models = higgs.scan().await.map_err(|err| {
-        tracing::warn!(error = %err, "higgs: scan failed");
-        control_error(&err).into_response()
-    })?;
-    let loaded_id = higgs
-        .status()
-        .await
-        .map(|s| s.loaded.map(|l| l.id))
-        .map_err(|err| {
-            tracing::warn!(error = %err, "higgs: status failed");
-            control_error(&err).into_response()
-        })?;
-    Ok((models, loaded_id))
-}
-
-/// The `(arch, quant)` support-cache key for a model. A missing arch/quant is
-/// keyed as the empty string, so all "unknown arch/quant" files share one verdict
-/// (and one probe) rather than each probing redundantly.
-fn support_key(model: &HiggsModel) -> (String, String) {
-    (
-        model.arch.clone().unwrap_or_default(),
-        model.quant.clone().unwrap_or_default(),
-    )
-}
-
-/// Gate 2 (host-side, zero FFI): does any registered tool-call parser recognize
-/// this model's chat template? `false` when there is no template or none matches.
-/// The `tool_parser` registry is pure Rust, so this runs in-process — no worker.
+/// Gate 2 (host-side, zero FFI): does this model's chat template declare tool
+/// handling? llama.cpp's auto-parser derives the actual parser from the
+/// template at load time, so the scan-time signal is the template mentioning
+/// tools/functions (same heuristic as the scan's `supports_tools`); `false`
+/// when there is no template (the legacy route renders no tool grammar).
 fn tool_calls_supported(model: &HiggsModel) -> bool {
     match model.chat_template.as_deref() {
-        Some(tmpl) => crate::worker::tool_parser::ToolParserRegistry::with_defaults()
-            .select(tmpl)
-            .is_some(),
+        Some(tmpl) => {
+            let tl = tmpl.to_lowercase();
+            tl.contains("tool") || tl.contains("function")
+        }
         None => false,
     }
 }
 
 /// Build the per-model control entry: the canonical [`HiggsModel`] enriched with
-/// its load `state`, `format`, and the two support gates.
+/// its load `state`, `format`, the Gate-2 tool-call support verdict, and the
+/// `last_load` params persisted on the last successful load (if any).
 ///
-/// `loadable`/`load_reason` are the Gate-1 verdict for this model's
-/// `(arch, quant)` (from the probe sweep). `support_reason` is the verbatim
-/// engine reason when `!loadable`, the fixed Gate-2 message when the model loads
-/// but no parser matches its template, else `None`.
-fn model_entry(
+/// There is NO load-to-test probe at scan time — engine loadability is learned
+/// only when the model is actually loaded (the load error is surfaced then).
+/// `support_reason` carries the fixed Gate-2 message when no tool-call parser
+/// matches the model's template, else `None`.
+pub(crate) fn model_entry(
     mut model: HiggsModel,
-    loaded_id: Option<&str>,
-    loadable: bool,
-    load_reason: Option<String>,
+    loaded_ids: &[String],
+    last_load: Option<LoadParams>,
+    readiness: crate::serve::readiness::ModelReadiness,
+    fit: Option<crate::serve::wire::ModelFit>,
+    tune: TuneProfileViews<'_>,
 ) -> HiggsModelEntry {
-    let is_loaded = loaded_id == Some(model.id.as_str());
+    // Multi-model: this model is "loaded" if it is among the resident ids, not only
+    // when it is the primary.
+    let is_loaded = loaded_ids.iter().any(|id| id == &model.id);
     let tool_calls = tool_calls_supported(&model);
-    let support_reason = if !loadable {
-        // Gate 1 failed: surface the engine's verbatim load error.
-        load_reason
-    } else if !tool_calls {
-        // Gate 1 passed, Gate 2 failed: no parser matches the template.
-        Some("no tool-call parser matches this model's template".to_owned())
-    } else {
-        None
-    };
+    // Gate 2 (pure host-side template sniff): no parser matches the template.
+    let support_reason =
+        (!tool_calls).then(|| "no tool-call parser matches this model's template".to_owned());
     // The transient chat_template never leaves the host; drop it explicitly
     // (it is `serde(skip)` anyway). `gguf_components` stays on the model — its
     // single home — and rides the flattened payload.
@@ -136,1009 +64,330 @@ fn model_entry(
             "not-loaded".to_owned()
         },
         format: "gguf".to_owned(),
-        loadable,
         tool_calls,
         support_reason,
+        last_load,
+        readiness,
+        fit,
+        tuned_load: tune.analytical.map(|t| t.profile.clone()),
+        benched_load: tune.bench.map(|t| t.profile.clone()),
+        tune_provenance: tune.active.map(|t| t.provenance),
+        bench_tps: tune.bench.and_then(|t| t.bench_tps),
+        // The first CONCRETE tuned window, bench (measured) preferred — an
+        // Auto-pinned bench falls through to the analytical slot rather than
+        // hiding it. Slot-presence is the "tuned/benchmarked" predicate: the
+        // ACTIVE record never GATES, because a bare load demotes it to a
+        // Heuristic that is not a tune (see `TuneProfileViews`) — but when that
+        // demoted record pins a SMALLER fixed window, the value is min'd with it,
+        // since the active record is what a JIT load actually pins: shipping the
+        // bigger tuned number would promise output the serving window can't
+        // hold (Fable mt-r1). Normally active == a slot record, so the min is a
+        // no-op.
+        tuned_max_tokens: [tune.bench, tune.analytical]
+            .into_iter()
+            .flatten()
+            .find_map(|t| t.profile.ctx_len().fixed_n())
+            .map(|n| {
+                let n = match tune.active.and_then(|t| t.profile.ctx_len().fixed_n()) {
+                    Some(active_n) => n.min(active_n),
+                    None => n, // Auto active: the trained window, never below a tune
+                };
+                n.min(crate::serve::MAX_OUTPUT_TOKENS)
+            }),
         model,
     }
 }
 
-/// `GET /api/higgs/models` — live scan of all configured directories, plus
-/// the currently loaded model id and the Gate-1/Gate-2 support verdict per model.
-pub(super) async fn control_models(State(higgs): State<Arc<Higgs>>) -> Response {
-    tracing::info!("higgs: GET /api/higgs/models");
-    let (models, loaded_id) = match scan_with_loaded(&higgs).await {
-        Ok(pair) => pair,
-        Err(resp) => return resp,
-    };
-    // Gate 1 sweep: one representative path per distinct (arch, quant), probed
-    // once (cached thereafter). Every model sharing the combo inherits the verdict.
-    let mut reps: std::collections::HashMap<(String, String), String> =
-        std::collections::HashMap::new();
-    for m in &models {
-        reps.entry(support_key(m)).or_insert_with(|| m.path.clone());
-    }
-    let combos = reps.len();
-    let support = higgs
-        .probe_support(
-            reps.into_iter()
-                .map(|((arch, quant), path)| (arch, quant, path))
-                .collect(),
-        )
-        .await;
-    let unsupported = support.values().filter(|(loadable, _)| !*loadable).count();
-    tracing::info!("higgs: support sweep — probed {combos} combos, {unsupported} unsupported");
-    let entries: Vec<HiggsModelEntry> = models
-        .into_iter()
-        .map(|m| {
-            let (loadable, reason) = support
-                .get(&support_key(&m))
-                .cloned()
-                .unwrap_or((false, Some("probe verdict missing".to_owned())));
-            model_entry(m, loaded_id.as_deref(), loadable, reason)
-        })
-        .collect();
-    Json(HiggsModelsResponse {
-        models: entries,
-        loaded_id,
-    })
-    .into_response()
+/// The per-model tune views the entry serves: the ACTIVE record (JIT default,
+/// its provenance labels the default set) plus the analytical/bench history
+/// slots. `from_triple` grandfathers a pre-dual-slot store — one whose BOTH
+/// history slots are empty (an old `models.json` predating the slots) — by
+/// serving its lone active record under its own provenance's label. Once
+/// EITHER slot is populated the store is post-dual (`put_tuning` fills a slot
+/// on every real tune/turbotune), so the active record is NOT borrowed: a later
+/// bare load can demote it to a `Heuristic` that was never an analytical tune,
+/// and borrowing that would fabricate a "Tuned" set. (Residual A: on a store
+/// whose only write was a bare load, that lone record is indistinguishable from
+/// a pre-dual analytical tune and is served as Tuned — a real tune supersedes it.
+/// Residual B: on a pre-dual store whose FIRST post-upgrade action is a benchmark,
+/// the bench slot populates and the gate turns off, so the prior analytical tune
+/// stops being grandfathered as "Tuned" until the user re-runs Tune — accepted
+/// because that analytical set is deterministic and re-derivable in one click,
+/// whereas `put_tuning` backfilling the active record to keep it would reintroduce
+/// the bare-load masquerade this gate exists to prevent.)
+#[derive(Clone, Copy, Default)]
+pub(crate) struct TuneProfileViews<'a> {
+    active: Option<&'a crate::tune::store::TuneRecord>,
+    analytical: Option<&'a crate::tune::store::TuneRecord>,
+    bench: Option<&'a crate::tune::store::TuneRecord>,
 }
 
-/// `GET /api/higgs/models/{*id}` — single enriched model by HuggingFace repo id.
-///
-/// The wildcard captures the full remaining path so slashed HF repo ids
-/// (`org/model`, `lmstudio-community/Foo-GGUF`) round-trip correctly.
-/// Returns [`HiggsModelEntry`] on success, or 404 [`HiggsErrorResponse`] when the
-/// id is absent from the scanned catalog.
-pub(super) async fn control_model_by_id(
-    State(higgs): State<Arc<Higgs>>,
-    Path(id): Path<String>,
-) -> Response {
-    tracing::info!(id = %id, "higgs: GET /api/higgs/models/{{*id}}");
-    let (models, loaded_id) = match scan_with_loaded(&higgs).await {
-        Ok(pair) => pair,
-        Err(resp) => return resp,
-    };
-    match models.into_iter().find(|m| m.id == id) {
-        Some(model) => {
-            // Gate 1 for this one model's (arch, quant) — cached after the first probe.
-            let (arch, quant) = support_key(&model);
-            let support = higgs
-                .probe_support(vec![(arch.clone(), quant.clone(), model.path.clone())])
-                .await;
-            let (loadable, reason) = support
-                .get(&(arch, quant))
-                .cloned()
-                .unwrap_or((false, Some("probe verdict missing".to_owned())));
-            Json(model_entry(model, loaded_id.as_deref(), loadable, reason)).into_response()
+pub(crate) type TuneTriple = (
+    Option<crate::tune::store::TuneRecord>,
+    Option<crate::tune::store::TuneRecord>,
+    Option<crate::tune::store::TuneRecord>,
+);
+
+/// The ACTIVE ("latest") tuning record per model, extracted from the
+/// `(active, analytical, bench)` triples the models list ALSO reads for its
+/// dual-profile wire fields. Readiness reads THIS map, so readiness and the
+/// `tuned_load`/`benched_load` fields both come from ONE `models.json` snapshot —
+/// a concurrent tune between two separate store reads can no longer make a row's
+/// readiness disagree with its profile fields.
+pub(crate) fn active_records(
+    profiles: &std::collections::BTreeMap<String, TuneTriple>,
+) -> std::collections::BTreeMap<String, crate::tune::store::TuneRecord> {
+    profiles
+        .iter()
+        .filter_map(|(id, (active, _, _))| active.clone().map(|a| (id.clone(), a)))
+        .collect()
+}
+
+impl<'a> TuneProfileViews<'a> {
+    pub(crate) fn from_triple(triple: Option<&'a TuneTriple>) -> Self {
+        let Some((active, analytical, bench)) = triple else {
+            return Self::default();
+        };
+        let active = active.as_ref();
+        let mut analytical = analytical.as_ref();
+        let mut bench = bench.as_ref();
+        // Grandfather ONLY a true pre-dual store (both history slots empty). A
+        // post-dual store always has a slot filled by `put_tuning`, so borrowing
+        // the active record there would surface a bare-load `Heuristic` — a manual
+        // reload that `set_profile` demoted after a turbotune — as the analytical
+        // "Tuned" set it never was.
+        if analytical.is_none() && bench.is_none() {
+            if let Some(a) = active {
+                if a.provenance == crate::tune::TuneProvenance::Bench {
+                    bench = Some(a);
+                } else {
+                    analytical = Some(a);
+                }
+            }
         }
-        None => {
-            let err = HiggsError::ModelNotFound { id };
-            tracing::warn!(error = %err, "higgs: model not found");
-            control_error(&err).into_response()
+        Self {
+            active,
+            analytical,
+            bench,
         }
     }
 }
 
-/// `POST /api/higgs/models/load` — load a model by id; absent parameters
-/// fall back to the host-configured defaults.
-pub(super) async fn control_load(
-    State(higgs): State<Arc<Higgs>>,
-    Json(req): Json<HiggsLoadRequest>,
-) -> Response {
-    tracing::warn!(id = %req.id, "higgs: loading model");
-    // A request with NO load parameter at all is a fully-default load —
-    // `Higgs::load` applies `default_load` itself (and ctx_len auto-cap). The
-    // moment ANY field is pinned, build a LoadParams: the three base fields fall
-    // back to `default_load`, every optional override passes through verbatim
-    // (absent = `None` = engine default).
-    let any_pinned = req.ctx_len.is_some()
-        || req.gpu_layers.is_some()
-        || req.threads.is_some()
-        || req.use_mmap.is_some()
-        || req.use_mlock.is_some()
-        || req.n_batch.is_some()
-        || req.n_ubatch.is_some()
-        || req.offload_kqv.is_some()
-        || req.rope_freq_base.is_some()
-        || req.rope_freq_scale.is_some()
-        || req.flash_attn.is_some()
-        || req.type_k.is_some()
-        || req.type_v.is_some()
-        || req.seed.is_some();
-    let params = if !any_pinned {
-        None
+/// Build the current hub-mode status. `enabled` = the hub network is up (accepting dials);
+/// `node_count` is the fleet size, which persists across a disable (nodes then show disconnected
+/// until the hub is re-enabled and they reconnect).
+pub(crate) async fn hub_status(higgs: &Higgs) -> HiggsHubStatus {
+    let node_count = match higgs.fleet() {
+        Some(fleet) => u32::try_from(fleet.nodes_view().await.len()).unwrap_or(u32::MAX),
+        None => 0,
+    };
+    match higgs.hub() {
+        Some(hub) => HiggsHubStatus {
+            enabled: true,
+            hub_id: Some(hub.hub_id().to_string()),
+            node_count,
+        },
+        None => HiggsHubStatus {
+            enabled: false,
+            hub_id: None,
+            node_count,
+        },
+    }
+}
+
+// ── API-key management (G4): the mint / revoke DECISION cores ───────────────
+//
+// The bearer-authenticated mutation glue lives on the facade
+// (`Higgs::mint_key` / `Higgs::revoke_key`); these pure decision functions are
+// shared so the in-process and (historically) HTTP callers enforce the same
+// invariants over the LOCKED keystore.
+
+/// The outcome of a mint decision, computed against the LOCKED keystore.
+pub(crate) enum Mint {
+    /// Mint with these effective scopes.
+    Ok(Vec<crate::keys::Scope>),
+    /// A key with this label already exists.
+    Duplicate,
+    /// Non-bootstrap mint with no valid Admin bearer for the current store.
+    Unauthorized,
+    /// A BOOTSTRAP mint (first key) whose EXPLICIT scopes omit `admin`: it would
+    /// flip auth on yet be unable to reach the Admin-scoped key-management API,
+    /// with no HTTP path left to recover ([codex r10]).
+    BootstrapNeedsAdmin,
+}
+
+/// Validate a mint label's charset. Labels address a key for revocation as a
+/// SINGLE path segment — anything that can't round-trip through such a segment
+/// (slashes, whitespace, control chars) must be rejected at mint or the key
+/// becomes unrevokable. `.` / `..` pass the charset but URL parsers normalize
+/// dot-segments away, so those are rejected too. Shared by the crate API's
+/// [`Higgs::mint_key`](crate::api::Higgs::mint_key).
+pub(crate) fn validate_key_label(label: &str) -> Result<(), HiggsError> {
+    let label_ok = !label.is_empty()
+        && label.len() <= 64
+        && label != "."
+        && label != ".."
+        && label
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if label_ok {
+        Ok(())
     } else {
-        let base = higgs.default_load();
-        Some(LoadParams {
-            ctx_len: req.ctx_len.unwrap_or(base.ctx_len),
-            gpu_layers: req.gpu_layers.unwrap_or(base.gpu_layers),
-            threads: req.threads.unwrap_or(base.threads),
-            use_mmap: req.use_mmap,
-            use_mlock: req.use_mlock,
-            n_batch: req.n_batch,
-            n_ubatch: req.n_ubatch,
-            offload_kqv: req.offload_kqv,
-            rope_freq_base: req.rope_freq_base,
-            rope_freq_scale: req.rope_freq_scale,
-            flash_attn: req.flash_attn,
-            type_k: req.type_k,
-            type_v: req.type_v,
-            seed: req.seed,
+        Err(HiggsError::InvalidKeyRequest {
+            detail: format!(
+                "invalid key label {label:?} — use 1-64 chars from [A-Za-z0-9._-] (the label must fit in a single URL path segment to be revocable)"
+            ),
         })
-    };
-    let started = std::time::Instant::now();
-    match higgs.load(&req.id, params).await {
-        Ok(()) => {
-            // Record the per-load idle-TTL override (HOST-SIDE only). It takes
-            // precedence over the global TTL in the idle reaper for THIS model
-            // and is cleared on unload. Absent = use the global TTL.
-            higgs.set_loaded_idle_ttl_override(req.idle_ttl_minutes);
-            // Completion line — bookends the "loading model" start line in the
-            // Developer Logs. id + elapsed go in the MESSAGE so they render in the
-            // console (the log layer captures the message + the `error` field only).
-            tracing::info!(
-                "higgs: model loaded: {} ({} ms)",
-                req.id,
-                started.elapsed().as_millis()
-            );
-            Json(HiggsLoadResponse {
-                status: HiggsOk::new(),
-                id: req.id,
-            })
-            .into_response()
-        }
-        Err(err) => {
-            // `error = %err` carries the full typed reason (worker RPC → HG004
-            // engine-load failure → llama.cpp detail); the log layer appends it.
-            tracing::warn!(id = %req.id, error = %err, "higgs: load failed");
-            control_error(&err).into_response()
-        }
     }
 }
 
-/// `POST /api/higgs/models/unload` — unload the current model.
-pub(super) async fn control_unload(State(higgs): State<Arc<Higgs>>) -> Response {
-    tracing::warn!("higgs: unloading model");
-    match higgs.unload().await {
-        Ok(()) => Json(HiggsOk::new()).into_response(),
-        Err(err) => {
-            tracing::warn!(error = %err, "higgs: unload failed");
-            control_error(&err).into_response()
-        }
-    }
-}
-
-/// `GET /api/higgs/status` — live engine + model status snapshot.
-pub(super) async fn control_status(State(higgs): State<Arc<Higgs>>) -> Response {
-    tracing::info!("higgs: GET /api/higgs/status");
-    match higgs.status().await {
-        Ok(status) => Json(status).into_response(),
-        Err(err) => {
-            tracing::warn!(error = %err, "higgs: status failed");
-            control_error(&err).into_response()
-        }
-    }
-}
-
-/// `GET /api/higgs/logs?n=200` — Developer-Log tail (worker stderr + captured
-/// serve-layer request events), oldest first. Point-in-time snapshot; for a
-/// live feed use `GET /api/higgs/logs/stream`.
-pub(super) async fn control_logs(
-    State(higgs): State<Arc<Higgs>>,
-    Query(q): Query<LogsQuery>,
-) -> Json<HiggsLogsResponse> {
-    tracing::info!(
-        n = q.n.unwrap_or(DEFAULT_LOG_LINES),
-        "higgs: GET /api/higgs/logs"
-    );
-    Json(HiggsLogsResponse {
-        lines: higgs.logs(q.n.unwrap_or(DEFAULT_LOG_LINES), q.filter()),
-    })
-}
-
-/// `GET /api/higgs/logs/settings` — current Developer-Log toggle state
-/// ("Verbose Logging" and "Log Incoming Tokens").
-pub(super) async fn control_logs_settings(State(higgs): State<Arc<Higgs>>) -> Json<LogSettings> {
-    tracing::info!("higgs: GET /api/higgs/logs/settings");
-    Json(LogSettings {
-        verbose: higgs.verbose(),
-        log_incoming_tokens: higgs.log_incoming_tokens(),
-        show_log_fields: higgs.log_show_fields(),
-    })
-}
-
-/// `PUT /api/higgs/logs/settings` — set both Developer-Log toggles ("Verbose
-/// Logging" and "Log Incoming Tokens"). A state-changing control op, so it logs
-/// at `warn` with the new values.
-pub(super) async fn control_set_logs_settings(
-    State(higgs): State<Arc<Higgs>>,
-    Json(body): Json<LogSettings>,
-) -> Json<HiggsOk> {
-    tracing::warn!(
-        verbose = body.verbose,
-        log_incoming_tokens = body.log_incoming_tokens,
-        show_log_fields = body.show_log_fields,
-        "higgs: set developer-log toggles"
-    );
-    higgs.set_verbose(body.verbose);
-    higgs.set_log_incoming_tokens(body.log_incoming_tokens);
-    higgs.set_log_show_fields(body.show_log_fields);
-    Json(HiggsOk::new())
-}
-
-/// `GET /api/higgs/settings` — current runtime server-behavior flags
-/// (just-in-time loading).
-pub(super) async fn control_settings(
-    State(higgs): State<Arc<Higgs>>,
-) -> Json<HiggsRuntimeSettings> {
-    tracing::info!("higgs: GET /api/higgs/settings");
-    Json(HiggsRuntimeSettings {
-        jit_enabled: higgs.jit_enabled(),
-        auto_unload_idle: higgs.auto_unload_idle(),
-        idle_ttl_minutes: higgs.idle_ttl_minutes(),
-        serving_enabled: higgs.serving_enabled(),
-    })
-}
-
-/// `PUT /api/higgs/settings` — set the runtime server-behavior flags
-/// (just-in-time loading). A state-changing control op, so it logs at `warn`
-/// with the new value.
-pub(super) async fn control_set_settings(
-    State(higgs): State<Arc<Higgs>>,
-    Json(body): Json<HiggsRuntimeSettings>,
-) -> Json<HiggsOk> {
-    tracing::warn!(
-        jit_enabled = body.jit_enabled,
-        auto_unload_idle = body.auto_unload_idle,
-        idle_ttl_minutes = body.idle_ttl_minutes,
-        serving_enabled = body.serving_enabled,
-        "higgs: set runtime server-behavior flags"
-    );
-    higgs.set_jit_enabled(body.jit_enabled);
-    higgs.set_auto_unload_idle(body.auto_unload_idle);
-    higgs.set_idle_ttl_minutes(body.idle_ttl_minutes);
-    higgs.set_serving_enabled(body.serving_enabled);
-    Json(HiggsOk::new())
-}
-
-/// `GET /api/higgs/logs/stream?n=200` — LIVE Developer Logs over SSE.
+/// Decide a mint against the CURRENT (locked) keystore `ks`. Pure — derives
+/// `bootstrap` from `ks` itself, so the empty-store window can't be raced: a
+/// second unauthenticated mint that reaches the lock after the first key
+/// landed sees a non-empty store, fails the bearer recheck, and is refused.
+/// The bootstrap mint (empty store) is allowed unauthenticated and MUST grant
+/// `Admin` — it defaults to `[admin]` when scopes are omitted, and REJECTS
+/// explicit scopes that omit `admin` ([`Mint::BootstrapNeedsAdmin`]), since a
+/// non-admin first key would flip auth on and lock the HTTP management surface
+/// out of itself with no recovery path. Later omitted-scopes mints default to
+/// `[chat, models]`. Explicit `requested` scopes otherwise win.
 ///
-/// Replays the last `n` history lines first (so a fresh subscriber sees recent
-/// context), then streams every new line as it is produced. Each line — worker
-/// stderr or a captured serve-layer request event — arrives as one SSE `data:`
-/// frame. A slow client that overflows the broadcast buffer gets a `Lagged`
-/// from the receiver: the handler logs a warning, emits a gap marker, and keeps
-/// streaming rather than dropping the connection. Stream ends on client
-/// disconnect or when the bus sender is permanently closed.
-pub(super) async fn control_logs_stream(
-    State(higgs): State<Arc<Higgs>>,
-    Query(q): Query<LogsQuery>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let n = q.n.unwrap_or(DEFAULT_LOG_LINES);
-    let filter = q.filter();
-    tracing::info!(n, "higgs: GET /api/higgs/logs/stream");
-
-    // Subscribe BEFORE snapshotting so no line slips between replay and live —
-    // a line that lands in this window is duplicated at worst, never lost.
-    let mut rx = higgs.subscribe_logs();
-    let replay = higgs.logs(n, filter);
-
-    // Pump replay-then-live lines into a channel, then `unfold` the receiver —
-    // the same Sse construction shape as the chat SSE path (`serve::stream`).
-    let (tx, out) = mpsc::unbounded_channel::<String>();
-    tokio::spawn(async move {
-        for line in replay {
-            if tx.send(line).is_err() {
-                return; // client gone before live phase
+/// `trusted` = an IN-PROCESS caller (the crate API's [`Higgs::mint_key`]): it
+/// short-circuits ONLY the bearer [`Mint::Unauthorized`] branch — EVERY structural
+/// invariant below (duplicate, bootstrap-needs-admin, scope defaults) still runs.
+pub(crate) fn decide_mint(
+    ks: &crate::keys::ApiKeys,
+    trusted: bool,
+    bearer: Option<&str>,
+    requested: Option<Vec<crate::keys::Scope>>,
+    label: &str,
+) -> Mint {
+    use crate::keys::Scope;
+    // `bootstrap` = the WHOLE store is empty (hidden keys included). Deliberately
+    // NOT `visible().next().is_none()`: with a hidden internal Admin present
+    // (embedded mode) the store is already auth-enabled and manageable via that
+    // hidden bearer, so the "first key must be Admin so you don't lock yourself
+    // out" rule does not apply — and forcing the first VISIBLE key to Admin would
+    // OVER-GRANT (an external-app token would silently become Admin). A caller who
+    // wants an admin key still requests `Admin` explicitly; standalone `higgs keys
+    // add` can always mint one directly. Auth stays gated on the full store below.
+    let bootstrap = ks.is_empty();
+    if !trusted && !bootstrap && !bearer.is_some_and(|t| ks.authorizes(t, Scope::Admin)) {
+        return Mint::Unauthorized;
+    }
+    if ks.iter().any(|k| k.label == label) {
+        return Mint::Duplicate;
+    }
+    // The FIRST key must be able to manage keys — reject explicit non-admin
+    // bootstrap scopes rather than mint a self-locking key.
+    if bootstrap {
+        if let Some(scopes) = &requested {
+            if !scopes.contains(&Scope::Admin) {
+                return Mint::BootstrapNeedsAdmin;
             }
         }
-        loop {
-            match rx.recv().await {
-                Ok(line) => {
-                    // Drop lines from other sources when a `?source=` filter is set.
-                    if let Some(f) = filter {
-                        if line.source != f {
-                            continue;
-                        }
-                    }
-                    if tx.send(line.text).is_err() {
-                        return; // client disconnected
-                    }
-                }
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    tracing::warn!(skipped, "higgs: log stream subscriber lagged");
-                    let marker = format!("[log stream lagged — dropped {skipped} lines]");
-                    if tx.send(marker).is_err() {
-                        return;
-                    }
-                }
-                // Sender dropped (worker+bus gone) — end the stream cleanly.
-                Err(broadcast::error::RecvError::Closed) => return,
-            }
+    }
+    let scopes = requested.unwrap_or_else(|| {
+        if bootstrap {
+            vec![Scope::Admin]
+        } else {
+            vec![Scope::Chat, Scope::Models]
         }
     });
-
-    let stream = futures::stream::unfold(out, |mut out| async move {
-        out.recv()
-            .await
-            .map(|line| (Ok::<_, Infallible>(Event::default().data(line)), out))
-    });
-
-    Sse::new(stream).keep_alive(KeepAlive::default())
+    Mint::Ok(scopes)
 }
 
-/// `POST /api/higgs/worker/stop` — gracefully shut down the worker.
-pub(super) async fn control_worker_stop(State(higgs): State<Arc<Higgs>>) -> Json<HiggsOk> {
-    tracing::warn!("higgs: stopping worker");
-    higgs.stop().await;
-    Json(HiggsOk::new())
+/// The outcome of a revoke decision, computed against the LOCKED keystore.
+pub(crate) enum Revoke {
+    /// Remove keys with the label; carries the count that will be removed.
+    Removed(usize),
+    /// The store became non-empty (a bootstrap mint won a race) and the request
+    /// carries no Admin bearer — refuse (codex r7, mirrors the mint recheck).
+    Unauthorized,
+    /// Would empty the keystore while LAN-exposed ([HG059]).
+    LastKeyOnLan,
+    /// Would remove the LAST Admin-capable key while OTHER (non-Admin) keys remain
+    /// — auth stays on but the Admin-only management surface becomes unreachable, a
+    /// lockout ([HG066]). Emptying the store entirely (turning auth off) is allowed;
+    /// stranding non-Admin keys is not.
+    LastAdminKey,
 }
 
-/// `GET /api/higgs/version` — higgs build version and engine info.
-pub(super) async fn control_version() -> Json<HiggsVersionResponse> {
-    tracing::info!("higgs: GET /api/higgs/version");
-    Json(HiggsVersionResponse {
-        higgs: env!("CARGO_PKG_VERSION").to_owned(),
-        engine: "llama.cpp".to_owned(),
-        engine_version: crate::worker::engine::llamacpp::engine_version(),
-        binding: LLAMA_CPP_2_VERSION.to_owned(),
-        supported_formats: vec!["gguf".to_owned()],
-    })
-}
-
-/// `GET /api/higgs/system` — host hardware (CPU/RAM/load) + inference runtime.
+/// Decide a revoke against the CURRENT (locked) keystore `ks`. Pure. A non-empty
+/// store REQUIRES a live Admin bearer: authorization is re-derived from the
+/// locked store, not trusted from an earlier pass, so a DELETE admitted while the
+/// store was empty (auth off) is refused if a concurrent bootstrap mint committed
+/// first. `lan_exposed` gates the last-key [HG059] refusal.
 ///
-/// Gathering samples CPU load over a short interval, so it runs on a blocking
-/// thread to avoid stalling the async executor.
-pub(super) async fn control_system(State(higgs): State<Arc<Higgs>>) -> Json<SystemInfo> {
-    tracing::info!("higgs: GET /api/higgs/system");
-    // Snapshot the read-only server config (cheap lock, no I/O) on the async
-    // thread, then move it into the blocking gather (which samples CPU load).
-    let config = higgs.server_config();
-    // Gather the worker-reported devices first (async — a transient worker RPC),
-    // then fold them into the blocking hardware/runtime snapshot. An empty list
-    // (no worker reachable) still yields a complete hardware/runtime response.
-    let gpus = higgs.sysinfo().await;
-    let info = tokio::task::spawn_blocking(move || SystemInfo::gather(config, gpus))
-        .await
-        .expect("system info gather task");
-    Json(info)
+/// `trusted` = an IN-PROCESS caller (the crate API's [`Higgs::revoke_key`]): it
+/// short-circuits ONLY the bearer [`Revoke::Unauthorized`] branch — the last-admin
+/// ([HG066]) and last-key-on-LAN ([HG059]) invariants below still run.
+pub(crate) fn decide_revoke(
+    ks: &crate::keys::ApiKeys,
+    trusted: bool,
+    bearer: Option<&str>,
+    label: &str,
+    lan_exposed: bool,
+) -> Revoke {
+    if !trusted
+        && !ks.is_empty()
+        && !bearer.is_some_and(|t| ks.authorizes(t, crate::keys::Scope::Admin))
+    {
+        return Revoke::Unauthorized;
+    }
+    // Every structural guard below operates over the VISIBLE keystore ONLY. A
+    // hidden internal key (the embedder's in-memory token, [`ApiKeys::add_internal`])
+    // is never persisted and never listable, so it must not influence a revoke
+    // decision: counting it in `total` would make `matching < total` true even
+    // when the user deletes their sole VISIBLE key, spuriously tripping the
+    // last-admin guard; counting it in `admin_remains` would let the last VISIBLE
+    // admin be revoked and strand the persisted management surface. The earlier
+    // auth re-check (is_empty / authorizes) still uses the FULL store — that is an
+    // AUTH question, and the hidden token legitimately authorizes. `visible() ==
+    // iter()` for a standalone higgs (no hidden keys), so this is byte-identical
+    // there.
+    let total = ks.visible().count();
+    let matching = ks.visible().filter(|k| k.label == label).count();
+    if matching > 0 && lan_exposed && matching == total {
+        return Revoke::LastKeyOnLan;
+    }
+    // Removing the LAST VISIBLE Admin key while OTHER visible keys remain locks the
+    // Admin-only management surface out of the persisted store — refuse. Two guards
+    // must both hold for that to be the case:
+    //   • the revoke actually removes a visible Admin (`removing_an_admin`) — revoking
+    //     a NON-admin key can't strand a management surface, even a store that never
+    //     had a visible Admin (reachable when an embedder mints scoped keys under its
+    //     hidden Admin), so those revokes stay allowed; and
+    //   • no visible Admin would remain afterwards (`!admin_remains`).
+    // Emptying the visible store entirely (matching == total → the persisted surface
+    // turns auth OFF) is a separate, allowed operation, gated only by the LAN check.
+    if matching > 0 && matching < total {
+        let removing_an_admin = ks
+            .visible()
+            .filter(|k| k.label == label)
+            .any(|k| k.scopes.contains(&crate::keys::Scope::Admin));
+        let admin_remains = ks
+            .visible()
+            .filter(|k| k.label != label)
+            .any(|k| k.scopes.contains(&crate::keys::Scope::Admin));
+        if removing_an_admin && !admin_remains {
+            return Revoke::LastAdminKey;
+        }
+    }
+    Revoke::Removed(matching)
+}
+
+/// Map a keystore file I/O failure onto the coded store error ([HG040]).
+pub(crate) fn keystore_io_error(e: std::io::Error) -> HiggsError {
+    HiggsError::PersistenceFailed {
+        store: "api_keys".into(),
+        path: crate::keys::keys_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "api_keys.json".into()),
+        source: e,
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::super::test_support::*;
-    use crate::log_bus::LogSource;
-    use axum::http::StatusCode;
-    use serde_json::json;
-    use std::time::Duration;
-    use tower::ServiceExt;
-
-    // ── Gate 2: host-side tool-call-parser sniff ─────────────────────────────
-
-    /// Build a minimal scanned model carrying only the chat template that the
-    /// Gate-2 sniff inspects; all other fields are placeholder.
-    fn model_with_template(template: Option<&str>) -> crate::worker::models::HiggsModel {
-        crate::worker::models::HiggsModel {
-            id: "org/model".into(),
-            path: "/x.gguf".into(),
-            size_bytes: 0,
-            quant: None,
-            source: crate::worker::models::HiggsModelSource::LmStudio,
-            arch: None,
-            ctx_train: None,
-            has_chat_template: template.is_some(),
-            supports_tools: false,
-            supports_reasoning: false,
-            gguf_components: Vec::new(),
-            chat_template: template.map(ToOwned::to_owned),
-        }
-    }
-
-    #[test]
-    fn gate2_sniffs_tool_call_template() {
-        // A template with the generic `<tool_call>` marker → a parser matches.
-        let with_calls = model_with_template(Some(
-            "{% for m in messages %}<|im_start|>{{ m.role }}<tool_call>{{ tool }}</tool_call>",
-        ));
-        assert!(
-            super::tool_calls_supported(&with_calls),
-            "<tool_call> matches"
-        );
-
-        // A plain chatml template with no tool markup → no parser matches.
-        let plain = model_with_template(Some(
-            "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>",
-        ));
-        assert!(
-            !super::tool_calls_supported(&plain),
-            "plain chatml: no match"
-        );
-
-        // No template at all → false.
-        assert!(!super::tool_calls_supported(&model_with_template(None)));
-    }
-
-    // ── Test 6: control load + unload roundtrip ──────────────────────────────
-
-    #[tokio::test]
-    async fn control_load_unload_roundtrip() {
-        let (sup, mut test_write, _test_read, _ring) = make_supervisor();
-        // `load` resolves the GGUF path host-side, so the id must be discoverable.
-        let dir = tempfile::TempDir::new().unwrap();
-        write_gguf_fixture(dir.path(), "org/model");
-        let app = make_app_with_lmstudio(sup, dir.path().to_path_buf());
-
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            write_response(&mut test_write, 1, json!({"id": "org/model"})).await; // higgs/load
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            write_response(&mut test_write, 2, loaded_status_json()).await; // status (unload id capture)
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            write_response(&mut test_write, 3, serde_json::Value::Null).await; // higgs/unload
-        });
-
-        let resp = app
-            .clone()
-            .oneshot(post_json(
-                "/api/higgs/models/load",
-                &json!({"id": "org/model"}),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-        assert_eq!(v["status"], "ok");
-        assert_eq!(v["id"], "org/model");
-
-        let resp = app
-            .oneshot(post_json("/api/higgs/models/unload", &json!({})))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-        assert_eq!(v["status"], "ok");
-    }
-
-    // ── Test 7: control_model_by_id with a slashed HF repo id ───────────────
-    //
-    // This is the regression test for the wildcard-route bug: with the old
-    // single-segment `{id}` route, a request to `/api/higgs/models/org/model`
-    // (literal slash in the path, as real curl sends) never matched — axum
-    // treated `org` and `model` as separate segments. The test previously used
-    // `org%2Fmodel` (percent-encoded) which happened to work against the broken
-    // route because `%2F` is a single segment. Using a literal slash here
-    // ensures the wildcard `{*id}` route is exercised as real callers do.
-
-    #[tokio::test]
-    async fn control_model_by_id_found_slashed() {
-        let (sup, mut test_write, _test_read, _ring) = make_supervisor();
-        // Scan runs host-side: discover the slashed id from a real GGUF fixture.
-        let dir = tempfile::TempDir::new().unwrap();
-        write_gguf_fixture(
-            dir.path(),
-            "lmstudio-community/NVIDIA-Nemotron-3-Nano-4B-GGUF",
-        );
-        let app = make_app_with_lmstudio(sup, dir.path().to_path_buf());
-
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            // Only the worker RPC remains: status (nothing loaded).
-            write_response(
-                &mut test_write,
-                1,
-                serde_json::json!({"loaded": null, "models_scanned": 1}),
-            )
-            .await;
-        });
-
-        // Literal slash in the URL — this is what real curl sends and what
-        // the old `{id}` route could never match.
-        let resp = app
-            .oneshot(get(
-                "/api/higgs/models/lmstudio-community/NVIDIA-Nemotron-3-Nano-4B-GGUF",
-            ))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-        assert_eq!(v["id"], "lmstudio-community/NVIDIA-Nemotron-3-Nano-4B-GGUF");
-        assert_eq!(v["state"], "not-loaded");
-        assert_eq!(v["format"], "gguf");
-        assert_eq!(v["arch"], "llama");
-    }
-
-    // ── Test 8: control_model_by_id not found (slashed id) ───────────────────
-
-    #[tokio::test]
-    async fn control_model_by_id_not_found() {
-        let (sup, mut test_write, _test_read, _ring) = make_supervisor();
-        // Empty temp dir → host-side scan finds nothing → the id is absent.
-        let dir = tempfile::TempDir::new().unwrap();
-        let app = make_app_with_lmstudio(sup, dir.path().to_path_buf());
-
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            // Only the worker RPC remains: status (nothing loaded).
-            write_response(
-                &mut test_write,
-                1,
-                serde_json::json!({"loaded": null, "models_scanned": 0}),
-            )
-            .await;
-        });
-
-        // Slashed id that does not exist in the catalog → 404 HG002.
-        let resp = app
-            .oneshot(get("/api/higgs/models/org/nope"))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-        assert!(v["error"].as_str().unwrap().contains("[HG002]"));
-    }
-
-    // ── Test 9: version endpoint ──────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn version_endpoint() {
-        let (sup, _test_write, _test_read, _ring) = make_supervisor();
-        let app = make_app(sup);
-
-        let resp = app.oneshot(get("/api/higgs/version")).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-        assert!(v["higgs"].as_str().is_some(), "higgs version present");
-        assert_eq!(v["engine"], "llama.cpp");
-        // engine_version is the real engine (ggml) version from ggml_version();
-        // binding is the llama-cpp-2 wrapper version — distinct fields.
-        assert!(v["engine_version"].as_str().is_some_and(|s| !s.is_empty()));
-        assert!(v["binding"].as_str().is_some_and(|s| !s.is_empty()));
-        let fmts = v["supported_formats"].as_array().expect("array");
-        assert!(fmts.contains(&serde_json::Value::String("gguf".to_owned())));
-    }
-
-    // ── (original Test 7, now test 10): logs endpoint shape and tail semantics ─
-
-    #[tokio::test]
-    async fn logs_endpoint_shapes() {
-        let (sup, _test_write, _test_read, bus) = make_supervisor();
-        bus.push(LogSource::Serve, "line one".to_owned());
-        bus.push(LogSource::Serve, "line two".to_owned());
-        bus.push(LogSource::Serve, "line three".to_owned());
-        let app = make_app(sup);
-
-        let resp = app.oneshot(get("/api/higgs/logs?n=2")).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-        assert_eq!(
-            v["lines"],
-            json!(["line two", "line three"]),
-            "tail of n, oldest first"
-        );
-    }
-
-    /// `?source=serve|worker` routes the two log origins to separate consoles —
-    /// end-to-end through the HTTP snapshot handler.
-    #[tokio::test]
-    async fn logs_endpoint_filters_by_source() {
-        let (sup, _test_write, _test_read, bus) = make_supervisor();
-        bus.push(LogSource::Serve, "higgs: GET /v1/models".to_owned());
-        bus.push(LogSource::Worker, "ggml_metal_init: loaded".to_owned());
-        bus.push(LogSource::Serve, "higgs: loading model".to_owned());
-        let app = make_app(sup);
-
-        // ?source=worker → only the worker stderr line.
-        let resp = app
-            .clone()
-            .oneshot(get("/api/higgs/logs?source=worker"))
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-        assert_eq!(
-            v["lines"],
-            json!(["ggml_metal_init: loaded"]),
-            "worker only"
-        );
-
-        // ?source=serve → only the higgs control-plane lines, in push order.
-        let resp = app
-            .clone()
-            .oneshot(get("/api/higgs/logs?source=serve"))
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-        assert_eq!(
-            v["lines"],
-            json!(["higgs: GET /v1/models", "higgs: loading model"]),
-            "serve only"
-        );
-
-        // No filter → all three, merged in push order.
-        let resp = app.oneshot(get("/api/higgs/logs")).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-        assert_eq!(
-            v["lines"].as_array().map(Vec::len),
-            Some(3),
-            "no filter = all sources merged"
-        );
-    }
-
-    // ── logs SSE stream: replay-then-live ordering ───────────────────────────
-
-    #[tokio::test]
-    async fn logs_stream_replays_then_streams_live() {
-        use super::{control_logs_stream, LogsQuery};
-        use crate::api::{Higgs, HiggsConfig};
-        use axum::extract::{Query, State};
-        use axum::response::IntoResponse;
-        use futures::StreamExt;
-        use std::sync::Arc;
-        use std::time::Duration;
-
-        let (sup, _test_write, _test_read, bus) = make_supervisor();
-        // Seed history BEFORE the request — this is the replay prefix.
-        bus.push(LogSource::Serve, "hist-1".to_owned());
-        bus.push(LogSource::Serve, "hist-2".to_owned());
-
-        let higgs = Arc::new(Higgs::with_supervisor(
-            Arc::new(sup),
-            HiggsConfig::default(),
-        ));
-        let resp = control_logs_stream(
-            State(higgs.clone()),
-            Query(LogsQuery {
-                n: Some(10),
-                source: None,
-            }),
-        )
-        .await
-        .into_response();
-        assert_eq!(
-            resp.headers()
-                .get(axum::http::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok()),
-            Some("text/event-stream"),
-            "SSE content-type"
-        );
-
-        let mut body = resp.into_body().into_data_stream();
-
-        // The replay prefix arrives first; collect frames until both history
-        // lines have been seen.
-        let mut seen = String::new();
-        while !(seen.contains("hist-1") && seen.contains("hist-2")) {
-            let frame = tokio::time::timeout(Duration::from_secs(2), body.next())
-                .await
-                .expect("replay frame within timeout")
-                .expect("body not ended")
-                .expect("frame ok");
-            seen.push_str(&String::from_utf8_lossy(&frame));
-        }
-        assert!(
-            seen.contains("hist-1") && seen.contains("hist-2"),
-            "replay: {seen}"
-        );
-
-        // After replay the stream is parked on the live receiver. Push a new line
-        // and it must arrive as a frame — proving live delivery, not closure.
-        bus.push(LogSource::Serve, "live-1".to_owned());
-        let mut live_seen = String::new();
-        while !live_seen.contains("live-1") {
-            let frame = tokio::time::timeout(Duration::from_secs(2), body.next())
-                .await
-                .expect("live frame within timeout")
-                .expect("body not ended")
-                .expect("frame ok");
-            live_seen.push_str(&String::from_utf8_lossy(&frame));
-        }
-        assert!(live_seen.contains("live-1"), "live: {live_seen}");
-
-        // The replay source itself is ordered oldest-first ahead of the live line.
-        assert_eq!(
-            higgs.logs(10, None),
-            vec![
-                "hist-1".to_owned(),
-                "hist-2".to_owned(),
-                "live-1".to_owned()
-            ]
-        );
-    }
-
-    // ── control_models: scan + status enrichment ─────────────────────────────
-
-    #[tokio::test]
-    async fn control_models_lists_with_loaded_flag() {
-        let (sup, mut test_write, _test_read, _ring) = make_supervisor();
-        // Host-side scan discovers `org/model`; the worker reports it loaded.
-        let dir = tempfile::TempDir::new().unwrap();
-        write_gguf_fixture(dir.path(), "org/model");
-        let app = make_app_with_lmstudio(sup, dir.path().to_path_buf());
-
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            write_response(&mut test_write, 1, loaded_status_json()).await; // status
-        });
-
-        let resp = app.oneshot(get("/api/higgs/models")).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-        assert_eq!(v["loaded_id"], "org/model");
-        let models = v["models"].as_array().expect("models array");
-        assert_eq!(models.len(), 1);
-        assert_eq!(models[0]["state"], "loaded", "loaded id is flagged");
-        assert_eq!(models[0]["format"], "gguf");
-        assert_eq!(models[0]["id"], "org/model");
-    }
-
-    // ── control_status passthrough ───────────────────────────────────────────
-
-    #[tokio::test]
-    async fn control_status_returns_snapshot() {
-        let (sup, mut test_write, _test_read, _ring) = make_supervisor();
-        let app = make_app(sup);
-
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            write_response(&mut test_write, 1, loaded_status_json()).await;
-        });
-
-        let resp = app.oneshot(get("/api/higgs/status")).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-        assert_eq!(v["loaded"]["id"], "org/model");
-    }
-
-    // ── control_load with explicit params (non-default branch) ───────────────
-
-    #[tokio::test]
-    async fn control_load_with_explicit_params() {
-        let (sup, mut test_write, _test_read, _ring) = make_supervisor();
-        // `load` resolves the GGUF path host-side, so the id must be discoverable.
-        let dir = tempfile::TempDir::new().unwrap();
-        write_gguf_fixture(dir.path(), "org/model");
-        let app = make_app_with_lmstudio(sup, dir.path().to_path_buf());
-
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            write_response(&mut test_write, 1, json!({"id": "org/model"})).await;
-            // higgs/load
-        });
-
-        // Providing ctx_len takes the param-merge branch (Some(LoadParams)).
-        let resp = app
-            .oneshot(post_json(
-                "/api/higgs/models/load",
-                &json!({"id": "org/model", "ctx_len": 2048}),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-        assert_eq!(v["status"], "ok");
-        assert_eq!(v["id"], "org/model");
-    }
-
-    // ── control_system: real host snapshot ───────────────────────────────────
-
-    #[tokio::test]
-    async fn control_system_returns_host_info() {
-        let (sup, _test_write, _test_read, _ring) = make_supervisor();
-        let app = make_app(sup);
-
-        let resp = app.oneshot(get("/api/higgs/system")).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-        // SystemInfo always reports a positive total RAM on a real host.
-        assert!(
-            v.get("ram").is_some() || v.get("cpu").is_some() || v.is_object(),
-            "system info is a populated object: {v}"
-        );
-    }
-
-    // ── logs settings: GET reflects default; PUT toggles verbose ─────────────
-
-    #[tokio::test]
-    async fn logs_settings_get_default_and_put_toggles() {
-        let (sup, _test_write, _test_read, _ring) = make_supervisor();
-        let app = make_app(sup);
-
-        // GET defaults to verbose:false.
-        let resp = app
-            .clone()
-            .oneshot(get("/api/higgs/logs/settings"))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-        assert_eq!(v["verbose"], false, "verbose defaults to false");
-        assert_eq!(
-            v["log_incoming_tokens"], false,
-            "log_incoming_tokens defaults to false"
-        );
-        assert_eq!(
-            v["show_log_fields"], false,
-            "show_log_fields defaults to false (redact)"
-        );
-
-        // PUT all flags true returns {"status":"ok"}.
-        let resp = app
-            .clone()
-            .oneshot(put_json(
-                "/api/higgs/logs/settings",
-                &json!({"verbose": true, "log_incoming_tokens": true, "show_log_fields": true}),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-        assert_eq!(v["status"], "ok");
-
-        // GET now reflects the new state for all flags.
-        let resp = app.oneshot(get("/api/higgs/logs/settings")).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-        assert_eq!(v["verbose"], true, "PUT toggled verbose on");
-        assert_eq!(
-            v["log_incoming_tokens"], true,
-            "PUT toggled log_incoming_tokens on"
-        );
-        assert_eq!(v["show_log_fields"], true, "PUT toggled show_log_fields on");
-    }
-
-    // ── runtime settings: GET reflects default (JIT on); PUT toggles JIT ─────
-
-    #[tokio::test]
-    async fn settings_get_default_and_put_toggles_jit() {
-        let (sup, _test_write, _test_read, _ring) = make_supervisor();
-        let app = make_app(sup);
-
-        // GET defaults: JIT on, auto-unload on, TTL 5 minutes.
-        let resp = app
-            .clone()
-            .oneshot(get("/api/higgs/settings"))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-        assert_eq!(v["jit_enabled"], true, "JIT defaults to on");
-        assert_eq!(v["auto_unload_idle"], true, "auto-unload defaults to on");
-        assert_eq!(v["idle_ttl_minutes"], 5, "TTL defaults to 5 minutes");
-        assert_eq!(v["serving_enabled"], true, "serving defaults to on");
-
-        // PUT all four (JIT off, auto-unload off, TTL 30, serving off) returns ok.
-        let resp = app
-            .clone()
-            .oneshot(put_json(
-                "/api/higgs/settings",
-                &json!({
-                    "jit_enabled": false,
-                    "auto_unload_idle": false,
-                    "idle_ttl_minutes": 30,
-                    "serving_enabled": false,
-                }),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-        assert_eq!(v["status"], "ok");
-
-        // GET now reflects all three new values.
-        let resp = app.oneshot(get("/api/higgs/settings")).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-        assert_eq!(v["jit_enabled"], false, "PUT toggled JIT off");
-        assert_eq!(v["auto_unload_idle"], false, "PUT toggled auto-unload off");
-        assert_eq!(v["idle_ttl_minutes"], 30, "PUT set TTL to 30 minutes");
-        assert_eq!(v["serving_enabled"], false, "PUT toggled serving off");
-    }
-
-    // ── settings handlers: round-trip through the typed GET/PUT pair ──────────
-
-    #[tokio::test]
-    async fn settings_handlers_round_trip() {
-        use super::{control_set_settings, control_settings};
-        use crate::api::Higgs;
-        use axum::extract::State;
-        use std::sync::Arc;
-
-        let (sup, _test_write, _test_read, _ring) = make_supervisor();
-        let higgs = Arc::new(Higgs::with_supervisor(
-            Arc::new(sup),
-            crate::api::HiggsConfig::default(),
-        ));
-
-        // GET handler reflects the default-on state.
-        assert!(
-            control_settings(State(higgs.clone())).await.0.jit_enabled,
-            "JIT on by default"
-        );
-
-        // PUT handler flips it off; the chat path's gate (`higgs.jit_enabled()`)
-        // now returns false, so an unloaded model is a 404 (explicit-load).
-        let ok = control_set_settings(
-            State(higgs.clone()),
-            axum::Json(crate::serve::HiggsRuntimeSettings {
-                jit_enabled: false,
-                auto_unload_idle: false,
-                idle_ttl_minutes: 30,
-                serving_enabled: false,
-            }),
-        )
-        .await;
-        assert_eq!(ok.0.status, "ok");
-        assert!(!higgs.jit_enabled(), "PUT disabled the JIT gate");
-        assert!(!higgs.auto_unload_idle(), "PUT disabled idle auto-unload");
-        assert_eq!(higgs.idle_ttl_minutes(), 30, "PUT set the idle TTL");
-        assert!(!higgs.serving_enabled(), "PUT disabled serving");
-        let got = control_settings(State(higgs.clone())).await.0;
-        assert!(!got.jit_enabled, "GET reflects JIT off");
-        assert!(!got.auto_unload_idle, "GET reflects auto-unload off");
-        assert_eq!(got.idle_ttl_minutes, 30, "GET reflects the new TTL");
-        assert!(!got.serving_enabled, "GET reflects serving off");
-    }
-
-    // ── verbose gate: served line appears only when verbose is on ─────────────
-
-    #[tokio::test]
-    async fn verbose_gate_round_trips_through_handlers() {
-        use super::{control_logs_settings, control_set_logs_settings};
-        use crate::api::Higgs;
-        use axum::extract::State;
-        use std::sync::Arc;
-
-        let (sup, _test_write, _test_read, _ring) = make_supervisor();
-        let higgs = Arc::new(Higgs::with_supervisor(
-            Arc::new(sup),
-            crate::api::HiggsConfig::default(),
-        ));
-
-        // GET handler reflects the default-off state.
-        assert!(
-            !control_logs_settings(State(higgs.clone())).await.0.verbose,
-            "verbose off by default"
-        );
-
-        // PUT handler flips it on; the chat path's gate (`higgs.verbose()`) now
-        // returns true, so the served line would be emitted (format asserted in
-        // v1's `served_message_format`).
-        let ok = control_set_logs_settings(
-            State(higgs.clone()),
-            axum::Json(crate::serve::LogSettings {
-                verbose: true,
-                log_incoming_tokens: true,
-                show_log_fields: false,
-            }),
-        )
-        .await;
-        assert_eq!(ok.0.status, "ok");
-        assert!(higgs.verbose(), "PUT enabled the chat verbose gate");
-        assert!(
-            higgs.log_incoming_tokens(),
-            "PUT enabled the incoming-tokens gate"
-        );
-        let got = control_logs_settings(State(higgs.clone())).await.0;
-        assert!(got.verbose, "GET reflects verbose on");
-        assert!(
-            got.log_incoming_tokens,
-            "GET reflects log_incoming_tokens on"
-        );
-    }
-
-    // ── control_worker_stop: graceful, always ok ─────────────────────────────
-
-    #[tokio::test]
-    async fn control_worker_stop_ok() {
-        let (sup, _test_write, _test_read, _ring) = make_supervisor();
-        let app = make_app(sup);
-
-        let resp = app
-            .oneshot(post_json("/api/higgs/worker/stop", &json!({})))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-        assert_eq!(v["status"], "ok");
-    }
-}
+#[path = "control_tests.rs"]
+mod tests;
