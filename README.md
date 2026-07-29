@@ -125,6 +125,40 @@ the router with `higgs::serve::v1_router(higgs.clone())` and merge it into your 
 
 ## Quick Start
 
+### Install a signed release (no clone)
+
+Releases ship as minisign-signed tarballs (macOS arm64 `metal`, Linux x86_64 `cpu`/`cuda` —
+see [RELEASING.md](RELEASING.md)). The repo is private, so downloads authenticate with a
+**fine-grained PAT** (GitHub → Settings → Developer settings → Fine-grained tokens; scope it
+to this repo, permission **Contents: Read**). One token, two commands, no clone:
+
+```bash
+export TOKEN=github_pat_…   # your fine-grained PAT (Contents: Read)
+
+# 1) fetch install.sh — one file via the contents API, not a checkout:
+curl -fsSL -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github.raw" \
+  https://api.github.com/repos/AI-Experiri/higgs/contents/install.sh -o install.sh
+chmod +x install.sh
+
+# 2) install a release — the same token downloads the signed tarball; --pubkey
+#    verifies its minisign signature against the repo's pinned release key:
+HIGGS_GITHUB_TOKEN=$TOKEN ./install.sh --version 0.1.0-beta.1 \
+  --pubkey RWQF20Rd+9jIND7YdCJsl3btwZKBAvF1EzRyHWiR8MH7C0JHhRSRdzSC
+```
+
+Run it **as the operator, never sudo**, and as `./install.sh` (not `bash install.sh` — the
+`#!/bin/bash -p` hardening only applies when it runs as a file). Pre-releases (any version
+with a `-`) are skipped by the default "latest", so pin `--version` for a beta. On Linux add
+`--cuda` for the CUDA build. It lands in `~/.higgs/bin/v<ver>/`, flips `~/.higgs/bin/current`,
+and prints the `install-service` command to run it as a login-bound service.
+
+After the first install the token is no longer needed: nodes update themselves
+(`higgs node self-update`, one-step `--rollback`) or are pushed to from a hub — see
+[RELEASING.md](RELEASING.md) Part D. `uninstall.sh` (fetched the same way) tears the service
+down cleanly, keeping `~/.higgs` unless `--purge`.
+
+### Build from source
+
 ```bash
 cargo build --release
 ```
