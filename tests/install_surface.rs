@@ -46,9 +46,16 @@ fn install_service_dry_run_renders_the_platform_plan() {
         assert!(stdout.contains("higgs-node.service"));
         assert!(stdout.contains("Restart=always"));
         assert!(stdout.contains("StartLimitIntervalSec=0"));
+        // loginctl (enable-linger) belongs only to --system; the login-bound default
+        // must never RUN it. It CAN appear in the NOTES — "--system adds `loginctl
+        // enable-linger`", or a heads-up about `loginctl disable-linger` on a host where
+        // linger is already enabled (GitHub's Linux runner is) — so match the command
+        // (`would run: … loginctl`), not the bare word.
         assert!(
-            !stdout.contains("loginctl"),
-            "default must not call loginctl: {stdout}"
+            !stdout
+                .lines()
+                .any(|l| l.trim_start().starts_with("would run:") && l.contains("loginctl")),
+            "default must not RUN loginctl (linger is --system-only): {stdout}"
         );
     }
 }
@@ -1855,7 +1862,9 @@ fn install_sh_warns_when_a_symlinked_bin_hides_a_group_writable_lexical_prefix()
     // A walk that resolves `cd -P` FIRST follows the symlink to the clean target and
     // never sees the group-writable prefix; the exec-path walk must check the
     // LEXICAL chain too (as install-service's Rust preflight does). Login-bound
-    // install still succeeds (no sudo), but --system must be withheld.
+    // install still succeeds (no sudo); --system is withheld only on macOS (where it
+    // is a sudo/root exec) — Linux --system is a non-root user unit, so it stays
+    // available and is NOT a root-escalation threat.
     use std::os::unix::fs::PermissionsExt;
     let tmp = tempfile::tempdir().unwrap();
     let stage = tmp.path().join("stage");
@@ -1878,14 +1887,26 @@ fn install_sh_warns_when_a_symlinked_bin_hides_a_group_writable_lexical_prefix()
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("always-on: UNAVAILABLE"),
-        "a group-writable LEXICAL prefix behind a symlinked bin must suppress --system: {stdout}"
-    );
-    assert!(
-        !stdout.contains("always-on: sudo "),
-        "must NOT advise the sudo --system command when the lexical prefix is group-writable: {stdout}"
-    );
+    if cfg!(target_os = "macos") {
+        // macOS --system uses sudo (the daemon is exec'd as ROOT), so a group-writable
+        // exec path is a root-escalation threat: install.sh WITHHOLDS the command.
+        assert!(
+            stdout.contains("always-on: UNAVAILABLE"),
+            "a group-writable LEXICAL prefix behind a symlinked bin must suppress --system: {stdout}"
+        );
+        assert!(
+            !stdout.contains("always-on: sudo "),
+            "must NOT advise the sudo --system command when the lexical prefix is group-writable: {stdout}"
+        );
+    } else {
+        // Linux --system is a NON-elevated user unit + linger (no sudo, runs as the
+        // operator, never root), so a group-writable exec path is NOT a root-escalation
+        // threat — install.sh correctly does NOT withhold the --system advice.
+        assert!(
+            stdout.contains("--system") && !stdout.contains("always-on: UNAVAILABLE"),
+            "Linux --system (a non-root user unit) must NOT be withheld for a group-writable prefix: {stdout}"
+        );
+    }
     std::fs::set_permissions(&prefix, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
