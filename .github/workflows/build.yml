@@ -1,17 +1,13 @@
 # Smoke-build the release's Linux CUDA leg on the SELF-HOSTED runner (Coolify,
-# ephemeral) — Approach B: the job runs INSIDE a prebuilt CUDA container, so
-# nothing CUDA-related is installed per run (the per-job toolkit install was a
-# 30+ minute apt avalanche on a bare ephemeral runner).
-#
-# Container choice is deliberate:
-#   - CUDA 12.5.0  = the exact version release.yml pins (Jimver action, cuda: 12.5.0)
-#   - ubuntu22.04  = the release's glibc baseline (CI builds on ubuntu-22.04;
-#     a 24.04 build would link a newer glibc and not run on 22.04-era boxes)
-# The devel image ships nvcc + gcc; the small apt below adds only the cmake/clang
-# FFI+bindgen deps (--no-install-recommends — no desktop bloat).
-#
-# Rust is installed per job (ephemeral runner, ~30s via rustup).
-# Build command = release.yml's cuda leg, verbatim.
+# ephemeral, bare Ubuntu 20.04 container) — using the runner AS-IS:
+#   - no `container:` (sibling-container workdir mounts need a host bind we don't have)
+#   - no CUDA metapackage, no add-apt-repository, no recommends → no GUI packages:
+#     the NVIDIA repo is added by writing one sources.list line, and ONLY the four
+#     packages the compile needs are installed (~1GB, minutes — not the 33-min avalanche)
+#   - cmake comes as a portable binary (focal's apt cmake 3.16 is too old for
+#     CMAKE_CUDA_ARCHITECTURES / the CUDAARCHS env)
+# Build command = release.yml's cuda leg, verbatim. Ephemeral runner: everything
+# is installed per job; target by LABEL only.
 name: build
 on:
   workflow_dispatch:
@@ -21,38 +17,57 @@ on:
 jobs:
   build-cuda:
     runs-on: [self-hosted, cuda]
-    container: nvidia/cuda:12.5.0-devel-ubuntu22.04
     timeout-minutes: 180
     steps:
-      - name: Show where and what (pre-checkout)
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Show where and what
         run: |
           echo "hostname: $(hostname)"
           uname -a
+          git log -1 --oneline && git rev-parse HEAD
           echo "runner name: ${RUNNER_NAME:-unknown}"
-          nvcc --version
 
-      - name: Install build deps (small, no recommends)
+      - name: Base build deps (no recommends, no GUI)
         run: |
           set -euo pipefail
-          apt-get update
-          apt-get install -y --no-install-recommends \
-            cmake clang libclang-dev pkg-config libssl-dev git curl ca-certificates
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libssl-dev clang libclang-dev \
+            git curl wget ca-certificates gnupg
+
+      - name: Portable cmake (focal apt cmake is too old for CUDAARCHS)
+        run: |
+          set -euo pipefail
+          curl -fsSL -o cmake.tgz https://github.com/Kitware/CMake/releases/download/v3.28.6/cmake-3.28.6-linux-x86_64.tar.gz
+          sudo tar -C /usr/local --strip-components=1 -xzf cmake.tgz
+          rm cmake.tgz
+          cmake --version | head -1
+
       - name: Bootstrap Rust
         run: |
           set -euo pipefail
           curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          persist-credentials: false
-
-      - name: Verify toolchain + commit
+      # LEAN CUDA: NVIDIA repo via keyring + one sources line (no add-apt-repository),
+      # then ONLY what nvcc + the llama.cpp cuda build need. Same 12.5 release.yml pins.
+      - name: CUDA 12.5 (nvcc + cudart + cublas only)
         run: |
-          git config --global --add safe.directory "$PWD" || true
-          git log -1 --oneline && git rev-parse HEAD
+          set -euo pipefail
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb && rm cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cuda-nvcc-12-5 cuda-cudart-dev-12-5 libcublas-dev-12-5 cuda-profiler-api-12-5
+          echo "/usr/local/cuda-12.5/bin" >> "$GITHUB_PATH"
+
+      - name: Verify toolchain
+        run: |
+          nvcc --version
           rustc --version && cargo --version
-          cmake --version | head -1
           gcc --version | head -1
 
       # Mirror release.yml's Linux env: neutralize the macOS-only [env] from
@@ -65,6 +80,7 @@ jobs:
             echo "SDKROOT="
             echo "BINDGEN_EXTRA_CLANG_ARGS="
             echo "CUDAARCHS=75;80;86;89;90"
+            echo "CUDA_PATH=/usr/local/cuda-12.5"
           } >> "$GITHUB_ENV"
 
       - name: Build (release.yml cuda leg command)
