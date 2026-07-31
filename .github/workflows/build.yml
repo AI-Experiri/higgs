@@ -1,61 +1,56 @@
-# Smoke-build on the SELF-HOSTED CUDA runner (Coolify, ephemeral).
+# Smoke-build the release's Linux CUDA leg on the SELF-HOSTED runner (Coolify,
+# ephemeral) — Approach B: the job runs INSIDE a prebuilt CUDA container, so
+# nothing CUDA-related is installed per run (the per-job toolkit install was a
+# 30+ minute apt avalanche on a bare ephemeral runner).
 #
-# Purpose: prove our own runner can produce the release's Linux CUDA leg, so
-# release.yml can target it instead of GitHub-hosted minutes. Mirrors the
-# release.yml cuda matrix leg EXACTLY (same pinned actions, CUDA version, env,
-# build command) — plus the bootstrap an ephemeral bare container needs
-# (rustup + base build tools), which GitHub's images preinstall.
+# Container choice is deliberate:
+#   - CUDA 12.5.0  = the exact version release.yml pins (Jimver action, cuda: 12.5.0)
+#   - ubuntu22.04  = the release's glibc baseline (CI builds on ubuntu-22.04;
+#     a 24.04 build would link a newer glibc and not run on 22.04-era boxes)
+# The devel image ships nvcc + gcc; the small apt below adds only the cmake/clang
+# FFI+bindgen deps (--no-install-recommends — no desktop bloat).
 #
-# The runner is EPHEMERAL (fresh container per job): every run starts empty,
-# so everything is installed per job. Target by LABEL only — never by name.
+# Rust is installed per job (ephemeral runner, ~30s via rustup).
+# Build command = release.yml's cuda leg, verbatim.
 name: build
 on:
   workflow_dispatch:
   push:
-    branches: ["smoke/**"]   # scoped: a 1-2h CUDA build must not fire on every push
+    branches: ["smoke/**"]   # scoped: a long CUDA build must not fire on every push
 
 jobs:
   build-cuda:
     runs-on: [self-hosted, cuda]
-    timeout-minutes: 240
+    container: nvidia/cuda:12.5.0-devel-ubuntu22.04
+    timeout-minutes: 180
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          persist-credentials: false
-
-      - name: Show where and what
+      - name: Show where and what (pre-checkout)
         run: |
           echo "hostname: $(hostname)"
           uname -a
-          git log -1 --oneline
-          git rev-parse HEAD
           echo "runner name: ${RUNNER_NAME:-unknown}"
+          nvcc --version
 
-      # Ephemeral bare container: no compilers, no rust. GitHub images have
-      # these preinstalled, which is why release.yml doesn't install them.
-      - name: Bootstrap base build tools
+      - name: Install build deps (small, no recommends)
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config libssl-dev cmake clang libclang-dev \
-            git curl ca-certificates software-properties-common gnupg
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            cmake clang libclang-dev pkg-config libssl-dev git curl ca-certificates
       - name: Bootstrap Rust
         run: |
           set -euo pipefail
           curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      # Same pinned action + CUDA version as release.yml's cuda leg.
-      - name: Install CUDA toolkit
-        uses: Jimver/cuda-toolkit@4bd727d5619dc6fa323b1e76c3aa5dca94f5ec6d # v0.2.19
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          cuda: "12.5.0"
-          method: network
+          persist-credentials: false
 
-      - name: Verify toolchain
+      - name: Verify toolchain + commit
         run: |
-          nvcc --version
+          git config --global --add safe.directory "$PWD" || true
+          git log -1 --oneline && git rev-parse HEAD
           rustc --version && cargo --version
           cmake --version | head -1
           gcc --version | head -1
