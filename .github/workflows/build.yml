@@ -1,0 +1,81 @@
+# Smoke-build on the SELF-HOSTED CUDA runner (Coolify, ephemeral).
+#
+# Purpose: prove our own runner can produce the release's Linux CUDA leg, so
+# release.yml can target it instead of GitHub-hosted minutes. Mirrors the
+# release.yml cuda matrix leg EXACTLY (same pinned actions, CUDA version, env,
+# build command) — plus the bootstrap an ephemeral bare container needs
+# (rustup + base build tools), which GitHub's images preinstall.
+#
+# The runner is EPHEMERAL (fresh container per job): every run starts empty,
+# so everything is installed per job. Target by LABEL only — never by name.
+name: build
+on:
+  workflow_dispatch:
+  push:
+    branches: ["smoke/**"]   # scoped: a 1-2h CUDA build must not fire on every push
+
+jobs:
+  build-cuda:
+    runs-on: [self-hosted, cuda]
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Show where and what
+        run: |
+          echo "hostname: $(hostname)"
+          uname -a
+          git log -1 --oneline
+          git rev-parse HEAD
+          echo "runner name: ${RUNNER_NAME:-unknown}"
+
+      # Ephemeral bare container: no compilers, no rust. GitHub images have
+      # these preinstalled, which is why release.yml doesn't install them.
+      - name: Bootstrap base build tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libssl-dev cmake clang libclang-dev \
+            git curl ca-certificates
+      - name: Bootstrap Rust
+        run: |
+          set -euo pipefail
+          curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      # Same pinned action + CUDA version as release.yml's cuda leg.
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@4bd727d5619dc6fa323b1e76c3aa5dca94f5ec6d # v0.2.19
+        with:
+          cuda: "12.5.0"
+          method: network
+
+      - name: Verify toolchain
+        run: |
+          nvcc --version
+          rustc --version && cargo --version
+          cmake --version | head -1
+          gcc --version | head -1
+
+      # Mirror release.yml's Linux env: neutralize the macOS-only [env] from
+      # .cargo/config.toml, disable OpenMP, bound the CUDA arch list.
+      - name: Configure build env
+        run: |
+          set -euo pipefail
+          {
+            echo "CMAKE_DISABLE_FIND_PACKAGE_OpenMP=ON"
+            echo "SDKROOT="
+            echo "BINDGEN_EXTRA_CLANG_ARGS="
+            echo "CUDAARCHS=75;80;86;89;90"
+          } >> "$GITHUB_ENV"
+
+      - name: Build (release.yml cuda leg command)
+        run: cargo build --release --locked --target x86_64-unknown-linux-gnu --features cuda
+
+      - name: Prove the artifact
+        run: |
+          ls -la target/x86_64-unknown-linux-gnu/release/higgs
+          ./target/x86_64-unknown-linux-gnu/release/higgs --version
