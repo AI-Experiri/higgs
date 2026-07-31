@@ -39,7 +39,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential pkg-config libssl-dev cmake clang libclang-dev \
-            git curl ca-certificates
+            git curl ca-certificates software-properties-common gnupg
       - name: Bootstrap Rust
         run: |
           set -euo pipefail
