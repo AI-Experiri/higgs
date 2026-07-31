@@ -1,7 +1,6 @@
 # Smoke-build the release's Linux CUDA leg on the self-hosted runner, AS-IS:
 # bare ephemeral container, no `container:`, no host mounts. CUDA = only the 4
 # packages nvcc needs (no metapackage, --no-install-recommends → no GUI).
-# cmake = portable binary (focal's apt cmake is too old for CUDAARCHS).
 # Build command = release.yml's cuda leg, verbatim.
 name: build
 on:
@@ -30,16 +29,8 @@ jobs:
           set -euo pipefail
           sudo apt-get -o DPkg::Lock::Timeout=600 update
           sudo apt-get -o DPkg::Lock::Timeout=600 install -y --no-install-recommends \
-            build-essential pkg-config libssl-dev clang libclang-dev \
+            build-essential pkg-config libssl-dev cmake clang libclang-dev \
             git curl wget ca-certificates gnupg
-
-      - name: Portable cmake
-        run: |
-          set -euo pipefail
-          curl -fsSL -o cmake.tgz https://github.com/Kitware/CMake/releases/download/v3.28.6/cmake-3.28.6-linux-x86_64.tar.gz
-          sudo tar -C /usr/local --strip-components=1 -xzf cmake.tgz
-          rm cmake.tgz
-          cmake --version | head -1
 
       - name: Bootstrap Rust
         run: |
@@ -50,7 +41,7 @@ jobs:
       - name: CUDA 12.5 — nvcc + cudart + cublas ONLY
         run: |
           set -euo pipefail
-          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-keyring_1.1-1_all.deb
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
           sudo dpkg -i cuda-keyring_1.1-1_all.deb && rm cuda-keyring_1.1-1_all.deb
           sudo apt-get -o DPkg::Lock::Timeout=600 update
           sudo apt-get -o DPkg::Lock::Timeout=600 install -y --no-install-recommends \
