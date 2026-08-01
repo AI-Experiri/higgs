@@ -68,7 +68,7 @@ jobs:
       - name: Build (release.yml cuda leg command)
         run: cargo build --release --locked --target x86_64-unknown-linux-gnu --features cuda
 
-      - name: Prove the artifact
+      - name: Prove the artifact (no exec — running a CUDA binary needs libcuda.so.1, the GPU driver, absent on this build VM)
         run: |
           ls -la target/x86_64-unknown-linux-gnu/release/higgs
-          ./target/x86_64-unknown-linux-gnu/release/higgs --version
+          file target/x86_64-unknown-linux-gnu/release/higgs
