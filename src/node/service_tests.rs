@@ -685,6 +685,41 @@ fn agent_plan_is_fully_user_space_and_targets_the_gui_domain() {
 // ── the Linux scope split (linger is the --system opt-in) ─────────────────────
 
 #[test]
+fn a_linger_enabled_host_notes_loginctl_but_the_login_bound_default_never_runs_it() {
+    // Reproduces GitHub's Linux runner, where linger is ALREADY enabled for the
+    // user. The login-bound systemd default then surfaces linger_note() — a heads-up
+    // that MENTIONS `loginctl disable-linger` — while the plan's COMMANDS still run NO
+    // loginctl. This is exactly why the CLI dry-run integration test must match the
+    // command (`would run: … loginctl`), not the bare word: on such a host the note
+    // legitimately contains "loginctl".
+    let plan = plan_systemd_user(
+        "runner",
+        p("/home/runner"),
+        p("/home/runner/.higgs"),
+        p("/home/runner/.higgs"),
+        None,
+        &[],
+        ServiceScope::LoginBound,
+    );
+    assert!(
+        !plan
+            .commands
+            .iter()
+            .any(|c| c.argv.first().map(String::as_str) == Some("loginctl")),
+        "the login-bound default must never RUN loginctl: {:?}",
+        plan.commands
+    );
+    // On a linger-enabled host the heads-up note DOES mention loginctl — a note, not a command.
+    let linger_dir = tempfile::tempdir().unwrap();
+    std::fs::write(linger_dir.path().join("runner"), b"").unwrap();
+    let note = linger_note(linger_dir.path(), "runner").expect("linger note when the flag exists");
+    assert!(
+        note.contains("loginctl"),
+        "the linger heads-up mentions loginctl in a NOTE (not a run command): {note}"
+    );
+}
+
+#[test]
 fn systemd_login_bound_default_never_calls_linger() {
     // DEFAULT (LoginBound): write + enable + daemon-reload + restart — and
     // NOTHING else. No loginctl call means zero possible polkit/sudo prompts.
