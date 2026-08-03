@@ -242,6 +242,18 @@ die() { echo "install.sh: ERROR: $*" >&2; exit 1; }
 # fn note() — print an informational message to stderr.
 note() { echo "install.sh: $*" >&2; }
 
+# ── Color (visual clarity only) ────────────────────────────────────────────────
+# Enabled ONLY when BOTH stdout and stderr are a terminal, and NO_COLOR is unset:
+# piped/captured output (tests, provisioning logs, `> file`) stays byte-plain, so
+# nothing that greps this script's output ever sees an escape code.
+if [ -t 1 ] && [ -t 2 ] && [ -z "${NO_COLOR+set}" ]; then
+  C_BOLD=$'\033[1m'; C_GREEN=$'\033[32m'; C_CYAN=$'\033[36m'; C_YELLOW=$'\033[33m'; C_OFF=$'\033[0m'
+else
+  C_BOLD=""; C_GREEN=""; C_CYAN=""; C_YELLOW=""; C_OFF=""
+fi
+# A verified/completed milestone — green with a check mark.
+ok() { echo "install.sh: ${C_GREEN}✓ $*${C_OFF}" >&2; }
+
 # fn usage() — print the file header (top of file) as the --help text.
 usage() { sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//' | sed '$d'; }
 
@@ -519,7 +531,7 @@ if [ -f "$workdir/${name}.tar.gz.sha256" ]; then
   want="$(cut -d' ' -f1 < "$workdir/${name}.tar.gz.sha256")"
   got="$(sha256 "$workdir/${name}.tar.gz" | cut -d' ' -f1)"
   [ "$want" = "$got" ] || die "sha256 MISMATCH for ${name}.tar.gz: manifest says $want, file is $got"
-  note "sha256 verified"
+  ok "sha256 verified"
 else
   die "no .sha256 next to the tarball — refusing an unverifiable install"
 fi
@@ -547,7 +559,7 @@ if [ -n "$PUBKEY" ]; then
   [ "$mtarget" = "$target" ]         || die "signed manifest is for target $mtarget, expected $target"
   [ "$mvariant" = "$variant" ]       || die "signed manifest is for variant $mvariant, expected $variant"
   [ "$msha" = "$got" ]               || die "signed manifest sha256 ($msha) does not match the tarball ($got)"
-  note "minisign-signed manifest verified (version/file/target/variant/sha256)"
+  ok "minisign-signed manifest verified (version/file/target/variant/sha256)"
 elif [ -f "$workdir/${name}.manifest.minisig" ]; then
   note "signed manifest present but no --pubkey given — skipping signature check (sha256 only)"
 fi
@@ -766,8 +778,8 @@ tmplink=""
 # a crash the moment this script returns.
 sync
 
-note "installed higgs v${VERSION} → ${verdir}"
-note "current → $(readlink "${bindir}/current")"
+ok "installed higgs v${VERSION} → ${verdir}"
+ok "current → $(readlink "${bindir}/current")"
 
 # The service command ALWAYS carries the resolved --prefix: `install-service`
 # defaults to the PASSWD home's ~/.higgs, which can differ from where we just
@@ -843,19 +855,19 @@ for _k in HIGGS_HF_ENDPOINT HIGGS_ENGINE; do
 done
 unset _k
 echo
-echo "Next steps:"
+echo "${C_BOLD}Next steps:${C_OFF}"
 # Default line: user-space, login-bound, no sudo. Second line: the --system
 # always-on opt-in (survives logout, starts at boot).
-echo "  PATH:    add $(printf '%q' "${bindir}/current") to PATH (or symlink ${qbin} into ~/.local/bin)"
+echo "  ${C_CYAN}${C_BOLD}PATH:${C_OFF}    add $(printf '%q' "${bindir}/current") to PATH (or symlink ${qbin} into ~/.local/bin)"
 if [ -z "$state_dir" ]; then
   # HOME and HIGGS_HOME are BOTH unset (a scrubbed provisioning env), so no state dir
   # can be derived and $svc_home carries no --higgs-home. `install-service` now
   # REFUSES an unset HOME (rather than silently pin the passwd default and restart-
   # loop), so even the login-bound command would be rejected — emit the fix instead of
   # an unusable command. (Same handling as the always-on line below.)
-  echo "  service: set HIGGS_HOME (or run with HOME set) first — install-service needs an explicit --higgs-home state dir, which can't be derived with HOME unset."
+  echo "  ${C_CYAN}${C_BOLD}service:${C_OFF} ${C_YELLOW}set HIGGS_HOME (or run with HOME set) first — install-service needs an explicit --higgs-home state dir, which can't be derived with HOME unset.${C_OFF}"
 else
-  echo "  service: ${qbin} node install-service --prefix ${qprefix}${svc_home}   # user service (login-bound, no sudo)"
+  echo "  ${C_CYAN}${C_BOLD}service:${C_OFF} ${qbin} node install-service --prefix ${qprefix}${svc_home}   # user service (login-bound, no sudo)"
 fi
 # The always-on (--system) line runs `sudo <prefix>/bin/current/higgs` — the PREFIX
 # BINARY as ROOT (macOS LaunchDaemon). If the exec path is GROUP-writable (a
@@ -931,7 +943,7 @@ _gw_walk() {
 _gw_walk "$bindir"
 _gw_walk "$verdir"
 if [ -n "$sys_sudo" ] && [ -n "$_exec_gw" ]; then
-  echo "  always-on: UNAVAILABLE — the exec path (${PREFIX} or an ancestor) is GROUP-writable or carries an ACL, so a --system daemon (installed via sudo, exec'd as root) could let a peer run code as ROOT. Use a clean, non-group-writable, ACL-free prefix for --system ('chmod -RN ${PREFIX}; chmod -R g-w ${PREFIX}'), or keep the login-bound service above."
+  echo "  ${C_CYAN}${C_BOLD}always-on:${C_OFF} ${C_YELLOW}UNAVAILABLE — the exec path (${PREFIX} or an ancestor) is GROUP-writable or carries an ACL, so a --system daemon (installed via sudo, exec'd as root) could let a peer run code as ROOT. Use a clean, non-group-writable, ACL-free prefix for --system ('chmod -RN ${PREFIX}; chmod -R g-w ${PREFIX}'), or keep the login-bound service above.${C_OFF}"
 elif [ -z "$state_dir" ]; then
   # With both HOME and HIGGS_HOME unset, no state dir can be derived, so the
   # `install-service … --system` command would carry no --higgs-home — and since r54
@@ -940,8 +952,8 @@ elif [ -z "$state_dir" ]; then
   # Linux --system is a non-elevated user unit that STILL refuses an unset HOME — so
   # the guard must NOT be gated on `$sys_sudo`. Emit the fix instead of an unusable
   # command. (The login-bound line above is guarded the same way.)
-  echo "  always-on: set HIGGS_HOME (or run with HOME set) first — install-service needs an explicit --higgs-home state dir, which can't be derived with HOME unset."
+  echo "  ${C_CYAN}${C_BOLD}always-on:${C_OFF} ${C_YELLOW}set HIGGS_HOME (or run with HOME set) first — install-service needs an explicit --higgs-home state dir, which can't be derived with HOME unset.${C_OFF}"
 else
-  echo "  always-on: ${sys_sudo}${qbin} node install-service --prefix ${qprefix}${svc_home} --system   # survives logout, starts at boot"
+  echo "  ${C_CYAN}${C_BOLD}always-on:${C_OFF} ${sys_sudo}${qbin} node install-service --prefix ${qprefix}${svc_home} --system   # survives logout, starts at boot"
 fi
 unset _exec_gw _g _p

@@ -12,6 +12,7 @@ pub mod fleet;
 pub mod hub;
 pub mod identity;
 pub mod node_id;
+pub mod preflight;
 pub mod release_courier;
 pub mod runtime;
 pub mod self_update;
