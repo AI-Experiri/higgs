@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use iroh_tickets::endpoint::EndpointTicket;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::auth::{Allowlist, PairingTokens};
 use crate::config::{config_path, name_or_init, InstanceConfig, Role, SavedHub};
@@ -2631,6 +2631,176 @@ fn run_node_connect(args: &[String]) -> Result<()> {
 /// wrote concurrently. The hub's id/label come from its HELLO result (authoritative); the
 /// `ticket` is the exact string we dialed. A persistence failure is logged, never fatal — the
 /// node stays connected regardless.
+/// How often the bare (service-run) daemon re-reads config.json while waiting to be
+/// paired — this poll IS the seamless pairing handoff (see the wait loop's comment).
+const HUB_WAIT_POLL: Duration = Duration::from_secs(3);
+/// Reminder cadence while waiting, in polls (~5 minutes at [`HUB_WAIT_POLL`]).
+const HUB_WAIT_REMIND_EVERY: u64 = 100;
+/// Pairing one-shot: attempts and per-attempt budget. Two attempts ride out a transient
+/// relay/holepunch flake; the preflight already vetoed hopeless environments.
+const PAIR_ATTEMPTS: u32 = 2;
+const PAIR_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Stop flag for the bare-wait pairing loop's plain signal handler. The handler stays
+/// installed until the serve path's tokio `shutdown_listener` replaces the disposition —
+/// no `SIG_DFL` gap — and the async block re-checks the flag right after the boot
+/// record, so a stop landing in the handover window still exits gracefully.
+static WAIT_STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+extern "C" fn wait_stop(_sig: libc::c_int) {
+    WAIT_STOP.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// True when the pairing process runs against a NON-DEFAULT `HIGGS_HOME`. The installed
+/// node service always manages the DEFAULT home, so a custom-home node (tests, side-by-
+/// side experiments) is its own process — pairing must never hand off to a service that
+/// manages a different state directory.
+fn custom_higgs_home() -> bool {
+    if std::env::var_os("HIGGS_HOME").is_none() {
+        return false;
+    }
+    // MIRROR the runtime exactly: `home::higgs_home()` treats ANY set value —
+    // including the empty string — as the override, so compare what the runtime
+    // would actually use against the default (same `dirs::home_dir()` fallback,
+    // so a scrubbed $HOME can't misclassify an explicitly-default HIGGS_HOME).
+    // An explicit spelling of ~/.higgs is still the default; anything else
+    // (empty included) is a custom home.
+    let default = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".higgs");
+    crate::home::higgs_home() != default
+}
+
+/// Absolute service-manager binary (never the ambient PATH — same trust posture as the
+/// install-service exec path).
+fn service_manager_bin() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "/bin/launchctl"
+    } else if Path::new("/usr/bin/systemctl").exists() {
+        "/usr/bin/systemctl"
+    } else {
+        "/bin/systemctl"
+    }
+}
+
+/// True when a higgs node service exists for this user — INSTALLED (macOS agent/daemon
+/// plist) or LIVE in the service manager (a loaded launchd job / an active-or-enabled
+/// systemd unit, which can outlive its unit file). Both sides matter: a plist with a
+/// dead job must still hand off (the restart below revives it), and a loaded job whose
+/// plist was removed must NOT be shadowed by a second foreground node.
+fn service_present() -> bool {
+    if custom_higgs_home() {
+        return false; // the service manages the DEFAULT home, not this one
+    }
+    // NOTE: no config-parsing home checks here. A service pinned to a DIFFERENT
+    // state dir has a different node key, never supersedes our connection, and the
+    // behavioral takeover-verify then keeps us serving in the foreground — the
+    // wrong-home case self-corrects without reading plists/unit files.
+    if cfg!(target_os = "macos") {
+        agent_installed() || system_daemon_installed() || service_alive()
+    } else {
+        let unit = crate::node::service::SYSTEMD_UNIT;
+        let run = |arg: &str| {
+            std::process::Command::new(service_manager_bin())
+                .args(["--user", arg, "--quiet", unit])
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        run("is-enabled") || run("is-active")
+    }
+}
+
+/// The user LaunchAgent plist exists for this user.
+fn agent_installed() -> bool {
+    dirs::home_dir()
+        .map(|h| crate::node::service::agent_plist_path(&h))
+        .is_some_and(|p| p.exists())
+}
+
+/// The system LaunchDaemon plist exists (root-managed, unreachable without sudo).
+fn system_daemon_installed() -> bool {
+    Path::new("/Library/LaunchDaemons")
+        .join(format!("{}.plist", crate::node::service::SERVICE_NAME))
+        .exists()
+}
+
+/// True when the service manager reports the node service LOADED/ACTIVE right now.
+fn service_alive() -> bool {
+    if cfg!(target_os = "macos") {
+        let domain_loaded = |domain: String| {
+            std::process::Command::new(service_manager_bin())
+                .args(["print", &domain])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        // gui domain (the agent), plus a BEST-EFFORT system-domain probe: it catches a
+        // loaded root daemon whose plist was removed where macOS allows unprivileged
+        // reads; where it refuses, the behavioral takeover-verify decides anyway.
+        domain_loaded(format!(
+            "gui/{}/{}",
+            unsafe { libc::getuid() },
+            crate::node::service::SERVICE_NAME
+        )) || domain_loaded(format!("system/{}", crate::node::service::SERVICE_NAME))
+    } else {
+        std::process::Command::new(service_manager_bin())
+            .args([
+                "--user",
+                "is-active",
+                "--quiet",
+                crate::node::service::SYSTEMD_UNIT,
+            ])
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+}
+
+/// How long the pairing waits for the restarted/waiting service to TAKE OVER —
+/// i.e. for the hub to supersede our admitted connection with the service's own
+/// dial. Covers the manager respawn throttle (5s), the waiting service's 3s
+/// config poll, and a relay-path dial.
+const HANDOFF_TAKEOVER_WINDOW: Duration = Duration::from_secs(20);
+
+/// The hub replaces a duplicate-identity dial by closing the OLD connection with
+/// code 0 / reason "retired" (`NodeTransport::close` on admit-replace) — observing
+/// that close IS the behavioral proof a correct-home service took the pairing over.
+fn close_is_supersede(err: &iroh::endpoint::ConnectionError) -> bool {
+    matches!(
+        err,
+        iroh::endpoint::ConnectionError::ApplicationClosed(f)
+            if f.error_code == 0u32.into() && f.reason.as_ref() == b"retired"
+    )
+}
+
+/// Best-effort restart of the installed service (absolute manager paths). The
+/// result is deliberately IGNORED: takeover is verified behaviorally (hub-side
+/// supersede of our connection), so a failed or impossible restart — e.g. an
+/// unreachable root LaunchDaemon, which converges via its own KeepAlive/poll —
+/// simply means the takeover window expires and we stay in the foreground.
+fn restart_service_best_effort() {
+    if cfg!(target_os = "macos") {
+        let _ = std::process::Command::new(service_manager_bin())
+            .args([
+                "kickstart",
+                "-k",
+                &format!(
+                    "gui/{}/{}",
+                    unsafe { libc::getuid() },
+                    crate::node::service::SERVICE_NAME
+                ),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    } else {
+        let _ = std::process::Command::new(service_manager_bin())
+            .args(["--user", "restart", crate::node::service::SYSTEMD_UNIT])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
 fn persist_hub(cfg_path: &Path, hello: &HelloResult, ticket: &str) {
     let mut cfg = match InstanceConfig::load(cfg_path) {
         Ok(c) => c,
@@ -2801,7 +2971,10 @@ fn run_node_daemon_body(args: &[String], confirm_bin: &Option<std::path::PathBuf
         return list_saved_hubs(&cfg, &id);
     }
 
-    // Resolve the hub to dial + whether to present a one-time token.
+    // Resolve the hub to dial + whether to present a one-time token. `pairing` marks the
+    // EXPLICIT-ticket invocation — the human-run enrollment command — which gets the
+    // preflight + one-shot handoff treatment; service/`--hub` reconnects do not.
+    let mut pairing = false;
     let (ticket_str, token): (String, Option<String>) = match args.first().map(String::as_str) {
         Some("--hub") => {
             let sel = args
@@ -2820,19 +2993,144 @@ fn run_node_daemon_body(args: &[String], confirm_bin: &Option<std::path::PathBuf
             )));
         }
         // An explicit ticket (first-time pairing, or an explicit re-dial); token optional.
-        Some(ticket) => (ticket.to_string(), args.get(1).cloned()),
-        // Bare: connect to the default saved hub, or explain how to pair if there is none.
+        Some(ticket) => {
+            pairing = true;
+            (ticket.to_string(), args.get(1).cloned())
+        }
+        // Bare: connect to the default saved hub. With none saved, WAIT for one instead of
+        // exiting: the service manager (launchd KeepAlive / systemd Restart) respawned an
+        // exiting daemon every few seconds forever, spamming the log with the pair hint —
+        // and the wait is also the seamless pairing handoff: the moment `higgs --node
+        // <ticket> <token>` persists the hub into config.json, THIS already-running service
+        // picks it up on the next poll and connects, no kickstart, no restart.
         None => match cfg.default_saved_hub() {
             Some(hub) => (hub.ticket.clone(), None),
             None => {
                 let name = name_or_init(Role::Node, &id, &crate::system::hostname())?;
                 println!("higgs node   : {name} ({id})");
-                println!("no saved hub yet — pair with: higgs --node <ticket> <token>");
-                return Ok(());
+                println!(
+                    "no saved hub yet — waiting to be paired (run: higgs --node <ticket> \
+                     <token>)"
+                );
+                // An operator stop during the wait is a GRACEFUL shutdown, not a crash —
+                // commit the trial before exiting so the recorded boot attempt above
+                // never falsely spends rollback budget (same rule as the serve loop's
+                // SIGTERM handling). The wait is sync, so a plain signal flag suffices.
+                unsafe {
+                    let handler = wait_stop as extern "C" fn(libc::c_int) as libc::sighandler_t;
+                    libc::signal(libc::SIGTERM, handler);
+                    libc::signal(libc::SIGINT, handler);
+                }
+                // The wait is part of THIS boot: a trialed binary that crashes while
+                // waiting must spend rollback budget like any other early-init crash,
+                // or a broken update crash-loops here forever with no auto-rollback.
+                // (A quick pairing can record this boot twice — once here, once at the
+                // serve-path record — which only spends budget FASTER, the safe bias;
+                // a healthy wait clears everything at ALIVE_GRACE below.)
+                if let Some(bin) = confirm_bin {
+                    if let Err(e) = crate::node::self_update::record_boot_attempt(
+                        bin,
+                        env!("CARGO_PKG_VERSION"),
+                    ) {
+                        // Mirror the serve path: untrackable health must not run a trial.
+                        eprintln!("higgs node: self-update boot-counter write failed ({e})");
+                        if let Ok(Some(prev)) = crate::node::self_update::force_rollback_trial(
+                            bin,
+                            env!("CARGO_PKG_VERSION"),
+                        ) {
+                            eprintln!(
+                                "higgs node: could not track the update's health (disk \
+                                 full?) — rolled back to {prev}. Restart to run it."
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
+                let mut polls: u64 = 0;
+                let mut trial_committed = false;
+                loop {
+                    std::thread::sleep(HUB_WAIT_POLL);
+                    polls += 1;
+                    if WAIT_STOP.load(std::sync::atomic::Ordering::SeqCst) {
+                        if let Some(bin) = confirm_bin {
+                            let _ = crate::node::self_update::confirm_alive(
+                                bin,
+                                env!("CARGO_PKG_VERSION"),
+                            );
+                        }
+                        println!("higgs node: stopped while waiting to be paired");
+                        return Ok(());
+                    }
+                    // Same health rule as the serve loop: a trialed binary that simply
+                    // STAYS UP for ALIVE_GRACE is healthy — an unpaired wait must not
+                    // leave the self-update trial pending (it would block later updates).
+                    if !trial_committed
+                        && polls.saturating_mul(HUB_WAIT_POLL.as_secs())
+                            >= crate::node::self_update::ALIVE_GRACE.as_secs()
+                    {
+                        // Markers are rooted at the INSTALL bin dir, same as every other
+                        // confirm site — current_exe would miss them. Only mark committed
+                        // on success so a transient failure retries next poll.
+                        match confirm_bin {
+                            Some(bin) => {
+                                // confirm_alive silently no-ops on lock contention, so
+                                // "committed" is judged by the marker actually clearing.
+                                let _ = crate::node::self_update::confirm_alive(
+                                    bin,
+                                    env!("CARGO_PKG_VERSION"),
+                                );
+                                trial_committed = !crate::node::self_update::is_trial_pending_for(
+                                    bin,
+                                    env!("CARGO_PKG_VERSION"),
+                                );
+                            }
+                            None => trial_committed = true,
+                        }
+                    }
+                    // A corrupt/unreadable config is an ENVIRONMENT failure, not a bad
+                    // binary — commit any pending trial before exiting so the recorded
+                    // boot attempt never spends rollback budget on it.
+                    let fresh = match InstanceConfig::load(&cfg_path) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            if let Some(bin) = confirm_bin {
+                                let _ = crate::node::self_update::confirm_alive(
+                                    bin,
+                                    env!("CARGO_PKG_VERSION"),
+                                );
+                            }
+                            return Err(e);
+                        }
+                    };
+                    if let Some(hub) = fresh.default_saved_hub() {
+                        println!("hub pairing detected — connecting");
+                        // The flag handler STAYS installed — the serve path's tokio
+                        // shutdown_listener replaces the disposition, and the async
+                        // block re-checks the flag after the boot record, so a stop
+                        // in the handover window is never lost.
+                        break (hub.ticket.clone(), None);
+                    }
+                    // A quiet reminder every ~5 minutes, not two lines per second.
+                    if polls.is_multiple_of(HUB_WAIT_REMIND_EVERY) {
+                        println!("still waiting to be paired — run: higgs --node <ticket> <token>");
+                    }
+                }
             }
         },
     };
-    let ticket: EndpointTicket = ticket_str.parse().map_err(Error::other)?;
+    // A malformed SAVED ticket is config corruption — an ENVIRONMENT failure; commit
+    // any pending trial so the wait path's recorded boot attempt never spends budget.
+    // A malformed EXPLICIT ticket (pairing) is an operator typo: no boot attempt was
+    // recorded and a typo is no evidence of binary health — leave the trial alone.
+    let ticket: EndpointTicket = match ticket_str.parse() {
+        Ok(t) => t,
+        Err(e) => {
+            if let (false, Some(bin)) = (pairing, confirm_bin.as_ref()) {
+                let _ = crate::node::self_update::confirm_alive(bin, env!("CARGO_PKG_VERSION"));
+            }
+            return Err(Error::other(e));
+        }
+    };
     let target = ticket.endpoint_addr().clone();
 
     let rt = runtime()?;
@@ -2872,6 +3170,16 @@ fn run_node_daemon_body(args: &[String], confirm_bin: &Option<std::path::PathBuf
                 }
             }
         }
+        // A stop that arrived while the wait loop's plain handler was still the
+        // disposition (before shutdown_listener above replaced it) only set the flag —
+        // honor it now as the same graceful exit the wait loop promises.
+        if WAIT_STOP.load(std::sync::atomic::Ordering::SeqCst) {
+            if let Some(bin) = confirm_bin {
+                let _ = crate::node::self_update::confirm_alive(bin, env!("CARGO_PKG_VERSION"));
+            }
+            println!("higgs node: stopped while waiting to be paired");
+            return Ok(false);
+        }
         let sk = load_or_create_secret(&key_path()?)?;
         let endpoint = bind_endpoint(sk).await.map_err(Error::other)?;
         let self_id = endpoint.id().to_string();
@@ -2905,7 +3213,9 @@ fn run_node_daemon_body(args: &[String], confirm_bin: &Option<std::path::PathBuf
             ollama_dirs: hc.ollama_dirs,
             idle_ttl: crate::node::runtime::DEFAULT_IDLE_TTL,
         }));
-        println!("higgs node   : {name} ({self_id}); connecting to hub…");
+        if !pairing {
+            println!("higgs node   : {name} ({self_id}); connecting to hub…");
+        }
 
         // Self-update "N seconds alive" commit: if a trial for this version is pending,
         // a binary that simply STAYS UP for ALIVE_GRACE (even without reaching the hub —
@@ -2937,6 +3247,222 @@ fn run_node_daemon_body(args: &[String], confirm_bin: &Option<std::path::PathBuf
         // Persist the hub into config.json once, after the FIRST admission, so a later bare
         // `higgs --node` reconnects to it without a ticket or token.
         let mut saved = false;
+
+        // A connection the PAIRING block below already established and hands to the serve
+        // loop's first iteration (foreground fall-through) — never redialed away.
+        let mut preconnected: Option<iroh::endpoint::Connection> = None;
+        // True only on the pairing-foreground path: a LATE service takeover (hub
+        // supersede after the wait window expired) must end this process instead of
+        // redialing into a duplicate-identity fight with the service.
+        let mut watch_supersede = false;
+
+        // ── PAIRING MODE: gated preflight → one-shot connect → seamless service handoff ──
+        // The human-run enrollment (`higgs --node <ticket> [token]`) self-diagnoses instead
+        // of looping into an opaque timeout (docs/pairing-preflight-checklist.md). On
+        // success with a node service installed, it hands the connection to the service and
+        // EXITS — never a second foreground node flapping against the service with the same
+        // identity. Without a service it stays up as a clearly-labeled foreground node.
+        if pairing {
+            let style = crate::node::preflight::Style::auto();
+            println!("higgs node   : {name} ({self_id})");
+            let report = crate::node::preflight::run(&target, &style).await;
+            if report.hopeless() {
+                eprintln!(
+                    "{}",
+                    style.fail(
+                        "no usable path to the hub — fix the failed checks above and re-run \
+                         this command"
+                    )
+                );
+                // An ENVIRONMENT failure is not a bad binary: commit any pending
+                // self-update trial so repeated preflight failures cannot spend the
+                // boot-rollback budget and roll back a healthy version.
+                if let Some(bin) = confirm_bin {
+                    let _ =
+                        crate::node::self_update::confirm_alive(bin, env!("CARGO_PKG_VERSION"));
+                }
+                return Err(Error::other("pairing preflight failed"));
+            }
+            // A Ctrl-C/SIGTERM during pairing must cancel NOW — not after the 2×30s
+            // connect budget — and must never persist or hand off afterwards. An
+            // operator cancel is a graceful exit: commit any pending trial first.
+            // (A signal during the preflight is buffered by the tokio signal stream
+            // and caught at the first connect-loop select below.)
+            let cancelled = |style: &crate::node::preflight::Style| {
+                if let Some(bin) = confirm_bin {
+                    let _ =
+                        crate::node::self_update::confirm_alive(bin, env!("CARGO_PKG_VERSION"));
+                }
+                eprintln!("{}", style.warn("pairing cancelled"));
+                Error::other("pairing cancelled")
+            };
+            println!("{}", style.head("higgs pair: connecting to hub…"));
+            let mut last_err: Option<Error> = None;
+            let mut admitted = None;
+            for _ in 0..PAIR_ATTEMPTS {
+                let attempt = tokio::time::timeout(
+                    PAIR_ATTEMPT_TIMEOUT,
+                    crate::node::connect_node(
+                        &endpoint,
+                        target.clone(),
+                        self_id.clone(),
+                        name.clone(),
+                        token.clone(),
+                    ),
+                );
+                tokio::pin!(attempt);
+                let outcome = tokio::select! {
+                    // biased: a cancel racing a successful connect must win — never
+                    // persist or hand off after the operator asked to stop.
+                    biased;
+                    _ = &mut operator => return Err(cancelled(&style)),
+                    r = &mut attempt => r,
+                };
+                match outcome {
+                    Ok(Ok(ok)) => {
+                        admitted = Some(ok);
+                        break;
+                    }
+                    Ok(Err(e)) => last_err = Some(e),
+                    Err(_) => {
+                        last_err = Some(Error::other(format!(
+                            "timed out after {}s",
+                            PAIR_ATTEMPT_TIMEOUT.as_secs()
+                        )))
+                    }
+                }
+            }
+            match admitted {
+                Some((conn, hello)) => {
+                    persist_hub(&cfg_path, &hello, &ticket_str);
+                    println!(
+                        "  {}",
+                        style.ok(&format!(
+                            "paired with hub {} ({}) (protocol v{})",
+                            crate::remote::sanitize_display(&hello.hub_name),
+                            hello.node_id,
+                            hello.agreed_version
+                        ))
+                    );
+                    if let Some(bin) = confirm_bin {
+                        let _ = crate::node::self_update::confirm_alive(
+                            bin,
+                            env!("CARGO_PKG_VERSION"),
+                        );
+                    }
+                    // The handoff depends on the hub actually LANDING in config.json (the
+                    // service connects from that file) — persist_hub is best-effort, so
+                    // verify by re-reading. A failed save falls through to foreground
+                    // serving: the pairing still works, and the warning names the problem.
+                    // The DEFAULT row must be this hub with this exact ticket: the bare
+                    // service dials default_saved_hub(), and remember_hub() always sets
+                    // default_hub on a successful save — so a matching non-default row is
+                    // a stale leftover from an earlier pairing, not proof this save landed.
+                    let hub_saved = InstanceConfig::load(&cfg_path).ok().is_some_and(|c| {
+                        c.default_saved_hub()
+                            .is_some_and(|h| h.hub_id == hello.node_id && h.ticket == ticket_str)
+                    });
+                    if !hub_saved {
+                        println!(
+                            "  {}",
+                            style.warn(
+                                "could not save the hub to config.json — staying in the \
+                                 foreground (fix the config path/permissions and re-pair \
+                                 for an always-on service handoff)"
+                            )
+                        );
+                    }
+                    if hub_saved && service_present() {
+                        // BEHAVIORAL handoff (replaces the old config-parsing design):
+                        // best-effort restart the installed service, then wait for the
+                        // HUB to close OUR admitted connection with the "retired"
+                        // supersede (the hub replaces a duplicate-identity dial). Only a
+                        // service that manages THIS node's state dir has this node's key
+                        // — so the supersede IS the proof of a correct handoff. A
+                        // wrong-home / dead / stale service never supersedes us and we
+                        // simply keep serving in the foreground. We exit only AFTER the
+                        // successor is demonstrably connected to the hub — strictly
+                        // stronger than any service-manager liveness proxy, and no
+                        // parsing of plists/unit files at all.
+                        restart_service_best_effort();
+                        println!(
+                            "  {}",
+                            style.head("waiting for the installed service to take over…")
+                        );
+                        let took_over = matches!(
+                            tokio::time::timeout(HANDOFF_TAKEOVER_WINDOW, conn.closed()).await,
+                            Ok(reason) if close_is_supersede(&reason)
+                        );
+                        if took_over {
+                            drop(conn);
+                            println!(
+                                "  {}",
+                                style.ok(
+                                    "handed off — the node service is connected to your \
+                                     hub now"
+                                )
+                            );
+                            if let Some(bin) = confirm_bin {
+                                let _ = crate::node::self_update::confirm_alive(
+                                    bin,
+                                    env!("CARGO_PKG_VERSION"),
+                                );
+                            }
+                            return Ok(false);
+                        }
+                        println!(
+                            "  {}",
+                            style.warn(
+                                "the installed service did not take over — continuing in \
+                                 the foreground so the node stays online (check: \
+                                 launchctl print gui/$UID/com.higgs.node, systemctl \
+                                 --user status higgs-node, or for a system daemon: sudo \
+                                 launchctl kickstart -k system/com.higgs.node)"
+                            )
+                        );
+                    }
+                    if hub_saved && !service_present() {
+                        println!(
+                            "  {}",
+                            style.warn(
+                                "no node service installed — running in the foreground \
+                                 (for always-on, run: higgs node install-service)"
+                            )
+                        );
+                    }
+                    // Fall into the daemon loop below as the (sole) node process, SERVING
+                    // the already-admitted connection — dropping and redialing here would
+                    // sever the link the hub just gated (and burn nothing: the token is
+                    // already consumed hub-side, so the loop's later reconnects go via the
+                    // allowlist).
+                    preconnected = Some(conn);
+                    token = None;
+                    saved = true;
+                    watch_supersede = true;
+                }
+                None => {
+                    let e = last_err.unwrap_or_else(|| Error::other("no attempt ran"));
+                    eprintln!("  {}", style.fail(&format!("pairing failed: {e}")));
+                    // Same budget rule as the preflight gate: a connect failure is an
+                    // environment problem, never spent against the update boot budget.
+                    if let Some(bin) = confirm_bin {
+                        let _ = crate::node::self_update::confirm_alive(
+                            bin,
+                            env!("CARGO_PKG_VERSION"),
+                        );
+                    }
+                    eprintln!(
+                        "{}",
+                        crate::node::preflight::connect_failure_advice(
+                            &report,
+                            cfg!(target_os = "macos"),
+                            crate::node::preflight::is_ssh_session(),
+                        )
+                    );
+                    return Err(Error::other("pairing failed"));
+                }
+            }
+        }
         // SIGINT/SIGTERM ends the loop so we can drain resident workers — a dropped Supervisor does
         // not reap its child, so an undrained exit would orphan models. The `operator` signal future
         // and the boot-attempt record were BOTH set up at the TOP of this block (before the risky
@@ -2956,6 +3482,30 @@ fn run_node_daemon_body(args: &[String], confirm_bin: &Option<std::path::PathBuf
             let shutdown = crate::node::self_update::await_node_shutdown(operator.as_mut());
             tokio::pin!(shutdown);
             'serve: loop {
+                // First iteration after a foreground pairing: serve the ALREADY-admitted
+                // connection instead of redialing (see the pairing block above).
+                if let Some(conn) = preconnected.take() {
+                    // Keep a handle to inspect the close reason after serving: if the
+                    // installed service took over LATE (hub superseded us with
+                    // "retired"), exit gracefully instead of redialing into a
+                    // duplicate-identity fight — the service is the rightful node now.
+                    let probe = conn.clone();
+                    tokio::select! {
+                        cause = &mut shutdown => break 'serve cause,
+                        _ = crate::node::serve_node(conn, node.clone()) => {
+                            if watch_supersede
+                                && probe.close_reason().is_some_and(|e| close_is_supersede(&e))
+                            {
+                                println!(
+                                    "node service took over the pairing — exiting \
+                                     (the service is connected to your hub)"
+                                );
+                                break 'serve crate::node::self_update::ShutdownCause::Operator;
+                            }
+                            eprintln!("hub connection closed; reconnecting…");
+                        }
+                    }
+                }
                 tokio::select! {
                     cause = &mut shutdown => break 'serve cause,
                 res = crate::node::connect_node(&endpoint, target.clone(), self_id.clone(), name.clone(), token.clone()) => {

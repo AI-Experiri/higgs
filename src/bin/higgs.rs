@@ -66,9 +66,17 @@ fn main() {
     let log_bus = Arc::new(higgs::LogBus::new());
     // Per-layer filters so the higgs log layer can admit higgs DEBUG (verbose
     // mode) without flooding fmt; info-level filter applied to fmt individually.
+    // Default filter demotes the iroh/QUIC transport's WARN firehose (relay retries, IPv6
+    // no-route sends, multipath close chatter) to ERROR — operationally meaningless noise
+    // that buried the useful lines during the first real-hardware install. RUST_LOG still
+    // overrides everything (set RUST_LOG=info,iroh=warn to get the firehose back).
     let env = || {
-        tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            tracing_subscriber::EnvFilter::new(
+                "info,iroh=error,noq_proto=error,noq_udp=error,netwatch=error,\
+                 portmapper=error,hickory_resolver=error",
+            )
+        })
     };
     tracing_subscriber::registry()
         .with(higgs::HiggsLogLayer::new(log_bus).with_filter(higgs::log_filter()))
