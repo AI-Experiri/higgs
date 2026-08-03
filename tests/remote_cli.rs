@@ -52,19 +52,70 @@ fn link_status_prints_identity_and_zero_paired() {
 }
 
 #[test]
-fn node_daemon_bare_without_saved_hubs_prints_pair_hint() {
+fn node_daemon_bare_without_saved_hubs_waits_for_pairing() {
+    use std::io::Read;
     let home = tempfile::tempdir().unwrap();
-    // Bare `--node` with no saved hub explains how to pair and exits 0 (no network).
-    let out = run_higgs(home.path(), &["--node"]);
-    assert!(out.status.success(), "bare --node (no hubs) exits 0");
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Bare `--node` with no saved hub prints the pair hint ONCE and then WAITS for a hub
+    // to appear in config.json (the service-manager path: no exit → no respawn loop → no
+    // log spam, and the wait doubles as the seamless pairing handoff). Fail-on-revert:
+    // the old behavior exited immediately, so "still alive after 2s" catches a regression.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_higgs"))
+        .args(["--node"])
+        .env("HIGGS_HOME", home.path())
+        .env("HIGGS_IROH_LOCAL", "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn higgs --node");
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        child.try_wait().expect("try_wait").is_none(),
+        "bare --node with no saved hub must WAIT for pairing, not exit"
+    );
+    // SIGTERM, not SIGKILL: the wait loop handles it gracefully (commits any pending
+    // self-update trial, prints, exits 0) and a clean exit flushes piped stdout —
+    // SIGKILL could drop the block-buffered output this test asserts on.
+    // SAFETY: a plain kill(2) on our own child's pid.
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+    }
+    // Bounded: a regression in graceful SIGTERM handling must fail the test, not
+    // hang the whole suite on an unbounded wait.
+    let mut status = None;
+    for _ in 0..50 {
+        if let Some(st) = child.try_wait().expect("try_wait") {
+            status = Some(st);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let status = match status {
+        Some(st) => st,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("node did not exit within 5s of SIGTERM — graceful stop regressed");
+        }
+    };
+    assert!(
+        status.success(),
+        "SIGTERM during the wait must be a GRACEFUL exit 0 (trial committed), got {status:?}"
+    );
+    let mut stdout = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.read_to_string(&mut stdout);
+    }
     assert!(
         stdout.contains("higgs node"),
         "prints node identity: {stdout}"
     );
     assert!(
+        stdout.contains("waiting to be paired"),
+        "prints the waiting hint: {stdout}"
+    );
+    assert!(
         stdout.contains("higgs --node <ticket>"),
-        "prints the pairing hint: {stdout}"
+        "hint includes the pairing command: {stdout}"
     );
 }
 
