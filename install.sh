@@ -805,6 +805,14 @@ if [ "$os" = "Darwin" ]; then
   if [ -n "${HOME-}" ] && [ -f "${HOME}/Library/LaunchAgents/com.higgs.node.plist" ]; then
     if launchctl kickstart -k "gui/$(id -u)/com.higgs.node" 2>/dev/null; then
       ok "restarted the higgs node service onto v${VERSION}"
+      # The binaries are not (yet) Developer-ID signed, so macOS keys the Local
+      # Network grant to the EXACT binary — every new version re-prompts, and
+      # the prompt only appears in a GUI session (never over SSH; there is no
+      # command-line grant). Without the click, the node times out connecting.
+      note "macOS will show a 'higgs wants to find devices on local networks' popup — click ALLOW"
+      note "(GUI only — it cannot appear over SSH, and there is no command-line way to grant it;"
+      note " if the node shows 'connect failed: timed out', check System Settings → Privacy &"
+      note " Security → Local Network and enable higgs, then rerun the launchctl restart above)"
     else
       note "could not restart com.higgs.node — restart it (or log out/in) to run v${VERSION}"
     fi
