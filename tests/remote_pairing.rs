@@ -78,6 +78,7 @@ async fn valid_token_pairs() {
             target: Some(higgs::node::self_update::BuildIdentity::current().target),
             variant: Some(higgs::node::self_update::BuildIdentity::current().variant),
             update_capable: true,
+            version_capable: true,
         }
     );
     assert!(now_paired, "node added to allowlist after pairing");
@@ -271,6 +272,7 @@ async fn hello_exchanges_friendly_names() {
             target: Some(higgs::node::self_update::BuildIdentity::current().target),
             variant: Some(higgs::node::self_update::BuildIdentity::current().variant),
             update_capable: true,
+            version_capable: true,
         }
     );
     assert_eq!(
@@ -341,6 +343,7 @@ async fn allowlisted_node_reconnects_without_token() {
             target: Some(higgs::node::self_update::BuildIdentity::current().target),
             variant: Some(higgs::node::self_update::BuildIdentity::current().variant),
             update_capable: true,
+            version_capable: true,
         }
     );
     let _ = std::fs::remove_file(&path);

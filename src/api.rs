@@ -2692,6 +2692,8 @@ impl Higgs {
             node_id: 0, // remote NodeIds start at 1; 0 is the local sentinel
             endpoint_id: "local".to_string(),
             connected: true,
+            // The local instance updates itself locally — a hub version-push never targets it.
+            update_by_version: false,
             is_local: true,
             label,
             inventory: Some(inventory),

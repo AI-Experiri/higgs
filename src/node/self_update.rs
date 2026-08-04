@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::diagnostic::HiggsError;
 use crate::node::cli::{temp_name, TRUSTED_PATH};
-use crate::update::{verify_artifact_sha256, verify_manifest_any, UpdateManifest};
+use crate::update::{verify_artifact_sha256, UpdateManifest};
 
 /// The acceleration variant THIS binary was compiled as, in the LOWERCASE
 /// spelling the release manifest + `install.sh` use (`metal`/`cuda`/`cpu`) — NOT
@@ -1478,11 +1478,46 @@ pub fn verify_and_check(
     // unknown schema and must not be presented as authenticated. The caller's hint fallback is the
     // honest value there, and the HG083 reason carries the actual schema number for the operator.
     authenticated_version: &mut Option<String>,
+    // When set, the AUTHENTICATED manifest must be exactly this version — the caller named a
+    // release (a version-only trigger) rather than accepting whatever the source serves. Checked
+    // BEFORE the artifact download, so a validly-signed manifest for a different version cannot
+    // force a large fetch before being refused.
+    expected_version: Option<&str>,
+) -> Result<VerifiedUpdate, HiggsError> {
+    verify_and_check_with(
+        source,
+        running,
+        allow_downgrade,
+        authenticated_version,
+        expected_version,
+        &crate::update::HIGGS_UPDATE_PUBKEYS,
+    )
+}
+
+/// [`verify_and_check`] with an injected key table — PRIVATE test seam, same
+/// rationale (and same table plumbing) as `verify_manifest_any_with`.
+fn verify_and_check_with(
+    source: &dyn UpdateSource,
+    running: &BuildIdentity,
+    allow_downgrade: bool,
+    authenticated_version: &mut Option<String>,
+    expected_version: Option<&str>,
+    pubkeys: &[(&str, &str)],
 ) -> Result<VerifiedUpdate, HiggsError> {
     let (manifest_bytes, sig_text) = source.manifest()?;
     // Signature BEFORE anything else reads the manifest fields (P1 invariant).
-    let (key_id, manifest) = verify_manifest_any(&manifest_bytes, &sig_text)?;
+    let (key_id, manifest) =
+        crate::update::verify_manifest_any_with(&manifest_bytes, &sig_text, pubkeys)?;
     *authenticated_version = Some(manifest.version.clone());
+    if let Some(expected) = expected_version {
+        if manifest.version != expected {
+            return Err(HiggsError::UpdateManifestInvalid {
+                detail: "the fetched manifest's version does not match the requested \
+                         release — refusing"
+                    .into(),
+            });
+        }
+    }
     // Eligibility BEFORE downloading the (large) artifact — refuse a wrong-target or
     // downgrade artifact without spending the bandwidth to fetch it.
     evaluate_eligibility(running, &manifest, allow_downgrade)?;
@@ -1577,7 +1612,13 @@ pub fn apply_pushed_update(
     let staged = (|| {
         let source = PushSource::new(manifest, manifest_sig, artifact_url)?;
         let running = installed_identity(bin);
-        let verified = verify_and_check(&source, &running, allow_downgrade, &mut authenticated_to)?;
+        let verified = verify_and_check(
+            &source,
+            &running,
+            allow_downgrade,
+            &mut authenticated_to,
+            None,
+        )?;
         stage_and_flip(
             bin,
             &verified.manifest,
@@ -1597,6 +1638,225 @@ pub fn apply_pushed_update(
                 bin,
                 running_version,
                 authenticated_to.as_deref().unwrap_or(target_hint),
+                &e.to_string(),
+            );
+            Err(e)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Version-only update (M_NODE_UPDATE_VERSION): the node fetches its OWN release
+// ---------------------------------------------------------------------------
+
+/// Max redirect hops the release fetch follows. GitHub serves `releases/download/...`
+/// via ONE 302 to its storage host; a small budget covers a mirror in front of it
+/// without letting a hostile chain wander.
+const RELEASE_REDIRECT_HOPS: usize = 4;
+
+/// Derive the three release-asset URLs for `version` and THIS build's target/variant
+/// under the node's configured `release_url` base (`…/releases`):
+/// `<base>/download/v<ver>/higgs-v<ver>-<suffix>{.manifest,.manifest.minisig,.tar.gz}`.
+/// PURE — the fetch policy is [`build_release_client`]. The base must be `https` (or
+/// `http` to a LITERAL loopback IP — the on-box test affordance every other release
+/// path shares) with no credentials/query/fragment, since the three children are
+/// derived by path edits.
+pub fn release_asset_urls(
+    base: &str,
+    version: &str,
+) -> Result<(reqwest::Url, reqwest::Url, reqwest::Url), HiggsError> {
+    // Syntax gate FIRST: the version lands in a URL path — a separator or traversal
+    // in a hub-supplied string must die here, and semver rejects all of them.
+    semver::Version::parse(version).map_err(|_| HiggsError::UpdateFetchFailed {
+        detail: "the requested update version is not a plain semver string".into(),
+    })?;
+    let base_url = crate::node::release_courier::parse_courier_url(base)?;
+    let ident = BuildIdentity::current();
+    let name = format!(
+        "higgs-v{version}-{}",
+        crate::node::release_courier::asset_suffix(&ident.target, &ident.variant)
+    );
+    let dir = {
+        let mut b = base_url.clone();
+        let path = b.path().trim_end_matches('/').to_string();
+        b.set_path(&format!("{path}/download/v{version}/"));
+        b
+    };
+    let child = |file: String| -> Result<reqwest::Url, HiggsError> {
+        dir.join(&file).map_err(|e| HiggsError::UpdateFetchFailed {
+            detail: format!("cannot derive a release asset URL: {e}"),
+        })
+    };
+    Ok((
+        child(format!("{name}.manifest"))?,
+        child(format!("{name}.manifest.minisig"))?,
+        child(format!("{name}.tar.gz"))?,
+    ))
+}
+
+/// True iff `next` is an acceptable redirect TARGET for the release fetch: `https`
+/// with no embedded credentials. (Unlike every other update fetch, a QUERY is
+/// allowed — GitHub's storage URLs carry signed query strings — because nothing is
+/// derived from a post-redirect URL: all three asset URLs were derived from the
+/// configured base BEFORE any redirect, and the bytes are untrusted until the CI
+/// signature + sha256 verify.) `http` is never an acceptable hop — not even back to
+/// loopback: a downgrade mid-chain would move signed-release traffic to plaintext.
+fn release_redirect_ok(next: &reqwest::Url) -> bool {
+    next.scheme() == "https" && next.username().is_empty() && next.password().is_none()
+}
+
+/// The blocking client for the version-update fetch: bounded redirects where EVERY
+/// hop must pass [`release_redirect_ok`]; same connect/read timeouts as every other
+/// update fetch. The release base is OPERATOR CONFIG (`config.json` `release_url`,
+/// default = this repo's GitHub releases) — trusted at the same level as the CLI
+/// `--url` — and the fetched bytes are trusted by NOTHING until [`verify_and_check`]
+/// proves the CI signature and the artifact sha256. `no_proxy` for a loopback base so
+/// an on-box test fetch never leaves the machine.
+fn build_release_client(base: &reqwest::Url) -> Result<reqwest::blocking::Client, HiggsError> {
+    let mut builder = reqwest::blocking::Client::builder()
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .timeout(HTTP_READ_TIMEOUT)
+        // No Referer across hops: a pre-redirect URL (which may carry a
+        // configured-path capability) must not leak to later redirect targets.
+        .referer(false)
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() > RELEASE_REDIRECT_HOPS {
+                return attempt.error("too many redirects for a release asset");
+            }
+            if release_redirect_ok(attempt.url()) {
+                attempt.follow()
+            } else {
+                attempt
+                    .error("release asset redirected to a non-https or credentialed URL — refusing")
+            }
+        }));
+    if is_loopback_host(base) {
+        builder = builder.no_proxy();
+    }
+    builder.build().map_err(|e| HiggsError::UpdateFetchFailed {
+        detail: format!("cannot build the HTTP client: {e}"),
+    })
+}
+
+/// [`UpdateSource`] for a version-only update: all three asset URLs pre-derived from
+/// the node's OWN configured release base ([`release_asset_urls`]) — the hub named a
+/// version and nothing else.
+pub struct VersionSource {
+    manifest_url: reqwest::Url,
+    sig_url: reqwest::Url,
+    artifact_url: reqwest::Url,
+    client: reqwest::blocking::Client,
+}
+
+impl VersionSource {
+    pub fn new(release_base: &str, version: &str) -> Result<Self, HiggsError> {
+        let (manifest_url, sig_url, artifact_url) = release_asset_urls(release_base, version)?;
+        let client = build_release_client(&manifest_url)?;
+        Ok(Self {
+            manifest_url,
+            sig_url,
+            artifact_url,
+            client,
+        })
+    }
+}
+
+impl UpdateSource for VersionSource {
+    fn manifest(&self) -> Result<(Vec<u8>, String), HiggsError> {
+        let manifest = fetch_bounded(
+            &self.client,
+            &self.manifest_url,
+            MAX_MANIFEST_BYTES,
+            "manifest",
+        )?;
+        let sig_bytes = fetch_bounded(&self.client, &self.sig_url, MAX_SIG_BYTES, "signature")?;
+        let sig = String::from_utf8(sig_bytes).map_err(|_| HiggsError::UpdateManifestInvalid {
+            detail: "the fetched signature is not UTF-8".into(),
+        })?;
+        Ok((manifest, sig))
+    }
+
+    fn artifact(&self, _file: &str) -> Result<Vec<u8>, HiggsError> {
+        // Deliberately IGNORES the manifest's `file`: the artifact URL was derived
+        // from the configured base + version + THIS build's suffix before any fetch,
+        // so a hostile manifest cannot steer the download anywhere. If the manifest
+        // names a different file, the sha256 check fails loudly right after.
+        fetch_bounded(
+            &self.client,
+            &self.artifact_url,
+            MAX_ARTIFACT_BYTES,
+            "artifact",
+        )
+    }
+}
+
+/// Apply a hub-TRIGGERED version-only update (`M_NODE_UPDATE_VERSION`): the node
+/// reads its OWN `release_url` from `config.json`, fetches + verifies + applies
+/// `version` through the SAME pipeline as every other source. Mirrors
+/// [`apply_pushed_update`] exactly (root refusal, lock, record/clear rules,
+/// UPGRADE-ONLY) — only the source differs.
+pub fn apply_version_update(bin: &Path, version: &str) -> Result<(String, String), HiggsError> {
+    let running_version = env!("CARGO_PKG_VERSION");
+    // SAFETY: geteuid has no preconditions and no failure mode.
+    if unsafe { libc::geteuid() } == 0 {
+        return Err(HiggsError::UpdateApplyFailed {
+            detail: "refusing to apply a pushed update as root — the node runs as the \
+                     unprivileged operator"
+                .into(),
+        });
+    }
+    let _lock = match UpdateLock::try_acquire(bin) {
+        LockAttempt::Held(lock) => lock,
+        LockAttempt::Contended => {
+            return Err(HiggsError::UpdateApplyFailed {
+                detail: format!(
+                    "another self-update is already running (lock held on {})",
+                    lock_path(bin).display()
+                ),
+            });
+        }
+        LockAttempt::Failed(e) => {
+            record_update_failure(bin, running_version, version, &e.to_string());
+            return Err(e);
+        }
+    };
+    let mut authenticated_to: Option<String> = None;
+    let staged = (|| {
+        // The node's OWN config decides WHERE releases come from — never the hub.
+        let release_base = crate::config::config_path()
+            .ok()
+            .and_then(|p| crate::config::InstanceConfig::load(&p).ok())
+            .map(|c| c.release_url())
+            .unwrap_or_else(|| crate::config::DEFAULT_RELEASE_URL.to_string());
+        let source = VersionSource::new(&release_base, version)?;
+        let running = installed_identity(bin);
+        // The version bind (AUTHENTICATED manifest == the version the hub named) runs
+        // inside `verify_and_check` via `expected_version`, BEFORE the artifact download —
+        // a release origin serving a validly-signed different manifest at that path is
+        // refused without spending the artifact bandwidth.
+        let verified = verify_and_check(
+            &source,
+            &running,
+            false,
+            &mut authenticated_to,
+            Some(version),
+        )?;
+        stage_and_flip(
+            bin,
+            &verified.manifest,
+            &verified.artifact,
+            false,
+            &smoke_run,
+        )?;
+        Ok::<(String, String), HiggsError>((running.version, verified.manifest.version))
+    })();
+    match staged {
+        Ok(pair) => Ok(pair),
+        Err(e) => {
+            record_update_failure(
+                bin,
+                running_version,
+                authenticated_to.as_deref().unwrap_or(version),
                 &e.to_string(),
             );
             Err(e)

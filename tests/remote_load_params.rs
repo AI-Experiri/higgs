@@ -109,6 +109,7 @@ async fn params_load_applies_ctx_on_a_real_node() {
         target: _,
         variant: _,
         update_capable: _,
+        version_capable: _,
     } = outcome
     else {
         panic!("admitted: {outcome:?}");

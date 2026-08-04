@@ -325,6 +325,9 @@ async fn build_manifest_client(url: &Url) -> Result<reqwest::Client, HiggsError>
         .connect_timeout(HTTP_CONNECT_TIMEOUT)
         .timeout(HTTP_FETCH_DEADLINE)
         .redirect(reqwest::redirect::Policy::none())
+        // GitHub's REST API rejects requests without a User-Agent (403) — name
+        // ourselves for every courier fetch (harmless to static mirrors).
+        .user_agent(concat!("higgs/", env!("CARGO_PKG_VERSION")))
         .no_proxy();
     if is_literal_loopback_url(url) {
         return builder
@@ -521,6 +524,291 @@ async fn fetch_and_assemble(
         // The courier names no key; the node tries all its pinned keys.
         pinned_key_id: None,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Version-choosing flow (UPx): list newer releases + version-only pushes
+// ---------------------------------------------------------------------------
+
+/// A releases-index JSON is bounded (100 entries of metadata) — cap it so a hostile/broken
+/// origin cannot stream unbounded bytes.
+const MAX_RELEASES_INDEX_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Derive the GitHub RELEASES-API index URL from a configured `release_url` of the shape
+/// `https://github.com/<owner>/<repo>/releases`. Listing is a GitHub-shape feature: a custom
+/// static mirror has no index contract, so a non-GitHub `release_url` gets a clear error
+/// telling the operator to use the exact-URL push instead. PURE (unit-testable).
+pub fn releases_api_url(release_url: &str) -> Result<Url, HiggsError> {
+    let u = parse_courier_url(release_url)?;
+    if u.host_str() != Some("github.com") {
+        return Err(fetch_err(
+            "listing releases is only supported for a github.com release_url — for a custom \
+             mirror, push with an exact manifest/base URL instead"
+                .into(),
+        ));
+    }
+    let segs: Vec<&str> = u
+        .path_segments()
+        .map(|s| s.filter(|p| !p.is_empty()).collect())
+        .unwrap_or_default();
+    match segs.as_slice() {
+        [owner, repo, "releases"] => Url::parse(&format!(
+            "https://api.github.com/repos/{owner}/{repo}/releases?per_page=100"
+        ))
+        .map_err(|e| fetch_err(format!("cannot derive the releases API URL: {e}"))),
+        _ => Err(fetch_err(
+            "the release_url is not of the form https://github.com/<owner>/<repo>/releases — \
+             cannot list releases from it"
+                .into(),
+        )),
+    }
+}
+
+/// PURE filter over a fetched releases index: every non-draft release whose tag is
+/// `v<semver>` STRICTLY NEWER than `current` and whose assets include the manifest for
+/// `(target, variant)` — i.e. versions this exact node can actually be updated to.
+/// Sorted newest-first. `current` unparseable/absent → empty (never guess an upgrade for a
+/// node whose version is unknown). The index is UNTRUSTED text: only syntactically-valid
+/// semver tags and exact asset-name matches survive, and nothing else is echoed anywhere.
+pub fn newer_releases_for(
+    index: &Value,
+    current: &str,
+    target: &str,
+    variant: &str,
+) -> Vec<String> {
+    let Ok(cur) = semver::Version::parse(current) else {
+        return Vec::new();
+    };
+    let Some(entries) = index.as_array() else {
+        return Vec::new();
+    };
+    let mut out: Vec<semver::Version> = entries
+        .iter()
+        .filter(|e| e.get("draft").and_then(Value::as_bool) != Some(true))
+        .filter_map(|e| {
+            let tag = e.get("tag_name")?.as_str()?;
+            let ver = semver::Version::parse(tag.strip_prefix('v')?).ok()?;
+            // Build metadata has NO precedence under semver, so "newer" is
+            // ill-defined across it — and CI never publishes +metadata tags.
+            // Refuse to offer them rather than risk an offered-but-refused push.
+            if !ver.build.is_empty() || ver <= cur {
+                return None;
+            }
+            // The node fetches manifest + .minisig + tarball — offer only releases
+            // that published the COMPLETE trio for this build (a partial upload
+            // would be offered and then fail at fetch).
+            let base = format!("higgs-v{}-{}", ver, asset_suffix(target, variant));
+            let names: Vec<&str> = e
+                .get("assets")?
+                .as_array()?
+                .iter()
+                .filter_map(|a| a.get("name").and_then(Value::as_str))
+                .collect();
+            let complete = [
+                format!("{base}.manifest"),
+                format!("{base}.manifest.minisig"),
+                format!("{base}.tar.gz"),
+            ]
+            .iter()
+            .all(|w| names.contains(&w.as_str()));
+            complete.then_some(ver)
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out.reverse();
+    out.into_iter().map(|v| v.to_string()).collect()
+}
+
+/// The version-listing flow behind the UI's Update button — ON DEMAND ONLY (this is the
+/// only network touch, and it happens when the operator clicks, never on a timer): fetch
+/// the releases index from the hub's configured `release_url` and return, for `node`,
+/// `{ current, available: [newer-first…], update_by_version }`. `available` is empty when
+/// the node is already newest (the UI says so), when its version/target/variant are
+/// unknown, or when nothing matching its build exists.
+pub async fn node_releases(
+    fleet: &HubFleet,
+    node: &str,
+    release_url: &str,
+) -> Result<Value, HiggsError> {
+    let t = fleet
+        .update_targets()
+        .await
+        .into_iter()
+        .find(|t| t.node == node)
+        .ok_or_else(|| HiggsError::NodeUnreachable {
+            endpoint_id: node.to_string(),
+            detail: "node is not connected".into(),
+        })?;
+    let current = t.software_version.clone().unwrap_or_default();
+    // A node whose version/build is unknown can never be offered anything —
+    // return the empty listing WITHOUT touching the network (the UI then shows
+    // its bootstrap/up-to-date state instead of a spurious fetch error).
+    let available = match (t.target.as_deref(), t.variant.as_deref()) {
+        // Parseable-version gate matches newer_releases_for's own rule — an
+        // unparseable current would filter to empty anyway, so never fetch for it.
+        (Some(target), Some(variant)) if semver::Version::parse(&current).is_ok() => {
+            let api = releases_api_url(release_url)?;
+            let client = build_manifest_client(&api).await?;
+            let body =
+                fetch_bounded(&client, &api, MAX_RELEASES_INDEX_BYTES, "releases index").await?;
+            // CONSTANT error text: the index is an UNTRUSTED body (courier-wide
+            // redaction rules).
+            let index: Value = serde_json::from_slice(&body)
+                .map_err(|_| fetch_err("the releases index is not valid JSON".into()))?;
+            newer_releases_for(&index, &current, target, variant)
+        }
+        _ => Vec::new(),
+    };
+    // NOTE deliberately NO bootstrap URL here: the listing only succeeds from the
+    // GitHub releases API, and a GitHub `…/releases/download/…` asset URL 302s to
+    // storage — which the manifest-push path refuses (no-redirect SSRF defence) —
+    // so a prefilled URL would predictably fail. The UI instead tells a legacy
+    // node's operator the honest bootstrap: re-run the installer on that machine
+    // (or paste a DIRECT static-mirror manifest URL).
+    Ok(json!({
+        "node": node,
+        "current": current,
+        "available": available,
+        "update_by_version": t.version_capable,
+    }))
+}
+
+/// Push the version-only update trigger to ONE node: the hub sends `version` (validated
+/// semver) and NOTHING else — the node self-fetches from its OWN configured `release_url`
+/// and re-verifies everything. Refused client-side for a node that did not advertise
+/// `update_by_version` (it must be updated once by installer/manifest-push first).
+pub async fn node_update_version(
+    fleet: &HubFleet,
+    node: &str,
+    version: &str,
+) -> Result<Value, HiggsError> {
+    semver::Version::parse(version).map_err(|_| {
+        fetch_err("the requested update version is not a plain semver string".into())
+    })?;
+    let t = fleet
+        .update_targets()
+        .await
+        .into_iter()
+        .find(|t| t.node == node)
+        .ok_or_else(|| HiggsError::NodeUnreachable {
+            endpoint_id: node.to_string(),
+            detail: "node is not connected".into(),
+        })?;
+    if !t.version_capable {
+        return Err(fetch_err(
+            "node does not support version-triggered updates — update it once via the \
+             installer (or an exact manifest-URL push); every later update is one click"
+                .into(),
+        ));
+    }
+    match fleet
+        .push_update_version_pinned(node, &t.transport, version)
+        .await?
+    {
+        PinnedPush::Accepted(reply) => Ok(reply),
+        // Same classification as a mid-op transport loss elsewhere (HG027): the
+        // node moved between the snapshot and the send — a retryable reachability
+        // condition, not a fetch failure.
+        PinnedPush::Reconnected => Err(HiggsError::NodeUnreachable {
+            endpoint_id: node.to_string(),
+            detail: "node reconnected during the update — retry".into(),
+        }),
+    }
+}
+
+/// Push the version-only trigger to EVERY connected node that can take it, collecting the
+/// same per-node `{node, status, …}` report `fleet_update` produces. A node without the
+/// capability (or without a reported version) is SKIPPED with the reason; one node's
+/// failure never fails the fleet. A node already AT or ABOVE `version` is skipped
+/// hub-side (the node would refuse the non-upgrade anyway — skipping keeps the report
+/// honest instead of "accepted-then-failed").
+pub async fn fleet_update_version(
+    fleet: &HubFleet,
+    version: &str,
+    release_url: &str,
+) -> Result<Value, HiggsError> {
+    use futures::stream::{self, StreamExt};
+    let want = semver::Version::parse(version).map_err(|_| {
+        fetch_err("the requested update version is not a plain semver string".into())
+    })?;
+    let targets = fleet.update_targets().await;
+    // Fetch the release index ONCE and verify per-node asset availability BEFORE
+    // pushing: a node whose build has no complete asset trio for `version` is
+    // SKIPPED here rather than ACKed-then-failed (the fleet report stays honest).
+    // Fetched only when a capable target exists — with none, every row is a
+    // capability-skip and no network is touched.
+    let index: Value = if targets.iter().any(|t| {
+        // Fetch only when some node could actually be PUSHED: capable, with a
+        // known build, and currently BELOW the requested version — otherwise
+        // every row is a local skip and an unreachable index must not fail them.
+        t.version_capable
+            && t.target.is_some()
+            && t.variant.is_some()
+            && t.software_version
+                .as_deref()
+                .and_then(|v| semver::Version::parse(v).ok())
+                .is_some_and(|c| c < want)
+    }) {
+        let api = releases_api_url(release_url)?;
+        let client = build_manifest_client(&api).await?;
+        let body = fetch_bounded(&client, &api, MAX_RELEASES_INDEX_BYTES, "releases index").await?;
+        serde_json::from_slice(&body)
+            .map_err(|_| fetch_err("the releases index is not valid JSON".into()))?
+    } else {
+        Value::Null
+    };
+    let results: Vec<Value> = stream::iter(targets)
+        .map(|t| {
+            let want = want.clone();
+            let index = &index;
+            async move {
+                if !t.version_capable {
+                    return skipped(&t.node, "node does not support version-triggered updates");
+                }
+                let Some(cur) = t
+                    .software_version
+                    .as_deref()
+                    .and_then(|v| semver::Version::parse(v).ok())
+                else {
+                    return skipped(&t.node, "node did not report a parseable version");
+                };
+                if cur >= want {
+                    return skipped(&t.node, "node is already at or above the requested version");
+                }
+                match (t.target.as_deref(), t.variant.as_deref()) {
+                    (Some(target), Some(variant)) => {
+                        // Availability check via the same PURE filter the listing uses:
+                        // `version` must be among this build's offerable releases.
+                        let offered = newer_releases_for(index, &cur.to_string(), target, variant);
+                        if !offered.iter().any(|v| v == &want.to_string()) {
+                            return skipped(
+                                &t.node,
+                                "the requested release ships no complete asset set for this \
+                                 node's build",
+                            );
+                        }
+                    }
+                    _ => return skipped(&t.node, "node did not report its build target/variant"),
+                }
+                match fleet
+                    .push_update_version_pinned(&t.node, &t.transport, &want.to_string())
+                    .await
+                {
+                    Ok(PinnedPush::Accepted(reply)) => {
+                        json!({ "node": t.node, "status": "accepted", "reply": reply })
+                    }
+                    Ok(PinnedPush::Reconnected) => {
+                        skipped(&t.node, "node reconnected during the update")
+                    }
+                    Err(e) => errored(&t.node, &e),
+                }
+            }
+        })
+        .buffer_unordered(FLEET_UPDATE_CONCURRENCY)
+        .collect()
+        .await;
+    Ok(json!({ "results": results }))
 }
 
 // ---------------------------------------------------------------------------

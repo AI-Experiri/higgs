@@ -52,6 +52,21 @@ pub const M_NODE_INVENTORY: &str = "higgs/node/inventory";
 /// then fails `HG087` (cannot locate its install dir, checked BEFORE any key check); a MANAGED dev
 /// build with no compiled-in pubkeys fails closed `HG081`.
 pub const M_NODE_UPDATE: &str = "higgs/node/update";
+/// `higgs/node/update_version` — the hub tells this node to update itself to an EXACT release
+/// VERSION; the node does its OWN download. Params: [`NodeUpdateVersionParams`] (`{version}`,
+/// plain semver, no `v` prefix). The node derives the manifest/`.minisig`/artifact URLs from
+/// its OWN configured `release_url` (`config.json`, default = this repo's GitHub releases) and
+/// the CI `higgs-v<ver>-<suffix>` naming for its OWN compiled target/variant, fetches them
+/// (https-only, redirect-tolerant — GitHub 302s release assets to storage; every hop must be
+/// https and the fetch is size/time-bounded), then runs the SAME verify+apply pipeline as every
+/// other update source: CI signature against COMPILED-IN pubkeys, sha256, eligibility
+/// (target/variant match, UPGRADE-ONLY), stage, trial-flip, re-exec, boot-guard rollback. The
+/// hub is a pure trigger — it supplies ONE semver string and no URL, so a compromised hub can
+/// name a version but can never choose WHERE the node fetches from or forge WHAT it applies.
+/// ACKed synchronously (`{status:"accepted"}`), applied detached; the outcome is the node's
+/// next HELLO (version advance or `update_failed`). Advertised by the `update_by_version`
+/// capability; a hub must not send it to a node that did not advertise it.
+pub const M_NODE_UPDATE_VERSION: &str = "higgs/node/update_version";
 /// `higgs/node/pull` — DATA-plane request to download a GGUF from HuggingFace into the node's
 /// own `~/.higgs/models/` (P4b). Streams [`N_PROGRESS`] then a final `{ path }`. `HG025` on
 /// failure. A subsequent `M_NODE_SCAN`/`M_NODE_LOAD` then sees the pulled model.
@@ -224,6 +239,9 @@ pub fn node_capabilities(reports_update_failures: bool) -> Capabilities {
         // `update` (M_UPDATE, §9): this build ships the signature-verified self-update PUSH
         // handler, so a hub may push a signed update (a dev build still fails closed HG081).
         ("update", true),
+        // `update_by_version` (M_NODE_UPDATE_VERSION): this build can be told a bare release
+        // VERSION and will fetch + verify + apply it from its OWN configured release_url.
+        ("update_by_version", true),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), serde_json::Value::Bool(v)))
@@ -522,6 +540,17 @@ pub struct NodePullParams {
 /// from verifying `manifest_sig` against the pubkeys compiled into the node, and the artifact
 /// from the manifest's `sha256`; a dev build pins no key and refuses (HG081). Not
 /// `deny_unknown_fields`: a newer hub may add optional fields an older node should ignore.
+/// Params of [`M_NODE_UPDATE_VERSION`] — the version-only update trigger. Not
+/// `deny_unknown_fields`: a newer hub may add optional fields an older node should ignore.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeUpdateVersionParams {
+    /// The exact release version to update to — plain semver, no `v` prefix (`0.1.0-beta.2`).
+    /// The node validates the syntax, derives the asset names for its OWN target/variant, and
+    /// enforces UPGRADE-ONLY eligibility after signature verification exactly like a pushed
+    /// manifest — a hub can never downgrade a node by naming an old version.
+    pub version: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeUpdateParams {
     /// The CI-signed update manifest, verbatim JSON text.

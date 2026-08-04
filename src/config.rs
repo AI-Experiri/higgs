@@ -117,9 +117,30 @@ pub struct InstanceConfig {
     /// keys, not this list.
     #[serde(default)]
     pub cors_origins: Vec<String>,
+    /// Release-source URL prefix for self-updates — the `…/releases` page whose
+    /// `download/v<ver>/<asset>` children CI publishes. `None`/empty → the
+    /// built-in default ([`DEFAULT_RELEASE_URL`], this repo's GitHub releases).
+    /// Both sides read their OWN copy: the hub lists available versions from it;
+    /// a node told "update to v<X>" downloads the assets from it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_url: Option<String>,
 }
 
+/// The built-in release source: this repo's GitHub releases. A node fetches
+/// `<here>/download/v<ver>/higgs-v<ver>-<suffix>{.manifest,.manifest.minisig,.tar.gz}`;
+/// the hub lists versions via the derived GitHub API endpoint.
+pub const DEFAULT_RELEASE_URL: &str = "https://github.com/AI-Experiri/higgs/releases";
+
 impl InstanceConfig {
+    /// The effective release-source URL: the configured override (trimmed, sans
+    /// trailing `/`) when non-empty, else [`DEFAULT_RELEASE_URL`].
+    pub fn release_url(&self) -> String {
+        match self.release_url.as_deref().map(str::trim) {
+            Some(u) if !u.is_empty() => u.trim_end_matches('/').to_string(),
+            _ => DEFAULT_RELEASE_URL.to_string(),
+        }
+    }
+
     /// Insert or replace a hub (keyed by `hub_id`) and make it the default. Called after a
     /// successful HELLO, so the latest ticket/label/`last_used_ms` always win and a bare
     /// `higgs --node` thereafter reconnects to it. Idempotent on the id (never duplicates).
