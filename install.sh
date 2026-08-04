@@ -430,9 +430,16 @@ gh_api() { # $1 = URL, $2 = Accept header, $3 = output file
   # -q FIRST: ignore ~/.curlrc — an operator's persistent `trace-ascii`,
   # extra `url`, or `location-trusted` there could otherwise write/leak the
   # Authorization header. Everything else is set explicitly here.
-  printf 'header = "Authorization: Bearer %s"\n' "$_gh_token" \
-    | "$CURL_BIN" -q -fsSL -K - -H "Accept: $2" -H "X-GitHub-Api-Version: 2022-11-28" \
+  # TOKENLESS when no PAT is set (the repo is public): the config pipe then
+  # carries no Authorization header at all — an empty Bearer would be a 401.
+  if [ -n "$_gh_token" ]; then
+    printf 'header = "Authorization: Bearer %s"\n' "$_gh_token" \
+      | "$CURL_BIN" -q -fsSL -K - -H "Accept: $2" -H "X-GitHub-Api-Version: 2022-11-28" \
+             -o "$3" "$1"
+  else
+    "$CURL_BIN" -q -fsSL -H "Accept: $2" -H "X-GitHub-Api-Version: 2022-11-28" \
            -o "$3" "$1"
+  fi
 }
 
 # fn fetch_asset() — download one named release asset into the workdir.
@@ -482,15 +489,23 @@ else
   # block, so its `printf` of the token is covered too.
   _xtrace_on=0; case "$-" in *x*) _xtrace_on=1;; esac
   { set +x; } 2>/dev/null
-  [ -n "$_gh_token" ] \
-    || die "set HIGGS_GITHUB_TOKEN (a fine-grained PAT, Contents:read on ${REPO}) or use --tarball"
+  # No hard token gate: the repo is public, so an unauthenticated fetch is the
+  # default; a fetch failure below names the PAT as the fix for a private repo.
   command -v jq >/dev/null \
     || die "the GitHub download path needs jq — install jq, or use --tarball with a scp'd artifact"
-  if [ -n "$VERSION" ]; then rel="tags/v${VERSION}"; else rel="latest"; fi
-  gh_api "https://api.github.com/repos/${REPO}/releases/${rel}" \
-         "application/vnd.github+json" "$workdir/release.json" \
-    || die "could not fetch release '${rel}' from ${REPO} (bad token, or no such version?)"
-  if [ -z "$VERSION" ]; then
+  if [ -n "$VERSION" ]; then
+    gh_api "https://api.github.com/repos/${REPO}/releases/tags/v${VERSION}" \
+           "application/vnd.github+json" "$workdir/release.json" \
+      || die "could not fetch release 'v${VERSION}' from ${REPO} — no such version, or a private repo (set HIGGS_GITHUB_TOKEN, a fine-grained PAT with Contents:read)"
+  else
+    # "Newest release" via the LIST, not GitHub's /releases/latest — that endpoint
+    # excludes PRERELEASES entirely (every higgs beta 404s there). Newest = the
+    # first non-draft entry (the list is newest-first).
+    gh_api "https://api.github.com/repos/${REPO}/releases?per_page=20" \
+           "application/vnd.github+json" "$workdir/releases.json" \
+      || die "could not list releases from ${REPO} — no releases yet, or a private repo (set HIGGS_GITHUB_TOKEN, a fine-grained PAT with Contents:read)"
+    jq '[.[] | select(.draft | not)][0] // empty' "$workdir/releases.json" > "$workdir/release.json"
+    [ -s "$workdir/release.json" ] || die "${REPO} has no published releases"
     VERSION="$(jq -r '.tag_name' "$workdir/release.json" | sed 's/^v//')"
     [ -n "$VERSION" ] && [ "$VERSION" != "null" ] || die "release JSON carried no tag_name"
   fi
