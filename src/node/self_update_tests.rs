@@ -1810,6 +1810,60 @@ fn stage_and_flip_records_no_prev_on_a_first_install() {
     );
 }
 
+// ---- verify_and_check (version bind BEFORE the artifact download) --------
+
+#[test]
+fn verify_and_check_refuses_a_wrong_version_manifest_before_fetching_the_artifact() {
+    // A version-only trigger names the release. If the origin serves a
+    // VALIDLY-SIGNED manifest for a DIFFERENT version at that path, the bind
+    // must refuse it before spending the artifact bandwidth — `artifact()`
+    // here panics to prove the download is never attempted.
+    use std::io::Cursor;
+    let minisign::KeyPair { pk, sk } =
+        minisign::KeyPair::generate_unencrypted_keypair().expect("keygen");
+    let manifest_bytes = serde_json::to_vec(&serde_json::json!({
+        "schema": 1,
+        "version": "9.9.9",
+        "commit": "c0ffee0000000000000000000000000000000000",
+        "file": "higgs-v9.9.9-aarch64-apple-darwin.tar.gz",
+        "target": "aarch64-apple-darwin",
+        "variant": "metal",
+        "sha256": "aa".repeat(32),
+    }))
+    .unwrap();
+    let sig = minisign::sign(None, &sk, Cursor::new(&manifest_bytes), None, None)
+        .expect("sign")
+        .into_string();
+    struct Signed(Vec<u8>, String);
+    impl UpdateSource for Signed {
+        fn manifest(&self) -> Result<(Vec<u8>, String), HiggsError> {
+            Ok((self.0.clone(), self.1.clone()))
+        }
+        fn artifact(&self, _f: &str) -> Result<Vec<u8>, HiggsError> {
+            panic!("must not fetch the artifact when the manifest is for a different version");
+        }
+    }
+    let pk_b64 = pk.to_base64();
+    let table: Vec<(&str, &str)> = vec![("test-key", pk_b64.as_str())];
+    let running = BuildIdentity::current();
+    let mut authenticated = None;
+    let err = verify_and_check_with(
+        &Signed(manifest_bytes, sig),
+        &running,
+        false,
+        &mut authenticated,
+        Some("8.8.8"),
+        &table,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, HiggsError::UpdateManifestInvalid { .. }),
+        "expected the version bind to refuse, got {err:?}"
+    );
+    // The manifest DID authenticate — the failure report names the real target.
+    assert_eq!(authenticated.as_deref(), Some("9.9.9"));
+}
+
 // ---- verify_and_check (fail-closed on an unverifiable signature) ---------
 
 #[test]
@@ -1831,7 +1885,7 @@ fn verify_and_check_fails_closed_on_an_unverifiable_signature() {
         }
     }
     let running = BuildIdentity::current();
-    let err = verify_and_check(&AnyBytes, &running, false, &mut None).unwrap_err();
+    let err = verify_and_check(&AnyBytes, &running, false, &mut None, None).unwrap_err();
     assert!(
         matches!(err, HiggsError::UpdateSignatureInvalid { .. }),
         "expected HG082 fail-closed, got {err:?}"
@@ -2761,5 +2815,206 @@ async fn a_buffered_operator_stop_is_consumed_at_the_final_re_exec_gate() {
     assert!(
         !operator_stop_pending(pending::<()>()).await,
         "no operator stop → the gate does not block and the re-exec proceeds"
+    );
+}
+
+// ── UPx: version-only update (node self-fetch) ────────────────────────────────
+
+#[test]
+fn release_asset_urls_derive_from_base_and_build() {
+    let (m, s, a) = release_asset_urls("https://github.com/o/r/releases", "1.2.3").unwrap();
+    let suffix =
+        crate::node::release_courier::asset_suffix(env!("HIGGS_BUILD_TARGET"), CURRENT_VARIANT);
+    assert_eq!(
+        m.as_str(),
+        format!("https://github.com/o/r/releases/download/v1.2.3/higgs-v1.2.3-{suffix}.manifest")
+    );
+    assert!(s
+        .as_str()
+        .ends_with(&format!("higgs-v1.2.3-{suffix}.manifest.minisig")));
+    assert!(a
+        .as_str()
+        .ends_with(&format!("higgs-v1.2.3-{suffix}.tar.gz")));
+    // Trailing slash on the base tolerated.
+    release_asset_urls("https://github.com/o/r/releases/", "1.2.3").unwrap();
+    // Loopback http base allowed (the shared on-box/test affordance).
+    release_asset_urls("http://127.0.0.1:8080/rel", "1.2.3").unwrap();
+}
+
+#[test]
+fn release_asset_urls_gate_version_and_base() {
+    // A hub-supplied version lands in a URL path — every non-semver shape must die.
+    for bad in [
+        "",
+        "v1.2.3",
+        "1.2.3/../evil",
+        "1.2.3?x=1",
+        "latest",
+        "1.2",
+        "a.b.c",
+    ] {
+        assert!(
+            release_asset_urls("https://github.com/o/r/releases", bad).is_err(),
+            "{bad:?} must be refused"
+        );
+    }
+    // Base URL policy comes from the shared courier vet.
+    assert!(release_asset_urls("http://mirror.example/r", "1.2.3").is_err());
+    assert!(release_asset_urls("https://u:p@github.com/o/r/releases", "1.2.3").is_err());
+    assert!(release_asset_urls("https://github.com/o/r/releases?tok=1", "1.2.3").is_err());
+}
+
+#[test]
+fn release_redirects_https_only() {
+    let ok = reqwest::Url::parse("https://objects.githubusercontent.com/x?sig=1").unwrap();
+    assert!(release_redirect_ok(&ok), "https + query is a valid hop");
+    let http = reqwest::Url::parse("http://example.com/x").unwrap();
+    assert!(!release_redirect_ok(&http), "plaintext hop refused");
+    let cred = reqwest::Url::parse("https://u:p@example.com/x").unwrap();
+    assert!(!release_redirect_ok(&cred), "credentialed hop refused");
+}
+
+// ── version-only update: URL derivation + fetch policy (UPx) ────────────────
+
+#[test]
+fn release_asset_urls_derives_the_trio_and_gates_the_version_syntax() {
+    // Non-semver (separators/traversal would land in a URL path) dies first.
+    for bad in ["v1.2.3", "1.2", "../../x", "1.2.3/evil"] {
+        let err = release_asset_urls("https://github.com/o/r/releases", bad).unwrap_err();
+        assert!(
+            matches!(err, HiggsError::UpdateFetchFailed { .. }),
+            "{bad:?} → {err:?}"
+        );
+    }
+    // A clean base yields the three siblings under the tag dir for THIS build.
+    let ident = BuildIdentity::current();
+    let suffix = crate::node::release_courier::asset_suffix(&ident.target, &ident.variant);
+    let (m, s, a) = release_asset_urls("https://github.com/o/r/releases", "1.2.3").unwrap();
+    let dir = format!("https://github.com/o/r/releases/download/v1.2.3/higgs-v1.2.3-{suffix}");
+    assert_eq!(m.as_str(), format!("{dir}.manifest"));
+    assert_eq!(s.as_str(), format!("{dir}.manifest.minisig"));
+    assert_eq!(a.as_str(), format!("{dir}.tar.gz"));
+    // A base the courier URL policy refuses (query) propagates the refusal.
+    assert!(release_asset_urls("https://github.com/o/r/releases?x=1", "1.2.3").is_err());
+}
+
+#[test]
+fn release_redirect_targets_must_be_https_without_credentials() {
+    let ok = |u: &str| release_redirect_ok(&reqwest::Url::parse(u).unwrap());
+    assert!(ok("https://objects.example.com/a?sig=abc"));
+    assert!(
+        !ok("http://127.0.0.1/a"),
+        "no plaintext hop, not even loopback"
+    );
+    assert!(
+        !ok("https://user@objects.example.com/a"),
+        "no credentialed hop"
+    );
+}
+
+/// One-shot blocking HTTP server on loopback: answers every request with `status`
+/// and `body` until dropped. Loopback http is the on-box test affordance the
+/// release fetch policy explicitly allows.
+fn serve_loopback(status: &'static str, body: &'static [u8]) -> (std::net::TcpListener, String) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!(
+        "http://127.0.0.1:{}/releases",
+        listener.local_addr().unwrap().port()
+    );
+    let l2 = listener.try_clone().unwrap();
+    std::thread::spawn(move || {
+        for stream in l2.incoming() {
+            let Ok(mut s) = stream else { break };
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 2048];
+            let _ = s.read(&mut buf);
+            let _ = write!(
+                s,
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = s.write_all(body);
+        }
+    });
+    (listener, base)
+}
+
+#[test]
+fn version_source_missing_release_maps_to_a_fetch_failure() {
+    let (_l, base) = serve_loopback("404 Not Found", b"nope");
+    let source = VersionSource::new(&base, "9.9.9").expect("loopback http base is allowed");
+    let err = source.manifest().unwrap_err();
+    assert!(
+        matches!(err, HiggsError::UpdateFetchFailed { .. }),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn version_source_fetches_but_garbage_fails_the_signature_closed() {
+    // The fetch itself succeeds (manifest + sig both served) — trust comes ONLY
+    // from the CI signature, and garbage does not verify under any pinned key.
+    let (_l, base) = serve_loopback("200 OK", b"not a manifest");
+    let source = VersionSource::new(&base, "9.9.9").expect("source");
+    let running = BuildIdentity::current();
+    let err = verify_and_check(&source, &running, false, &mut None, Some("9.9.9")).unwrap_err();
+    assert!(
+        matches!(err, HiggsError::UpdateSignatureInvalid { .. }),
+        "got {err:?}"
+    );
+}
+
+// ── apply_version_update (config-driven fetch, fail-closed, failure recorded) ─
+
+#[test]
+fn apply_version_update_fails_closed_and_records_from_the_configured_release_url() {
+    // The node's OWN config names the release origin — point it at a loopback
+    // server that serves garbage: the fetch succeeds, the CI signature fails
+    // closed, and the failure is recorded for the next HELLO. Serialized with
+    // the other HIGGS_HOME tests; the var is restored after.
+    let _env = crate::TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_l, base) = serve_loopback("200 OK", b"not a manifest");
+    let home = tempfile::tempdir().unwrap();
+    let prev = std::env::var_os("HIGGS_HOME");
+    // SAFETY: serialized by TEST_ENV_LOCK; restored below.
+    unsafe { std::env::set_var("HIGGS_HOME", home.path()) };
+    std::fs::write(
+        home.path().join("config.json"),
+        serde_json::to_vec(&serde_json::json!({ "release_url": base })).unwrap(),
+    )
+    .unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let err = apply_version_update(bin.path(), "9.9.9").unwrap_err();
+    unsafe {
+        match prev {
+            Some(v) => std::env::set_var("HIGGS_HOME", v),
+            None => std::env::remove_var("HIGGS_HOME"),
+        }
+    }
+    assert!(
+        matches!(err, HiggsError::UpdateSignatureInvalid { .. }),
+        "garbage manifest fails the signature closed: {err:?}"
+    );
+    let failed = peek_update_failure(bin.path()).expect("failure recorded for the next HELLO");
+    assert_eq!(
+        failed.to, "9.9.9",
+        "pre-verify failure reports the hub's named target"
+    );
+}
+
+#[test]
+fn apply_version_update_refuses_while_another_update_holds_the_lock() {
+    let bin = tempfile::tempdir().unwrap();
+    let held = match UpdateLock::try_acquire(bin.path()) {
+        LockAttempt::Held(l) => l,
+        _ => panic!("fresh dir lock must be acquirable"),
+    };
+    let err = apply_version_update(bin.path(), "1.2.3").unwrap_err();
+    drop(held);
+    assert!(
+        format!("{err}").contains("another self-update is already running"),
+        "got {err}"
     );
 }

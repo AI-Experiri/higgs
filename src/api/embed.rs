@@ -440,6 +440,64 @@ impl Higgs {
         }
     }
 
+    /// List the releases `node` can be updated TO (the UI's Update button, UPx) — ON DEMAND
+    /// ONLY: the network is touched when the operator clicks, never on a timer. Reads the hub's
+    /// own configured `release_url` (default: this repo's GitHub releases), fetches the release
+    /// index, and returns `{ current, available: [newer-first…], update_by_version }` filtered to
+    /// versions STRICTLY NEWER than the node's reported version that ship an asset for its build
+    /// target/variant. Hub-gated like every fleet op.
+    pub async fn node_releases(&self, node: &str) -> Result<Value, HiggsError> {
+        if self.hub().is_none() {
+            return Err(not_a_hub_error("nodes/releases"));
+        }
+        let fleet = self
+            .fleet()
+            .ok_or_else(|| not_a_hub_error("nodes/releases"))?;
+        let release_url = Self::configured_release_url();
+        crate::node::release_courier::node_releases(&fleet, node, &release_url).await
+    }
+
+    /// Trigger a version-only self-update on ONE node (UPx): the hub sends the chosen semver and
+    /// NOTHING else — the node self-fetches the assets from its OWN configured `release_url` and
+    /// re-verifies the CI signature + sha256 against its compiled-in key. Upgrade-only is enforced
+    /// node-side as ever. Refused for a node that did not advertise `update_by_version`.
+    pub async fn node_update_version(
+        &self,
+        node: &str,
+        version: &str,
+    ) -> Result<Value, HiggsError> {
+        if self.hub().is_none() {
+            return Err(not_a_hub_error("nodes/update"));
+        }
+        let fleet = self
+            .fleet()
+            .ok_or_else(|| not_a_hub_error("nodes/update"))?;
+        crate::node::release_courier::node_update_version(&fleet, node, version).await
+    }
+
+    /// Trigger the version-only update on EVERY capable connected node (UPx) — per-node report,
+    /// one node's failure never fails the fleet; already-newest nodes are skipped honestly.
+    pub async fn fleet_update_version(&self, version: &str) -> Result<Value, HiggsError> {
+        if self.hub().is_none() {
+            return Err(not_a_hub_error("nodes/update"));
+        }
+        let fleet = self
+            .fleet()
+            .ok_or_else(|| not_a_hub_error("nodes/update"))?;
+        let release_url = Self::configured_release_url();
+        crate::node::release_courier::fleet_update_version(&fleet, version, &release_url).await
+    }
+
+    /// The hub process's configured release source (its OWN `config.json` `release_url`, else
+    /// the built-in default) — the index the Update listing reads.
+    fn configured_release_url() -> String {
+        crate::config::config_path()
+            .ok()
+            .and_then(|p| crate::config::InstanceConfig::load(&p).ok())
+            .map(|c| c.release_url())
+            .unwrap_or_else(|| crate::config::DEFAULT_RELEASE_URL.to_string())
+    }
+
     /// Retire a paired node for good (drop from the allowlist + the fleet) —
     /// formerly `POST /api/higgs/nodes/retire`.
     pub async fn node_retire(&self, node: &str) -> Result<(), HiggsError> {

@@ -364,3 +364,19 @@ fn name_or_init_generates_then_reuses() {
     }
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+#[test]
+fn release_url_defaults_and_overrides() {
+    let mut c = InstanceConfig::default();
+    assert_eq!(c.release_url(), DEFAULT_RELEASE_URL, "unset → built-in");
+    c.release_url = Some(String::new());
+    assert_eq!(c.release_url(), DEFAULT_RELEASE_URL, "empty → built-in");
+    c.release_url = Some("  ".into());
+    assert_eq!(c.release_url(), DEFAULT_RELEASE_URL, "blank → built-in");
+    c.release_url = Some(" https://mirror.example/higgs/releases/ ".into());
+    assert_eq!(
+        c.release_url(),
+        "https://mirror.example/higgs/releases",
+        "trimmed, trailing slash dropped"
+    );
+}

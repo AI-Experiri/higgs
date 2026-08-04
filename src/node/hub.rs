@@ -247,6 +247,7 @@ pub fn spawn_accept_loop(
                         target,
                         variant,
                         update_capable,
+                        version_capable,
                     } => {
                         tracing::info!(node = %peer, "higgs hub: node admitted");
                         // add_node runs UNDER the allowlist lock (held here) so it's mutually
@@ -274,6 +275,7 @@ pub fn spawn_accept_loop(
                                 target,
                                 variant,
                                 update_capable,
+                                version_capable,
                             )
                             .await;
                         // Accept node→hub requests (self-`leave`) on this connection. Holds the
