@@ -224,7 +224,7 @@ pub fn verify_manifest_any(
 
 /// [`verify_manifest_any`] with an injected key table — PRIVATE test seam,
 /// same rationale as [`verify_manifest_with`].
-fn verify_manifest_any_with(
+pub(crate) fn verify_manifest_any_with(
     manifest_bytes: &[u8],
     signature_text: &str,
     pubkeys: &[(&str, &str)],

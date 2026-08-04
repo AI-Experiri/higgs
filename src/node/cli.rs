@@ -122,6 +122,7 @@ fn run_link_pair() -> Result<()> {
                     target: _,
                     variant: _,
                     update_capable: _,
+                    version_capable: _,
                 } => {
                     // An all-filtered HELLO version sanitizes to empty — print a
                     // placeholder, not "higgs ," (T14 r22).
@@ -1661,8 +1662,9 @@ fn run_node_self_update(args: &[String]) -> Result<()> {
     let running = su::installed_identity(&bin);
     // The CLI update runs with the operator watching the terminal — the failure is shown directly,
     // not persisted for a later HELLO — so the authenticated-version out-param is discarded.
-    let verified = su::verify_and_check(source.as_ref(), &running, allow_downgrade, &mut None)
-        .map_err(as_io)?;
+    let verified =
+        su::verify_and_check(source.as_ref(), &running, allow_downgrade, &mut None, None)
+            .map_err(as_io)?;
     println!(
         "verified update {} -> {} (key {}, target {}, variant {})",
         running.version,

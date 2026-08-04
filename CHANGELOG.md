@@ -23,6 +23,22 @@ from it.
 
 ### Added
 
+- **One-click fleet updates**: the jigglebot Fleet "Update" button now lists, on
+  click only (never on a timer), every release newer than what the node runs
+  (`node_releases` via the GitHub releases API — complete asset trio, upgrade
+  only, newest first). Picking one sends the node a BARE version string
+  (`M_NODE_UPDATE_VERSION`, new `update_by_version` HELLO capability); the node
+  downloads manifest+signature+artifact itself from its own configured
+  `release_url` (new `config.json` field, default = this repo's GitHub
+  releases), re-verifies the CI minisign signature against its compiled-in
+  keys, binds the authenticated manifest version to the requested one BEFORE
+  the artifact download, and applies through the same verify → stage → flip →
+  restart pipeline as every other update. `fleet_update_version` pushes to
+  every capable node with honest per-node skip reasons. A pre-capability node
+  is told precisely: on the latest → "nothing to update"; newer exists → re-run
+  the installer (or a direct static-mirror manifest URL — GitHub links redirect
+  and are refused by those builds).
+
 - **Pairing preflight** (`higgs --node <ticket> <token>`): colored, gated
   self-diagnosis before dialing — per-nameserver DNS probes that name the exact
   dead resolver, ticket relay/direct-path analysis, and macOS Local Network

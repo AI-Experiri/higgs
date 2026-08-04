@@ -96,7 +96,14 @@ pub async fn dispatch_node_control(rt: &NodeRuntime, req: RpcRequest) -> RpcResp
 /// still leave the node applying — that is reconciled by the eventually-consistent, IDEMPOTENT
 /// contract on [`accept_node_update`], not by this write, not a synchronous handshake.
 pub struct DeferredUpdate {
-    params: crate::remote::NodeUpdateParams,
+    kind: DeferredKind,
+}
+
+/// Which update trigger arrived: a full manifest PUSH (`M_NODE_UPDATE`) or a bare
+/// VERSION the node self-fetches (`M_NODE_UPDATE_VERSION`).
+enum DeferredKind {
+    Push(crate::remote::NodeUpdateParams),
+    Version(String),
 }
 
 impl DeferredUpdate {
@@ -109,7 +116,7 @@ impl DeferredUpdate {
     /// install (`self_update_bin_dir`; not in that layout → HG087); a dev build pins no key → HG081.
     /// The outcome is LOGGED; the hub observes SUCCESS via the node's next HELLO `software_version`.
     pub fn spawn(self) {
-        let params = self.params;
+        let kind = self.kind;
         tokio::spawn(async move {
             let applied = tokio::task::spawn_blocking(move || {
                 let bin = crate::node::cli::self_update_bin_dir().ok_or_else(|| {
@@ -119,21 +126,28 @@ impl DeferredUpdate {
                             .into(),
                     }
                 })?;
-                // apply_pushed_update records a post-lock failure itself (from = the installed
-                // version, to = the AUTHENTICATED manifest version once verified, else this hint)
-                // and clears the marker on success, so the connected apply-failure is reported to
+                // Both applies record a post-lock failure themselves (from = the installed
+                // version, to = the AUTHENTICATED manifest version once verified, else the hint)
+                // and clear the marker on success, so the connected apply-failure is reported to
                 // the hub on the next HELLO with the most accurate target it can prove.
-                crate::node::self_update::apply_pushed_update(
-                    &bin,
-                    &params.manifest,
-                    &params.manifest_sig,
-                    &params.artifact_url,
-                    // A hub-pushed self-update is UPGRADE-ONLY (REL-P4e): downgrade is ALWAYS
-                    // refused here, so a compromised paired hub cannot replay an old signed release
-                    // to downgrade this node. Rollback is the node's own LOCAL job.
-                    false,
-                    params.target_version.as_deref().unwrap_or(""),
-                )
+                match kind {
+                    DeferredKind::Push(params) => crate::node::self_update::apply_pushed_update(
+                        &bin,
+                        &params.manifest,
+                        &params.manifest_sig,
+                        &params.artifact_url,
+                        // A hub-pushed self-update is UPGRADE-ONLY (REL-P4e): downgrade is ALWAYS
+                        // refused here, so a compromised paired hub cannot replay an old signed
+                        // release to downgrade this node. Rollback is the node's own LOCAL job.
+                        false,
+                        params.target_version.as_deref().unwrap_or(""),
+                    ),
+                    // Version-only trigger: the node fetches its OWN release assets from its
+                    // configured release_url — the hub named a version and nothing else.
+                    DeferredKind::Version(version) => {
+                        crate::node::self_update::apply_version_update(&bin, &version)
+                    }
+                }
             })
             .await;
             match applied {
@@ -192,7 +206,45 @@ pub fn accept_node_update(req: &RpcRequest) -> (RpcResponse, Option<DeferredUpda
         req.id,
         json!({ "status": "accepted", "target_version": target }),
     );
-    (resp, Some(DeferredUpdate { params }))
+    (
+        resp,
+        Some(DeferredUpdate {
+            kind: DeferredKind::Push(params),
+        }),
+    )
+}
+
+/// A version-only update trigger (`M_NODE_UPDATE_VERSION`) — same deferred contract as
+/// [`accept_node_update`]: reply `"accepted"` first, apply detached after the reply is
+/// buffered. The version is syntax-gated here (plain semver) so a malformed push fails
+/// fast in the reply instead of detached; everything else (fetch, signature, upgrade-only
+/// eligibility) is the apply's job.
+pub fn accept_node_update_version(req: &RpcRequest) -> (RpcResponse, Option<DeferredUpdate>) {
+    let params = match parse::<crate::remote::NodeUpdateVersionParams>(req) {
+        Ok(p) => p,
+        Err(resp) => return (resp(req.id), None),
+    };
+    if semver::Version::parse(&params.version).is_err() {
+        return (
+            err(
+                req.id,
+                INVALID_PARAMS,
+                "invalid params: `version` is not a plain semver string".into(),
+                None,
+            ),
+            None,
+        );
+    }
+    let resp = ok_value(
+        req.id,
+        json!({ "status": "accepted", "target_version": params.version }),
+    );
+    (
+        resp,
+        Some(DeferredUpdate {
+            kind: DeferredKind::Version(params.version),
+        }),
+    )
 }
 
 /// Parse params into `T`; on failure return a closure that builds the INVALID_PARAMS

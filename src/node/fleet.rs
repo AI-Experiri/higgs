@@ -142,6 +142,12 @@ pub struct NodeView {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub variant: Option<String>,
+    /// Whether the node's CURRENT admission advertised the `update_by_version` capability —
+    /// the hub may send it a bare release VERSION and it self-fetches the assets from its own
+    /// configured `release_url`. `false` for a legacy node, a disconnected node's stale card,
+    /// and the local card (which is updated locally, not pushed).
+    #[serde(default)]
+    pub update_by_version: bool,
 }
 }
 
@@ -161,6 +167,11 @@ pub struct NodeUpdateTarget {
     pub target: Option<String>,
     pub variant: Option<String>,
     pub update_capable: bool,
+    /// Whether the node advertised `update_by_version` (it accepts a bare version trigger).
+    pub version_capable: bool,
+    /// The node's self-reported semver from its CURRENT HELLO — the "current version" a
+    /// release listing compares against. `None` for a pre-T14 admission.
+    pub software_version: Option<String>,
     /// The node's CURRENT transport at the moment of the snapshot — the CAS key for the push.
     pub transport: Arc<NodeTransport>,
 }
@@ -325,6 +336,8 @@ enum FleetMsg {
         target: Option<String>,
         variant: Option<String>,
         update_capable: bool,
+        /// Whether its HELLO advertised `update_by_version` (bare-version self-fetch trigger).
+        version_capable: bool,
         #[allow(clippy::type_complexity)]
         reply: oneshot::Sender<Option<(NodeId, Option<Arc<NodeTransport>>)>>,
     },
@@ -612,6 +625,9 @@ struct FleetActor {
     /// signature-verified self-update push handler, so `fleet_update` pushes to them. Same
     /// per-admission lifecycle as `event_nodes`.
     update_capable: HashSet<NodeKey>,
+    /// Nodes whose CURRENT admission advertised `update_by_version`. Same lifecycle as
+    /// `update_capable`: set atomically at admission, cleared at retire/re-admission.
+    version_capable: HashSet<NodeKey>,
     /// Per-node lifecycle generation, bumped on every load/unload/kill/route-drop. A
     /// `refresh_inventory` only commits its (possibly stale) result if this is unchanged
     /// since it started — so a slow connect-time fetch can't clobber a newer state.
@@ -786,6 +802,7 @@ impl FleetActor {
         self.targets.remove(node);
         self.variants.remove(node);
         self.update_capable.remove(node);
+        self.version_capable.remove(node);
         self.pending_pushes.remove(node);
         self.fallback_inflight.remove(node);
         // Drop any chat-refresh debounce slot too: a retired node needs no
@@ -832,6 +849,8 @@ impl FleetActor {
                 NodeView {
                     node_id: node_id.0,
                     connected: self.nodes.contains_key(&endpoint_id),
+                    update_by_version: self.nodes.contains_key(&endpoint_id)
+                        && self.version_capable.contains(&endpoint_id),
                     // The fleet only tracks remote nodes; the local node is prepended by the serve
                     // layer. `label` is filled there from the allowlist (live, rename-aware).
                     is_local: false,
@@ -986,6 +1005,8 @@ impl Actor for FleetActor {
                         target: self.targets.get(node).cloned(),
                         variant: self.variants.get(node).cloned(),
                         update_capable: self.update_capable.contains(node),
+                        version_capable: self.version_capable.contains(node),
+                        software_version: self.software_versions.get(node).cloned(),
                         transport: transport.clone(),
                     })
                     .collect();
@@ -1007,6 +1028,7 @@ impl Actor for FleetActor {
                 target,
                 variant,
                 update_capable,
+                version_capable,
                 reply,
             } => {
                 if matches!(gen, Some(g) if g != self.admit_gen) {
@@ -1103,6 +1125,11 @@ impl Actor for FleetActor {
                         self.update_capable.insert(node.clone());
                     } else {
                         self.update_capable.remove(&node);
+                    }
+                    if version_capable {
+                        self.version_capable.insert(node.clone());
+                    } else {
+                        self.version_capable.remove(&node);
                     }
                     let replaced = self.nodes.insert(node.clone(), transport);
                     // Announced HERE, atomic with the insert (T10 r4 #1) — a
@@ -1618,6 +1645,7 @@ impl HubFleet {
             targets: HashMap::new(),
             variants: HashMap::new(),
             update_capable: HashSet::new(),
+            version_capable: HashSet::new(),
             versions: HashMap::new(),
             epochs: HashMap::new(),
             bus: bus_for_actor,
@@ -1709,6 +1737,7 @@ impl HubFleet {
             None,
             None,
             false,
+            false,
         )
         .await
     }
@@ -1733,6 +1762,7 @@ impl HubFleet {
         target: Option<String>,
         variant: Option<String>,
         update_capable: bool,
+        version_capable: bool,
     ) {
         self.admit_inner(
             node,
@@ -1746,6 +1776,7 @@ impl HubFleet {
             target,
             variant,
             update_capable,
+            version_capable,
         )
         .await
     }
@@ -1764,6 +1795,7 @@ impl HubFleet {
         target: Option<String>,
         variant: Option<String>,
         update_capable: bool,
+        version_capable: bool,
     ) {
         // Atomically admit: assign the stable NodeId, insert the transport, record the build
         // identity, and bump the epoch in ONE actor message, gated by the admission generation. If
@@ -1784,6 +1816,7 @@ impl HubFleet {
                 target,
                 variant,
                 update_capable,
+                version_capable,
                 reply,
             })
             .await
@@ -1910,6 +1943,47 @@ impl HubFleet {
         self.send_update(node, &current, params)
             .await
             .map(PinnedPush::Accepted)
+    }
+
+    /// Version-only variant of [`push_update_pinned`](Self::push_update_pinned): deliver
+    /// `M_NODE_UPDATE_VERSION` (a bare semver string — the node self-fetches its assets from its
+    /// OWN configured `release_url`) while `expected` is still the node's current transport. The
+    /// same pinning rationale applies: the CAPABILITY (`update_by_version`) was read from that
+    /// transport's HELLO, so a reconnect (possibly onto a build without it) must not be pushed on
+    /// the strength of a stale snapshot. Same receipt semantics as every update push: `accepted`
+    /// is not an outcome; the node's next HELLO is.
+    pub async fn push_update_version_pinned(
+        &self,
+        node: &str,
+        expected: &Arc<NodeTransport>,
+        version: &str,
+    ) -> Result<PinnedPush, HiggsError> {
+        let Ok(current) = self.transport(node).await else {
+            return Ok(PinnedPush::Reconnected);
+        };
+        if !Arc::ptr_eq(&current, expected) {
+            return Ok(PinnedPush::Reconnected);
+        }
+        let fut = current.request(
+            crate::remote::M_NODE_UPDATE_VERSION,
+            json!({ "version": version }),
+        );
+        // Same whole-push bound as `send_update` (open_bi + write + reply; see the
+        // rationale there) — a credit-withholding node becomes a per-node error.
+        const NODE_PUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+        let outcome = match tokio::time::timeout(NODE_PUSH_TIMEOUT, fut).await {
+            Ok(r) => r,
+            // Same shape as `send_update`: a wedged node is an op error routed
+            // through `handle_op_error` (→ HG027, transport dropped) — never a
+            // fetch-classed error that leaves the dead transport installed.
+            Err(_) => Err(HiggsError::WorkerDead {
+                context: "node update push timed out before the node replied".into(),
+            }),
+        };
+        match outcome {
+            Ok(v) => Ok(PinnedPush::Accepted(v)),
+            Err(e) => Err(self.handle_op_error(node, &current, e).await),
+        }
     }
 
     /// Encode + deliver `M_NODE_UPDATE` on `transport` and return the node's reply. Mirrors

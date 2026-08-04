@@ -494,3 +494,294 @@ async fn node_update_resolves_then_fails_on_an_absent_node() {
     .expect_err("push to an unconnected node is unreachable");
     assert!(matches!(e, HiggsError::NodeUnreachable { .. }), "{e:?}");
 }
+
+// ── UPx: version-choosing flow ────────────────────────────────────────────────
+
+#[test]
+fn releases_api_url_accepts_github_repo_shape_only() {
+    let api = releases_api_url("https://github.com/AI-Experiri/higgs/releases").unwrap();
+    assert_eq!(
+        api.as_str(),
+        "https://api.github.com/repos/AI-Experiri/higgs/releases?per_page=100"
+    );
+    // Trailing slash tolerated (empty segments are filtered).
+    releases_api_url("https://github.com/o/r/releases/").unwrap();
+    // Non-GitHub mirror: listing unsupported (exact-URL push is the path there).
+    assert!(releases_api_url("https://mirror.example/higgs/releases").is_err());
+    // Wrong path shape on github.com.
+    assert!(releases_api_url("https://github.com/AI-Experiri/higgs").is_err());
+    assert!(releases_api_url("https://github.com/o/r/releases/extra").is_err());
+}
+
+#[test]
+fn newer_releases_filters_and_sorts() {
+    let target = "aarch64-apple-darwin";
+    let variant = "metal";
+    let entry = |tag: &str, draft: bool, with_asset: bool| {
+        let assets = if with_asset {
+            let ver = tag.trim_start_matches('v');
+            let base = format!("higgs-v{ver}-{}", asset_suffix(target, variant));
+            serde_json::json!([
+                { "name": format!("{base}.manifest") },
+                { "name": format!("{base}.manifest.minisig") },
+                { "name": format!("{base}.tar.gz") },
+            ])
+        } else {
+            serde_json::json!([])
+        };
+        serde_json::json!({ "tag_name": tag, "draft": draft, "assets": assets })
+    };
+    let index = serde_json::json!([
+        entry("v0.1.0-beta.3", false, true), // newer, has asset → in
+        entry("v0.1.0-beta.2", false, true), // newer, has asset → in
+        entry("v0.1.0-beta.1", false, true), // == current → out
+        entry("v0.0.9", false, true),        // older → out
+        entry("v0.2.0", true, true),         // draft → out
+        entry("v0.3.0", false, false),       // newer, NO asset for this build → out
+        serde_json::json!({ "tag_name": "not-a-tag", "draft": false, "assets": [] }),
+    ]);
+    // A manifest-only (incomplete) release must NOT be offered.
+    let partial = serde_json::json!([{
+        "tag_name": "v0.4.0", "draft": false,
+        "assets": [{ "name": manifest_filename("0.4.0", target, variant) }]
+    }]);
+    assert!(
+        newer_releases_for(&partial, "0.1.0", target, variant).is_empty(),
+        "incomplete asset trio is not offered"
+    );
+    // A +build-metadata tag is never offered (no semver precedence; CI never
+    // publishes one).
+    let meta = serde_json::json!([entry("v0.9.0+hotpatch", false, true)]);
+    assert!(newer_releases_for(&meta, "0.1.0", target, variant).is_empty());
+    let got = newer_releases_for(&index, "0.1.0-beta.1", target, variant);
+    assert_eq!(got, vec!["0.1.0-beta.3", "0.1.0-beta.2"], "newest first");
+    // Unknown current version → never guess an upgrade.
+    assert!(newer_releases_for(&index, "", target, variant).is_empty());
+    assert!(newer_releases_for(&index, "garbage", target, variant).is_empty());
+    // Non-array index → empty, not a panic.
+    assert!(newer_releases_for(&serde_json::json!({}), "0.1.0", target, variant).is_empty());
+}
+
+// ── version-flow ops against a REAL admitted fleet (loopback iroh) ──────────
+
+/// Admit ONE node with a chosen identity so the version ops see a realistic
+/// `NodeUpdateTarget` — mirrors `fleet_tests::fleet_with_one_node`, with the
+/// identity fields parameterized.
+async fn fleet_with_identity(
+    software_version: Option<&str>,
+    target: Option<&str>,
+    variant: Option<&str>,
+    version_capable: bool,
+) -> (Arc<crate::node::fleet::HubFleet>, String, tempfile::TempDir) {
+    use crate::node::test_support::{fake_runtime, local_endpoint, stage_dummy_model};
+    let (root, _model_id) = stage_dummy_model("higgs-test/m");
+    let hub = local_endpoint().await;
+    let node = local_endpoint().await;
+    let hub_addr = hub.addr();
+    let node_key = node.id().to_string();
+    let rt = Arc::new(fake_runtime(vec![root.path().to_path_buf()]));
+    tokio::spawn(async move {
+        let node_conn = node
+            .connect(hub_addr, crate::remote::ALPN)
+            .await
+            .expect("connect");
+        crate::node::serve_node(node_conn, rt).await;
+    });
+    let conn = hub.accept().await.expect("incoming").await.expect("conn");
+    std::mem::forget(hub);
+    let fleet = Arc::new(crate::node::fleet::HubFleet::new(Arc::new(
+        crate::log_bus::LogBus::new(),
+    )));
+    fleet
+        .add_node_with_identity(
+            node_key.clone(),
+            Arc::new(crate::node::transport::NodeTransport::new(conn)),
+            None,
+            None,
+            software_version.map(str::to_string),
+            false,
+            None,
+            true,
+            target.map(str::to_string),
+            variant.map(str::to_string),
+            true,
+            version_capable,
+        )
+        .await;
+    (fleet, node_key, root)
+}
+
+#[tokio::test]
+async fn node_releases_unknown_node_is_unreachable() {
+    let err = node_releases(&empty_fleet(), "nope", "https://github.com/o/r/releases")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, HiggsError::NodeUnreachable { .. }),
+        "got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn node_releases_empty_listing_for_an_unknown_build_without_network() {
+    // Version present but no target/variant → the network is never touched (the
+    // release_url here would fail `releases_api_url` if it were) and the listing
+    // is empty with the capability faithfully reported.
+    let (fleet, node, _root) = fleet_with_identity(Some("0.1.0"), None, None, true).await;
+    let v = node_releases(&fleet, &node, "https://not-github.example/whatever")
+        .await
+        .expect("no-network listing");
+    assert_eq!(v["node"], node);
+    assert_eq!(v["current"], "0.1.0");
+    assert_eq!(v["available"], json!([]));
+    assert_eq!(v["update_by_version"], true);
+}
+
+#[tokio::test]
+async fn node_releases_skips_the_fetch_for_an_unparseable_version() {
+    let (fleet, node, _root) = fleet_with_identity(
+        Some("not-semver"),
+        Some("aarch64-apple-darwin"),
+        Some("metal"),
+        false,
+    )
+    .await;
+    let v = node_releases(&fleet, &node, "https://not-github.example/whatever")
+        .await
+        .expect("no-network listing");
+    assert_eq!(v["available"], json!([]));
+    assert_eq!(v["update_by_version"], false);
+}
+
+#[tokio::test]
+async fn node_update_version_rejects_non_semver_before_any_lookup() {
+    let err = node_update_version(&empty_fleet(), "any", "v1.2.3")
+        .await
+        .unwrap_err();
+    assert!(format!("{err}").contains("semver"), "got {err}");
+}
+
+#[tokio::test]
+async fn node_update_version_unknown_node_is_unreachable() {
+    let err = node_update_version(&empty_fleet(), "nope", "1.2.3")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, HiggsError::NodeUnreachable { .. }),
+        "got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn node_update_version_refuses_a_node_without_the_capability() {
+    let (fleet, node, _root) = fleet_with_identity(
+        Some("0.1.0"),
+        Some("aarch64-apple-darwin"),
+        Some("metal"),
+        false,
+    )
+    .await;
+    let err = node_update_version(&fleet, &node, "9.9.9")
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{err}").contains("does not support version-triggered updates"),
+        "got {err}"
+    );
+}
+
+#[tokio::test]
+async fn fleet_update_version_rejects_non_semver() {
+    let err = fleet_update_version(&empty_fleet(), "v1.2.3", "https://github.com/o/r/releases")
+        .await
+        .unwrap_err();
+    assert!(format!("{err}").contains("semver"), "got {err}");
+}
+
+#[tokio::test]
+async fn fleet_update_version_reports_local_skips_without_touching_the_network() {
+    // Each of these rows is decided hub-side; none is pushable, so the release
+    // index is NEVER fetched (release_url would fail `releases_api_url` if it were).
+    for (sv, target, variant, capable, expect) in [
+        (
+            Some("0.1.0"),
+            Some("aarch64-apple-darwin"),
+            Some("metal"),
+            false,
+            "does not support version-triggered updates",
+        ),
+        (
+            Some("not-semver"),
+            Some("aarch64-apple-darwin"),
+            Some("metal"),
+            true,
+            "parseable version",
+        ),
+        (
+            Some("9.9.9"),
+            Some("aarch64-apple-darwin"),
+            Some("metal"),
+            true,
+            "already at or above",
+        ),
+        (Some("0.1.0"), None, None, true, "build target/variant"),
+    ] {
+        let (fleet, node, _root) = fleet_with_identity(sv, target, variant, capable).await;
+        let v = fleet_update_version(&fleet, "1.0.0", "https://not-github.example/x")
+            .await
+            .expect("local skip report");
+        let rows = v["results"].as_array().expect("rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["node"], node);
+        assert_eq!(rows[0]["status"], "skipped");
+        let reason = rows[0]["reason"].as_str().unwrap_or_default();
+        assert!(reason.contains(expect), "reason {reason:?} vs {expect:?}");
+    }
+}
+
+#[tokio::test]
+async fn fleet_update_skips_a_node_without_a_reported_build() {
+    // Capable of updates but never reported target/variant → the courier cannot
+    // pick an asset; the row is SKIPPED, never pushed-and-failed. No manifest is
+    // fetched for a skip, so the (bound, silent) release origin is never asked.
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!(
+        "http://127.0.0.1:{}/higgs/v9.9.9",
+        l.local_addr().unwrap().port()
+    );
+    let (fleet, node, _root) = fleet_with_identity(Some("0.1.0"), None, None, true).await;
+    let v = fleet_update(&fleet, &base).await.expect("report");
+    let rows = v["results"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["node"], node);
+    assert_eq!(rows[0]["status"], "skipped");
+    assert!(
+        rows[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("build target/variant"),
+        "{:?}",
+        rows[0]
+    );
+}
+
+#[tokio::test]
+async fn fleet_update_reports_a_manifest_fetch_failure_per_node() {
+    // Full build identity → the courier derives the per-node manifest URL and
+    // fetches it; a 404 origin folds into an ERROR row for that node (never
+    // fatal to the fleet report).
+    let port = spawn_release_server().await;
+    let base = format!("http://127.0.0.1:{port}/wrong-path/v9.9.9");
+    let (fleet, node, _root) = fleet_with_identity(
+        Some("0.1.0"),
+        Some("aarch64-apple-darwin"),
+        Some("metal"),
+        true,
+    )
+    .await;
+    let v = fleet_update(&fleet, &base).await.expect("report");
+    let rows = v["results"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["node"], node);
+    assert_eq!(rows[0]["status"], "error", "{:?}", rows[0]);
+}

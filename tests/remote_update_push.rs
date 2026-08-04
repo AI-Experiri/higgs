@@ -175,6 +175,7 @@ async fn hub_courier_pushes_release_and_node_accepts() {
         target,
         variant,
         update_capable,
+        version_capable,
     } = outcome
     else {
         panic!("node must be admitted: {outcome:?}");
@@ -193,6 +194,10 @@ async fn hub_courier_pushes_release_and_node_accepts() {
     assert!(
         update_capable,
         "a current node advertises the `update` capability"
+    );
+    assert!(
+        version_capable,
+        "a current node advertises the `update_by_version` capability"
     );
 
     // Register the node + its build identity into the fleet exactly as the production accept loop
@@ -213,6 +218,7 @@ async fn hub_courier_pushes_release_and_node_accepts() {
             target,
             variant,
             update_capable,
+            version_capable,
         )
         .await;
 
@@ -286,6 +292,32 @@ async fn hub_courier_pushes_release_and_node_accepts() {
         matches!(pinned, PinnedPush::Reconnected),
         "a stale (non-current) transport must be reported Reconnected, not Accepted"
     );
+
+    // ── UPx: the VERSION-ONLY trigger. The hub sends a bare semver; the node ACKs and
+    // self-fetches from ITS OWN configured release_url (written into its config.json before
+    // spawn). Fail-on-revert: without the node's M_NODE_UPDATE_VERSION handler this RPC is
+    // method-not-found and the courier errors. ──
+    let reply = release_courier::node_update_version(&fleet, &peer, ver)
+        .await
+        .expect("version-only trigger accepted");
+    assert_eq!(
+        reply["status"], "accepted",
+        "version trigger ACKed: {reply}"
+    );
+    assert_eq!(reply["target_version"], ver);
+
+    // A malformed version is refused HUB-SIDE before any push.
+    let e = release_courier::node_update_version(&fleet, &peer, "not-a-version")
+        .await
+        .expect_err("non-semver version refused");
+    assert!(e.to_string().contains("semver"), "{e}");
+
+    // ── UPx: the release LISTING is a github.com-shape feature — the loopback test base is
+    // refused with the actionable message, BEFORE any fetch. ──
+    let e = release_courier::node_releases(&fleet, &peer, &base_url)
+        .await
+        .expect_err("listing from a non-github release_url is refused");
+    assert!(e.to_string().contains("github.com"), "{e}");
 }
 
 /// `fleet_update` REPORTS a node it cannot target rather than failing the whole fleet: a connected
@@ -373,6 +405,21 @@ async fn fleet_update_skips_a_non_update_capable_node() {
         results[0]
     );
     // It never reached the release host (loopback port 9, nothing listening) — it was pre-filtered.
+    // UPx: the version-only trigger is refused for a node WITHOUT the
+    // `update_by_version` capability — with the actionable bootstrap hint, and
+    // BEFORE any push. Fail-on-revert for the hub-side capability gate.
+    let peer = results[0]["node"].as_str().expect("node key").to_string();
+    let e = release_courier::node_update_version(&fleet, &peer, "9.9.9")
+        .await
+        .expect_err("version trigger refused for a non-capable node");
+    assert!(e.to_string().contains("installer"), "{e}");
+    // And the fleet-wide version trigger SKIPS it (never accepted-then-failed).
+    let vreport =
+        release_courier::fleet_update_version(&fleet, "9.9.9", "https://github.com/o/r/releases")
+            .await
+            .expect("fleet_update_version returns a report");
+    assert_eq!(vreport["results"][0]["status"], "skipped", "{vreport}");
+
     assert!(
         results[0]["reason"]
             .as_str()
