@@ -67,4 +67,11 @@ target?: string,
  * the release-asset selector. Same lifecycle as `target`; absent for a legacy node or the
  * local card.
  */
-variant?: string, };
+variant?: string, 
+/**
+ * Whether the node's CURRENT admission advertised the `update_by_version` capability —
+ * the hub may send it a bare release VERSION and it self-fetches the assets from its own
+ * configured `release_url`. `false` for a legacy node, a disconnected node's stale card,
+ * and the local card (which is updated locally, not pushed).
+ */
+update_by_version: boolean, };

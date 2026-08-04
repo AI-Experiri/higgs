@@ -19,6 +19,62 @@ from it.
 
 ## [Unreleased]
 
+## [0.1.0-beta.2] - 2026-08-03
+
+### Added
+
+- **One-click fleet updates**: the jigglebot Fleet "Update" button now lists, on
+  click only (never on a timer), every release newer than what the node runs
+  (`node_releases` via the GitHub releases API — complete asset trio, upgrade
+  only, newest first). Picking one sends the node a BARE version string
+  (`M_NODE_UPDATE_VERSION`, new `update_by_version` HELLO capability); the node
+  downloads manifest+signature+artifact itself from its own configured
+  `release_url` (new `config.json` field, default = this repo's GitHub
+  releases), re-verifies the CI minisign signature against its compiled-in
+  keys, binds the authenticated manifest version to the requested one BEFORE
+  the artifact download, and applies through the same verify → stage → flip →
+  restart pipeline as every other update. `fleet_update_version` pushes to
+  every capable node with honest per-node skip reasons. A pre-capability node
+  is told precisely: on the latest → "nothing to update"; newer exists → re-run
+  the installer (or a direct static-mirror manifest URL — GitHub links redirect
+  and are refused by those builds).
+
+- **Pairing preflight** (`higgs --node <ticket> <token>`): colored, gated
+  self-diagnosis before dialing — per-nameserver DNS probes that name the exact
+  dead resolver, ticket relay/direct-path analysis, and macOS Local Network
+  guidance (with an SSH caveat: the permission prompt cannot appear over SSH).
+  Pairing hard-stops only when no path to the hub can exist; every failure
+  prints the specific user action that fixes it.
+- **One-shot pairing with verified service handoff**: pairing saves the hub,
+  best-effort restarts the installed service, and exits only after the hub
+  demonstrably supersedes the pairing connection with the service's own dial
+  (duplicate-identity close) — no Ctrl-C, no manual `launchctl kickstart`, never
+  two node processes fighting, never zero. If no service takes over, pairing
+  keeps serving in the foreground so the node stays online.
+- An installed-but-unpaired node service now **waits quietly for pairing**
+  (polls `config.json` every 3s; one hint line, then a reminder every ~5
+  minutes) instead of exit/respawn log spam — and the wait doubles as the
+  seamless handoff for a fresh install.
+- Colored, user-consumable output for `install.sh` and the pairing flow
+  (tty-gated ANSI; `NO_COLOR` disables).
+
+### Changed
+
+- Default log filter demotes iroh/transport/hickory-resolver internals to
+  `error` (a `RUST_LOG` override still shows everything).
+- A late service takeover while a paired foreground node is serving now exits
+  that foreground process cleanly (it recognizes the hub's supersede close)
+  instead of redialing into a duplicate-identity fight.
+
+### Fixed
+
+- Repeated pairing/preflight failures (environment problems: unreachable hub,
+  dead DNS, corrupt config, malformed saved ticket) no longer spend the
+  self-update rollback budget — only real boot crashes do.
+- Ctrl-C/SIGTERM during pairing cancels immediately (never persists a hub or
+  hands off afterwards) and exits nonzero so scripts cannot mistake a cancel
+  for a successful pairing.
+
 ## [0.1.0-beta.1] - 2026-06-25
 
 First public beta. A semver pre-release (`0.1.0-beta.1` < `0.1.0`); the release is

@@ -239,3 +239,69 @@ async fn worker_ref_methods_reject_bad_params() {
         assert_eq!(resp.id, rid, "the parse closure preserves the request id");
     }
 }
+
+// ── accept_node_update_version (M_NODE_UPDATE_VERSION) ──────────────────────
+
+#[test]
+fn update_version_rejects_missing_and_non_semver_versions() {
+    // Missing `version` → INVALID_PARAMS, nothing deferred.
+    let (resp, deferred) =
+        accept_node_update_version(&req(1, crate::remote::M_NODE_UPDATE_VERSION, json!({})));
+    let e = resp.error.expect("empty params refused");
+    assert_eq!(e.code, INVALID_PARAMS);
+    assert!(
+        deferred.is_none(),
+        "a rejected trigger has nothing to apply"
+    );
+    // A tag-shaped string is NOT plain semver — the syntax gate fails fast in the
+    // reply instead of detached.
+    let (resp, deferred) = accept_node_update_version(&req(
+        2,
+        crate::remote::M_NODE_UPDATE_VERSION,
+        json!({ "version": "v1.2.3" }),
+    ));
+    let e = resp.error.expect("tag-shaped version refused");
+    assert_eq!(e.code, INVALID_PARAMS);
+    assert!(
+        e.message.contains("semver"),
+        "names the rule: {}",
+        e.message
+    );
+    assert!(deferred.is_none());
+}
+
+#[test]
+fn update_version_accepts_plain_semver_and_defers_the_apply() {
+    let (resp, deferred) = accept_node_update_version(&req(
+        3,
+        crate::remote::M_NODE_UPDATE_VERSION,
+        json!({ "version": "1.2.3" }),
+    ));
+    assert!(resp.error.is_none(), "plain semver accepted: {resp:?}");
+    let result = resp.result.expect("accepted reply");
+    assert_eq!(result["status"], "accepted");
+    assert_eq!(result["target_version"], "1.2.3");
+    // Deferred apply present; drop WITHOUT spawning (same contract as the manifest push).
+    assert!(
+        deferred.is_some(),
+        "a valid trigger carries a deferred apply"
+    );
+    drop(deferred);
+}
+
+#[tokio::test]
+async fn update_version_spawn_outside_an_install_layout_fails_without_applying() {
+    // The detached apply resolves this daemon's install dir FIRST; a test binary
+    // is not in the bin/v<ver>/current layout, so the apply fails fast (logged,
+    // nothing staged) — the reply was already "accepted", per the deferred
+    // contract. This drives the REAL spawn path end-to-end minus the apply.
+    let (resp, deferred) = accept_node_update_version(&req(
+        7,
+        crate::remote::M_NODE_UPDATE_VERSION,
+        json!({ "version": "1.2.3" }),
+    ));
+    assert!(resp.error.is_none());
+    deferred.expect("deferred").spawn();
+    // Give the detached task a moment to run to its logged failure.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+}

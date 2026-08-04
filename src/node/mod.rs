@@ -12,6 +12,7 @@ pub mod fleet;
 pub mod hub;
 pub mod identity;
 pub mod node_id;
+pub mod preflight;
 pub mod release_courier;
 pub mod runtime;
 pub mod self_update;
@@ -104,6 +105,11 @@ pub enum GateOutcome {
         /// signature-verified self-update PUSH handler, so the hub may push it a signed update.
         /// `fleet_update` pre-filters on this (a node without it is skipped, not push-and-failed).
         update_capable: bool,
+        /// Whether the node's HELLO advertised the `update_by_version` capability — it accepts
+        /// a bare release VERSION (`M_NODE_UPDATE_VERSION`) and self-fetches the assets from its
+        /// own configured `release_url`. The hub must not send the version trigger to a node
+        /// without it (such a node updates once via the installer/manifest push first).
+        version_capable: bool,
     },
     /// Rejected; `code` is the HG diagnostic that explains why (logged at origin).
     Rejected { code: &'static str },
@@ -452,6 +458,8 @@ pub(crate) async fn gate_admit(
         // Capability map rule (same as fleet_events): only an explicit boolean `true` advertises
         // the self-update push handler.
         update_capable: hello.capabilities.get("update") == Some(&serde_json::Value::Bool(true)),
+        version_capable: hello.capabilities.get("update_by_version")
+            == Some(&serde_json::Value::Bool(true)),
     }
 }
 
@@ -902,7 +910,9 @@ async fn handle_node_stream(
             crate::node::data::relay_pull(&conn, &mut send, req).await;
             continue;
         }
-        if req.method == crate::remote::M_NODE_UPDATE {
+        if req.method == crate::remote::M_NODE_UPDATE
+            || req.method == crate::remote::M_NODE_UPDATE_VERSION
+        {
             // Hub-PUSHED self-update: write the `"accepted"` reply FIRST, then start applying — the
             // apply is a DEFERRED side effect that must not precede its own reply. A successful
             // `write_frame` means the reply was BUFFERED to QUIC, NOT that the hub RECEIVED it
@@ -913,7 +923,11 @@ async fn handle_node_stream(
             // that never receives the reply treats it as OUTCOME-UNKNOWN and retries; the apply is
             // IDEMPOTENT — `apply_pushed_update` refuses an equal/older version and refuses stacking
             // on an unconfirmed trial — so a retry after the node already applied is safely refused.
-            let (resp, deferred) = crate::node::control::accept_node_update(&req);
+            let (resp, deferred) = if req.method == crate::remote::M_NODE_UPDATE_VERSION {
+                crate::node::control::accept_node_update_version(&req)
+            } else {
+                crate::node::control::accept_node_update(&req)
+            };
             let reply_buffered = write_frame(&mut send, &RpcFrame::Response(resp))
                 .await
                 .is_ok();
