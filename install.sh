@@ -796,6 +796,29 @@ sync
 ok "installed higgs v${VERSION} → ${verdir}"
 ok "current → $(readlink "${bindir}/current")"
 
+# UPDATE-IN-PLACE UX: if a higgs node service is ALREADY installed, the running
+# process still executes the OLD binary — restart it now so the flip takes
+# effect immediately (the operator should never need to know launchctl/systemctl
+# incantations). Best-effort: a restart failure is NOTED, never fatal — the
+# install itself succeeded, and the next service (re)start picks up `current`.
+if [ "$os" = "Darwin" ]; then
+  if [ -n "${HOME-}" ] && [ -f "${HOME}/Library/LaunchAgents/com.higgs.node.plist" ]; then
+    if launchctl kickstart -k "gui/$(id -u)/com.higgs.node" 2>/dev/null; then
+      ok "restarted the higgs node service onto v${VERSION}"
+    else
+      note "could not restart com.higgs.node — restart it (or log out/in) to run v${VERSION}"
+    fi
+  fi
+else
+  if command -v systemctl >/dev/null && systemctl --user cat higgs-node.service >/dev/null 2>&1; then
+    if systemctl --user restart higgs-node.service 2>/dev/null; then
+      ok "restarted the higgs node service onto v${VERSION}"
+    else
+      note "could not restart higgs-node.service — restart it to run v${VERSION}"
+    fi
+  fi
+fi
+
 # The service command ALWAYS carries the resolved --prefix: `install-service`
 # defaults to the PASSWD home's ~/.higgs, which can differ from where we just
 # installed (our default used $HOME) — so omitting it could point the service
