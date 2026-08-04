@@ -19,6 +19,8 @@ from it.
 
 ## [Unreleased]
 
+## [0.1.0-beta.2] - 2026-08-03
+
 ### Added
 
 - **One-click fleet updates**: the jigglebot Fleet "Update" button now lists, on
