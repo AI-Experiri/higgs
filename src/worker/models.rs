@@ -878,7 +878,7 @@ fn is_projector_sidecar(fname: &str, arch: Option<&str>) -> bool {
 /// Strips the `.gguf` suffix, takes the last `-` or `.` separated token, and
 /// checks whether it looks like a quantization tag (`Q…`, `IQ…`, `f16`,
 /// `bf16`, `f32`).
-fn quant_from_filename(name: &str) -> Option<String> {
+pub(crate) fn quant_from_filename(name: &str) -> Option<String> {
     let stem = name
         .strip_suffix(".gguf")
         .or_else(|| name.strip_suffix(".GGUF"))?;

@@ -66,6 +66,25 @@ impl Default for HiggsConfig {
                 dirs.push(h.join(".lmstudio").join("models"));
                 dirs.push(h.join(".cache").join("lm-studio").join("models"));
             }
+            // The higgs models dir (`~/.higgs/models`, LM-Studio layout) —
+            // where catalog downloads and node pulls land. In the DEFAULTS so
+            // every entry point (node daemon, embedder, CLI) sees a
+            // just-downloaded model without its own ad-hoc push (the node
+            // daemon has scanned this dir since P4b; this extends the same
+            // root to the embedded default). The scanner treats a missing dir
+            // as empty. Residual: when the SAME `org/model` id also exists in
+            // another root, `ModelStore`'s first-match-by-sorted-path pick can
+            // now resolve the bare id to the higgs-owned copy on embedded
+            // setups too — the pre-existing duplicate-id semantics, now
+            // uniform across entry points; every file still lists in the
+            // models view. Pushed only when it is a directory or absent — a
+            // pathological non-directory occupant would fail the WHOLE scan
+            // (`read_dir` errors on it, unlike a missing path), so it is
+            // skipped instead of scanned.
+            let higgs_models = crate::home::higgs_home().join("models");
+            if higgs_models.is_dir() || !higgs_models.exists() {
+                dirs.push(higgs_models);
+            }
             dirs
         };
 

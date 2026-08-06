@@ -88,6 +88,7 @@ fn main() {
         Some("--node") => Some(higgs::node::cli::run_node_daemon(&args[1..])),
         Some("link") => Some(higgs::node::cli::run_link(&args[1..])),
         Some("node") => Some(higgs::node::cli::run_node(&args[1..])),
+        Some("model") => Some(higgs::catalog::cli::run_model(&args[1..])),
         Some("keys") => Some(higgs::keys::run_keys(&args[1..])),
         _ => None,
     };
@@ -110,6 +111,7 @@ fn main() {
          higgs node <connect|leave> …       one-shot node-side ops against a hub\n  \
          higgs node install-service          node service — user-space, login-bound by default; --system = always-on\n  \
          higgs link <pair|status>           hub-side fleet pairing\n  \
+         higgs model <search|show|download>  search the Hugging Face catalog / pull a GGUF\n  \
          higgs keys <…>                      manage API keys\n  \
          higgs --version                     print the version"
     );

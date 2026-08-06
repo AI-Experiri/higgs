@@ -88,6 +88,62 @@ impl NodeTransport {
         }
     }
 
+    /// Trigger a catalog download ON the node (`M_NODE_PULL`): the node fetches
+    /// `repo`/`file` from the Hub ITSELF (its own endpoint/fallback, atomic into
+    /// its models dir) — no bytes cross this stream, only `N_PROGRESS`
+    /// notifications and the final `{ path }` reply. Deliberately no TOTAL
+    /// deadline (a multi-GB pull runs as long as it runs) but a STALL deadline
+    /// ([`PULL_STALL_TIMEOUT`]): the node streams a progress notification per
+    /// chunk, so a stream with no frame for that long is a wedged node/Hub —
+    /// iroh keep-alives keep the CONNECTION alive, so QUIC liveness alone
+    /// would never bound an application-silent peer. Mirrors the stall-based
+    /// load timeout philosophy.
+    pub async fn pull(
+        &self,
+        repo: &str,
+        file: &str,
+        revision: Option<&str>,
+        on_progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
+    ) -> Result<Value, HiggsError> {
+        let id = self.alloc_id();
+        // Bound the OPEN + WRITE phase with the same stall deadline: a peer
+        // that withholds stream credit (or stalls the request write) while
+        // keeping the connection alive would otherwise hang before the read
+        // loop's own stall clock ever starts — the same hazard the update
+        // push bounds with its whole-push timeout.
+        let open_and_send = async {
+            let (mut send, recv) = self.conn.open_bi().await.map_err(transport_dead)?;
+            let params = crate::remote::NodePullParams {
+                request_id: id,
+                repo: repo.to_owned(),
+                file: file.to_owned(),
+                revision: revision.map(str::to_owned),
+            };
+            let req = RpcRequest {
+                jsonrpc: "2.0".into(),
+                id,
+                method: crate::remote::M_NODE_PULL.into(),
+                params: serde_json::to_value(&params)
+                    .map_err(|e| transport_dead(format!("encode pull params: {e}")))?,
+            };
+            write_frame(&mut send, &RpcFrame::Request(req))
+                .await
+                .map_err(transport_dead)?;
+            let _ = send.finish();
+            Ok::<_, HiggsError>(recv)
+        };
+        let recv = match tokio::time::timeout(PULL_STALL_TIMEOUT, open_and_send).await {
+            Ok(res) => res?,
+            Err(_) => {
+                return Err(transport_dead(format!(
+                    "pull open/send stalled: no stream in {}s",
+                    PULL_STALL_TIMEOUT.as_secs()
+                )))
+            }
+        };
+        pull_read_loop(BufReader::new(recv), on_progress, PULL_STALL_TIMEOUT).await
+    }
+
     /// Relay a remote chat: open a data stream, send `M_CHAT`, and return the streamed
     /// deltas (`rx`) plus a future resolving to the final result. The hub uses the SAME
     /// value for the JSON-RPC `id` and `params.request_id` (codex), so the per-stream
@@ -207,6 +263,55 @@ impl std::future::Future for ChatDone {
 
 /// Extract `result` from a node reply, mapping a node/worker error to a `HiggsError` that
 /// carries the origin diagnostic code (so the hub maps the true status).
+/// Stall deadline for one pull frame: the node emits a progress notification
+/// per received chunk, so a stream with NO frame for this long means the node
+/// (or its Hub fetch) is wedged — fail the pull instead of holding the
+/// in-flight slot forever. There is deliberately no TOTAL deadline.
+pub(crate) const PULL_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The pull stream demux, split from [`NodeTransport::pull`] so it is
+/// unit-testable over any reader: `N_PROGRESS` notifications → `on_progress`
+/// (tolerant decode — a malformed one is dropped, never fails the pull), the
+/// final `Response` → the result, early close → transport-dead, and a frame
+/// gap longer than `stall` → transport-dead ("stalled").
+async fn pull_read_loop<R>(
+    reader: R,
+    on_progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
+    stall: std::time::Duration,
+) -> Result<Value, HiggsError>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let mut lines = reader.lines();
+    loop {
+        let next = match tokio::time::timeout(stall, lines.next_line()).await {
+            Ok(res) => res.map_err(transport_dead)?,
+            Err(_) => {
+                break Err(transport_dead(format!(
+                    "pull stalled: no frame for {}s",
+                    stall.as_secs()
+                )))
+            }
+        };
+        match next {
+            Some(line) => match rpc::decode(&line).map_err(|e| transport_dead(e.to_string()))? {
+                RpcFrame::Notification(n) if n.method == crate::remote::N_PROGRESS => {
+                    let downloaded = n
+                        .params
+                        .get("downloaded")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    let total = n.params.get("total").and_then(Value::as_u64);
+                    on_progress(downloaded, total);
+                }
+                RpcFrame::Response(resp) => break extract_result(crate::remote::M_NODE_PULL, resp),
+                _ => {}
+            },
+            None => break Err(transport_dead("node closed the pull stream before final")),
+        }
+    }
+}
+
 fn extract_result(method: &str, resp: RpcResponse) -> Result<Value, HiggsError> {
     if let Some(err) = resp.error {
         let worker_code = err
