@@ -115,7 +115,7 @@ pub(crate) fn http_status_to_error(
 /// applies to the fallback path, so primary and fallback always target the same host
 /// (otherwise a user's mirror would be silently bypassed by the hub client). Unset ⇒ the
 /// crate's default (`https://huggingface.co`), and its own `HF_ENDPOINT`/token resolution.
-fn hf_client(repo_id: &str) -> Result<HFClient, HiggsError> {
+pub(crate) fn hf_client(repo_id: &str) -> Result<HFClient, HiggsError> {
     let mut builder = HFClient::builder();
     if let Ok(ep) = std::env::var("HIGGS_HF_ENDPOINT") {
         if !ep.is_empty() {
@@ -127,7 +127,7 @@ fn hf_client(repo_id: &str) -> Result<HFClient, HiggsError> {
 
 /// Construct a hub repo handle for `repo_id` (a model repo). Centralizes the
 /// client build + `split_repo` + `repo()` dance and its error classification.
-fn model_repo(repo_id: &str) -> Result<huggingface_hub::HFRepository, HiggsError> {
+pub(crate) fn model_repo(repo_id: &str) -> Result<huggingface_hub::HFRepository, HiggsError> {
     let (owner, name) = split_repo(repo_id).ok_or_else(|| HiggsError::HubClient {
         repo: repo_id.to_owned(),
         detail: format!("repo id must be 'org/model', got {repo_id:?}"),

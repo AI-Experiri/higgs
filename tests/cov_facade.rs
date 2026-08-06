@@ -582,3 +582,97 @@ async fn chat_flood_past_admission_gate_is_server_busy() {
 
     higgs.shutdown().await;
 }
+
+/// The UPx/catalog-era node ops with NO hub: the version-trigger push, the
+/// release listing, the fleet-wide version push, the URL-based courier pushes,
+/// and `node_label` for an unknown node — every one refuses with the
+/// not-a-hub/absent-node error instead of pretending, and `nodes()` with no
+/// fleet still lists the LOCAL node as the single first-class row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn version_and_courier_ops_without_a_hub_refuse() {
+    let Some(higgs) = higgs_local(&[TINY_MODEL_ID]).await else {
+        eprintln!("SKIP version_and_courier_ops_without_a_hub_refuse: tiny gguf not found");
+        return;
+    };
+
+    let releases = higgs.node_releases("some-node").await.map(|_| ());
+    let by_version = higgs
+        .node_update_version("some-node", "1.2.3")
+        .await
+        .map(|_| ());
+    let fleet_by_version = higgs.fleet_update_version("1.2.3").await.map(|_| ());
+    let courier = higgs
+        .node_update("some-node", "https://mirror.example/m.manifest")
+        .await
+        .map(|_| ());
+    let fleet_courier = higgs
+        .fleet_update("https://mirror.example/v1.2.3/")
+        .await
+        .map(|_| ());
+    for (name, r) in [
+        ("node_releases", releases),
+        ("node_update_version", by_version),
+        ("fleet_update_version", fleet_by_version),
+        ("node_update", courier),
+        ("fleet_update", fleet_courier),
+    ] {
+        let err = r.expect_err(&format!("{name} with no hub must fail"));
+        assert!(
+            matches!(err, HiggsError::HubControlFailed { .. }),
+            "{name} → HubControlFailed: {err:?}"
+        );
+    }
+
+    // Relabeling an unknown node (no fleet) reports "not found" (Ok(false)) or
+    // a not-a-hub refusal — never a silent success.
+    let relabel = higgs.node_label("nope", "x").await;
+    match relabel {
+        Ok(renamed) => assert!(!renamed, "unknown node must not rename"),
+        Err(e) => assert!(matches!(e, HiggsError::HubControlFailed { .. })),
+    }
+
+    let nodes = higgs.nodes().await;
+    assert_eq!(nodes.len(), 1, "no fleet → the local node only");
+    assert!(nodes[0].is_local, "the single row is the local node");
+
+    higgs.shutdown().await;
+}
+
+/// Key management + CORS edge arms over the facade: a duplicate mint label is
+/// refused, revoking an unknown label is a NotFound-shaped error, and an
+/// invalid CORS origin never persists.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn key_and_cors_edge_arms_refuse_cleanly() {
+    let Some(higgs) = higgs_local(&[TINY_MODEL_ID]).await else {
+        eprintln!("SKIP key_and_cors_edge_arms_refuse_cleanly: tiny gguf not found");
+        return;
+    };
+
+    // The FIRST key must carry admin (the only key able to manage keys).
+    higgs
+        .mint_key("dup-label", Some(vec![Scope::Admin]))
+        .expect("first mint");
+    let dup = higgs.mint_key("dup-label", Some(vec![Scope::Chat]));
+    assert!(dup.is_err(), "duplicate label must refuse");
+    let gone = higgs.revoke_key("never-existed");
+    assert!(gone.is_err(), "revoking an unknown label must refuse");
+
+    for bad in ["not a url", "ftp://x", "https://", ""] {
+        assert!(
+            higgs.set_cors_origins(vec![bad.to_string()]).is_err(),
+            "{bad:?} must be refused as a CORS origin"
+        );
+    }
+    assert!(
+        higgs.cors_settings().origins.is_empty(),
+        "no invalid origin persisted"
+    );
+
+    // model_by_id: present id round-trips, absent id is ModelNotFound.
+    let entry = higgs.model_by_id(TINY_MODEL_ID).await.expect("known id");
+    assert_eq!(entry.model.id, TINY_MODEL_ID);
+    let missing = higgs.model_by_id("acme/absent").await;
+    assert!(matches!(missing, Err(HiggsError::ModelNotFound { .. })));
+
+    higgs.shutdown().await;
+}

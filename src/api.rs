@@ -218,6 +218,29 @@ pub struct Higgs {
     /// transient — a subscriber that joins mid-load still gets the remaining phases +
     /// the terminal event).
     load_events: tokio::sync::broadcast::Sender<crate::api::types::ModelLoadEvent>,
+    /// Live catalog-download progress events (`Higgs::model_download`), the
+    /// download twin of `load_events`: `Starting` → throttled `Downloading` →
+    /// terminal `Done`/`Failed`. Same broadcast semantics — no subscribers is
+    /// a no-op, and a late subscriber still gets the remaining phases.
+    download_events: tokio::sync::broadcast::Sender<crate::catalog::wire::ModelDownloadEvent>,
+    /// `(target node, repo, file)` catalog downloads currently in flight
+    /// (`None` node = this machine). `model_download`/`model_download_on`
+    /// refuse a concurrent duplicate of the same file on the same target, so
+    /// the event stream stays unambiguous per (target, file) and a multi-GB
+    /// transfer never runs twice — while local and per-node transfers of the
+    /// same file stay independent slots.
+    downloads_in_flight:
+        parking_lot::Mutex<std::collections::HashSet<(Option<String>, String, String)>>,
+    /// Last LOGGED progress step per in-flight download (`(target node,
+    /// repo, file)` → decile/GiB step). Every download's lifecycle is
+    /// mirrored into the log stream; this gate keeps the `Downloading` phase
+    /// at one line per 10% (or per GiB when the length is unknown) instead of
+    /// one per throttled event. Entries are dropped on the terminal phases —
+    /// bounded ONLY because every emitter runs under `DownloadTerminalGuard`
+    /// (a terminal event fires even on cancel/drop). An emitter outside the
+    /// guard would leak its key; do not add one.
+    download_log_steps:
+        parking_lot::Mutex<std::collections::HashMap<(Option<String>, String, String), u64>>,
     /// Override for the `config.json` path. `None` in production → the real
     /// [`crate::config::config_path`] (`~/.higgs` or `$HIGGS_HOME`). Set to a unique temp
     /// path for in-crate unit tests (see [`default_config_path_override`]) so `load`'s
@@ -775,6 +798,11 @@ impl Higgs {
             // ~50 loads interleaved faster than a subscriber polls. A lagged SSE
             // client skips the gap and keeps streaming.
             load_events: tokio::sync::broadcast::channel(256).0,
+            // Download events are throttled at the emitter (≥250ms apart), so
+            // the same capacity gives a lagging subscriber minutes of slack.
+            download_events: tokio::sync::broadcast::channel(256).0,
+            downloads_in_flight: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            download_log_steps: parking_lot::Mutex::new(std::collections::HashMap::new()),
             config_path: parking_lot::Mutex::new(default_config_path_override()),
             keys_io: parking_lot::Mutex::new(()),
             key_touch_throttle: parking_lot::Mutex::new(std::collections::HashMap::new()),
@@ -2806,6 +2834,84 @@ impl Higgs {
         self.load_events.subscribe()
     }
 
+    /// Subscribe to live catalog-download progress events
+    /// ([`crate::catalog::wire::ModelDownloadEvent`]) — the download twin of
+    /// [`subscribe_load_events`](Self::subscribe_load_events).
+    pub fn subscribe_download_events(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::catalog::wire::ModelDownloadEvent> {
+        self.download_events.subscribe()
+    }
+
+    /// Push one catalog-download event, stamping `at_ms` here so every emitter
+    /// shares the same clock. A `send` with no subscribers is a harmless no-op.
+    pub(crate) fn emit_download_event(&self, mut ev: crate::catalog::wire::ModelDownloadEvent) {
+        ev.at_ms = now_unix_ms();
+        self.log_download_event(&ev);
+        let _ = self.download_events.send(ev);
+    }
+
+    /// Mirror every catalog download's lifecycle (local AND per-node) into
+    /// the log stream — the jigglebot Logs pane and any file the process logs
+    /// to. `Starting`/`Done`/`Failed` always log; `Downloading` logs once per
+    /// 10% (per-GiB when the length is unknown) via [`Self::download_log_steps`].
+    fn log_download_event(&self, ev: &crate::catalog::wire::ModelDownloadEvent) {
+        use crate::catalog::wire::ModelDownloadPhase as Phase;
+        let key = (ev.node.clone(), ev.repo.clone(), ev.file.clone());
+        let target = ev.node.as_deref().unwrap_or("this machine");
+        match ev.phase {
+            Phase::Starting => {
+                self.download_log_steps.lock().insert(key, 0);
+                tracing::info!(
+                    repo = %ev.repo, file = %ev.file, target = %target,
+                    "higgs: download starting"
+                );
+            }
+            Phase::Downloading => {
+                let step = match ev.total_bytes {
+                    Some(t) if t > 0 => ev.downloaded_bytes * 10 / t,
+                    _ => ev.downloaded_bytes >> 30,
+                };
+                let mut steps = self.download_log_steps.lock();
+                let last = steps.entry(key).or_insert(0);
+                if step <= *last {
+                    return;
+                }
+                *last = step;
+                drop(steps);
+                match ev.total_bytes {
+                    Some(t) if t > 0 => tracing::info!(
+                        repo = %ev.repo, file = %ev.file, target = %target,
+                        downloaded = ev.downloaded_bytes, total = t,
+                        percent = ev.downloaded_bytes * 100 / t,
+                        "higgs: download progress"
+                    ),
+                    _ => tracing::info!(
+                        repo = %ev.repo, file = %ev.file, target = %target,
+                        downloaded = ev.downloaded_bytes,
+                        "higgs: download progress (length unknown)"
+                    ),
+                }
+            }
+            Phase::Done => {
+                self.download_log_steps.lock().remove(&key);
+                tracing::info!(
+                    repo = %ev.repo, file = %ev.file, target = %target,
+                    path = ev.path.as_deref().unwrap_or(""),
+                    "higgs: download done"
+                );
+            }
+            Phase::Failed => {
+                self.download_log_steps.lock().remove(&key);
+                tracing::warn!(
+                    repo = %ev.repo, file = %ev.file, target = %target,
+                    code = ev.code.as_deref().unwrap_or(""),
+                    "higgs: download FAILED"
+                );
+            }
+        }
+    }
+
     /// Push one model-load lifecycle event to live SSE subscribers. A `send` with no
     /// subscribers is a harmless no-op (the load proceeds regardless). `code` is set
     /// only for [`ModelLoadPhase::Failed`].
@@ -2815,6 +2921,17 @@ impl Higgs {
         phase: crate::api::types::ModelLoadPhase,
         code: Option<String>,
     ) {
+        // Every load-phase transition is mirrored into the log stream (same
+        // treatment as downloads): phases are low-frequency, so ALL of them
+        // log — failures at warn with their code.
+        match phase {
+            crate::api::types::ModelLoadPhase::Failed => tracing::warn!(
+                model = %id,
+                code = code.as_deref().unwrap_or(""),
+                "higgs: model load FAILED"
+            ),
+            _ => tracing::info!(model = %id, phase = ?phase, "higgs: model load phase"),
+        }
         let _ = self.load_events.send(crate::api::types::ModelLoadEvent {
             id: id.to_owned(),
             phase,

@@ -14,6 +14,7 @@ mod ts_export;
 pub mod actor;
 pub mod api;
 pub mod auth;
+pub mod catalog;
 pub mod config;
 pub mod delta_queue;
 pub mod diagnostic;

@@ -639,6 +639,43 @@ fn default_config_paths() {
         "hf_dirs must use ~/.cache/huggingface/hub (not XDG cache_dir)"
     );
     assert!(
+        cfg.lmstudio_dirs
+            .iter()
+            .any(|p| *p == crate::home::higgs_home().join("models")),
+        "lmstudio_dirs must include the higgs models dir — catalog downloads \
+         land there and every embedder's scan must see them"
+    );
+    // A pathological occupant (a FILE at the models path) must NOT be pushed:
+    // `read_dir` on it would fail the WHOLE scan, unlike a missing dir.
+    {
+        let _env = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("HIGGS_HOME");
+        // SAFETY: serialized by TEST_ENV_LOCK; restored below.
+        unsafe { std::env::set_var("HIGGS_HOME", tmp.path()) };
+        let models = tmp.path().join("models");
+        let absent = HiggsConfig::default();
+        assert!(
+            absent.lmstudio_dirs.contains(&models),
+            "absent dir is included (the scanner treats it as empty)"
+        );
+        std::fs::write(&models, b"not a dir").unwrap();
+        let occupied = HiggsConfig::default();
+        assert!(
+            !occupied.lmstudio_dirs.contains(&models),
+            "a non-directory occupant is skipped, not scanned"
+        );
+        // SAFETY: serialized by TEST_ENV_LOCK.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("HIGGS_HOME", v),
+                None => std::env::remove_var("HIGGS_HOME"),
+            }
+        }
+    }
+    assert!(
         cfg.ollama_dirs
             .iter()
             .any(|p| p.ends_with(".ollama/models")),

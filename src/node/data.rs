@@ -209,20 +209,83 @@ async fn pull_stream<P, F>(
         file: params.file,
         revision: params.revision.unwrap_or_else(|| "main".into()),
     };
+    tracing::info!(
+        repo = %target.repo,
+        file = %target.file,
+        revision = %target.revision,
+        dest = %models_root.display(),
+        "higgs node: pull requested by hub"
+    );
 
     // Run the download in its own task so a hub disconnect doesn't abort a near-complete
     // pull. Progress flows over a BOUNDED channel; when the hub stream is back-pressured the
     // download drops surplus ticks (`try_send`) rather than buffering every chunk — progress
     // is lossy-tolerant, so memory stays bounded regardless of model size.
+    // The task logs its OWN lifecycle (start/progress deciles/outcome): the log record must
+    // survive even when the hub connection is long gone by the time the transfer resolves.
+    // Owned copies for log lines: the target moves into the download task and
+    // is mutably-borrow-blocked inside it, while the handler needs the same
+    // context on its disconnect lines (concurrent pulls must never interleave
+    // ambiguously in the log).
+    let (log_repo, log_file) = (target.repo.clone(), target.file.clone());
     let (prog_tx, mut prog_rx) = tokio::sync::mpsc::channel::<(u64, Option<u64>)>(64);
     let (final_tx, final_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        let mut cb = move |downloaded: u64, total: Option<u64>| {
+        let started = std::time::Instant::now();
+        let (cb_repo, cb_file) = (target.repo.clone(), target.file.clone());
+        let mut last_logged_step: u64 = 0;
+        let mut last_downloaded: u64 = 0;
+        let mut cb = |downloaded: u64, total: Option<u64>| {
+            last_downloaded = downloaded;
+            // Every 10% when the length is known, else every GiB — enough to
+            // follow a transfer from the log without flooding it per-chunk.
+            let step = match total {
+                Some(t) if t > 0 => downloaded * 10 / t,
+                _ => downloaded >> 30,
+            };
+            if step > last_logged_step {
+                last_logged_step = step;
+                match total {
+                    Some(t) if t > 0 => tracing::info!(
+                        repo = %cb_repo,
+                        file = %cb_file,
+                        downloaded,
+                        total = t,
+                        percent = downloaded * 100 / t,
+                        "higgs node: pull progress"
+                    ),
+                    _ => tracing::info!(
+                        repo = %cb_repo,
+                        file = %cb_file,
+                        downloaded,
+                        "higgs node: pull progress (length unknown)"
+                    ),
+                }
+            }
             let _ = prog_tx.try_send((downloaded, total));
         };
+        tracing::info!(repo = %target.repo, file = %target.file, "higgs node: pull download starting");
         let res =
             crate::download::download_dual(&target, &models_root, &primary, &fallback, &mut cb)
                 .await;
+        match &res {
+            Ok(path) => tracing::info!(
+                repo = %target.repo,
+                file = %target.file,
+                path = %path.display(),
+                bytes = last_downloaded,
+                elapsed_secs = started.elapsed().as_secs(),
+                "higgs node: pull done — file on disk"
+            ),
+            Err(e) => tracing::warn!(
+                repo = %target.repo,
+                file = %target.file,
+                bytes = last_downloaded,
+                elapsed_secs = started.elapsed().as_secs(),
+                error = %e,
+                "higgs node: pull FAILED"
+            ),
+        }
         let _ = final_tx.send(res);
     });
     tokio::pin!(final_rx);
@@ -233,7 +296,13 @@ async fn pull_stream<P, F>(
             maybe = prog_rx.recv(), if progress_open => match maybe {
                 Some((downloaded, total)) => {
                     if write_progress(send, request_id, downloaded, total).await.is_err() {
-                        return; // hub gone — the download task still finishes
+                        // Hub gone — the download task still finishes (and logs).
+                        tracing::info!(
+                            repo = %log_repo,
+                            file = %log_file,
+                            "higgs node: hub stream write failed mid-pull; download continues in the background"
+                        );
+                        return;
                     }
                 }
                 None => progress_open = false,
@@ -241,8 +310,22 @@ async fn pull_stream<P, F>(
             res = &mut final_rx => break res.unwrap_or_else(|_| {
                 Err(HiggsError::DownloadFailed { repo: String::new(), file: String::new(), detail: "download task dropped".into() })
             }),
-            _ = conn.closed() => return,
-            _ = send.stopped() => return,
+            _ = conn.closed() => {
+                tracing::info!(
+                    repo = %log_repo,
+                    file = %log_file,
+                    "higgs node: hub connection closed mid-pull; download continues in the background"
+                );
+                return;
+            }
+            _ = send.stopped() => {
+                tracing::info!(
+                    repo = %log_repo,
+                    file = %log_file,
+                    "higgs node: hub stopped the pull stream; download continues in the background"
+                );
+                return;
+            }
         }
     };
     // Flush any progress buffered before the final resolved.

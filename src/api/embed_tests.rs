@@ -1446,3 +1446,370 @@ async fn applied_cors_disclosure_follows_listener_liveness() {
         "the last exit returns to pre-serve semantics"
     );
 }
+
+// ── MSx: model-search catalog ops ──────────────────────────────────────────
+
+/// A fake `Fetcher` for the catalog download op: streams `chunks`, or fails
+/// with the constructed classified error.
+struct CatalogFakeFetcher {
+    chunks: Vec<Vec<u8>>,
+    fail_with: Option<Box<dyn Fn() -> HiggsError + Send + Sync>>,
+}
+
+impl crate::download::Fetcher for CatalogFakeFetcher {
+    async fn fetch(
+        &self,
+        _target: &crate::download::PullTarget,
+        on_chunk: &mut (dyn FnMut(&[u8]) + Send),
+        progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
+    ) -> Result<(), HiggsError> {
+        if let Some(mk) = &self.fail_with {
+            return Err(mk());
+        }
+        let total: u64 = self.chunks.iter().map(|c| c.len() as u64).sum();
+        let mut sent = 0u64;
+        for c in &self.chunks {
+            on_chunk(c);
+            sent += c.len() as u64;
+            progress(sent, Some(total));
+        }
+        Ok(())
+    }
+}
+
+fn drain_download_events(
+    rx: &mut tokio::sync::broadcast::Receiver<crate::catalog::wire::ModelDownloadEvent>,
+) -> Vec<crate::catalog::wire::ModelDownloadEvent> {
+    let mut events = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        events.push(ev);
+    }
+    events
+}
+
+#[tokio::test]
+async fn model_download_emits_starting_then_done_and_lands_the_file() {
+    use crate::catalog::wire::ModelDownloadPhase;
+    let higgs = fake_higgs(vec![]);
+    let root = tempfile::tempdir().expect("root");
+    let ok = CatalogFakeFetcher {
+        chunks: vec![b"gguf-bytes".to_vec()],
+        fail_with: None,
+    };
+    let never = CatalogFakeFetcher {
+        chunks: vec![],
+        fail_with: Some(Box::new(|| panic!("fallback must not run"))),
+    };
+    let mut rx = higgs.subscribe_download_events();
+    let path = higgs
+        .model_download_with("acme/m", "m-Q4_K_M.gguf", root.path(), &ok, &never)
+        .await
+        .expect("download");
+    assert_eq!(path, root.path().join("acme/m/m-Q4_K_M.gguf"));
+    assert!(path.is_file());
+
+    let events = drain_download_events(&mut rx);
+    assert_eq!(
+        events.first().expect("starting").phase,
+        ModelDownloadPhase::Starting
+    );
+    let done = events.last().expect("done");
+    assert_eq!(done.phase, ModelDownloadPhase::Done);
+    assert_eq!(done.repo, "acme/m");
+    assert_eq!(done.file, "m-Q4_K_M.gguf");
+    assert_eq!(done.downloaded_bytes, 10);
+    assert_eq!(done.total_bytes, Some(10));
+    assert_eq!(done.path.as_deref(), Some(path.to_str().unwrap()));
+    assert!(done.code.is_none());
+    assert!(events.iter().all(|e| e.at_ms > 0));
+}
+
+#[tokio::test]
+async fn model_download_failure_emits_failed_with_the_diagnostic_code() {
+    use crate::catalog::wire::ModelDownloadPhase;
+    let higgs = fake_higgs(vec![]);
+    let root = tempfile::tempdir().expect("root");
+    let bad = CatalogFakeFetcher {
+        chunks: vec![],
+        fail_with: Some(Box::new(|| HiggsError::HubTransport {
+            repo: "acme/m".into(),
+            detail: "injected".into(),
+        })),
+    };
+    let mut rx = higgs.subscribe_download_events();
+    let err = higgs
+        .model_download_with("acme/m", "m.gguf", root.path(), &bad, &bad)
+        .await
+        .expect_err("both paths fail");
+    // Both transports exhausted → the dual-path terminal code.
+    assert!(matches!(err, HiggsError::HubFetchExhausted { .. }));
+
+    let events = drain_download_events(&mut rx);
+    let failed = events.last().expect("failed event");
+    assert_eq!(failed.phase, ModelDownloadPhase::Failed);
+    assert_eq!(failed.code.as_deref(), Some("HG036"));
+    assert!(failed.path.is_none());
+}
+
+#[tokio::test]
+async fn a_second_concurrent_download_of_the_same_file_is_refused() {
+    /// Blocks mid-transfer until released, then streams one chunk.
+    struct BlockingFetcher {
+        release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+    impl crate::download::Fetcher for BlockingFetcher {
+        async fn fetch(
+            &self,
+            _target: &crate::download::PullTarget,
+            on_chunk: &mut (dyn FnMut(&[u8]) + Send),
+            progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
+        ) -> Result<(), HiggsError> {
+            if let Some(rx) = self.release.lock().await.take() {
+                let _ = rx.await;
+            }
+            on_chunk(b"ok");
+            progress(2, Some(2));
+            Ok(())
+        }
+    }
+
+    let higgs = Arc::new(fake_higgs(vec![]));
+    let root = tempfile::tempdir().expect("root");
+    let (tx, rx) = tokio::sync::oneshot::channel();
+
+    let first = {
+        let higgs = higgs.clone();
+        let root = root.path().to_path_buf();
+        tokio::spawn(async move {
+            let blocking = BlockingFetcher {
+                release: tokio::sync::Mutex::new(Some(rx)),
+            };
+            higgs
+                .model_download_with("acme/m", "m.gguf", &root, &blocking, &blocking)
+                .await
+        })
+    };
+    // Let the first transfer claim its slot and park on the release channel.
+    tokio::task::yield_now().await;
+
+    let instant = BlockingFetcher {
+        release: tokio::sync::Mutex::new(None),
+    };
+    let refused = higgs
+        .model_download_with("acme/m", "m.gguf", root.path(), &instant, &instant)
+        .await
+        .expect_err("duplicate in-flight download must be refused");
+    assert!(matches!(refused, HiggsError::DownloadFailed { .. }));
+    assert!(refused.to_string().contains("already downloading"));
+
+    tx.send(()).expect("release the first transfer");
+    first
+        .await
+        .expect("join")
+        .expect("the original download still completes");
+
+    // The slot is free again — a fresh download of the same file succeeds.
+    higgs
+        .model_download_with("acme/m", "m.gguf", root.path(), &instant, &instant)
+        .await
+        .expect("post-completion download");
+}
+
+/// The facade's `model_search` + `model_detail` over the fixture Hub (sync
+/// test with its own runtime so `TEST_ENV_LOCK` never crosses an await in an
+/// async fn).
+#[test]
+fn facade_model_search_and_detail_over_a_loopback_hub() {
+    let _env = crate::TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let hub = crate::catalog::test_support::fixture_hub().await;
+        let _redirect = crate::catalog::test_support::EnvRedirect::set(&hub.endpoint, None);
+        let higgs = fake_higgs(vec![]);
+
+        let q = crate::catalog::wire::CatalogQuery {
+            search: "tiny".into(),
+            author: None,
+            sort: None,
+            limit: None,
+            compatible_only: None,
+        };
+        let resp = higgs.model_search(&q).await.expect("search");
+        assert_eq!(resp.models.len(), 2);
+        assert_eq!(resp.models[0].id, "acme/tiny");
+
+        let d = higgs.model_detail("acme/tiny").await.expect("detail");
+        assert_eq!(d.summary.id, "acme/tiny");
+        assert_eq!(d.quants.len(), 2);
+        assert_eq!(d.quants[0].size_bytes, Some(4_000));
+        let more: Vec<&str> = d.more_by_author.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(more, ["acme/big"]);
+    });
+}
+
+/// A `models_dir` preflight failure still honors the event contract:
+/// subscribers see `Starting` then a terminal `Failed`, never silence.
+#[test]
+fn model_download_preflight_failure_still_emits_the_terminal_event() {
+    use crate::catalog::wire::ModelDownloadPhase;
+    let _env = crate::TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let tmp = tempfile::tempdir().expect("tmp");
+    // HIGGS_HOME as a FILE → `ensure_home`'s create_dir_all fails → the
+    // download can never even resolve its destination root.
+    let home_file = tmp.path().join("home-occupied");
+    std::fs::write(&home_file, b"not a dir").unwrap();
+    let prev = std::env::var_os("HIGGS_HOME");
+    // SAFETY: serialized by TEST_ENV_LOCK; restored below.
+    unsafe { std::env::set_var("HIGGS_HOME", &home_file) };
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let higgs = fake_higgs(vec![]);
+        let mut rx = higgs.subscribe_download_events();
+        let err = higgs
+            .model_download("acme/m", "m.gguf")
+            .await
+            .expect_err("preflight must fail");
+        assert!(matches!(err, HiggsError::HubFileWrite { .. }));
+        let events = drain_download_events(&mut rx);
+        assert_eq!(
+            events.first().map(|e| e.phase),
+            Some(ModelDownloadPhase::Starting)
+        );
+        let failed = events.last().expect("terminal event");
+        assert_eq!(failed.phase, ModelDownloadPhase::Failed);
+        assert!(failed.code.is_some());
+    });
+
+    // SAFETY: serialized by TEST_ENV_LOCK.
+    unsafe {
+        match prev {
+            Some(v) => std::env::set_var("HIGGS_HOME", v),
+            None => std::env::remove_var("HIGGS_HOME"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn model_download_on_without_a_hub_refuses_before_any_event() {
+    let higgs = fake_higgs(vec![]);
+    let mut rx = higgs.subscribe_download_events();
+    let err = higgs
+        .model_download_on("some-node", "acme/m", "m.gguf")
+        .await
+        .expect_err("no hub → refuse");
+    assert!(matches!(err, HiggsError::HubControlFailed { .. }));
+    assert!(
+        rx.try_recv().is_err(),
+        "a not-a-hub refusal is synchronous — no download events"
+    );
+}
+
+#[tokio::test]
+async fn local_and_per_node_download_slots_are_independent() {
+    // Claiming the LOCAL slot for (repo, file) must not block a node-targeted
+    // claim of the same file, and vice versa — but a duplicate on the SAME
+    // target is refused.
+    let higgs = fake_higgs(vec![]);
+    let local = super::InFlightDownload::claim(&higgs, None, "acme/m", "m.gguf").expect("local");
+    let node_a =
+        super::InFlightDownload::claim(&higgs, Some("node-a"), "acme/m", "m.gguf").expect("node a");
+    assert!(
+        super::InFlightDownload::claim(&higgs, Some("node-a"), "acme/m", "m.gguf").is_err(),
+        "duplicate on the same node refused"
+    );
+    assert!(
+        super::InFlightDownload::claim(&higgs, Some("node-b"), "acme/m", "m.gguf").is_ok(),
+        "a different node is its own slot"
+    );
+    drop(local);
+    super::InFlightDownload::claim(&higgs, None, "acme/m", "m.gguf")
+        .expect("local slot free again after drop");
+    drop(node_a);
+}
+
+#[tokio::test]
+async fn catalog_inventory_reflects_the_local_scan() {
+    let (higgs, _dir) = fake_higgs_with_fixture();
+    let inv = higgs.catalog_inventory().await;
+    assert!(inv.has_repo("org/model"));
+    assert!(!inv.has_repo("org/absent"));
+}
+
+/// Cancelling a download mid-transfer (the bridge's HiggsCancel abort) must
+/// still deliver the terminal event: dropping the op future after `Starting`
+/// emits `Failed { code: "cancelled" }` — the Starting→terminal contract
+/// survives caller cancellation exactly like the load TerminalGuard.
+#[tokio::test]
+async fn a_cancelled_download_still_emits_the_terminal_failed_event() {
+    use crate::catalog::wire::ModelDownloadPhase;
+    struct ParkedFetcher {
+        release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+    impl crate::download::Fetcher for ParkedFetcher {
+        async fn fetch(
+            &self,
+            _target: &crate::download::PullTarget,
+            _on_chunk: &mut (dyn FnMut(&[u8]) + Send),
+            _progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
+        ) -> Result<(), HiggsError> {
+            if let Some(rx) = self.release.lock().await.take() {
+                let _ = rx.await; // parks until released or dropped
+            }
+            Ok(())
+        }
+    }
+
+    let higgs = Arc::new(fake_higgs(vec![]));
+    let root = tempfile::tempdir().expect("root");
+    let (_hold, rx) = tokio::sync::oneshot::channel::<()>();
+    let mut events = higgs.subscribe_download_events();
+
+    let task = {
+        let higgs = higgs.clone();
+        let root = root.path().to_path_buf();
+        tokio::spawn(async move {
+            let parked = ParkedFetcher {
+                release: tokio::sync::Mutex::new(Some(rx)),
+            };
+            let _ = higgs
+                .model_download_with("acme/m", "m.gguf", &root, &parked, &parked)
+                .await;
+        })
+    };
+    // Let the transfer claim its slot and park, then cancel it.
+    tokio::task::yield_now().await;
+    task.abort();
+    let _ = task.await;
+
+    let mut phases = Vec::new();
+    while let Ok(ev) = events.try_recv() {
+        phases.push((ev.phase, ev.code));
+    }
+    assert_eq!(
+        phases.first().map(|p| p.0),
+        Some(ModelDownloadPhase::Starting)
+    );
+    let (phase, code) = phases.last().cloned().expect("terminal event");
+    assert_eq!(phase, ModelDownloadPhase::Failed);
+    assert_eq!(code.as_deref(), Some("cancelled"));
+
+    // The slot is free again — a fresh download proceeds.
+    let ok = ParkedFetcher {
+        release: tokio::sync::Mutex::new(None),
+    };
+    higgs
+        .model_download_with("acme/m", "m.gguf", root.path(), &ok, &ok)
+        .await
+        .expect("slot released after cancellation");
+}

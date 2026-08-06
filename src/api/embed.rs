@@ -302,6 +302,302 @@ impl Higgs {
             .ok_or_else(|| HiggsError::ModelNotFound { id: id.to_owned() })
     }
 
+    // ── MSx: model-search catalog ──────────────────────────────────────────
+
+    /// Search the Hugging Face model catalog (GGUF repos only) — the Model
+    /// Search tab's query op; an empty query is the browse page (the Hub's
+    /// full GGUF listing in the requested order). On-click only: no cache, no
+    /// timer, no background refresh. Every row's `downloaded` flag comes from
+    /// ONE local scan snapshot taken for this call; row fit estimates use the
+    /// cached hardware sample's VRAM total, exactly like
+    /// [`model_detail`](Self::model_detail).
+    pub async fn model_search(
+        &self,
+        q: &crate::catalog::CatalogQuery,
+    ) -> Result<crate::catalog::CatalogSearchResponse, HiggsError> {
+        let inv = self.catalog_inventory().await;
+        let hw = self.hardware().await;
+        let vram = (hw.vram_total_bytes > 0).then_some(hw.vram_total_bytes);
+        crate::catalog::service::search(&crate::catalog::HfSource, q, &inv, vram).await
+    }
+
+    /// One repo's full catalog detail: README, quant rows with sizes and
+    /// size-based fit verdicts, and more-by-author. Fit uses the cached
+    /// hardware sample's VRAM total; a machine reporting no VRAM gets size
+    /// rows without verdicts (never a fake one).
+    pub async fn model_detail(
+        &self,
+        repo: &str,
+    ) -> Result<crate::catalog::CatalogModelDetail, HiggsError> {
+        let inv = self.catalog_inventory().await;
+        let hw = self.hardware().await;
+        let vram = (hw.vram_total_bytes > 0).then_some(hw.vram_total_bytes);
+        crate::catalog::service::detail(&crate::catalog::HfSource, repo, &inv, vram).await
+    }
+
+    /// Download one catalog quant into `~/.higgs/models/` (a default scan
+    /// root, so the next scan lists it), emitting live
+    /// [`crate::catalog::ModelDownloadEvent`]s over
+    /// [`subscribe_download_events`](Self::subscribe_download_events):
+    /// `Starting` → throttled `Downloading` → terminal `Done`/`Failed`.
+    /// Returns the final on-disk path.
+    pub async fn model_download(
+        &self,
+        repo: &str,
+        file: &str,
+    ) -> Result<std::path::PathBuf, HiggsError> {
+        let root = match crate::download::models_dir() {
+            Ok(root) => root,
+            Err(e) => {
+                let err = HiggsError::HubFileWrite {
+                    repo: repo.to_owned(),
+                    file: file.to_owned(),
+                    detail: format!("models dir: {e}"),
+                };
+                // The event contract (Starting → terminal) holds even for the
+                // destination-root preflight: a subscriber must never be left
+                // with a download that silently went nowhere.
+                use crate::catalog::wire::{ModelDownloadEvent, ModelDownloadPhase};
+                let base = |phase: ModelDownloadPhase, code: Option<String>| ModelDownloadEvent {
+                    node: None,
+                    repo: repo.to_owned(),
+                    file: file.to_owned(),
+                    phase,
+                    downloaded_bytes: 0,
+                    total_bytes: None,
+                    at_ms: 0,
+                    code,
+                    path: None,
+                };
+                self.emit_download_event(base(ModelDownloadPhase::Starting, None));
+                self.emit_download_event(base(
+                    ModelDownloadPhase::Failed,
+                    miette::Diagnostic::code(&err).map(|c| c.to_string()),
+                ));
+                return Err(err);
+            }
+        };
+        self.model_download_with(
+            repo,
+            file,
+            &root,
+            &crate::hub::HubFetcher,
+            &crate::download::HttpFetcher,
+        )
+        .await
+    }
+
+    /// Download one catalog quant ON a fleet node (`M_NODE_PULL`): the node
+    /// fetches the file from the Hub ITSELF (its own endpoint + fallback,
+    /// atomic into its `~/.higgs/models`) — only progress crosses the fleet.
+    /// Emits the SAME [`crate::catalog::ModelDownloadEvent`] stream as a local
+    /// download, tagged `node: Some(..)`; returns the node-side path. One
+    /// in-flight transfer per `(node, repo, file)`; requires the hub enabled;
+    /// a pre-pull-capable node surfaces HG026, a mid-pull disconnect HG027 —
+    /// both as the terminal `Failed` event AND the returned error.
+    pub async fn model_download_on(
+        &self,
+        node: &str,
+        repo: &str,
+        file: &str,
+    ) -> Result<String, HiggsError> {
+        use crate::catalog::wire::{ModelDownloadEvent, ModelDownloadPhase};
+        if self.hub().is_none() {
+            return Err(not_a_hub_error(&format!("models/download on {node}")));
+        }
+        let fleet = self
+            .fleet()
+            .ok_or_else(|| not_a_hub_error(&format!("models/download on {node}")))?;
+        let _in_flight = InFlightDownload::claim(self, Some(node), repo, file)?;
+        // `at_ms` is stamped by `emit_download_event`.
+        let base = |phase: ModelDownloadPhase| ModelDownloadEvent {
+            node: Some(node.to_owned()),
+            repo: repo.to_owned(),
+            file: file.to_owned(),
+            phase,
+            downloaded_bytes: 0,
+            total_bytes: None,
+            at_ms: 0,
+            code: None,
+            path: None,
+        };
+        self.emit_download_event(base(ModelDownloadPhase::Starting));
+        let mut term = DownloadTerminalGuard {
+            higgs: self,
+            node: Some(node.to_owned()),
+            repo: repo.to_owned(),
+            file: file.to_owned(),
+            armed: true,
+        };
+        // The node re-validates on arrival (`dest_path`); refusing the same
+        // shapes here keeps a bad request from ever opening a stream — but only
+        // AFTER `Starting`, so the slot-claimed event contract (Starting →
+        // terminal) holds exactly like the local path.
+        if let Err(e) = crate::download::dest_path(std::path::Path::new("."), repo, file) {
+            term.armed = false;
+            self.emit_download_event(ModelDownloadEvent {
+                code: miette::Diagnostic::code(&e).map(|c| c.to_string()),
+                ..base(ModelDownloadPhase::Failed)
+            });
+            return Err(e);
+        }
+        let mut gate =
+            crate::catalog::pull::ProgressGate::new(crate::catalog::pull::DOWNLOAD_EVENT_INTERVAL);
+        let mut last = (0u64, None::<u64>);
+        let result = fleet
+            .pull_on_node(node, repo, file, &mut |downloaded, total| {
+                last = (downloaded, total);
+                if gate.should_emit(std::time::Instant::now()) {
+                    self.emit_download_event(ModelDownloadEvent {
+                        downloaded_bytes: downloaded,
+                        total_bytes: total,
+                        ..base(ModelDownloadPhase::Downloading)
+                    });
+                }
+            })
+            .await;
+        term.armed = false; // a real terminal follows — the guard must not also fire
+        match result {
+            Ok(reply) => {
+                let path = reply
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                self.emit_download_event(ModelDownloadEvent {
+                    downloaded_bytes: last.0,
+                    total_bytes: last.1,
+                    path: Some(path.clone()),
+                    ..base(ModelDownloadPhase::Done)
+                });
+                Ok(path)
+            }
+            Err(e) => {
+                // The node's ORIGIN code (e.g. HG036) is the actionable one;
+                // HG009 is only the relay envelope. Same preference the OOM
+                // classifier applies to relayed worker errors.
+                let code = match &e {
+                    HiggsError::WorkerRpc {
+                        worker_code: Some(c),
+                        ..
+                    } => Some(c.clone()),
+                    other => miette::Diagnostic::code(other).map(|c| c.to_string()),
+                };
+                self.emit_download_event(ModelDownloadEvent {
+                    downloaded_bytes: last.0,
+                    total_bytes: last.1,
+                    code,
+                    ..base(ModelDownloadPhase::Failed)
+                });
+                Err(e)
+            }
+        }
+    }
+
+    /// [`model_download`](Self::model_download) with the destination root and
+    /// both fetchers injected — the test seam (production always passes the
+    /// hub-client primary + `reqwest` fallback into the real models dir).
+    pub(crate) async fn model_download_with<P, F>(
+        &self,
+        repo: &str,
+        file: &str,
+        root: &std::path::Path,
+        primary: &P,
+        fallback: &F,
+    ) -> Result<std::path::PathBuf, HiggsError>
+    where
+        P: crate::download::Fetcher + Sync,
+        F: crate::download::Fetcher + Sync,
+    {
+        use crate::catalog::wire::{ModelDownloadEvent, ModelDownloadPhase};
+        // One in-flight download per (repo, file): a concurrent duplicate is
+        // refused BEFORE any event is emitted, so subscribers never see two
+        // interleaved streams for the same file and a multi-GB transfer never
+        // runs twice. The claim releases on every exit path (Drop).
+        let _in_flight = InFlightDownload::claim(self, None, repo, file)?;
+        // `at_ms` is stamped by `emit_download_event`.
+        let base = |phase: ModelDownloadPhase| ModelDownloadEvent {
+            node: None,
+            repo: repo.to_owned(),
+            file: file.to_owned(),
+            phase,
+            downloaded_bytes: 0,
+            total_bytes: None,
+            at_ms: 0,
+            code: None,
+            path: None,
+        };
+        self.emit_download_event(base(ModelDownloadPhase::Starting));
+        let mut term = DownloadTerminalGuard {
+            higgs: self,
+            node: None,
+            repo: repo.to_owned(),
+            file: file.to_owned(),
+            armed: true,
+        };
+        let mut gate =
+            crate::catalog::pull::ProgressGate::new(crate::catalog::pull::DOWNLOAD_EVENT_INTERVAL);
+        let mut last = (0u64, None::<u64>);
+        let result = crate::catalog::pull::pull_with(
+            repo,
+            file,
+            root,
+            primary,
+            fallback,
+            &mut |downloaded, total| {
+                last = (downloaded, total);
+                if gate.should_emit(std::time::Instant::now()) {
+                    self.emit_download_event(ModelDownloadEvent {
+                        downloaded_bytes: downloaded,
+                        total_bytes: total,
+                        ..base(ModelDownloadPhase::Downloading)
+                    });
+                }
+            },
+        )
+        .await;
+        term.armed = false; // a real terminal follows — the guard must not also fire
+        match &result {
+            Ok(path) => self.emit_download_event(ModelDownloadEvent {
+                downloaded_bytes: last.0,
+                total_bytes: last.1,
+                path: Some(path.display().to_string()),
+                ..base(ModelDownloadPhase::Done)
+            }),
+            Err(e) => self.emit_download_event(ModelDownloadEvent {
+                downloaded_bytes: last.0,
+                total_bytes: last.1,
+                code: miette::Diagnostic::code(e).map(|c| c.to_string()),
+                ..base(ModelDownloadPhase::Failed)
+            }),
+        }
+        result
+    }
+
+    /// The local downloaded-state snapshot for catalog rows: every scanned
+    /// model's repo id + file name, from ONE scan. A scan failure reads as an
+    /// empty inventory (rows show as not downloaded) rather than failing the
+    /// catalog op — discovery must keep working when a scan dir is sick.
+    pub(crate) async fn catalog_inventory(&self) -> crate::catalog::LocalInventory {
+        let mut inv = crate::catalog::LocalInventory::empty();
+        match self.scan().await {
+            Ok(models) => {
+                for m in &models {
+                    if let Some(name) = std::path::Path::new(&m.path)
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                    {
+                        inv.insert(&m.id, name);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "higgs: catalog inventory scan failed; rows show as not downloaded");
+            }
+        }
+        inv
+    }
+
     // ── A1.2: hub lifecycle + node ops ─────────────────────────────────────
 
     /// Turn the hub network ON (the kill switch) — formerly the `POST
@@ -425,7 +721,29 @@ impl Higgs {
                     p.id = model.to_owned();
                     p
                 });
-                fleet.load(node, model, wire).await
+                // Remote loads mirror into the log stream like local phases
+                // and downloads do — there is no push channel for a node's
+                // load progress, so the start/outcome lines ARE the record.
+                tracing::info!(node = %node, model = %model, "higgs: node load requested");
+                let started = std::time::Instant::now();
+                let res = fleet.load(node, model, wire).await;
+                match &res {
+                    Ok(worker) => tracing::info!(
+                        node = %node,
+                        model = %model,
+                        worker_id = worker.0,
+                        elapsed_secs = started.elapsed().as_secs(),
+                        "higgs: node load done — model resident on the node"
+                    ),
+                    Err(e) => tracing::warn!(
+                        node = %node,
+                        model = %model,
+                        elapsed_secs = started.elapsed().as_secs(),
+                        error = %e,
+                        "higgs: node load FAILED"
+                    ),
+                }
+                res
             }
             None => Err(not_a_hub_error("nodes/load")),
         }
@@ -1400,6 +1718,73 @@ pub(crate) fn fit_generation_budget(
             let budget = requested.unwrap_or(available);
             Ok(budget.min(available).min(max_out).max(1))
         }
+    }
+}
+
+/// Emits the terminal `Failed { code: "cancelled" }` download event if the
+/// op future is DROPPED between `Starting` and its natural terminal — the
+/// bridge's cancel (or any caller drop) aborts the future, and without this
+/// the Starting→terminal event contract would break exactly there. The same
+/// seam the load path covers with its `TerminalGuard`. Disarmed right before
+/// the normal terminal emit.
+struct DownloadTerminalGuard<'a> {
+    higgs: &'a Higgs,
+    node: Option<String>,
+    repo: String,
+    file: String,
+    armed: bool,
+}
+
+impl Drop for DownloadTerminalGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.higgs
+            .emit_download_event(crate::catalog::wire::ModelDownloadEvent {
+                node: self.node.clone(),
+                repo: self.repo.clone(),
+                file: self.file.clone(),
+                phase: crate::catalog::wire::ModelDownloadPhase::Failed,
+                downloaded_bytes: 0,
+                total_bytes: None,
+                at_ms: 0,
+                code: Some("cancelled".to_owned()),
+                path: None,
+            });
+    }
+}
+
+/// RAII claim on the per-`(repo, file)` catalog-download slot
+/// (`Higgs::downloads_in_flight`): claiming an occupied slot is refused, and
+/// the slot frees on Drop — every exit path of the download included.
+struct InFlightDownload<'a> {
+    higgs: &'a Higgs,
+    key: (Option<String>, String, String),
+}
+
+impl<'a> InFlightDownload<'a> {
+    fn claim(
+        higgs: &'a Higgs,
+        node: Option<&str>,
+        repo: &str,
+        file: &str,
+    ) -> Result<Self, HiggsError> {
+        let key = (node.map(str::to_owned), repo.to_owned(), file.to_owned());
+        if !higgs.downloads_in_flight.lock().insert(key.clone()) {
+            return Err(HiggsError::DownloadFailed {
+                repo: repo.to_owned(),
+                file: file.to_owned(),
+                detail: "already downloading — one transfer per file at a time".to_owned(),
+            });
+        }
+        Ok(Self { higgs, key })
+    }
+}
+
+impl Drop for InFlightDownload<'_> {
+    fn drop(&mut self) {
+        self.higgs.downloads_in_flight.lock().remove(&self.key);
     }
 }
 

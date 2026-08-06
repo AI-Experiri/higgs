@@ -59,6 +59,7 @@ cd "$(dirname "$0")/.."
 exec cargo llvm-cov \
   --test auth \
   --test autotune \
+  --test catalog \
   --test chat_fleet \
   --test config_persistence \
   --test control_api \
@@ -89,6 +90,7 @@ exec cargo llvm-cov \
   --test reasoning_v1 \
   --test rebind \
   --test remote_cli \
+  --test remote_download \
   --test remote_hub_e2e \
   --test remote_load_params \
   --test remote_node_e2e \
