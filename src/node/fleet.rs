@@ -1875,6 +1875,27 @@ impl HubFleet {
         }
     }
 
+    /// Trigger a catalog download ON `node` (`M_NODE_PULL` sender): the node
+    /// fetches `repo`/`file` from the Hub itself and streams progress back to
+    /// `on_progress`; the result is the node-side `{ path }`. Mirrors
+    /// [`scan_node`](Self::scan_node) route-wise (a data op, no epoch/route
+    /// mutation); a dead transport maps to HG027 (and drops) via
+    /// [`handle_op_error`](Self::handle_op_error). A pre-P4b node without the
+    /// handler answers method-unknown (HG026) — surfaced verbatim.
+    pub async fn pull_on_node(
+        &self,
+        node: &str,
+        repo: &str,
+        file: &str,
+        on_progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
+    ) -> Result<Value, HiggsError> {
+        let transport = self.transport(node).await?;
+        match transport.pull(repo, file, None, on_progress).await {
+            Ok(v) => Ok(v),
+            Err(e) => Err(self.handle_op_error(node, &transport, e).await),
+        }
+    }
+
     /// The self-update push targets (REL-P4e): one descriptor per CURRENTLY-CONNECTED node,
     /// carrying the build identity + capability it advertised. The courier (`Higgs::fleet_update`)
     /// resolves a per-node manifest URL from each OFF the actor.

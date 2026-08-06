@@ -108,3 +108,61 @@ async fn chat_streams_chunks_then_final() {
     assert_eq!(got.concat(), "hello", "streamed chunks");
     assert_eq!(final_res["content"], "hello");
 }
+
+// ── pull_read_loop (RD1: the M_NODE_PULL demux + stall deadline) ───────────
+
+/// Write `frames` into a duplex, return the read half wrapped for the loop.
+fn pull_reader(frames: &[&str]) -> tokio::io::BufReader<tokio::io::DuplexStream> {
+    let (mut tx, rx) = tokio::io::duplex(64 * 1024);
+    let payload = frames.iter().map(|f| format!("{f}\n")).collect::<String>();
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        let _ = tx.write_all(payload.as_bytes()).await;
+        // Dropping tx closes the stream (EOF after the written frames).
+    });
+    tokio::io::BufReader::new(rx)
+}
+
+#[tokio::test]
+async fn pull_loop_demuxes_progress_then_final_result() {
+    let reader = pull_reader(&[
+        r#"{"jsonrpc":"2.0","method":"higgs/node/progress","params":{"request_id":1,"downloaded":5,"total":10}}"#,
+        r#"{"jsonrpc":"2.0","method":"higgs/node/progress","params":{"request_id":1,"downloaded":10,"total":10}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"result":{"path":"/n/models/a/b/f.gguf"}}"#,
+    ]);
+    let mut seen: Vec<(u64, Option<u64>)> = Vec::new();
+    let out = pull_read_loop(reader, &mut |d, t| seen.push((d, t)), PULL_STALL_TIMEOUT)
+        .await
+        .expect("final result");
+    assert_eq!(out["path"], "/n/models/a/b/f.gguf");
+    assert_eq!(seen, vec![(5, Some(10)), (10, Some(10))]);
+}
+
+#[tokio::test]
+async fn pull_loop_early_close_is_transport_dead() {
+    let reader = pull_reader(&[
+        r#"{"jsonrpc":"2.0","method":"higgs/node/progress","params":{"request_id":1,"downloaded":5}}"#,
+    ]);
+    let err = pull_read_loop(reader, &mut |_, _| {}, PULL_STALL_TIMEOUT)
+        .await
+        .expect_err("closed before final");
+    assert!(err.to_string().contains("before final"), "{err}");
+}
+
+/// A connection that stays OPEN but application-silent must fail at the stall
+/// deadline instead of holding the pull (and its in-flight slot) forever —
+/// iroh keep-alives keep QUIC alive, so only this deadline bounds it. The
+/// paused clock auto-advances, so the 120s deadline fires instantly here.
+#[tokio::test(start_paused = true)]
+async fn pull_loop_application_silence_hits_the_stall_deadline() {
+    let (_tx, rx) = tokio::io::duplex(1024); // writer held open, never writes
+    let reader = tokio::io::BufReader::new(rx);
+    let err = tokio::time::timeout(
+        std::time::Duration::from_secs(3600),
+        pull_read_loop(reader, &mut |_, _| {}, PULL_STALL_TIMEOUT),
+    )
+    .await
+    .expect("stall deadline must bound the silent stream")
+    .expect_err("stalled");
+    assert!(err.to_string().contains("stalled"), "{err}");
+}
