@@ -102,7 +102,7 @@ pub fn dest_path(models_root: &Path, repo: &str, file: &str) -> Result<PathBuf, 
 /// URL-reserved character (`#`, `?`, `%`, `:`, space, …) so a segment is BOTH a valid local
 /// filename and a literal URL path component (no percent-encoding needed, no fragment/query
 /// injection into the resolve URL).
-fn is_safe_segment(s: &str) -> bool {
+pub(crate) fn is_safe_segment(s: &str) -> bool {
     !s.is_empty()
         && s != "."
         && s != ".."
