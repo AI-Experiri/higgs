@@ -2926,3 +2926,62 @@ async fn a_remote_route_does_not_resurrect_a_local_non_chat_id() {
         "a same-id remote route must not resurrect the locally-refused id"
     );
 }
+
+// --- offline_help: platform-specific troubleshooting for a disconnected node ---
+
+#[test]
+fn offline_help_macos_mentions_local_network_permission() {
+    let lines = offline_help(Some("macos"), None);
+    let joined = lines.join("\n");
+    assert!(
+        joined.contains("Local Network"),
+        "a macOS node's offline help must name the Local Network permission: {joined}"
+    );
+    assert!(
+        joined.contains("System Settings"),
+        "must give the exact settings path: {joined}"
+    );
+    assert!(
+        joined.contains("~/.higgs/bin/current/higgs"),
+        "must give the GUI-Terminal fallback command: {joined}"
+    );
+}
+
+#[test]
+fn offline_help_infers_macos_from_the_target_triple() {
+    let lines = offline_help(None, Some("aarch64-apple-darwin"));
+    assert!(
+        lines.join("\n").contains("Local Network"),
+        "an apple-darwin target with no inventory still gets the macOS hint"
+    );
+}
+
+#[test]
+fn offline_help_linux_has_no_macos_steps_but_still_helps() {
+    let lines = offline_help(Some("linux"), Some("x86_64-unknown-linux-gnu"));
+    let joined = lines.join("\n");
+    assert!(
+        !joined.contains("Local Network"),
+        "no macOS-only advice on linux: {joined}"
+    );
+    assert!(!lines.is_empty(), "linux nodes still get generic guidance");
+}
+
+#[test]
+fn offline_help_unknown_platform_gets_generic_guidance_only() {
+    let lines = offline_help(None, None);
+    let joined = lines.join("\n");
+    assert!(!lines.is_empty());
+    assert!(!joined.contains("Local Network"));
+}
+
+#[test]
+fn offline_help_unrecognized_os_still_consults_the_target_triple() {
+    // An os string that is neither "macos" nor a known non-mac value must not
+    // suppress the triple fallback — the build target is authoritative.
+    let lines = offline_help(Some("darwin"), Some("aarch64-apple-darwin"));
+    assert!(
+        lines.join("\n").contains("Local Network"),
+        "an apple-darwin build with an aliased os string still gets the macOS hint"
+    );
+}
