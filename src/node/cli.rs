@@ -2593,6 +2593,20 @@ fn run_node_leave(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// The full `source()` chain of an error, ` → `-joined. The reconnect log
+/// must say WHY a dial failed — the top-level message alone ("timed out")
+/// hides the actionable cause underneath.
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut cur = e.source();
+    while let Some(cause) = cur {
+        out.push_str(" → ");
+        out.push_str(&cause.to_string());
+        cur = cause.source();
+    }
+    out
+}
+
 fn run_node_connect(args: &[String]) -> Result<()> {
     let ticket_str = args
         .first()
@@ -3481,6 +3495,10 @@ fn run_node_daemon_body(args: &[String], confirm_bin: &Option<std::path::PathBuf
         let shutdown_cause = {
             let shutdown = crate::node::self_update::await_node_shutdown(operator.as_mut());
             tokio::pin!(shutdown);
+            // Consecutive redial failures — drives the periodic what-to-check
+            // block below so an operator tailing node.log REMOTELY sees the
+            // likely fix, not just a wall of identical timeouts.
+            let mut connect_failures: u64 = 0;
             'serve: loop {
                 // First iteration after a foreground pairing: serve the ALREADY-admitted
                 // connection instead of redialing (see the pairing block above).
@@ -3512,6 +3530,7 @@ fn run_node_daemon_body(args: &[String], confirm_bin: &Option<std::path::PathBuf
                     match res {
                         Ok((conn, hello)) => {
                             token = None; // admitted — token burned hub-side; don't resend it
+                            connect_failures = 0;
                             if !saved {
                                 saved = true;
                                 persist_hub(&cfg_path, &hello, &ticket_str);
@@ -3542,7 +3561,37 @@ fn run_node_daemon_body(args: &[String], confirm_bin: &Option<std::path::PathBuf
                                 }
                             }
                         }
-                        Err(e) => eprintln!("higgs node: connect failed: {e}"),
+                        Err(e) => {
+                            connect_failures += 1;
+                            // The FULL cause chain — the top-level line alone
+                            // ("timed out") says nothing an operator can act on.
+                            eprintln!(
+                                "higgs node: connect failed (attempt {connect_failures}): {}",
+                                error_chain(&e)
+                            );
+                            // Roughly once a minute of failures, say what to
+                            // CHECK — the operator tailing this log is usually
+                            // remote and cannot see this machine's screen.
+                            if connect_failures == 3 || connect_failures.is_multiple_of(20) {
+                                eprintln!(
+                                    "higgs node: still unreachable after {connect_failures} attempts — check:"
+                                );
+                                #[cfg(target_os = "macos")]
+                                eprintln!(
+                                    "  • {}",
+                                    crate::node::fleet::macos_lna_advice(
+                                        "On THIS machine's own screen (not SSH)"
+                                    )
+                                );
+                                eprintln!(
+                                    "  • the hub must be up and reachable (its Fleet tab shows \
+                                     'Hub active')"
+                                );
+                                eprintln!(
+                                    "  • full checklist: docs/pairing-preflight-checklist.md"
+                                );
+                            }
+                        }
                     }
                 }
             }

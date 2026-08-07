@@ -1186,3 +1186,32 @@ fn refuse_writable_ancestry_strict_inside_prefix_sticky_ok_above() {
     );
     std::fs::set_permissions(&drop, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
+
+// --- error_chain: full cause chain, no duplicated adjacent segments ---
+
+#[test]
+fn error_chain_walks_sources_and_dedupes_identical_adjacent_segments() {
+    // io::Error::other delegates Display to the inner error AND returns it from
+    // source() — a naive walk would print the same message twice at the top.
+    let inner = std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out");
+    let wrapped = std::io::Error::other(inner);
+    assert_eq!(error_chain(&wrapped), "timed out");
+
+    #[derive(Debug)]
+    struct Outer(std::io::Error);
+    impl std::fmt::Display for Outer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "dial failed")
+        }
+    }
+    impl std::error::Error for Outer {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+    let chained = Outer(std::io::Error::other(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "timed out",
+    )));
+    assert_eq!(error_chain(&chained), "dial failed → timed out");
+}

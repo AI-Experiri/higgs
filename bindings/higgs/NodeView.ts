@@ -74,4 +74,13 @@ variant?: string,
  * configured `release_url`. `false` for a legacy node, a disconnected node's stale card,
  * and the local card (which is updated locally, not pushed).
  */
-update_by_version: boolean, };
+update_by_version: boolean, 
+/**
+ * Operator troubleshooting steps for a DISCONNECTED node, computed hub-side from the
+ * platform the node last reported (inventory `os`, else the HELLO target triple) — e.g.
+ * the macOS Local Network permission is per-binary and a self-update installs a new
+ * binary, so an updated Mac node can be silently blocked. The UI renders these lines
+ * verbatim; higgs owns the content so clients never hardcode platform advice. Always
+ * empty for a connected node or the local card.
+ */
+offline_help?: Array<string>, };

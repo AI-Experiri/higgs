@@ -148,7 +148,63 @@ pub struct NodeView {
     /// and the local card (which is updated locally, not pushed).
     #[serde(default)]
     pub update_by_version: bool,
+    /// Operator troubleshooting steps for a DISCONNECTED node, computed hub-side from the
+    /// platform the node last reported (inventory `os`, else the HELLO target triple) — e.g.
+    /// the macOS Local Network permission is per-binary and a self-update installs a new
+    /// binary, so an updated Mac node can be silently blocked. The UI renders these lines
+    /// verbatim; higgs owns the content so clients never hardcode platform advice. Always
+    /// empty for a connected node or the local card.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub offline_help: Vec<String>,
 }
+}
+
+/// The macOS Local-Network advice, shared by the node's own reconnect-loop log
+/// (src/node/cli.rs) and the hub's [`offline_help`] so the two never diverge —
+/// only the `where` clause differs by audience ("On THIS machine's own screen"
+/// node-side vs "On the node machine's own screen" hub-side).
+pub(crate) fn macos_lna_advice(where_clause: &str) -> String {
+    format!(
+        "macOS Local Network permission is PER-BINARY, and a self-update installs a NEW binary \
+         — macOS may be silently blocking it. {where_clause}: System Settings → Privacy & \
+         Security → Local Network → allow 'higgs'. If it is not listed, run \
+         '~/.higgs/bin/current/higgs --node' once from a GUI Terminal so the permission prompt \
+         appears, then restart the service."
+    )
+}
+
+/// Troubleshooting lines for a node that will not (re)connect, keyed off the platform it
+/// last reported: `os` from its cached inventory (`"macos"`/`"linux"`), falling back to the
+/// HELLO build-target triple. Pure so it unit-tests without a live fleet. Accepted residual:
+/// the platform facts are the DISCONNECTED node's cached ones — a machine physically swapped
+/// for a different-OS box under the same identity would show the old platform's advice until
+/// it reconnects or is retired (self-correcting: any reconnect empties the field).
+pub(crate) fn offline_help(os: Option<&str>, target: Option<&str>) -> Vec<String> {
+    // macOS if the node said so, else infer from the build-target triple — consulted
+    // whenever the os string is not affirmatively a non-mac platform (an aliased or
+    // future os value must not suppress the authoritative triple).
+    let affirmatively_non_mac =
+        os.is_some_and(|o| matches!(o.to_ascii_lowercase().as_str(), "linux" | "freebsd"));
+    let macos = os.is_some_and(|o| o.eq_ignore_ascii_case("macos"))
+        || (!affirmatively_non_mac && target.is_some_and(|t| t.contains("apple-darwin")));
+    let mut lines = Vec::new();
+    if macos {
+        lines.push(macos_lna_advice(
+            "On the node machine's own screen (not SSH)",
+        ));
+    }
+    lines.push(
+        "On the node machine, check the service is running and read its log: \
+         ~/.higgs/logs/node.log — each failed dial logs its cause."
+            .to_owned(),
+    );
+    lines.push(
+        "The hub must be up and reachable from the node's network (this Fleet tab being open \
+         means the hub side is active)."
+            .to_owned(),
+    );
+    lines.push("Full checklist: docs/pairing-preflight-checklist.md in the higgs repo.".to_owned());
+    lines
 }
 
 /// One CONNECTED node's self-update push descriptor (REL-P4e), as the release courier
@@ -846,11 +902,19 @@ impl FleetActor {
                             }
                             inv
                         });
+                let connected = self.nodes.contains_key(&endpoint_id);
                 NodeView {
                     node_id: node_id.0,
-                    connected: self.nodes.contains_key(&endpoint_id),
-                    update_by_version: self.nodes.contains_key(&endpoint_id)
-                        && self.version_capable.contains(&endpoint_id),
+                    connected,
+                    offline_help: if connected {
+                        Vec::new()
+                    } else {
+                        offline_help(
+                            inventory.as_ref().map(|i| i.os.as_str()),
+                            self.targets.get(&endpoint_id).map(String::as_str),
+                        )
+                    },
+                    update_by_version: connected && self.version_capable.contains(&endpoint_id),
                     // The fleet only tracks remote nodes; the local node is prepended by the serve
                     // layer. `label` is filled there from the allowlist (live, rename-aware).
                     is_local: false,
