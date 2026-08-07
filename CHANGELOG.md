@@ -19,7 +19,31 @@ from it.
 
 ## [Unreleased]
 
+## [0.1.0-beta.4] - 2026-08-06
+
+### Added
+
+- **Node connect diagnostics**: each failed hub dial now logs the FULL error
+  cause chain plus an attempt counter, and roughly once a minute a "still
+  unreachable — check:" block — on macOS including the Local Network
+  permission recovery steps (the permission is per-binary, so a self-update
+  can silently lose it). The hub serves the same platform-specific steps to
+  the UI via a new `NodeView.offline_help` field, rendered on offline Fleet
+  cards — nothing platform-specific is hardcoded client-side.
+
 ## [0.1.0-beta.3] - 2026-08-05
+
+### Added
+
+- **HF model-search catalog** (`catalog` module + jigglebot Model Search UI):
+  browse mode (empty query → most-downloaded compatible GGUF repos), sort
+  (downloads/likes/updated/trending), "fits this machine" filter with a
+  per-quant-family footprint estimate (I-quant-aware), background real-size
+  fallback when the Hub omits sizes, shard-aware default-quant preselect, and
+  local + remote (fleet-node) downloads with full lifecycle logging on both
+  the hub and node (`pull requested/starting/progress/done|FAILED` with
+  repo/file/bytes/elapsed). Model-load phases are logged too, and the Servers
+  tab shows every loaded model fleet-wide (remote worker pills + eject).
 
 ## [0.1.0-beta.2] - 2026-08-03
 
