@@ -5,7 +5,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use ggus::{GGuf, GGufMetaMapExt};
+use gguf_rs_lib::format::metadata::Metadata;
 use memmap2::MmapOptions;
 use serde::{Deserialize, Serialize};
 
@@ -298,16 +298,15 @@ fn enrich_gguf_metadata(model: &mut HiggsModel) {
             return;
         }
     };
-    // ggus 0.5.1 PANICS (not errors) on inputs it dislikes: `GGuf::new` slices
-    // out of range on a TRUNCATED file (a model mid-download in a watched
-    // LM-Studio dir) or a quant type whose block size it mis-sizes (observed:
-    // bartowski IQ4_XS), and its GETTERS unwrap internally (e.g.
-    // `llm_context_length()` unwraps `general_architecture()` — a GGUF without
-    // `general.architecture` panics). A single such file must not crash the
-    // whole scan, so the ENTIRE enrichment is unwind-caught; the model stays
-    // cataloged with whatever fields were set before the panic. ggus types are
-    // not UnwindSafe (interior refs), which AssertUnwindSafe waives — sound
-    // here because the closure only writes plain field values into `model`.
+    // The parser (`gguf-rs-lib`) returns ERRORS on malformed/truncated input and
+    // unknown tensor types — unlike the previous `ggus` dependency, whose
+    // `todo!()`/internal unwraps PANICKED on a truncated file (a model
+    // mid-download in a watched LM-Studio dir) or a quant it didn't know
+    // (observed: bartowski IQ4_XS block sizing; gpt-oss MXFP4). The unwind
+    // guard is KEPT as defense-in-depth anyway: a single bad file must never
+    // crash the whole scan, whatever a future parser version does. The closure
+    // only writes plain field values into `model`, so AssertUnwindSafe is
+    // sound.
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         enrich_from_gguf(model, &mmap);
     }));
@@ -323,43 +322,94 @@ fn enrich_gguf_metadata(model: &mut HiggsModel) {
     }
 }
 
-/// The panicky part of [`enrich_gguf_metadata`]: every `ggus` call lives here,
-/// inside the caller's `catch_unwind`.
+/// Typed key reads over the parsed GGUF metadata map. Unsigned reads also accept
+/// a non-negative SIGNED value — GGUF writers disagree on int width/signedness
+/// for the same semantic key, and a `pooling_type` written as `i32 3` must not
+/// read as absent.
+fn meta_str<'m>(meta: &'m Metadata, key: &str) -> Option<&'m str> {
+    meta.get(key).and_then(|v| v.as_str())
+}
+fn meta_u64(meta: &Metadata, key: &str) -> Option<u64> {
+    let v = meta.get(key)?;
+    v.as_u64()
+        .or_else(|| v.as_i64().and_then(|n| u64::try_from(n).ok()))
+}
+fn meta_bool(meta: &Metadata, key: &str) -> Option<bool> {
+    meta.get(key)
+        .and_then(gguf_rs_lib::format::MetadataValue::as_bool)
+}
+
+/// The parse-and-extract part of [`enrich_gguf_metadata`], inside the caller's
+/// `catch_unwind`.
+/// Parses ONLY the header + metadata table — never the tensor descriptors.
+/// Enrichment consumes no tensor info, and the full `GGUFFileReader` errors on
+/// any tensor type its table doesn't know — which would throw away a perfectly
+/// readable metadata section for every FUTURE quant (the exact failure mode
+/// this port removed for MXFP4). Metadata sits directly after the header in
+/// the GGUF layout, so this is also the cheapest possible scan.
 fn enrich_from_gguf(model: &mut HiggsModel, mmap: &memmap2::Mmap) {
-    let Ok(gguf) = GGuf::new(mmap) else {
-        model.enrich_error = Some(enrich_err(&model.path, "malformed GGUF header"));
-        return;
+    use gguf_rs_lib::format::constants::{GGUF_MAX_METADATA_DECODED_SIZE, GGUF_MAX_METADATA_SIZE};
+    use gguf_rs_lib::format::header::GGUFHeader;
+
+    let mut cur = std::io::Cursor::new(&mmap[..]);
+    let header = match GGUFHeader::read_from(&mut cur).and_then(|h| {
+        h.validate_comprehensive()?;
+        Ok(h)
+    }) {
+        Ok(h) => h,
+        Err(e) => {
+            model.enrich_error = Some(enrich_err(
+                &model.path,
+                format!("malformed GGUF header: {e}"),
+            ));
+            return;
+        }
     };
-    let arch = gguf.general_architecture().ok().map(ToString::to_string);
+    // ACCEPTED RESIDUAL: this decodes EVERY metadata value — including large
+    // tokenizer arrays enrichment never reads — into an owned map per scan
+    // (bounded by the crate's 256MiB limits, transient), and it is ALL-OR-
+    // NOTHING: a malformed/oversized LATE value (a corrupt tokenizer array)
+    // fails the whole read, losing early scalars the old lazy reader could
+    // still surface as partial fields. The model stays cataloged either way
+    // (enrich_error explains the blanks). Regaining lazy/partial reads would
+    // mean hand-writing a KV skip-parser — exactly the maintenance burden
+    // this port removed.
+    let meta = &match Metadata::read_from_with_limits(
+        &mut cur,
+        header.metadata_kv_count,
+        GGUF_MAX_METADATA_SIZE,
+        GGUF_MAX_METADATA_DECODED_SIZE,
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            model.enrich_error = Some(enrich_err(
+                &model.path,
+                format!("malformed GGUF metadata: {e}"),
+            ));
+            return;
+        }
+    };
+    let version = header.version;
+    let arch = meta_str(meta, "general.architecture").map(ToString::to_string);
     model.arch = arch.clone();
-    // NOT ggus's `llm_context_length()` — it UNWRAPS `general_architecture()`
-    // internally, panicking on an arch-less GGUF and aborting the rest of the
-    // enrichment (the catch_unwind above turns that into partial fields).
-    // Read the arch-scoped key directly instead.
-    model.ctx_train = arch.as_deref().and_then(|a| {
-        gguf.get_usize(&format!("{a}.context_length"))
-            .ok()
-            .map(|n| n as u64)
-    });
+    model.ctx_train = arch
+        .as_deref()
+        .and_then(|a| meta_u64(meta, &format!("{a}.context_length")));
     // Typed tuning fields (arch-scoped). Read the GQA KV head count
     // (`attention.head_count_kv`) — the KV-cache size driver — NOT the query
     // `head_count`, which over-estimates KV by the GQA factor.
     if let Some(a) = arch.as_deref() {
-        let read_u32 = |suffix: &str| {
-            gguf.get_usize(&format!("{a}.{suffix}"))
-                .ok()
-                .map(|n| n as u32)
-        };
+        let read_u32 = |suffix: &str| meta_u64(meta, &format!("{a}.{suffix}")).map(|n| n as u32);
         model.block_count = read_u32("block_count");
         model.head_count = read_u32("attention.head_count");
         model.head_count_kv = read_u32("attention.head_count_kv");
         model.embedding_length = read_u32("embedding_length");
         model.expert_count = read_u32("expert_count");
-        model.domain = read_domain(&gguf, a);
+        model.domain = read_domain(meta, a);
     }
     // Read the embedded chat template once and derive capabilities from it
     // (the template is the GGUF's own declaration of how it talks).
-    let template = gguf.tokenizer_chat_template().ok();
+    let template = meta_str(meta, "tokenizer.chat_template");
     model.has_chat_template = template.is_some();
     if let Some(t) = template {
         // `supports_tools` means "higgs can serve tool calls for this model".
@@ -375,7 +425,7 @@ fn enrich_from_gguf(model: &mut HiggsModel, mmap: &memmap2::Mmap) {
         // Capture the template for the host-side Gate-2 parser sniff (not on the wire).
         model.chat_template = Some(t.to_string());
     }
-    model.gguf_components = curated_components(&gguf, arch.as_deref());
+    model.gguf_components = curated_components(version, meta, arch.as_deref());
 }
 
 /// Read the capability class ([`ModelDomain`]) out of the arch-scoped GGUF header.
@@ -400,19 +450,18 @@ fn enrich_from_gguf(model: &mut HiggsModel, mmap: &memmap2::Mmap) {
 /// non-generative conversion (a bert classifier, an MLM) lands here too. The refusal
 /// is what matters — none of them can autoregress — and the UI copy says
 /// "non-generative" rather than promising vectors (codex r3).
-fn read_domain(gguf: &GGuf, arch: &str) -> ModelDomain {
+fn read_domain(meta: &Metadata, arch: &str) -> ModelDomain {
     // llama.cpp's pooling enum: 0 NONE, 1 MEAN, 2 CLS, 3 LAST, 4 RANK. RANK is a
     // reranker's declaration (scores, not vectors) — its own domain, so a future
     // /v1/embeddings does not mistake it for an embedder.
-    const POOLING_RANK: usize = 4;
-    let pooling = gguf.get_usize(&format!("{arch}.pooling_type")).ok();
+    const POOLING_RANK: u64 = 4;
+    let pooling = meta_u64(meta, &format!("{arch}.pooling_type"));
     if pooling == Some(POOLING_RANK) {
         return ModelDomain::Reranker;
     }
     let pooled = pooling.is_some_and(|p| p != 0);
-    let bidirectional = gguf
-        .get_bool(&format!("{arch}.attention.causal"))
-        .is_ok_and(|causal| !causal);
+    let bidirectional =
+        meta_bool(meta, &format!("{arch}.attention.causal")).is_some_and(|causal| !causal);
     if pooled || bidirectional {
         ModelDomain::Embedding
     } else {
@@ -426,7 +475,7 @@ fn read_domain(gguf: &GGuf, arch: &str) -> ModelDomain {
 /// surfaced — giant arrays (token lists, merges) are deliberately skipped so the
 /// scan payload stays small. Missing keys are simply omitted. `arch` (when known)
 /// prefixes the architecture-scoped keys (`{arch}.context_length`, etc.).
-fn curated_components(gguf: &GGuf, arch: Option<&str>) -> Vec<GgufComponent> {
+fn curated_components(version: u32, meta: &Metadata, arch: Option<&str>) -> Vec<GgufComponent> {
     let mut out: Vec<GgufComponent> = Vec::new();
     let mut push = |key: &str, value: String| {
         out.push(GgufComponent {
@@ -436,44 +485,89 @@ fn curated_components(gguf: &GGuf, arch: Option<&str>) -> Vec<GgufComponent> {
     };
 
     // gguf container version (from the file header — not a metadata KV).
-    push("gguf.version", gguf.header.version.to_string());
+    push("gguf.version", version.to_string());
 
     // general.* — architecture and quantization shape.
-    if let Ok(v) = gguf.general_architecture() {
+    if let Some(v) = meta_str(meta, "general.architecture") {
         push("general.architecture", v.to_string());
     }
-    // general.file_type / general.filetype is the quant enum; render its name.
-    if let Ok(ft) = gguf.general_filetype() {
-        // GGufFileType has no name(); its Debug form is the canonical quant label
-        // (e.g. `MostlyQ4_K_M`).
-        push("general.file_type", format!("{ft:?}"));
+    // general.file_type is llama.cpp's LLAMA_FTYPE enum; render its quant name.
+    // BOTH spellings are read: the GGUF spec says `general.file_type`, but
+    // writers in the wild (and the previous `ggus` reader) also use/accept
+    // `general.filetype`.
+    if let Some(ft) =
+        meta_u64(meta, "general.file_type").or_else(|| meta_u64(meta, "general.filetype"))
+    {
+        push("general.file_type", file_type_label(ft));
     }
-    if let Ok(v) = gguf.general_quantization_version() {
+    if let Some(v) = meta_u64(meta, "general.quantization_version") {
         push("general.quantization_version", v.to_string());
     }
 
     // tokenizer.* — load-relevant tokenizer identity (scalars only).
-    if let Ok(v) = gguf.get_str("tokenizer.ggml.model") {
+    if let Some(v) = meta_str(meta, "tokenizer.ggml.model") {
         push("tokenizer.ggml.model", v.to_string());
     }
-    if let Ok(v) = gguf.get_str("tokenizer.ggml.pre") {
+    if let Some(v) = meta_str(meta, "tokenizer.ggml.pre") {
         push("tokenizer.ggml.pre", v.to_string());
     }
 
     // {arch}.* — architecture-scoped scalars that shape the load.
     if let Some(a) = arch {
-        if let Ok(v) = gguf.get_usize(&format!("{a}.context_length")) {
-            push(&format!("{a}.context_length"), v.to_string());
-        }
-        if let Ok(v) = gguf.get_usize(&format!("{a}.block_count")) {
-            push(&format!("{a}.block_count"), v.to_string());
-        }
-        if let Ok(v) = gguf.get_usize(&format!("{a}.attention.head_count")) {
-            push(&format!("{a}.attention.head_count"), v.to_string());
+        for suffix in ["context_length", "block_count", "attention.head_count"] {
+            let key = format!("{a}.{suffix}");
+            if let Some(v) = meta_u64(meta, &key) {
+                push(&key, v.to_string());
+            }
         }
     }
 
     out
+}
+
+/// Render llama.cpp's `LLAMA_FTYPE` id (the `general.file_type` metadata value)
+/// as its canonical quant name. UNKNOWN ids render as `ftype <n>` instead of
+/// being dropped or failing — a new quant must degrade to an odd label, never
+/// hide the field or break the scan (the ggus `todo!()` lesson). Table source:
+/// `llama.h` `llama_ftype` (through `MXFP4_MOE = 38` as of llama.cpp b6100).
+fn file_type_label(ft: u64) -> String {
+    match ft {
+        0 => "F32",
+        1 => "F16",
+        2 => "Q4_0",
+        3 => "Q4_1",
+        7 => "Q8_0",
+        8 => "Q5_0",
+        9 => "Q5_1",
+        10 => "Q2_K",
+        11 => "Q3_K_S",
+        12 => "Q3_K_M",
+        13 => "Q3_K_L",
+        14 => "Q4_K_S",
+        15 => "Q4_K_M",
+        16 => "Q5_K_S",
+        17 => "Q5_K_M",
+        18 => "Q6_K",
+        19 => "IQ2_XXS",
+        20 => "IQ2_XS",
+        21 => "Q2_K_S",
+        22 => "IQ3_XS",
+        23 => "IQ3_XXS",
+        24 => "IQ1_S",
+        25 => "IQ4_NL",
+        26 => "IQ3_S",
+        27 => "IQ3_M",
+        28 => "IQ2_S",
+        29 => "IQ2_M",
+        30 => "IQ4_XS",
+        31 => "IQ1_M",
+        32 => "BF16",
+        36 => "TQ1_0",
+        37 => "TQ2_0",
+        38 => "MXFP4_MOE",
+        n => return format!("ftype {n}"),
+    }
+    .to_string()
 }
 
 // ---------------------------------------------------------------------------

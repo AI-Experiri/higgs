@@ -1215,3 +1215,29 @@ fn error_chain_walks_sources_and_dedupes_identical_adjacent_segments() {
     )));
     assert_eq!(error_chain(&chained), "dial failed → timed out");
 }
+
+#[test]
+fn render_plan_notes_separates_quick_reference_from_prose() {
+    let style = crate::node::preflight::Style { enabled: false };
+    let notes = vec![
+        "logs:  /p/logs/node.log".to_string(),
+        "state: HIGGS_HOME=/p".to_string(),
+        "the unit file stays at /p/higgs-node.service — keep --prefix mounted at boot".to_string(),
+        "status: systemctl --user status higgs-node.service".to_string(),
+        "login-bound: the unit runs only while op has a session".to_string(),
+    ];
+    let out = render_plan_notes(&style, &notes);
+    // kv lines: aligned two-space-indented `key:` entries, content verbatim.
+    assert!(out.contains("  logs:   /p/logs/node.log"), "{out}");
+    assert!(out.contains("  state:  HIGGS_HOME=/p"), "{out}");
+    assert!(
+        out.contains("  status: systemctl --user status higgs-node.service"),
+        "{out}"
+    );
+    // prose lines: `! `-marked paragraphs, separated by a blank line.
+    assert!(out.contains("\n\n! the unit file stays at"), "{out}");
+    assert!(
+        out.contains("\n\n! login-bound: the unit runs only"),
+        "{out}"
+    );
+}

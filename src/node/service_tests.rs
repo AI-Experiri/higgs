@@ -1248,3 +1248,48 @@ fn agent_headless_hint_only_for_the_login_bound_agent() {
     assert_eq!(agent_headless_hint(ServiceKind::Launchd), "");
     assert_eq!(agent_headless_hint(ServiceKind::SystemdUser), "");
 }
+
+/// EVERY plan's quick-reference `key:` notes (logs/state/status/stop) must be
+/// CONTIGUOUS — before the first prose note — so cli.rs's `render_plan_notes`
+/// keeps them in one aligned block instead of orphaning keys after a paragraph.
+#[test]
+fn quick_reference_notes_precede_prose_in_every_plan() {
+    let home = Path::new("/home/op");
+    let higgs = Path::new("/home/op/.higgs");
+    let plans = [
+        (
+            "systemd",
+            plan_systemd_user(
+                "op",
+                home,
+                higgs,
+                higgs,
+                None,
+                &[],
+                ServiceScope::LoginBound,
+            ),
+        ),
+        (
+            "launchd-agent",
+            plan_launchd_agent(home, 501, higgs, higgs, None, &[]),
+        ),
+        (
+            "launchd-daemon",
+            plan_launchd("op", home, 501, higgs, higgs, None, &[]),
+        ),
+    ];
+    const KV_KEYS: &[&str] = &["logs", "state", "models", "config", "status", "stop"];
+    let is_kv = |n: &str| {
+        n.split_once(':')
+            .is_some_and(|(k, _)| KV_KEYS.contains(&k.trim()))
+    };
+    for (name, plan) in plans {
+        let first_prose = plan.notes.iter().position(|n| !is_kv(n)).unwrap();
+        assert!(
+            plan.notes[first_prose..].iter().all(|n| !is_kv(n)),
+            "{name}: a key: quick-reference note appears AFTER prose, splitting the aligned \
+             block: {:?}",
+            plan.notes
+        );
+    }
+}

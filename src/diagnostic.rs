@@ -761,9 +761,8 @@ pub enum HiggsError {
     LanBindWithoutAdminKey { bind: String },
 
     /// GGUF header enrichment FAILED for a scanned model — the file could not be
-    /// opened/mmapped, its header was malformed, or the `ggus` parse panicked (a
-    /// truncated file mid-download, an unsupported quant block size, or a header
-    /// missing `general.architecture`). The model is still cataloged with whatever
+    /// opened/mmapped, or its header failed to parse (a truncated file
+    /// mid-download, a malformed metadata table). The model is still cataloged with whatever
     /// partial fields were read before the failure; this code is stamped onto the
     /// model entry (`HiggsModel::enrich_error`) so the UI can explain the blank
     /// header fields instead of showing the model as genuinely sparse. Non-fatal —
