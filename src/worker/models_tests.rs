@@ -1334,3 +1334,86 @@ fn a_silent_header_stays_an_llm() {
     let models = store.scan(&[dir.path().to_path_buf()], &[], &[]).unwrap();
     assert_eq!(models[0].domain, ModelDomain::Llm);
 }
+
+/// The gpt-oss regression: a GGUF whose tensors are MXFP4 (ggml type 39) must
+/// enrich FULLY — arch, ctx_train, and NO `enrich_error`. The previous `ggus`
+/// reader hit a literal `todo!()` on this tensor type, panicked, and left the
+/// model with partial metadata + a repeating panic WARN on every rescan.
+#[test]
+fn mxfp4_tensor_type_enriches_fully() {
+    use gguf_rs_lib::builder::GGUFBuilder;
+    use gguf_rs_lib::format::metadata::MetadataValue as V;
+    use gguf_rs_lib::tensor::TensorType;
+
+    // One MXFP4 tensor: 32 elements = one 17-byte block.
+    let (bytes, _) = GGUFBuilder::new()
+        .add_metadata("general.architecture", V::String("gptoss".into()))
+        .add_metadata("gptoss.context_length", V::U32(131072))
+        .add_tensor("blk.0.ffn.w", vec![32], TensorType::MXFP4, vec![0u8; 17])
+        .unwrap()
+        .build_to_bytes()
+        .unwrap();
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    write_file(&root.join("org/gpt-oss-20b/gpt-oss-20b-MXFP4.gguf"), &bytes);
+
+    let mut store = ModelStore::default();
+    let models = store.scan(&[root.to_path_buf()], &[], &[]).unwrap();
+    let model = &models[0];
+    assert_eq!(model.arch.as_deref(), Some("gptoss"));
+    assert_eq!(model.ctx_train, Some(131072));
+    assert_eq!(
+        model.enrich_error, None,
+        "MXFP4 must not degrade enrichment"
+    );
+}
+
+/// A GGUF whose tensor descriptor carries a tensor-type id NEWER than the
+/// parser's table must STILL enrich fully — enrichment reads only the header +
+/// metadata section, which sits BEFORE the tensor descriptors in the file
+/// layout. (Reverting to a full `GGUFFileReader` parse fails this test: the
+/// reader errors on the unknown type and throws away the readable metadata.)
+#[test]
+fn unknown_future_tensor_type_still_enriches_metadata() {
+    use gguf_rs_lib::builder::GGUFBuilder;
+    use gguf_rs_lib::format::metadata::MetadataValue as V;
+    use gguf_rs_lib::tensor::TensorType;
+
+    let (mut bytes, _) = GGUFBuilder::new()
+        .add_metadata("general.architecture", V::String("futurellm".into()))
+        .add_metadata("futurellm.context_length", V::U32(8192))
+        .add_tensor("blk.0.w", vec![32], TensorType::MXFP4, vec![0u8; 17])
+        .unwrap()
+        .build_to_bytes()
+        .unwrap();
+
+    // Overwrite the tensor descriptor's type field (u32, right after
+    // name + n_dims(u32) + dims(u64 * n_dims)) with an id no parser knows.
+    let name = b"blk.0.w";
+    let name_pos = bytes
+        .windows(name.len())
+        .position(|w| w == name)
+        .expect("tensor name present");
+    let type_pos = name_pos + name.len() + 4 + 8;
+    assert_eq!(
+        u32::from_le_bytes(bytes[type_pos..type_pos + 4].try_into().unwrap()),
+        39,
+        "expected the MXFP4 type id at the computed descriptor offset"
+    );
+    bytes[type_pos..type_pos + 4].copy_from_slice(&999u32.to_le_bytes());
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    write_file(&root.join("org/future/future-XX.gguf"), &bytes);
+
+    let mut store = ModelStore::default();
+    let models = store.scan(&[root.to_path_buf()], &[], &[]).unwrap();
+    let model = &models[0];
+    assert_eq!(model.arch.as_deref(), Some("futurellm"));
+    assert_eq!(model.ctx_train, Some(8192));
+    assert_eq!(
+        model.enrich_error, None,
+        "unknown tensor type must not degrade metadata enrichment"
+    );
+}

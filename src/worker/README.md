@@ -14,7 +14,7 @@ catalog** — the host scans and passes a resolved GGUF path in `M_LOAD`.
 | File / submodule | Responsibility |
 |------------------|----------------|
 | `mod.rs` | The RPC server: `worker_main()` entry, the stdin run loop (`serve`/`serve_state`), method dispatch, the `M_*`/`N_*` protocol constants, `WorkerState` (the engine + the loaded `(id, LoadParams)`), the chat streaming sink, and JSON-RPC error routing (`to_rpc_error`). |
-| `models.rs` | The model store: read-only discovery across LM Studio / HuggingFace-cache / Ollama dirs (`ModelStore::scan`), producing `HiggsModel` records enriched from the GGUF header. **Pure Rust — no FFI** (`ggus` + `memmap2` + `std::fs`), so it runs **host-side** (the host scans; `M_LOAD` carries the resolved path). It lives here because it owns the `HiggsModel`/`HiggsModelSource` wire types. |
+| `models.rs` | The model store: read-only discovery across LM Studio / HuggingFace-cache / Ollama dirs (`ModelStore::scan`), producing `HiggsModel` records enriched from the GGUF header. **Pure Rust — no FFI** (`gguf-rs-lib` + `memmap2` + `std::fs`), so it runs **host-side** (the host scans; `M_LOAD` carries the resolved path). It lives here because it owns the `HiggsModel`/`HiggsModelSource` wire types. |
 | `models_tests.rs` | Unit tests for `models.rs` (sibling test file; not production code). |
 | `engine/` | The `HiggsEngine` trait + the pluggable engine registry (`HIGGS_ENGINE`). The seam the rest of higgs is written against. Has its own README/DESIGN. |
 | `engine/llamacpp/` | The concrete llama.cpp engine — the only FFI boundary. Has its own README/DESIGN. |
