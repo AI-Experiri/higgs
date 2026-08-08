@@ -19,6 +19,26 @@ from it.
 
 ## [Unreleased]
 
+## [0.1.0-beta.5] - 2026-08-08
+
+### Fixed
+
+- **gpt-oss / MXFP4 model metadata**: the model scanner's GGUF header reader
+  (`ggus`) panicked on MXFP4 tensors — gpt-oss models cataloged with partial
+  metadata (degraded autotune/fit estimates) and the node log filled with a
+  repeating panic warning on every rescan. The scanner now uses `gguf-rs-lib`
+  and reads only the header + metadata section, so models in any current or
+  future quantization enrich fully and a single bad file can never spam the
+  log or crash the scan.
+- `install.sh` with `--pubkey` now fails on a missing `minisign` CLI BEFORE
+  downloading the artifact, not after.
+
+### Changed
+
+- `higgs node install-service` output is human-readable: colored step results
+  and an aligned quick-reference block (logs/state/status/stop) with
+  advisories as separate marked paragraphs, instead of a wall of text.
+
 ## [0.1.0-beta.4] - 2026-08-06
 
 ### Added

@@ -283,6 +283,15 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# PREFLIGHT: fail on a missing verification tool NOW, before any network or
+# download work — discovering it only at verify time wastes the whole (large)
+# artifact download. The same check at the verify site stays as the authoritative
+# guard (this early one is UX; PATH could in principle change in between).
+if [ -n "$PUBKEY" ]; then
+  command -v minisign >/dev/null \
+    || die "--pubkey given but the minisign CLI is not installed — install it first (apt install minisign / brew install minisign)"
+fi
+
 # Resolve the DEFAULT prefix now that flags are parsed (--help already exited).
 # ONLY the default needs HOME, so a scrubbed env with HOME unset can still
 # `--prefix /opt/higgs` — and gets a clear error, not a raw `set -u` abort, if

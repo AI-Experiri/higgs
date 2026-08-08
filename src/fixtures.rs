@@ -20,35 +20,25 @@
 //! integration test compiles against the lib as an external crate and would need
 //! the feature enabled to see this module.)
 
-use std::io::Cursor;
 use std::path::Path;
 
-use ggus::{GGufFileHeader, GGufFileWriter, GGufMetaDataValueType as T};
+use gguf_rs_lib::builder::GGUFBuilder;
+use gguf_rs_lib::format::metadata::MetadataValue as V;
 
 use crate::api::Higgs;
 
-/// A GGUF metadata string value: `u64` length prefix + raw bytes.
-fn gguf_string(s: &str) -> Vec<u8> {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(8 + bytes.len());
-    out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-    out.extend_from_slice(bytes);
-    out
-}
-
 /// Serialize `kvs` as a header-only GGUF (no tensors) and write it to
 /// `<root>/<id>/<filename>`, creating the model dir.
-fn write_header_only(root: &Path, id: &str, filename: &str, kvs: &[(&str, T, Vec<u8>)]) {
-    let mut buf = Cursor::new(Vec::<u8>::new());
-    let mut w = GGufFileWriter::new(&mut buf, GGufFileHeader::new(3, 0, kvs.len() as u64)).unwrap();
-    for (k, t, v) in kvs {
-        w.write_meta_kv(k, *t, v).unwrap();
+fn write_header_only(root: &Path, id: &str, filename: &str, kvs: Vec<(&str, V)>) {
+    let mut b = GGUFBuilder::new();
+    for (k, v) in kvs {
+        b = b.add_metadata(k, v);
     }
-    w.finish::<Vec<u8>>(false).finish().unwrap();
+    let (bytes, _) = b.build_to_bytes().unwrap();
 
     let path = root.join(id).join(filename);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(&path, buf.into_inner()).unwrap();
+    std::fs::write(&path, bytes).unwrap();
 }
 
 /// A minimal valid GENERATIVE GGUF (arch=llama, ctx=4096, chat template) at
@@ -59,17 +49,12 @@ pub fn write_gguf_fixture(root: &Path, id: &str) {
         root,
         id,
         "model-Q4_K_M.gguf",
-        &[
-            ("general.architecture", T::String, gguf_string("llama")),
-            (
-                "llama.context_length",
-                T::U32,
-                4096u32.to_le_bytes().to_vec(),
-            ),
+        vec![
+            ("general.architecture", V::String("llama".into())),
+            ("llama.context_length", V::U32(4096)),
             (
                 "tokenizer.chat_template",
-                T::String,
-                gguf_string("{% for m in messages %}{{ m.content }}{% endfor %}"),
+                V::String("{% for m in messages %}{{ m.content }}{% endfor %}".into()),
             ),
         ],
     );
@@ -92,11 +77,11 @@ pub fn write_embedding_gguf_fixture_named(root: &Path, id: &str, filename: &str)
         root,
         id,
         filename,
-        &[
-            ("general.architecture", T::String, gguf_string("bert")),
-            ("bert.context_length", T::U32, 512u32.to_le_bytes().to_vec()),
-            ("bert.pooling_type", T::U32, 2u32.to_le_bytes().to_vec()),
-            ("bert.attention.causal", T::Bool, vec![0u8]),
+        vec![
+            ("general.architecture", V::String("bert".into())),
+            ("bert.context_length", V::U32(512)),
+            ("bert.pooling_type", V::U32(2)),
+            ("bert.attention.causal", V::Bool(false)),
         ],
     );
 }
@@ -110,10 +95,10 @@ pub fn write_reranker_gguf_fixture(root: &Path, id: &str) {
         root,
         id,
         "model-Q8_0.gguf",
-        &[
-            ("general.architecture", T::String, gguf_string("bert")),
-            ("bert.context_length", T::U32, 512u32.to_le_bytes().to_vec()),
-            ("bert.pooling_type", T::U32, 4u32.to_le_bytes().to_vec()),
+        vec![
+            ("general.architecture", V::String("bert".into())),
+            ("bert.context_length", V::U32(512)),
+            ("bert.pooling_type", V::U32(4)),
         ],
     );
 }

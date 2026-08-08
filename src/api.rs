@@ -1690,7 +1690,7 @@ impl Higgs {
 
     /// Scan all configured model directories and return the discovered models.
     ///
-    /// Runs host-side: model scanning is pure Rust (`ggus` + `memmap2` + `std::fs`,
+    /// Runs host-side: model scanning is pure Rust (`gguf-rs-lib` + `memmap2` + `std::fs`,
     /// no llama.cpp FFI) so it needs no worker. Returns `Err` [HG001] if a
     /// configured root exists but cannot be read.
     pub async fn scan(&self) -> Result<Vec<HiggsModel>, HiggsError> {

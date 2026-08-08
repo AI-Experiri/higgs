@@ -16,7 +16,7 @@ out-of-scope list) and is why the engine never runs in the host.
   ============                                          =====================================
 
   Higgs facade  (api/embed.rs, api.rs)
-    scan()          ─▶ ModelStore::scan (models.rs)  ── pure Rust: ggus + memmap2 + std::fs,
+    scan()          ─▶ ModelStore::scan (models.rs)  ── pure Rust: gguf-rs-lib + memmap2 + std::fs,
         LM Studio / HF cache / Ollama roots              NO FFI, so the catalog is HOST-side
         ─▶ Vec<HiggsModel>  (+ GGUF enrichment)
     model_entries() ─▶ HiggsModelEntry rows
@@ -62,7 +62,7 @@ locks of its own.
 
 `WorkerState` holds the engine (`Box<dyn HiggsEngine>`) and `Option<(model_id, LoadParams)>` — the
 resident model id and its load-time params. It deliberately holds **no model catalog**: scanning
-is **pure Rust with no FFI** (`models.rs`: `ggus` + `memmap2` + `std::fs`), so the host scans and
+is **pure Rust with no FFI** (`models.rs`: `gguf-rs-lib` + `memmap2` + `std::fs`), so the host scans and
 resolves the GGUF path, then passes it in `M_LOAD`. A fresh worker's store would be empty, so
 without host-side resolution every load would `[HG002]`. (`models.rs` lives under `worker/`
 because it owns the `HiggsModel` types, but it runs host-side.)
@@ -91,13 +91,12 @@ curated `gguf_components` list for the UI. The chat template is captured transie
 
 ### Scan invariants / guards
 
-- **Enrichment is panic-caught.** `ggus 0.5.1` **panics** (not errors) on a truncated file (a
-  model mid-download in a watched dir), a mis-sized quant block, or a GGUF missing
-  `general.architecture` (its getters unwrap internally). The whole enrichment runs inside
-  `catch_unwind(AssertUnwindSafe(...))`; a panicking file stays cataloged with whatever fields
-  were set before the panic — one bad file never crashes the scan. We read the arch-scoped
-  `{arch}.context_length` directly rather than `ggus`'s `llm_context_length()`, which unwraps the
-  architecture.
+- **Enrichment is error-first, and still panic-caught.** The `gguf-rs-lib` reader returns
+  errors on malformed/truncated input and knows the modern tensor types (MXFP4/NVFP4 —
+  the previous `ggus` dependency hit a literal `todo!()` on gpt-oss's MXFP4 and panicked
+  on every rescan). The whole enrichment still runs inside `catch_unwind(AssertUnwindSafe(...))`
+  as defense-in-depth: a misbehaving file stays cataloged with whatever fields were set —
+  one bad file never crashes the scan.
 - **A corrupt/unreadable header is not an error** — the enrichment fields stay `None`/`false`, the
   model stays in the catalog. No new error code is raised there.
 - **Projector sidecars are excluded.** `is_projector_sidecar` drops `mmproj-*.gguf` /
