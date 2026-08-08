@@ -136,6 +136,12 @@ pub struct ServicePlan {
     /// The plan's relationship to root.
     pub root: RootRequirement,
     /// Operator guidance printed at the end (log path, manual fallbacks).
+    ///
+    /// RENDERING CONTRACT (`cli.rs` `render_plan_notes`): a note whose first
+    /// `:`-delimited token is one of `logs`/`state`/`models`/`config`/`status`/
+    /// `stop` renders as an aligned quick-reference row; everything else renders
+    /// as a `!`-marked prose paragraph. Don't start a PROSE note with one of
+    /// those tokens (start it with a multi-word lead-in instead).
     pub notes: Vec<String>,
 }
 
@@ -628,14 +634,16 @@ fn plan_launchd_agent(
         unit_content: launchd_plist(None, home, prefix, higgs_home, model_dir, extra_env),
         unit_path,
         root: RootRequirement::Refuse,
+        // Quick-reference `key:` notes stay CONTIGUOUS (before any prose note)
+        // so the renderer's aligned block isn't split — same as the other plans.
         notes: vec![
             format!("logs:  {}", log_path(prefix).display()),
             format!("state: HIGGS_HOME={}", higgs_home.display()),
+            format!("status: launchctl print gui/{uid}/{SERVICE_NAME}"),
+            format!("stop:   launchctl bootout gui/{uid}/{SERVICE_NAME}"),
             "login-bound: the agent starts at login and STOPS AT LOGOUT (a locked screen is \
              fine) — for an always-on node re-run with --system (LaunchDaemon, needs sudo)"
                 .to_string(),
-            format!("status: launchctl print gui/{uid}/{SERVICE_NAME}"),
-            format!("stop:   launchctl bootout gui/{uid}/{SERVICE_NAME}"),
             // BOUNDED RESIDUAL (parity with the systemd note): install-time exec/log
             // access is probed under THIS shell's supplementary groups, but the agent
             // is bootstrapped into `gui/<uid>` — the GUI login session, whose groups
@@ -702,9 +710,12 @@ fn plan_systemd_user(
             SYSTEMD_UNIT.into(),
         ]),
     ];
+    // Quick-reference `key:` notes stay CONTIGUOUS (before any prose note) so
+    // the renderer's aligned block isn't split — same order as the launchd plans.
     let mut notes = vec![
         format!("logs:  {}", log_path(prefix).display()),
         format!("state: HIGGS_HOME={}", higgs_home.display()),
+        format!("status: systemctl --user status {SYSTEMD_UNIT}"),
         // Linked units must exist when the manager loads its units: a
         // prefix on a volume mounted AFTER the user manager starts leaves
         // the link dangling and the node down.
@@ -714,7 +725,6 @@ fn plan_systemd_user(
              `systemctl --user daemon-reload`)",
             unit_path.display()
         ),
-        format!("status: systemctl --user status {SYSTEMD_UNIT}"),
         // BOUNDED RESIDUAL: install-time exec/log access is probed under THIS
         // shell's supplementary groups, but the unit runs under the `systemd
         // --user` manager, whose groups were fixed at the operator's LOGIN. If

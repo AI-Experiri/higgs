@@ -91,8 +91,6 @@ encoding_rs = "0.8"
 # port stripped, IPv6/port validation), so the exact-match allowlist can match.
 # Already in the tree transitively via iroh; a direct dep here pins the API we use.
 url = "2.5.8"
-# Header-only GGUF metadata reading (memory-maps the file; weights are never loaded)
-ggus = "0.5.1"
 memmap2 = "0.9"
 # Host hardware + resource info (CPU name/arch, RAM total/used, CPU load) for
 # the /api/higgs/system endpoint. Cross-platform, ~200M downloads.
@@ -143,6 +141,7 @@ semver = "1"
 # `tar` that PATH could resolve to a planted binary — the very class P2b hardened).
 tar = "0.4"
 flate2 = "1"
+gguf-rs-lib = "0.3.0"
 
 [dev-dependencies]
 # Full minisign (keygen + SIGNING) so update-verification tests can mint a
@@ -158,6 +157,7 @@ http-body-util = "0.1"
 # HTTP client for the black-box integration tests (spawn higgs, drive /v1
 # + /api/higgs over real HTTP). rustls to avoid a system OpenSSL dependency.
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+ggus = "0.5.1"
 
 [lints]
 workspace = true

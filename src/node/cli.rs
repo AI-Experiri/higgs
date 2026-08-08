@@ -2446,7 +2446,11 @@ fn run_node_install_service(args: &[String]) -> Result<()> {
             unit_dir.display()
         );
     }
-    println!("wrote {}", plan.unit_path.display());
+    let style = crate::node::preflight::Style::auto();
+    println!(
+        "{}",
+        style.ok(&format!("wrote {}", plan.unit_path.display()))
+    );
 
     for cmd in &plan.commands {
         let (prog, rest) = cmd.argv.split_first().expect("plan commands are non-empty");
@@ -2508,8 +2512,10 @@ fn run_node_install_service(args: &[String]) -> Result<()> {
             }
         };
         match status {
-            Ok(st) if st.success() => println!("ran: {joined}"),
-            Ok(st) if cmd.best_effort => println!("skipped ({st}): {joined}"),
+            Ok(st) if st.success() => println!("{}", style.ok(&format!("ran: {joined}"))),
+            Ok(st) if cmd.best_effort => {
+                println!("{}", style.warn(&format!("skipped ({st}): {joined}")))
+            }
             Ok(st) => {
                 let rolled = rollback_unit();
                 return Err(Error::other(format!(
@@ -2517,7 +2523,9 @@ fn run_node_install_service(args: &[String]) -> Result<()> {
                      re-run{headless_hint}"
                 )));
             }
-            Err(e) if cmd.best_effort => println!("skipped: {joined} ({e})"),
+            Err(e) if cmd.best_effort => {
+                println!("{}", style.warn(&format!("skipped: {joined} ({e})")))
+            }
             Err(e) => {
                 let rolled = rollback_unit();
                 return Err(Error::other(format!(
@@ -2526,10 +2534,53 @@ fn run_node_install_service(args: &[String]) -> Result<()> {
             }
         }
     }
-    for n in &plan.notes {
-        println!("{n}");
-    }
+    print!("{}", render_plan_notes(&style, &plan.notes));
     Ok(())
+}
+
+/// Renders the install plan's notes for a human: the short `key: value`
+/// quick-reference lines (logs/state/status/…) become an aligned block with
+/// bold keys, and each long advisory paragraph gets its own `!`-marked entry
+/// separated by a blank line — instead of one undifferentiated wall of text.
+/// Purely presentational: every note string is rendered verbatim (colors are
+/// tty-gated via [`crate::node::preflight::Style`], so pipes/logs see plain
+/// bytes).
+fn render_plan_notes(style: &crate::node::preflight::Style, notes: &[String]) -> String {
+    use std::fmt::Write as _;
+    // The quick-reference keys the plans emit (`service.rs` + the models:/config:
+    // lines `plan_install` inserts). Anything else is prose guidance.
+    const KV_KEYS: &[&str] = &["logs", "state", "models", "config", "status", "stop"];
+    fn kv(n: &str) -> Option<(&str, &str)> {
+        n.split_once(':')
+            .filter(|(k, _)| KV_KEYS.contains(&k.trim()))
+    }
+    let width = notes
+        .iter()
+        .filter_map(|n| kv(n).map(|(k, _)| k.trim().len()))
+        .max()
+        .unwrap_or(0);
+    let mut out = String::new();
+    let mut in_kv_block = false;
+    for n in notes {
+        if let Some((k, v)) = kv(n) {
+            if !in_kv_block {
+                out.push('\n');
+                in_kv_block = true;
+            }
+            let _ = writeln!(
+                out,
+                "  {}{} {}",
+                style.head(&format!("{}:", k.trim())),
+                " ".repeat(width - k.trim().len()),
+                v.trim()
+            );
+        } else {
+            out.push('\n');
+            in_kv_block = false;
+            let _ = writeln!(out, "{}", style.warn(n));
+        }
+    }
+    out
 }
 
 /// `higgs node leave [--hub <label|id>]` — self-retire: dial the saved hub (default, or the one
