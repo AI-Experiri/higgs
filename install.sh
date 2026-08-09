@@ -777,6 +777,33 @@ printf '%s' "$variant" > "$vmarker_tmp" \
 # macOS, whose only hard guarantee is F_FULLFSYNC, out of reach from a script.)
 sync
 
+# SMOKE the staged binary BEFORE the flip: a binary that dies in the OS loader
+# (built against a newer macOS SDK / newer glibc than this machine) must refuse
+# the install with a plain-language reason — never flip `current` onto a binary
+# that cannot start. The loader's only explanation is on stderr; classify the
+# known signatures instead of dumping raw dyld/ld.so spew.
+# BOUNDED: perl's alarm(2) survives exec, so a staged binary that WEDGES during
+# init gets SIGALRM after 20s instead of hanging the installer forever (the
+# Rust self-update smoke has the same bound; `timeout(1)` is not on stock
+# macOS). Residual: a forked descendant inheriting stderr could still hold the
+# capture pipe open — the alarm bounds the binary itself, the common case.
+smoke_err="$(perl -e 'alarm 20; exec @ARGV or die "exec failed: $!\n"' -- \
+  "${verdir}/higgs" --version 2>&1 >/dev/null)" && smoke_ok=1 || smoke_ok=0
+if [ "$smoke_ok" -ne 1 ]; then
+  case "$smoke_err" in
+    *"which was built for macOS"*)
+      die "this release requires a NEWER macOS than this machine runs (built against a newer SDK) — not installable here; use a release built for this macOS or upgrade the OS. Loader said: $(printf '%s' "$smoke_err" | head -n1)" ;;
+    *"Symbol not found"*|*"Library not loaded"*)
+      die "this release references an API or library this machine does not have — usually built for a NEWER macOS (use a release built for this macOS or upgrade the OS); less commonly a bundled library is missing/corrupt. Loader said: $(printf '%s' "$smoke_err" | head -n1)" ;;
+    *GLIBC_*"not found"*)
+      die "this release requires a NEWER glibc than this machine has — not installable here; use a release built for this distro or upgrade it. Loader said: $(printf '%s' "$smoke_err" | head -n1)" ;;
+    "")
+      die "staged binary failed its smoke run (${verdir}/higgs --version) with no output — it may have hung (killed after 20s) or died silently; refusing to install it" ;;
+    *)
+      die "staged binary failed its smoke run (${verdir}/higgs --version) — refusing to install it. It said: $(printf '%s' "$smoke_err" | head -n1)" ;;
+  esac
+fi
+
 # Atomic flip: build the new symlink under a temp name in the SAME directory,
 # then rename(2) over `current`. rename never follows the destination symlink
 # and either fully succeeds or changes nothing — there is no window where
