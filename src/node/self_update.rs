@@ -2359,6 +2359,55 @@ pub fn stage_and_flip(
 /// hang of the updater) delivers the output over a channel, and we wait for it with a
 /// small bounded grace; if it does not arrive, smoke FAILS (the version can't be
 /// confirmed) rather than hanging while holding the update lock.
+/// Classify a failed smoke run's STDERR into an actionable operator message,
+/// when it matches a known OS-incompatibility signature. `None` = unrecognized
+/// (the caller reports the raw exit + first stderr line instead).
+///
+/// These are LOADER failures — the binary died before `main`, so the only
+/// explanation anywhere is what dyld (macOS) or ld.so (Linux) wrote to stderr:
+/// - dyld: `Symbol not found: …` / `Library not loaded: …` — the binary was
+///   built against a newer macOS SDK and references an API/dylib this machine
+///   doesn't have.
+/// - dyld: `… (which was built for macOS X.Y)` — explicit version refusal.
+/// - ld.so: `version GLIBC_x.yy not found` — Linux build newer than this
+///   distro's glibc.
+fn classify_smoke_stderr(stderr: &str) -> Option<&'static str> {
+    // dyld's explicit version refusal is DEFINITIVE about the cause; bare
+    // "Symbol not found"/"Library not loaded" are only the USUAL symptom of a
+    // too-new SDK — the same lines fire for a missing/corrupt bundled dylib on
+    // a perfectly compatible macOS, so those get the softer both-causes text.
+    if stderr.contains("which was built for macOS") {
+        return Some(
+            "this binary requires a NEWER macOS than this machine runs (it was built against \
+             a newer SDK) — not installable here; use a release built for this macOS or \
+             upgrade the OS",
+        );
+    }
+    if stderr.contains("Symbol not found") || stderr.contains("Library not loaded") {
+        return Some(
+            "this binary references an API or library this machine does not have — usually \
+             it was built for a NEWER macOS (use a release built for this macOS or upgrade \
+             the OS); less commonly a bundled library is missing or corrupt",
+        );
+    }
+    // Adjacent match (the real ld.so shape is "version `GLIBC_2.38' not found"),
+    // not two independent substring hits anywhere in the output — keeps this in
+    // lockstep with install.sh's `*GLIBC_*"not found"*` glob.
+    // `get(..40)` is None when byte 40 splits a multibyte char — fall back to
+    // the whole tail rather than panicking on adversarial/multilingual stderr.
+    let glibc = stderr
+        .split("GLIBC_")
+        .skip(1)
+        .any(|after| after.get(..40).unwrap_or(after).contains("not found"));
+    if glibc {
+        return Some(
+            "this binary requires a NEWER glibc than this machine has — not installable \
+             here; use a release built for this distro or upgrade it",
+        );
+    }
+    None
+}
+
 pub fn smoke_run(path: &Path) -> Result<String, HiggsError> {
     use std::os::unix::process::CommandExt;
     let mut cmd = std::process::Command::new(path);
@@ -2367,7 +2416,12 @@ pub fn smoke_run(path: &Path) -> Result<String, HiggsError> {
         .env("PATH", TRUSTED_PATH)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
+        // stderr is CAPTURED (not discarded): a binary built against a newer
+        // macOS/glibc dies in the LOADER before main with its explanation only
+        // on stderr (dyld "Symbol not found"/"Library not loaded", ld.so
+        // "GLIBC_x not found") — without it the failure reads as a bare
+        // "exited with signal", which tells the operator nothing actionable.
+        .stderr(std::process::Stdio::piped());
     // SAFETY: the closure runs in the forked child and calls only setsid, a bare
     // async-signal-safe syscall — no allocation, no lock inheritance risk.
     unsafe {
@@ -2396,6 +2450,15 @@ pub fn smoke_run(path: &Path) -> Result<String, HiggsError> {
             let mut out = String::new();
             let _ = so.read_to_string(&mut out);
             let _ = tx.send(out);
+        });
+    }
+    // Same bounded-drain pattern for stderr (loader diagnostics).
+    let (etx, erx) = std::sync::mpsc::channel::<String>();
+    if let Some(mut se) = child.stderr.take() {
+        std::thread::spawn(move || {
+            let mut out = String::new();
+            let _ = se.read_to_string(&mut out);
+            let _ = etx.send(out);
         });
     }
 
@@ -2432,9 +2495,22 @@ pub fn smoke_run(path: &Path) -> Result<String, HiggsError> {
     reap_group();
     let _ = child.wait();
     if !status.success() {
+        // Pull whatever the loader/binary said on stderr (bounded — the drain
+        // thread may still be blocked on a detached descendant) and classify the
+        // known OS-incompatibility signatures into an actionable message.
+        let stderr = erx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap_or_default();
+        let diagnosis = classify_smoke_stderr(&stderr)
+            .map(|d| format!(" — {d}"))
+            .unwrap_or_default();
+        let first_line = stderr.lines().find(|l| !l.trim().is_empty());
+        let said = first_line
+            .map(|l| format!(" (binary said: {})", l.trim()))
+            .unwrap_or_default();
         return Err(HiggsError::UpdateApplyFailed {
             detail: format!(
-                "staged binary {} --version exited with {status}",
+                "staged binary {} --version exited with {status}{diagnosis}{said}",
                 path.display()
             ),
         });
