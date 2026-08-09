@@ -15,4 +15,10 @@ rustflags = ["-C", "link-arg=-fuse-ld=/opt/homebrew/bin/ld64.lld"]
 
 [env]
 SDKROOT = "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
+# ONE deployment floor for the whole build (rustc AND the cc/cmake FFI tree) —
+# without it the C/C++ objects target the host SDK while Rust links for its
+# 11.0 default, and ld64 prints a "newer than target minimum" warning per
+# object file. Matches release.yml's shipped floor. cargo [env] only applies
+# when the var is ABSENT, so a shell override still wins.
+MACOSX_DEPLOYMENT_TARGET = "14.0"
 BINDGEN_EXTRA_CLANG_ARGS = "--target=arm64-apple-darwin -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
