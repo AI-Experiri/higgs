@@ -1663,9 +1663,15 @@ fn run_node_self_update(args: &[String]) -> Result<()> {
     let running = su::installed_identity(&bin);
     // The CLI update runs with the operator watching the terminal — the failure is shown directly,
     // not persisted for a later HELLO — so the authenticated-version out-param is discarded.
-    let verified =
-        su::verify_and_check(source.as_ref(), &running, allow_downgrade, &mut None, None)
-            .map_err(as_io)?;
+    let verified = su::verify_and_check(
+        source.as_ref(),
+        &running,
+        &bin,
+        allow_downgrade,
+        &mut None,
+        None,
+    )
+    .map_err(as_io)?;
     println!(
         "verified update {} -> {} (key {}, target {}, variant {})",
         running.version,
@@ -1682,10 +1688,11 @@ fn run_node_self_update(args: &[String]) -> Result<()> {
     }
     // Serialize the stage->flip critical section against a concurrent self-update.
     let _lock = su::UpdateLock::acquire(&bin).map_err(as_io)?;
+    let mut verified = verified;
     su::stage_and_flip(
         &bin,
-        &verified.manifest,
-        &verified.artifact,
+        &verified.manifest.clone(),
+        verified.artifact.reader().map_err(as_io)?,
         allow_downgrade,
         &su::smoke_run,
     )

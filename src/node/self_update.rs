@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::diagnostic::HiggsError;
 use crate::node::cli::{temp_name, TRUSTED_PATH};
-use crate::update::{verify_artifact_sha256, UpdateManifest};
+use crate::update::UpdateManifest;
 
 /// The acceleration variant THIS binary was compiled as, in the LOWERCASE
 /// spelling the release manifest + `install.sh` use (`metal`/`cuda`/`cpu`) — NOT
@@ -862,10 +862,136 @@ pub trait UpdateSource {
     /// `(manifest_bytes, signature_text)` — the JSON manifest and the full text of
     /// its `.minisig`.
     fn manifest(&self) -> Result<(Vec<u8>, String), HiggsError>;
-    /// The artifact tarball bytes for `file` (the manifest's `file` field, already
-    /// authenticated). The impl decides how to locate it (a sibling file, a release
-    /// asset URL); the caller re-hashes the bytes against the manifest regardless.
-    fn artifact(&self, file: &str) -> Result<Vec<u8>, HiggsError>;
+    /// STREAM the artifact tarball for `file` (the manifest's `file` field, already
+    /// authenticated) into `spool` — never materialize it in memory (a CUDA release
+    /// tarball is hundreds of MiB; the old `Vec<u8>` return OOM-bounded updates at
+    /// 256 MiB and refused real releases, HG088). The impl decides how to locate the
+    /// bytes (a sibling file, a release asset URL); the spool hashes as it writes and
+    /// the caller compares that digest against the manifest regardless of source.
+    fn artifact_to(&self, file: &str, spool: &mut ArtifactSpool) -> Result<(), HiggsError>;
+}
+
+/// A private on-disk spool for the artifact download: an `O_EXCL` random-named
+/// `0600` file that hashes every byte as it is written (single pass — no re-read
+/// to verify) and enforces the anti-runaway size cap. Created in the install `bin`
+/// dir (durable disk, same filesystem the staged version lands on) — deliberately
+/// NOT the system temp dir, which on Linux is commonly a RAM-backed tmpfs and
+/// would reintroduce the exact RAM spike this streaming path removes. The file is
+/// deleted on Drop, so every error path cleans up; the happy path holds it alive
+/// through [`stage_and_flip`] and drops it after.
+pub struct ArtifactSpool {
+    path: PathBuf,
+    file: Option<std::fs::File>,
+    hasher: sha2::Sha256,
+    written: u64,
+    cap: u64,
+}
+
+impl ArtifactSpool {
+    /// Create the spool file in `dir` (owner-only, collision-refusing). `cap` is the
+    /// hard byte bound writes may not exceed.
+    pub fn create_in(dir: &Path, cap: u64) -> Result<Self, HiggsError> {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Random (not PID-only) name — same rationale and helper as every other temp
+        // in the node paths; O_EXCL below refuses to reuse ANY pre-existing entry.
+        let path = dir.join(crate::node::cli::temp_name(".update-artifact"));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| HiggsError::UpdateApplyFailed {
+                detail: format!("cannot create artifact spool in {}: {e}", dir.display()),
+            })?;
+        Ok(Self {
+            path,
+            file: Some(file),
+            hasher: <sha2::Sha256 as sha2::Digest>::new(),
+            written: 0,
+            cap,
+        })
+    }
+
+    /// Append a chunk: cap-checked BEFORE it is written or hashed.
+    pub fn write_chunk(&mut self, chunk: &[u8]) -> Result<(), HiggsError> {
+        use sha2::Digest as _;
+        if self.written + chunk.len() as u64 > self.cap {
+            return Err(fetch_err(format!(
+                "artifact exceeds the {}-byte cap",
+                self.cap
+            )));
+        }
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| HiggsError::UpdateApplyFailed {
+                detail: "artifact spool already finished".into(),
+            })?;
+        std::io::Write::write_all(file, chunk).map_err(|e| HiggsError::UpdateApplyFailed {
+            detail: format!("writing artifact spool: {e}"),
+        })?;
+        self.hasher.update(chunk);
+        self.written += chunk.len() as u64;
+        Ok(())
+    }
+
+    /// Flush + fsync and return the lowercase hex sha256 of everything written.
+    /// The FD stays open — [`Self::reader`] hands back the SAME file object the
+    /// hash covered, so unpack never re-opens by path (no re-open TOCTOU window).
+    pub fn finish(&mut self) -> Result<String, HiggsError> {
+        use sha2::Digest as _;
+        if let Some(f) = self.file.as_ref() {
+            f.sync_all().map_err(|e| HiggsError::UpdateApplyFailed {
+                detail: format!("flushing artifact spool: {e}"),
+            })?;
+        }
+        let digest = self.hasher.clone().finalize();
+        Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
+    }
+
+    /// The verified artifact as a reader — the SAME fd the digest covered,
+    /// rewound to the start. Errors if the spool was never created.
+    pub fn reader(&mut self) -> Result<&mut std::fs::File, HiggsError> {
+        use std::io::Seek as _;
+        let f = self
+            .file
+            .as_mut()
+            .ok_or_else(|| HiggsError::UpdateApplyFailed {
+                detail: "artifact spool has no open file".into(),
+            })?;
+        f.seek(std::io::SeekFrom::Start(0))
+            .map_err(|e| HiggsError::UpdateApplyFailed {
+                detail: format!("rewinding artifact spool: {e}"),
+            })?;
+        Ok(f)
+    }
+
+    /// The on-disk path of the spooled artifact.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Bytes written so far.
+    pub fn written(&self) -> u64 {
+        self.written
+    }
+}
+
+impl Drop for ArtifactSpool {
+    fn drop(&mut self) {
+        // Best-effort: the spool is a temp file; every exit path removes it.
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+impl std::fmt::Debug for ArtifactSpool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ArtifactSpool")
+            .field("path", &self.path)
+            .field("written", &self.written)
+            .finish_non_exhaustive()
+    }
 }
 
 /// An update staged from LOCAL files the operator already fetched (scp, `curl`, a
@@ -892,13 +1018,39 @@ impl UpdateSource for LocalSource {
         Ok((m, sig))
     }
 
-    fn artifact(&self, _file: &str) -> Result<Vec<u8>, HiggsError> {
+    fn artifact_to(&self, _file: &str, spool: &mut ArtifactSpool) -> Result<(), HiggsError> {
         // The tarball path is given explicitly; `file` is cross-checked against the
         // manifest by the caller (via the sha256), so we don't re-derive the path
         // from an untrusted-until-verified field.
-        std::fs::read(&self.tarball).map_err(|e| HiggsError::UpdateApplyFailed {
-            detail: format!("cannot read tarball {}: {e}", self.tarball.display()),
+        let mut f =
+            std::fs::File::open(&self.tarball).map_err(|e| HiggsError::UpdateApplyFailed {
+                detail: format!("cannot read tarball {}: {e}", self.tarball.display()),
+            })?;
+        copy_into_spool(&mut f, spool, || {
+            format!("reading tarball {}", self.tarball.display())
         })
+    }
+}
+
+/// Stream `src` into the spool in bounded chunks — the shared read loop for every
+/// file-backed source (the HTTP sources stream inside [`fetch_bounded_to`], which
+/// adds the deadline/status handling a network body needs).
+fn copy_into_spool<R: std::io::Read>(
+    src: &mut R,
+    spool: &mut ArtifactSpool,
+    ctx: impl Fn() -> String,
+) -> Result<(), HiggsError> {
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let n = src
+            .read(&mut chunk)
+            .map_err(|e| HiggsError::UpdateApplyFailed {
+                detail: format!("{}: {e}", ctx()),
+            })?;
+        if n == 0 {
+            return Ok(());
+        }
+        spool.write_chunk(&chunk[..n])?;
     }
 }
 
@@ -917,13 +1069,16 @@ impl UpdateSource for LocalSource {
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 /// A minisign signature is a couple of short base64 lines.
 const MAX_SIG_BYTES: u64 = 4 * 1024;
-/// Ceiling for the release tarball, held in memory before hashing. A real single-binary
-/// higgs tarball is tens of MiB; 256 MiB is ~10× headroom yet bounds the transient
-/// allocation so a malicious host cannot OOM a small (2–4 GiB Pi/Jetson) node by serving
-/// a huge body before the `sha256` check (HG084) rejects it. RESIDUAL: the body is still
-/// buffered in RAM up to this cap — a fully stream-to-disk fetch (hashing the file, not a
-/// `Vec`) is a larger refactor of the shared verify/apply pipeline, deferred.
-const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
+/// Anti-runaway ceiling for the release tarball, which is STREAMED TO DISK and hashed
+/// incrementally ([`ArtifactSpool`]) — never held in memory, so this bounds transient
+/// DISK use, not RAM, and a malicious host cannot OOM any node at any size. Sized with
+/// ample headroom over the real artifacts (the Linux CUDA tarball is ~650 MiB — the old
+/// 256 MiB in-memory cap refused it, HG088). RESIDUAL: on a node with less free disk
+/// than this cap, a hostile/broken source can still drive the spool to ENOSPC before
+/// the sha256 check (HG084) rejects the body — the write fails cleanly and the spool
+/// is deleted, but the transient disk pressure is real; sources are operator-configured or
+/// hub-authenticated, so the exposure needs a trusted-side compromise first.
+const MAX_ARTIFACT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const HTTP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 /// Passed to the reqwest blocking client's `timeout`, which it applies PER READ of the
 /// streamed body (not to the whole body) — so it serves as a per-read stall guard: a read
@@ -934,6 +1089,24 @@ const HTTP_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30
 /// Wall-clock ceiling for a single GET's whole body — enforced by us in [`HttpSource::
 /// get_bounded`] because reqwest's blocking client has no total-body deadline.
 const HTTP_FETCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The ARTIFACT download's slow-drip guard is THROUGHPUT-BASED, not a fixed wall
+/// clock: a ~650 MiB CUDA tarball under a 600 s total deadline would demand a
+/// sustained ≥1.1 MB/s and fail on legitimately slow links, while a fixed larger
+/// deadline would let a 1 B/s drip hold the update thread for hours. Instead the
+/// fetch must deliver at least [`ARTIFACT_MIN_WINDOW_BYTES`] per
+/// [`ARTIFACT_PROGRESS_WINDOW`] (≈1 KiB/s — an order of magnitude below any real
+/// link, three orders above a drip), plus [`ARTIFACT_MAX_DURATION`] as an
+/// absolute ceiling so nothing runs unbounded.
+const ARTIFACT_PROGRESS_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+const ARTIFACT_MIN_WINDOW_BYTES: u64 = 64 * 1024;
+const ARTIFACT_MAX_DURATION: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+
+/// The pure verdict for the artifact slow-drip guard: has this progress window
+/// closed with too few bytes? (Split out for unit tests.)
+fn artifact_window_stalled(window_elapsed: std::time::Duration, window_bytes: u64) -> bool {
+    window_elapsed >= ARTIFACT_PROGRESS_WINDOW && window_bytes < ARTIFACT_MIN_WINDOW_BYTES
+}
 
 fn fetch_err(detail: String) -> HiggsError {
     HiggsError::UpdateFetchFailed { detail }
@@ -1243,11 +1416,85 @@ impl HttpSource {
     }
 }
 
+/// [`fetch_bounded`] variant that STREAMS the body into an [`ArtifactSpool`] instead of
+/// buffering it — the artifact path. Same status/redirect/deadline handling; the size cap
+/// is the spool's (checked per chunk before anything is written or hashed).
+fn fetch_bounded_to(
+    client: &reqwest::blocking::Client,
+    url: &reqwest::Url,
+    spool: &mut ArtifactSpool,
+    what: &str,
+) -> Result<(), HiggsError> {
+    let loc = redact_url(url);
+    let resp = client
+        .get(url.clone())
+        .send()
+        .map_err(|e| fetch_err(format!("GET {what} {loc}: {}", e.without_url())))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        if status.is_redirection() {
+            return Err(fetch_err(format!(
+                "{what} {loc} redirected (HTTP {}); redirects are not followed — pass the \
+                 final direct URL to --url (or use --tarball/--manifest/--manifest-sig)",
+                status.as_u16()
+            )));
+        }
+        return Err(fetch_err(format!(
+            "GET {what} {loc}: HTTP {}",
+            status.as_u16()
+        )));
+    }
+    // Content-Length is untrusted (never echoed); the per-chunk spool cap is the
+    // authoritative bound either way — this just refuses an honestly-huge body early.
+    if let Some(len) = resp.content_length() {
+        if len > MAX_ARTIFACT_BYTES {
+            return Err(fetch_err(format!(
+                "{what} at {loc} exceeds the {MAX_ARTIFACT_BYTES}-byte cap"
+            )));
+        }
+    }
+    let mut body = resp;
+    let mut chunk = [0u8; 64 * 1024];
+    // Throughput-based slow-drip guard (see the ARTIFACT_* constants): the fixed
+    // 600 s wall clock that bounds the small manifest/sig fetches would demand
+    // ≥1.1 MB/s sustained for a ~650 MiB artifact and fail honest slow links.
+    let start = std::time::Instant::now();
+    let mut window_start = start;
+    let mut window_bytes: u64 = 0;
+    loop {
+        let now = std::time::Instant::now();
+        if now.duration_since(start) >= ARTIFACT_MAX_DURATION {
+            return Err(fetch_err(format!(
+                "{what} at {loc} exceeded the {ARTIFACT_MAX_DURATION:?} absolute fetch ceiling"
+            )));
+        }
+        if artifact_window_stalled(now.duration_since(window_start), window_bytes) {
+            return Err(fetch_err(format!(
+                "{what} at {loc} stalled (under {ARTIFACT_MIN_WINDOW_BYTES} bytes in \
+                 {ARTIFACT_PROGRESS_WINDOW:?}) — aborting the download"
+            )));
+        }
+        if now.duration_since(window_start) >= ARTIFACT_PROGRESS_WINDOW {
+            window_start = now;
+            window_bytes = 0;
+        }
+        let n = std::io::Read::read(&mut body, &mut chunk)
+            .map_err(|e| fetch_err(format!("reading {what} {loc}: {e}")))?;
+        if n == 0 {
+            return Ok(());
+        }
+        window_bytes += n as u64;
+        spool.write_chunk(&chunk[..n])?;
+    }
+}
+
 /// GET `url`, erroring on a non-2xx status, an over-cap `Content-Length`, a body that
 /// exceeds `cap` bytes even if the header lied/was absent, or a body that takes longer than
 /// [`HTTP_FETCH_DEADLINE`] to arrive (a slow-drip guard the per-read timeout alone cannot
 /// provide). The body is read in bounded chunks so nothing over `cap` is ever buffered.
-/// Shared by [`HttpSource`] (--url CLI) and [`PushSource`] (M_UPDATE hub-push artifact).
+/// Shared by [`HttpSource`] (--url CLI) and [`PushSource`] (M_UPDATE hub-push artifact)
+/// for the SMALL fetches (manifest, signature); the artifact streams via
+/// [`fetch_bounded_to`].
 fn fetch_bounded(
     client: &reqwest::blocking::Client,
     url: &reqwest::Url,
@@ -1339,9 +1586,9 @@ impl UpdateSource for HttpSource {
         Ok((manifest, sig))
     }
 
-    fn artifact(&self, file: &str) -> Result<Vec<u8>, HiggsError> {
+    fn artifact_to(&self, file: &str, spool: &mut ArtifactSpool) -> Result<(), HiggsError> {
         let url = artifact_url_from(&self.manifest_url, file)?;
-        self.get_bounded(&url, MAX_ARTIFACT_BYTES, "artifact")
+        fetch_bounded_to(&self.client, &url, spool, "artifact")
     }
 }
 
@@ -1415,7 +1662,7 @@ impl UpdateSource for PushSource {
         Ok((self.manifest.clone(), self.sig.clone()))
     }
 
-    fn artifact(&self, file: &str) -> Result<Vec<u8>, HiggsError> {
+    fn artifact_to(&self, file: &str, spool: &mut ArtifactSpool) -> Result<(), HiggsError> {
         // BIND the hub-supplied URL to the SIGNED manifest `file`: the URL's last path segment
         // MUST equal the authenticated release filename. The `artifact_url` is pushed by the hub
         // INDEPENDENTLY of the inline manifest, and the sha256 check (HG084) only runs AFTER the
@@ -1439,12 +1686,7 @@ impl UpdateSource for PushSource {
                 redact_url(&self.artifact_url)
             )));
         }
-        fetch_bounded(
-            &self.client,
-            &self.artifact_url,
-            MAX_ARTIFACT_BYTES,
-            "artifact",
-        )
+        fetch_bounded_to(&self.client, &self.artifact_url, spool, "artifact")
     }
 }
 
@@ -1453,13 +1695,14 @@ impl UpdateSource for PushSource {
 // ---------------------------------------------------------------------------
 
 /// A verified, eligible update ready to apply: the authenticated manifest, the
-/// verified artifact bytes, and the key id that verified it. Produced by
-/// [`verify_and_check`]; consumed by [`stage_and_flip`].
+/// verified on-disk artifact (the spool file — its sha256 was checked as it was
+/// written), and the key id that verified it. Produced by [`verify_and_check`];
+/// consumed by [`stage_and_flip`]. Dropping this deletes the spool file.
 #[derive(Debug)]
 pub struct VerifiedUpdate {
     pub key_id: String,
     pub manifest: UpdateManifest,
-    pub artifact: Vec<u8>,
+    pub artifact: ArtifactSpool,
 }
 
 /// Fetch → verify signature (HG081-083) → check eligibility (HG085-086) → fetch
@@ -1468,6 +1711,10 @@ pub struct VerifiedUpdate {
 pub fn verify_and_check(
     source: &dyn UpdateSource,
     running: &BuildIdentity,
+    // Directory the artifact spool file is created in — the caller's install `bin`
+    // dir (durable disk; NOT the system temp dir, which is commonly a RAM-backed
+    // tmpfs on Linux and would turn the download back into a RAM spike).
+    spool_dir: &Path,
     allow_downgrade: bool,
     // OUT: the AUTHENTICATED target version, set the moment the manifest signature AND parse both
     // succeed (before eligibility/artifact/sha). A caller that records a post-verification failure
@@ -1487,6 +1734,7 @@ pub fn verify_and_check(
     verify_and_check_with(
         source,
         running,
+        spool_dir,
         allow_downgrade,
         authenticated_version,
         expected_version,
@@ -1499,6 +1747,7 @@ pub fn verify_and_check(
 fn verify_and_check_with(
     source: &dyn UpdateSource,
     running: &BuildIdentity,
+    spool_dir: &Path,
     allow_downgrade: bool,
     authenticated_version: &mut Option<String>,
     expected_version: Option<&str>,
@@ -1521,12 +1770,17 @@ fn verify_and_check_with(
     // Eligibility BEFORE downloading the (large) artifact — refuse a wrong-target or
     // downgrade artifact without spending the bandwidth to fetch it.
     evaluate_eligibility(running, &manifest, allow_downgrade)?;
-    let artifact = source.artifact(&manifest.file)?;
-    verify_artifact_sha256(&manifest, &artifact)?;
+    // STREAM the artifact to the private spool, hashing as it lands — no in-memory
+    // copy at any size (the Linux CUDA tarball is ~650 MiB). The digest is compared
+    // against the AUTHENTICATED manifest before the spool is trusted.
+    let mut spool = ArtifactSpool::create_in(spool_dir, MAX_ARTIFACT_BYTES)?;
+    source.artifact_to(&manifest.file, &mut spool)?;
+    let digest = spool.finish()?;
+    crate::update::verify_artifact_sha256_hex(&manifest, &digest)?;
     Ok(VerifiedUpdate {
         key_id,
         manifest,
-        artifact,
+        artifact: spool,
     })
 }
 
@@ -1615,14 +1869,16 @@ pub fn apply_pushed_update(
         let verified = verify_and_check(
             &source,
             &running,
+            bin,
             allow_downgrade,
             &mut authenticated_to,
             None,
         )?;
+        let mut verified = verified;
         stage_and_flip(
             bin,
-            &verified.manifest,
-            &verified.artifact,
+            &verified.manifest.clone(),
+            verified.artifact.reader()?,
             allow_downgrade,
             &smoke_run,
         )?;
@@ -1776,17 +2032,12 @@ impl UpdateSource for VersionSource {
         Ok((manifest, sig))
     }
 
-    fn artifact(&self, _file: &str) -> Result<Vec<u8>, HiggsError> {
+    fn artifact_to(&self, _file: &str, spool: &mut ArtifactSpool) -> Result<(), HiggsError> {
         // Deliberately IGNORES the manifest's `file`: the artifact URL was derived
         // from the configured base + version + THIS build's suffix before any fetch,
         // so a hostile manifest cannot steer the download anywhere. If the manifest
         // names a different file, the sha256 check fails loudly right after.
-        fetch_bounded(
-            &self.client,
-            &self.artifact_url,
-            MAX_ARTIFACT_BYTES,
-            "artifact",
-        )
+        fetch_bounded_to(&self.client, &self.artifact_url, spool, "artifact")
     }
 }
 
@@ -1837,14 +2088,16 @@ pub fn apply_version_update(bin: &Path, version: &str) -> Result<(String, String
         let verified = verify_and_check(
             &source,
             &running,
+            bin,
             false,
             &mut authenticated_to,
             Some(version),
         )?;
+        let mut verified = verified;
         stage_and_flip(
             bin,
-            &verified.manifest,
-            &verified.artifact,
+            &verified.manifest.clone(),
+            verified.artifact.reader()?,
             false,
             &smoke_run,
         )?;
@@ -2160,10 +2413,18 @@ pub type SmokeRunner<'a> = dyn Fn(&Path) -> Result<String, HiggsError> + 'a;
 pub fn stage_and_flip(
     bin: &Path,
     manifest: &UpdateManifest,
-    artifact: &[u8],
+    // The VERIFIED artifact as an open reader — the SAME fd whose bytes the
+    // sha256 covered ([`ArtifactSpool::reader`]); never a path re-opened after
+    // verification (that re-open would be a TOCTOU window).
+    artifact: &mut dyn std::io::Read,
     allow_downgrade: bool,
     smoke: &SmokeRunner,
 ) -> Result<(), HiggsError> {
+    // Best-effort sweep of STALE artifact spools (a SIGKILL/power-loss mid-download
+    // leaves one; Drop cannot run). Only entries older than a day — a concurrent
+    // verify may legitimately be spooling right now, and the update lock the
+    // callers hold does not cover the pre-lock download phase.
+    sweep_stale_spools(bin);
     let ver = &manifest.version;
     // NOTE: we do NOT touch the process `umask` here. This runs both as the one-shot CLI AND
     // (via the M_UPDATE hub-push) INSIDE the long-lived node daemon, whose `umask` must not be
@@ -2745,7 +3006,32 @@ fn normalize_published_modes(stage: &Path) -> Result<(), HiggsError> {
 /// `tar`'s unpack refuses any entry whose path escapes `dest` (`..`/absolute); modes are
 /// re-normalized by [`normalize_published_modes`] before publication, so a hostile mode
 /// in the archive cannot survive; we never follow the archive outside `dest`.
-fn unpack_tar_gz(bytes: &[u8], dest: &Path) -> Result<(), HiggsError> {
+/// Remove `.update-artifact.*` spool files older than 24 h from `bin` — leftovers
+/// from a hard kill mid-download (Drop-cleanup cannot run under SIGKILL). Age-gated
+/// so a live concurrent download's spool is never swept. Best-effort by design.
+fn sweep_stale_spools(bin: &Path) {
+    let Ok(entries) = std::fs::read_dir(bin) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with(".update-artifact.") {
+            continue;
+        }
+        let stale = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > std::time::Duration::from_secs(24 * 60 * 60));
+        if stale {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
+fn unpack_tar_gz(src: &mut dyn std::io::Read, dest: &Path) -> Result<(), HiggsError> {
     use std::os::unix::fs::DirBuilderExt;
     std::fs::DirBuilder::new()
         .mode(0o700)
@@ -2766,7 +3052,7 @@ fn unpack_tar_gz(bytes: &[u8], dest: &Path) -> Result<(), HiggsError> {
     // inherited ACL so `0700` genuinely means owner-only. Fail CLOSED — a staging dir we
     // cannot prove private must not receive a possibly-setuid extraction.
     strip_inherited_acls(dest)?;
-    let gz = flate2::read::GzDecoder::new(bytes);
+    let gz = flate2::read::GzDecoder::new(std::io::BufReader::new(src));
     let mut ar = tar::Archive::new(gz);
     ar.set_preserve_permissions(true);
     ar.set_overwrite(true);

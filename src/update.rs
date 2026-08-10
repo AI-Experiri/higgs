@@ -262,14 +262,20 @@ pub fn verify_artifact_sha256(
     manifest: &UpdateManifest,
     artifact: &[u8],
 ) -> Result<(), HiggsError> {
-    let got = hex(&Sha256::digest(artifact));
+    verify_artifact_sha256_hex(manifest, &hex(&Sha256::digest(artifact)))
+}
+
+/// [`verify_artifact_sha256`] over an ALREADY-COMPUTED hex digest — the streamed
+/// download path hashes the artifact incrementally as it lands on disk (it is never
+/// in memory whole), so only the digest reaches this check.
+pub fn verify_artifact_sha256_hex(manifest: &UpdateManifest, got: &str) -> Result<(), HiggsError> {
     if got.eq_ignore_ascii_case(&manifest.sha256) {
         Ok(())
     } else {
         Err(HiggsError::UpdateArtifactMismatch {
             file: manifest.file.clone(),
             expected: manifest.sha256.clone(),
-            got,
+            got: got.to_string(),
         })
     }
 }

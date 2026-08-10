@@ -25,6 +25,24 @@ fn ident(version: &str, target: &str, variant: &str) -> BuildIdentity {
 
 /// A gzip'd tar carrying a single REGULAR executable file `higgs` (mode 0755)
 /// with the given bytes — the shape [`stage_and_flip`] expects to unpack.
+/// Drive a source's `artifact_to` into a fresh spool and return the spooled BYTES
+/// (test convenience mirroring the old `artifact()` shape).
+fn spool_artifact(src: &dyn UpdateSource, file: &str) -> Result<Vec<u8>, HiggsError> {
+    let dir = tempfile::tempdir().unwrap();
+    let mut spool = ArtifactSpool::create_in(dir.path(), 1024 * 1024 * 1024).unwrap();
+    src.artifact_to(file, &mut spool)?;
+    spool.finish()?;
+    Ok(std::fs::read(spool.path()).unwrap())
+}
+
+/// Write artifact BYTES to an on-disk file (the shape `stage_and_flip` now takes —
+/// the prod path spools the download to disk and hands over the file).
+fn art_file(dir: &Path, bytes: &[u8]) -> PathBuf {
+    let p = dir.join(crate::node::cli::temp_name(".test-artifact"));
+    std::fs::write(&p, bytes).unwrap();
+    p
+}
+
 fn tarball_with_higgs(bytes: &[u8], mode: u32) -> Vec<u8> {
     let mut out = Vec::new();
     {
@@ -1239,7 +1257,14 @@ fn stage_and_flip_publishes_smokes_and_flips() {
     let art = tarball_with_higgs(b"new-binary", 0o755);
     let m = local_manifest("2.0.0");
     let smoke = ok_smoke("higgs 2.0.0");
-    stage_and_flip(&bin, &m, &art, false, smoke.as_ref()).unwrap();
+    stage_and_flip(
+        &bin,
+        &m,
+        &mut std::fs::File::open(art_file(&bin, &art)).unwrap(),
+        false,
+        smoke.as_ref(),
+    )
+    .unwrap();
 
     // Published v2.0.0/higgs (regular exec) + .variant marker (this build's variant).
     assert!(bin.join("v2.0.0/higgs").exists());
@@ -1280,7 +1305,14 @@ fn stage_and_flip_clears_the_last_failure_marker_on_success() {
     let art = tarball_with_higgs(b"new-binary", 0o755);
     let m = local_manifest("2.0.0");
     let smoke = ok_smoke("higgs 2.0.0");
-    stage_and_flip(&bin, &m, &art, false, smoke.as_ref()).unwrap();
+    stage_and_flip(
+        &bin,
+        &m,
+        &mut std::fs::File::open(art_file(&bin, &art)).unwrap(),
+        false,
+        smoke.as_ref(),
+    )
+    .unwrap();
     assert!(
         peek_update_failure(&bin).is_none(),
         "a successful stage+flip clears the last-failure marker"
@@ -1298,7 +1330,14 @@ fn stage_and_flip_refuses_a_rolled_back_version() {
     let art = tarball_with_higgs(b"new-binary", 0o755);
     let m = local_manifest("2.0.0");
     let smoke = ok_smoke("higgs 2.0.0");
-    let err = stage_and_flip(&bin, &m, &art, false, smoke.as_ref()).unwrap_err();
+    let err = stage_and_flip(
+        &bin,
+        &m,
+        &mut std::fs::File::open(art_file(&bin, &art)).unwrap(),
+        false,
+        smoke.as_ref(),
+    )
+    .unwrap_err();
     assert!(
         err.to_string().contains("previously failed its boot trial"),
         "a poisoned version is refused: {err}"
@@ -1320,7 +1359,13 @@ fn stage_and_flip_refuses_when_the_smoke_reports_the_wrong_version() {
     // The staged binary claims a DIFFERENT version → refuse, do NOT flip.
     let smoke = ok_smoke("higgs 6.6.6");
     assert!(matches!(
-        stage_and_flip(&bin, &m, &art, false, smoke.as_ref()),
+        stage_and_flip(
+            &bin,
+            &m,
+            &mut std::fs::File::open(art_file(&bin, &art)).unwrap(),
+            false,
+            smoke.as_ref()
+        ),
         Err(HiggsError::UpdateApplyFailed { .. })
     ));
     assert_eq!(
@@ -1343,7 +1388,13 @@ fn stage_and_flip_refuses_a_tarball_without_a_regular_higgs() {
     let m = local_manifest("2.0.0");
     let smoke = ok_smoke("higgs 2.0.0");
     assert!(matches!(
-        stage_and_flip(&bin, &m, &art, false, smoke.as_ref()),
+        stage_and_flip(
+            &bin,
+            &m,
+            &mut std::fs::File::open(art_file(&bin, &art)).unwrap(),
+            false,
+            smoke.as_ref()
+        ),
         Err(HiggsError::UpdateApplyFailed { .. })
     ));
     assert_eq!(current_target(&bin), Some("v1.0.0".to_string()));
@@ -1362,7 +1413,13 @@ fn stage_and_flip_refuses_a_sticky_world_writable_bin() {
     let art = tarball_with_higgs(b"new", 0o755);
     let m = local_manifest("2.0.0");
     let smoke = ok_smoke("higgs 2.0.0");
-    let got = stage_and_flip(&bin, &m, &art, false, smoke.as_ref());
+    let got = stage_and_flip(
+        &bin,
+        &m,
+        &mut std::fs::File::open(art_file(&bin, &art)).unwrap(),
+        false,
+        smoke.as_ref(),
+    );
     // Restore perms so TempDir cleanup can recurse.
     let _ = std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755));
     assert!(
@@ -1390,7 +1447,13 @@ fn stage_and_flip_smokes_before_publishing_so_a_failed_apply_keeps_prev() {
     let smoke = ok_smoke("higgs 6.6.6"); // reports the WRONG version → smoke fails
                                          // allow_downgrade=true so eligibility passes; the SMOKE failure is what refuses.
     assert!(matches!(
-        stage_and_flip(&bin, &m, &art, true, smoke.as_ref()),
+        stage_and_flip(
+            &bin,
+            &m,
+            &mut std::fs::File::open(art_file(&bin, &art)).unwrap(),
+            true,
+            smoke.as_ref()
+        ),
         Err(HiggsError::UpdateApplyFailed { .. })
     ));
     // The known-good rollback copy is untouched, and current did not move.
@@ -1411,7 +1474,14 @@ fn stage_and_flip_normalizes_a_world_writable_binary() {
     let art = tarball_with_higgs(b"bin", 0o4777); // setuid + world-write + exec
     let m = local_manifest("2.0.0");
     let smoke = ok_smoke("higgs 2.0.0");
-    stage_and_flip(&bin, &m, &art, false, smoke.as_ref()).unwrap();
+    stage_and_flip(
+        &bin,
+        &m,
+        &mut std::fs::File::open(art_file(&bin, &art)).unwrap(),
+        false,
+        smoke.as_ref(),
+    )
+    .unwrap();
     let mode = std::fs::metadata(bin.join("v2.0.0/higgs"))
         .unwrap()
         .permissions()
@@ -1457,7 +1527,13 @@ fn stage_and_flip_refuses_stacking_on_an_unconfirmed_trial() {
     let m = local_manifest("3.0.0");
     let smoke = ok_smoke("higgs 3.0.0");
     assert!(matches!(
-        stage_and_flip(&bin, &m, &art, false, smoke.as_ref()),
+        stage_and_flip(
+            &bin,
+            &m,
+            &mut std::fs::File::open(art_file(&bin, &art)).unwrap(),
+            false,
+            smoke.as_ref()
+        ),
         Err(HiggsError::UpdateApplyFailed { .. })
     ));
     assert_eq!(
@@ -1478,7 +1554,14 @@ fn stage_and_flip_clears_a_stale_trial_and_proceeds() {
     let art = tarball_with_higgs(b"new", 0o755);
     let m = local_manifest("3.0.0");
     let smoke = ok_smoke("higgs 3.0.0");
-    stage_and_flip(&bin, &m, &art, false, smoke.as_ref()).unwrap();
+    stage_and_flip(
+        &bin,
+        &m,
+        &mut std::fs::File::open(art_file(&bin, &art)).unwrap(),
+        false,
+        smoke.as_ref(),
+    )
+    .unwrap();
     // Proceeded: current flipped to v3.0.0, trial now records v3 over v1.
     assert_eq!(current_target(&bin), Some("v3.0.0".to_string()));
     let marker: TrialMarker =
@@ -1498,7 +1581,13 @@ fn stage_and_flip_rechecks_eligibility_under_lock() {
     let m = local_manifest("2.0.0"); // older than the installed v3
     let smoke = ok_smoke("higgs 2.0.0");
     assert!(matches!(
-        stage_and_flip(&bin, &m, &art, false, smoke.as_ref()),
+        stage_and_flip(
+            &bin,
+            &m,
+            &mut std::fs::File::open(art_file(&bin, &art)).unwrap(),
+            false,
+            smoke.as_ref()
+        ),
         Err(HiggsError::UpdateNotNewer { .. })
     ));
     assert_eq!(current_target(&bin), Some("v3.0.0".to_string()));
@@ -1527,7 +1616,14 @@ fn stage_and_flip_tightens_a_pre_existing_world_writable_version_dir() {
     let art = tarball_with_higgs(b"new", 0o755);
     let m = local_manifest("2.0.0");
     let smoke = ok_smoke("higgs 2.0.0");
-    stage_and_flip(&bin, &m, &art, false, smoke.as_ref()).unwrap();
+    stage_and_flip(
+        &bin,
+        &m,
+        &mut std::fs::File::open(art_file(&bin, &art)).unwrap(),
+        false,
+        smoke.as_ref(),
+    )
+    .unwrap();
     let mode = std::fs::metadata(&vdir).unwrap().permissions().mode() & 0o7777;
     assert_eq!(mode, 0o755, "version dir tightened to 0755");
 }
@@ -1563,7 +1659,11 @@ fn unpack_creates_the_staging_dir_owner_only() {
     use std::os::unix::fs::PermissionsExt;
     let tmp = tempfile::tempdir().unwrap();
     let dest = tmp.path().join("stage");
-    unpack_tar_gz(&tarball_with_higgs(b"x", 0o755), &dest).unwrap();
+    unpack_tar_gz(
+        &mut std::fs::File::open(art_file(tmp.path(), &tarball_with_higgs(b"x", 0o755))).unwrap(),
+        &dest,
+    )
+    .unwrap();
     let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o700, "staging dir must be created owner-only");
 }
@@ -1588,7 +1688,13 @@ fn stage_and_flip_refuses_a_pre_existing_vdir_with_a_peer_write_acl() {
     let art = tarball_with_higgs(b"new", 0o755);
     let m = local_manifest("2.0.0");
     let smoke = ok_smoke("higgs 2.0.0");
-    let got = stage_and_flip(&bin, &m, &art, false, smoke.as_ref());
+    let got = stage_and_flip(
+        &bin,
+        &m,
+        &mut std::fs::File::open(art_file(&bin, &art)).unwrap(),
+        false,
+        smoke.as_ref(),
+    );
     let _ = std::process::Command::new("/bin/chmod")
         .arg("-N")
         .arg(&vdir)
@@ -1668,7 +1774,10 @@ fn unpack_strips_an_inherited_acl_from_the_private_staging_dir() {
         .expect("chmod +a");
     assert!(add.success(), "could not add the inheritable test ACL");
     let stage = bin.join(".update-stage.acltest");
-    let res = unpack_tar_gz(&tarball_with_higgs(b"x", 0o755), &stage);
+    let res = unpack_tar_gz(
+        &mut std::fs::File::open(art_file(&bin, &tarball_with_higgs(b"x", 0o755))).unwrap(),
+        &stage,
+    );
     let acl = std::process::Command::new("/bin/ls")
         .arg("-lde")
         .arg(&stage)
@@ -1697,7 +1806,13 @@ fn stage_and_flip_refuses_a_non_flat_archive() {
     let m = local_manifest("2.0.0");
     let smoke = ok_smoke("higgs 2.0.0");
     assert!(matches!(
-        stage_and_flip(&bin, &m, &tarball_with_nested(), false, smoke.as_ref()),
+        stage_and_flip(
+            &bin,
+            &m,
+            &mut std::fs::File::open(art_file(&bin, &tarball_with_nested())).unwrap(),
+            false,
+            smoke.as_ref()
+        ),
         Err(HiggsError::UpdateApplyFailed { .. })
     ));
     assert_eq!(
@@ -1717,7 +1832,13 @@ fn stage_and_flip_cleans_up_after_a_failed_unpack() {
     let m = local_manifest("2.0.0");
     let smoke = ok_smoke("higgs 2.0.0");
     assert!(matches!(
-        stage_and_flip(&bin, &m, b"not a gzip tarball", false, smoke.as_ref()),
+        stage_and_flip(
+            &bin,
+            &m,
+            &mut std::fs::File::open(art_file(&bin, b"not a gzip tarball")).unwrap(),
+            false,
+            smoke.as_ref()
+        ),
         Err(HiggsError::UpdateApplyFailed { .. })
     ));
     let litter: Vec<_> = std::fs::read_dir(&bin)
@@ -1750,7 +1871,7 @@ fn stage_and_flip_cleans_up_a_stage_tree_with_a_restrictive_dir_mode() {
         stage_and_flip(
             &bin,
             &m,
-            &tarball_with_a_restrictive_dir(),
+            &mut std::fs::File::open(art_file(&bin, &tarball_with_a_restrictive_dir())).unwrap(),
             false,
             smoke.as_ref()
         ),
@@ -1800,7 +1921,14 @@ fn stage_and_flip_records_no_prev_on_a_first_install() {
     let art = tarball_with_higgs(b"first", 0o755);
     let m = local_manifest("1.0.0");
     let smoke = ok_smoke("higgs 1.0.0");
-    stage_and_flip(&bin, &m, &art, false, smoke.as_ref()).unwrap();
+    stage_and_flip(
+        &bin,
+        &m,
+        &mut std::fs::File::open(art_file(&bin, &art)).unwrap(),
+        false,
+        smoke.as_ref(),
+    )
+    .unwrap();
     assert_eq!(current_target(&bin), Some("v1.0.0".to_string()));
     let raw = std::fs::read(bin.join(".update-trial")).unwrap();
     let marker: TrialMarker = serde_json::from_slice(&raw).unwrap();
@@ -1839,7 +1967,7 @@ fn verify_and_check_refuses_a_wrong_version_manifest_before_fetching_the_artifac
         fn manifest(&self) -> Result<(Vec<u8>, String), HiggsError> {
             Ok((self.0.clone(), self.1.clone()))
         }
-        fn artifact(&self, _f: &str) -> Result<Vec<u8>, HiggsError> {
+        fn artifact_to(&self, _f: &str, _spool: &mut ArtifactSpool) -> Result<(), HiggsError> {
             panic!("must not fetch the artifact when the manifest is for a different version");
         }
     }
@@ -1847,9 +1975,11 @@ fn verify_and_check_refuses_a_wrong_version_manifest_before_fetching_the_artifac
     let table: Vec<(&str, &str)> = vec![("test-key", pk_b64.as_str())];
     let running = BuildIdentity::current();
     let mut authenticated = None;
+    let spool_dir = tempfile::tempdir().unwrap();
     let err = verify_and_check_with(
         &Signed(manifest_bytes, sig),
         &running,
+        spool_dir.path(),
         false,
         &mut authenticated,
         Some("8.8.8"),
@@ -1880,12 +2010,21 @@ fn verify_and_check_fails_closed_on_an_unverifiable_signature() {
                 "untrusted comment: x\nAAAA\n".to_string(),
             ))
         }
-        fn artifact(&self, _f: &str) -> Result<Vec<u8>, HiggsError> {
+        fn artifact_to(&self, _f: &str, _spool: &mut ArtifactSpool) -> Result<(), HiggsError> {
             panic!("must not fetch the artifact when the manifest fails to verify");
         }
     }
     let running = BuildIdentity::current();
-    let err = verify_and_check(&AnyBytes, &running, false, &mut None, None).unwrap_err();
+    let spool_dir = tempfile::tempdir().unwrap();
+    let err = verify_and_check(
+        &AnyBytes,
+        &running,
+        spool_dir.path(),
+        false,
+        &mut None,
+        None,
+    )
+    .unwrap_err();
     assert!(
         matches!(err, HiggsError::UpdateSignatureInvalid { .. }),
         "expected HG082 fail-closed, got {err:?}"
@@ -1974,7 +2113,7 @@ fn local_source_reads_the_three_files() {
     let (mb, sig) = src.manifest().unwrap();
     assert_eq!(mb, br#"{"schema":1}"#);
     assert_eq!(sig, "sig-text");
-    assert_eq!(src.artifact("ignored").unwrap(), b"tarbytes");
+    assert_eq!(spool_artifact(&src, "ignored").unwrap(), b"tarbytes");
 }
 
 #[test]
@@ -1990,7 +2129,7 @@ fn local_source_errors_on_a_missing_manifest() {
         Err(HiggsError::UpdateApplyFailed { .. })
     ));
     assert!(matches!(
-        src.artifact("x"),
+        spool_artifact(&src, "x"),
         Err(HiggsError::UpdateApplyFailed { .. })
     ));
 }
@@ -2034,7 +2173,10 @@ fn push_source_artifact_fetches_when_the_url_names_the_manifest_file() {
     let manifest_url = spawn_loopback_http(b"", b"", b"THE-ARTIFACT", 1);
     let artifact_url = manifest_url.replace("higgs.manifest", "higgs.tar.gz");
     let src = push_source_over_loopback(&artifact_url);
-    assert_eq!(src.artifact("higgs.tar.gz").unwrap(), b"THE-ARTIFACT");
+    assert_eq!(
+        spool_artifact(&src, "higgs.tar.gz").unwrap(),
+        b"THE-ARTIFACT"
+    );
 }
 
 #[test]
@@ -2133,8 +2275,7 @@ fn push_source_refuses_a_url_that_does_not_name_the_manifest_file() {
     // (last path segment must match), refusing an arbitrary endpoint BEFORE any GET. (Loopback
     // client used only so the mismatch is what fails, not `new`'s address vet.)
     let src = push_source_over_loopback("http://127.0.0.1:9/state-changing-get");
-    let err = src
-        .artifact("higgs.tar.gz")
+    let err = spool_artifact(&src, "higgs.tar.gz")
         .expect_err("a URL that does not name the manifest file is refused");
     assert!(
         err.to_string()
@@ -2491,7 +2632,7 @@ fn http_source_fetches_manifest_sig_and_artifact() {
     assert_eq!(m, b"THE-MANIFEST");
     assert_eq!(sig, "THE-SIG");
     // artifact() derives the sibling URL from the manifest's `file` field.
-    let a = src.artifact("higgs.tar.gz").unwrap();
+    let a = spool_artifact(&src, "higgs.tar.gz").unwrap();
     assert_eq!(a, b"THE-ARTIFACT");
 }
 
@@ -2957,7 +3098,16 @@ fn version_source_fetches_but_garbage_fails_the_signature_closed() {
     let (_l, base) = serve_loopback("200 OK", b"not a manifest");
     let source = VersionSource::new(&base, "9.9.9").expect("source");
     let running = BuildIdentity::current();
-    let err = verify_and_check(&source, &running, false, &mut None, Some("9.9.9")).unwrap_err();
+    let spool_dir = tempfile::tempdir().unwrap();
+    let err = verify_and_check(
+        &source,
+        &running,
+        spool_dir.path(),
+        false,
+        &mut None,
+        Some("9.9.9"),
+    )
+    .unwrap_err();
     assert!(
         matches!(err, HiggsError::UpdateSignatureInvalid { .. }),
         "got {err:?}"
@@ -3075,4 +3225,191 @@ fn smoke_run_failure_reports_the_loader_diagnosis() {
 fn classify_smoke_stderr_survives_multibyte_near_the_window_edge() {
     let s = format!("GLIBC_{}é not found", "x".repeat(39));
     let _ = classify_smoke_stderr(&s);
+}
+
+// ── ArtifactSpool (streamed, hashed, capped, self-cleaning) ────────────────
+
+#[test]
+fn spool_hashes_what_it_writes_and_cleans_up_on_drop() {
+    use sha2::Digest as _;
+    let dir = tempfile::tempdir().unwrap();
+    let mut spool = ArtifactSpool::create_in(dir.path(), 1024).unwrap();
+    spool.write_chunk(b"hello ").unwrap();
+    spool.write_chunk(b"world").unwrap();
+    let digest = spool.finish().unwrap();
+    let expected: String = sha2::Sha256::digest(b"hello world")
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(digest, expected, "incremental digest must equal one-shot");
+    assert_eq!(std::fs::read(spool.path()).unwrap(), b"hello world");
+    let path = spool.path().to_path_buf();
+    drop(spool);
+    assert!(!path.exists(), "spool file must be deleted on drop");
+}
+
+#[test]
+fn spool_refuses_over_cap_mid_stream() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut spool = ArtifactSpool::create_in(dir.path(), 8).unwrap();
+    spool.write_chunk(b"12345678").unwrap();
+    let err = spool.write_chunk(b"9").unwrap_err();
+    assert!(
+        err.to_string().contains("exceeds the 8-byte cap"),
+        "got {err}"
+    );
+}
+
+/// A sha256 mismatch after a fully-streamed artifact must fail HG084 AND leave no
+/// spool file behind (the VerifiedUpdate is never constructed; Drop cleans up).
+#[test]
+fn streamed_artifact_sha_mismatch_fails_and_leaves_no_spool() {
+    let dir = tempfile::tempdir().unwrap();
+    struct WrongBytes;
+    impl UpdateSource for WrongBytes {
+        fn manifest(&self) -> Result<(Vec<u8>, String), HiggsError> {
+            unreachable!("manifest handled by the _with test harness")
+        }
+        fn artifact_to(&self, _f: &str, spool: &mut ArtifactSpool) -> Result<(), HiggsError> {
+            spool.write_chunk(b"not the signed bytes")
+        }
+    }
+    // Drive just the artifact+sha leg the way verify_and_check does.
+    let manifest = UpdateManifest {
+        schema: crate::update::UPDATE_MANIFEST_SCHEMA,
+        version: "9.9.9".into(),
+        file: "higgs.tar.gz".into(),
+        target: "t".into(),
+        variant: "v".into(),
+        sha256: "00".repeat(32),
+        commit: String::new(),
+    };
+    let mut spool = ArtifactSpool::create_in(dir.path(), 1024).unwrap();
+    WrongBytes.artifact_to(&manifest.file, &mut spool).unwrap();
+    let digest = spool.finish().unwrap();
+    let path = spool.path().to_path_buf();
+    let err = crate::update::verify_artifact_sha256_hex(&manifest, &digest).unwrap_err();
+    assert!(
+        matches!(err, HiggsError::UpdateArtifactMismatch { .. }),
+        "got {err:?}"
+    );
+    drop(spool);
+    assert!(!path.exists(), "failed download must leave no spool file");
+}
+
+#[test]
+fn artifact_window_stalled_is_throughput_based() {
+    use std::time::Duration;
+    // Window not yet closed → never stalled, however few bytes.
+    assert!(!artifact_window_stalled(Duration::from_secs(59), 0));
+    // Window closed with a drip (under 64 KiB) → stalled.
+    assert!(artifact_window_stalled(Duration::from_secs(60), 1024));
+    // Window closed with real progress → not stalled.
+    assert!(!artifact_window_stalled(Duration::from_secs(60), 64 * 1024));
+}
+
+#[test]
+fn sweep_stale_spools_removes_only_old_artifacts() {
+    let dir = tempfile::tempdir().unwrap();
+    let stale = dir.path().join(".update-artifact.deadbeef");
+    let fresh = dir.path().join(".update-artifact.cafebabe");
+    let unrelated = dir.path().join("v1.2.3");
+    std::fs::write(&stale, b"x").unwrap();
+    std::fs::write(&fresh, b"y").unwrap();
+    std::fs::write(&unrelated, b"z").unwrap();
+    // Age the stale one two days back.
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(48 * 60 * 60);
+    let f = std::fs::File::options().write(true).open(&stale).unwrap();
+    f.set_modified(old).unwrap();
+    drop(f);
+    sweep_stale_spools(dir.path());
+    assert!(!stale.exists(), "48h-old spool must be swept");
+    assert!(fresh.exists(), "fresh spool must survive (live download)");
+    assert!(unrelated.exists(), "non-spool files untouched");
+}
+
+/// END-TO-END streamed pipeline, network-free: a REAL signed manifest over a
+/// LocalSource with a REAL tarball → verify_and_check (streams to the spool,
+/// hashes incrementally, compares to the authenticated manifest) →
+/// stage_and_flip consuming the SAME verified fd (rewound) → `current` flipped
+/// and the published binary's bytes are the tarball's. Then the spool file is
+/// gone. This is the proof the streaming path works whole, not per-piece.
+#[test]
+fn streamed_update_pipeline_end_to_end_verifies_stages_and_flips() {
+    use sha2::Digest as _;
+    use std::io::Cursor;
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = install_layout(tmp.path(), "1.0.0");
+
+    // A real multi-chunk artifact (~1 MiB — several 64 KiB reads) so the spool
+    // reassembles and hashes across chunk boundaries.
+    let payload: Vec<u8> = (0..1_000_000u32).map(|i| (i % 251) as u8).collect();
+    let art = tarball_with_higgs(&payload, 0o755);
+    let sha: String = sha2::Sha256::digest(&art)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+
+    let minisign::KeyPair { pk, sk } =
+        minisign::KeyPair::generate_unencrypted_keypair().expect("keygen");
+    let manifest_bytes = serde_json::to_vec(&serde_json::json!({
+        "schema": 1,
+        "version": "2.0.0",
+        "commit": "c0ffee0000000000000000000000000000000000",
+        "file": "higgs-v2.0.0.tar.gz",
+        "target": env!("HIGGS_BUILD_TARGET"),
+        "variant": CURRENT_VARIANT,
+        "sha256": sha,
+    }))
+    .unwrap();
+    let sig = minisign::sign(None, &sk, Cursor::new(&manifest_bytes), None, None)
+        .expect("sign")
+        .into_string();
+
+    let manifest_path = tmp.path().join("m.manifest");
+    let sig_path = tmp.path().join("m.manifest.minisig");
+    let tar_path = tmp.path().join("higgs-v2.0.0.tar.gz");
+    std::fs::write(&manifest_path, &manifest_bytes).unwrap();
+    std::fs::write(&sig_path, &sig).unwrap();
+    std::fs::write(&tar_path, &art).unwrap();
+    let source = LocalSource {
+        manifest: manifest_path,
+        manifest_sig: sig_path,
+        tarball: tar_path,
+    };
+
+    let pk_b64 = pk.to_base64();
+    let table: Vec<(&str, &str)> = vec![("test-key", pk_b64.as_str())];
+    let running = installed_identity(&bin);
+    let mut verified = verify_and_check_with(
+        &source,
+        &running,
+        &bin,
+        false,
+        &mut None,
+        Some("2.0.0"),
+        &table,
+    )
+    .expect("streamed verify must succeed");
+    let spool_path = verified.artifact.path().to_path_buf();
+    assert!(spool_path.exists(), "spool file present after verify");
+
+    let smoke = ok_smoke("higgs 2.0.0");
+    stage_and_flip(
+        &bin,
+        &verified.manifest.clone(),
+        verified.artifact.reader().unwrap(),
+        false,
+        smoke.as_ref(),
+    )
+    .expect("stage from the verified fd must succeed");
+
+    assert_eq!(current_target(&bin), Some("v2.0.0".to_string()));
+    assert_eq!(
+        std::fs::read(bin.join("v2.0.0/higgs")).unwrap(),
+        payload,
+        "published binary must be byte-identical to the tarball payload"
+    );
+    drop(verified);
+    assert!(!spool_path.exists(), "spool cleaned up after the pipeline");
 }
