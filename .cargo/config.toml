@@ -19,6 +19,8 @@ SDKROOT = "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/
 # without it the C/C++ objects target the host SDK while Rust links for its
 # 11.0 default, and ld64 prints a "newer than target minimum" warning per
 # object file. Matches release.yml's shipped floor. cargo [env] only applies
-# when the var is ABSENT, so a shell override still wins.
+# when the var is ABSENT, so a shell override still wins. Note: a dev machine
+# on macOS < 14 would build binaries its own dyld refuses — all current dev/
+# fleet machines run >= 14.
 MACOSX_DEPLOYMENT_TARGET = "14.0"
 BINDGEN_EXTRA_CLANG_ARGS = "--target=arm64-apple-darwin -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
