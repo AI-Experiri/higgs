@@ -29,6 +29,17 @@ from it.
   loading the connection. Groundwork for per-node log terminals in the
   jigglebot Fleet tab.
 
+### Fixed
+
+- **Fleet updates to CUDA nodes** [HG088]: the update artifact was downloaded
+  into memory under a 256 MiB cap, refusing the ~650 MiB Linux CUDA tarball —
+  every hub-pushed update to a CUDA node failed. Artifacts now stream to disk
+  with the sha256 computed as bytes land (no memory spike at any size), are
+  unpacked from the very file handle the hash covered, and slow links are
+  tolerated (throughput-based stall guard instead of a fixed 10-minute clock).
+  (This fix was authored for beta.7 but was stranded on the beta.6 release
+  branch by a merge race — beta.7/beta.8 shipped without it.)
+
 ## [0.1.0-beta.7] - 2026-08-10
 
 ## [0.1.0-beta.6] - 2026-08-10
