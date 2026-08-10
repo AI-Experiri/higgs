@@ -254,6 +254,13 @@ jobs:
               echo "BINDGEN_EXTRA_CLANG_ARGS=--target=arm64-apple-darwin -isysroot $sdk"
               echo "RUSTFLAGS="
               echo "OpenMP_ROOT=$(brew --prefix libomp)"
+              # THE supported macOS floor for shipped binaries. Both rustc and the
+              # C/C++ FFI build (cc/cmake) honor this, so the whole binary agrees:
+              # an older macOS then REFUSES to launch it with a clear "requires
+              # macOS 14.0" instead of a dyld symbol crash deep in llama.cpp code
+              # compiled against the runner's newer SDK. Bump deliberately, never
+              # implicitly via a runner image change.
+              echo "MACOSX_DEPLOYMENT_TARGET=14.0"
             } >> "$GITHUB_ENV"
           else
             # Neutralize the macOS-only [env] from .cargo/config.toml on Linux:

@@ -19,6 +19,17 @@ from it.
 
 ## [Unreleased]
 
+## [0.1.0-beta.6] - 2026-08-10
+
+### Added
+
+- **Incompatible-binary diagnosis**: self-update's smoke gate and `install.sh`
+  (which now smoke-runs the staged binary BEFORE flipping `current`) report
+  loader deaths in plain language — "requires a NEWER macOS" / "requires a
+  NEWER glibc" with the loader's own line quoted — instead of a bare exit
+  status. macOS release binaries now declare their supported floor
+  (macOS 14.0), so an older Mac refuses launch cleanly instead of crashing.
+
 ## [0.1.0-beta.5] - 2026-08-08
 
 ### Fixed
