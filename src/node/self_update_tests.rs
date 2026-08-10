@@ -3018,3 +3018,61 @@ fn apply_version_update_refuses_while_another_update_holds_the_lock() {
         "got {err}"
     );
 }
+
+#[test]
+fn classify_smoke_stderr_names_the_os_incompatibility() {
+    // macOS loader signatures → "requires a NEWER macOS".
+    for s in [
+        "dyld[123]: Symbol not found: _os_feature_enabled\n  Referenced from: higgs",
+        "dyld[9]: Library not loaded: /usr/lib/swift/libswiftCore.dylib",
+        "dyld: higgs (which was built for macOS 26.5) cannot run on 12.6",
+    ] {
+        let d = classify_smoke_stderr(s).expect("macOS signature classified");
+        assert!(d.contains("NEWER macOS"), "{d}");
+    }
+    // Linux loader signature → "requires a NEWER glibc".
+    let d = classify_smoke_stderr(
+        "higgs: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.38' not found (required by higgs)",
+    )
+    .expect("glibc signature classified");
+    assert!(d.contains("NEWER glibc"), "{d}");
+    // Unrelated crashes stay unclassified — no false diagnosis.
+    assert_eq!(
+        classify_smoke_stderr("thread 'main' panicked at src/x.rs"),
+        None
+    );
+    assert_eq!(classify_smoke_stderr(""), None);
+}
+
+/// A staged binary that dies in the loader must surface the LOADER's stderr and
+/// the classified "requires newer OS" diagnosis — not a bare exit status.
+/// (Simulated with a script that prints a dyld-shaped refusal and exits nonzero;
+/// smoke_run cannot tell a real loader death from this.)
+#[test]
+fn smoke_run_failure_reports_the_loader_diagnosis() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let bin = dir.path().join("higgs");
+    std::fs::write(
+        &bin,
+        "#!/bin/sh\necho 'dyld[42]: Symbol not found: _newer_api' >&2\nexit 1\n",
+    )
+    .unwrap();
+    let mut perm = std::fs::metadata(&bin).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
+    std::fs::set_permissions(&bin, perm).unwrap();
+
+    let err = smoke_run(&bin).unwrap_err().to_string();
+    assert!(err.contains("NEWER macOS"), "diagnosis missing: {err}");
+    assert!(
+        err.contains("Symbol not found"),
+        "loader line missing: {err}"
+    );
+}
+
+/// A multibyte character straddling the 40-byte adjacency window must not
+/// panic the classifier (byte-slicing a UTF-8 string mid-char does).
+#[test]
+fn classify_smoke_stderr_survives_multibyte_near_the_window_edge() {
+    let s = format!("GLIBC_{}é not found", "x".repeat(39));
+    let _ = classify_smoke_stderr(&s);
+}
