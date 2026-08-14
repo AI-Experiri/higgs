@@ -78,6 +78,10 @@ fn main() {
             )
         })
     };
+    // Register the SAME bus as the process-global before it moves into the layer:
+    // the node daemon's NodeRuntime picks it up so its own tracing (the Serve ring)
+    // is what M_NODE_LOGS serves to the hub.
+    higgs::LogBus::install_global(log_bus.clone());
     tracing_subscriber::registry()
         .with(higgs::HiggsLogLayer::new(log_bus).with_filter(higgs::log_filter()))
         .with(tracing_subscriber::fmt::layer().with_filter(env()))

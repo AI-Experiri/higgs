@@ -71,6 +71,7 @@ async fn add_node_with_identity_sets_the_build_identity_atomically() {
             Some("metal".to_string()),
             true,
             true,
+            true,
         )
         .await;
 
@@ -893,6 +894,7 @@ fn inventory_age_is_the_max_of_both_clocks_from_the_pull_start_stamp() {
         variants: HashMap::new(),
         update_capable: std::collections::HashSet::new(),
         version_capable: std::collections::HashSet::new(),
+        log_capable: std::collections::HashSet::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
         fallback_inflight: HashMap::new(),
@@ -941,6 +943,7 @@ fn inventory_age_is_the_max_of_both_clocks_from_the_pull_start_stamp() {
         variants: HashMap::new(),
         update_capable: std::collections::HashSet::new(),
         version_capable: std::collections::HashSet::new(),
+        log_capable: std::collections::HashSet::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
         fallback_inflight: HashMap::new(),
@@ -1009,6 +1012,7 @@ async fn readmission_strips_the_previous_process_snapshot_seq() {
         variants: HashMap::new(),
         update_capable: std::collections::HashSet::new(),
         version_capable: std::collections::HashSet::new(),
+        log_capable: std::collections::HashSet::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
         fallback_inflight: HashMap::new(),
@@ -1071,6 +1075,7 @@ async fn older_started_pull_never_overwrites_a_newer_snapshot() {
         variants: HashMap::new(),
         update_capable: std::collections::HashSet::new(),
         version_capable: std::collections::HashSet::new(),
+        log_capable: std::collections::HashSet::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
         fallback_inflight: HashMap::new(),
@@ -1320,6 +1325,7 @@ fn served_ids_are_collision_free_even_when_a_model_name_clashes_with_a_suffix() 
         variants: HashMap::new(),
         update_capable: std::collections::HashSet::new(),
         version_capable: std::collections::HashSet::new(),
+        log_capable: std::collections::HashSet::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
         fallback_inflight: HashMap::new(),
@@ -1527,6 +1533,7 @@ async fn pushed_worker_snapshot_merges_under_the_seq_guard() {
         variants: HashMap::new(),
         update_capable: std::collections::HashSet::new(),
         version_capable: std::collections::HashSet::new(),
+        log_capable: std::collections::HashSet::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
         fallback_inflight: HashMap::new(),
@@ -2048,6 +2055,7 @@ async fn a_pre_cache_push_is_retained_and_replayed_over_an_older_pull() {
         variants: HashMap::new(),
         update_capable: std::collections::HashSet::new(),
         version_capable: std::collections::HashSet::new(),
+        log_capable: std::collections::HashSet::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
         fallback_inflight: HashMap::new(),
@@ -2175,6 +2183,7 @@ async fn a_stale_fallback_owner_stands_down_before_pulling() {
         variants: HashMap::new(),
         update_capable: std::collections::HashSet::new(),
         version_capable: std::collections::HashSet::new(),
+        log_capable: std::collections::HashSet::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
         fallback_inflight: HashMap::new(),
@@ -2645,6 +2654,7 @@ async fn a_reused_worker_id_does_not_lend_its_domain_to_a_stale_route() {
         variants: HashMap::new(),
         update_capable: std::collections::HashSet::new(),
         version_capable: std::collections::HashSet::new(),
+        log_capable: std::collections::HashSet::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
         fallback_inflight: HashMap::new(),
@@ -2762,6 +2772,7 @@ async fn a_stale_inventory_row_does_not_unadvertise_a_reused_worker_id() {
         variants: HashMap::new(),
         update_capable: std::collections::HashSet::new(),
         version_capable: std::collections::HashSet::new(),
+        log_capable: std::collections::HashSet::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
         fallback_inflight: HashMap::new(),
@@ -2984,4 +2995,136 @@ fn offline_help_unrecognized_os_still_consults_the_target_triple() {
         lines.join("\n").contains("Local Network"),
         "an apple-darwin build with an aliased os string still gets the macOS hint"
     );
+}
+
+/// The log-watch registry end-to-end over real iroh (fail-on-revert for the
+/// refcount/teardown protocol): the first watcher opens the stream and gets the
+/// snapshot; a second watcher SHARES it; dropping one keeps it alive; dropping
+/// the LAST tears it down node-side (a line pushed after teardown never reaches
+/// the hub); a fresh watch then starts a NEW stream whose snapshot includes
+/// that line. Reverting the guard-drop teardown (or the refcount) fails the
+/// after-teardown assertion; reverting subscribe-before-spawn can fail the
+/// first watcher's live assertions.
+#[tokio::test]
+async fn log_watch_registry_shares_streams_and_tears_down_on_last_drop() {
+    use crate::log_bus::{LogLine, LogSource};
+    let (root, _model_id) = stage_dummy_model("higgs-test/logwatch");
+    let hub = local_endpoint().await;
+    let node = local_endpoint().await;
+    let hub_addr = hub.addr();
+    let node_key = node.id().to_string();
+    let rt = Arc::new(fake_runtime(vec![root.path().to_path_buf()]));
+    rt.bus().push(LogSource::Serve, "boot line".into());
+    let rt_node = rt.clone();
+    tokio::spawn(async move {
+        let node_conn = node.connect(hub_addr, ALPN).await.expect("connect");
+        serve_node(node_conn, rt_node).await;
+    });
+    let conn = hub.accept().await.expect("incoming").await.expect("conn");
+    std::mem::forget(hub);
+
+    let bus = Arc::new(crate::log_bus::LogBus::new());
+    let fleet = Arc::new(HubFleet::new(bus.clone()));
+    fleet
+        .add_node_with_identity(
+            node_key.clone(),
+            Arc::new(NodeTransport::new(conn)),
+            None,
+            None,
+            None,
+            false,
+            None,
+            true,
+            Some("t".to_string()),
+            Some("v".to_string()),
+            true,
+            true,
+            true, // log_capable
+        )
+        .await;
+
+    // Helper: wait until the hub bus's RemoteNode ring for this node contains `needle`.
+    async fn wait_for_line(
+        bus: &crate::log_bus::LogBus,
+        node: crate::node::node_id::NodeId,
+        needle: &str,
+    ) -> bool {
+        for _ in 0..100 {
+            let snap = bus.snapshot(100, Some(LogSource::RemoteNode { node }));
+            if snap.iter().any(|l| l.contains(needle)) {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    // First watcher: opens the stream; the snapshot line lands in the hub bus.
+    let w1 = fleet
+        .watch_node_logs(&node_key, 50)
+        .await
+        .expect("first watch");
+    let node_id = w1.node;
+    assert!(
+        wait_for_line(&bus, node_id, "boot line").await,
+        "first watcher must land the snapshot in the hub bus"
+    );
+
+    // Second watcher SHARES the stream (no error, same node id).
+    let w2 = fleet
+        .watch_node_logs(&node_key, 50)
+        .await
+        .expect("second watch shares");
+    assert_eq!(w2.node, node_id);
+
+    // Dropping ONE watcher keeps the stream alive: a live line still arrives.
+    drop(w1);
+    rt.bus().push(LogSource::Serve, "still watched".into());
+    assert!(
+        wait_for_line(&bus, node_id, "still watched").await,
+        "one remaining watcher must keep the stream alive"
+    );
+
+    // Dropping the LAST watcher tears the stream down node-side: a line pushed
+    // afterwards must NOT reach the hub bus.
+    drop(w2);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await; // let teardown land
+    rt.bus().push(LogSource::Serve, "after teardown".into());
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let snap = bus.snapshot(100, Some(LogSource::RemoteNode { node: node_id }));
+    assert!(
+        !snap.iter().any(|l| l.contains("after teardown")),
+        "no watcher ⇒ no bytes cross iroh: {snap:?}"
+    );
+
+    // A FRESH watch starts a new stream; its snapshot includes the missed line.
+    let w3 = fleet
+        .watch_node_logs(&node_key, 50)
+        .await
+        .expect("fresh watch after teardown");
+    assert!(
+        wait_for_line(&bus, node_id, "after teardown").await,
+        "a new watch re-snapshots history including lines missed while off"
+    );
+    // Its live receiver also works end-to-end.
+    let mut rx = w3.rx;
+    rt.bus().push(LogSource::Serve, "live again".into());
+    let mut got_live = false;
+    for _ in 0..100 {
+        match rx.try_recv() {
+            Ok(LogLine {
+                source: LogSource::RemoteNode { node },
+                text,
+            }) if node == node_id && text == "live again" => {
+                got_live = true;
+                break;
+            }
+            Ok(_) => continue,
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            Err(e) => panic!("watch rx died: {e:?}"),
+        }
+    }
+    assert!(got_live, "live line must reach the watcher's receiver");
 }

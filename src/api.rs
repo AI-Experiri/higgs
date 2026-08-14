@@ -2722,6 +2722,7 @@ impl Higgs {
             connected: true,
             // The local instance updates itself locally — a hub version-push never targets it.
             update_by_version: false,
+            node_logs: false,
             // The local card is always "connected" — there is nothing to troubleshoot.
             offline_help: Vec::new(),
             is_local: true,

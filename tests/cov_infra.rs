@@ -718,10 +718,15 @@ async fn log_bus_parse_and_matches() {
         }
         other => panic!("node:1:2 → RemoteWorker, got {other:?}"),
     }
+    // `node:<id>` (no worker part) = that node's own DAEMON log (M_NODE_LOGS).
+    match LogSource::parse("node:1") {
+        Some(LogSource::RemoteNode { node }) => assert_eq!(node.0, 1),
+        other => panic!("node:1 → RemoteNode, got {other:?}"),
+    }
     // Unknown / malformed selectors → None (all sources).
     assert_eq!(LogSource::parse("bogus"), None);
     assert_eq!(LogSource::parse("worker:nan"), None);
-    assert_eq!(LogSource::parse("node:1"), None);
+    assert_eq!(LogSource::parse("node:x"), None);
     assert_eq!(LogSource::parse("node:x:2"), None);
 
     // The `worker` filter is the UNION selector: it matches keyed local workers too.

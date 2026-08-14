@@ -215,9 +215,14 @@ fn parses_remote_node_source_selector() {
             worker: WorkerId(2)
         })
     );
+    // `node:<id>` without a worker part is the node's own DAEMON log (M_NODE_LOGS).
+    assert_eq!(
+        LogSource::parse("node:1"),
+        Some(LogSource::RemoteNode { node: NodeId(1) })
+    );
     // Malformed selectors fall back to "all sources" (None).
-    assert_eq!(LogSource::parse("node:1"), None);
     assert_eq!(LogSource::parse("node:x:2"), None);
+    assert_eq!(LogSource::parse("node:x"), None);
     assert_eq!(LogSource::parse("bogus"), None);
 }
 
@@ -514,4 +519,49 @@ fn evict_local_reclaims_a_dead_workers_ring() {
     assert!(bus.snapshot(10, Some(w)).is_empty());
     // Idempotent on a never-logged / already-evicted worker.
     bus.evict_local(WorkerId(7));
+}
+
+#[test]
+fn remote_node_source_parses_snapshots_and_evicts() {
+    use crate::node::node_id::NodeId;
+    // `node:<id>` (no worker part) selects a node's own DAEMON log.
+    assert_eq!(
+        LogSource::parse("node:7"),
+        Some(LogSource::RemoteNode { node: NodeId(7) })
+    );
+    // The worker form still parses as before.
+    assert!(matches!(
+        LogSource::parse("node:7:3"),
+        Some(LogSource::RemoteWorker { .. })
+    ));
+    let bus = LogBus::new();
+    let n7 = LogSource::RemoteNode { node: NodeId(7) };
+    let n8 = LogSource::RemoteNode { node: NodeId(8) };
+    bus.push(n7, "seven says hi".into());
+    bus.push(n8, "eight says hi".into());
+    assert_eq!(bus.snapshot(10, Some(n7)), vec!["seven says hi"]);
+    // Unfiltered snapshot interleaves the daemon rings too.
+    assert_eq!(bus.snapshot(10, None).len(), 2);
+    // Retire eviction clears the node's daemon ring alongside its worker rings.
+    bus.evict_node(NodeId(7));
+    assert!(bus.snapshot(10, Some(n7)).is_empty());
+    assert_eq!(bus.snapshot(10, Some(n8)), vec!["eight says hi"]);
+}
+
+/// A WORKER token flood must never lag (or drop lines from) the SERVE-only
+/// subscription — the daemon-log stream's isolation guarantee. (On the shared
+/// broadcast this fails: worker pushes advance every subscriber's cursor.)
+#[test]
+fn worker_floods_do_not_lag_the_serve_subscription() {
+    let bus = LogBus::new();
+    let mut serve_rx = bus.subscribe_serve();
+    // Overrun the shared channel capacity many times over with worker lines.
+    for i in 0..2048 {
+        bus.push(LogSource::Worker, format!("token {i}"));
+    }
+    bus.push(LogSource::Serve, "daemon: still crisp".into());
+    match serve_rx.try_recv() {
+        Ok(line) => assert_eq!(line, "daemon: still crisp"),
+        other => panic!("serve subscriber must see its line un-lagged, got {other:?}"),
+    }
 }
