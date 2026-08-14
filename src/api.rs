@@ -2825,6 +2825,39 @@ impl Higgs {
         self.local.bus().subscribe()
     }
 
+    /// Watch a REMOTE node's own DAEMON log live (`M_NODE_LOGS`): refcounted —
+    /// the first watcher opens the iroh follow stream; dropping the returned
+    /// handle tears it down when it is the last (no watcher ⇒ no log bytes
+    /// cross iroh). Read `handle.rx`, keeping lines whose source is
+    /// `LogSource::RemoteNode { node: handle.node }`. Hub mode off ⇒ HG027.
+    /// The LOCAL machine needs no watch — use [`Self::logs`]/
+    /// [`Self::subscribe_logs`] with a `Serve` filter.
+    pub async fn watch_node_logs(
+        &self,
+        endpoint_id: &str,
+        n: u64,
+    ) -> Result<crate::node::fleet::NodeLogWatch, HiggsError> {
+        let fleet = self.fleet().ok_or_else(|| HiggsError::NodeUnreachable {
+            endpoint_id: endpoint_id.to_string(),
+            detail: "hub mode is off".into(),
+        })?;
+        fleet.watch_node_logs(endpoint_id, n).await
+    }
+
+    /// One-shot last-`n` snapshot of a REMOTE node's daemon log (no standing
+    /// stream). Hub mode off ⇒ HG027.
+    pub async fn node_logs(
+        &self,
+        endpoint_id: &str,
+        n: u64,
+    ) -> Result<Vec<String>, HiggsError> {
+        let fleet = self.fleet().ok_or_else(|| HiggsError::NodeUnreachable {
+            endpoint_id: endpoint_id.to_string(),
+            detail: "hub mode is off".into(),
+        })?;
+        fleet.node_logs_snapshot(endpoint_id, n).await
+    }
+
     /// Subscribe to live model-load lifecycle events ([`ModelLoadEvent`]) pushed
     /// AFTER this call — formerly the source for the `/api/higgs/events` SSE
     /// endpoint; now the embedder's `watch_events` feed.
