@@ -127,6 +127,15 @@ must commit the regenerated TS).
 
 ## Commit discipline
 
+- **Release branches receive ZERO commits — ever.** EVERYTHING lands on
+  `develop` first: fixes, features, AND the version bump + changelog move. A
+  `release/v*` branch is purely a cut vehicle — branch off `main`, merge
+  `develop` in, PR to `main` — it is never committed to directly. A commit
+  born on a release branch merges nowhere and silently misses every future
+  release (this exact failure stranded the HG088 stream-to-disk fix on the
+  beta.6 branch; beta.7/beta.8 shipped without it). Before cutting, verify the
+  fixes the release claims are ancestors of `develop` (`git branch --contains
+  <sha>`); after the release merges, sync `develop` from `main`.
 - One logical unit per commit; conventional-commit subject.
 - End commit messages with the `Co-Authored-By` trailer.
 - Commit/push only when asked; branch off the default branch first if needed.
