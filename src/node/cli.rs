@@ -1199,26 +1199,46 @@ fn operator_can_exec(path: &Path, op: &Operator, euid: libc::uid_t) -> Result<bo
     };
     let deadline = std::time::Instant::now() + EXEC_PREFLIGHT_TIMEOUT;
     loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                reap_group(); // reap any descendants the child left behind
-                let _ = child.wait();
-                return Ok(status.success());
-            }
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    reap_group();
-                    let _ = child.kill(); // in case the group send raced setsid
-                    let _ = child.wait(); // reap the immediate child
-                    return Ok(false);
-                }
-                std::thread::sleep(std::time::Duration::from_millis(25));
-            }
-            Err(_) => {
-                reap_group();
-                return Ok(false);
-            }
+        // PEEK at the exit WITHOUT reaping (`WNOWAIT`): the leader must still
+        // be a zombie — its pid reserved — when the group SIGKILL below goes
+        // out. `try_wait` would reap first, freeing the pid for REUSE, and
+        // `kill(-pid)` could then blast an unrelated fresh process group
+        // (bit us as cross-test kills in parallel CI runs).
+        // SAFETY: waitid writes only into `info`; WNOHANG|WNOWAIT never blocks
+        // and never consumes the exit status.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+            )
+        };
+        if rc == -1 {
+            // ECHILD/EINVAL — nothing knowable to wait for; best-effort clean.
+            reap_group();
+            let _ = child.wait();
+            return Ok(false);
         }
+        // With WNOHANG, rc == 0 both when the child exited (si_pid == pid) and
+        // when it is still running (si_pid == 0).
+        #[cfg(target_os = "linux")]
+        let done = unsafe { info.si_pid() } == pid;
+        #[cfg(not(target_os = "linux"))]
+        let done = info.si_pid == pid;
+        if done {
+            reap_group(); // leader is a ZOMBIE here — pid cannot be reused yet
+            let status = child.wait(); // now reap, consuming the real status
+            return Ok(status.map(|s| s.success()).unwrap_or(false));
+        }
+        if std::time::Instant::now() >= deadline {
+            reap_group();
+            let _ = child.kill(); // in case the group send raced setsid
+            let _ = child.wait(); // reap the immediate child
+            return Ok(false);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
     }
 }
 
