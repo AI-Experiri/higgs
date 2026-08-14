@@ -144,6 +144,89 @@ impl NodeTransport {
         pull_read_loop(BufReader::new(recv), on_progress, PULL_STALL_TIMEOUT).await
     }
 
+    /// Fetch/stream the node's OWN DAEMON log (`M_NODE_LOGS`, the node.log lines —
+    /// never worker/model output). Every line (and `lagged` marker, rendered as a
+    /// visible `… <n> lines dropped` line) is handed to `on_line`; returns when the
+    /// node completes the reply (snapshot mode), errors, or — in `follow` mode —
+    /// when `stop` resolves (the watcher left: the recv stream is DROPPED, the node
+    /// sees `send.stopped()` and stops sending — hard teardown, no idle traffic).
+    /// No stall clock in follow mode: an idle log is healthy; connection death is
+    /// surfaced by the read erroring when QUIC closes.
+    pub async fn node_logs(
+        &self,
+        n: u64,
+        follow: bool,
+        on_line: &mut (dyn FnMut(String) + Send),
+        stop: std::pin::Pin<&mut (dyn std::future::Future<Output = ()> + Send)>,
+    ) -> Result<(), HiggsError> {
+        let id = self.alloc_id();
+        let open_and_send = async {
+            let (mut send, recv) = self.conn.open_bi().await.map_err(transport_dead)?;
+            let req = RpcRequest {
+                jsonrpc: "2.0".into(),
+                id,
+                method: crate::remote::M_NODE_LOGS.into(),
+                params: serde_json::json!({ "n": n, "follow": follow }),
+            };
+            write_frame(&mut send, &RpcFrame::Request(req))
+                .await
+                .map_err(transport_dead)?;
+            let _ = send.finish();
+            Ok::<_, HiggsError>(recv)
+        };
+        let recv = match tokio::time::timeout(CONTROL_RPC_TIMEOUT, open_and_send).await {
+            Ok(res) => res?,
+            Err(_) => {
+                return Err(transport_dead(format!(
+                    "node-logs open/send stalled: no stream in {}s",
+                    CONTROL_RPC_TIMEOUT.as_secs()
+                )))
+            }
+        };
+        let mut reader = BufReader::new(recv);
+        let read_loop = async {
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let read = reader
+                    .read_line(&mut line)
+                    .await
+                    .map_err(|e| transport_dead(format!("node-logs read: {e}")))?;
+                if read == 0 {
+                    // The happy path ALWAYS terminates on the final Response frame
+                    // (snapshot mode) or the `stop` future (follow mode); a bare EOF
+                    // is the stream closing BEFORE that completion. Treat it as an
+                    // error so a truncated snapshot isn't reported as whole and a
+                    // dropped follow surfaces its end reason to the console.
+                    return Err(transport_dead(
+                        "node-logs stream closed before its final response",
+                    ));
+                }
+                match rpc::decode(line.trim_end()) {
+                    Ok(RpcFrame::Notification(note))
+                        if note.method == crate::remote::N_NODE_LOG =>
+                    {
+                        if let Some(l) = note.params.get("line").and_then(Value::as_str) {
+                            on_line(l.to_string());
+                        } else if let Some(k) = note.params.get("lagged").and_then(Value::as_u64) {
+                            on_line(format!("… {k} lines dropped (stream lagging)"));
+                        }
+                    }
+                    Ok(RpcFrame::Response(resp)) => {
+                        return extract_result(crate::remote::M_NODE_LOGS, resp).map(|_| ());
+                    }
+                    _ => {} // unknown frames skipped (forward compat)
+                }
+            }
+        };
+        tokio::select! {
+            res = read_loop => res,
+            // Watcher gone: drop the stream (via return) — the node's
+            // `send.stopped()` fires and it stops streaming.
+            _ = stop => Ok(()),
+        }
+    }
+
     /// Relay a remote chat: open a data stream, send `M_CHAT`, and return the streamed
     /// deltas (`rx`) plus a future resolving to the final result. The hub uses the SAME
     /// value for the JSON-RPC `id` and `params.request_id` (codex), so the per-stream

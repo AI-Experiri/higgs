@@ -110,6 +110,10 @@ pub enum GateOutcome {
         /// own configured `release_url`. The hub must not send the version trigger to a node
         /// without it (such a node updates once via the installer/manifest push first).
         version_capable: bool,
+        /// Whether the node's HELLO advertised the `node_logs` capability — it serves its own
+        /// DAEMON log over `M_NODE_LOGS` on demand. The UI hides the live-logs toggle for a
+        /// node without it (a pre-capability build would method-not-found the request).
+        log_capable: bool,
     },
     /// Rejected; `code` is the HG diagnostic that explains why (logged at origin).
     Rejected { code: &'static str },
@@ -458,6 +462,7 @@ pub(crate) async fn gate_admit(
         // Capability map rule (same as fleet_events): only an explicit boolean `true` advertises
         // the self-update push handler.
         update_capable: hello.capabilities.get("update") == Some(&serde_json::Value::Bool(true)),
+        log_capable: hello.capabilities.get("node_logs") == Some(&serde_json::Value::Bool(true)),
         version_capable: hello.capabilities.get("update_by_version")
             == Some(&serde_json::Value::Bool(true)),
     }
@@ -768,6 +773,86 @@ pub async fn serve_node(conn: Connection, rt: std::sync::Arc<crate::node::runtim
 /// Node side: drain the runtime's per-worker log relay onto a uni stream to the hub as
 /// `N_LOG_LINE` notifications. Returns when the connection drops (the uni write fails) or
 /// the runtime's relay sender goes away. Best-effort: a lagged hub drops the gap.
+/// Serve one `M_NODE_LOGS` request on its bi-stream: the last-`n` DAEMON-log
+/// snapshot (`LogSource::Serve` lines — the node.log content, NEVER worker/model
+/// output) as [`N_NODE_LOG`] notifications, then — only with `follow: true` —
+/// live Serve lines until the hub stops reading (`send.stopped()`), the
+/// connection closes, or the bus goes away. Ends with a Response so a snapshot
+/// request gets a clean completion. Backpressure: the broadcast subscription is
+/// lossy — on lag a `{ "lagged": <n> }` marker frame is sent instead of the
+/// missed lines, so a log flood can never balloon memory or stall the QUIC
+/// connection; nothing here streams unless the hub explicitly asked.
+async fn relay_node_logs(
+    rt: &std::sync::Arc<crate::node::runtime::NodeRuntime>,
+    conn: &Connection,
+    send: &mut iroh::endpoint::SendStream,
+    req: crate::rpc::RpcRequest,
+) {
+    use crate::log_bus::LogSource;
+    let n = req
+        .params
+        .get("n")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(200)
+        .min(2000) as usize;
+    let follow = req
+        .params
+        .get("follow")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let bus = rt.bus().clone();
+    // Subscribe BEFORE the snapshot so no line can fall between them (a dup is
+    // possible instead and harmless for a log console). SERVE-ONLY channel: a
+    // worker token flood must not advance (and lag) this subscriber's cursor.
+    let mut live = bus.subscribe_serve();
+    async fn write_line(
+        send: &mut iroh::endpoint::SendStream,
+        params: serde_json::Value,
+    ) -> std::io::Result<()> {
+        let note = crate::rpc::RpcNotification {
+            jsonrpc: "2.0".into(),
+            method: crate::remote::N_NODE_LOG.into(),
+            params,
+        };
+        write_frame(send, &RpcFrame::Notification(note)).await
+    }
+    for line in bus.snapshot(n, Some(LogSource::Serve)) {
+        if write_line(send, serde_json::json!({ "line": line }))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+    if follow {
+        loop {
+            let msg = tokio::select! {
+                m = live.recv() => m,
+                _ = send.stopped() => return, // hub stopped watching — stop sending
+                _ = conn.closed() => return,
+            };
+            let params = match msg {
+                Ok(text) => serde_json::json!({ "line": text }),
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(k)) => {
+                    serde_json::json!({ "lagged": k })
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
+            if write_line(send, params).await.is_err() {
+                return;
+            }
+        }
+    }
+    // Clean completion (snapshot-only requests, or the bus closing under follow).
+    let resp = crate::rpc::RpcResponse {
+        jsonrpc: "2.0".into(),
+        id: req.id,
+        result: Some(serde_json::json!({ "ok": true })),
+        error: None,
+    };
+    let _ = write_frame(send, &RpcFrame::Response(resp)).await;
+}
+
 async fn relay_worker_logs(
     conn: Connection,
     rt: std::sync::Arc<crate::node::runtime::NodeRuntime>,
@@ -908,6 +993,12 @@ async fn handle_node_stream(
         if req.method == crate::remote::M_NODE_PULL {
             // DATA plane: download a GGUF into ~/.higgs/models/, streaming N_PROGRESS.
             crate::node::data::relay_pull(&conn, &mut send, req).await;
+            continue;
+        }
+        if req.method == crate::remote::M_NODE_LOGS {
+            // The node's OWN daemon log (Serve-ring lines) — snapshot + optional follow.
+            // Owns the stream until the hub stops reading or the connection drops.
+            relay_node_logs(&rt, &conn, &mut send, req).await;
             continue;
         }
         if req.method == crate::remote::M_NODE_UPDATE

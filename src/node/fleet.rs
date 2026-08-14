@@ -148,6 +148,12 @@ pub struct NodeView {
     /// and the local card (which is updated locally, not pushed).
     #[serde(default)]
     pub update_by_version: bool,
+    /// Whether this node's CURRENT connection can serve its own DAEMON log live
+    /// (`M_NODE_LOGS` — the node.log lines, never worker/model output). `false` for a
+    /// disconnected or pre-capability node; the UI hides the live-logs toggle then.
+    /// `serde(default)` keeps older frontends/payloads compatible.
+    #[serde(default)]
+    pub node_logs: bool,
     /// Operator troubleshooting steps for a DISCONNECTED node, computed hub-side from the
     /// platform the node last reported (inventory `os`, else the HELLO target triple) — e.g.
     /// the macOS Local Network permission is per-binary and a self-update installs a new
@@ -394,6 +400,8 @@ enum FleetMsg {
         update_capable: bool,
         /// Whether its HELLO advertised `update_by_version` (bare-version self-fetch trigger).
         version_capable: bool,
+        /// Whether its HELLO advertised `node_logs` (M_NODE_LOGS daemon-log serving).
+        log_capable: bool,
         #[allow(clippy::type_complexity)]
         reply: oneshot::Sender<Option<(NodeId, Option<Arc<NodeTransport>>)>>,
     },
@@ -684,6 +692,8 @@ struct FleetActor {
     /// Nodes whose CURRENT admission advertised `update_by_version`. Same lifecycle as
     /// `update_capable`: set atomically at admission, cleared at retire/re-admission.
     version_capable: HashSet<NodeKey>,
+    /// Nodes whose CURRENT admission advertised `node_logs` (M_NODE_LOGS daemon-log serving).
+    log_capable: HashSet<NodeKey>,
     /// Per-node lifecycle generation, bumped on every load/unload/kill/route-drop. A
     /// `refresh_inventory` only commits its (possibly stale) result if this is unchanged
     /// since it started — so a slow connect-time fetch can't clobber a newer state.
@@ -859,6 +869,7 @@ impl FleetActor {
         self.variants.remove(node);
         self.update_capable.remove(node);
         self.version_capable.remove(node);
+        self.log_capable.remove(node);
         self.pending_pushes.remove(node);
         self.fallback_inflight.remove(node);
         // Drop any chat-refresh debounce slot too: a retired node needs no
@@ -915,6 +926,7 @@ impl FleetActor {
                         )
                     },
                     update_by_version: connected && self.version_capable.contains(&endpoint_id),
+                    node_logs: connected && self.log_capable.contains(&endpoint_id),
                     // The fleet only tracks remote nodes; the local node is prepended by the serve
                     // layer. `label` is filled there from the allowlist (live, rename-aware).
                     is_local: false,
@@ -1093,6 +1105,7 @@ impl Actor for FleetActor {
                 variant,
                 update_capable,
                 version_capable,
+                log_capable,
                 reply,
             } => {
                 if matches!(gen, Some(g) if g != self.admit_gen) {
@@ -1194,6 +1207,11 @@ impl Actor for FleetActor {
                         self.version_capable.insert(node.clone());
                     } else {
                         self.version_capable.remove(&node);
+                    }
+                    if log_capable {
+                        self.log_capable.insert(node.clone());
+                    } else {
+                        self.log_capable.remove(&node);
                     }
                     let replaced = self.nodes.insert(node.clone(), transport);
                     // Announced HERE, atomic with the insert (T10 r4 #1) — a
@@ -1686,6 +1704,11 @@ pub struct HubFleet {
     /// the inventory cache when emitted) plus hub-local connect/drop/retire markers.
     /// No subscribers ⇒ sends are dropped no-ops.
     events_tx: tokio::sync::broadcast::Sender<FleetEvent>,
+    /// Live per-node daemon-log subscriptions (M_NODE_LOGS) — refcounted; empty
+    /// unless a UI watcher explicitly toggled a node's live logs on.
+    log_watchers: LogWatchMap,
+    /// Monotonic generation for log-watch tasks (stale-entry hygiene).
+    log_watch_gen: std::sync::atomic::AtomicU64,
 }
 
 impl HubFleet {
@@ -1696,6 +1719,7 @@ impl HubFleet {
         let bus_for_actor = bus.clone();
         let (events_tx, _) = tokio::sync::broadcast::channel(FLEET_EVENT_CAP);
         let events_for_actor = events_tx.clone();
+        let log_watchers: LogWatchMap = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let handle = spawn_actor(FleetActor {
             nodes: HashMap::new(),
             routes: HashMap::new(),
@@ -1710,6 +1734,7 @@ impl HubFleet {
             variants: HashMap::new(),
             update_capable: HashSet::new(),
             version_capable: HashSet::new(),
+            log_capable: HashSet::new(),
             versions: HashMap::new(),
             epochs: HashMap::new(),
             bus: bus_for_actor,
@@ -1723,6 +1748,8 @@ impl HubFleet {
             handle,
             bus,
             events_tx,
+            log_watchers,
+            log_watch_gen: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1802,6 +1829,7 @@ impl HubFleet {
             None,
             false,
             false,
+            false,
         )
         .await
     }
@@ -1827,6 +1855,7 @@ impl HubFleet {
         variant: Option<String>,
         update_capable: bool,
         version_capable: bool,
+        log_capable: bool,
     ) {
         self.admit_inner(
             node,
@@ -1841,6 +1870,7 @@ impl HubFleet {
             variant,
             update_capable,
             version_capable,
+            log_capable,
         )
         .await
     }
@@ -1860,6 +1890,7 @@ impl HubFleet {
         variant: Option<String>,
         update_capable: bool,
         version_capable: bool,
+        log_capable: bool,
     ) {
         // Atomically admit: assign the stable NodeId, insert the transport, record the build
         // identity, and bump the epoch in ONE actor message, gated by the admission generation. If
@@ -1881,6 +1912,7 @@ impl HubFleet {
                 variant,
                 update_capable,
                 version_capable,
+                log_capable,
                 reply,
             })
             .await
@@ -3104,3 +3136,223 @@ async fn read_node_notifications(
 #[cfg(test)]
 #[path = "fleet_tests.rs"]
 mod tests;
+
+// ---------------------------------------------------------------------------
+// Per-node DAEMON-log watching (M_NODE_LOGS) — refcounted, hard-teardown
+// ---------------------------------------------------------------------------
+
+/// Shared state of one node's live-log subscription: how many watchers hold it
+/// and the stop signal its streaming task selects on. First watcher opens the
+/// iroh stream; the LAST watcher's drop fires `stop` — the task drops the recv
+/// stream, the node sees `send.stopped()` and stops sending. No watcher ⇒ no
+/// bytes cross iroh, ever.
+struct LogWatchShared {
+    count: usize,
+    stop: tokio::sync::watch::Sender<bool>,
+    /// Task generation — a dead task's stale entry is replaced, not reused.
+    gen: u64,
+}
+
+/// Registry of live per-node log subscriptions, shared between [`HubFleet`],
+/// the streaming tasks, and every [`NodeLogWatch`] guard.
+type LogWatchMap = Arc<parking_lot::Mutex<HashMap<NodeKey, LogWatchShared>>>;
+
+/// A live handle on one node's daemon-log stream: read `rx` (filter to
+/// `LogSource::RemoteNode { node }` — the bus broadcast is shared) until done;
+/// DROPPING this is the teardown (last one out closes the iroh stream).
+pub struct NodeLogWatch {
+    /// The hub bus subscription carrying the streamed lines (among others).
+    /// DELIBERATE asymmetry with the node side's dedicated serve channel: this
+    /// is the SHARED hub broadcast, so a hub-local worker flood can lag it —
+    /// acceptable because the per-node ring backs a re-snapshot
+    /// (`logs(n, node:<id>)`) and the UI stream is lossy by design; the
+    /// node→hub leg (the iroh bytes) stays flood-isolated either way.
+    pub rx: tokio::sync::broadcast::Receiver<crate::log_bus::LogLine>,
+    /// The bus key this node's lines are filed under.
+    pub node: NodeId,
+    _guard: LogWatchGuard,
+}
+
+struct LogWatchGuard {
+    key: NodeKey,
+    gen: u64,
+    map: LogWatchMap,
+}
+
+impl Drop for LogWatchGuard {
+    fn drop(&mut self) {
+        let mut map = self.map.lock();
+        if let Some(state) = map.get_mut(&self.key) {
+            if state.gen != self.gen {
+                return; // a newer subscription generation owns this key now
+            }
+            state.count = state.count.saturating_sub(1);
+            if state.count == 0 {
+                let _ = state.stop.send(true);
+                map.remove(&self.key);
+            }
+        }
+    }
+}
+
+impl HubFleet {
+    /// Watch `node`'s OWN DAEMON log live. Refcounted: the first watcher opens the
+    /// `M_NODE_LOGS` follow stream (last-`n` snapshot included); later watchers share
+    /// it (they see new lines via the bus broadcast; the ring holds recent history).
+    /// The stream is torn down when the last [`NodeLogWatch`] drops. Lines are filed
+    /// into the hub bus under `LogSource::RemoteNode` so `logs(n, node:<id>)`
+    /// snapshots serve history to late joiners.
+    pub async fn watch_node_logs(
+        self: &Arc<Self>,
+        node: &str,
+        n: u64,
+    ) -> Result<NodeLogWatch, HiggsError> {
+        // Reachability first (HG027 for unknown/disconnected)…
+        let transport = self.transport(node).await?;
+        // …then capability: a pre-`node_logs` build would method-not-found the
+        // request; refuse with the honest remedy instead.
+        let view = self
+            .nodes_view()
+            .await
+            .into_iter()
+            .find(|v| v.endpoint_id == node)
+            .ok_or_else(|| HiggsError::NodeUnreachable {
+                endpoint_id: node.to_string(),
+                detail: "not in the fleet view".into(),
+            })?;
+        if !view.node_logs {
+            return Err(HiggsError::NodeUnreachable {
+                endpoint_id: node.to_string(),
+                detail: "this node's higgs build does not serve its daemon log \
+                         (update the node to a node_logs-capable release)"
+                    .into(),
+            });
+        }
+        let node_id = NodeId(view.node_id);
+        let key: NodeKey = node.to_string();
+        // Subscribe BEFORE (possibly) spawning the streaming task, so the FIRST
+        // watcher's `rx` can't miss the snapshot lines the task pushes to the bus
+        // between spawn and subscribe (a fast node would otherwise open a blank
+        // live console until the next line). A dup vs the ring is harmless for a
+        // log view — same subscribe-before-snapshot rule as `relay_node_logs`.
+        let rx = self.bus.subscribe();
+        let mut map = self.log_watchers.lock();
+        let gen = match map.get_mut(&key) {
+            Some(state) => {
+                state.count += 1;
+                state.gen
+            }
+            None => {
+                let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+                let gen = self
+                    .log_watch_gen
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                map.insert(
+                    key.clone(),
+                    LogWatchShared {
+                        count: 1,
+                        stop: stop_tx,
+                        gen,
+                    },
+                );
+                let bus = self.bus.clone();
+                let watchers = self.log_watchers.clone();
+                let task_key = key.clone();
+                tokio::spawn(async move {
+                    let mut on_line = |line: String| {
+                        bus.push(
+                            crate::log_bus::LogSource::RemoteNode { node: node_id },
+                            line,
+                        );
+                    };
+                    let stop = async move {
+                        // watch::Receiver::wait_for resolves on true or sender drop.
+                        let _ = stop_rx.wait_for(|v| *v).await;
+                    };
+                    tokio::pin!(stop);
+                    let res = transport
+                        .node_logs(n, true, &mut on_line, stop.as_mut())
+                        .await;
+                    if let Err(e) = res {
+                        // Surface the end-of-stream reason IN the log console itself.
+                        bus.push(
+                            crate::log_bus::LogSource::RemoteNode { node: node_id },
+                            format!("— log stream ended: {e}"),
+                        );
+                    }
+                    // Clear our own registry entry (if still ours) so the next
+                    // toggle-on starts a fresh stream instead of joining a dead one.
+                    // RESIDUAL (accepted): watchers still holding a NodeLogWatch when
+                    // the stream dies — INCLUDING one that joined the same-gen entry in
+                    // the window between this push and the removal below — see the
+                    // "log stream ended" line but are NOT auto-resubscribed; the UI
+                    // re-toggles (its stream state chip shows the end). A count-gated
+                    // auto-respawn here would loop on a persistently failing node; the
+                    // explicit re-toggle is the honest recovery.
+                    let mut map = watchers.lock();
+                    if map.get(&task_key).is_some_and(|s| s.gen == gen) {
+                        map.remove(&task_key);
+                    }
+                });
+                gen
+            }
+        };
+        drop(map);
+        Ok(NodeLogWatch {
+            rx,
+            node: node_id,
+            _guard: LogWatchGuard {
+                key,
+                gen,
+                map: self.log_watchers.clone(),
+            },
+        })
+    }
+
+    /// One-shot last-`n` snapshot of `node`'s DAEMON log over iroh (no standing
+    /// stream, nothing retained hub-side). For the UI's closed-panel preview.
+    pub async fn node_logs_snapshot(
+        self: &Arc<Self>,
+        node: &str,
+        n: u64,
+    ) -> Result<Vec<String>, HiggsError> {
+        let transport = self.transport(node).await?;
+        // Same friendly capability refusal as `watch_node_logs` — a pre-capability
+        // build would answer method-not-found, which reads like a fault, not a fact.
+        let capable = self
+            .nodes_view()
+            .await
+            .into_iter()
+            .any(|v| v.endpoint_id == node && v.node_logs);
+        if !capable {
+            return Err(HiggsError::NodeUnreachable {
+                endpoint_id: node.to_string(),
+                detail: "this node's higgs build does not serve its daemon log \
+                         (update the node to a node_logs-capable release)"
+                    .into(),
+            });
+        }
+        let mut lines = Vec::new();
+        let mut on_line = |line: String| lines.push(line);
+        let stop = std::future::pending::<()>();
+        tokio::pin!(stop);
+        // follow=false completes after the snapshot Response. Bound the WHOLE
+        // exchange, not just the open: a wedged-but-alive node that accepts the
+        // stream and never sends the final Response must not hang the caller.
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            transport.node_logs(n, false, &mut on_line, stop.as_mut()),
+        )
+        .await
+        {
+            Ok(res) => res?,
+            Err(_) => {
+                return Err(HiggsError::NodeUnreachable {
+                    endpoint_id: node.to_string(),
+                    detail: "daemon-log snapshot timed out".into(),
+                })
+            }
+        }
+        Ok(lines)
+    }
+}

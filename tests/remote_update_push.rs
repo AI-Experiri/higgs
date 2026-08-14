@@ -176,6 +176,7 @@ async fn hub_courier_pushes_release_and_node_accepts() {
         variant,
         update_capable,
         version_capable,
+        log_capable: _,
     } = outcome
     else {
         panic!("node must be admitted: {outcome:?}");
@@ -219,6 +220,7 @@ async fn hub_courier_pushes_release_and_node_accepts() {
             variant,
             update_capable,
             version_capable,
+            true,
         )
         .await;
 

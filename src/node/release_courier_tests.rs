@@ -606,6 +606,7 @@ async fn fleet_with_identity(
             variant.map(str::to_string),
             true,
             version_capable,
+            true,
         )
         .await;
     (fleet, node_key, root)

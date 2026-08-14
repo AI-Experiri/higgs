@@ -25,6 +25,21 @@ pub const M_HELLO: &str = "higgs/node/hello";
 /// (DESIGN-remote.md §4.2, P4). Params: `{ "worker_id": <u32>, "line": <string> }`.
 pub const N_LOG_LINE: &str = "higgs/node/log_line";
 
+/// `M_NODE_LOGS` — hub → node: the node's OWN DAEMON log (the `LogSource::Serve` lines
+/// that also land in node.log — connects, updates, scans, serving events), NEVER worker/
+/// model output (that is `N_LOG_LINE`'s job). Params: `{ "n": <u64>, "follow": <bool> }`.
+/// Reply on the SAME bi-stream: one [`N_NODE_LOG`] notification per line (the last-`n`
+/// snapshot first, then — only when `follow` — live lines), closed by a final Response.
+/// A `follow` stream ends when the HUB stops reading (the node sees `send.stopped()` and
+/// tears down — no bytes cross iroh once the watcher is gone) or the node shuts down.
+/// Gated on the `node_logs` HELLO capability.
+pub const M_NODE_LOGS: &str = "higgs/node/logs";
+
+/// One daemon-log line on an [`M_NODE_LOGS`] reply stream. Params: `{ "line": <string> }`,
+/// plus `{ "lagged": <u64> }` marker frames when the node dropped lines to protect the
+/// connection (the stream is lossy-by-design under log floods; the marker says so).
+pub const N_NODE_LOG: &str = "higgs/node/node_log";
+
 /// Control-plane methods (hub → node), all namespaced `higgs/node/*` so a reader never
 /// confuses a hub→node op with a node→worker `higgs/*` op (DESIGN-remote.md §4.2, flag #1).
 pub const M_NODE_LOAD: &str = "higgs/node/load";
@@ -242,6 +257,9 @@ pub fn node_capabilities(reports_update_failures: bool) -> Capabilities {
         // `update_by_version` (M_NODE_UPDATE_VERSION): this build can be told a bare release
         // VERSION and will fetch + verify + apply it from its OWN configured release_url.
         ("update_by_version", true),
+        // `node_logs` (M_NODE_LOGS): this build serves its own DAEMON log (snapshot +
+        // follow) to the hub on demand — nothing streams unless a watcher asks.
+        ("node_logs", true),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), serde_json::Value::Bool(v)))
