@@ -19,6 +19,26 @@ from it.
 
 ## [Unreleased]
 
+## [0.1.0-beta.9] - 2026-08-14
+
+### Fixed
+
+- **The [HG088] streamed-artifact fix actually ships.** The stream-to-disk
+  update downloader (documented under beta.8 below) was stranded on the
+  beta.6 release branch by a merge race — beta.7 and beta.8 binaries were
+  built WITHOUT it, so hub-pushed updates to CUDA nodes still failed on the
+  256 MiB in-memory cap. It is now merged through develop and in this build.
+  Nodes still running beta.8 or older must take THIS update via `install.sh`
+  once (their running downloader is the capped one); updates stream from
+  beta.9 onward.
+
+### Added
+
+- `NodeLogWatch.created` (hub-side library API): tells the embedding consumer
+  whether its watch spawned the node-log stream (its `rx` carries the full
+  snapshot) or joined an existing one (ring replay needed) — fixes duplicated
+  history in per-node log terminals.
+
 ## [0.1.0-beta.8] - 2026-08-13
 
 ### Added
@@ -30,6 +50,17 @@ from it.
   log flood degrades to an explicit "lines dropped" marker instead of
   loading the connection. Groundwork for per-node log terminals in the
   jigglebot Fleet tab.
+
+### Fixed
+
+- **Fleet updates to CUDA nodes** [HG088]: the update artifact was downloaded
+  into memory under a 256 MiB cap, refusing the ~650 MiB Linux CUDA tarball —
+  every hub-pushed update to a CUDA node failed. Artifacts now stream to disk
+  with the sha256 computed as bytes land (no memory spike at any size), are
+  unpacked from the very file handle the hash covered, and slow links are
+  tolerated (throughput-based stall guard instead of a fixed 10-minute clock).
+  (This fix was authored for beta.7 but was stranded on the beta.6 release
+  branch by a merge race — beta.7/beta.8 shipped without it.)
 
 ## [0.1.0-beta.7] - 2026-08-10
 

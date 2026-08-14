@@ -3066,16 +3066,22 @@ async fn log_watch_registry_shares_streams_and_tears_down_on_last_drop() {
         .expect("first watch");
     let node_id = w1.node;
     assert!(
+        w1.created,
+        "the stream-spawning watch reports created=true (its rx carries the snapshot)"
+    );
+    assert!(
         wait_for_line(&bus, node_id, "boot line").await,
         "first watcher must land the snapshot in the hub bus"
     );
 
-    // Second watcher SHARES the stream (no error, same node id).
+    // Second watcher SHARES the stream (no error, same node id) and reports
+    // created=false — its rx missed the snapshot, so consumers ring-replay.
     let w2 = fleet
         .watch_node_logs(&node_key, 50)
         .await
         .expect("second watch shares");
     assert_eq!(w2.node, node_id);
+    assert!(!w2.created, "a joiner must report created=false");
 
     // Dropping ONE watcher keeps the stream alive: a live line still arrives.
     drop(w1);
