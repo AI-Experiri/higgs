@@ -19,6 +19,16 @@ from it.
 
 ## [Unreleased]
 
+### Added
+
+- **Per-node daemon-log streaming**: the hub can view each fleet node's own
+  higgs daemon log live (the node.log lines — never model/worker output).
+  Off by default and watcher-driven: nothing crosses the network until the
+  UI asks, the stream tears down the moment the last viewer leaves, and a
+  log flood degrades to an explicit "lines dropped" marker instead of
+  loading the connection. Groundwork for per-node log terminals in the
+  jigglebot Fleet tab.
+
 ## [0.1.0-beta.7] - 2026-08-10
 
 ## [0.1.0-beta.6] - 2026-08-10
