@@ -2846,11 +2846,7 @@ impl Higgs {
 
     /// One-shot last-`n` snapshot of a REMOTE node's daemon log (no standing
     /// stream). Hub mode off ⇒ HG027.
-    pub async fn node_logs(
-        &self,
-        endpoint_id: &str,
-        n: u64,
-    ) -> Result<Vec<String>, HiggsError> {
+    pub async fn node_logs(&self, endpoint_id: &str, n: u64) -> Result<Vec<String>, HiggsError> {
         let fleet = self.fleet().ok_or_else(|| HiggsError::NodeUnreachable {
             endpoint_id: endpoint_id.to_string(),
             detail: "hub mode is off".into(),

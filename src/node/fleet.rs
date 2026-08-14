@@ -3170,6 +3170,12 @@ pub struct NodeLogWatch {
     pub rx: tokio::sync::broadcast::Receiver<crate::log_bus::LogLine>,
     /// The bus key this node's lines are filed under.
     pub node: NodeId,
+    /// True when THIS watch spawned the streaming task (first watcher): its
+    /// `rx` was subscribed before the spawn, so it carries the node's full
+    /// last-`n` snapshot — a consumer must NOT also replay the ring or every
+    /// history line prints twice. A joiner (`created == false`) subscribed
+    /// after the snapshot passed and needs the ring replay for history.
+    pub created: bool,
     _guard: LogWatchGuard,
 }
 
@@ -3237,10 +3243,10 @@ impl HubFleet {
         // log view — same subscribe-before-snapshot rule as `relay_node_logs`.
         let rx = self.bus.subscribe();
         let mut map = self.log_watchers.lock();
-        let gen = match map.get_mut(&key) {
+        let (gen, created) = match map.get_mut(&key) {
             Some(state) => {
                 state.count += 1;
-                state.gen
+                (state.gen, false)
             }
             None => {
                 let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
@@ -3294,13 +3300,14 @@ impl HubFleet {
                         map.remove(&task_key);
                     }
                 });
-                gen
+                (gen, true)
             }
         };
         drop(map);
         Ok(NodeLogWatch {
             rx,
             node: node_id,
+            created,
             _guard: LogWatchGuard {
                 key,
                 gen,
