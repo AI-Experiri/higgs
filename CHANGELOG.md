@@ -19,6 +19,8 @@ from it.
 
 ## [Unreleased]
 
+## [0.1.0-beta.8] - 2026-08-13
+
 ### Added
 
 - **Per-node daemon-log streaming**: the hub can view each fleet node's own
