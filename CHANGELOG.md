@@ -19,6 +19,26 @@ from it.
 
 ## [Unreleased]
 
+## [0.1.0-beta.9] - 2026-08-14
+
+### Fixed
+
+- **The [HG088] streamed-artifact fix actually ships.** The stream-to-disk
+  update downloader (documented under beta.8 below) was stranded on the
+  beta.6 release branch by a merge race — beta.7 and beta.8 binaries were
+  built WITHOUT it, so hub-pushed updates to CUDA nodes still failed on the
+  256 MiB in-memory cap. It is now merged through develop and in this build.
+  Nodes still running beta.8 or older must take THIS update via `install.sh`
+  once (their running downloader is the capped one); updates stream from
+  beta.9 onward.
+
+### Added
+
+- `NodeLogWatch.created` (hub-side library API): tells the embedding consumer
+  whether its watch spawned the node-log stream (its `rx` carries the full
+  snapshot) or joined an existing one (ring replay needed) — fixes duplicated
+  history in per-node log terminals.
+
 ## [0.1.0-beta.8] - 2026-08-13
 
 ### Added
