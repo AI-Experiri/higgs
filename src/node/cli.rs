@@ -123,6 +123,7 @@ fn run_link_pair() -> Result<()> {
                     variant: _,
                     update_capable: _,
                     version_capable: _,
+                    log_capable: _,
                 } => {
                     // An all-filtered HELLO version sanitizes to empty — print a
                     // placeholder, not "higgs ," (T14 r22).
@@ -3267,7 +3268,11 @@ fn run_node_daemon_body(args: &[String], confirm_bin: &Option<std::path::PathBuf
         // just-pulled model is loadable with no extra push here.
         // A node has no UI; its worker stderr is relayed to the hub. HIGGS_VERBOSE=1 keeps
         // the full llama.cpp dump (default off drops the per-load metadata flood).
-        let bus = Arc::new(crate::log_bus::LogBus::new());
+        // The PROCESS-GLOBAL bus (the one the daemon's own tracing lands in) when
+        // running as the real binary — M_NODE_LOGS serves its Serve ring to the
+        // hub. Tests/embedders without a global get a private bus as before.
+        let bus = crate::log_bus::LogBus::global()
+            .unwrap_or_else(|| Arc::new(crate::log_bus::LogBus::new()));
         if std::env::var("HIGGS_VERBOSE").is_ok_and(|v| v == "1" || v == "true") {
             bus.set_verbose(true);
         }

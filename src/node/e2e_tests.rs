@@ -277,3 +277,113 @@ async fn fleet_event_relay_resends_the_last_event_after_an_idle_reset() {
     );
     assert_eq!(kind2, "resync", "recovery carries the Resync kind");
 }
+
+/// M_NODE_LOGS end-to-end over a real iroh link: the hub asks for the node's OWN
+/// daemon log — the last-n snapshot arrives, a line pushed AFTER subscribing
+/// arrives live (follow), worker/model lines never cross, and dropping the
+/// watcher's stop future ends the read cleanly.
+#[tokio::test]
+async fn node_serves_its_daemon_log_snapshot_and_follow_over_iroh() {
+    use crate::log_bus::LogSource;
+    let (model_root, _model_id) = stage_dummy_model("higgs-test/logsrc");
+    let hub = local_endpoint().await;
+    let node = local_endpoint().await;
+    let hub_addr = hub.addr();
+    let hub_id = hub.id().to_string();
+    let node_id = node.id().to_string();
+
+    let allow_path =
+        std::env::temp_dir().join(format!("higgs-e2e-logs-allow-{}.json", std::process::id()));
+    let _ = std::fs::remove_file(&allow_path);
+    let mut allow = Allowlist::load(&allow_path).unwrap();
+    allow.add(node_id.clone(), Some("log-node".into())).unwrap();
+
+    let rt = Arc::new(fake_runtime(vec![model_root.path().to_path_buf()]));
+    // Seed the node's DAEMON log (Serve ring) + a worker line that must NOT cross.
+    rt.bus()
+        .push(LogSource::Serve, "daemon: node booted".into());
+    rt.bus()
+        .push(LogSource::Worker, "worker: llama noise".into());
+    let rt_node = rt.clone();
+    let node_task = tokio::spawn(async move {
+        let (node_conn, _hello) = connect_node(&node, hub_addr, node_id, String::new(), None)
+            .await
+            .expect("connect");
+        serve_node(node_conn, rt_node).await;
+    });
+
+    let incoming = hub.accept().await.expect("incoming");
+    let conn = incoming.await.expect("conn");
+    let mut tokens = PairingTokens::new();
+    let outcome = gate_connection(
+        &conn,
+        &mut allow,
+        &mut tokens,
+        1,
+        &HubIdentity::new(hub_id),
+        None,
+        HELLO_DEADLINE,
+    )
+    .await;
+    let GateOutcome::Admitted { log_capable, .. } = outcome else {
+        panic!("node not admitted: {outcome:?}");
+    };
+    assert!(log_capable, "a current build advertises node_logs");
+
+    let transport = Arc::new(crate::node::transport::NodeTransport::new(conn));
+
+    // Follow stream: collect lines until we have the snapshot line + one live line.
+    let (line_tx, mut line_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let t2 = transport.clone();
+    let watch_task = tokio::spawn(async move {
+        let mut on_line = move |l: String| {
+            let _ = line_tx.send(l);
+        };
+        let stop = async move {
+            let _ = stop_rx.await;
+        };
+        tokio::pin!(stop);
+        t2.node_logs(50, true, &mut on_line, stop.as_mut()).await
+    });
+
+    // Snapshot line arrives…
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), line_rx.recv())
+        .await
+        .expect("snapshot line in time")
+        .expect("line");
+    assert_eq!(first, "daemon: node booted");
+
+    // …then a LIVE daemon line pushed after subscribing…
+    rt.bus()
+        .push(LogSource::Serve, "daemon: something happened".into());
+    let live = tokio::time::timeout(std::time::Duration::from_secs(5), line_rx.recv())
+        .await
+        .expect("live line in time")
+        .expect("line");
+    assert_eq!(live, "daemon: something happened");
+
+    // …and a WORKER line pushed live never crosses this stream.
+    rt.bus()
+        .push(LogSource::Worker, "worker: more llama noise".into());
+    rt.bus().push(LogSource::Serve, "daemon: after".into());
+    let next = tokio::time::timeout(std::time::Duration::from_secs(5), line_rx.recv())
+        .await
+        .expect("follow-up line in time")
+        .expect("line");
+    assert_eq!(
+        next, "daemon: after",
+        "worker/model lines must never ride the daemon-log stream"
+    );
+
+    // Teardown: firing stop ends the watch cleanly.
+    let _ = stop_tx.send(());
+    let res = tokio::time::timeout(std::time::Duration::from_secs(5), watch_task)
+        .await
+        .expect("watch task ends after stop")
+        .expect("join");
+    assert!(res.is_ok(), "stop is a clean end: {res:?}");
+
+    node_task.abort();
+    let _ = std::fs::remove_file(&allow_path);
+}

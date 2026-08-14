@@ -29,6 +29,7 @@
 //! dependency.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 use parking_lot::Mutex;
 use tokio::sync::broadcast;
@@ -77,6 +78,11 @@ pub enum LogSource {
     /// A remote node's worker stderr, relayed over iroh and keyed by which node +
     /// which worker on it (`?source=node:<node>:<worker>`).
     RemoteWorker { node: NodeId, worker: WorkerId },
+    /// A remote node's OWN DAEMON log (its `LogSource::Serve` lines, streamed over
+    /// iroh on demand — `M_NODE_LOGS`), keyed by node (`?source=node:<node>`).
+    /// Deliberately distinct from `RemoteWorker`: the daemon log is the higgs
+    /// control plane, never model/worker output.
+    RemoteNode { node: NodeId },
 }
 
 impl LogSource {
@@ -94,7 +100,13 @@ impl LogSource {
                     });
                 }
                 let rest = s.strip_prefix("node:")?;
-                let (n, w) = rest.split_once(':')?;
+                // `node:<id>` = the node's own daemon log; `node:<id>:<worker>` =
+                // one of its workers.
+                let Some((n, w)) = rest.split_once(':') else {
+                    return Some(LogSource::RemoteNode {
+                        node: NodeId(rest.parse().ok()?),
+                    });
+                };
                 Some(LogSource::RemoteWorker {
                     node: NodeId(n.parse().ok()?),
                     worker: WorkerId(w.parse().ok()?),
@@ -164,11 +176,22 @@ pub struct LogBus {
     /// line and reclaimed by [`evict_remote`](Self::evict_remote) on unload/kill/retire
     /// so a dead worker's ring doesn't leak. Each ring is independently `RING_CAP`-bounded.
     remote: Mutex<HashMap<(NodeId, WorkerId), Ring>>,
+    /// Per-node DAEMON-log history rings (`M_NODE_LOGS` lines), created on the
+    /// first streamed line and reclaimed by [`evict_node`](Self::evict_node) on
+    /// retire. Each ring is independently `RING_CAP`-bounded.
+    remote_node: Mutex<HashMap<NodeId, Ring>>,
     /// Monotonic line counter — stamps every push so an unfiltered (`None`)
     /// snapshot can re-interleave the two rings in arrival order.
     seq: std::sync::atomic::AtomicU64,
     /// Live fan-out of every pushed line to current SSE subscribers.
     tx: broadcast::Sender<LogLine>,
+    /// SERVE-ONLY live fan-out — the daemon-log stream (`M_NODE_LOGS` relay)
+    /// subscribes HERE, not to the shared `tx`: on the shared channel a worker
+    /// token flood advances every subscriber's cursor, so a Serve-filtered
+    /// reader would lag (and DROP real daemon lines) because of traffic it
+    /// never wanted. A dedicated channel makes daemon-log lag mean daemon-log
+    /// volume, nothing else.
+    serve_tx: broadcast::Sender<String>,
     /// DEBUG toggle, OFF by default. When `true`, [`HiggsLogLayer`] also emits
     /// non-message/non-`error` structured fields — INCLUDING prompt content —
     /// so logs can be debugged un-redacted. The flag lives here (not on `Higgs`)
@@ -183,17 +206,39 @@ pub struct LogBus {
     verbose: std::sync::atomic::AtomicBool,
 }
 
+/// The PROCESS-GLOBAL bus — the one bound to the global tracing subscriber in
+/// `bin/higgs.rs`. Set once at startup; read by the node daemon so its
+/// `NodeRuntime` shares the SAME bus the daemon's own tracing lands in (the
+/// `M_NODE_LOGS` stream serves those Serve-ring lines). A bus is naturally
+/// process-global here because the tracing subscriber it feeds is too.
+static GLOBAL_BUS: std::sync::OnceLock<Arc<LogBus>> = std::sync::OnceLock::new();
+
 impl LogBus {
+    /// Register the process-global bus (first call wins; later calls are no-ops —
+    /// tests that build private buses never touch this).
+    pub fn install_global(bus: Arc<LogBus>) {
+        let _ = GLOBAL_BUS.set(bus);
+    }
+
+    /// The process-global bus, if `install_global` ran (the real binary); `None`
+    /// under tests/embedders that manage their own buses.
+    pub fn global() -> Option<Arc<LogBus>> {
+        GLOBAL_BUS.get().cloned()
+    }
+
     /// Create an empty bus with the default ring and broadcast capacities.
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(BROADCAST_CAP);
+        let (serve_tx, _) = broadcast::channel(BROADCAST_CAP);
         Self {
             serve: Mutex::new(VecDeque::with_capacity(RING_CAP)),
             worker: Mutex::new(VecDeque::with_capacity(RING_CAP)),
             local: Mutex::new(HashMap::new()),
             remote: Mutex::new(HashMap::new()),
+            remote_node: Mutex::new(HashMap::new()),
             seq: std::sync::atomic::AtomicU64::new(0),
             tx,
+            serve_tx,
             show_fields: std::sync::atomic::AtomicBool::new(false),
             verbose: std::sync::atomic::AtomicBool::new(false),
         }
@@ -259,8 +304,17 @@ impl LogBus {
                 let ring = remote.entry((node, worker)).or_default();
                 push_ring(ring, seq, text.clone());
             }
+            LogSource::RemoteNode { node } => {
+                let mut rings = self.remote_node.lock();
+                let seq = self.next_seq();
+                let ring = rings.entry(node).or_default();
+                push_ring(ring, seq, text.clone());
+            }
         }
         // Err means zero subscribers — fine; the ring already has the line.
+        if source == LogSource::Serve {
+            let _ = self.serve_tx.send(text.clone());
+        }
         let _ = self.tx.send(LogLine { source, text });
     }
 
@@ -268,6 +322,12 @@ impl LogBus {
     /// stamp and the ring insertion are atomic per ring (see [`push`](Self::push)).
     fn next_seq(&self) -> u64 {
         self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Subscribe to SERVE lines only (the daemon log) — isolated from worker/
+    /// model traffic so lag here always means daemon-log volume (see `serve_tx`).
+    pub fn subscribe_serve(&self) -> broadcast::Receiver<String> {
+        self.serve_tx.subscribe()
     }
 
     /// Reclaim a LOCAL worker's history ring (called when the worker leaves the node
@@ -291,6 +351,7 @@ impl LogBus {
     /// per-worker eviction would miss.
     pub fn evict_node(&self, node: NodeId) {
         self.remote.lock().retain(|(n, _), _| *n != node);
+        self.remote_node.lock().remove(&node);
     }
 
     /// Up to `n` most-recent line texts (oldest first), restricted to one
@@ -330,18 +391,27 @@ impl LogBus {
                 .get(&(node, worker))
                 .map(|ring| last_n(ring, n))
                 .unwrap_or_default(),
+            Some(LogSource::RemoteNode { node }) => self
+                .remote_node
+                .lock()
+                .get(&node)
+                .map(|ring| last_n(ring, n))
+                .unwrap_or_default(),
             None => {
-                // Always lock in a consistent order (serve, worker, local, remote) — no deadlock.
+                // Always lock in a consistent order (serve, worker, local, remote,
+                // remote_node) — no deadlock.
                 let serve = self.serve.lock();
                 let worker = self.worker.lock();
                 let local = self.local.lock();
                 let remote = self.remote.lock();
+                let remote_node = self.remote_node.lock();
                 merged(
                     serve
                         .iter()
                         .chain(worker.iter())
                         .chain(local.values().flat_map(|r| r.iter()))
-                        .chain(remote.values().flat_map(|r| r.iter())),
+                        .chain(remote.values().flat_map(|r| r.iter()))
+                        .chain(remote_node.values().flat_map(|r| r.iter())),
                     n,
                 )
             }

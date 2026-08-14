@@ -265,3 +265,13 @@ fn hello_tolerates_missing_and_unknown_capabilities() {
         Some(&serde_json::Value::Bool(true))
     );
 }
+
+#[test]
+fn node_capabilities_advertise_node_logs() {
+    let caps = node_capabilities(false);
+    assert_eq!(
+        caps.get("node_logs"),
+        Some(&serde_json::Value::Bool(true)),
+        "current builds serve their daemon log on demand"
+    );
+}

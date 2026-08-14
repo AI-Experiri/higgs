@@ -76,6 +76,13 @@ variant?: string,
  */
 update_by_version: boolean, 
 /**
+ * Whether this node's CURRENT connection can serve its own DAEMON log live
+ * (`M_NODE_LOGS` — the node.log lines, never worker/model output). `false` for a
+ * disconnected or pre-capability node; the UI hides the live-logs toggle then.
+ * `serde(default)` keeps older frontends/payloads compatible.
+ */
+node_logs: boolean, 
+/**
  * Operator troubleshooting steps for a DISCONNECTED node, computed hub-side from the
  * platform the node last reported (inventory `os`, else the HELLO target triple) — e.g.
  * the macOS Local Network permission is per-binary and a self-update installs a new
