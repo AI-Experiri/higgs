@@ -3,6 +3,71 @@
 Conventions an agent MUST follow when changing this crate. These are hard
 requirements, not suggestions.
 
+## No bespoke code when a popular crate exists (HARD RULE, ZERO TOLERANCE)
+
+**If a well-adopted Rust crate does the thing, USE IT. Do not write your own.**
+Not "consider it." Not "check first." USE THE CRATE. This is not negotiable.
+
+Before implementing ANY mechanism (locking, dedup, atomicity, sync, cache,
+retry, backoff, timeouts, file I/O primitives, concurrent maps, atomics,
+observability, HTTP, TLS, JSON, checksums, path handling, temp files, glob,
+crypto, hashing, base64, uuid, time, subprocess, watchers, config, CLI parsing,
+templating, compression, semver, url, mime, etc.) check in this order and
+STOP at the first hit:
+
+1. `std` / `libc` / `tokio` / `parking_lot` — is the primitive already there?
+2. A well-adopted crate (>100k downloads, >1 yr old) — the ecosystem has one
+   for basically everything: `fs2`/`fd-lock` (flock), `dashmap` (concurrent
+   map), `arc-swap` (RCU), `once_cell` (lazy statics), `bytes`, `blake3`,
+   `sha2`, `hex`, `base64`, `uuid`, `tempfile`, `walkdir`, `notify`,
+   `serde_yaml`, `toml`, `humantime`, `chrono`, `time`, `backoff`,
+   `retry-policies`, `reqwest`, `hyper`, `tower`, `governor`, `indicatif`,
+   `crossbeam`, `flume`, `regex`, `tracing`, `metrics`, etc.
+3. A pattern already used elsewhere in this repo — but ONLY as a tiebreaker
+   between two equally-good crate wrappers; a bespoke pattern already in the
+   repo is not license to keep adding to it (it may itself be tech debt).
+
+**Only invent custom if NO CRATE APPLIES and the commit message must justify
+why.** "It's just a few lines" is not a justification. Bespoke wrappers with
+`unsafe`, errno branching, and safety comments are exactly the boilerplate a
+1-line crate call replaces.
+
+**File locking = `fs2`. No exceptions.** Every file-lock in this crate goes
+through `fs2::FileExt` (`try_lock_exclusive`, `lock_exclusive`,
+`try_lock_shared`, `unlock`). NO raw `libc::flock` in new code, and existing
+raw-flock sites (`ledger.rs`, `self_update.rs`) are TECH DEBT to migrate to
+`fs2` when touched. If you find yourself writing `unsafe { libc::flock(...) }`
+you are violating this rule.
+
+**Also NEVER invent bespoke schemes when a primitive would make the problem
+disappear.** Repeated pattern that WASTES CODEX ROUNDS: bespoke
+residue-detection predicates / mtime heuristics / drain queues get built when
+a per-key flock (via `fs2::try_lock_exclusive`) makes the whole
+"detect residue" question unaskable. Codex then hammers the bespoke heuristic
+across rounds and the loop converges on nothing. When codex clusters findings
+on your custom mechanism, ask "what primitive would make this question
+unaskable?" BEFORE iterating another heuristic.
+
+## Agent concurrency (HARD RULE)
+
+**No more than 2 subagents run at a time — ever.** Any Workflow or Agent
+fan-out (reviews, test-writing, anything) executes as SEQUENTIAL PAIRS:
+`parallel(chunk-of-2)` in a loop, never a wider fan-out. Parallel subagents
+burn the session quota; a 6-wide fan-out can exhaust it mid-round and waste
+everything in flight.
+
+## Communication style (HARD RULE)
+
+**No walls of text. Complex topics get a diagram, not paragraphs.** When
+explaining a race, a control-flow decision, a two-process interaction, or any
+"case A vs case B" comparison, lead with an ASCII diagram / table / boxed
+scenario — prose is at most a couple of tight sentences framing it. Bullet
+lists of scenarios stacked on top of each other are a wall of text in
+disguise; convert them to a side-by-side box comparison. If the reader has to
+scroll to see the shape of the thing, you failed. This applies inside
+convergence-loop status messages too — a redesign-vs-residual question shows
+the two shapes visually, not in bullet paragraphs.
+
 ## Codex review convergence (required before any change is "done")
 
 Every non-trivial change is reviewed with `codex` in a loop until it **converges**.

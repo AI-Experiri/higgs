@@ -220,7 +220,7 @@ pub struct Higgs {
     load_events: tokio::sync::broadcast::Sender<crate::api::types::ModelLoadEvent>,
     /// Live catalog-download progress events (`Higgs::model_download`), the
     /// download twin of `load_events`: `Starting` → throttled `Downloading` →
-    /// terminal `Done`/`Failed`. Same broadcast semantics — no subscribers is
+    /// terminal `Done`/`Failed`/`Cancelled`. Same broadcast semantics — no subscribers is
     /// a no-op, and a late subscriber still gets the remaining phases.
     download_events: tokio::sync::broadcast::Sender<crate::catalog::wire::ModelDownloadEvent>,
     /// `(target node, repo, file)` catalog downloads currently in flight
@@ -231,14 +231,19 @@ pub struct Higgs {
     /// same file stay independent slots.
     downloads_in_flight:
         parking_lot::Mutex<std::collections::HashSet<(Option<String>, String, String)>>,
-    /// Last LOGGED progress step per in-flight download (`(target node,
+    /// Last LOGGED progress step per download key (`(target node,
     /// repo, file)` → decile/GiB step). Every download's lifecycle is
     /// mirrored into the log stream; this gate keeps the `Downloading` phase
     /// at one line per 10% (or per GiB when the length is unknown) instead of
-    /// one per throttled event. Entries are dropped on the terminal phases —
-    /// bounded ONLY because every emitter runs under `DownloadTerminalGuard`
-    /// (a terminal event fires even on cancel/drop). An emitter outside the
-    /// guard would leak its key; do not add one.
+    /// one per throttled event. Entries are dropped on Done/Failed and on a
+    /// REAL cancel (HG089) — but deliberately KEPT on a `Cancelled{HG090}`
+    /// adopt terminal (the live original owns the slot under the same key;
+    /// see `log_download_event`). The map's bound is therefore DISTINCT
+    /// DOWNLOAD KEYS this process ever saw, not empty-after-terminal —
+    /// small (one entry per (node, repo, file) tuple; a stale slot is
+    /// overwritten by the key's next `Starting`). An emitter outside
+    /// `DownloadTerminalGuard` would still be wrong: every attempt must
+    /// end in a terminal event.
     download_log_steps:
         parking_lot::Mutex<std::collections::HashMap<(Option<String>, String, String), u64>>,
     /// Override for the `config.json` path. `None` in production → the real
@@ -2723,6 +2728,11 @@ impl Higgs {
             // The local instance updates itself locally — a hub version-push never targets it.
             update_by_version: false,
             node_logs: false,
+            // Local downloads surface through the download-events stream, not
+            // the HELLO announcement / pull-status poll (there is no HELLO
+            // for the local card).
+            pull_status: false,
+            downloads: Vec::new(),
             // The local card is always "connected" — there is nothing to troubleshoot.
             offline_help: Vec::new(),
             is_local: true,
@@ -2843,6 +2853,39 @@ impl Higgs {
         })?;
         fleet.watch_node_logs(endpoint_id, n).await
     }
+    /// THIS machine's downloads ledger
+    /// (`~/.higgs/models/.downloads.json`): everything any LOCAL process —
+    /// this embedded hub, a node daemon, a `higgs model download` CLI — is
+    /// downloading, plus the recent terminal history (done/failed/cancelled,
+    /// dead-pid entries swept). The referable status record; live entries
+    /// first. Remote nodes' downloads are NOT here — those are
+    /// [`Self::node_downloads`] / [`NodeView::downloads`]. An unreadable
+    /// ledger reads as empty (status is best-effort, never an error source).
+    pub fn downloads_status(&self) -> Vec<crate::catalog::wire::DownloadLedgerEntry> {
+        match crate::download::models_dir() {
+            Ok(root) => crate::catalog::ledger::read_all(&root),
+            Err(e) => {
+                tracing::warn!(error = %e, "downloads ledger unavailable");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Downloads currently IN FLIGHT on a REMOTE node, with live byte
+    /// progress (`M_NODE_PULL_STATUS`) — the on-demand refresh of the node's
+    /// HELLO "I am downloading …" announcement ([`NodeView::downloads`]
+    /// carries the at-connect snapshot; this call re-reads it live). Hub mode
+    /// off ⇒ HG027.
+    pub async fn node_downloads(
+        &self,
+        endpoint_id: &str,
+    ) -> Result<Vec<crate::remote::HelloDownload>, HiggsError> {
+        let fleet = self.fleet().ok_or_else(|| HiggsError::NodeUnreachable {
+            endpoint_id: endpoint_id.to_string(),
+            detail: "hub mode is off".into(),
+        })?;
+        fleet.node_downloads(endpoint_id).await
+    }
 
     /// One-shot last-`n` snapshot of a REMOTE node's daemon log (no standing
     /// stream). Hub mode off ⇒ HG027.
@@ -2885,7 +2928,7 @@ impl Higgs {
 
     /// Mirror every catalog download's lifecycle (local AND per-node) into
     /// the log stream — the jigglebot Logs pane and any file the process logs
-    /// to. `Starting`/`Done`/`Failed` always log; `Downloading` logs once per
+    /// to. `Starting`/`Done`/`Failed`/`Cancelled` always log; `Downloading` logs once per
     /// 10% (per-GiB when the length is unknown) via [`Self::download_log_steps`].
     fn log_download_event(&self, ev: &crate::catalog::wire::ModelDownloadEvent) {
         use crate::catalog::wire::ModelDownloadPhase as Phase;
@@ -2900,8 +2943,12 @@ impl Higgs {
                 );
             }
             Phase::Downloading => {
+                // u128 intermediate: the counters are node-supplied and the
+                // decode normalization bounds total>=downloaded but not the
+                // magnitude — a hostile 2^60 pair would overflow the u64
+                // multiply (panic under debug overflow-checks).
                 let step = match ev.total_bytes {
-                    Some(t) if t > 0 => ev.downloaded_bytes * 10 / t,
+                    Some(t) if t > 0 => (ev.downloaded_bytes as u128 * 10 / t as u128) as u64,
                     _ => ev.downloaded_bytes >> 30,
                 };
                 let mut steps = self.download_log_steps.lock();
@@ -2915,7 +2962,7 @@ impl Higgs {
                     Some(t) if t > 0 => tracing::info!(
                         repo = %ev.repo, file = %ev.file, target = %target,
                         downloaded = ev.downloaded_bytes, total = t,
-                        percent = ev.downloaded_bytes * 100 / t,
+                        percent = (ev.downloaded_bytes as u128 * 100 / t as u128) as u64,
                         "higgs: download progress"
                     ),
                     _ => tracing::info!(
@@ -2931,6 +2978,34 @@ impl Higgs {
                     repo = %ev.repo, file = %ev.file, target = %target,
                     path = ev.path.as_deref().unwrap_or(""),
                     "higgs: download done"
+                );
+            }
+            Phase::Cancelled => {
+                // The HG090 code discriminates a DUPLICATE-REFUSAL adopt
+                // ("this attempt yielded; the live original keeps
+                // downloading") from a real cancel (HG089 / drop-guard).
+                // An adopt must NOT clear the throttle slot — the LIVE
+                // original owns it under the same (node, repo, file) key,
+                // and removing it would reset its decile logging — and its
+                // log line must not read as a cancellation of a transfer
+                // that is still running.
+                if ev.code.as_deref() == Some("HG090") {
+                    // Two producers share this shape: a duplicate refusal
+                    // AND an attested hub-side drop of a node transfer that
+                    // survives by design. Both mean the same thing to the
+                    // log reader: THIS attempt ended, the transfer itself
+                    // continues elsewhere — keep the line producer-neutral.
+                    tracing::info!(
+                        repo = %ev.repo, file = %ev.file, target = %target,
+                        "higgs: download attempt yielded — transfer continues elsewhere"
+                    );
+                    return;
+                }
+                self.download_log_steps.lock().remove(&key);
+                // info, not warn: a cancel is an operator action, not a fault.
+                tracing::info!(
+                    repo = %ev.repo, file = %ev.file, target = %target,
+                    "higgs: download cancelled"
                 );
             }
             Phase::Failed => {

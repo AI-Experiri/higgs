@@ -154,6 +154,23 @@ pub struct NodeView {
     /// `serde(default)` keeps older frontends/payloads compatible.
     #[serde(default)]
     pub node_logs: bool,
+    /// Whether this node's CURRENT connection reports its in-flight downloads on demand
+    /// (`M_NODE_PULL_STATUS`). `false` for a disconnected or pre-capability node — the UI
+    /// skips the live refresh then (`Higgs::node_downloads` refuses it with a friendly
+    /// update-the-node error). `serde(default)` keeps older frontends/payloads compatible.
+    #[serde(default)]
+    pub pull_status: bool,
+    /// Downloads IN FLIGHT on the node — seeded by its HELLO at
+    /// (re)admission ("hello, I am downloading …", live byte progress as of
+    /// that moment) and REFRESHED by every successful
+    /// `Higgs::node_downloads` poll (`M_NODE_PULL_STATUS`), whose result is
+    /// written back into this cache when the polling transport is still the
+    /// node's current one — a finished transfer disappears on the next
+    /// poll, not the next reconnect. How the hub continues a transfer that
+    /// survived a disconnect instead of re-issuing into [HG090]. Empty when
+    /// none / a legacy node / disconnected.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub downloads: Vec<crate::remote::HelloDownload>,
     /// Operator troubleshooting steps for a DISCONNECTED node, computed hub-side from the
     /// platform the node last reported (inventory `os`, else the HELLO target triple) — e.g.
     /// the macOS Local Network permission is per-binary and a self-update installs a new
@@ -337,6 +354,16 @@ enum FleetMsg {
         node: NodeKey,
         reply: oneshot::Sender<Result<Arc<NodeTransport>, HiggsError>>,
     },
+    /// ATOMIC snapshot for the downloads status poll: the node's CURRENT transport paired
+    /// with whether THAT connection advertised `pull_status`. One actor message, so a
+    /// reconnect between two separate reads can never pair transport T1 with capability
+    /// state recorded for T2 (a skewed-binary reconnect in that gap would status-poll a
+    /// pre-capability connection into a wire method-not-found instead of the friendly
+    /// refusal).
+    PullStatusHandle {
+        node: NodeKey,
+        reply: oneshot::Sender<Result<(Arc<NodeTransport>, bool), HiggsError>>,
+    },
     /// The node's HELLO-negotiated protocol major, `None` if never admitted with one.
     NodeProtocol {
         node: NodeKey,
@@ -402,6 +429,14 @@ enum FleetMsg {
         version_capable: bool,
         /// Whether its HELLO advertised `node_logs` (M_NODE_LOGS daemon-log serving).
         log_capable: bool,
+        /// Whether its HELLO advertised `pull_status` (M_NODE_PULL_STATUS in-flight-download
+        /// reporting) — gates the hub's downloads refresh (friendly refusal, not a wire
+        /// method-not-found, for a pre-capability build).
+        pull_capable: bool,
+        /// Downloads IN FLIGHT on the node at HELLO time ("hello, I am
+        /// downloading …") — refreshed per (re)admission, cleared at retire,
+        /// shown only while connected (a disconnected node's list is stale).
+        downloads: Vec<crate::remote::HelloDownload>,
         #[allow(clippy::type_complexity)]
         reply: oneshot::Sender<Option<(NodeId, Option<Arc<NodeTransport>>)>>,
     },
@@ -415,6 +450,20 @@ enum FleetMsg {
     },
     Retire {
         node: NodeKey,
+        reply: oneshot::Sender<()>,
+    },
+    /// Overwrite a node's cached in-flight downloads with a FRESH
+    /// `M_NODE_PULL_STATUS` result — the write-back that makes `nodes_view`
+    /// converge while connected (the HELLO snapshot alone would claim a
+    /// finished transfer "in flight" until the next reconnect).
+    SetNodeDownloads {
+        node: NodeKey,
+        downloads: Vec<crate::remote::HelloDownload>,
+        /// The transport the poll used — the write commits ONLY if this is
+        /// still the node's CURRENT transport (Arc identity, the
+        /// `DropTransportIf` pattern): a delayed reply from a PRIOR
+        /// connection must not overwrite a newer admission's fresh HELLO.
+        transport: Arc<NodeTransport>,
         reply: oneshot::Sender<()>,
     },
     /// Close + forget EVERY node's transport (mark all disconnected) AND disarm new-node
@@ -694,6 +743,14 @@ struct FleetActor {
     version_capable: HashSet<NodeKey>,
     /// Nodes whose CURRENT admission advertised `node_logs` (M_NODE_LOGS daemon-log serving).
     log_capable: HashSet<NodeKey>,
+    /// Nodes whose CURRENT connection advertised `pull_status` (in-flight-download reporting).
+    pull_capable: HashSet<NodeKey>,
+    /// Per-node in-flight downloads: seeded from the CURRENT admission's
+    /// HELLO announcement, then refreshed by each successful
+    /// `node_downloads` poll write-back (`SetNodeDownloads`, transport-CAS
+    /// guarded). Overwritten per (re)admission, removed at retire; served
+    /// in `nodes_view` only while connected.
+    node_downloads: HashMap<NodeKey, Vec<crate::remote::HelloDownload>>,
     /// Per-node lifecycle generation, bumped on every load/unload/kill/route-drop. A
     /// `refresh_inventory` only commits its (possibly stale) result if this is unchanged
     /// since it started — so a slow connect-time fetch can't clobber a newer state.
@@ -870,6 +927,8 @@ impl FleetActor {
         self.update_capable.remove(node);
         self.version_capable.remove(node);
         self.log_capable.remove(node);
+        self.pull_capable.remove(node);
+        self.node_downloads.remove(node);
         self.pending_pushes.remove(node);
         self.fallback_inflight.remove(node);
         // Drop any chat-refresh debounce slot too: a retired node needs no
@@ -927,6 +986,15 @@ impl FleetActor {
                     },
                     update_by_version: connected && self.version_capable.contains(&endpoint_id),
                     node_logs: connected && self.log_capable.contains(&endpoint_id),
+                    pull_status: connected && self.pull_capable.contains(&endpoint_id),
+                    downloads: if connected {
+                        self.node_downloads
+                            .get(&endpoint_id)
+                            .cloned()
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    },
                     // The fleet only tracks remote nodes; the local node is prepended by the serve
                     // layer. `label` is filled there from the allowlist (live, rename-aware).
                     is_local: false,
@@ -1063,6 +1131,18 @@ impl Actor for FleetActor {
                     }
                 }));
             }
+            FleetMsg::PullStatusHandle { node, reply } => {
+                let _ = reply.send(
+                    self.nodes
+                        .get(&node)
+                        .cloned()
+                        .map(|t| (t, self.pull_capable.contains(&node)))
+                        .ok_or_else(|| HiggsError::NodeUnreachable {
+                            endpoint_id: node.clone(),
+                            detail: "node not connected".into(),
+                        }),
+                );
+            }
             FleetMsg::Epoch { node, reply } => {
                 let _ = reply.send(self.epoch(&node));
             }
@@ -1106,6 +1186,8 @@ impl Actor for FleetActor {
                 update_capable,
                 version_capable,
                 log_capable,
+                pull_capable,
+                downloads,
                 reply,
             } => {
                 if matches!(gen, Some(g) if g != self.admit_gen) {
@@ -1208,10 +1290,19 @@ impl Actor for FleetActor {
                     } else {
                         self.version_capable.remove(&node);
                     }
+                    // "Hello, I am downloading …": overwrite (an empty list
+                    // clears a prior admission's) so the view always reflects
+                    // THIS connection's announcement.
+                    self.node_downloads.insert(node.clone(), downloads);
                     if log_capable {
                         self.log_capable.insert(node.clone());
                     } else {
                         self.log_capable.remove(&node);
+                    }
+                    if pull_capable {
+                        self.pull_capable.insert(node.clone());
+                    } else {
+                        self.pull_capable.remove(&node);
                     }
                     let replaced = self.nodes.insert(node.clone(), transport);
                     // Announced HERE, atomic with the insert (T10 r4 #1) — a
@@ -1248,6 +1339,24 @@ impl Actor for FleetActor {
                     self.emit(&node, FleetEventKind::NodeDropped);
                 }
                 let _ = reply.send(removed);
+            }
+            FleetMsg::SetNodeDownloads {
+                node,
+                downloads,
+                transport,
+                reply,
+            } => {
+                // Commit ONLY when the polling transport is still current — a
+                // raced retire or re-admission (new transport, fresh HELLO)
+                // wins over this delayed reply.
+                if self
+                    .nodes
+                    .get(&node)
+                    .is_some_and(|t| Arc::ptr_eq(t, &transport))
+                {
+                    self.node_downloads.insert(node, downloads);
+                }
+                let _ = reply.send(());
             }
             FleetMsg::Retire { node, reply } => {
                 // Only a node the fleet actually knew is a drop event — a retire
@@ -1709,6 +1818,16 @@ pub struct HubFleet {
     log_watchers: LogWatchMap,
     /// Monotonic generation for log-watch tasks (stale-entry hygiene).
     log_watch_gen: std::sync::atomic::AtomicU64,
+    /// Per-node serialization of `M_NODE_PULL_STATUS` polls. The write-back's
+    /// transport-identity CAS orders commits ACROSS reconnects but not BETWEEN
+    /// concurrent polls on the SAME connection — a delayed stale reply could
+    /// commit after a fresher one and resurrect a finished transfer in the
+    /// view. Holding this per-node lock across request + write-back makes poll
+    /// N+1's node-side registry read strictly follow poll N's, so committed
+    /// data is monotonic by construction. Entries are one tiny Arc per
+    /// ADMITTED node ever polled — a poll for an unknown id fails before
+    /// allocating, so caller-supplied garbage cannot grow the map.
+    pull_polls: parking_lot::Mutex<HashMap<NodeKey, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl HubFleet {
@@ -1735,6 +1854,8 @@ impl HubFleet {
             update_capable: HashSet::new(),
             version_capable: HashSet::new(),
             log_capable: HashSet::new(),
+            pull_capable: HashSet::new(),
+            node_downloads: HashMap::new(),
             versions: HashMap::new(),
             epochs: HashMap::new(),
             bus: bus_for_actor,
@@ -1750,6 +1871,7 @@ impl HubFleet {
             events_tx,
             log_watchers,
             log_watch_gen: std::sync::atomic::AtomicU64::new(0),
+            pull_polls: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -1830,6 +1952,8 @@ impl HubFleet {
             false,
             false,
             false,
+            false,
+            Vec::new(),
         )
         .await
     }
@@ -1856,6 +1980,8 @@ impl HubFleet {
         update_capable: bool,
         version_capable: bool,
         log_capable: bool,
+        pull_capable: bool,
+        downloads: Vec<crate::remote::HelloDownload>,
     ) {
         self.admit_inner(
             node,
@@ -1871,6 +1997,8 @@ impl HubFleet {
             update_capable,
             version_capable,
             log_capable,
+            pull_capable,
+            downloads,
         )
         .await
     }
@@ -1891,6 +2019,8 @@ impl HubFleet {
         update_capable: bool,
         version_capable: bool,
         log_capable: bool,
+        pull_capable: bool,
+        downloads: Vec<crate::remote::HelloDownload>,
     ) {
         // Atomically admit: assign the stable NodeId, insert the transport, record the build
         // identity, and bump the epoch in ONE actor message, gated by the admission generation. If
@@ -1913,6 +2043,8 @@ impl HubFleet {
                 update_capable,
                 version_capable,
                 log_capable,
+                pull_capable,
+                downloads,
                 reply,
             })
             .await
@@ -2426,6 +2558,19 @@ impl HubFleet {
             reply,
         })
         .await;
+        // DELIBERATELY no `pull_polls` cleanup here. A retire-time remove
+        // races a retire→re-admit→fresh-poll cycle: the fresh poll's newly
+        // inserted mutex could be deleted by this (stale) retire, letting
+        // a second fresh poll allocate ANOTHER mutex — two polls running
+        // unserialized on one node. Instead the map is bounded by
+        // EVER-ADMITTED node keys: entries are allocated only after the
+        // actor confirmed it tracks the node (never for caller-supplied
+        // strings), each is one `Arc<Mutex<()>>` (~tens of bytes), and the
+        // set of endpoints a hub ever admits is the pairing allowlist —
+        // small and operator-bounded. A retired node's entry is inert (a
+        // mutex nobody locks) and is REUSED verbatim on re-admission,
+        // which preserves poll serialization across the retire/re-admit
+        // boundary by construction.
     }
 
     /// Close every node's transport and mark all nodes disconnected, WITHOUT dropping routes,
@@ -3314,6 +3459,120 @@ impl HubFleet {
                 map: self.log_watchers.clone(),
             },
         })
+    }
+
+    /// The downloads currently IN FLIGHT on `node`, with live progress
+    /// (`M_NODE_PULL_STATUS`) — the on-demand refresh of the HELLO
+    /// announcement (the UI polls this while a download row is visible).
+    /// A pre-capability node method-not-founds the request; that surfaces as
+    /// the transport error rather than being faked as "no downloads".
+    pub async fn node_downloads(
+        self: &Arc<Self>,
+        node: &str,
+    ) -> Result<Vec<crate::remote::HelloDownload>, HiggsError> {
+        // Transport + capability in ONE actor read: the capability belongs to a
+        // CONNECTION (it came from that connection's HELLO), so reading them
+        // separately would let a reconnect in the gap pair a stale transport
+        // with the new connection's capability — status-polling a
+        // pre-capability build into a wire method-not-found.
+        let (transport, capable) = self
+            .ask(|reply| FleetMsg::PullStatusHandle {
+                node: node.to_string(),
+                reply,
+            })
+            .await
+            .unwrap_or_else(|| Err(Self::actor_gone()))?;
+        // Same friendly capability refusal as `node_logs_snapshot` — a
+        // pre-capability build would answer method-not-found, which reads
+        // like a fault, not a fact.
+        if !capable {
+            return Err(HiggsError::NodeUnreachable {
+                endpoint_id: node.to_string(),
+                detail: "this node's higgs build does not report its in-flight downloads \
+                         (update the node to a pull_status-capable release)"
+                    .into(),
+            });
+        }
+        // ONE poll per node at a time, held across request + write-back: the
+        // write-back's transport CAS orders commits across RECONNECTS, but two
+        // concurrent polls on the SAME connection could commit out of data
+        // order (a delayed stale reply lands after a fresher one and
+        // resurrects a finished transfer in the view). Serialized, poll N+1's
+        // node-side registry read strictly follows poll N's, so committed
+        // data is monotonic by construction. Allocated only AFTER the actor
+        // confirmed it tracks this node — an unknown id errors above and must
+        // not grow the map (its bound is "nodes the hub admitted", not
+        // caller-supplied strings). The snapshot itself needs no lock: a poll
+        // whose transport goes stale mid-flight errors into the HG027 drop
+        // path or fails the write-back CAS — it can never commit.
+        // NO removal path exists for `pull_polls` entries (see `retire`'s
+        // comment): the map is bounded by EVER-ADMITTED node keys, an
+        // entry is inert when its node is retired, and re-admission
+        // REUSES the same mutex — which is exactly what preserves per-node
+        // poll serialization across retire/re-admit cycles without any
+        // prune-vs-fresh-poll race.
+        let poll_lock = {
+            let mut polls = self.pull_polls.lock();
+            polls.entry(node.to_string()).or_default().clone()
+        };
+        let _poll_guard = poll_lock.lock().await;
+        // Mirror `scan_node`: a dead/wedged transport maps to HG027 AND drops
+        // the node from the fleet via `handle_op_error` — the view must not
+        // keep serving stale downloads for a connection that no longer works.
+        // BOUNDED read (64 KiB — same bound as the HELLO frame): the reply's
+        // shape is ≤16 small entries, and the cap must apply BEFORE the hub
+        // buffers the line, not after deserialization.
+        let reply = match transport
+            .request_bounded(
+                crate::remote::M_NODE_PULL_STATUS,
+                serde_json::json!({}),
+                64 * 1024,
+            )
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => return Err(self.handle_op_error(node, &transport, e).await),
+        };
+        // The dispatch builds the `downloads` key UNCONDITIONALLY (even when
+        // empty), so a reply without it — or with a non-list payload — is a
+        // PROTOCOL VIOLATION from a skewed/faulty peer, the same HG038 class
+        // as a junk M_NODE_INVENTORY reply. It is NOT authoritative-empty
+        // (treating it as empty would write back an erased cache while the
+        // original transfer may still be live) and NOT HG027 (the transport
+        // is alive — the node answered). Erroring HERE, before the
+        // write-back, leaves the cached HELLO announcement intact.
+        let downloads =
+            reply
+                .get("downloads")
+                .cloned()
+                .ok_or_else(|| HiggsError::ProtocolViolation {
+                    peer_role: "node".into(),
+                    detail: "M_NODE_PULL_STATUS reply carried no `downloads` key".into(),
+                })?;
+        let raw: Vec<crate::remote::HelloDownload> =
+            serde_json::from_value(downloads).map_err(|e| HiggsError::ProtocolViolation {
+                peer_role: "node".into(),
+                detail: format!("M_NODE_PULL_STATUS reply did not decode: {e}"),
+            })?;
+        // Same trust boundary as the HELLO announcement: VALIDATE-or-DROP
+        // (keep a valid `(repo,file)` identity EXACT — it is the node's
+        // registry key an operator acts on; drop what could never have
+        // registered), capped inside the helper — so the live-status path
+        // cannot bypass the admission policy.
+        let fresh: Vec<crate::remote::HelloDownload> =
+            crate::remote::accept_announced_downloads(&raw);
+        // WRITE-BACK: the HELLO snapshot in the view goes stale the moment a
+        // transfer ends; every live poll refreshes the cache so `nodes_view`
+        // converges (a finished download disappears on the next UI refresh,
+        // not the next reconnect).
+        self.ask(|reply| FleetMsg::SetNodeDownloads {
+            node: node.to_string(),
+            downloads: fresh.clone(),
+            transport: transport.clone(),
+            reply,
+        })
+        .await;
+        Ok(fresh)
     }
 
     /// One-shot last-`n` snapshot of `node`'s DAEMON log over iroh (no standing

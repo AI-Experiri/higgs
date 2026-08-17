@@ -111,6 +111,8 @@ async fn params_load_applies_ctx_on_a_real_node() {
         update_capable: _,
         version_capable: _,
         log_capable: _,
+        pull_capable: _,
+        downloads: _,
     } = outcome
     else {
         panic!("admitted: {outcome:?}");

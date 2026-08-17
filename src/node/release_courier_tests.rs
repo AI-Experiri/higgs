@@ -607,6 +607,8 @@ async fn fleet_with_identity(
             true,
             version_capable,
             true,
+            true,
+            Vec::new(),
         )
         .await;
     (fleet, node_key, root)

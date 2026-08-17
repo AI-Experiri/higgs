@@ -287,3 +287,45 @@ fn render_detail_shows_quants_sizes_and_fit() {
     assert!(out.contains("acme/other"));
     assert!(out.contains("# Title"));
 }
+
+#[test]
+fn downloads_subcommand_parses_and_renders_the_ledger() {
+    assert!(
+        matches!(
+            parse_model_cmd(&args(&["downloads"])).expect("parse"),
+            ModelCmd::Downloads
+        ),
+        "bare `downloads` lists the machine ledger"
+    );
+    // Renderer: live entry with progress + pid, terminal entries with their
+    // verdicts; empty ledger says so instead of printing nothing.
+    use crate::catalog::wire::{DownloadLedgerEntry, DownloadLedgerStatus};
+    let mk = |status, downloaded, total, detail: Option<&str>| DownloadLedgerEntry {
+        repo: "acme/m".into(),
+        file: "m.gguf".into(),
+        pid: 42,
+        pid_started_at: None,
+        started_at_ms: 1,
+        downloaded,
+        total,
+        status,
+        ended_at_ms: None,
+        path: None,
+        detail: detail.map(str::to_owned),
+    };
+    let out = render_ledger(&[
+        mk(DownloadLedgerStatus::Downloading, 50, Some(100), None),
+        mk(DownloadLedgerStatus::Done, 100, Some(100), None),
+        mk(DownloadLedgerStatus::Failed, 10, None, Some("boom")),
+        mk(DownloadLedgerStatus::Cancelled, 5, None, None),
+    ]);
+    assert!(out.contains("downloading [pid 42]"), "{out}");
+    assert!(out.contains("(50%)"), "{out}");
+    assert!(out.contains("done"), "{out}");
+    assert!(out.contains("failed — boom"), "{out}");
+    assert!(out.contains("cancelled"), "{out}");
+    assert_eq!(
+        render_ledger(&[]),
+        "no downloads recorded on this machine\n"
+    );
+}

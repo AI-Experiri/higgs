@@ -61,18 +61,24 @@ exec cargo llvm-cov \
   --test autotune \
   --test catalog \
   --test chat_fleet \
+  --test cli_download \
   --test config_persistence \
   --test control_api \
   --test control_errors \
   --test control_fleet_routes \
   --test cors_live \
+  --test cov_catalog_api \
+  --test cov_cli_args2 \
   --test cov_facade \
   --test cov_fleet2 \
+  --test cov_fleet3 \
   --test cov_infra \
   --test cov_nodecli \
   --test cov_paths2 \
   --test cov_remote \
   --test cov_serve \
+  --test cov_serve_edges \
+  --test cov_update_fixture \
   --test cov_worker \
   --test courier_edges \
   --test facade_hub_edges \

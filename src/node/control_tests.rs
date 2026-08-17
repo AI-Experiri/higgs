@@ -305,3 +305,31 @@ async fn update_version_spawn_outside_an_install_layout_fails_without_applying()
     // Give the detached task a moment to run to its logged failure.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 }
+
+/// M_NODE_PULL_STATUS's reply must serialize `HelloDownload` VERBATIM
+/// (r49 finding: a hand-built JSON subset lost the r48 `cancellable`
+/// field and made the live refresh downgrade registry-backed rows to
+/// observe-only). Test the announce → serialize → decode round-trip that
+/// the dispatch performs: any field on `HelloDownload` survives.
+#[test]
+fn m_node_pull_status_reply_serializes_the_full_hello_download() {
+    use crate::remote::HelloDownload;
+    // Register an in-process download so the announcement has a
+    // registry-backed row (cancellable=true).
+    let reg = crate::catalog::cancel::node_registry();
+    let _guard = reg
+        .register(None, "acme/reg-pull-status", "cancellable-check.gguf")
+        .expect("register");
+    // Mirror the r49 dispatch path: announce → serde_json::to_value → decode.
+    let announced = crate::node::data::announced_downloads();
+    let wire = serde_json::to_value(&announced).expect("full wire serialize");
+    let decoded: Vec<HelloDownload> = serde_json::from_value(wire).expect("round-trip");
+    let row = decoded
+        .iter()
+        .find(|d| d.repo == "acme/reg-pull-status" && d.file == "cancellable-check.gguf")
+        .expect("our registry row is in the announcement");
+    assert!(
+        row.cancellable,
+        "registry-backed row is cancellable (dispatch must serialize the full wire type, not a subset): {decoded:?}"
+    );
+}

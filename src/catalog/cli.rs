@@ -13,7 +13,7 @@ use crate::catalog::source::HfSource;
 use crate::catalog::wire::{CatalogModelDetail, CatalogQuery, CatalogSearchResponse, CatalogSort};
 use crate::diagnostic::HiggsError;
 
-const USAGE: &str = "usage: higgs model <search <query…> [--limit <n>] [--sort downloads|likes|updated|trending] | show <org/model> | download <org/model> [<file.gguf>]>";
+const USAGE: &str = "usage: higgs model <search <query…> [--limit <n>] [--sort downloads|likes|updated|trending] | show <org/model> | download <org/model> [<file.gguf>] | downloads>";
 
 /// One parsed `higgs model` invocation.
 #[derive(Debug)]
@@ -30,6 +30,9 @@ pub(crate) enum ModelCmd {
     /// `download <org/model> [<file>]` — pull a quant (default: the pick
     /// [`service::default_quant`] makes).
     Download { repo: String, file: Option<String> },
+    /// `downloads` — this MACHINE's downloads ledger: everything any local
+    /// process is downloading plus the recent terminal history.
+    Downloads,
 }
 
 /// Parse `higgs model …` args. `Err` carries the full usage line plus what
@@ -85,6 +88,7 @@ pub(crate) fn parse_model_cmd(args: &[String]) -> std::result::Result<ModelCmd, 
                 file: args.get(2).cloned(),
             })
         }
+        Some("downloads") => Ok(ModelCmd::Downloads),
         _ => Err(usage("unknown subcommand")),
     }
 }
@@ -290,6 +294,18 @@ fn cli_inventory() -> LocalInventory {
 
 async fn run_cmd(cmd: ModelCmd) -> std::result::Result<(), HiggsError> {
     match cmd {
+        ModelCmd::Downloads => {
+            let root = crate::download::models_dir().map_err(|e| HiggsError::DownloadFailed {
+                repo: String::new(),
+                file: String::new(),
+                detail: format!("models dir unavailable: {e}"),
+            })?;
+            print!(
+                "{}",
+                sanitize_terminal(&render_ledger(&crate::catalog::ledger::read_all(&root)))
+            );
+            Ok(())
+        }
         ModelCmd::Search { query, limit, sort } => {
             let q = CatalogQuery {
                 search: query,
@@ -364,3 +380,44 @@ async fn run_cmd(cmd: ModelCmd) -> std::result::Result<(), HiggsError> {
 #[cfg(test)]
 #[path = "cli_tests.rs"]
 mod tests;
+
+/// Render the machine downloads ledger: live transfers first (with
+/// progress), then recent history. The ledger's own read order.
+pub(crate) fn render_ledger(entries: &[crate::catalog::wire::DownloadLedgerEntry]) -> String {
+    use crate::catalog::wire::DownloadLedgerStatus as S;
+    if entries.is_empty() {
+        return "no downloads recorded on this machine\n".to_string();
+    }
+    let mut out = String::new();
+    for e in entries {
+        let progress = match (e.status, e.total) {
+            (S::Downloading, Some(t)) if t > 0 => {
+                format!(
+                    "{} / {} ({}%)",
+                    fmt_bytes(e.downloaded),
+                    fmt_bytes(t),
+                    e.downloaded * 100 / t
+                )
+            }
+            (S::Downloading, _) => format!("{} / ?", fmt_bytes(e.downloaded)),
+            _ => fmt_bytes(e.downloaded),
+        };
+        let status = match e.status {
+            S::Downloading => format!("downloading [pid {}]", e.pid),
+            S::Done => "done".to_string(),
+            S::Failed => format!(
+                "failed{}",
+                e.detail
+                    .as_deref()
+                    .map(|d| format!(" — {d}"))
+                    .unwrap_or_default()
+            ),
+            S::Cancelled => "cancelled".to_string(),
+        };
+        out.push_str(&format!(
+            "{}/{}  {}  {}\n",
+            e.repo, e.file, progress, status
+        ));
+    }
+    out
+}

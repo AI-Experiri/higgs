@@ -84,8 +84,20 @@ pub const M_NODE_UPDATE: &str = "higgs/node/update";
 pub const M_NODE_UPDATE_VERSION: &str = "higgs/node/update_version";
 /// `higgs/node/pull` — DATA-plane request to download a GGUF from HuggingFace into the node's
 /// own `~/.higgs/models/` (P4b). Streams [`N_PROGRESS`] then a final `{ path }`. `HG025` on
-/// failure. A subsequent `M_NODE_SCAN`/`M_NODE_LOAD` then sees the pulled model.
+/// failure; `HG090` when the SAME (repo, file) is already transferring on the node (one copy
+/// per file — wait or cancel it); `HG089` when the transfer was cancelled mid-flight (nothing
+/// landed; temp cleanup is the transfer's own drop guard, best-effort — failures are
+/// tracing-only). A subsequent `M_NODE_SCAN`/`M_NODE_LOAD` then sees the pulled model.
 pub const M_NODE_PULL: &str = "higgs/node/pull";
+/// `higgs/node/pull_status` — CONTROL request: every download currently in flight ON the node,
+/// with live progress. Reply rows are [`HelloDownload`]:
+/// `{ downloads: [{repo, file, downloaded, total?, cancellable}] }` — `cancellable` says
+/// whether THIS node's process owns the transfer (its cancel registry can stop it); ledger-only
+/// rows from sibling processes are observe-only (`false`). The hub asks this on (re)connect so
+/// a transfer that survived a disconnect is CONTINUED (progress shown, duplicate never
+/// attempted) instead of silently colliding with [HG090] on a blind re-issue. Advertised by
+/// the `pull_status` capability.
+pub const M_NODE_PULL_STATUS: &str = "higgs/node/pull_status";
 /// `N_PROGRESS` — node → hub download-progress notification on the pull stream:
 /// `{ request_id, downloaded, total? }` (`total` omitted when the server sends no length).
 pub const N_PROGRESS: &str = "higgs/node/progress";
@@ -175,6 +187,92 @@ pub struct HelloParams {
     /// Defaults to empty so a peer that omits it still parses.
     #[serde(default)]
     pub capabilities: Capabilities,
+    /// Downloads currently IN FLIGHT on this node, with live progress — the
+    /// node's opening announcement ("hello, I am downloading X, N bytes in")
+    /// so a hub reconnecting mid-transfer CONTINUES the download it already
+    /// started (shows progress, never re-issues into an [HG090] refusal).
+    /// Refreshable while connected via `M_NODE_PULL_STATUS`. Additive: an
+    /// older node omits it, an older hub ignores it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub downloads: Vec<HelloDownload>,
+}
+
+higgs_ts! {
+/// One in-flight download announced in [`HelloParams::downloads`] (and echoed
+/// by `M_NODE_PULL_STATUS`): identity + live byte progress. Surfaced on
+/// [`crate::node::fleet::NodeView::downloads`] so the Fleet UI shows a
+/// transfer that survived a hub disconnect and the operator continues it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HelloDownload {
+    pub repo: String,
+    pub file: String,
+    #[ts(type = "number")]
+    pub downloaded: u64,
+    /// Absent when the server sent no content length.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub total: Option<u64>,
+    /// `true` when the node's OWN process registry holds this transfer
+    /// (`node_registry().in_flight()`) and can cancel it via the future
+    /// M_NODE_PULL_CANCEL dispatch. `false` when the row is announced from
+    /// the machine LEDGER only — another process on the node box
+    /// (`higgs download` CLI, embedded hub) is doing the transfer and this
+    /// node has no cancel channel into it. The UI hides the cancel button
+    /// on non-cancellable rows; a future cancel dispatch refuses them with
+    /// a clear "not this process — cancel it where it was started"
+    /// message. Additive: default `false` so an older hub decoding a
+    /// newer node's payload treats every row as observe-only rather than
+    /// falsely offering a cancel that can't take.
+    #[serde(default)]
+    pub cancellable: bool,
+}
+}
+
+/// Accept a node-announced in-flight download list at the hub trust boundary
+/// (the HELLO `downloads` field and `M_NODE_PULL_STATUS` replies):
+/// VALIDATE-or-DROP, never rewrite. `(repo, file)` is the download's
+/// addressable IDENTITY — the exact key the node's cancel registry holds and
+/// the key an operator acts on from the fleet view — so a lossy display
+/// transform (e.g. [`sanitize_display`]'s 128-char cap) would leave a visible
+/// row no continue/cancel can ever address. Instead each entry must pass the
+/// SAME rules the node itself enforced before registering the pull —
+/// [`crate::download::dest_path`] verbatim: `<org>/<model>` + single
+/// `*.gguf`, all `[A-Za-z0-9._-]` segments, each within the filesystem's
+/// NAME_MAX (one shared predicate on both sides, so a registrable pull is
+/// always announceable and vice versa — no drift). A passing identity is
+/// pure safe-charset ASCII, hence inherently display-safe VERBATIM; a
+/// failing entry cannot correspond to a registered pull on a well-behaved
+/// node and is dropped whole. The list is capped at 16 mirroring the
+/// producer's bound (HELLO frame protection: 16 × ≤767-byte identities sits
+/// far under the 64 KiB frame caps). Progress counters are normalized too:
+/// an impossible `total` (zero, or less than `downloaded`) degrades to None
+/// rather than reaching a UI percent computation.
+pub fn accept_announced_downloads(raw: &[HelloDownload]) -> Vec<HelloDownload> {
+    // DEDUP by CASE-FOLDED (repo, file) BEFORE the cap. A faulty/hostile
+    // node could fill the 16 slots with duplicates of one key, hiding real
+    // entries and breaking the "one operator action key → one UI row"
+    // addressability invariant. The fold matches the machine
+    // download-lock's key identity (case-variant names are one on-disk
+    // file / one lock slot on default case-insensitive APFS); entries are
+    // kept VERBATIM — the fold is only the dedup key. First occurrence
+    // wins (arrival order).
+    let mut seen = std::collections::HashSet::new();
+    raw.iter()
+        .filter(|d| crate::download::dest_path(std::path::Path::new("."), &d.repo, &d.file).is_ok())
+        .filter(|d| seen.insert((d.repo.to_ascii_lowercase(), d.file.to_ascii_lowercase())))
+        .take(16)
+        .cloned()
+        .map(|mut d| {
+            // The COUNTERS are node-supplied too: an impossible pair
+            // (`total == 0`, or `downloaded > total`) would feed a UI
+            // percent/bar a divide-by-zero or >100%. The entry stays — the
+            // transfer is real, dropping it would hide a live download — but
+            // the inconsistent `total` degrades to None ("length unknown"),
+            // which every consumer already renders.
+            d.total = d.total.filter(|&t| t > 0 && d.downloaded <= t);
+            d
+        })
+        .collect()
 }
 
 /// Sanitize a peer-supplied DISPLAY NAME for a terminal (T14 r22/r23): names
@@ -257,6 +355,9 @@ pub fn node_capabilities(reports_update_failures: bool) -> Capabilities {
         // `update_by_version` (M_NODE_UPDATE_VERSION): this build can be told a bare release
         // VERSION and will fetch + verify + apply it from its OWN configured release_url.
         ("update_by_version", true),
+        // `pull_status` (M_NODE_PULL_STATUS): this build reports its in-flight
+        // downloads + live progress to a (re)connecting hub.
+        ("pull_status", true),
         // `node_logs` (M_NODE_LOGS): this build serves its own DAEMON log (snapshot +
         // follow) to the hub on demand — nothing streams unless a watcher asks.
         ("node_logs", true),
