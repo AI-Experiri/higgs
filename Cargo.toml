@@ -1,6 +1,6 @@
 [package]
 name = "higgs"
-version = "0.1.0-beta.9"
+version = "0.1.0-beta.10"
 edition = "2021"
 description = "In-app local model runtime: OpenAI-compatible serving over llama.cpp with crash-isolated worker"
 license = "MIT"
@@ -109,6 +109,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 sha2 = "0.10"
 # Constant-time digest comparison for API-token auth (keys.rs).
 subtle = "2"
+# File-locking (flock) primitive — used by the download-lock RAII guard,
+# the ledger read-modify-write lock, and the self-update apply lock. The
+# `fs2::FileExt` trait gives `try_lock_exclusive` / `unlock` cross-platform
+# with EWOULDBLOCK mapped to `WouldBlock`; kernel drops the flock on any
+# process exit (crash, SIGKILL, power loss). Per CLAUDE.md this crate is
+# the only file-lock path — no raw `libc::flock` in new code.
+fs2 = "0.4"
 # Passwd-database lookups for `higgs node install-service` (the service must be
 # pinned to the OPERATOR's user/home — under sudo that is SUDO_USER's passwd
 # entry, which $HOME/$USER cannot reliably provide). Integration tests also use

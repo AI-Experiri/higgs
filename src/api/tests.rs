@@ -3366,3 +3366,53 @@ async fn a_remote_non_chat_route_suppresses_the_jit_ad() {
         "an id whose remote route is known non-generative is not advertised via JIT"
     );
 }
+
+#[tokio::test]
+async fn a_cancelled_hg090_adopt_keeps_the_live_originals_log_step_slot() {
+    // The HG090 discriminator lives in the CANCELLED arm (every production
+    // HG090 emit is a `Cancelled{HG090}` terminal since the r51-r55 event
+    // unification). A duplicate-refusal adopt shares the LIVE original's
+    // (node, repo, file) key — clearing the slot would reset the original's
+    // decile logging, and logging "download cancelled" would misreport a
+    // transfer that is still running. A REAL cancel (HG089) still clears.
+    let higgs = fake_higgs(vec![]);
+    // The live original is mid-stream: its slot is tracked at decile 3.
+    let progress = crate::catalog::wire::ModelDownloadEvent {
+        node: Some("n1".into()),
+        repo: "acme/m".into(),
+        file: "m.gguf".into(),
+        phase: crate::catalog::wire::ModelDownloadPhase::Downloading,
+        downloaded_bytes: 3,
+        total_bytes: Some(10),
+        at_ms: 1,
+        code: None,
+        path: None,
+    };
+    higgs.log_download_event(&progress);
+    assert_eq!(higgs.download_log_steps.lock().len(), 1);
+    // A duplicate attempt's adopt terminal (same key, code HG090) must NOT
+    // clear the original's slot.
+    let adopt = crate::catalog::wire::ModelDownloadEvent {
+        phase: crate::catalog::wire::ModelDownloadPhase::Cancelled,
+        code: Some("HG090".into()),
+        ..progress.clone()
+    };
+    higgs.log_download_event(&adopt);
+    assert_eq!(
+        higgs.download_log_steps.lock().len(),
+        1,
+        "an HG090 adopt is a one-off info line about the DUPLICATE; the \
+         live original's throttle slot survives"
+    );
+    // A REAL cancel (HG089) is the original's own terminal — slot clears.
+    let real_cancel = crate::catalog::wire::ModelDownloadEvent {
+        phase: crate::catalog::wire::ModelDownloadPhase::Cancelled,
+        code: Some("HG089".into()),
+        ..progress.clone()
+    };
+    higgs.log_download_event(&real_cancel);
+    assert!(
+        higgs.download_log_steps.lock().is_empty(),
+        "a real cancel clears the slot"
+    );
+}

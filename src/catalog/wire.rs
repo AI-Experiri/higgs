@@ -195,8 +195,9 @@ higgs_const_enum! {
     /// Lifecycle phase of a catalog download, pushed as a live
     /// [`ModelDownloadEvent`] over the download-event subscription
     /// ([`Higgs::subscribe_download_events`](crate::api::Higgs::subscribe_download_events)).
-    /// `Starting`/`Downloading` are progress phases; `Done`/`Failed` are
-    /// terminal.
+    /// `Starting`/`Downloading` are progress phases; `Done`/`Failed`/
+    /// `Cancelled` are terminal — a row that saw any of the three never
+    /// gets another event for the same attempt.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     #[serde(rename_all = "snake_case")]
     pub enum ModelDownloadPhase {
@@ -208,6 +209,15 @@ higgs_const_enum! {
         Done,
         /// Terminal: the download failed; `code` carries the `HGxxx`.
         Failed,
+        /// Terminal for THIS ATTEMPT, discriminated by `code`:
+        /// `HG089` = a real cancel (operator action / caller drop) — the
+        /// transfer stopped, nothing landed (its own temp guard cleaned
+        /// up, failures visible only in tracing); `HG090` = this attempt
+        /// yielded to a transfer that CONTINUES elsewhere (duplicate
+        /// refusal, or a hub-side drop of a node transfer that survives by
+        /// design) — progress fields may carry the live transfer's bytes.
+        /// Both render as neutral/info states, never an error toast.
+        Cancelled,
     }
 }
 
@@ -221,7 +231,18 @@ higgs_ts! {
         /// Fleet node the download runs ON (`Higgs::model_download_on`);
         /// absent = this machine (`Higgs::model_download`). One event stream
         /// serves every target — subscribers key progress by
-        /// `(node, repo, file)`.
+        /// `(node, repo, file)`. A duplicate re-issue for a key that is
+        /// already transferring TERMINALIZES this attempt with
+        /// `Cancelled` carrying `code: "HG090"` — the ORIGINAL transfer
+        /// keeps flowing its own event stream (Downloading→Done); the
+        /// row's ongoing truth is `NodeView.downloads`, not this refused
+        /// attempt's event stream. Every HG090 producer (hub-facade
+        /// pre-Starting refusal, node-side post-Starting refusal, LOCAL
+        /// cross-process adopt, and the wire-attested hub-side drop of a
+        /// node transfer that survives by design) shares this
+        /// Cancelled-terminal shape — the `HG090` code on the terminal is
+        /// what tags the UI to render it as an info state ("the transfer
+        /// continues elsewhere"), never an error.
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         pub node: Option<String>,
@@ -241,8 +262,17 @@ higgs_ts! {
         /// Unix-ms when the event was emitted.
         #[ts(type = "number")]
         pub at_ms: u64,
-        /// The `HGxxx` diagnostic code — present only on
-        /// [`ModelDownloadPhase::Failed`].
+        /// The `HGxxx` diagnostic code. Present on
+        /// [`ModelDownloadPhase::Failed`] (what failed) and on
+        /// [`ModelDownloadPhase::Cancelled`] — the two codes that ride
+        /// Cancelled are `HG089` (the transfer STOPPED: a local caller
+        /// drop, an unattested remote drop, or — once the cancel-dispatch
+        /// slice ships — an operator cancel; nothing landed) and `HG090`
+        /// (this attempt yielded to a transfer that CONTINUES elsewhere:
+        /// duplicate refusal, cross-process adopt, or a wire-attested
+        /// hub-side drop; the live transfer's row continues via
+        /// `NodeView.downloads`). UI classification: `HG089`/`HG090`
+        /// render as info states, never as error toasts.
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         pub code: Option<String>,
@@ -250,5 +280,73 @@ higgs_ts! {
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         pub path: Option<String>,
+    }
+}
+
+higgs_const_enum! {
+    /// Lifecycle status of one entry in the machine-local downloads LEDGER
+    /// (`~/.higgs/models/.downloads.json`, [`crate::catalog::ledger`]): the on-disk,
+    /// cross-process record of what this machine is downloading and has
+    /// downloaded. Distinct from [`ModelDownloadPhase`] (the live PUSH event
+    /// stream): the ledger is the referable state, the events are its motion.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum DownloadLedgerStatus {
+        /// The transfer is in flight in the process named by `pid`.
+        Downloading,
+        /// The file landed whole at `path`.
+        Done,
+        /// The transfer ended without landing the file (`detail` says why —
+        /// including "downloader process exited", the dead-pid sweep's verdict
+        /// on a crashed downloader's stale entry).
+        Failed,
+        /// The transfer was cancelled mid-flight. Temp cleanup is done by
+        /// the transfer's OWN per-attempt drop guard (never a blanket
+        /// sweep); an unlink failure is visible only in tracing — this
+        /// status records the outcome, not a cleanup receipt.
+        Cancelled,
+    }
+}
+
+higgs_ts! {
+    /// One machine-local downloads-ledger entry ([`crate::catalog::ledger`]):
+    /// a live transfer (any process on this machine — node daemon, embedded
+    /// hub, `higgs download` CLI) or a terminal history record. `(repo, file)`
+    /// is the download identity (same `dest_path` rules as everywhere);
+    /// `pid` names the owning process while `status` is `downloading`.
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct DownloadLedgerEntry {
+        pub repo: String,
+        pub file: String,
+        /// Owning process while downloading (dead-pid entries are swept).
+        pub pid: u32,
+        /// That process's kernel start time (platform units) — the pid-reuse
+        /// disambiguator: liveness requires the pid AND its start time to
+        /// match, so a recycled pid never masquerades as a live transfer.
+        /// Absent on legacy entries / unqueryable platforms (pid-only then).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional, type = "number")]
+        pub pid_started_at: Option<u64>,
+        #[ts(type = "number")]
+        pub started_at_ms: u64,
+        #[ts(type = "number")]
+        pub downloaded: u64,
+        /// Absent when the server sent no content length.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional, type = "number")]
+        pub total: Option<u64>,
+        pub status: DownloadLedgerStatus,
+        /// Set on every terminal status.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional, type = "number")]
+        pub ended_at_ms: Option<u64>,
+        /// Final on-disk path — [`DownloadLedgerStatus::Done`] only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub path: Option<String>,
+        /// Failure reason — [`DownloadLedgerStatus::Failed`] only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub detail: Option<String>,
     }
 }

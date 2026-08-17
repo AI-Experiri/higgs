@@ -114,6 +114,18 @@ pub enum GateOutcome {
         /// DAEMON log over `M_NODE_LOGS` on demand. The UI hides the live-logs toggle for a
         /// node without it (a pre-capability build would method-not-found the request).
         log_capable: bool,
+        /// Whether the node's HELLO advertised the `pull_status` capability — it reports its
+        /// in-flight downloads over `M_NODE_PULL_STATUS` on demand. The hub refuses a
+        /// downloads refresh for a node without it (a pre-capability build would
+        /// method-not-found the request, which reads like a fault, not a fact).
+        pull_capable: bool,
+        /// Downloads IN FLIGHT on the node at HELLO time ("hello, I am
+        /// downloading …", with live byte progress) — how a reconnecting hub
+        /// learns a transfer survived the disconnect and CONTINUES it instead
+        /// of re-issuing into [HG090]. Validated at this trust boundary
+        /// (entries pass the node's own `dest_path` rules and are kept EXACT;
+        /// what could never register is dropped). Empty for a legacy node.
+        downloads: Vec<crate::remote::HelloDownload>,
     },
     /// Rejected; `code` is the HG diagnostic that explains why (logged at origin).
     Rejected { code: &'static str },
@@ -465,6 +477,26 @@ pub(crate) async fn gate_admit(
         log_capable: hello.capabilities.get("node_logs") == Some(&serde_json::Value::Bool(true)),
         version_capable: hello.capabilities.get("update_by_version")
             == Some(&serde_json::Value::Bool(true)),
+        // Capability map rule (same as node_logs): only an explicit boolean `true` advertises
+        // the pull-status reporter — the fleet stores this so a downloads refresh against a
+        // pre-capability build is refused up front instead of method-not-found on the wire.
+        pull_capable: hello.capabilities.get("pull_status") == Some(&serde_json::Value::Bool(true)),
+        // Trust boundary: repo/file are node-supplied strings headed for the
+        // UI, but they are also the download's addressable IDENTITY (the
+        // node's registry key) — so VALIDATE-or-DROP, never rewrite: an entry
+        // must pass the same `dest_path` rules the node enforced before
+        // registering (then it is safe-charset ASCII, display-safe verbatim),
+        // and one that can't is dropped whole (it corresponds to no
+        // registered pull). The list is capped inside the helper. GATED on
+        // the `pull_status` capability: an announcement the hub could never
+        // refresh (a skewed build without the status op) would otherwise pin
+        // a stale row in the view until reconnect.
+        downloads: if hello.capabilities.get("pull_status") == Some(&serde_json::Value::Bool(true))
+        {
+            crate::remote::accept_announced_downloads(&hello.downloads)
+        } else {
+            Vec::new()
+        },
     }
 }
 
@@ -579,6 +611,12 @@ pub async fn connect_node(
         // confirm it. A non-managed/dev launch (can't inspect the marker) or an inconclusive read
         // (transient error) omits the capability, so its `None` PRESERVES a stored failure.
         capabilities: node_capabilities(update_bin.is_some() && marker_conclusive),
+        // "Hello, I am downloading …" — announce every in-flight pull on
+        // this MACHINE (this process's registry ∪ the downloads ledger's
+        // other-process entries, live progress) so a hub reconnecting
+        // mid-transfer continues the download it already started instead of
+        // re-issuing into [HG090].
+        downloads: crate::node::data::announced_downloads(),
     };
     let req = RpcRequest {
         jsonrpc: "2.0".into(),

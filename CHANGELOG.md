@@ -19,6 +19,44 @@ from it.
 
 ## [Unreleased]
 
+## [0.1.0-beta.10] - 2026-08-16
+
+### Added
+
+- **Machine-wide download deduplication.** Every download entry point (hub
+  facade, node pull, `higgs model download` CLI) now claims a per-key kernel
+  `flock` (`<models>/.download-locks/`, via `fs2`) held for the transfer's
+  whole life — the kernel releases it on ANY exit, including SIGKILL and
+  power loss. A second start of the same `(repo, file)` anywhere on the
+  machine refuses with `[HG090]` and ADOPTS the live transfer instead of
+  corrupting it: the UI row repaints with the original's real progress.
+- **Machine downloads ledger + `higgs model downloads`.** Every transfer on
+  the box records status/history (live progress, done/failed/cancelled) in
+  `~/.higgs/models/.downloads.json`; the new CLI subcommand renders it, and
+  the node announces the ledger UNION with its own in-flight registry over
+  HELLO/`pull_status`, so a sibling process's CLI download is visible in the
+  fleet view. Three staleness sweeps (dead pid, unheld lock file, 24 h
+  lockless aging) retire residue rows on every read.
+- **Honest `cancelled` download terminals.** Download event streams gained a
+  `Cancelled` phase: `[HG089]` = this transfer stopped (nothing landed,
+  partial cleaned), `[HG090]` = this *attempt* yielded to an already-running
+  transfer that continues elsewhere. A duplicate click can no longer paint a
+  running download as failed or leave an ownerless row.
+
+### Changed
+
+- Download identity is case-folded end to end (lock key, adopt lookup,
+  announcement dedups) to match the default case-insensitive APFS — case
+  variants of one on-disk file can no longer race two writers or show
+  phantom duplicate rows.
+- The node's pull-refusal daemon log now discriminates lock contention
+  (`[HG090]` "already in flight") from filesystem faults (`[HG034]`, with
+  the error attached) — a perms/disk problem no longer reads as a phantom
+  duplicate transfer.
+- Coverage gates: integration coverage raised to 84% (new black-box suites
+  for the CLI surface, fleet wire, update/courier fixtures, catalog API, and
+  serve edges); unit coverage held at ≥90%.
+
 ## [0.1.0-beta.9] - 2026-08-14
 
 ### Fixed

@@ -18,7 +18,10 @@
 //! The facade ops (`Higgs::model_search`/`model_detail`/`model_download`) in
 //! `crate::api::embed` are thin delegations into this module.
 
+pub mod cancel;
 pub mod cli;
+pub mod download_lock;
+pub mod ledger;
 pub mod pull;
 pub mod service;
 pub mod source;

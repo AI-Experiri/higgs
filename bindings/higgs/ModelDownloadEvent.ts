@@ -12,7 +12,18 @@ export type ModelDownloadEvent = {
  * Fleet node the download runs ON (`Higgs::model_download_on`);
  * absent = this machine (`Higgs::model_download`). One event stream
  * serves every target — subscribers key progress by
- * `(node, repo, file)`.
+ * `(node, repo, file)`. A duplicate re-issue for a key that is
+ * already transferring TERMINALIZES this attempt with
+ * `Cancelled` carrying `code: "HG090"` — the ORIGINAL transfer
+ * keeps flowing its own event stream (Downloading→Done); the
+ * row's ongoing truth is `NodeView.downloads`, not this refused
+ * attempt's event stream. Every HG090 producer (hub-facade
+ * pre-Starting refusal, node-side post-Starting refusal, LOCAL
+ * cross-process adopt, and the wire-attested hub-side drop of a
+ * node transfer that survives by design) shares this
+ * Cancelled-terminal shape — the `HG090` code on the terminal is
+ * what tags the UI to render it as an info state ("the transfer
+ * continues elsewhere"), never an error.
  */
 node?: string, 
 /**
@@ -40,8 +51,17 @@ total_bytes?: number,
  */
 at_ms: number, 
 /**
- * The `HGxxx` diagnostic code — present only on
- * [`ModelDownloadPhase::Failed`].
+ * The `HGxxx` diagnostic code. Present on
+ * [`ModelDownloadPhase::Failed`] (what failed) and on
+ * [`ModelDownloadPhase::Cancelled`] — the two codes that ride
+ * Cancelled are `HG089` (the transfer STOPPED: a local caller
+ * drop, an unattested remote drop, or — once the cancel-dispatch
+ * slice ships — an operator cancel; nothing landed) and `HG090`
+ * (this attempt yielded to a transfer that CONTINUES elsewhere:
+ * duplicate refusal, cross-process adopt, or a wire-attested
+ * hub-side drop; the live transfer's row continues via
+ * `NodeView.downloads`). UI classification: `HG089`/`HG090`
+ * render as info states, never as error toasts.
  */
 code?: string, 
 /**

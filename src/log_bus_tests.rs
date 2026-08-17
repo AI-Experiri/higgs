@@ -565,3 +565,29 @@ fn worker_floods_do_not_lag_the_serve_subscription() {
         other => panic!("serve subscriber must see its line un-lagged, got {other:?}"),
     }
 }
+
+/// The process-global bus registration is FIRST-CALL-WINS: the bus bound at
+/// startup stays the one `global()` hands the node daemon for its whole life —
+/// a later (buggy/duplicate) install must be a no-op, never a silent swap that
+/// would split daemon tracing across two buses mid-run. This test is the ONLY
+/// unit test allowed to touch the global slot (all others build private buses),
+/// so both installs and the reads are deterministic within it.
+#[test]
+fn install_global_is_first_call_wins_and_read_back_by_global() {
+    let first = Arc::new(LogBus::new());
+    LogBus::install_global(first.clone());
+    let got = LogBus::global().expect("global() returns the installed bus");
+    assert!(
+        Arc::ptr_eq(&got, &first),
+        "global() hands back the very bus that was installed"
+    );
+
+    // A second install is a no-op — the first registration survives.
+    let second = Arc::new(LogBus::new());
+    LogBus::install_global(second.clone());
+    let still = LogBus::global().expect("global() still set");
+    assert!(
+        Arc::ptr_eq(&still, &first),
+        "later installs must not replace the startup bus"
+    );
+}

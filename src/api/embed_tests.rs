@@ -1599,8 +1599,11 @@ async fn a_second_concurrent_download_of_the_same_file_is_refused() {
         .model_download_with("acme/m", "m.gguf", root.path(), &instant, &instant)
         .await
         .expect_err("duplicate in-flight download must be refused");
-    assert!(matches!(refused, HiggsError::DownloadFailed { .. }));
-    assert!(refused.to_string().contains("already downloading"));
+    assert!(
+        matches!(refused, HiggsError::DownloadInFlight { .. }),
+        "the refusal is [HG090] DownloadInFlight — its own code, not the HG025 failure umbrella"
+    );
+    assert!(refused.to_string().contains("already in flight"));
 
     tx.send(()).expect("release the first transfer");
     first
@@ -1748,10 +1751,12 @@ async fn catalog_inventory_reflects_the_local_scan() {
 
 /// Cancelling a download mid-transfer (the bridge's HiggsCancel abort) must
 /// still deliver the terminal event: dropping the op future after `Starting`
-/// emits `Failed { code: "cancelled" }` — the Starting→terminal contract
-/// survives caller cancellation exactly like the load TerminalGuard.
+/// emits `Cancelled { code: HG089 }` — the Starting→terminal contract
+/// survives caller cancellation exactly like the load TerminalGuard, and a
+/// dropped-future cancellation is the Cancelled phase (info state), never a
+/// Failed error toast.
 #[tokio::test]
-async fn a_cancelled_download_still_emits_the_terminal_failed_event() {
+async fn a_cancelled_download_still_emits_the_terminal_cancelled_event() {
     use crate::catalog::wire::ModelDownloadPhase;
     struct ParkedFetcher {
         release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
@@ -1801,8 +1806,8 @@ async fn a_cancelled_download_still_emits_the_terminal_failed_event() {
         Some(ModelDownloadPhase::Starting)
     );
     let (phase, code) = phases.last().cloned().expect("terminal event");
-    assert_eq!(phase, ModelDownloadPhase::Failed);
-    assert_eq!(code.as_deref(), Some("cancelled"));
+    assert_eq!(phase, ModelDownloadPhase::Cancelled);
+    assert_eq!(code.as_deref(), Some("HG089"));
 
     // The slot is free again — a fresh download proceeds.
     let ok = ParkedFetcher {
@@ -1812,4 +1817,163 @@ async fn a_cancelled_download_still_emits_the_terminal_failed_event() {
         .model_download_with("acme/m", "m.gguf", root.path(), &ok, &ok)
         .await
         .expect("slot released after cancellation");
+}
+
+/// `downloads_status` is the facade read of the MACHINE ledger: everything
+/// recorded under this `HIGGS_HOME`'s models root — live first, then
+/// history. Runs under `TEST_ENV_LOCK` (the ledger path derives from the
+/// process-global `HIGGS_HOME`).
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // TEST_ENV_LOCK serializes HIGGS_HOME for the test
+async fn downloads_status_reads_the_machine_ledger() {
+    let _env = crate::TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let home = tempfile::tempdir().unwrap();
+    let prev = std::env::var_os("HIGGS_HOME");
+    // SAFETY: serialized by TEST_ENV_LOCK; restored below.
+    unsafe { std::env::set_var("HIGGS_HOME", home.path()) };
+
+    let higgs = fake_higgs(vec![]);
+    assert!(
+        higgs.downloads_status().is_empty(),
+        "a fresh machine has no download history"
+    );
+    let root = crate::download::models_dir().expect("models dir");
+    let claim = crate::catalog::ledger::claim_start(&root, "acme/m", "m.gguf").expect("claim");
+    let live = higgs.downloads_status();
+    assert_eq!(live.len(), 1);
+    assert_eq!(
+        live[0].status,
+        crate::catalog::wire::DownloadLedgerStatus::Downloading
+    );
+    claim.end(
+        crate::catalog::ledger::LedgerEnd::Done {
+            path: "/x/m.gguf".into(),
+        },
+        None,
+    );
+    let all = higgs.downloads_status();
+    assert_eq!(all.len(), 1);
+    assert_eq!(
+        all[0].status,
+        crate::catalog::wire::DownloadLedgerStatus::Done
+    );
+
+    // SAFETY: still under the lock.
+    unsafe {
+        match prev {
+            Some(v) => std::env::set_var("HIGGS_HOME", v),
+            None => std::env::remove_var("HIGGS_HOME"),
+        }
+    }
+}
+
+/// A LOCAL download colliding with ANOTHER process's live transfer (the
+/// machine-wide download flock in `catalog::download_lock`) follows the same
+/// adopt rule as the node path: THIS attempt terminalizes with
+/// `Cancelled{HG090}` (never `Failed` — the transfer IS running, elsewhere).
+/// We simulate the concurrent process by holding a `DownloadLock` directly
+/// in the test — the flock is what refuses the second attempt, not a
+/// hand-seeded ledger row.
+#[tokio::test]
+async fn a_local_cross_process_duplicate_adopts_not_fails() {
+    use crate::catalog::wire::ModelDownloadPhase;
+    let higgs = Arc::new(fake_higgs(vec![]));
+    let root = tempfile::tempdir().expect("root");
+    // Hold the machine-wide download lock for the key — the download-lock
+    // flock is the authority; anything downstream (ledger seed, etc.)
+    // wouldn't refuse without it now.
+    let _held =
+        crate::catalog::download_lock::DownloadLock::acquire(root.path(), "acme/m", "m.gguf")
+            .expect("hold the key");
+    struct SmallOkFetcher;
+    impl crate::download::Fetcher for SmallOkFetcher {
+        async fn fetch(
+            &self,
+            _t: &crate::download::PullTarget,
+            on_chunk: &mut (dyn FnMut(&[u8]) + Send),
+            progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
+        ) -> Result<(), HiggsError> {
+            on_chunk(b"x");
+            progress(1, Some(1));
+            Ok(())
+        }
+    }
+    let mut events = higgs.subscribe_download_events();
+    let ok = SmallOkFetcher;
+    let err = higgs
+        .model_download_with("acme/m", "m.gguf", root.path(), &ok, &ok)
+        .await
+        .expect_err("the duplicate REQUEST is refused by the flock");
+    assert!(
+        matches!(err, HiggsError::DownloadInFlight { .. }),
+        "machine-wide [HG090]: {err}"
+    );
+    let mut phases = Vec::new();
+    while let Ok(ev) = events.try_recv() {
+        phases.push((ev.phase, ev.code, ev.downloaded_bytes, ev.total_bytes));
+    }
+    let (phase, code, _dl, _total) = phases.last().cloned().expect("terminal");
+    assert_eq!(
+        phase,
+        ModelDownloadPhase::Cancelled,
+        "LOCAL adopt terminalizes THIS attempt as Cancelled: {phases:?}"
+    );
+    assert_eq!(code.as_deref(), Some("HG090"));
+    assert!(
+        !phases
+            .iter()
+            .any(|(p, ..)| *p == ModelDownloadPhase::Failed),
+        "a running download is never painted failed: {phases:?}"
+    );
+}
+
+/// A LOCAL same-process duplicate (the facade `downloads_in_flight` claim,
+/// hit while the FIRST attempt still holds the slot) follows the unified
+/// duplicate contract: THIS attempt terminalizes with `Cancelled{HG090}` on
+/// the event stream (the live original's stream owns the mainline). Before
+/// the fix, the claim refusal short-circuited with `?` and emitted nothing —
+/// an event-stream subscriber never learned the attempt existed.
+#[tokio::test]
+async fn a_local_same_process_duplicate_emits_the_cancelled_hg090_terminal() {
+    use crate::catalog::wire::ModelDownloadPhase;
+    let higgs = Arc::new(fake_higgs(vec![]));
+    let root = tempfile::tempdir().expect("root");
+    // First attempt holds the facade slot (claim directly — no transfer
+    // needs to run; the slot is what refuses).
+    let _held =
+        super::InFlightDownload::claim(&higgs, None, "acme/m", "m.gguf").expect("first claim");
+    struct NeverFetcher;
+    impl crate::download::Fetcher for NeverFetcher {
+        async fn fetch(
+            &self,
+            _t: &crate::download::PullTarget,
+            _on_chunk: &mut (dyn FnMut(&[u8]) + Send),
+            _progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
+        ) -> Result<(), HiggsError> {
+            unreachable!("refused before any fetch")
+        }
+    }
+    let mut events = higgs.subscribe_download_events();
+    let err = higgs
+        .model_download_with(
+            "acme/m",
+            "m.gguf",
+            root.path(),
+            &NeverFetcher,
+            &NeverFetcher,
+        )
+        .await
+        .expect_err("duplicate refused");
+    assert!(matches!(err, HiggsError::DownloadInFlight { .. }));
+    let mut phases = Vec::new();
+    while let Ok(ev) = events.try_recv() {
+        phases.push((ev.phase, ev.code));
+    }
+    assert_eq!(
+        phases,
+        vec![(ModelDownloadPhase::Cancelled, Some("HG090".to_owned()))],
+        "exactly one terminal Cancelled{{HG090}} for the refused attempt"
+    );
 }

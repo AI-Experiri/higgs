@@ -796,3 +796,120 @@ async fn serve_v1_refuses_keyless_lan_listener() {
         "the refused serve tore down the resident worker (no leak)"
     );
 }
+
+/// The refused-transition and auth arms of the shared status table: a missing/
+/// insufficient key is `401`, and every "well-formed but conflicts with live
+/// state" refusal — last-key-on-LAN, last-Admin-key, bench-holds-the-model,
+/// ephemeral-already-resident — is `409 Conflict` (the client resolves the
+/// conflict and retries, unlike a 400 which says the request itself is wrong).
+#[test]
+fn http_status_auth_and_conflict_arms() {
+    assert_eq!(
+        http_status(&HiggsError::Unauthorized),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        http_status(&HiggsError::LastKeyOnLan { label: "k".into() }),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        http_status(&HiggsError::LastAdminKey { label: "k".into() }),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        http_status(&HiggsError::BenchModelLoaded {
+            id: "org/model".into()
+        }),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        http_status(&HiggsError::EphemeralResident {
+            id: "org/model".into()
+        }),
+        StatusCode::CONFLICT
+    );
+}
+
+/// The RELAXED Host policy (`enforce_loopback_host = false` — what `serve_v1`
+/// builds for a deliberate, key-gated non-loopback bind): a LAN client's
+/// natural `Host: <lan-ip>:<port>` must pass straight through to routing
+/// instead of 403ing before auth — otherwise the keyed-LAN mode is unusable.
+/// The strict policy on the same request is the 403 proven by
+/// `router_host_guard_and_body_limit`, so this pins the policy DIFFERENCE.
+#[tokio::test]
+async fn relaxed_host_policy_admits_foreign_host_headers() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let app = super::v1_router_with_host_policy(super::test_support::make_higgs(), false);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .header("host", "192.168.1.50:31415") // a LAN client's natural Host
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the relaxed policy must not 403 a LAN Host header"
+    );
+}
+
+/// The loopback HAPPY serve path of `serve_v1`: it publishes the persisted CORS
+/// list, serves real HTTP on the socket, then — when the shutdown future
+/// resolves — drains gracefully, releases the serve registration, stops the
+/// facade, and returns `Ok`. This is the path every embedded loopback listener
+/// lives on; the refusal twins above never reach it.
+#[tokio::test]
+async fn serve_v1_on_loopback_serves_health_then_drains_on_shutdown() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let higgs = super::test_support::make_higgs();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(serve_v1(Arc::clone(&higgs), listener, async move {
+        let _ = stop_rx.await;
+    }));
+
+    // A real request over the live socket: /health is open and answers 200.
+    // `connection: close` bounds the read; every await is deadline-bounded.
+    let mut conn = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::net::TcpStream::connect(addr),
+    )
+    .await
+    .expect("connect deadline")
+    .expect("connect to the live listener");
+    conn.write_all(b"GET /health HTTP/1.1\r\nhost: 127.0.0.1\r\nconnection: close\r\n\r\n")
+        .await
+        .expect("send request");
+    let mut raw = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        conn.read_to_end(&mut raw),
+    )
+    .await
+    .expect("response deadline")
+    .expect("read response");
+    let head = String::from_utf8_lossy(&raw);
+    assert!(
+        head.starts_with("HTTP/1.1 200"),
+        "health over the live listener: {head}"
+    );
+    drop(conn); // no connection left open across the graceful drain
+
+    // Resolve the shutdown future: the serve must drain and exit Ok — the
+    // graceful path (deregister → last-listener stop → `served?` → Ok).
+    stop_tx.send(()).expect("server still waiting on shutdown");
+    tokio::time::timeout(std::time::Duration::from_secs(10), server)
+        .await
+        .expect("serve_v1 must resolve after shutdown")
+        .expect("task join")
+        .expect("graceful serve exits Ok");
+}

@@ -1417,3 +1417,99 @@ fn unknown_future_tensor_type_still_enriches_metadata() {
         "unknown tensor type must not degrade metadata enrichment"
     );
 }
+
+#[test]
+fn file_type_labels_cover_the_llama_ftype_table_and_degrade_on_unknowns() {
+    // The quant label table mirrors `llama.h llama_ftype` — every arm maps,
+    // and an unlisted value DEGRADES to an odd label instead of hiding the
+    // field or breaking the scan (the ggus `todo!()` lesson).
+    let cases: &[(u64, &str)] = &[
+        (0, "F32"),
+        (1, "F16"),
+        (2, "Q4_0"),
+        (3, "Q4_1"),
+        (7, "Q8_0"),
+        (8, "Q5_0"),
+        (9, "Q5_1"),
+        (10, "Q2_K"),
+        (11, "Q3_K_S"),
+        (12, "Q3_K_M"),
+        (13, "Q3_K_L"),
+        (14, "Q4_K_S"),
+        (15, "Q4_K_M"),
+        (16, "Q5_K_S"),
+        (17, "Q5_K_M"),
+        (18, "Q6_K"),
+        (19, "IQ2_XXS"),
+        (20, "IQ2_XS"),
+        (21, "Q2_K_S"),
+        (22, "IQ3_XS"),
+        (23, "IQ3_XXS"),
+        (24, "IQ1_S"),
+        (25, "IQ4_NL"),
+        (26, "IQ3_S"),
+        (27, "IQ3_M"),
+        (28, "IQ2_S"),
+        (29, "IQ2_M"),
+        (30, "IQ4_XS"),
+        (31, "IQ1_M"),
+        (32, "BF16"),
+        (36, "TQ1_0"),
+        (37, "TQ2_0"),
+        (38, "MXFP4_MOE"),
+    ];
+    for (ft, label) in cases {
+        assert_eq!(file_type_label(*ft), *label, "ftype {ft}");
+    }
+    assert_eq!(
+        file_type_label(999),
+        "ftype 999",
+        "unknown degrades, never panics"
+    );
+    assert_eq!(file_type_label(33), "ftype 33", "gap values degrade too");
+}
+
+#[test]
+fn lmstudio_scan_skips_stray_files_and_empty_names_quietly() {
+    // The walk's skip arms: a stray FILE at org level, a stray FILE at model
+    // level, and a model dir with no GGUF — all skipped without error, and a
+    // MISSING root is a clean no-op (racing deletion tolerated).
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("stray-at-org-level.txt"), b"x").unwrap();
+    let org = root.path().join("acme");
+    std::fs::create_dir_all(org.join("empty-model")).unwrap();
+    std::fs::write(org.join("stray-at-model-level.txt"), b"x").unwrap();
+    let mut out = Vec::new();
+    scan_lmstudio(root.path(), &mut out).expect("stray entries never fail the scan");
+    assert!(out.is_empty(), "nothing scannable found: {out:?}");
+
+    let mut out = Vec::new();
+    scan_lmstudio(&root.path().join("never-created"), &mut out)
+        .expect("missing root is a clean no-op");
+    assert!(out.is_empty());
+}
+
+#[test]
+fn hf_cache_scan_skips_stray_entries_and_non_gguf_files_quietly() {
+    // The HF-cache walk's skip arms: non-dir entries at repo/snapshot/rev
+    // levels and non-.gguf files inside a revision — all skipped without
+    // error; a missing root is a clean no-op.
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("stray.txt"), b"x").unwrap();
+    let rev = root.path().join("models--acme--tiny/snapshots/abc123");
+    std::fs::create_dir_all(&rev).unwrap();
+    std::fs::write(rev.join("README.md"), b"not a gguf").unwrap();
+    std::fs::write(
+        root.path().join("models--acme--tiny/snapshots/stray.file"),
+        b"x",
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    scan_hf_cache(root.path(), &mut out).expect("stray entries never fail the scan");
+    assert!(out.is_empty(), "nothing scannable found: {out:?}");
+
+    let mut out = Vec::new();
+    scan_hf_cache(&root.path().join("never-created"), &mut out)
+        .expect("missing root is a clean no-op");
+    assert!(out.is_empty());
+}

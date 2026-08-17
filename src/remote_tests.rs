@@ -137,7 +137,32 @@ fn sample_params() -> HelloParams {
         target: Some("aarch64-apple-darwin".into()),
         variant: Some("metal".into()),
         capabilities: node_capabilities(true),
+        downloads: vec![],
     }
+}
+
+#[test]
+fn hello_announces_in_flight_downloads_and_they_roundtrip() {
+    // "Hello, I am downloading …": the announcement rides HELLO so a
+    // reconnecting hub continues a surviving transfer instead of re-issuing.
+    let mut p = sample_params();
+    p.downloads = vec![HelloDownload {
+        repo: "acme/m".into(),
+        file: "m-Q4.gguf".into(),
+        downloaded: 123_456,
+        total: Some(999_999),
+        cancellable: true,
+    }];
+    let v = serde_json::to_value(&p).unwrap();
+    assert_eq!(v["downloads"][0]["repo"], "acme/m");
+    let back: HelloParams = serde_json::from_value(v).unwrap();
+    assert_eq!(back.downloads, p.downloads);
+    // An EMPTY list is omitted from the wire (additive-field hygiene), and a
+    // legacy HELLO without the field parses to empty.
+    let empty = serde_json::to_value(sample_params()).unwrap();
+    assert!(empty.get("downloads").is_none());
+    let legacy: HelloParams = serde_json::from_value(empty).unwrap();
+    assert!(legacy.downloads.is_empty());
 }
 
 #[test]
@@ -274,4 +299,195 @@ fn node_capabilities_advertise_node_logs() {
         Some(&serde_json::Value::Bool(true)),
         "current builds serve their daemon log on demand"
     );
+}
+
+#[test]
+fn announced_downloads_are_validated_exact_or_dropped_never_truncated() {
+    // `(repo, file)` is the download's addressable IDENTITY — the exact key
+    // the node's cancel registry holds and the key an operator acts on from
+    // the fleet view — so a VALID identity longer than any display cap must
+    // survive VERBATIM. Truncating it would leave a visible row no
+    // cancel/continue can ever address.
+    let long = HelloDownload {
+        repo: "acme/models".into(),
+        file: format!("{}.gguf", "q".repeat(150)),
+        downloaded: 7,
+        total: Some(9),
+        cancellable: true,
+    };
+    // Entries that could NEVER have registered on a well-behaved node (the
+    // node validates via `dest_path` before registering a pull) are DROPPED
+    // whole — never rewritten into a different, equally unaddressable string.
+    let traversal = HelloDownload {
+        repo: "../etc".into(),
+        file: "pw.gguf".into(),
+        downloaded: 0,
+        total: None,
+        cancellable: true,
+    };
+    let ansi = HelloDownload {
+        repo: "acme/m".into(),
+        file: "\u{1b}[2Jwipe.gguf".into(),
+        downloaded: 0,
+        total: None,
+        cancellable: true,
+    };
+    let not_gguf = HelloDownload {
+        repo: "acme/m".into(),
+        file: "notes.txt".into(),
+        downloaded: 0,
+        total: None,
+        cancellable: true,
+    };
+    // Longer than NAME_MAX (255 bytes): no such file can exist on disk, so no
+    // real pull carries it — dropped, not displayed.
+    let overlong = HelloDownload {
+        repo: "acme/m".into(),
+        file: format!("{}.gguf", "q".repeat(300)),
+        downloaded: 0,
+        total: None,
+        cancellable: true,
+    };
+    let out = accept_announced_downloads(&[long.clone(), traversal, ansi, not_gguf, overlong]);
+    assert_eq!(
+        out,
+        vec![long],
+        "valid identity kept exact; unregistrable entries dropped whole"
+    );
+}
+
+#[test]
+fn announced_downloads_list_is_capped_at_16() {
+    // The producer bounds its list (HELLO frame protection); the hub enforces
+    // the same cap on the untrusted side.
+    let raw: Vec<HelloDownload> = (0..40)
+        .map(|i| HelloDownload {
+            repo: "acme/m".into(),
+            file: format!("f{i}.gguf"),
+            downloaded: 0,
+            total: None,
+            cancellable: true,
+        })
+        .collect();
+    assert_eq!(accept_announced_downloads(&raw).len(), 16);
+}
+
+#[test]
+fn announced_download_counters_are_normalized_at_the_trust_boundary() {
+    // The identity is validated, but the COUNTERS are also node-supplied: an
+    // impossible pair (`total == Some(0)`, or `downloaded > total`) would feed
+    // a UI percent/bar a divide-by-zero or >100%. The entry itself stays (the
+    // transfer is real — dropping it would hide a live download); only the
+    // inconsistent `total` degrades to None ("length unknown"), which every
+    // consumer already renders.
+    let mk = |downloaded: u64, total: Option<u64>| HelloDownload {
+        repo: "acme/m".into(),
+        file: "m.gguf".into(),
+        downloaded,
+        total,
+        cancellable: true,
+    };
+    let out = accept_announced_downloads(&[mk(7, Some(0))]);
+    assert_eq!(out[0].total, None, "zero total is not a divisor");
+    assert_eq!(out[0].downloaded, 7, "byte count kept");
+    let out = accept_announced_downloads(&[mk(u64::MAX, Some(1))]);
+    assert_eq!(
+        out[0].total, None,
+        "downloaded > total is impossible — total degrades"
+    );
+    // Consistent pairs pass verbatim, including the complete boundary — but
+    // dedup by (repo, file) keeps first-only, so vary the file per entry.
+    let mk_f = |file: &str, downloaded, total| HelloDownload {
+        repo: "acme/m".into(),
+        file: file.into(),
+        downloaded,
+        total,
+        cancellable: true,
+    };
+    let out = accept_announced_downloads(&[
+        mk_f("a.gguf", 5, Some(5)),
+        mk_f("b.gguf", 1, Some(5)),
+        mk_f("c.gguf", 3, None),
+    ]);
+    assert_eq!(out[0].total, Some(5));
+    assert_eq!(out[1].total, Some(5));
+    assert_eq!(out[2].total, None);
+}
+
+#[test]
+fn announced_downloads_are_deduped_by_repo_file_before_the_cap() {
+    // A faulty/hostile node could fill the 16 slots with duplicates of one
+    // key — hiding real entries and breaking the addressability invariant
+    // ("one operator action key → one UI row"). First occurrence wins.
+    let mut raw = Vec::new();
+    for i in 0..17 {
+        raw.push(HelloDownload {
+            repo: "acme/m".into(),
+            file: "same.gguf".into(),
+            downloaded: i,
+            total: None,
+            cancellable: true,
+        });
+    }
+    raw.push(HelloDownload {
+        repo: "acme/m".into(),
+        file: "different.gguf".into(),
+        downloaded: 99,
+        total: None,
+        cancellable: true,
+    });
+    let out = accept_announced_downloads(&raw);
+    assert_eq!(
+        out.len(),
+        2,
+        "duplicates collapse, second key survives: {out:?}"
+    );
+    assert_eq!(out[0].downloaded, 0, "first-of-duplicates wins");
+    assert_eq!(out[1].file, "different.gguf");
+}
+
+/// r87 pin: the dedup key is CASE-FOLDED, matching the machine
+/// download-lock's identity fold — case-variant names are one on-disk file
+/// / one lock slot on default case-insensitive APFS, so they must collapse
+/// to one UI row (first occurrence, kept verbatim). Reverting the seen-set
+/// key to the exact-case tuple keeps both variants and fails this pin.
+#[test]
+fn case_variant_announced_downloads_collapse_to_one_folded_key() {
+    let mk = |repo: &str, file: &str, downloaded| HelloDownload {
+        repo: repo.into(),
+        file: file.into(),
+        downloaded,
+        total: None,
+        cancellable: true,
+    };
+    let out = accept_announced_downloads(&[
+        mk("acme/m", "same.gguf", 1),
+        mk("ACME/m", "SAME.GGUF", 2),
+        mk("acme/M", "Same.Gguf", 3),
+    ]);
+    assert_eq!(out.len(), 1, "case variants are one folded key: {out:?}");
+    assert_eq!(out[0].repo, "acme/m", "first occurrence kept VERBATIM");
+    assert_eq!(out[0].file, "same.gguf");
+    assert_eq!(out[0].downloaded, 1);
+}
+
+#[test]
+fn hello_download_cancellable_defaults_false_for_legacy_wires() {
+    // The `cancellable` bit is additive: a hub decoding a NEWER node's
+    // payload sees the field; a hub decoding an OLDER node's payload
+    // (no field) must NOT falsely offer a cancel that can't take. Serde
+    // default is `false`.
+    let legacy = serde_json::json!({
+        "repo": "acme/m", "file": "m.gguf",
+        "downloaded": 5, "total": 10
+    });
+    let d: HelloDownload = serde_json::from_value(legacy).expect("legacy row parses");
+    assert!(!d.cancellable, "no field on wire → observe-only by default");
+    // A NEWER wire with the field set true parses through.
+    let modern = serde_json::json!({
+        "repo": "acme/m", "file": "m.gguf",
+        "downloaded": 5, "total": 10, "cancellable": true
+    });
+    let d2: HelloDownload = serde_json::from_value(modern).expect("modern row parses");
+    assert!(d2.cancellable, "explicit true is honored");
 }
