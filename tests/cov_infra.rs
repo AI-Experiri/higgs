@@ -89,7 +89,7 @@ async fn serve_fixed(status: axum::http::StatusCode, body: &'static str) -> Stri
 
 // ── download.rs: in-test Fetcher fakes ───────────────────────────────────────
 
-use higgs::download::{dest_path, download, download_dual, Fetcher, HttpFetcher, PullTarget};
+use higgs::download::{dest_path, download_dual, Fetcher, HttpFetcher, PullTarget};
 
 /// A [`Fetcher`] that emits `body` in one chunk and reports progress — the "network
 /// succeeded" fake, so the atomic-write path in `download` runs end to end.
@@ -164,16 +164,12 @@ async fn download_single_fetcher_paths() {
     let root = TempDir::new().unwrap();
     let t = PullTarget::new("acme/model", "weights.gguf");
     let mut prog = |_dl: u64, _total: Option<u64>| {};
-    let path = download(
-        &t,
-        root.path(),
-        &OkFetcher {
-            body: b"GGUF".to_vec(),
-        },
-        &mut prog,
-    )
-    .await
-    .expect("download succeeds");
+    let ok = OkFetcher {
+        body: b"GGUF".to_vec(),
+    };
+    let path = download_dual(&t, root.path(), &ok, &ok, &mut prog)
+        .await
+        .expect("download succeeds");
     assert!(path.exists(), "final file written: {path:?}");
     assert_eq!(std::fs::read(&path).unwrap(), b"GGUF");
 
@@ -184,7 +180,8 @@ async fn download_single_fetcher_paths() {
         file: "weights.gguf".into(),
         revision: "bad rev".into(),
     };
-    let err = download(&bad, root.path(), &OkFetcher { body: vec![] }, &mut prog)
+    let empty = OkFetcher { body: vec![] };
+    let err = download_dual(&bad, root.path(), &empty, &empty, &mut prog)
         .await
         .unwrap_err();
     assert!(
@@ -197,16 +194,12 @@ async fn download_single_fetcher_paths() {
     let root2 = TempDir::new().unwrap();
     let occupied = root2.path().join("acme/model/weights.gguf");
     std::fs::create_dir_all(&occupied).unwrap();
-    let err = download(
-        &t,
-        root2.path(),
-        &OkFetcher {
-            body: b"x".to_vec(),
-        },
-        &mut prog,
-    )
-    .await
-    .unwrap_err();
+    let onefetch = OkFetcher {
+        body: b"x".to_vec(),
+    };
+    let err = download_dual(&t, root2.path(), &onefetch, &onefetch, &mut prog)
+        .await
+        .unwrap_err();
     assert!(
         matches!(err, HiggsError::HubFileWrite { .. }),
         "rename onto a directory → HubFileWrite, got {err:?}"
@@ -289,7 +282,7 @@ async fn download_httpfetcher_live_server() {
         let mut prog = move |d: u64, tot: Option<u64>| {
             *seen2.lock().unwrap() = (d, tot);
         };
-        let path = download(&t, root.path(), &HttpFetcher, &mut prog)
+        let path = download_dual(&t, root.path(), &HttpFetcher, &HttpFetcher, &mut prog)
             .await
             .expect("HttpFetcher 200 succeeds");
         assert_eq!(std::fs::read(&path).unwrap(), b"GGUF-bytes");
@@ -298,20 +291,28 @@ async fn download_httpfetcher_live_server() {
         assert_eq!(total, Some(10), "content-length reported to progress");
     }
 
-    // A 429: HttpFetcher classifies it as HubRateLimited (HG031) via http_status_to_error.
+    // A 429: HttpFetcher classifies the status as HG031 (rate-limited). download_dual
+    // retries the fallback on a fetcher failure, and here BOTH fetchers are HttpFetcher
+    // against the same 429 server, so the result is the terminal HubFetchExhausted (HG036)
+    // carrying two HG031 diagnoses — not a bare HubRateLimited.
     {
         let base = serve_fixed(axum::http::StatusCode::TOO_MANY_REQUESTS, "slow down").await;
         let _env = EnvVarGuard::set("HIGGS_HF_ENDPOINT", &base);
         let root = TempDir::new().unwrap();
         let t = PullTarget::new("acme/model", "weights.gguf");
         let mut prog = |_d: u64, _t: Option<u64>| {};
-        let err = download(&t, root.path(), &HttpFetcher, &mut prog)
+        let err = download_dual(&t, root.path(), &HttpFetcher, &HttpFetcher, &mut prog)
             .await
             .unwrap_err();
-        assert!(
-            matches!(err, HiggsError::HubRateLimited { .. }),
-            "HTTP 429 → HubRateLimited, got {err:?}"
-        );
+        match err {
+            HiggsError::HubFetchExhausted {
+                primary, fallback, ..
+            } => {
+                assert!(primary.contains("HG031"), "primary is HG031: {primary}");
+                assert!(fallback.contains("HG031"), "fallback is HG031: {fallback}");
+            }
+            other => panic!("HTTP 429 on both paths → HubFetchExhausted, got {other:?}"),
+        }
     }
 }
 

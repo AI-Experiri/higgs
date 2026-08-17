@@ -88,6 +88,62 @@ impl NodeTransport {
         }
     }
 
+    /// [`request`](Self::request) with a BOUNDED reply read: the frame is
+    /// rejected once it exceeds `max_bytes`, so a compromised/buggy node
+    /// cannot make the hub buffer an arbitrarily large reply line before any
+    /// consumer-side cap applies. Use for ops whose reply has a known small
+    /// shape (e.g. `M_NODE_PULL_STATUS`).
+    pub async fn request_bounded(
+        &self,
+        method: &str,
+        params: Value,
+        max_bytes: usize,
+    ) -> Result<Value, HiggsError> {
+        let id = self.alloc_id();
+        // Bound the OPEN + WRITE phase too (same hazard `pull()` guards): a
+        // wedged node or withheld QUIC stream credit would otherwise hang
+        // BEFORE the reply-read timeout ever starts — and the caller's
+        // handle_op_error (which drops the dead transport) would never run.
+        let open_and_send = async {
+            let (mut send, recv) = self.conn.open_bi().await.map_err(transport_dead)?;
+            let req = RpcRequest {
+                jsonrpc: "2.0".into(),
+                id,
+                method: method.into(),
+                params,
+            };
+            write_frame(&mut send, &RpcFrame::Request(req))
+                .await
+                .map_err(transport_dead)?;
+            let _ = send.finish();
+            Ok::<_, HiggsError>(recv)
+        };
+        let recv = match tokio::time::timeout(CONTROL_RPC_TIMEOUT, open_and_send).await {
+            Ok(r) => r?,
+            Err(_) => {
+                return Err(transport_dead(format!(
+                    "control RPC {method}: open/send timed out"
+                )))
+            }
+        };
+        let mut reader = BufReader::new(recv);
+        let line = match tokio::time::timeout(
+            CONTROL_RPC_TIMEOUT,
+            rpc::read_bounded_frame(&mut reader, max_bytes),
+        )
+        .await
+        {
+            Ok(Ok(Some(line))) => line,
+            Ok(Ok(None)) => return Err(transport_dead("node closed the stream before replying")),
+            Ok(Err(e)) => return Err(transport_dead(e)),
+            Err(_) => return Err(transport_dead(format!("control RPC {method} timed out"))),
+        };
+        match rpc::decode(&line).map_err(|e| transport_dead(e.to_string()))? {
+            RpcFrame::Response(resp) => extract_result(method, resp),
+            other => Err(transport_dead(format!("unexpected reply frame: {other:?}"))),
+        }
+    }
+
     /// Trigger a catalog download ON the node (`M_NODE_PULL`): the node fetches
     /// `repo`/`file` from the Hub ITSELF (its own endpoint/fallback, atomic into
     /// its models dir) — no bytes cross this stream, only `N_PROGRESS`
@@ -384,7 +440,17 @@ where
                         .get("downloaded")
                         .and_then(Value::as_u64)
                         .unwrap_or(0);
-                    let total = n.params.get("total").and_then(Value::as_u64);
+                    // Same counter normalization `accept_announced_downloads`
+                    // applies to the HELLO/pull_status paths for identical
+                    // node-supplied numbers: an impossible total (zero, or
+                    // less than `downloaded`) degrades to None ("length
+                    // unknown") so a skewed/faulty node cannot push a
+                    // divide-by-zero or a >100% bar into UI percent math.
+                    let total = n
+                        .params
+                        .get("total")
+                        .and_then(Value::as_u64)
+                        .filter(|&t| t > 0 && t >= downloaded);
                     on_progress(downloaded, total);
                 }
                 RpcFrame::Response(resp) => break extract_result(crate::remote::M_NODE_PULL, resp),

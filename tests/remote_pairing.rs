@@ -80,6 +80,10 @@ async fn valid_token_pairs() {
             update_capable: true,
             version_capable: true,
             log_capable: true,
+            // A current node reports its in-flight downloads on demand (DL slice).
+            pull_capable: true,
+            // The in-process test node has no download in flight to announce.
+            downloads: vec![],
         }
     );
     assert!(now_paired, "node added to allowlist after pairing");
@@ -275,6 +279,10 @@ async fn hello_exchanges_friendly_names() {
             update_capable: true,
             version_capable: true,
             log_capable: true,
+            // A current node reports its in-flight downloads on demand (DL slice).
+            pull_capable: true,
+            // The in-process test node has no download in flight to announce.
+            downloads: vec![],
         }
     );
     assert_eq!(
@@ -347,6 +355,10 @@ async fn allowlisted_node_reconnects_without_token() {
             update_capable: true,
             version_capable: true,
             log_capable: true,
+            // A current node reports its in-flight downloads on demand (DL slice).
+            pull_capable: true,
+            // The in-process test node has no download in flight to announce.
+            downloads: vec![],
         }
     );
     let _ = std::fs::remove_file(&path);
