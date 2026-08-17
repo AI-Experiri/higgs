@@ -253,3 +253,107 @@ async fn probe_reports_alive_answer_and_dead() {
     // unless a local resolver runs; accept None or Some—the assertion documents intent.)
     let _ = dead;
 }
+
+// ── style / env / ticket-split / runner (unit-side) ────────────────────────────
+
+#[test]
+fn style_auto_is_plain_under_captured_output() {
+    // Captured test output is not a terminal, so auto() must disable color and
+    // paint() must return the text byte-plain (no ANSI escapes for logs/pipes).
+    let style = Style::auto();
+    let painted = style.paint("31", "plain");
+    assert!(
+        !painted.contains('\x1b'),
+        "captured output stays byte-plain: {painted:?}"
+    );
+}
+
+#[test]
+fn ssh_session_detection_requires_a_nonempty_marker() {
+    let _env = crate::TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let prev: Vec<_> = ["SSH_CONNECTION", "SSH_TTY", "SSH_CLIENT"]
+        .iter()
+        .map(|k| (*k, std::env::var_os(k)))
+        .collect();
+    // SAFETY: serialized by TEST_ENV_LOCK; restored below.
+    unsafe {
+        for (k, _) in &prev {
+            std::env::remove_var(k);
+        }
+    }
+    assert!(!is_ssh_session(), "no markers → not an SSH session");
+    unsafe { std::env::set_var("SSH_CONNECTION", "") };
+    assert!(!is_ssh_session(), "an EMPTY marker does not count");
+    unsafe { std::env::set_var("SSH_CONNECTION", "10.0.0.1 22 10.0.0.2 22") };
+    assert!(is_ssh_session(), "a populated marker does");
+    // SAFETY: still under the lock.
+    unsafe {
+        for (k, v) in prev {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+}
+
+#[test]
+fn split_ticket_addrs_separates_relays_from_direct_sockets() {
+    let pk = iroh::SecretKey::generate().public();
+    let direct: SocketAddr = "10.1.2.3:7842".parse().unwrap();
+    let addr = iroh::EndpointAddr::from_parts(
+        pk,
+        [
+            TransportAddr::Relay("https://relay.example.net/".parse().unwrap()),
+            TransportAddr::Ip(direct),
+        ],
+    );
+    let (relays, directs) = split_ticket_addrs(&addr);
+    assert_eq!(relays, vec!["relay.example.net".to_string()]);
+    assert_eq!(directs, vec![direct]);
+}
+
+#[tokio::test]
+async fn probe_reports_a_dead_loopback_nameserver_as_not_responding() {
+    // 127.0.0.1:53 has no resolver in the test environment: the UDP probe
+    // gets no valid answer inside its deadline → None ("dead"), never a
+    // false "alive". Bounded by the passed timeout — deterministic.
+    let out = probe_nameserver(
+        "127.0.0.1".parse().unwrap(),
+        "relay.example.net",
+        Duration::from_millis(250),
+    )
+    .await;
+    assert_eq!(out, None, "no resolver on loopback → dead");
+}
+
+#[tokio::test]
+async fn run_skips_dns_probes_for_an_ip_literal_relay() {
+    // An IP-literal relay host needs no DNS: run() must mark the relay
+    // resolvable WITHOUT probing any nameserver (zero network beyond the
+    // print statements) and report the ticket's shape verbatim.
+    let pk = iroh::SecretKey::generate().public();
+    let direct: SocketAddr = "127.0.0.1:1".parse().unwrap();
+    let addr = iroh::EndpointAddr::from_parts(
+        pk,
+        [
+            TransportAddr::Relay("https://127.0.0.1/".parse().unwrap()),
+            TransportAddr::Ip(direct),
+        ],
+    );
+    let report = run(&addr, &Style::auto()).await;
+    assert_eq!(report.relay_hosts, vec!["127.0.0.1".to_string()]);
+    assert_eq!(report.direct_addrs, vec![direct]);
+    assert_eq!(
+        report.relay_resolves,
+        Some(true),
+        "IP-literal relay needs no DNS"
+    );
+    assert!(
+        report.nameservers.is_empty(),
+        "no probes fired for an IP-literal relay"
+    );
+    assert!(!report.hopeless(), "a viable relay path exists");
+}
