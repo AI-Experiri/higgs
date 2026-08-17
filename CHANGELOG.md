@@ -19,6 +19,8 @@ from it.
 
 ## [Unreleased]
 
+## [0.1.0-beta.10] - 2026-08-16
+
 ### Added
 
 - **Machine-wide download deduplication.** Every download entry point (hub
