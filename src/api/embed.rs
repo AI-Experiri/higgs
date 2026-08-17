@@ -339,7 +339,7 @@ impl Higgs {
     /// root, so the next scan lists it), emitting live
     /// [`crate::catalog::ModelDownloadEvent`]s over
     /// [`subscribe_download_events`](Self::subscribe_download_events):
-    /// `Starting` → throttled `Downloading` → terminal `Done`/`Failed`.
+    /// `Starting` → throttled `Downloading` → one terminal (`Done`/`Failed`/`Cancelled`).
     /// Returns the final on-disk path.
     pub async fn model_download(
         &self,
@@ -408,7 +408,6 @@ impl Higgs {
         let fleet = self
             .fleet()
             .ok_or_else(|| not_a_hub_error(&format!("models/download on {node}")))?;
-        let _in_flight = InFlightDownload::claim(self, Some(node), repo, file)?;
         // `at_ms` is stamped by `emit_download_event`.
         let base = |phase: ModelDownloadPhase| ModelDownloadEvent {
             node: Some(node.to_owned()),
@@ -421,13 +420,51 @@ impl Higgs {
             code: None,
             path: None,
         };
+        // Two sources of a duplicate refusal, treated differently on purpose:
+        //
+        // (a) Node-registry refusal (below, after Starting): the NODE
+        //     attested that a transfer is running. Repaint is safe — the row
+        //     has a real owner streaming progress.
+        //
+        // (b) HUB-facade pre-Starting claim refusal (here): the local
+        //     `downloads_in_flight` set says another same-key request is
+        //     already in this hub's pipeline. THIS attempt is honestly
+        //     cancelled in favor of it: emit a `Cancelled{HG090}` TERMINAL
+        //     (no ownerless non-terminal row; no wire RPC on the refusal
+        //     path — a live-check to `node_downloads()` here would block up
+        //     to the control timeout on a wedged node and defeat "second
+        //     click is fast"). The ORIGINAL transfer's visibility lives in
+        //     `NodeView.downloads` / `Higgs::node_downloads()`, not this
+        //     refused attempt's event stream — same shape as the local-path
+        //     HG090 adopt.
+        let _in_flight = match InFlightDownload::claim(self, Some(node), repo, file) {
+            Ok(claim) => claim,
+            Err(e) => {
+                self.emit_download_event(ModelDownloadEvent {
+                    code: Some("HG090".into()),
+                    ..base(ModelDownloadPhase::Cancelled)
+                });
+                return Err(e);
+            }
+        };
         self.emit_download_event(base(ModelDownloadPhase::Starting));
+        // Wire attestation for the drop-guard's code choice: a progress
+        // frame from the node PROVES it registered + started the detached
+        // transfer (only the node's pull task sends them). Until one
+        // arrives, a dropped future may have died in `open_bi`/
+        // `write_frame` before the request ever landed — in that window
+        // the honest drop code is HG089 ("nothing started anywhere"),
+        // never HG090 ("transfer continues"). Residual: request landed
+        // but zero frames yet → HG089 under-claims; the fleet view
+        // self-corrects on the next NodeView.downloads poll/HELLO.
+        let wire_attested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut term = DownloadTerminalGuard {
             higgs: self,
             node: Some(node.to_owned()),
             repo: repo.to_owned(),
             file: file.to_owned(),
             armed: true,
+            remote_attested: Some(wire_attested.clone()),
         };
         // The node re-validates on arrival (`dest_path`); refusing the same
         // shapes here keeps a bad request from ever opening a stream — but only
@@ -446,6 +483,7 @@ impl Higgs {
         let mut last = (0u64, None::<u64>);
         let result = fleet
             .pull_on_node(node, repo, file, &mut |downloaded, total| {
+                wire_attested.store(true, std::sync::atomic::Ordering::Relaxed);
                 last = (downloaded, total);
                 if gate.should_emit(std::time::Instant::now()) {
                     self.emit_download_event(ModelDownloadEvent {
@@ -483,11 +521,49 @@ impl Higgs {
                     } => Some(c.clone()),
                     other => miette::Diagnostic::code(other).map(|c| c.to_string()),
                 };
+                // [HG090] "already in flight": the node just ATTESTED this
+                // very download is running — so the download is NOT failed,
+                // only THIS request is (operator ruling: stop the request,
+                // mark the download as downloading in the hub). Since
+                // `Starting` already fired on this event row, terminalize
+                // it with `Cancelled{HG090}` — same shape as the hub-facade
+                // pre-Starting refusal, and same shape as the LOCAL adopt
+                // in `model_download_with`. No live-check RPC on the
+                // refusal path: a wedged node would block up to the control
+                // timeout AND trigger transport-drop side effects on this
+                // caller. The ORIGINAL transfer's visibility lives in
+                // `NodeView.downloads` (poll-driven), never in THIS refused
+                // attempt's event stream — a non-terminal `Downloading`
+                // here would leave the row ownerless with no future
+                // terminal if the original finished before/around the
+                // status poll.
+                if code.as_deref() == Some("HG090")
+                    || matches!(&e, HiggsError::DownloadInFlight { .. })
+                {
+                    self.emit_download_event(ModelDownloadEvent {
+                        downloaded_bytes: last.0,
+                        total_bytes: last.1,
+                        code: Some("HG090".into()),
+                        ..base(ModelDownloadPhase::Cancelled)
+                    });
+                    return Err(e);
+                }
+                // Cancelled ≠ failed: a node-side [HG089] (the transfer was
+                // cancelled, partial swept) gets its OWN terminal phase so the
+                // UI renders a neutral state, never an error toast. The origin
+                // code rides a relayed WorkerRpc, so match by code string.
+                let phase = if code.as_deref() == Some("HG089")
+                    || matches!(&e, HiggsError::DownloadCancelled { .. })
+                {
+                    ModelDownloadPhase::Cancelled
+                } else {
+                    ModelDownloadPhase::Failed
+                };
                 self.emit_download_event(ModelDownloadEvent {
                     downloaded_bytes: last.0,
                     total_bytes: last.1,
                     code,
-                    ..base(ModelDownloadPhase::Failed)
+                    ..base(phase)
                 });
                 Err(e)
             }
@@ -510,11 +586,6 @@ impl Higgs {
         F: crate::download::Fetcher + Sync,
     {
         use crate::catalog::wire::{ModelDownloadEvent, ModelDownloadPhase};
-        // One in-flight download per (repo, file): a concurrent duplicate is
-        // refused BEFORE any event is emitted, so subscribers never see two
-        // interleaved streams for the same file and a multi-GB transfer never
-        // runs twice. The claim releases on every exit path (Drop).
-        let _in_flight = InFlightDownload::claim(self, None, repo, file)?;
         // `at_ms` is stamped by `emit_download_event`.
         let base = |phase: ModelDownloadPhase| ModelDownloadEvent {
             node: None,
@@ -527,6 +598,24 @@ impl Higgs {
             code: None,
             path: None,
         };
+        // One in-flight download per (repo, file): a concurrent duplicate is
+        // refused before Starting, so subscribers never see two interleaved
+        // streams for the same file and a multi-GB transfer never runs
+        // twice. The refusal follows the unified duplicate contract: THIS
+        // attempt terminalizes with `Cancelled{HG090}` (same shape as the
+        // node path and the cross-process flock refusal inside the
+        // download) — the live original's stream owns the mainline events.
+        // The claim releases on every exit path (Drop).
+        let _in_flight = match InFlightDownload::claim(self, None, repo, file) {
+            Ok(claim) => claim,
+            Err(e) => {
+                self.emit_download_event(ModelDownloadEvent {
+                    code: Some("HG090".into()),
+                    ..base(ModelDownloadPhase::Cancelled)
+                });
+                return Err(e);
+            }
+        };
         self.emit_download_event(base(ModelDownloadPhase::Starting));
         let mut term = DownloadTerminalGuard {
             higgs: self,
@@ -534,6 +623,7 @@ impl Higgs {
             repo: repo.to_owned(),
             file: file.to_owned(),
             armed: true,
+            remote_attested: None,
         };
         let mut gate =
             crate::catalog::pull::ProgressGate::new(crate::catalog::pull::DOWNLOAD_EVENT_INTERVAL);
@@ -564,6 +654,35 @@ impl Higgs {
                 path: Some(path.display().to_string()),
                 ..base(ModelDownloadPhase::Done)
             }),
+            // ANOTHER process on this machine is already transferring the key
+            // (the ledger's [HG090]) — the request stops. This is the LOCAL
+            // adopt path: unlike the remote-node path, the local card has no
+            // `NodeView.downloads` owner to close a non-terminal row from
+            // outside this process, and the other process's event bus does
+            // NOT cross process boundaries (no way for us to observe its
+            // Done/Failed). So THIS attempt terminalizes with `Cancelled` +
+            // code HG090 — the row closes with the other process's live
+            // progress carried in for context (never Failed: the file IS
+            // downloading, just not in this process). The other process's
+            // ledger is the durable source of truth for what actually lands.
+            Err(HiggsError::DownloadInFlight { .. }) => {
+                // Case-FOLDED match, mirroring the download-lock's key fold:
+                // the flock that produced this refusal treats case variants
+                // as one key (APFS case-insensitivity), so the live row may
+                // carry different casing than this request — an exact match
+                // would miss it and zero out the adopt event's progress.
+                let live = crate::catalog::ledger::read_live(root)
+                    .into_iter()
+                    .find(|l| {
+                        l.repo.eq_ignore_ascii_case(repo) && l.file.eq_ignore_ascii_case(file)
+                    });
+                self.emit_download_event(ModelDownloadEvent {
+                    downloaded_bytes: live.as_ref().map_or(0, |l| l.downloaded),
+                    total_bytes: live.as_ref().and_then(|l| l.total),
+                    code: Some("HG090".into()),
+                    ..base(ModelDownloadPhase::Cancelled)
+                });
+            }
             Err(e) => self.emit_download_event(ModelDownloadEvent {
                 downloaded_bytes: last.0,
                 total_bytes: last.1,
@@ -1721,18 +1840,39 @@ pub(crate) fn fit_generation_budget(
     }
 }
 
-/// Emits the terminal `Failed { code: "cancelled" }` download event if the
-/// op future is DROPPED between `Starting` and its natural terminal — the
-/// bridge's cancel (or any caller drop) aborts the future, and without this
-/// the Starting→terminal event contract would break exactly there. The same
-/// seam the load path covers with its `TerminalGuard`. Disarmed right before
-/// the normal terminal emit.
+/// Emits a terminal `Cancelled` download event if the op future is DROPPED
+/// between `Starting` and its natural terminal — the bridge's cancel (or
+/// any caller drop) aborts the future, and without this the
+/// Starting→terminal event contract would break exactly there. The same
+/// seam the load path covers with its `TerminalGuard`. Disarmed right
+/// before the normal terminal emit.
+///
+/// The code distinguishes what actually happened to the TRANSFER:
+///  * LOCAL (`node: None`) → `HG089`: dropping the local future kills the
+///    transfer itself (its TempGuard sweeps the tmp) — "cancelled, nothing
+///    landed" is the truth.
+///  * REMOTE (`node: Some`), WIRE-ATTESTED → `HG090`: a progress frame
+///    proved the node registered + started the detached transfer, which
+///    SURVIVES a dropped hub-side stream by design — only THIS attempt's
+///    observation ended; the row's ongoing truth is `NodeView.downloads`.
+///  * REMOTE, UNATTESTED → `HG089`: the future may have died in
+///    `open_bi`/`write_frame` before the request ever reached the node —
+///    claiming "transfer continues" (HG090) for a pull that may never
+///    have started would be a lie. If the request DID land with zero
+///    frames observed, HG089 under-claims briefly and the fleet view
+///    self-corrects on the next `NodeView.downloads` poll / HELLO.
+///
+/// Never `Failed`: a drop is a cancellation (operator action / caller went
+/// away), and Failed would render an error toast for it.
 struct DownloadTerminalGuard<'a> {
     higgs: &'a Higgs,
     node: Option<String>,
     repo: String,
     file: String,
     armed: bool,
+    /// Remote-path wire attestation (None on the local path): set true by
+    /// the first node progress frame.
+    remote_attested: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Drop for DownloadTerminalGuard<'_> {
@@ -1740,16 +1880,25 @@ impl Drop for DownloadTerminalGuard<'_> {
         if !self.armed {
             return;
         }
+        let attested = self
+            .remote_attested
+            .as_ref()
+            .is_some_and(|a| a.load(std::sync::atomic::Ordering::Relaxed));
+        let code = if self.node.is_some() && attested {
+            "HG090"
+        } else {
+            "HG089"
+        };
         self.higgs
             .emit_download_event(crate::catalog::wire::ModelDownloadEvent {
                 node: self.node.clone(),
                 repo: self.repo.clone(),
                 file: self.file.clone(),
-                phase: crate::catalog::wire::ModelDownloadPhase::Failed,
+                phase: crate::catalog::wire::ModelDownloadPhase::Cancelled,
                 downloaded_bytes: 0,
                 total_bytes: None,
                 at_ms: 0,
-                code: Some("cancelled".to_owned()),
+                code: Some(code.to_owned()),
                 path: None,
             });
     }
@@ -1772,10 +1921,16 @@ impl<'a> InFlightDownload<'a> {
     ) -> Result<Self, HiggsError> {
         let key = (node.map(str::to_owned), repo.to_owned(), file.to_owned());
         if !higgs.downloads_in_flight.lock().insert(key.clone()) {
-            return Err(HiggsError::DownloadFailed {
+            // Same [HG090] code as the node-side registry refusal: ONE code for
+            // "already downloading" fleet-wide, so the UI classifies it by code.
+            // Both callers (`model_download_on` and `model_download_with`)
+            // react to this refusal by terminalizing THEIR attempt with a
+            // `Cancelled{HG090}` event (the unified duplicate contract) —
+            // never Failed (would lie about a running transfer), never a
+            // non-terminal repaint (would strand an ownerless row).
+            return Err(HiggsError::DownloadInFlight {
                 repo: repo.to_owned(),
                 file: file.to_owned(),
-                detail: "already downloading — one transfer per file at a time".to_owned(),
             });
         }
         Ok(Self { higgs, key })

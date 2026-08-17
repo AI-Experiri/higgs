@@ -170,8 +170,18 @@ pub(crate) async fn relay_pull(conn: &Connection, send: &mut SendStream, req: Rp
         crate::hub::HubFetcher,
         crate::download::HttpFetcher,
         models_root,
+        crate::catalog::cancel::node_registry(),
     )
     .await;
+}
+
+/// True iff a `DownloadLock::acquire` refusal is CONTENTION — another live
+/// holder of the machine-wide slot (`HG090`) — rather than a filesystem
+/// failure (`HG034`: locks dir uncreatable, lock file unopenable, flock
+/// I/O error). Discriminates the daemon log line in [`pull_stream`] so an
+/// I/O fault is never logged as "already in flight".
+fn acquire_refusal_is_contention(e: &crate::diagnostic::HiggsError) -> bool {
+    matches!(e, crate::diagnostic::HiggsError::DownloadInFlight { .. })
 }
 
 /// Generic core of [`relay_pull`]: download via `primary` (falling back to `fallback`) into
@@ -185,6 +195,7 @@ async fn pull_stream<P, F>(
     primary: P,
     fallback: F,
     models_root: std::path::PathBuf,
+    cancels: &'static crate::catalog::cancel::PullCancelRegistry,
 ) where
     P: crate::download::Fetcher + Send + Sync + 'static,
     F: crate::download::Fetcher + Send + Sync + 'static,
@@ -223,6 +234,118 @@ async fn pull_stream<P, F>(
     // is lossy-tolerant, so memory stays bounded regardless of model size.
     // The task logs its OWN lifecycle (start/progress deciles/outcome): the log record must
     // survive even when the hub connection is long gone by the time the transfer resolves.
+    // Register as cancellable BEFORE spawning — a duplicate (the hub re-issuing
+    // a pull that is still running after a reconnect) is REFUSED right here on
+    // the wire: it is the node's job to say "a download is already in
+    // progress", never to start a second copy of the same transfer. The RAII
+    // guard rides the download task and deregisters on every exit path;
+    // `None` node: on the node process itself every pull is local; the
+    // FUTURE `M_NODE_PULL_CANCEL` dispatch fires this key.
+    // MIXED-VERSION NOTE: an OLD hub (pre-pull_status) that reconnects and
+    // blindly re-issues gets one honest [HG090] error it cannot classify —
+    // acceptable: in this fleet the hub (jigglebot embedding higgs at HEAD)
+    // always upgrades before nodes, and even the old-hub case self-heals when
+    // the orphan resolves.
+    // ACCEPTED RESIDUAL: an ORPHANED transfer (hub disconnected mid-pull; the
+    // task keeps going by design) holds the key until it resolves, so a
+    // re-issue is refused ([HG090]) for the remainder — and because the
+    // orphan's progress/final channels died with the old stream, the hub can
+    // observe NEITHER progress NOR the outcome of that in-flight transfer
+    // until it lands on disk (the next M_SCAN shows the file) or the cancel
+    // dispatch (companion slice) kills it. The wedge self-heals on guard drop
+    // — but a STALLED orphan (half-open TCP; the download path has no read
+    // timeout, a pre-existing gap) holds the key until the transfer dies on
+    // its own; the cancel dispatch is the recovery for that case too.
+    // FOLLOW-UP: a throughput-based stall guard on the download path (like
+    // self-update's) would bound the wedge without any cancel.
+    // Validate the wire values FIRST (same rules the download applies) so the
+    // registry keyspace only ever holds real, safe targets — garbage is
+    // refused before it can occupy a cancel slot.
+    if let Err(e) = crate::download::dest_path(&models_root, &target.repo, &target.file) {
+        reply_err(send, req.id, -32000, e.to_string(), hg_data(&e)).await;
+        return;
+    }
+    // Revision too (same rule download_attempt enforces later): a malformed
+    // revision must fail HERE, before it can occupy a cancel-registry slot
+    // and refuse a legitimate same-key pull with [HG090] until the doomed
+    // task runs and dies.
+    if !target
+        .revision
+        .split('/')
+        .all(crate::download::is_safe_segment)
+    {
+        let e = HiggsError::DownloadFailed {
+            repo: target.repo.clone(),
+            file: target.file.clone(),
+            detail: format!(
+                "invalid revision {:?} (segments must be [A-Za-z0-9._-])",
+                target.revision
+            ),
+        };
+        reply_err(send, req.id, -32000, e.to_string(), hg_data(&e)).await;
+        return;
+    }
+    // MACHINE-WIDE DOWNLOAD AUTHORITY: acquire the download-lock BEFORE the
+    // node-local cancel registry insert. Otherwise there is a brief window
+    // (registry inserted but flock not yet acquired) where
+    // `announced_downloads()` reports this key as `cancellable: true` with
+    // zero progress, suppressing the REAL foreign owner's ledger row in the
+    // fleet view. With the lock held first, an announced `cancellable: true`
+    // always means we own the machine-wide slot for the key.
+    // The lock guard is MOVED into the download task below and lives for
+    // the transfer's entire lifetime; the kernel drops it on any exit.
+    let dl_lock = match crate::catalog::download_lock::DownloadLock::acquire(
+        &models_root,
+        &target.repo,
+        &target.file,
+    ) {
+        Ok(l) => l,
+        Err(e) => {
+            // Discriminate the daemon log by CAUSE: acquire also fails on
+            // I/O faults (locks dir uncreatable, lock file unopenable →
+            // HG034), and logging those as "already in flight" sends the
+            // operator hunting a phantom duplicate transfer instead of the
+            // filesystem fault. The wire reply already carries the real
+            // structured error either way.
+            if acquire_refusal_is_contention(&e) {
+                tracing::warn!(
+                    repo = %target.repo,
+                    file = %target.file,
+                    "higgs node: pull refused — already in flight (machine-wide download lock held)"
+                );
+            } else {
+                tracing::warn!(
+                    repo = %target.repo,
+                    file = %target.file,
+                    error = %e,
+                    "higgs node: pull refused — download-lock acquire failed"
+                );
+            }
+            reply_err(send, req.id, -32000, e.to_string(), hg_data(&e)).await;
+            return;
+        }
+    };
+    let (cancel_guard, cancelled, pull_progress) =
+        match crate::catalog::cancel::PullCancelRegistry::register(
+            cancels,
+            None,
+            &target.repo,
+            &target.file,
+        ) {
+            Ok(x) => x,
+            Err(e) => {
+                tracing::warn!(
+                    repo = %target.repo,
+                    file = %target.file,
+                    "higgs node: pull refused — cancel registry conflict"
+                );
+                // Structured HG payload like every other pull error — the hub
+                // distinguishes "already downloading" from a genuine failure by
+                // code, never by string-matching the message.
+                reply_err(send, req.id, -32000, e.to_string(), hg_data(&e)).await;
+                return;
+            }
+        };
     // Owned copies for log lines: the target moves into the download task and
     // is mutably-borrow-blocked inside it, while the handler needs the same
     // context on its disconnect lines (concurrent pulls must never interleave
@@ -231,6 +354,16 @@ async fn pull_stream<P, F>(
     let (prog_tx, mut prog_rx) = tokio::sync::mpsc::channel::<(u64, Option<u64>)>(64);
     let (final_tx, final_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
+        // ORDER MATTERS: in Rust, locals drop in reverse declaration order.
+        // Declare the machine-wide flock FIRST so it drops LAST (after all
+        // logging + the cancel-registry deregistration below), and the
+        // cancel guard SECOND so it drops FIRST. This closes the race
+        // where the flock could be released before the cancel-registry
+        // row is torn down — during which `announced_downloads()` would
+        // publish `cancellable: true` for a slot the process no longer
+        // owns.
+        let dl_lock = dl_lock;
+        let _cancel_guard = cancel_guard;
         let started = std::time::Instant::now();
         let (cb_repo, cb_file) = (target.repo.clone(), target.file.clone());
         let mut last_logged_step: u64 = 0;
@@ -262,12 +395,39 @@ async fn pull_stream<P, F>(
                     ),
                 }
             }
+            // Feed the registry's live counters too — what M_NODE_PULL_STATUS
+            // reports to a (re)connecting hub ("a download is already going,
+            // here is how far along it is").
+            pull_progress.set(downloaded, total);
             let _ = prog_tx.try_send((downloaded, total));
         };
         tracing::info!(repo = %target.repo, file = %target.file, "higgs node: pull download starting");
-        let res =
-            crate::download::download_dual(&target, &models_root, &primary, &fallback, &mut cb)
-                .await;
+        // IMMEDIATE registration tick: a zero-byte progress frame the moment
+        // the transfer is registered + about to run, BEFORE the first HF
+        // byte. The hub uses its FIRST progress frame as wire attestation
+        // ("the node really started this transfer") for the drop-guard's
+        // HG089-vs-HG090 choice — without this tick, a registered transfer
+        // with a slow time-to-first-byte (cold HF connection) dropped early
+        // would read as "never started" (HG089) despite running. Same
+        // notification channel progress already rides; an old hub just sees
+        // one extra 0-byte tick.
+        pull_progress.set(0, None);
+        let _ = prog_tx.try_send((0, None));
+        let res = crate::catalog::cancel::cancellable_pull(
+            crate::download::download_dual_locked(
+                &target,
+                &models_root,
+                &primary,
+                &fallback,
+                &mut cb,
+                &dl_lock,
+            ),
+            cancelled,
+            &models_root,
+            &target.repo,
+            &target.file,
+        )
+        .await;
         match &res {
             Ok(path) => tracing::info!(
                 repo = %target.repo,
@@ -276,6 +436,16 @@ async fn pull_stream<P, F>(
                 bytes = last_downloaded,
                 elapsed_secs = started.elapsed().as_secs(),
                 "higgs node: pull done — file on disk"
+            ),
+            // Cancelled ≠ failed, in the node log too: an operator cancel is
+            // an info event, never a warning that trips log-based alerts.
+            Err(e @ HiggsError::DownloadCancelled { .. }) => tracing::info!(
+                repo = %target.repo,
+                file = %target.file,
+                bytes = last_downloaded,
+                elapsed_secs = started.elapsed().as_secs(),
+                detail = %e,
+                "higgs node: pull cancelled"
             ),
             Err(e) => tracing::warn!(
                 repo = %target.repo,
@@ -286,6 +456,11 @@ async fn pull_stream<P, F>(
                 "higgs node: pull FAILED"
             ),
         }
+        // Free the cancel key BEFORE the result becomes observable on the
+        // wire: the handler replies the moment final_rx resolves, and a hub
+        // that SAW success may instantly re-issue — it must not be refused
+        // "already in flight" by a key whose transfer it knows is done.
+        drop(_cancel_guard);
         let _ = final_tx.send(res);
     });
     tokio::pin!(final_rx);
@@ -431,3 +606,58 @@ fn hg_data(e: &HiggsError) -> Option<serde_json::Value> {
 #[cfg(test)]
 #[path = "data_tests.rs"]
 mod tests;
+
+/// Everything this MACHINE is downloading, for the node's announcement
+/// surfaces (the HELLO `downloads` field and the `M_NODE_PULL_STATUS`
+/// reply): this process's cancel registry (live byte counters) UNION the
+/// machine ledger's live entries from OTHER processes — e.g. a
+/// `higgs download` CLI run on this box, its progress as of its last
+/// throttled ledger write — so the fleet sees MACHINE truth, not process
+/// truth. Registry entries win a key collision (their counters are fresher
+/// and lock-free); collision is CASE-FOLDED, matching the machine
+/// download-lock's key fold — on the default case-insensitive APFS a
+/// case-variant identity is the same on-disk file and the same lock slot,
+/// so a stale case-variant ledger row must not announce beside the live
+/// registry row. The list is bounded to 16, the HELLO-frame producer
+/// bound. A missing/unreadable ledger degrades to registry-only (status is
+/// best-effort, never a failure source).
+pub(crate) fn announced_downloads() -> Vec<crate::remote::HelloDownload> {
+    let mut out: Vec<crate::remote::HelloDownload> = crate::catalog::cancel::node_registry()
+        .in_flight()
+        .into_iter()
+        .map(|p| crate::remote::HelloDownload {
+            repo: p.repo,
+            file: p.file,
+            downloaded: p.downloaded,
+            total: p.total,
+            // Registry-backed: the node's OWN process has the cancel
+            // channel via `catalog::cancel::node_registry`.
+            cancellable: true,
+        })
+        .collect();
+    if let Ok(root) = crate::download::models_dir() {
+        for e in crate::catalog::ledger::read_live(&root) {
+            if e.pid != std::process::id()
+                && !out.iter().any(|d| {
+                    d.repo.eq_ignore_ascii_case(&e.repo) && d.file.eq_ignore_ascii_case(&e.file)
+                })
+            {
+                out.push(crate::remote::HelloDownload {
+                    repo: e.repo,
+                    file: e.file,
+                    downloaded: e.downloaded,
+                    total: e.total,
+                    // LEDGER-only: another process on this box owns it;
+                    // this node has no cancel channel into that process.
+                    cancellable: false,
+                });
+            }
+        }
+    }
+    // PRODUCER-side validate-or-drop (the same predicate the hub applies):
+    // ledger rows are file content, and a semantically-bad row with a huge
+    // repo/file would inflate our OWN HELLO/status frame past the 64 KiB
+    // caps — a bad status file must degrade to a smaller announcement, never
+    // cost this node its admission. Also enforces the 16-cap.
+    crate::remote::accept_announced_downloads(&out)
+}

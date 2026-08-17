@@ -10,7 +10,7 @@ use crate::node::runtime::NodeRuntime;
 use crate::node::worker_id::WorkerId;
 use crate::remote::{
     NodeLoadParams, NodeLoadResult, WorkerRef, M_NODE_INVENTORY, M_NODE_KILL, M_NODE_LOAD,
-    M_NODE_SCAN, M_NODE_STATUS, M_NODE_SYSINFO, M_NODE_UNLOAD,
+    M_NODE_PULL_STATUS, M_NODE_SCAN, M_NODE_STATUS, M_NODE_SYSINFO, M_NODE_UNLOAD,
 };
 use crate::rpc::{RpcError, RpcRequest, RpcResponse};
 
@@ -73,6 +73,28 @@ pub async fn dispatch_node_control(rt: &NodeRuntime, req: RpcRequest) -> RpcResp
             Ok(v) => ok_value(id, v),
             Err(e) => err_from(id, &e),
         },
+        // The node ANNOUNCES its in-flight downloads + live progress: what a
+        // (re)connecting hub asks first, so a transfer that survived a
+        // disconnect is continued (progress shown, duplicate never attempted)
+        // instead of colliding with [HG090] on a blind re-issue.
+        M_NODE_PULL_STATUS => {
+            // Serialize via the wire type so every field goes over the same
+            // way HELLO does — a hand-built subset here dropped the r48
+            // `cancellable` bit and made the live refresh downgrade every
+            // registry-backed row to observe-only in the UI (r49 finding).
+            match serde_json::to_value(json!({
+                "downloads": crate::node::data::announced_downloads(),
+            })) {
+                Ok(v) => ok_value(id, v),
+                Err(e) => err_from(
+                    id,
+                    &HiggsError::ProtocolViolation {
+                        peer_role: "node".into(),
+                        detail: format!("pull_status serialize: {e}"),
+                    },
+                ),
+            }
+        }
         // NOTE: the hub-PUSHED self-update (`M_NODE_UPDATE`) is NOT handled here. It is the one
         // control op with a DEFERRED side effect (start applying an update), which is started ONLY
         // after its `"accepted"` reply is WRITTEN — so a clearly-dead stream (write error) applies

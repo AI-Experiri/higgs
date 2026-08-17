@@ -72,6 +72,8 @@ async fn add_node_with_identity_sets_the_build_identity_atomically() {
             true,
             true,
             true,
+            true,
+            Vec::new(),
         )
         .await;
 
@@ -84,6 +86,93 @@ async fn add_node_with_identity_sets_the_build_identity_atomically() {
     assert!(
         t.update_capable,
         "the node advertised the `update` capability"
+    );
+    drop(root);
+}
+
+/// The HELLO download announcement ("hello, I am downloading …") reaches the
+/// fleet view: `AdmitNode` stores it and `nodes_view` serves it on the
+/// CONNECTED node's row; a disconnect empties the row's list (same mirrored
+/// semantics as `node_logs` — a disconnected node's announcement is stale)
+/// while the node itself stays listed. Fail-on-revert: drop the `nodes_view`
+/// population (or the `AdmitNode` insert) and the first assertion fails; drop
+/// its `connected` gate and the post-disconnect assertion fails.
+#[tokio::test]
+async fn hello_downloads_surface_in_the_view_only_while_connected() {
+    let (root, _model_id) = stage_dummy_model("higgs-test/m");
+    let hub = local_endpoint().await;
+    let node = local_endpoint().await;
+    let hub_addr = hub.addr();
+    let node_key = node.id().to_string();
+    let rt = Arc::new(fake_runtime(vec![root.path().to_path_buf()]));
+    tokio::spawn(async move {
+        let node_conn = node.connect(hub_addr, ALPN).await.expect("connect");
+        serve_node(node_conn, rt).await;
+    });
+    let conn = hub.accept().await.expect("incoming").await.expect("conn");
+    std::mem::forget(hub);
+
+    let announced = vec![crate::remote::HelloDownload {
+        repo: "org/repo".to_string(),
+        file: "model.gguf".to_string(),
+        downloaded: 1234,
+        total: Some(5678),
+        cancellable: true,
+    }];
+    let fleet = Arc::new(HubFleet::new(Arc::new(crate::log_bus::LogBus::new())));
+    fleet
+        .add_node_with_identity(
+            node_key.clone(),
+            Arc::new(NodeTransport::new(conn)),
+            None,
+            None,
+            None,
+            false,
+            None,
+            true,
+            None,
+            None,
+            false,
+            false,
+            false,
+            // pull_capable: the announcer necessarily reports pull status.
+            true,
+            announced.clone(),
+        )
+        .await;
+
+    let view = fleet.nodes_view().await;
+    let row = view
+        .iter()
+        .find(|n| n.endpoint_id == node_key)
+        .expect("admitted node in the view");
+    assert!(row.connected, "node connected after admission");
+    assert!(
+        row.pull_status,
+        "the pull_status capability surfaces on the connected row (the UI's poll gate)"
+    );
+    assert_eq!(
+        row.downloads, announced,
+        "the connected row carries the HELLO download announcement"
+    );
+
+    // Disconnect (kill switch severs the transport; the node stays listed).
+    // The stored announcement is stale the moment the connection drops, so
+    // the view serves an EMPTY list — exactly the `node_logs` semantics.
+    fleet.disconnect_all().await;
+    let view = fleet.nodes_view().await;
+    let row = view
+        .iter()
+        .find(|n| n.endpoint_id == node_key)
+        .expect("node still listed after disconnect");
+    assert!(!row.connected, "node shown disconnected, not removed");
+    assert!(
+        row.downloads.is_empty(),
+        "a disconnected node's stale announcement is not served"
+    );
+    assert!(
+        !row.pull_status,
+        "a disconnected node cannot be status-polled — the flag follows the connection"
     );
     drop(root);
 }
@@ -895,6 +984,8 @@ fn inventory_age_is_the_max_of_both_clocks_from_the_pull_start_stamp() {
         update_capable: std::collections::HashSet::new(),
         version_capable: std::collections::HashSet::new(),
         log_capable: std::collections::HashSet::new(),
+        pull_capable: std::collections::HashSet::new(),
+        node_downloads: HashMap::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
         fallback_inflight: HashMap::new(),
@@ -944,6 +1035,8 @@ fn inventory_age_is_the_max_of_both_clocks_from_the_pull_start_stamp() {
         update_capable: std::collections::HashSet::new(),
         version_capable: std::collections::HashSet::new(),
         log_capable: std::collections::HashSet::new(),
+        pull_capable: std::collections::HashSet::new(),
+        node_downloads: HashMap::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
         fallback_inflight: HashMap::new(),
@@ -1013,6 +1106,8 @@ async fn readmission_strips_the_previous_process_snapshot_seq() {
         update_capable: std::collections::HashSet::new(),
         version_capable: std::collections::HashSet::new(),
         log_capable: std::collections::HashSet::new(),
+        pull_capable: std::collections::HashSet::new(),
+        node_downloads: HashMap::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
         fallback_inflight: HashMap::new(),
@@ -1076,6 +1171,8 @@ async fn older_started_pull_never_overwrites_a_newer_snapshot() {
         update_capable: std::collections::HashSet::new(),
         version_capable: std::collections::HashSet::new(),
         log_capable: std::collections::HashSet::new(),
+        pull_capable: std::collections::HashSet::new(),
+        node_downloads: HashMap::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
         fallback_inflight: HashMap::new(),
@@ -1326,6 +1423,8 @@ fn served_ids_are_collision_free_even_when_a_model_name_clashes_with_a_suffix() 
         update_capable: std::collections::HashSet::new(),
         version_capable: std::collections::HashSet::new(),
         log_capable: std::collections::HashSet::new(),
+        pull_capable: std::collections::HashSet::new(),
+        node_downloads: HashMap::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
         fallback_inflight: HashMap::new(),
@@ -1534,6 +1633,8 @@ async fn pushed_worker_snapshot_merges_under_the_seq_guard() {
         update_capable: std::collections::HashSet::new(),
         version_capable: std::collections::HashSet::new(),
         log_capable: std::collections::HashSet::new(),
+        pull_capable: std::collections::HashSet::new(),
+        node_downloads: HashMap::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
         fallback_inflight: HashMap::new(),
@@ -2056,6 +2157,8 @@ async fn a_pre_cache_push_is_retained_and_replayed_over_an_older_pull() {
         update_capable: std::collections::HashSet::new(),
         version_capable: std::collections::HashSet::new(),
         log_capable: std::collections::HashSet::new(),
+        pull_capable: std::collections::HashSet::new(),
+        node_downloads: HashMap::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
         fallback_inflight: HashMap::new(),
@@ -2184,6 +2287,8 @@ async fn a_stale_fallback_owner_stands_down_before_pulling() {
         update_capable: std::collections::HashSet::new(),
         version_capable: std::collections::HashSet::new(),
         log_capable: std::collections::HashSet::new(),
+        pull_capable: std::collections::HashSet::new(),
+        node_downloads: HashMap::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
         fallback_inflight: HashMap::new(),
@@ -2655,6 +2760,8 @@ async fn a_reused_worker_id_does_not_lend_its_domain_to_a_stale_route() {
         update_capable: std::collections::HashSet::new(),
         version_capable: std::collections::HashSet::new(),
         log_capable: std::collections::HashSet::new(),
+        pull_capable: std::collections::HashSet::new(),
+        node_downloads: HashMap::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
         fallback_inflight: HashMap::new(),
@@ -2773,6 +2880,8 @@ async fn a_stale_inventory_row_does_not_unadvertise_a_reused_worker_id() {
         update_capable: std::collections::HashSet::new(),
         version_capable: std::collections::HashSet::new(),
         log_capable: std::collections::HashSet::new(),
+        pull_capable: std::collections::HashSet::new(),
+        node_downloads: HashMap::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
         fallback_inflight: HashMap::new(),
@@ -3040,8 +3149,37 @@ async fn log_watch_registry_shares_streams_and_tears_down_on_last_drop() {
             true,
             true,
             true, // log_capable
+            true, // pull_capable
+            // "Hello, I am downloading …": the announcement must surface on
+            // the connected node's view (and NOWHERE else — cleared on
+            // retire, hidden when disconnected).
+            vec![crate::remote::HelloDownload {
+                repo: "acme/m".into(),
+                file: "m-Q4.gguf".into(),
+                downloaded: 1234,
+                total: Some(9999),
+                cancellable: true,
+            }],
         )
         .await;
+    {
+        let views = fleet.nodes_view().await;
+        let v = views
+            .iter()
+            .find(|v| v.endpoint_id == node_key)
+            .expect("admitted node in view");
+        assert_eq!(
+            v.downloads,
+            vec![crate::remote::HelloDownload {
+                repo: "acme/m".into(),
+                file: "m-Q4.gguf".into(),
+                downloaded: 1234,
+                total: Some(9999),
+                cancellable: true,
+            }],
+            "the HELLO download announcement rides the connected NodeView"
+        );
+    }
 
     // Helper: wait until the hub bus's RemoteNode ring for this node contains `needle`.
     async fn wait_for_line(
@@ -3133,4 +3271,49 @@ async fn log_watch_registry_shares_streams_and_tears_down_on_last_drop() {
         }
     }
     assert!(got_live, "live line must reach the watcher's receiver");
+}
+
+#[tokio::test]
+async fn an_unknown_node_status_poll_allocates_no_poll_lock() {
+    // `pull_polls` is bounded by nodes the hub actually tracks: a poll for an
+    // id the fleet has never admitted fails BEFORE any per-node lock is
+    // allocated, so the public facade cannot grow the map with garbage keys.
+    let fleet = Arc::new(HubFleet::new(Arc::new(crate::log_bus::LogBus::new())));
+    let err = fleet
+        .node_downloads("no-such-node")
+        .await
+        .expect_err("unknown node");
+    assert!(matches!(err, HiggsError::NodeUnreachable { .. }), "{err:?}");
+    assert!(
+        fleet.pull_polls.lock().is_empty(),
+        "a refused poll leaves no per-node lock behind"
+    );
+}
+
+/// The out-of-actor `pull_polls` map must NOT grow unbounded across
+/// pair/poll/retire cycles: a long-running hub that pairs many nodes over
+/// time would leak one `Arc<Mutex<()>>` per retired endpoint. Retire must
+/// remove the key. Fail-on-revert: skip the `pull_polls.lock().remove` in
+/// `retire` and this test finds a residual entry.
+#[tokio::test]
+async fn retire_keeps_the_per_node_pull_status_lock_for_reuse() {
+    // DESIGN (r65): retire must NOT remove `pull_polls[node]` — a
+    // retire-time remove races a retire→re-admit→fresh-poll cycle and can
+    // delete the mutex a fresh poll just allocated, breaking per-node
+    // poll serialization. Instead the entry is inert while retired and
+    // REUSED verbatim on re-admission (same Arc), which preserves
+    // serialization across the boundary by construction. The map is
+    // bounded by ever-admitted node keys (allocation happens only after
+    // the actor confirmed tracking), not by currently-admitted ones.
+    let fleet = Arc::new(HubFleet::new(Arc::new(crate::log_bus::LogBus::new())));
+    let peer = "test-peer".to_string();
+    let mutex = Arc::new(tokio::sync::Mutex::new(()));
+    fleet.pull_polls.lock().insert(peer.clone(), mutex.clone());
+    fleet.retire(&peer).await;
+    let survived = fleet.pull_polls.lock().get(&peer).cloned();
+    assert!(
+        survived.is_some_and(|cur| Arc::ptr_eq(&cur, &mutex)),
+        "retire keeps the SAME mutex — re-admission reuses it, so a stale \
+         retire can never delete a fresh poll's allocation"
+    );
 }

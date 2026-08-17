@@ -582,3 +582,546 @@ async fn download_dual_exhausted_is_hg036_with_both_diagnoses() {
     let dest = dest_path(dir.path(), "org/m", "x.gguf").unwrap();
     assert!(!dest.exists(), "no file when both paths fail");
 }
+
+#[test]
+fn remove_partials_matches_the_temp_prefix_exactly() {
+    let dir = tempfile::tempdir().unwrap();
+    // Multi-dot filename: dest "a.b.gguf" → temps named "a.b.gguf.part.<pid>.<n>".
+    let model_dir = dir.path().join("org/m");
+    std::fs::create_dir_all(&model_dir).unwrap();
+    let pid = std::process::id();
+    let temp1 = model_dir.join(format!("a.b.gguf.part.{pid}.0"));
+    let temp2 = model_dir.join(format!("a.b.gguf.part.{pid}.7"));
+    // Another PROCESS's temp for the SAME file — its transfer is live; the
+    // sweep only ever cleans temps this process minted.
+    let foreign = model_dir.join("a.b.gguf.part.999999.0");
+    let dest = model_dir.join("a.b.gguf");
+    // Prefix near-misses that must survive: another file's temp, a model whose
+    // NAME happens to start the same, a REAL model literally named
+    // "<stem>.part.<x>.gguf" (a bare prefix match would delete it — data
+    // loss), and that model's own in-flight temp.
+    let other_temp = model_dir.join(format!("a.c.gguf.part.{pid}.0"));
+    let lookalike = model_dir.join("a.b.partial.gguf");
+    let prefix_model = model_dir.join("a.b.part.x.gguf");
+    let prefix_model_temp = model_dir.join(format!("a.b.part.x.gguf.part.{pid}.0"));
+    for p in [
+        &temp1,
+        &temp2,
+        &foreign,
+        &dest,
+        &other_temp,
+        &lookalike,
+        &prefix_model,
+        &prefix_model_temp,
+    ] {
+        std::fs::write(p, b"x").unwrap();
+    }
+    remove_partials(dir.path(), "org/m", "a.b.gguf").expect("sweep");
+    assert!(!temp1.exists() && !temp2.exists(), "both OWN temps swept");
+    assert!(
+        foreign.exists(),
+        "another process's live temp for the same file must survive"
+    );
+    assert!(dest.exists(), "final file untouched");
+    assert!(other_temp.exists(), "another file's temp untouched");
+    assert!(lookalike.exists(), "non-temp lookalike untouched");
+    assert!(
+        prefix_model.exists(),
+        "a REAL model named <stem>.part.<x>.gguf must never be deleted"
+    );
+    assert!(
+        prefix_model_temp.exists(),
+        "a concurrent different-file temp sharing the prefix must survive"
+    );
+}
+
+#[test]
+fn remove_partials_rejects_the_same_bad_shapes_as_the_download() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(remove_partials(dir.path(), "../escape", "m.gguf").is_err());
+    assert!(remove_partials(dir.path(), "org/m", "not-gguf.txt").is_err());
+    // A missing model dir is fine — nothing to sweep.
+    remove_partials(dir.path(), "org/m", "m.gguf").expect("no dir, no-op");
+}
+
+#[test]
+fn dest_path_rejects_segments_the_filesystem_or_temp_naming_cannot_hold() {
+    // A name the filesystem can't hold is refused UP FRONT with the typed
+    // error — which also keeps every REGISTERED pull announceable (the hub's
+    // announcement validator IS dest_path; a node-side accept the hub would
+    // drop would leave an in-flight pull invisible to the fleet view).
+    //
+    // The FILE bound reserves room for the download's own temp: bytes go to
+    // `<file>.part.<u32 pid>.<u64 seq>` first, so the file name must fit
+    // NAME_MAX (255) MINUS that worst-case 37-byte suffix — a 250-char name
+    // whose FINAL path is legal would still die ENAMETOOLONG at the temp
+    // create, i.e. "accepted but uncreatable", exactly what this refusal
+    // exists to prevent. Repo segments are directories (no temp suffix):
+    // plain NAME_MAX.
+    let root = std::path::Path::new("/models");
+    let file_at_bound = format!("{}.gguf", "q".repeat(213)); // 218 bytes
+    assert_eq!(file_at_bound.len(), 218);
+    assert!(dest_path(root, "acme/m", &file_at_bound).is_ok());
+    let file_over = format!("{}.gguf", "q".repeat(214)); // 219 bytes
+    assert!(
+        dest_path(root, "acme/m", &file_over).is_err(),
+        "a file whose TEMP cannot be created is refused up front"
+    );
+    let org_at_bound = format!("{}/m", "q".repeat(255));
+    assert!(dest_path(root, &org_at_bound, "m.gguf").is_ok());
+    let org_over = format!("{}/m", "q".repeat(256));
+    assert!(dest_path(root, &org_over, "m.gguf").is_err());
+}
+
+#[tokio::test]
+async fn download_records_the_ledger_lifecycle_and_respects_a_live_claim() {
+    // The ledger's ONE writer is this download path: a successful transfer
+    // must leave a terminal `done` history entry (with the final path), and a
+    // key some live process already claims must be refused [HG090] BEFORE any
+    // bytes move — the machine-wide extension of the in-process rule.
+    use crate::catalog::ledger;
+    use crate::catalog::wire::DownloadLedgerStatus;
+    let home = tempfile::tempdir().expect("home");
+    let root = home.path().join("models");
+    std::fs::create_dir_all(&root).expect("root");
+    let target = PullTarget::new("acme/m", "m.gguf");
+    let ok = FakeFetcher::new(vec![b"GGUF-bytes".to_vec()]);
+    let path = download_dual(&target, &root, &ok, &ok, &mut |_, _| {})
+        .await
+        .expect("download lands");
+    let all = ledger::read_all(&root);
+    assert_eq!(all.len(), 1, "one history entry: {all:?}");
+    assert_eq!(all[0].status, DownloadLedgerStatus::Done);
+    assert_eq!(all[0].path.as_deref(), path.to_str());
+    // The terminal carries the FINAL byte count — the throttled progress
+    // mirror (8 MiB deltas) never fires for a small file, so without a final
+    // flush a done entry would read "0 bytes".
+    assert_eq!(
+        all[0].downloaded,
+        b"GGUF-bytes".len() as u64,
+        "done entry records the real final size"
+    );
+    assert!(ledger::read_live(&root).is_empty(), "key freed");
+
+    // Another live download on the same key refuses the duplicate up front
+    // with [HG090] — the machine-wide flock in `catalog::download_lock`
+    // (held here directly to simulate a concurrent process without a
+    // second binary; the download-lock tests cover the flock semantics
+    // themselves).
+    let _held = crate::catalog::download_lock::DownloadLock::acquire(&root, "acme/m", "held.gguf")
+        .expect("hold the key");
+    let err = download_dual(
+        &PullTarget::new("acme/m", "held.gguf"),
+        &root,
+        &ok,
+        &ok,
+        &mut |_, _| {},
+    )
+    .await
+    .expect_err("held key refuses the duplicate");
+    assert!(
+        matches!(err, HiggsError::DownloadInFlight { .. }),
+        "machine-wide [HG090]: {err}"
+    );
+    drop(_held);
+    // Once released, the same key downloads normally.
+    let _ok_after = download_dual(
+        &PullTarget::new("acme/m", "held.gguf"),
+        &root,
+        &ok,
+        &ok,
+        &mut |_, _| {},
+    )
+    .await
+    .expect("key downloads once released");
+
+    // A FAILED transfer records a failed terminal (detail kept).
+    let bad = FakeFetcher::failing(|| HiggsError::HubTransport {
+        repo: "acme/m".into(),
+        detail: "boom".into(),
+    });
+    let _ = download_dual(
+        &PullTarget::new("acme/m", "gone.gguf"),
+        &root,
+        &bad,
+        &bad,
+        &mut |_, _| {},
+    )
+    .await
+    .expect_err("both fetchers fail");
+    let failed = ledger::read_all(&root)
+        .into_iter()
+        .find(|e| e.file == "gone.gguf")
+        .expect("failed entry recorded");
+    assert_eq!(failed.status, DownloadLedgerStatus::Failed);
+    assert!(failed.detail.is_some());
+}
+
+#[tokio::test]
+async fn an_invalid_identity_never_touches_the_ledger() {
+    // The ledger documents its `(repo, file)` as dest_path-valid — so
+    // validation must run BEFORE the claim, or a refused pull (HG025) would
+    // persist an identity the announcement validator itself would drop.
+    use crate::catalog::ledger;
+    let home = tempfile::tempdir().expect("home");
+    let root = home.path().join("models");
+    std::fs::create_dir_all(&root).expect("root");
+    let ok = FakeFetcher::new(vec![b"x".to_vec()]);
+    let err = download_dual(
+        &PullTarget::new("acme/m", "not-a-model.txt"),
+        &root,
+        &ok,
+        &ok,
+        &mut |_, _| {},
+    )
+    .await
+    .expect_err("non-gguf refused");
+    assert!(err.to_string().starts_with("[HG025]"), "{err}");
+    assert!(
+        ledger::read_all(&root).is_empty(),
+        "a refused identity leaves NO ledger trace"
+    );
+}
+
+#[tokio::test]
+async fn fallback_restart_resets_the_ledger_progress_mirror() {
+    // The primary can die 4 GiB in; the fallback restarts from ZERO. The
+    // throttle's high-water mark must reset on that regression, or the
+    // ledger keeps announcing near-complete progress while the fallback
+    // re-downloads from the start. The probe fallback reads the ledger the
+    // moment its own first progress tick lands.
+    use crate::catalog::ledger;
+    use std::sync::{Arc, Mutex};
+    let home = tempfile::tempdir().expect("home");
+    let root = home.path().join("models");
+    std::fs::create_dir_all(&root).expect("root");
+
+    // Primary: report a huge progress mark (forces a throttled ledger write),
+    // then fail with a fetcher-class error so the fallback runs.
+    struct BigThenFail;
+    impl Fetcher for BigThenFail {
+        async fn fetch(
+            &self,
+            target: &PullTarget,
+            _on_chunk: &mut (dyn FnMut(&[u8]) + Send),
+            progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
+        ) -> Result<(), HiggsError> {
+            progress(100 * 1024 * 1024, Some(200 * 1024 * 1024));
+            Err(HiggsError::HubTransport {
+                repo: target.repo.clone(),
+                detail: "primary died mid-flight".into(),
+            })
+        }
+    }
+    // Fallback: on its first progress tick, capture what the LEDGER says.
+    // CRITICAL for the pin's revert-power: this fallback reports the SAME
+    // total as the primary (200 MiB) — exactly what production does, since
+    // both transports fetch the same file. With an identical total, the
+    // throttle's `total_changed` branch CANNOT fire on the restart tick,
+    // so ONLY the `regressed` branch can force the immediate mirror write.
+    // (A differing total here would mask a `regressed` revert: the r73
+    // mutation test proved the old Some(3) made the pin pass with the
+    // regression branch deleted.)
+    struct ProbeFallback {
+        root: std::path::PathBuf,
+        seen: Arc<Mutex<Option<u64>>>,
+    }
+    impl Fetcher for ProbeFallback {
+        async fn fetch(
+            &self,
+            _t: &PullTarget,
+            on_chunk: &mut (dyn FnMut(&[u8]) + Send),
+            progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
+        ) -> Result<(), HiggsError> {
+            on_chunk(b"x");
+            progress(1, Some(200 * 1024 * 1024));
+            let live = ledger::read_live(&self.root)
+                .into_iter()
+                .next()
+                .map(|e| e.downloaded);
+            *self.seen.lock().unwrap() = live;
+            on_chunk(b"yz");
+            progress(3, Some(200 * 1024 * 1024));
+            Ok(())
+        }
+    }
+    let seen = Arc::new(Mutex::new(None));
+    let fallback = ProbeFallback {
+        root: root.clone(),
+        seen: seen.clone(),
+    };
+    download_dual(
+        &PullTarget::new("acme/m", "m.gguf"),
+        &root,
+        &BigThenFail,
+        &fallback,
+        &mut |_, _| {},
+    )
+    .await
+    .expect("fallback lands the file");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        Some(1),
+        "the fallback's restart-from-zero is mirrored immediately — not the primary's stale high-water mark"
+    );
+}
+
+#[tokio::test]
+async fn a_dropped_download_future_cleans_its_own_temp_via_the_guard() {
+    // The `TempGuard` inside `download_attempt` unlinks the transfer's
+    // specific `.part.<pid>.<seq>` tmp on drop — that's what makes the
+    // cancel path safe to STOP blanket-sweeping (which was clipping
+    // concurrent same-pid callers' live tmps, r45 finding). Test:
+    // spawn a download future that parks on its first await; abort the
+    // task; assert the tmp is gone AND no other side-effect leaked.
+    struct ParkFetcher {
+        park: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+    impl Fetcher for ParkFetcher {
+        async fn fetch(
+            &self,
+            _t: &PullTarget,
+            on_chunk: &mut (dyn FnMut(&[u8]) + Send),
+            _p: &mut (dyn FnMut(u64, Option<u64>) + Send),
+        ) -> Result<(), HiggsError> {
+            on_chunk(b"partial");
+            if let Some(rx) = self.park.lock().await.take() {
+                let _ = rx.await;
+            }
+            Ok(())
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let (_hold, rx) = tokio::sync::oneshot::channel::<()>();
+    let park = ParkFetcher {
+        park: tokio::sync::Mutex::new(Some(rx)),
+    };
+    let target = PullTarget::new("acme/m", "m.gguf");
+    let task = {
+        let root = root.clone();
+        tokio::spawn(async move {
+            let mut prog = |_: u64, _: Option<u64>| {};
+            download(&target, &root, &park, &mut prog).await
+        })
+    };
+    // Let the fetcher park after writing a partial.
+    tokio::task::yield_now().await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    task.abort();
+    let _ = task.await;
+    // The tmp guard's drop must have unlinked our specific temp.
+    let file_dir = root.join("acme/m");
+    let leftover: Vec<_> = std::fs::read_dir(&file_dir)
+        .map(|it| {
+            it.filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        leftover.is_empty() || leftover.iter().all(|n| !n.contains(".part.")),
+        "the aborted download's `.part` temp is gone: {leftover:?}"
+    );
+}
+
+/// The public `download()` primitive must ALSO acquire the machine-wide
+/// download lock, else `flock` is bypassable via a caller that never used
+/// `download_dual`. Before the fix, an in-crate caller could race a locked
+/// download and both writers' renames would land the same final path.
+/// Pinned by holding the lock and asserting `download()` refuses HG090.
+#[tokio::test]
+async fn public_download_also_gates_on_the_machine_wide_lock() {
+    let root = tempfile::tempdir().unwrap();
+    let _held =
+        crate::catalog::download_lock::DownloadLock::acquire(root.path(), "acme/m", "held.gguf")
+            .expect("hold the key");
+    let ok = FakeFetcher::new(vec![b"x".to_vec()]);
+    let err = download(
+        &PullTarget::new("acme/m", "held.gguf"),
+        root.path(),
+        &ok,
+        &mut |_, _| {},
+    )
+    .await
+    .expect_err("public download() must refuse when the flock is held");
+    assert!(
+        matches!(err, HiggsError::DownloadInFlight { .. }),
+        "public download() shares the same HG090 gate: {err}"
+    );
+    drop(_held);
+    // Once released, download() proceeds normally.
+    let _ok = download(
+        &PullTarget::new("acme/m", "held.gguf"),
+        root.path(),
+        &ok,
+        &mut |_, _| {},
+    )
+    .await
+    .expect("download() works once the lock is released");
+}
+
+/// `download_dual_locked` must refuse a caller that holds a `DownloadLock`
+/// for the WRONG key. Without this identity check, a caller could acquire
+/// a lock for key A and pass it in for key B — bypassing B's flock and
+/// letting a concurrent transfer of B corrupt disk state.
+#[tokio::test]
+async fn download_dual_locked_refuses_a_lock_that_protects_a_different_key() {
+    let root = tempfile::tempdir().unwrap();
+    // Acquire lock for OTHER key.
+    let wrong =
+        crate::catalog::download_lock::DownloadLock::acquire(root.path(), "acme/m", "other.gguf")
+            .expect("acquire wrong-key lock");
+    let ok = FakeFetcher::new(vec![b"x".to_vec()]);
+    // Try to use it for the ACTUAL target.
+    let err = crate::download::download_dual_locked(
+        &PullTarget::new("acme/m", "target.gguf"),
+        root.path(),
+        &ok,
+        &ok,
+        &mut |_, _| {},
+        &wrong,
+    )
+    .await
+    .expect_err("mismatched lock must be refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("DownloadLock was acquired for a different key"),
+        "coded internal-error surfaces the mismatch: {msg}"
+    );
+}
+
+/// A malformed REVISION must refuse (HG025) with ZERO side effects — no
+/// download-lock file, no ledger row. Before the fix, the revision check
+/// lived only inside `download_attempt`, so `download_dual` had already
+/// acquired the flock and written a `Downloading`+`Failed` ledger pair by
+/// the time the refusal fired.
+#[tokio::test]
+async fn a_malformed_revision_refuses_before_any_lock_or_ledger_side_effect() {
+    let root = tempfile::tempdir().unwrap();
+    let ok = FakeFetcher::new(vec![b"x".to_vec()]);
+    let mut t = PullTarget::new("acme/m", "m.gguf");
+    t.revision = "main#frag".into();
+    let err = download_dual(&t, root.path(), &ok, &ok, &mut |_, _| {})
+        .await
+        .expect_err("malformed revision refused");
+    assert!(
+        err.to_string().starts_with("[HG025]"),
+        "wire-validation refusal: {err}"
+    );
+    // ZERO side effects: no lock file for the key, no ledger entries at all.
+    assert!(
+        !crate::catalog::download_lock::lock_file_exists(root.path(), "acme/m", "m.gguf"),
+        "no lock file created by a refused pull"
+    );
+    assert!(
+        crate::catalog::ledger::read_all(root.path()).is_empty(),
+        "no ledger row created by a refused pull"
+    );
+}
+
+#[test]
+fn remove_partials_surfaces_an_unreadable_model_dir() {
+    // A readdir failure other than NotFound must ERROR — a silent Ok would
+    // let [HG089] claim "partial swept" over a multi-GB `.part` we never
+    // even saw. Simulate with an unreadable (0o000) model dir.
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("acme/m");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+    let mut deny = std::fs::metadata(&dir).unwrap().permissions();
+    deny.set_mode(0o000);
+    std::fs::set_permissions(&dir, deny).unwrap();
+    let err = remove_partials(root.path(), "acme/m", "m.gguf")
+        .expect_err("unreadable dir must not read as swept");
+    let mut back = std::fs::metadata(&dir).unwrap().permissions();
+    back.set_mode(mode);
+    std::fs::set_permissions(&dir, back).unwrap();
+    assert!(
+        err.to_string().contains("cannot read model dir"),
+        "the failure names the readdir: {err}"
+    );
+}
+
+#[test]
+fn remove_partials_reports_a_failed_unlink_instead_of_claiming_swept() {
+    // First unlink failure wins: a matching temp in a read-only dir cannot
+    // be removed — the sweep must ERROR (caller reports partial_swept =
+    // false) instead of silently leaving the temp under a "swept" claim.
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("acme/m");
+    std::fs::create_dir_all(&dir).unwrap();
+    let temp = dir.join(format!("m.gguf.part.{}.7", std::process::id()));
+    std::fs::write(&temp, b"partial").unwrap();
+    let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+    let mut ro = std::fs::metadata(&dir).unwrap().permissions();
+    ro.set_mode(0o500); // r-x: readable, unlink refused
+    std::fs::set_permissions(&dir, ro).unwrap();
+    let err =
+        remove_partials(root.path(), "acme/m", "m.gguf").expect_err("failed unlink must surface");
+    let mut back = std::fs::metadata(&dir).unwrap().permissions();
+    back.set_mode(mode);
+    std::fs::set_permissions(&dir, back).unwrap();
+    assert!(
+        err.to_string().contains("could not remove"),
+        "the failure names the stuck temp: {err}"
+    );
+    assert!(temp.is_file(), "the temp really is still there");
+}
+
+#[tokio::test]
+async fn an_uncreatable_dest_parent_is_a_local_hg034_not_a_fetcher_error() {
+    // A FILE squatting the repo-dir path makes `create_dir_all` fail before
+    // any fetch: HG034 local filesystem failure (never eligible for the
+    // fetcher fallback, never HG090 contention).
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("acme"), b"squatter").unwrap();
+    let ok = FakeFetcher::new(vec![b"x".to_vec()]);
+    let err = download(
+        &PullTarget::new("acme/m", "m.gguf"),
+        root.path(),
+        &ok,
+        &mut |_, _| {},
+    )
+    .await
+    .expect_err("uncreatable parent refuses");
+    assert!(
+        matches!(err, HiggsError::HubFileWrite { .. }),
+        "local fs failure is HG034: {err}"
+    );
+}
+
+#[tokio::test]
+async fn a_single_fetcher_download_propagates_the_failure_and_cleans_its_temp() {
+    // The single-fetcher `download` path (CLI/facade delegation): a fetcher
+    // failure propagates VERBATIM (classified, no HG036 dual-wrap) and the
+    // attempt's temp is removed — no `.part` residue.
+    let root = tempfile::tempdir().unwrap();
+    let failing = FakeFetcher::failing(|| HiggsError::HubTransport {
+        repo: "acme/m".into(),
+        detail: "boom".into(),
+    });
+    let err = download(
+        &PullTarget::new("acme/m", "m.gguf"),
+        root.path(),
+        &failing,
+        &mut |_, _| {},
+    )
+    .await
+    .expect_err("fetcher failure propagates");
+    assert!(
+        matches!(err, HiggsError::HubTransport { .. }),
+        "verbatim classified error, not a dual-exhaust wrap: {err}"
+    );
+    let dir = root.path().join("acme/m");
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for e in entries.flatten() {
+            assert!(
+                !e.file_name().to_string_lossy().contains(".part."),
+                "no temp residue after a failed attempt"
+            );
+        }
+    }
+}

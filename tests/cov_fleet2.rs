@@ -42,8 +42,8 @@ use higgs::node::fleet::HubFleet;
 use higgs::node::transport::NodeTransport;
 use higgs::node::{gate_connection, send_leave, GateOutcome, HubIdentity, HELLO_DEADLINE};
 use higgs::remote::{
-    node_capabilities, HelloParams, UpdateFailed, ALPN, M_HELLO, M_NODE_INVENTORY, M_NODE_LOAD,
-    M_NODE_SCAN, M_NODE_UNLOAD, PROTOCOL_VERSIONS,
+    node_capabilities, HelloDownload, HelloParams, UpdateFailed, ALPN, M_HELLO, M_NODE_INVENTORY,
+    M_NODE_LOAD, M_NODE_PULL_STATUS, M_NODE_SCAN, M_NODE_UNLOAD, PROTOCOL_VERSIONS,
 };
 use higgs::rpc::{self, RpcError, RpcFrame, RpcNotification, RpcRequest, RpcResponse};
 use higgs::worker::{M_CHAT, N_CHAT_CHUNK};
@@ -252,6 +252,7 @@ async fn hub_gate_rejects_crafted_version_mismatch() {
         target: None,
         variant: None,
         capabilities: node_capabilities(true),
+        downloads: vec![],
     };
     let req = RpcRequest {
         jsonrpc: "2.0".into(),
@@ -348,6 +349,7 @@ async fn hub_gate_sanitizes_and_surfaces_a_hello_update_failure() {
         target: None,
         variant: None,
         capabilities: node_capabilities(true),
+        downloads: vec![],
     };
     let req = RpcRequest {
         jsonrpc: "2.0".into(),
@@ -1204,5 +1206,422 @@ async fn subscribe_fleet_events_sees_node_connected() {
     assert_eq!(
         ev_json["kind"], "node_connected",
         "admission emits NodeConnected: {ev:?}"
+    );
+}
+
+// ── announced download identity: validate-or-drop, never truncate ──────────────────────────
+
+/// The gate keeps a VALID announced download identity EXACT — `(repo, file)` is the node
+/// registry key the operator acts on (continue/cancel from the fleet view), so a lossy
+/// display transform (the 128-char `sanitize_display` cap) would leave a visible row no
+/// action can address — and DROPS entries that could never have registered on a well-behaved
+/// node (the node validates via `dest_path` before registering a pull). Fail-on-revert:
+/// route the announcement back through `sanitize_display` and the 155-char exactness assert
+/// fails (truncated to 128); keep-but-sanitize the hostile entries and the drop assert fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gate_keeps_valid_download_identity_exact_and_drops_invalid() {
+    let hub = minimal_ep().await;
+    let node = minimal_ep().await;
+    let hub_addr = hub.addr();
+    let hub_id = hub.id().to_string();
+    let node_id = node.id().to_string();
+
+    let mut allow = temp_allowlist("dl-exact");
+    let mut tokens = PairingTokens::new();
+    let tok = tokens.mint(now_ms(), 600_000);
+
+    let gate = tokio::spawn(async move {
+        let incoming = tokio::time::timeout(Duration::from_secs(10), hub.accept())
+            .await
+            .expect("node dialed within 10s")
+            .expect("incoming");
+        let conn = incoming.await.expect("connection");
+        let out = gate_connection(
+            &conn,
+            &mut allow,
+            &mut tokens,
+            now_ms(),
+            &HubIdentity::new(hub_id),
+            Some("dl".into()),
+            HELLO_DEADLINE,
+        )
+        .await;
+        // keep conn alive until the node has read its reply
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        out
+    });
+
+    // A legitimate in-flight pull whose filename is longer than any display cap
+    // (still a valid single `*.gguf` segment well under NAME_MAX).
+    let announced = HelloDownload {
+        repo: "acme/models".into(),
+        file: format!("{}.gguf", "q".repeat(150)),
+        downloaded: 7,
+        total: Some(9),
+        cancellable: true,
+    };
+    let conn = node.connect(hub_addr, ALPN).await.expect("connect");
+    let (mut send, recv) = conn.open_bi().await.expect("open_bi");
+    let params = HelloParams {
+        role: "node".into(),
+        node_id,
+        name: String::new(),
+        pairing_token: Some(tok),
+        protocol_versions: PROTOCOL_VERSIONS.to_vec(),
+        min_supported: 1,
+        software_version: "9.9.9".into(),
+        update_failed: None,
+        target: None,
+        variant: None,
+        capabilities: node_capabilities(false),
+        downloads: vec![
+            announced.clone(),
+            // Could never register: repo escapes the models layout.
+            HelloDownload {
+                repo: "../etc".into(),
+                file: "pw.gguf".into(),
+                downloaded: 0,
+                total: None,
+                cancellable: true,
+            },
+            // Could never register: control char fails the safe-segment charset.
+            HelloDownload {
+                repo: "acme/m".into(),
+                file: "\u{1b}[2Jwipe.gguf".into(),
+                downloaded: 0,
+                total: None,
+                cancellable: true,
+            },
+        ],
+    };
+    let req = RpcRequest {
+        jsonrpc: "2.0".into(),
+        id: 1,
+        method: M_HELLO.into(),
+        params: serde_json::to_value(params).expect("hello serializes"),
+    };
+    send.write_all(format!("{}\n", rpc::encode(&RpcFrame::Request(req))).as_bytes())
+        .await
+        .expect("write hello");
+    let _ = send.finish();
+    // Read the hub's HELLO result so the handshake completes cleanly.
+    let mut lines = BufReader::new(recv).lines();
+    let _ = lines.next_line().await;
+
+    let outcome = gate.await.expect("gate task");
+    let GateOutcome::Admitted { downloads, .. } = outcome else {
+        panic!("crafted HELLO with a valid token must be admitted, got {outcome:?}");
+    };
+    assert_eq!(
+        downloads,
+        vec![announced],
+        "valid identity survives EXACT (no truncation); unregistrable entries dropped whole"
+    );
+}
+
+/// The live `M_NODE_PULL_STATUS` refresh applies the SAME validate-or-drop trust boundary as
+/// the HELLO announcement: a valid long identity comes back EXACT, hostile entries are
+/// dropped whole (never rewritten). Fail-on-revert: sanitize-instead-of-validate truncates
+/// the 155-char filename and keeps the traversal entry — both asserts fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn node_downloads_keeps_valid_identity_exact_and_drops_invalid() {
+    let (dialer, acceptor, _eps) = connect_pair().await;
+    let peer = dialer.remote_id().to_string();
+
+    let long_file = format!("{}.gguf", "q".repeat(150));
+    let lf = long_file.clone();
+    let _mock = tokio::spawn(serve_mock(acceptor, move |method, id, _params| {
+        if method == M_NODE_PULL_STATUS {
+            Reply::Response(resp_ok(
+                id,
+                json!({ "downloads": [
+                    // The valid entry is what a real node's registry-backed row
+                    // announces — `cancellable: true`. The wire type defaults
+                    // missing `cancellable` to `false` (older peers), so the
+                    // mock must include it explicitly to match the assertion
+                    // below (this is what a modern node actually sends).
+                    { "repo": "acme/models", "file": lf, "downloaded": 7, "total": 9, "cancellable": true },
+                    { "repo": "../etc", "file": "pw.gguf", "downloaded": 0 },
+                    { "repo": "acme/m", "file": "\u{1b}[2Jwipe.gguf", "downloaded": 0 },
+                ] }),
+            ))
+        } else {
+            Reply::Response(resp_err(id, "HG037", "unknown method"))
+        }
+    }));
+
+    let fleet = Arc::new(HubFleet::new(Arc::new(LogBus::new())));
+    // Admit the mock as PULL-CAPABLE (it answers M_NODE_PULL_STATUS) — the
+    // production accept loop records this from the HELLO capability map.
+    fleet
+        .add_node_with_identity(
+            peer.clone(),
+            Arc::new(NodeTransport::new(dialer)),
+            None,
+            None,
+            None,
+            false,
+            None,
+            true,
+            None,
+            None,
+            false,
+            false,
+            false,
+            true,
+            Vec::new(),
+        )
+        .await;
+
+    let out = fleet.node_downloads(&peer).await.expect("status ok");
+    assert_eq!(
+        out,
+        vec![HelloDownload {
+            repo: "acme/models".into(),
+            file: long_file,
+            downloaded: 7,
+            total: Some(9),
+            cancellable: true,
+        }],
+        "valid long identity EXACT; invalid entries dropped, not rewritten"
+    );
+}
+
+/// A pre-capability node (its HELLO never advertised `pull_status`) gets the same FRIENDLY
+/// refusal `node_logs` gives — a method-not-found from an old build reads like a fault, not a
+/// fact. The mock here would happily answer the RPC with a valid list: a refusal therefore
+/// proves the hub consulted the ADVERTISED capability instead of firing the RPC blind.
+/// Fail-on-revert: send unconditionally and the call returns Ok(entries) — the expect_err
+/// fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn node_downloads_refuses_friendly_for_a_pre_capability_node() {
+    let (dialer, acceptor, _eps) = connect_pair().await;
+    let peer = dialer.remote_id().to_string();
+
+    let _mock = tokio::spawn(serve_mock(acceptor, move |method, id, _params| {
+        if method == M_NODE_PULL_STATUS {
+            Reply::Response(resp_ok(
+                id,
+                json!({ "downloads": [
+                    { "repo": "acme/models", "file": "m.gguf", "downloaded": 7 },
+                ] }),
+            ))
+        } else {
+            Reply::Response(resp_err(id, "HG037", "unknown method"))
+        }
+    }));
+
+    let fleet = Arc::new(HubFleet::new(Arc::new(LogBus::new())));
+    // `add_node` is the legacy/no-identity admission: NO capabilities advertised.
+    fleet
+        .add_node(
+            peer.clone(),
+            Arc::new(NodeTransport::new(dialer)),
+            None,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .await;
+
+    let err = fleet
+        .node_downloads(&peer)
+        .await
+        .expect_err("a node that never advertised pull_status must be refused, not queried");
+    assert!(
+        err.to_string().contains("pull_status-capable"),
+        "the refusal names the capability and the remedy (update the node): {err}"
+    );
+}
+
+/// A capability-advertising node's `pull_status` reply ALWAYS carries the `downloads` key
+/// (the dispatch builds it unconditionally) — so a `{}` reply is a PROTOCOL VIOLATION from a
+/// skewed/faulty peer, not an authoritative "no downloads". Treating it as empty would WRITE
+/// BACK an empty list and erase the cached HELLO announcement while the original transfer may
+/// still be live — the operator loses the announce-and-continue row. And a type-malformed
+/// payload is the same violation family as junk `M_NODE_INVENTORY` (HG038-class), NOT
+/// HG027 connectivity loss (the transport is alive; the node replied). Fail-on-revert:
+/// treat-missing-as-empty makes the expect_err fail and the cache assert fail; map-to-
+/// NodeUnreachable makes the ProtocolViolation matches! fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pull_status_protocol_violations_do_not_erase_the_cached_announcement() {
+    let (dialer, acceptor, _eps) = connect_pair().await;
+    let peer = dialer.remote_id().to_string();
+
+    let _mock = tokio::spawn(serve_mock(acceptor, move |method, id, _params| {
+        if method == M_NODE_PULL_STATUS {
+            Reply::Response(resp_ok(id, json!({})))
+        } else {
+            Reply::Response(resp_err(id, "HG037", "unknown method"))
+        }
+    }));
+
+    let announced = vec![HelloDownload {
+        repo: "acme/models".into(),
+        file: "m.gguf".into(),
+        downloaded: 7,
+        total: Some(9),
+        cancellable: true,
+    }];
+    let fleet = Arc::new(HubFleet::new(Arc::new(LogBus::new())));
+    fleet
+        .add_node_with_identity(
+            peer.clone(),
+            Arc::new(NodeTransport::new(dialer)),
+            None,
+            None,
+            None,
+            false,
+            None,
+            true,
+            None,
+            None,
+            false,
+            false,
+            false,
+            true,
+            announced.clone(),
+        )
+        .await;
+
+    // Missing `downloads` key → ProtocolViolation, cache untouched.
+    let err = fleet
+        .node_downloads(&peer)
+        .await
+        .expect_err("a reply without the downloads key is a protocol violation");
+    assert!(
+        matches!(err, HiggsError::ProtocolViolation { .. }),
+        "missing key → ProtocolViolation (transport is alive), got {err:?}"
+    );
+    let row = fleet
+        .nodes_view()
+        .await
+        .into_iter()
+        .find(|n| n.endpoint_id == peer)
+        .expect("node in view");
+    assert_eq!(
+        row.downloads, announced,
+        "the cached HELLO announcement survives a malformed status reply"
+    );
+}
+
+/// The type-malformed sibling of the missing-key case above: `downloads` present but not a
+/// list. Same HG038-class ProtocolViolation, never HG027 (the node answered; connectivity
+/// is fine).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pull_status_type_malformed_reply_is_a_protocol_violation_not_unreachable() {
+    let (dialer, acceptor, _eps) = connect_pair().await;
+    let peer = dialer.remote_id().to_string();
+
+    let _mock = tokio::spawn(serve_mock(acceptor, move |method, id, _params| {
+        if method == M_NODE_PULL_STATUS {
+            Reply::Response(resp_ok(id, json!({ "downloads": "junk" })))
+        } else {
+            Reply::Response(resp_err(id, "HG037", "unknown method"))
+        }
+    }));
+
+    let fleet = Arc::new(HubFleet::new(Arc::new(LogBus::new())));
+    fleet
+        .add_node_with_identity(
+            peer.clone(),
+            Arc::new(NodeTransport::new(dialer)),
+            None,
+            None,
+            None,
+            false,
+            None,
+            true,
+            None,
+            None,
+            false,
+            false,
+            false,
+            true,
+            Vec::new(),
+        )
+        .await;
+
+    let err = fleet
+        .node_downloads(&peer)
+        .await
+        .expect_err("a non-list downloads payload is a protocol violation");
+    assert!(
+        matches!(err, HiggsError::ProtocolViolation { .. }),
+        "malformed payload → ProtocolViolation, got {err:?}"
+    );
+}
+
+/// Status polls for ONE node are serialized: the write-back's transport CAS orders commits
+/// across reconnects, but two concurrent polls on the SAME connection could commit out of
+/// DATA order (a delayed stale reply lands last and resurrects a finished transfer in the
+/// view). The mock measures true wire concurrency — each `pull_status` handler holds a
+/// counter high for 50 ms — so overlapping RPCs record a max of 2. Fail-on-revert: drop the
+/// per-node poll lock and the two spawned polls overlap on the wire, failing the max==1
+/// assert.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_pull_status_polls_are_serialized_per_node() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (dialer, acceptor, _eps) = connect_pair().await;
+    let peer = dialer.remote_id().to_string();
+
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let max_seen = Arc::new(AtomicUsize::new(0));
+    let (fl, mx) = (in_flight.clone(), max_seen.clone());
+    let _mock = tokio::spawn(serve_mock(acceptor, move |method, id, _params| {
+        if method == M_NODE_PULL_STATUS {
+            let now = fl.fetch_add(1, Ordering::SeqCst) + 1;
+            mx.fetch_max(now, Ordering::SeqCst);
+            // Hold the overlap window open long enough for a concurrent
+            // request to land (the handler runs on its own spawned task).
+            std::thread::sleep(Duration::from_millis(50));
+            fl.fetch_sub(1, Ordering::SeqCst);
+            Reply::Response(resp_ok(id, json!({ "downloads": [] })))
+        } else {
+            Reply::Response(resp_err(id, "HG037", "unknown method"))
+        }
+    }));
+
+    let fleet = Arc::new(HubFleet::new(Arc::new(LogBus::new())));
+    fleet
+        .add_node_with_identity(
+            peer.clone(),
+            Arc::new(NodeTransport::new(dialer)),
+            None,
+            None,
+            None,
+            false,
+            None,
+            true,
+            None,
+            None,
+            false,
+            false,
+            false,
+            true,
+            Vec::new(),
+        )
+        .await;
+
+    let (a, b) = tokio::join!(
+        {
+            let fleet = fleet.clone();
+            let peer = peer.clone();
+            async move { fleet.node_downloads(&peer).await }
+        },
+        {
+            let fleet = fleet.clone();
+            let peer = peer.clone();
+            async move { fleet.node_downloads(&peer).await }
+        }
+    );
+    a.expect("first poll ok");
+    b.expect("second poll ok");
+    assert_eq!(
+        max_seen.load(Ordering::SeqCst),
+        1,
+        "polls for one node never overlap on the wire"
     );
 }

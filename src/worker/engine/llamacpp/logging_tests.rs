@@ -291,3 +291,15 @@ fn set_engine_verbose_is_noop_when_uninstalled() {
     set_engine_verbose(true);
     set_engine_verbose(false);
 }
+
+#[test]
+fn installing_worker_logging_is_idempotent_and_verbosity_flips_live() {
+    // `install_worker_logging` is called once at worker start; in a process
+    // that already has a subscriber the inner `try_init` is a no-op — the
+    // call must stay safe either way, twice (idempotence), and the runtime
+    // verbosity flag it installs must flip live afterwards.
+    install_worker_logging();
+    install_worker_logging();
+    set_engine_verbose(true);
+    set_engine_verbose(false);
+}

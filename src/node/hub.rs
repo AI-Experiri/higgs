@@ -249,8 +249,23 @@ pub fn spawn_accept_loop(
                         update_capable,
                         version_capable,
                         log_capable,
+                        pull_capable,
+                        downloads,
                     } => {
                         tracing::info!(node = %peer, "higgs hub: node admitted");
+                        // "Hello, I am downloading …" — make the surviving
+                        // transfer visible the moment the node reconnects, so
+                        // the operator continues it rather than re-issuing.
+                        for d in &downloads {
+                            tracing::info!(
+                                node = %peer,
+                                repo = %d.repo,
+                                file = %d.file,
+                                downloaded = d.downloaded,
+                                total = ?d.total,
+                                "higgs hub: node announces an in-flight download"
+                            );
+                        }
                         // add_node runs UNDER the allowlist lock (held here) so it's mutually
                         // exclusive with a concurrent retire — the register can't race a removal.
                         // Gated on THIS loop's admission generation: if the kill switch disabled
@@ -278,6 +293,8 @@ pub fn spawn_accept_loop(
                                 update_capable,
                                 version_capable,
                                 log_capable,
+                                pull_capable,
+                                downloads,
                             )
                             .await;
                         // Accept node→hub requests (self-`leave`) on this connection. Holds the

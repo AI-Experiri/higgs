@@ -744,6 +744,65 @@ pub enum HiggsError {
     #[diagnostic(code(HG088), severity(Error))]
     UpdateFetchFailed { detail: String },
 
+    /// An in-flight model download was CANCELLED — today that means the
+    /// caller dropped/aborted the op future (a local drop kills the
+    /// transfer; an unattested remote drop may have never reached the
+    /// node); once the FUTURE cancel-dispatch slice ships, an explicit
+    /// operator cancel produces the same code. Terminal for that transfer: the per-transfer temp-guard
+    /// unlinks the `.part.<pid>.<seq>` file on future-drop (best-effort — a
+    /// unlink failure is only visible in tracing) and nothing lands in
+    /// `~/.higgs/models/`. Distinct from [HG025] (a FAILURE) so the UI can
+    /// render "cancelled" instead of an error.
+    #[snafu(display(
+        "[HG089] model download cancelled for {repo}/{file} — partial temp cleanup attempted (best-effort; check the node log if disk usage grows)"
+    ))]
+    #[diagnostic(code(HG089), severity(Warning))]
+    DownloadCancelled {
+        repo: String,
+        file: String,
+        /// Historical field: since r46 the per-transfer temp guard in
+        /// [`crate::download::download`] performs cleanup asynchronously on
+        /// its own drop; the outcome (rare unlink failure on
+        /// permissions/I/O) is only visible in tracing, not on this wire
+        /// field. Kept for on-wire back-compat and always set to `true` by
+        /// the cancel path — do NOT read as "cleanup verified". The
+        /// diagnostic message reflects the best-effort reality.
+        partial_swept: bool,
+    },
+
+    /// A download request was refused because the SAME (node, repo, file) is
+    /// already transferring — one copy per key; wait for it or cancel it.
+    /// Its own code (not the [HG025] failure umbrella) so the hub classifies
+    /// "already downloading" purely by code — a wait/info state in the UI,
+    /// never an error toast.
+    #[snafu(display(
+        "[HG090] download already in flight for {repo}/{file} — wait for it or cancel it first"
+    ))]
+    #[diagnostic(code(HG090), severity(Warning))]
+    DownloadInFlight { repo: String, file: String },
+
+    /// A cancel signal was accepted but the download finished before it could
+    /// be observed — the file IS on disk. Surfaced (as an info-severity signal,
+    /// not an error) so the UI can distinguish "cancel honored, nothing landed"
+    /// (`[HG089]`) from "cancel outraced by completion, file landed" — both
+    /// have a legitimate meaning and neither is a bug. The download's terminal
+    /// event stream still fires `Done` (the file is real).
+    ///
+    /// BEST-EFFORT emission: HG091 fires when `cancellable_pull` observes the
+    /// cancel signal set at the moment it returns Ok. Because cancel signals
+    /// and completion resolve on separate async task-wake paths, a cancel
+    /// accepted in the microscopic window AFTER the outrace-check reads
+    /// `false` but BEFORE the receiver is dropped may not fire HG091 — the
+    /// caller sees `cancel() → Ok` and the event stream sees `Done`, with
+    /// no warning between them. That residual is the known, documented
+    /// limit of async cancel semantics (see [`cancellable_pull`]'s two-regime
+    /// contract); the truth on disk is not affected.
+    #[snafu(display(
+        "[HG091] cancel requested but download for {repo}/{file} completed first — the file is on disk"
+    ))]
+    #[diagnostic(code(HG091), severity(Warning))]
+    CancelLostToCompletion { repo: String, file: String },
+
     /// Startup refused: a non-loopback bind with keys present but NONE holding the
     /// `Admin` scope. Auth would be ON, but every Admin-scoped operation
     /// (mint/revoke) is then rejected — the operator can't manage keys on the

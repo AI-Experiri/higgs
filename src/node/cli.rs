@@ -124,6 +124,8 @@ fn run_link_pair() -> Result<()> {
                     update_capable: _,
                     version_capable: _,
                     log_capable: _,
+                    pull_capable: _,
+                    downloads: _,
                 } => {
                     // An all-filtered HELLO version sanitizes to empty — print a
                     // placeholder, not "higgs ," (T14 r22).
