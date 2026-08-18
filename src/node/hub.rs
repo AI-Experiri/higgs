@@ -351,6 +351,12 @@ async fn serve_node_requests(
             Ok(RpcFrame::Request(r)) => r,
             _ => continue,
         };
+        // Reply-side scheduler tier: only M_NODE_LEAVE and unknown/method_not_found
+        // ride this loop today — both are CONTROL by design (the catch-all in
+        // `stream_priority::priority_for` also lands on CONTROL). Tag the send
+        // half BEFORE the first write so any future op accepted here inherits
+        // the right tier from the same source of truth.
+        crate::node::stream_priority::apply_for(&send, &req.method);
         if req.method != crate::remote::M_NODE_LEAVE {
             // Unknown request = a protocol skew (HG037, → 501): the shared helper
             // keeps -32601 and rides HG037 in data.code.

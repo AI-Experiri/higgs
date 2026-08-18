@@ -65,6 +65,7 @@ impl NodeTransport {
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, HiggsError> {
         let id = self.alloc_id();
         let (mut send, recv) = self.conn.open_bi().await.map_err(transport_dead)?;
+        crate::node::stream_priority::apply_for(&send, method);
         let req = RpcRequest {
             jsonrpc: "2.0".into(),
             id,
@@ -106,6 +107,7 @@ impl NodeTransport {
         // handle_op_error (which drops the dead transport) would never run.
         let open_and_send = async {
             let (mut send, recv) = self.conn.open_bi().await.map_err(transport_dead)?;
+            crate::node::stream_priority::apply_for(&send, method);
             let req = RpcRequest {
                 jsonrpc: "2.0".into(),
                 id,
@@ -169,6 +171,7 @@ impl NodeTransport {
         // push bounds with its whole-push timeout.
         let open_and_send = async {
             let (mut send, recv) = self.conn.open_bi().await.map_err(transport_dead)?;
+            crate::node::stream_priority::apply_for(&send, crate::remote::M_NODE_PULL);
             let params = crate::remote::NodePullParams {
                 request_id: id,
                 repo: repo.to_owned(),
@@ -218,6 +221,7 @@ impl NodeTransport {
         let id = self.alloc_id();
         let open_and_send = async {
             let (mut send, recv) = self.conn.open_bi().await.map_err(transport_dead)?;
+            crate::node::stream_priority::apply_for(&send, crate::remote::M_NODE_LOGS);
             let req = RpcRequest {
                 jsonrpc: "2.0".into(),
                 id,
@@ -301,6 +305,7 @@ impl NodeTransport {
     ) -> Result<(crate::delta_queue::DeltaReceiver, ChatDone), HiggsError> {
         let id = self.alloc_id();
         let (mut send, recv) = self.conn.open_bi().await.map_err(transport_dead)?;
+        crate::node::stream_priority::apply_for(&send, M_CHAT);
         let mut params = json!({
             "request_id": id,
             "worker_id": worker_id,
