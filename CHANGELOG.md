@@ -19,6 +19,8 @@ from it.
 
 ## [Unreleased]
 
+## [0.1.0-beta.11] - 2026-08-17
+
 ### Added
 
 - **Node log control (NL-V).** New `M_NODE_LOG_LEVEL` control op + wire
