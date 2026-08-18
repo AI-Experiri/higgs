@@ -1140,6 +1140,11 @@ const EXEC_PREFLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 fn operator_can_exec(path: &Path, op: &Operator, euid: libc::uid_t) -> Result<bool> {
     use std::os::unix::process::CommandExt;
     if !is_regular_file(path) {
+        tracing::warn!(
+            target: "higgs::node",
+            path = %path.display(),
+            "operator_can_exec: path is not a regular file"
+        );
         return Ok(false);
     }
     let mut cmd = std::process::Command::new(path);
@@ -1187,7 +1192,17 @@ fn operator_can_exec(path: &Path, op: &Operator, euid: libc::uid_t) -> Result<bo
     // operator cannot run it → false, NOT a hard error.
     let mut child = match spawned {
         Ok(c) => c,
-        Err(_) => return Ok(false),
+        Err(e) => {
+            tracing::warn!(
+                target: "higgs::node",
+                path = %path.display(),
+                euid,
+                error = %e,
+                errno = e.raw_os_error(),
+                "operator_can_exec: spawn/execve failed"
+            );
+            return Ok(false);
+        }
     };
     // Kill the probe's whole process group (the child is its leader via setsid),
     // reaping any descendants a `--version` handler forked — orphaned to init
@@ -1219,8 +1234,17 @@ fn operator_can_exec(path: &Path, op: &Operator, euid: libc::uid_t) -> Result<bo
         };
         if rc == -1 {
             // ECHILD/EINVAL — nothing knowable to wait for; best-effort clean.
+            let werr = std::io::Error::last_os_error();
             reap_group();
             let _ = child.wait();
+            tracing::warn!(
+                target: "higgs::node",
+                path = %path.display(),
+                pid,
+                errno = werr.raw_os_error(),
+                error = %werr,
+                "operator_can_exec: waitid failed"
+            );
             return Ok(false);
         }
         // With WNOHANG, rc == 0 both when the child exited (si_pid == pid) and
@@ -1232,12 +1256,33 @@ fn operator_can_exec(path: &Path, op: &Operator, euid: libc::uid_t) -> Result<bo
         if done {
             reap_group(); // leader is a ZOMBIE here — pid cannot be reused yet
             let status = child.wait(); // now reap, consuming the real status
-            return Ok(status.map(|s| s.success()).unwrap_or(false));
+            let ok = status
+                .as_ref()
+                .map(std::process::ExitStatus::success)
+                .unwrap_or(false);
+            if !ok {
+                tracing::warn!(
+                    target: "higgs::node",
+                    path = %path.display(),
+                    pid,
+                    status = ?status.as_ref().ok().map(std::process::ExitStatus::code),
+                    wait_error = ?status.as_ref().err().map(std::io::Error::to_string),
+                    "operator_can_exec: probe exited non-zero (or wait failed)"
+                );
+            }
+            return Ok(ok);
         }
         if std::time::Instant::now() >= deadline {
             reap_group();
             let _ = child.kill(); // in case the group send raced setsid
             let _ = child.wait(); // reap the immediate child
+            tracing::warn!(
+                target: "higgs::node",
+                path = %path.display(),
+                pid,
+                timeout_secs = EXEC_PREFLIGHT_TIMEOUT.as_secs(),
+                "operator_can_exec: probe timed out"
+            );
             return Ok(false);
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
