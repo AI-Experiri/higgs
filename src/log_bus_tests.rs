@@ -324,7 +324,7 @@ fn default_constructs_an_empty_bus() {
     let bus = LogBus::default();
     assert!(bus.snapshot(10, None).is_empty());
     assert!(!bus.show_fields(), "DEBUG mode off by default");
-    assert!(!bus.verbose(), "verbose off by default");
+    assert!(bus.verbose(), "verbose ON by default (NL-V design)");
 }
 
 #[test]
@@ -368,9 +368,11 @@ fn layer_captures_debug_typed_error_and_fields() {
 #[test]
 fn layer_drops_debug_level_when_not_verbose() {
     // With verbose OFF, a higgs-target DEBUG/TRACE event is dropped at the level gate
-    // (`return`) — only INFO+ reaches the Developer-Logs ring.
+    // (`return`) — only INFO+ reaches the Developer-Logs ring. Fresh bus defaults
+    // verbose=true per NL-V, so this test explicitly flips it off.
     use tracing_subscriber::layer::SubscriberExt;
     let bus = Arc::new(LogBus::new());
+    bus.set_verbose(false);
     assert!(!bus.verbose());
     let subscriber = tracing_subscriber::registry().with(HiggsLogLayer::new(bus.clone()));
     tracing::subscriber::with_default(subscriber, || {

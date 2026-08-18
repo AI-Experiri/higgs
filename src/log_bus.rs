@@ -240,7 +240,13 @@ impl LogBus {
             tx,
             serve_tx,
             show_fields: std::sync::atomic::AtomicBool::new(false),
-            verbose: std::sync::atomic::AtomicBool::new(false),
+            // Default ON: NL-V's operator-visible design is "always verbose,
+            // toggle off during quiet periods, on again to debug". The tracing
+            // subscriber's per-layer filter (`log_filter`) still admits
+            // `higgs::*` down to DEBUG only, so TRACE lines still require the
+            // caller to bump their subscriber filter — this flag governs the
+            // Serve ring's promotion of DEBUG events into the follow stream.
+            verbose: std::sync::atomic::AtomicBool::new(true),
         }
     }
 
@@ -523,7 +529,8 @@ where
 {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
         let meta = event.metadata();
-        if !meta.target().starts_with(HIGGS_TARGET_PREFIX) {
+        let target = meta.target();
+        if !target.starts_with(HIGGS_TARGET_PREFIX) {
             return;
         }
         // "Verbose Logging" level gate for the Developer-Logs (serve) console:
@@ -537,7 +544,23 @@ where
         if visitor.message.is_empty() {
             return;
         }
-        let mut line = format!("{} [{}] {}", timestamp(), meta.level(), visitor.message);
+        // NL-V section badge: the second segment of the event target (after
+        // the `higgs::` prefix) — e.g. `higgs::download::pull_stream` →
+        // `[download]`, bare `higgs` → `[higgs]`. Rendered inline at the
+        // START of every line so a reader can visually group / filter
+        // client-side WITHOUT the daemon carrying a filter/routing concept.
+        let section = target
+            .strip_prefix(HIGGS_TARGET_PREFIX)
+            .and_then(|rest| rest.strip_prefix("::"))
+            .map(|rest| rest.split("::").next().unwrap_or(rest))
+            .filter(|s| !s.is_empty())
+            .unwrap_or("higgs");
+        let mut line = format!(
+            "[{section}] {} [{}] {}",
+            timestamp(),
+            meta.level(),
+            visitor.message
+        );
         // The typed `error` diagnostic is ALWAYS shown — it never carries prompt
         // content and is the whole point of debuggable failures.
         if let Some(err) = &visitor.error {

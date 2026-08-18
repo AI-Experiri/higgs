@@ -1433,8 +1433,10 @@ async fn spawn_production_constructor_defaults() {
 async fn log_verbose_and_show_fields_toggles_roundtrip() {
     let (sup, _tw, _tr) = make_supervisor();
 
-    // Verbose: off by default → set true → reads back true.
-    assert!(!sup.log_verbose(), "verbose off by default");
+    // Verbose: ON by default (NL-V) → set false → reads back false.
+    assert!(sup.log_verbose(), "verbose ON by default (NL-V)");
+    sup.set_log_verbose(false);
+    assert!(!sup.log_verbose(), "set_log_verbose(false) is observed");
     sup.set_log_verbose(true);
     assert!(sup.log_verbose(), "verbose now on");
     sup.set_log_verbose(false);

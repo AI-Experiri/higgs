@@ -139,7 +139,7 @@ pub(crate) async fn relay_chat(
         let e = HiggsError::ChatStreamOverflow {
             buffered_bytes: chunks.buffered_bytes(),
         };
-        tracing::warn!(error = %e, "higgs: relayed chat stream overflowed");
+        tracing::warn!(target: "higgs::chat", error = %e, "higgs: relayed chat stream overflowed");
         reply_err(send, req.id, -32000, e.to_string(), hg_data(&e)).await;
         return;
     }
@@ -221,6 +221,7 @@ async fn pull_stream<P, F>(
         revision: params.revision.unwrap_or_else(|| "main".into()),
     };
     tracing::info!(
+        target: "higgs::download",
         repo = %target.repo,
         file = %target.file,
         revision = %target.revision,
@@ -309,12 +310,14 @@ async fn pull_stream<P, F>(
             // structured error either way.
             if acquire_refusal_is_contention(&e) {
                 tracing::warn!(
+                    target: "higgs::download",
                     repo = %target.repo,
                     file = %target.file,
                     "higgs node: pull refused — already in flight (machine-wide download lock held)"
                 );
             } else {
                 tracing::warn!(
+                    target: "higgs::download",
                     repo = %target.repo,
                     file = %target.file,
                     error = %e,
@@ -335,6 +338,7 @@ async fn pull_stream<P, F>(
             Ok(x) => x,
             Err(e) => {
                 tracing::warn!(
+                    target: "higgs::download",
                     repo = %target.repo,
                     file = %target.file,
                     "higgs node: pull refused — cancel registry conflict"
@@ -380,6 +384,7 @@ async fn pull_stream<P, F>(
                 last_logged_step = step;
                 match total {
                     Some(t) if t > 0 => tracing::info!(
+                        target: "higgs::download",
                         repo = %cb_repo,
                         file = %cb_file,
                         downloaded,
@@ -388,6 +393,7 @@ async fn pull_stream<P, F>(
                         "higgs node: pull progress"
                     ),
                     _ => tracing::info!(
+                        target: "higgs::download",
                         repo = %cb_repo,
                         file = %cb_file,
                         downloaded,
@@ -401,7 +407,7 @@ async fn pull_stream<P, F>(
             pull_progress.set(downloaded, total);
             let _ = prog_tx.try_send((downloaded, total));
         };
-        tracing::info!(repo = %target.repo, file = %target.file, "higgs node: pull download starting");
+        tracing::info!(target: "higgs::download", repo = %target.repo, file = %target.file, "higgs node: pull download starting");
         // IMMEDIATE registration tick: a zero-byte progress frame the moment
         // the transfer is registered + about to run, BEFORE the first HF
         // byte. The hub uses its FIRST progress frame as wire attestation
@@ -430,6 +436,7 @@ async fn pull_stream<P, F>(
         .await;
         match &res {
             Ok(path) => tracing::info!(
+                target: "higgs::download",
                 repo = %target.repo,
                 file = %target.file,
                 path = %path.display(),
@@ -440,6 +447,7 @@ async fn pull_stream<P, F>(
             // Cancelled ≠ failed, in the node log too: an operator cancel is
             // an info event, never a warning that trips log-based alerts.
             Err(e @ HiggsError::DownloadCancelled { .. }) => tracing::info!(
+                target: "higgs::download",
                 repo = %target.repo,
                 file = %target.file,
                 bytes = last_downloaded,
@@ -448,6 +456,7 @@ async fn pull_stream<P, F>(
                 "higgs node: pull cancelled"
             ),
             Err(e) => tracing::warn!(
+                target: "higgs::download",
                 repo = %target.repo,
                 file = %target.file,
                 bytes = last_downloaded,
@@ -473,6 +482,7 @@ async fn pull_stream<P, F>(
                     if write_progress(send, request_id, downloaded, total).await.is_err() {
                         // Hub gone — the download task still finishes (and logs).
                         tracing::info!(
+                            target: "higgs::download",
                             repo = %log_repo,
                             file = %log_file,
                             "higgs node: hub stream write failed mid-pull; download continues in the background"
