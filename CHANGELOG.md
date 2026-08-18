@@ -19,6 +19,49 @@ from it.
 
 ## [Unreleased]
 
+## [0.1.0-beta.11] - 2026-08-17
+
+### Added
+
+- **Node log control (NL-V).** New `M_NODE_LOG_LEVEL` control op + wire
+  types `NodeLogControlParams { verbose: Option<bool> }` and
+  `NodeLogControlReply { verbose: bool }` let a hub toggle a paired node's
+  log verbosity at runtime. `verbose=true` (the new default) admits
+  `debug!`/`trace!` in addition to `info!`/`warn!`/`error!`; `false` clamps
+  to `info!` and above. Every admitted line now carries a `[section]`
+  badge derived from the tracing target's 2nd segment (`higgs::node::…` →
+  `[node]`, `higgs::worker::…` → `[worker]`), so log consumers can tell
+  where a line originated without inventing per-message tags. Facade:
+  `Higgs::set_node_log_level(endpoint, params)`. A pre-NL-V node without
+  the capability surfaces as `NodeUnreachable` with a "update to a
+  node_log_control-capable release" hint.
+
+- **Node daemon lifecycle logs.** Happy-path `tracing::info!` calls on
+  node startup, hub-connect / hub-reconnect, worker load / unload / kill,
+  and download start / finish, with targets that feed the section badge
+  above. Fixes an empty `M_NODE_LOGS` stream on a healthy idle node — the
+  stream worked but had nothing to carry.
+
+- **Per-QUIC-stream priority (SP1).** Every send-stream open/accept site
+  in the hub↔node iroh transport now tags Quinn/noq's
+  `SendStream::set_priority` so the local scheduler orders traffic
+  control > interactive > diagnostic. Three named constants
+  (`CONTROL_STREAM_PRIORITY = +100`, `INTERACTIVE_STREAM_PRIORITY = 0`,
+  `DIAGNOSTIC_STREAM_PRIORITY = -100`) map opcode → tier via
+  `priority_for(method)`; unknown opcodes safely default to CONTROL. No
+  wire-format change, no public API change, no bindings regen — peers see
+  identical protocol; only local scheduler behavior shifts. Companion to
+  NL-V's default-on verbose: LogBus subscriber-side was already lossy,
+  SP1 closes the loop on the wire so a debug firehose on one connection
+  cannot backpressure the chat stream sharing it.
+
+### Changed
+
+- **`LogBus::verbose` defaults to `true`.** Previously `false` (silent);
+  now every daemon lifecycle line is admitted to the ring by default so
+  `M_NODE_LOGS` streams useful content the moment a hub subscribes. Tests
+  that asserted the old default were updated accordingly.
+
 ## [0.1.0-beta.10] - 2026-08-16
 
 ### Added

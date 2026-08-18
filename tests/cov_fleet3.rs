@@ -1562,3 +1562,49 @@ async fn crafted_hub_pull_requests_hit_node_side_validation() {
 
     conn.close(0u32.into(), b"done");
 }
+
+/// NL-V r4 pin: `HubFleet::set_node_log_level` wraps a pre-NL-V node's
+/// HG037 method-not-found refusal into a friendly `NodeUnreachable
+/// { detail: "update the node…" }`. Load-bearing wire fact: the
+/// `NodeTransport::extract_result` funnel maps EVERY error response to
+/// `HiggsError::WorkerRpc { worker_code: Some(code), .. }` — never to
+/// `RpcMethodNotFound` (which is only ever constructed on the outbound
+/// reply side). Reverting the match arm to `RpcMethodNotFound { .. }`
+/// makes the arm unreachable, `handle_op_error` passes `WorkerRpc`
+/// through unchanged, and the operator sees a raw HG037 protocol code
+/// instead of the friendly capability guidance — this pin catches that
+/// regression.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fleet_set_node_log_level_wraps_pre_nlv_method_not_found() {
+    let fleet = Arc::new(HubFleet::new(Arc::new(LogBus::new())));
+    let (dialer, acceptor, _eps) = connect_pair().await;
+    let peer = dialer.remote_id().to_string();
+    // Pre-NL-V node: any request comes back as HG037 method-not-found
+    // (exactly what `node/control.rs`'s fallthrough builds).
+    let _mock = tokio::spawn(serve_mock(acceptor, |_method, id, _p| {
+        Reply::Response(resp_err(id, "HG037", "unknown"))
+    }));
+    let transport = Arc::new(NodeTransport::new(dialer.clone()));
+    admit(&fleet, &peer, transport, false, false, false).await;
+
+    let err = fleet
+        .set_node_log_level(
+            &peer,
+            higgs::remote::NodeLogControlParams {
+                verbose: Some(true),
+            },
+        )
+        .await
+        .expect_err("pre-NL-V node refuses");
+    assert!(
+        matches!(err, HiggsError::NodeUnreachable { .. }),
+        "friendly capability wrap, not raw HG037: {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("update the node") && msg.contains("node_log_control"),
+        "operator sees the capability guidance: {msg}"
+    );
+
+    dialer.close(0u32.into(), b"done");
+}

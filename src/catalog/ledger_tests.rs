@@ -675,16 +675,18 @@ fn pid_start_time_carries_sub_second_precision() {
     let a = pid_start_time(std::process::id());
     let b = pid_start_time(std::process::id());
     assert_eq!(a, b, "start-time stamp is stable for a live pid");
+    // Post-r48 macOS: sec * 1e6 + usec. If sub-second precision is stripped
+    // (seconds-only), the stamp is always divisible by 1_000_000. Real usec
+    // is essentially never 0 — check both sides of the boundary to detect a
+    // regression to seconds-only.
+    //
+    // On Linux the stamp is in clock ticks since boot, sub-second by nature;
+    // on other unqueryable platforms this returns None and we skip. Only the
+    // macOS branch reads the inner value, so gate the whole `if let` on that
+    // target — otherwise `v` is bound-and-never-read on Linux CI and
+    // `-D unused-variables` fails the build.
+    #[cfg(target_os = "macos")]
     if let Some(v) = a {
-        // Post-r48 macOS: sec * 1e6 + usec. If sub-second precision is
-        // stripped (seconds-only), `v` is always divisible by 1_000_000.
-        // Real usec is essentially never 0 — check both sides of the
-        // boundary to detect a regression to seconds-only.
-        //
-        // On Linux the stamp is in clock ticks since boot, sub-second by
-        // nature; on other unqueryable platforms this returns None and
-        // we skip.
-        #[cfg(target_os = "macos")]
         assert!(
             v % 1_000_000 != 0,
             "macOS start-time must include the microsecond component (got {v})"
