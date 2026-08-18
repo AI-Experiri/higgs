@@ -35,6 +35,16 @@ pub const N_LOG_LINE: &str = "higgs/node/log_line";
 /// Gated on the `node_logs` HELLO capability.
 pub const M_NODE_LOGS: &str = "higgs/node/logs";
 
+/// `higgs/node/log_level` — CONTROL request (hub → node): change the node
+/// daemon's `LogBus` filter LIVE. Params: [`NodeLogControlParams`]
+/// (`{verbose?, sections?}`, both fields optional — omit to keep the current
+/// value); reply: [`NodeLogControlReply`] with the EFFECTIVE post-apply state.
+/// The change is DAEMON-GLOBAL (NL-V decision A): one setting per node, shared
+/// by every `M_NODE_LOGS` subscriber. Gated on the `node_log_control` HELLO
+/// capability — a legacy node refuses with `method_not_found` and the hub
+/// friendly-errors before opening the RPC (mirrors the `pull_status` refusal).
+pub const M_NODE_LOG_LEVEL: &str = "higgs/node/log_level";
+
 /// One daemon-log line on an [`M_NODE_LOGS`] reply stream. Params: `{ "line": <string> }`,
 /// plus `{ "lagged": <u64> }` marker frames when the node dropped lines to protect the
 /// connection (the stream is lossy-by-design under log floods; the marker says so).
@@ -361,6 +371,11 @@ pub fn node_capabilities(reports_update_failures: bool) -> Capabilities {
         // `node_logs` (M_NODE_LOGS): this build serves its own DAEMON log (snapshot +
         // follow) to the hub on demand — nothing streams unless a watcher asks.
         ("node_logs", true),
+        // `node_log_control` (M_NODE_LOG_LEVEL, NL-V): this build accepts hub-
+        // driven runtime changes to its LogBus verbosity + target-prefix section
+        // filter. A pre-NL-V node would refuse the op with method_not_found; the
+        // hub gates on this capability so the operator sees a friendly error.
+        ("node_log_control", true),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), serde_json::Value::Bool(v)))
@@ -747,6 +762,30 @@ pub fn negotiate_version(
             ours: our_versions.to_vec(),
         }),
     }
+}
+
+higgs_ts! {
+/// [`M_NODE_LOG_LEVEL`] request params (hub → node): flip the node daemon's
+/// `LogBus.verbose` gate LIVE. `None` = keep the current value; a bool
+/// value overrides it (`true` admits DEBUG/TRACE into the `LogSource::Serve`
+/// stream, `false` restores the INFO+ gate). This is the only knob — the
+/// section badge that appears at the start of each log line is set at write
+/// time by the tracing target, not by the wire.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NodeLogControlParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub verbose: Option<bool>,
+}
+}
+
+higgs_ts! {
+/// [`M_NODE_LOG_LEVEL`] reply: the EFFECTIVE post-apply verbosity on the
+/// node. Echoed so a caller stays in sync with the daemon's actual state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NodeLogControlReply {
+    pub verbose: bool,
+}
 }
 
 #[cfg(test)]

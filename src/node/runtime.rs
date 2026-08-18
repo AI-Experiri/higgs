@@ -1446,17 +1446,67 @@ impl NodeRuntime {
     /// node resolves the GGUF path from its own disk; returns the new `WorkerId` and the
     /// worker's `M_LOAD` result. A slow load runs concurrently and cannot block other ops.
     pub async fn load(&self, params: NodeLoadParams) -> Result<(WorkerId, Value), HiggsError> {
-        self.call(|reply| NodeMsg::Load { params, reply }).await
+        // NL-V daemon-lifecycle log: the sole entry point every worker load
+        // takes (hub-driven M_NODE_LOAD dispatch AND local `node/cli.rs` load
+        // funnel through here). Tagged `higgs::worker` so the operator's
+        // section filter can subset to worker events.
+        let model = params.id.clone();
+        let res = self.call(|reply| NodeMsg::Load { params, reply }).await;
+        match &res {
+            Ok((worker_id, _)) => tracing::info!(
+                target: "higgs::worker",
+                worker_id = worker_id.0,
+                model = %model,
+                "loaded model"
+            ),
+            Err(e) => tracing::warn!(
+                target: "higgs::worker",
+                model = %model,
+                error = %e,
+                "load failed"
+            ),
+        }
+        res
     }
 
     /// Graceful unload: stop the worker, free the id.
     pub async fn unload(&self, id: WorkerId) -> Result<(), HiggsError> {
-        self.call(|reply| NodeMsg::Unload { id, reply }).await
+        let res = self.call(|reply| NodeMsg::Unload { id, reply }).await;
+        match &res {
+            Ok(()) => tracing::info!(
+                target: "higgs::worker",
+                worker_id = id.0,
+                reason = "unload",
+                "unloaded worker"
+            ),
+            Err(e) => tracing::warn!(
+                target: "higgs::worker",
+                worker_id = id.0,
+                error = %e,
+                "unload failed"
+            ),
+        }
+        res
     }
 
     /// Force-kill ONE worker. Identical to [`unload`](Self::unload) at this layer.
     pub async fn kill(&self, id: WorkerId) -> Result<(), HiggsError> {
-        self.call(|reply| NodeMsg::Kill { id, reply }).await
+        let res = self.call(|reply| NodeMsg::Kill { id, reply }).await;
+        match &res {
+            Ok(()) => tracing::info!(
+                target: "higgs::worker",
+                worker_id = id.0,
+                reason = "kill",
+                "killed worker"
+            ),
+            Err(e) => tracing::warn!(
+                target: "higgs::worker",
+                worker_id = id.0,
+                error = %e,
+                "kill failed"
+            ),
+        }
+        res
     }
 
     /// Per-worker status (forwards `M_STATUS` to that worker's Supervisor).

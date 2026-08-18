@@ -3621,4 +3621,60 @@ impl HubFleet {
         }
         Ok(lines)
     }
+
+    /// NL-V: change `node`'s daemon-log `LogBus` filter LIVE — verbosity gate
+    /// and/or target-prefix section set. Returns the EFFECTIVE post-apply
+    /// state (the node computes it and echoes; we do not invent). Bounded
+    /// (64 KiB) — the reply is a small struct, and the cap protects the hub
+    /// from a faulty peer inflating the frame. `method_not_found` (a
+    /// pre-NL-V build) is wrapped in the same friendly-capability shape
+    /// `node_logs_snapshot` uses, so the operator sees a fact ("update the
+    /// node…") instead of a raw protocol code.
+    pub async fn set_node_log_level(
+        self: &Arc<Self>,
+        node: &str,
+        params: crate::remote::NodeLogControlParams,
+    ) -> Result<crate::remote::NodeLogControlReply, HiggsError> {
+        let transport = self.transport(node).await?;
+        let payload = serde_json::to_value(&params).map_err(|e| HiggsError::ProtocolViolation {
+            peer_role: "hub".into(),
+            detail: format!("log_level params serialize: {e}"),
+        })?;
+        let reply = match transport
+            .request_bounded(crate::remote::M_NODE_LOG_LEVEL, payload, 64 * 1024)
+            .await
+        {
+            Ok(v) => v,
+            // A pre-NL-V node answers HG037 method-not-found (`node/control.rs`
+            // falls through to the shared helper). Load-bearing wire fact:
+            // `NodeTransport::extract_result` (`src/node/transport.rs`) funnels
+            // EVERY error response into `WorkerRpc { worker_code: Some(code),
+            // .. }` — `RpcMethodNotFound` is only ever CONSTRUCTED on the
+            // outbound reply side, never observed here. Match on
+            // `worker_code == "HG037"` to actually catch the pre-NL-V refusal
+            // (a `RpcMethodNotFound` arm would be dead code) and wrap it in
+            // the same friendly capability shape `node_logs_snapshot` uses so
+            // the operator sees "update the node…" instead of a raw protocol
+            // code. This failure does NOT trip `handle_op_error`'s drop path
+            // (the transport is alive, the peer just doesn't know the method).
+            Err(HiggsError::WorkerRpc {
+                worker_code: Some(ref c),
+                ..
+            }) if c == "HG037" => {
+                return Err(HiggsError::NodeUnreachable {
+                    endpoint_id: node.to_string(),
+                    detail: "this node's higgs build does not accept runtime log-level \
+                             changes (update the node to a node_log_control-capable release)"
+                        .into(),
+                });
+            }
+            Err(e) => return Err(self.handle_op_error(node, &transport, e).await),
+        };
+        serde_json::from_value::<crate::remote::NodeLogControlReply>(reply).map_err(|e| {
+            HiggsError::ProtocolViolation {
+                peer_role: "node".into(),
+                detail: format!("M_NODE_LOG_LEVEL reply did not decode: {e}"),
+            }
+        })
+    }
 }

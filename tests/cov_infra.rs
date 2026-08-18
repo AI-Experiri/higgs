@@ -829,8 +829,10 @@ async fn log_bus_layer_captures_higgs_events() {
     let _g = serial().await;
 
     // With verbose OFF, a higgs DEBUG event is admitted to the layer (via `log_filter`)
-    // but dropped by the level gate — nothing lands in the ring.
+    // but dropped by the level gate — nothing lands in the ring. Verbose defaults to
+    // ON (NL-V) so this test explicitly disables it to exercise the level-gate branch.
     let bus_a = Arc::new(LogBus::new());
+    bus_a.set_verbose(false);
     {
         let sub = tracing_subscriber::registry()
             .with(HiggsLogLayer::new(bus_a.clone()).with_filter(log_filter()));
