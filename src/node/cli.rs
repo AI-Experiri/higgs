@@ -3060,6 +3060,16 @@ pub fn run_node_daemon(args: &[String]) -> Result<()> {
 /// install's bin dir, threaded through for the in-serve confirm hooks.
 fn run_node_daemon_body(args: &[String], confirm_bin: &Option<std::path::PathBuf>) -> Result<()> {
     let id = load_or_create_secret(&key_path()?)?.public().to_string();
+    // NL-V: one-shot lifecycle "starting" log so a Fleet subscriber connecting
+    // BEFORE the first hub admit still sees the node came up (the follow
+    // stream replays the last `n` from the ring — this ensures at least one
+    // line exists). `higgs::node` target for the operator's section filter.
+    tracing::info!(
+        target: "higgs::node",
+        endpoint_id = %id,
+        higgs_version = env!("CARGO_PKG_VERSION"),
+        "node daemon starting"
+    );
     let cfg_path = config_path()?;
     let cfg = InstanceConfig::load(&cfg_path)?;
 
@@ -3606,6 +3616,10 @@ fn run_node_daemon_body(args: &[String], confirm_bin: &Option<std::path::PathBuf
                                 break 'serve crate::node::self_update::ShutdownCause::Operator;
                             }
                             eprintln!("hub connection closed; reconnecting…");
+                            tracing::info!(
+                                target: "higgs::node",
+                                "hub connection closed; reconnecting"
+                            );
                         }
                     }
                 }
@@ -3639,10 +3653,27 @@ fn run_node_daemon_body(args: &[String], confirm_bin: &Option<std::path::PathBuf
                                 hello.node_id,
                                 hello.agreed_version
                             );
+                            // NL-V: mirror the operator-facing lifecycle onto
+                            // the LogBus so `M_NODE_LOGS` subscribers (Fleet
+                            // node terminal) see connect/disconnect for an
+                            // otherwise-idle node. `println!` alone bypasses
+                            // tracing entirely. `higgs::node` target so the
+                            // section filter can subset lifecycle events.
+                            tracing::info!(
+                                target: "higgs::node",
+                                hub_id = %hello.node_id,
+                                hub_name = %crate::remote::sanitize_display(&hello.hub_name),
+                                protocol = hello.agreed_version,
+                                "connected to hub"
+                            );
                             tokio::select! {
                                 cause = &mut shutdown => break 'serve cause,
                                 _ = crate::node::serve_node(conn, node.clone()) => {
                                     eprintln!("hub connection closed; reconnecting…");
+                            tracing::info!(
+                                target: "higgs::node",
+                                "hub connection closed; reconnecting"
+                            );
                                 }
                             }
                         }

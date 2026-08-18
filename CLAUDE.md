@@ -68,6 +68,37 @@ scroll to see the shape of the thing, you failed. This applies inside
 convergence-loop status messages too — a redesign-vs-residual question shows
 the two shapes visually, not in bullet paragraphs.
 
+## Convergence audit (HARD RULE)
+
+For every finding a reviewer surfaces, before touching code answer four
+questions in writing:
+
+  1. Who calls this in production?
+  2. Does that caller produce the input shape the finding needs?
+     No → hypothetical → DISMISS, note it, next.
+  3. If a hostile caller could produce it, does exploiting the finding
+     grant them capability they don't already have on the same
+     trust boundary?
+     No → trust-model dismiss.
+  4. Have I already dismissed the same CLASS this round?
+     Yes → refer to the earlier dismissal, don't re-litigate.
+
+Only if the answers survive 1–4 do I open an editor. Ratifying a
+reviewer's finding without running this audit turns the convergence
+loop from safety net into over-engineering amplifier.
+
+## Match feature surface to user ask (HARD RULE)
+
+Restate the user's ask in one sentence at the start of any new-feature
+spec. Mark every field / knob / test I'm about to add as:
+
+    NEEDED   the ask directly requires it
+    NICE     arguable — flag it and ask before adding
+    NOISE    I invented it — do not add
+
+If it is not NEEDED, ask before it lands in code. "It might be useful"
+is not NEEDED.
+
 ## Codex review convergence (required before any change is "done")
 
 Every non-trivial change is reviewed with `codex` in a loop until it **converges**.
@@ -204,3 +235,60 @@ must commit the regenerated TS).
 - One logical unit per commit; conventional-commit subject.
 - End commit messages with the `Co-Authored-By` trailer.
 - Commit/push only when asked; branch off the default branch first if needed.
+
+## Cutting a release (HARD RULE — use `scripts/release/cut-release.sh`, no other path)
+
+The ONLY way `main` changes is a release PR. The ONLY way that PR gets built
+is `scripts/release/cut-release.sh <x.y.z>`. Never hand-craft a release
+branch, never edit `Cargo.toml`'s version by hand for a release, never
+commit to `release/v*`.
+
+**Prerequisite (must be true before you run the script):**
+
+  1. Every feature this release ships is MERGED INTO `develop` (a commit
+     stranded on a feature branch will NOT ship — that's how the HG088 fix
+     missed beta.7 and beta.8).
+  2. `develop`'s `git status` is clean (nothing uncommitted).
+  3. `develop` is IN SYNC with `origin/develop` (pushed).
+  4. `scripts/quality.sh` is green on `develop` — fmt + clippy + tests +
+     ts-rs bindings match committed copies.
+
+**Sequence:**
+
+  1. On `develop`, add the release's changes to `CHANGELOG.md` under
+     `## [Unreleased]` (Added / Changed / Fixed sections). Commit + push.
+     The script rolls `[Unreleased]` into `## [x.y.z] - YYYY-MM-DD` at
+     cut time — do not do that yourself.
+  2. From ANYWHERE in the repo, run:
+         scripts/release/cut-release.sh <x.y.z>
+     (plain semver, no `v` prefix — e.g. `0.1.0-beta.11`). It checks out
+     `main`, branches `release/v<x.y.z>` off it, merges `develop` in,
+     bumps `Cargo.toml`'s version, rolls the CHANGELOG, pushes the
+     release branch, opens the PR to `main`. `--dry-run` shows the plan
+     without touching anything; `--no-verify` skips `scripts/quality.sh`
+     (do NOT use unless the user explicitly asks).
+  3. Review + merge the PR (you or the user — the script does not merge).
+     `.github/workflows/release.yml` reads `Cargo.toml`'s version on the
+     merged commit, tags `v<x.y.z>`, builds macOS arm64 + Linux x86_64 +
+     Linux CUDA, signs manifests with the CI minisign key, and publishes
+     the GitHub Release with 12 assets (tar.gz + sha256 + manifest +
+     minisig per target). If any tag `v<x.y.z>` already exists the workflow
+     no-ops — DO NOT try to reuse a version number.
+  4. Watch for the release to appear (`gh release view v<x.y.z>`). Then
+     SYNC `develop` FROM `main` and push:
+         git checkout develop
+         git fetch origin
+         git merge origin/main -m "Merge main (v<x.y.z>) back into develop"
+         git push origin develop
+     Without this sync, the next release cut off `main` will re-merge the
+     release bump commit as a change instead of the parent commit —
+     eventually causing "hey where is my fix" surprises.
+
+**Never:**
+
+  - Commit directly to `release/v*` (a fix born there ships nowhere).
+  - Push a release tag by hand (CI is the source of truth).
+  - Bump `Cargo.toml`'s version outside `cut-release.sh`.
+  - Rename or delete an already-published release (users' installers pin the
+    tag; a rename breaks their update path).
+  - Skip step 4 (the develop-from-main sync).

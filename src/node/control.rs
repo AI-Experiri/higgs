@@ -9,8 +9,9 @@ use crate::diagnostic::HiggsError;
 use crate::node::runtime::NodeRuntime;
 use crate::node::worker_id::WorkerId;
 use crate::remote::{
-    NodeLoadParams, NodeLoadResult, WorkerRef, M_NODE_INVENTORY, M_NODE_KILL, M_NODE_LOAD,
-    M_NODE_PULL_STATUS, M_NODE_SCAN, M_NODE_STATUS, M_NODE_SYSINFO, M_NODE_UNLOAD,
+    NodeLoadParams, NodeLoadResult, NodeLogControlParams, NodeLogControlReply, WorkerRef,
+    M_NODE_INVENTORY, M_NODE_KILL, M_NODE_LOAD, M_NODE_LOG_LEVEL, M_NODE_PULL_STATUS, M_NODE_SCAN,
+    M_NODE_STATUS, M_NODE_SYSINFO, M_NODE_UNLOAD,
 };
 use crate::rpc::{RpcError, RpcRequest, RpcResponse};
 
@@ -95,6 +96,34 @@ pub async fn dispatch_node_control(rt: &NodeRuntime, req: RpcRequest) -> RpcResp
                 ),
             }
         }
+        // NL-V runtime verbose gate. Applies to the process-global `LogBus`
+        // installed at startup — the same bus `M_NODE_LOGS` follows, so
+        // effects are immediate. Absence of the global bus (a test-only
+        // embed) is an INTERNAL_ERROR rather than a silent success:
+        // reporting an EFFECTIVE state we never applied would lie to the UI.
+        M_NODE_LOG_LEVEL => match parse::<NodeLogControlParams>(&req) {
+            Ok(params) => match crate::log_bus::LogBus::global() {
+                Some(bus) => {
+                    if let Some(v) = params.verbose {
+                        bus.set_verbose(v);
+                    }
+                    ok(
+                        id,
+                        NodeLogControlReply {
+                            verbose: bus.verbose(),
+                        },
+                    )
+                }
+                None => err_from(
+                    id,
+                    &HiggsError::ProtocolViolation {
+                        peer_role: "node".into(),
+                        detail: "log_level: no global LogBus installed".into(),
+                    },
+                ),
+            },
+            Err(resp) => resp(id),
+        },
         // NOTE: the hub-PUSHED self-update (`M_NODE_UPDATE`) is NOT handled here. It is the one
         // control op with a DEFERRED side effect (start applying an update), which is started ONLY
         // after its `"accepted"` reply is WRITTEN — so a clearly-dead stream (write error) applies

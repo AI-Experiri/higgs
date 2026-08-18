@@ -18,6 +18,7 @@ pub mod runtime;
 pub mod self_update;
 pub mod served;
 pub mod service;
+pub mod stream_priority;
 pub mod transport;
 pub mod worker_id;
 
@@ -576,6 +577,7 @@ pub async fn connect_node(
     use std::io::Error;
     let conn = endpoint.connect(target, ALPN).await.map_err(Error::other)?;
     let (mut send, recv) = conn.open_bi().await.map_err(Error::other)?;
+    crate::node::stream_priority::apply_for(&send, M_HELLO);
 
     // Report the last self-update FAILURE so the hub learns WHY a pushed update did not take — a
     // boot-guard rollback ran at boot, before this connection existed. This is re-reported on EVERY
@@ -707,6 +709,7 @@ fn validate_hub_hello(result: &HelloResult, peer: &str) -> std::io::Result<()> {
 pub async fn send_leave(conn: &Connection) -> std::io::Result<()> {
     use std::io::Error;
     let (mut send, recv) = conn.open_bi().await.map_err(Error::other)?;
+    crate::node::stream_priority::apply_for(&send, M_NODE_LEAVE);
     let req = RpcRequest {
         jsonrpc: "2.0".into(),
         id: 1,
@@ -898,6 +901,7 @@ async fn relay_worker_logs(
     let Ok(mut send) = conn.open_uni().await else {
         return;
     };
+    crate::node::stream_priority::apply_for(&send, crate::remote::N_LOG_LINE);
     let mut logs = rt.subscribe_logs();
     loop {
         let (worker_id, line) = match logs.recv().await {
@@ -958,6 +962,7 @@ async fn relay_fleet_events(
         let Ok(mut send) = conn.open_uni().await else {
             return; // connection gone
         };
+        crate::node::stream_priority::apply_for(&send, crate::remote::N_FLEET_EVENT);
         if std::mem::take(&mut resnap) {
             rt.request_fleet_resnapshot(); // a Resync arrives via the broadcast below
         }
@@ -1022,6 +1027,12 @@ async fn handle_node_stream(
             Ok(RpcFrame::Request(r)) => r,
             _ => continue, // ignore non-request frames on this direction
         };
+        // Reply-side scheduler tier: chat streams token firehoses back, log
+        // streams stream log-lines back, control streams reply small. Tag the
+        // send half BEFORE the first write so all outbound bytes ride the
+        // right tier (the hub's `open_bi` set its own outbound; this covers
+        // ours).
+        crate::node::stream_priority::apply_for(&send, &req.method);
         if req.method == crate::worker::M_CHAT {
             // DATA plane: relay the chat to the worker's Supervisor and stream chunks +
             // final back. `relay_chat` owns the writes and its own cancellation.

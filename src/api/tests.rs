@@ -502,13 +502,14 @@ fn insufficient_memory_diagnostic_is_503_capacity() {
 // ── Verbose toggle: default false, set/get round-trip ────────────────────
 
 #[tokio::test]
-async fn verbose_defaults_false_and_round_trips() {
+async fn verbose_defaults_true_and_round_trips() {
+    // NL-V: verbose defaults ON so an incident already has DEBUG in the ring.
     let higgs = fake_higgs(vec![]);
-    assert!(!higgs.verbose(), "verbose defaults to false");
-    higgs.set_verbose(true);
-    assert!(higgs.verbose(), "set_verbose(true) is observed");
+    assert!(higgs.verbose(), "verbose defaults to true (NL-V)");
     higgs.set_verbose(false);
     assert!(!higgs.verbose(), "set_verbose(false) is observed");
+    higgs.set_verbose(true);
+    assert!(higgs.verbose(), "set_verbose(true) is observed");
 }
 
 // ── Log-incoming-tokens toggle: default false, set/get round-trip ─────────
@@ -939,11 +940,11 @@ async fn chat_stream_delivers() {
 async fn log_bus_returns_node_shared_bus() {
     let higgs = fake_higgs(vec![]);
     let bus = higgs.log_bus();
-    assert!(!bus.verbose(), "fresh bus defaults to non-verbose");
+    assert!(bus.verbose(), "fresh bus defaults verbose=true (NL-V)");
     // The bus is the node's: flipping verbose through the facade is visible on the
     // returned handle (same underlying LogBus, not a clone of state).
-    higgs.set_verbose(true);
-    assert!(bus.verbose(), "log_bus() hands back the node's live bus");
+    higgs.set_verbose(false);
+    assert!(!bus.verbose(), "log_bus() hands back the node's live bus");
 }
 
 // ── set_fleet / fleet(): install + idempotent replace ─────────────────────

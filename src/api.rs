@@ -2897,6 +2897,26 @@ impl Higgs {
         fleet.node_logs_snapshot(endpoint_id, n).await
     }
 
+    /// NL-V: change a REMOTE node's daemon-log filter LIVE — verbose gate
+    /// (INFO+ vs DEBUG/TRACE) and/or target-prefix section set. Returns the
+    /// EFFECTIVE state the node applied. Both `params.verbose` and
+    /// `params.sections` are optional; the node keeps the current value for
+    /// omitted fields (so a UI can toggle verbose without disturbing an
+    /// operator's active section filter). A pre-NL-V node refuses with a
+    /// friendly "update the node…" error (see `HubFleet::set_node_log_level`).
+    /// Hub mode off ⇒ HG027.
+    pub async fn set_node_log_level(
+        &self,
+        endpoint_id: &str,
+        params: crate::remote::NodeLogControlParams,
+    ) -> Result<crate::remote::NodeLogControlReply, HiggsError> {
+        let fleet = self.fleet().ok_or_else(|| HiggsError::NodeUnreachable {
+            endpoint_id: endpoint_id.to_string(),
+            detail: "hub mode is off".into(),
+        })?;
+        fleet.set_node_log_level(endpoint_id, params).await
+    }
+
     /// Subscribe to live model-load lifecycle events ([`ModelLoadEvent`]) pushed
     /// AFTER this call — formerly the source for the `/api/higgs/events` SSE
     /// endpoint; now the embedder's `watch_events` feed.

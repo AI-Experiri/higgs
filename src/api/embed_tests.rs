@@ -797,7 +797,7 @@ async fn nodes_view_labels_the_local_node_from_instance_name() {
 async fn logs_settings_round_trips() {
     let higgs = fake_higgs(vec![]);
     let before = higgs.logs_settings();
-    assert!(!before.verbose);
+    assert!(before.verbose, "verbose defaults ON (NL-V)");
     higgs.set_logs_settings(&crate::serve::wire::LogSettings {
         verbose: true,
         log_incoming_tokens: true,
