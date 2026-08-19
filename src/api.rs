@@ -922,6 +922,14 @@ impl Higgs {
         self.fleet.lock().clone()
     }
 
+    /// Passive network stats + inferred label for `node`. `None` when the hub
+    /// isn't running OR the fleet actor is unreachable (dying); otherwise a
+    /// snapshot (with `state = Disconnected` when the node isn't currently
+    /// paired). No probe traffic, no cache.
+    pub async fn network_stats(&self, node: &str) -> Option<crate::remote::NetworkStats> {
+        self.fleet()?.network_stats(node).await
+    }
+
     /// Install/replace the API-key store gating the HTTP surface (P5). An empty store
     /// disables auth. The standalone binary calls this with the loaded `api_keys.json`.
     pub fn set_api_keys(&self, keys: Arc<crate::keys::ApiKeys>) {

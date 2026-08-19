@@ -788,6 +788,68 @@ pub struct NodeLogControlReply {
 }
 }
 
+higgs_const_enum! {
+    /// Which QUIC path iroh currently has selected for this node's connection.
+    /// Read passively from `Connection::paths()` — no probing.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum LinkPath { Direct, Relay }
+}
+
+higgs_const_enum! {
+    /// Inferred link label — a function of `(connected?, path)`. Nothing else
+    /// (no thresholds, no windows) colors it.
+    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum LinkState { Healthy, Degraded, #[default] Disconnected }
+}
+
+higgs_ts! {
+/// One passive snapshot of a node's iroh connection stats + the inferred label.
+/// Sampled ON DEMAND when the UI asks (`Higgs::network_stats`); nothing cached,
+/// no subscription, no probe traffic. Every field is read from ONE
+/// `Path::stats()` snapshot of iroh's currently-selected path (rtt included);
+/// numeric fields are serialized as JSON `number`.
+///
+/// `lost_packets` / `sent_datagrams` / `bytes_tx` / `bytes_rx` come from
+/// `Path::stats()` on the SELECTED path only — they are per-path counters,
+/// NOT per-connection totals and NOT per-interval deltas. On a path change
+/// the numbers you see are whatever that other path's independent counters
+/// have accumulated since its own PathId came into existence (which for
+/// direct + relay may date back to connection setup). Consumers wanting
+/// rates must diff two samples themselves.
+///
+/// No clean loss-rate denominator: `lost_packets` is a QUIC-packet counter,
+/// but iroh 1.0's `PathStats` exposes no same-granularity `sent_packets` —
+/// only `udp_tx.datagrams` (surfaced here as `sent_datagrams`, UDP-datagram
+/// granularity). Dividing `lost_packets / sent_datagrams` mixes units and
+/// yields a meaningless ratio. Use `lost_packets` as an absolute loss
+/// indicator, not a percentage.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct NetworkStats {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub path: Option<LinkPath>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub rtt_ms: Option<u32>,
+    #[ts(type = "number")] pub lost_packets: u64,
+    #[ts(type = "number")] pub sent_datagrams: u64,
+    #[ts(type = "number")] pub bytes_tx: u64,
+    #[ts(type = "number")] pub bytes_rx: u64,
+    /// How long the node has been ADMITTED to the fleet on the current
+    /// connection, in hub-monotonic milliseconds. Stamped when
+    /// `admit_inner` runs (post-HELLO on the established QUIC connection,
+    /// so this under-counts the true iroh connection age by the HELLO
+    /// round-trip). `None` when the node isn't currently connected. Reset
+    /// on every (re)admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub uptime_ms: Option<u64>,
+    pub state: LinkState,
+}
+}
+
 #[cfg(test)]
 #[path = "remote_tests.rs"]
 mod tests;
