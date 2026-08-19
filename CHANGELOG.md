@@ -19,6 +19,8 @@ from it.
 
 ## [Unreleased]
 
+## [0.1.0-beta.12] - 2026-08-19
+
 ### Added
 
 - **Passive network stats + inferred label (NQ).** New crate-level
