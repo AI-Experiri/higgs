@@ -2759,6 +2759,10 @@ impl Higgs {
             // the hub never pushes an update to itself.
             target: Some(env!("HIGGS_BUILD_TARGET").to_string()),
             variant: Some(crate::node::self_update::CURRENT_VARIANT.to_string()),
+            // The local card has no iroh path; render a neutral Disconnected
+            // stub with no counters — the UI hides / greys the link badge for
+            // is_local rows.
+            link: crate::remote::NetworkStats::default(),
         }
     }
 

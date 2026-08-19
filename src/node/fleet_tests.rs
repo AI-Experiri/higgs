@@ -3330,11 +3330,11 @@ async fn retire_keeps_the_per_node_pull_status_lock_for_reuse() {
 
 // ─── NQ passive network stats: unit tests ────────────────────────────────
 
-/// `build_network_stats` covers all three branches. Fail-on-revert: flip any
+/// `get_passive_link_stats` covers all three branches. Fail-on-revert: flip any
 /// branch (e.g. Direct→Degraded, Relay→Healthy, disconnected leaking a
 /// sample) and a case here fires.
 #[test]
-fn build_network_stats_direct_is_healthy_with_live_counters() {
+fn get_passive_link_stats_direct_is_healthy_with_live_counters() {
     use crate::node::transport::NetworkSample;
     use crate::remote::{LinkPath, LinkState};
     let s = NetworkSample {
@@ -3345,7 +3345,7 @@ fn build_network_stats_direct_is_healthy_with_live_counters() {
         bytes_tx: 4096,
         bytes_rx: 8192,
     };
-    let stats = build_network_stats(true, Some(s), Some(1234));
+    let stats = get_passive_link_stats(true, Some(s), Some(1234));
     assert_eq!(stats.state, LinkState::Healthy);
     assert_eq!(stats.path, Some(LinkPath::Direct));
     assert_eq!(stats.rtt_ms, Some(7));
@@ -3357,7 +3357,7 @@ fn build_network_stats_direct_is_healthy_with_live_counters() {
 }
 
 #[test]
-fn build_network_stats_relay_is_degraded_not_healthy() {
+fn get_passive_link_stats_relay_is_degraded_not_healthy() {
     use crate::node::transport::NetworkSample;
     use crate::remote::{LinkPath, LinkState};
     let s = NetworkSample {
@@ -3368,7 +3368,7 @@ fn build_network_stats_relay_is_degraded_not_healthy() {
         bytes_tx: 0,
         bytes_rx: 0,
     };
-    let stats = build_network_stats(true, Some(s), Some(1));
+    let stats = get_passive_link_stats(true, Some(s), Some(1));
     // Relay MUST classify Degraded — the design's motivating case (a live
     // link with low RTT still counts as Degraded because iroh fell back off
     // the direct path).
@@ -3378,10 +3378,10 @@ fn build_network_stats_relay_is_degraded_not_healthy() {
 }
 
 #[test]
-fn build_network_stats_connected_but_no_selected_path_is_degraded() {
+fn get_passive_link_stats_connected_but_no_selected_path_is_degraded() {
     use crate::remote::LinkState;
     // Mid-handshake / migration: connected but iroh has no selected path.
-    let stats = build_network_stats(true, None, Some(42));
+    let stats = get_passive_link_stats(true, None, Some(42));
     assert_eq!(stats.state, LinkState::Degraded);
     assert_eq!(stats.path, None);
     assert_eq!(stats.rtt_ms, None);
@@ -3392,7 +3392,7 @@ fn build_network_stats_connected_but_no_selected_path_is_degraded() {
 }
 
 #[test]
-fn build_network_stats_disconnected_zeroes_everything_and_drops_uptime() {
+fn get_passive_link_stats_disconnected_zeroes_everything_and_drops_uptime() {
     use crate::node::transport::NetworkSample;
     use crate::remote::{LinkPath, LinkState};
     let leaked = NetworkSample {
@@ -3406,7 +3406,7 @@ fn build_network_stats_disconnected_zeroes_everything_and_drops_uptime() {
     // Even if the caller passes a lingering sample or uptime, the
     // disconnected branch MUST wipe them — otherwise the UI shows live-looking
     // stats for a dead node.
-    let stats = build_network_stats(false, Some(leaked), Some(9_999));
+    let stats = get_passive_link_stats(false, Some(leaked), Some(9_999));
     assert_eq!(stats.state, LinkState::Disconnected);
     assert_eq!(stats.path, None);
     assert_eq!(stats.rtt_ms, None);

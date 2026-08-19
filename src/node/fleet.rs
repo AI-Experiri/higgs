@@ -179,6 +179,15 @@ pub struct NodeView {
     /// empty for a connected node or the local card.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub offline_help: Vec<String>,
+    /// Passive network snapshot — the SAME `NetworkStats` that
+    /// [`crate::api::Higgs::network_stats`] returns for this endpoint, sampled
+    /// atomically with the rest of this view on the fleet actor. Included in
+    /// every fleet snapshot so a UI can render a link badge from
+    /// `link.state` (`Healthy` / `Degraded` / `Disconnected`) without a
+    /// second RPC per node. For the local card the serve layer prepends a
+    /// default (Disconnected) stub — the local machine has no iroh path.
+    #[serde(default)]
+    pub link: crate::remote::NetworkStats,
 }
 }
 
@@ -683,10 +692,13 @@ impl PulledAt {
     }
 }
 
-/// Pure builder for [`crate::remote::NetworkStats`] from the actor-scoped
-/// facts: whether the node is currently connected, an optional live iroh
-/// sample, and this-connection uptime. Split out for testability — the
-/// mailbox handler is a one-liner around this.
+/// Pure formatter that shapes the actor-scoped facts (`connected`, an
+/// optional live iroh sample, this-connection uptime) into the wire
+/// [`crate::remote::NetworkStats`] the UI renders as a link badge.
+/// Reads-and-formats, does not compute anything — the same shape used by
+/// `nodes_view()` (fleet snapshot) and `HubFleet::network_stats(node)`
+/// (per-node RPC), so the classifier stays single-sourced. Sibling of
+/// `nodes_view` in naming.
 ///
 /// Accepted design residuals (all inherent to on-demand passive sampling):
 ///
@@ -709,7 +721,7 @@ impl PulledAt {
 ///    the mailbox behind it. Deemed acceptable — iroh reads are small
 ///    hashmap/atomic accesses in practice — over the alternative (sample
 ///    off-actor, lose the admit/drop atomicity guarantee).
-fn build_network_stats(
+fn get_passive_link_stats(
     connected: bool,
     sample: Option<crate::node::transport::NetworkSample>,
     uptime_ms: Option<u64>,
@@ -1051,6 +1063,19 @@ impl FleetActor {
                             inv
                         });
                 let connected = self.nodes.contains_key(&endpoint_id);
+                // Passive NQ: sample the same way the standalone
+                // `Higgs::network_stats` call does, but INLINE with the
+                // rest of the snapshot so every fleet view carries a
+                // fresh link badge without a second RPC per node.
+                let link_sample = self
+                    .nodes
+                    .get(&endpoint_id)
+                    .and_then(|t| t.network_sample());
+                let link_uptime = self
+                    .connected_at
+                    .get(&endpoint_id)
+                    .map(|t| u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX));
+                let link = get_passive_link_stats(connected, link_sample, link_uptime);
                 NodeView {
                     node_id: node_id.0,
                     connected,
@@ -1084,6 +1109,7 @@ impl FleetActor {
                     update_failed: self.update_failures.get(&endpoint_id).cloned(),
                     target: self.targets.get(&endpoint_id).cloned(),
                     variant: self.variants.get(&endpoint_id).cloned(),
+                    link,
                     endpoint_id,
                 }
             })
@@ -1215,7 +1241,8 @@ impl Actor for FleetActor {
                     .get(&node)
                     .map(|t| u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX));
                 let sample = self.nodes.get(&node).and_then(|t| t.network_sample());
-                let stats = build_network_stats(self.nodes.contains_key(&node), sample, uptime_ms);
+                let stats =
+                    get_passive_link_stats(self.nodes.contains_key(&node), sample, uptime_ms);
                 let _ = reply.send(stats);
             }
             FleetMsg::PullStatusHandle { node, reply } => {
