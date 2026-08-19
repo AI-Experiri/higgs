@@ -30,6 +30,17 @@ pub struct NodeTransport {
     next_id: AtomicU64,
 }
 
+/// One passive read of the QUIC connection's selected path.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NetworkSample {
+    pub(crate) path: crate::remote::LinkPath,
+    pub(crate) rtt_ms: Option<u32>,
+    pub(crate) lost_packets: u64,
+    pub(crate) sent_datagrams: u64,
+    pub(crate) bytes_tx: u64,
+    pub(crate) bytes_rx: u64,
+}
+
 impl NodeTransport {
     pub fn new(conn: Connection) -> Self {
         Self {
@@ -59,6 +70,33 @@ impl NodeTransport {
     /// `closed()` watcher so it can release its handle and free the connection.
     pub fn close(&self) {
         self.conn.close(0u32.into(), b"retired");
+    }
+
+    /// Passive network sample: read iroh's selected path kind + RTT + per-path
+    /// stats from ONE `Path::stats()` snapshot (no wire traffic; iroh's
+    /// internal synchronization is opaque). Every field — `path`, `rtt`,
+    /// counters — comes from the same `selected` `Path` value, so a
+    /// mid-call path migration cannot yield mixed / torn reads. `None` when
+    /// no path is currently selected (a brief mid-migration window).
+    pub(crate) fn network_sample(&self) -> Option<NetworkSample> {
+        use crate::remote::LinkPath;
+        let paths = self.conn.paths();
+        let selected = paths.into_iter().find(iroh::endpoint::Path::is_selected)?;
+        let path = if selected.is_relay() {
+            LinkPath::Relay
+        } else {
+            LinkPath::Direct
+        };
+        let stats = selected.stats();
+        let rtt_ms = Some(u32::try_from(stats.rtt.as_millis()).unwrap_or(u32::MAX));
+        Some(NetworkSample {
+            path,
+            rtt_ms,
+            lost_packets: stats.lost_packets,
+            sent_datagrams: stats.udp_tx.datagrams,
+            bytes_tx: stats.udp_tx.bytes,
+            bytes_rx: stats.udp_rx.bytes,
+        })
     }
 
     /// Issue one `higgs/node/*` control RPC on a fresh bidi stream and await its response.

@@ -986,6 +986,7 @@ fn inventory_age_is_the_max_of_both_clocks_from_the_pull_start_stamp() {
         log_capable: std::collections::HashSet::new(),
         pull_capable: std::collections::HashSet::new(),
         node_downloads: HashMap::new(),
+        connected_at: HashMap::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
         fallback_inflight: HashMap::new(),
@@ -1037,6 +1038,7 @@ fn inventory_age_is_the_max_of_both_clocks_from_the_pull_start_stamp() {
         log_capable: std::collections::HashSet::new(),
         pull_capable: std::collections::HashSet::new(),
         node_downloads: HashMap::new(),
+        connected_at: HashMap::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
         fallback_inflight: HashMap::new(),
@@ -1108,6 +1110,7 @@ async fn readmission_strips_the_previous_process_snapshot_seq() {
         log_capable: std::collections::HashSet::new(),
         pull_capable: std::collections::HashSet::new(),
         node_downloads: HashMap::new(),
+        connected_at: HashMap::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
         fallback_inflight: HashMap::new(),
@@ -1173,6 +1176,7 @@ async fn older_started_pull_never_overwrites_a_newer_snapshot() {
         log_capable: std::collections::HashSet::new(),
         pull_capable: std::collections::HashSet::new(),
         node_downloads: HashMap::new(),
+        connected_at: HashMap::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
         fallback_inflight: HashMap::new(),
@@ -1425,6 +1429,7 @@ fn served_ids_are_collision_free_even_when_a_model_name_clashes_with_a_suffix() 
         log_capable: std::collections::HashSet::new(),
         pull_capable: std::collections::HashSet::new(),
         node_downloads: HashMap::new(),
+        connected_at: HashMap::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
         fallback_inflight: HashMap::new(),
@@ -1635,6 +1640,7 @@ async fn pushed_worker_snapshot_merges_under_the_seq_guard() {
         log_capable: std::collections::HashSet::new(),
         pull_capable: std::collections::HashSet::new(),
         node_downloads: HashMap::new(),
+        connected_at: HashMap::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
         fallback_inflight: HashMap::new(),
@@ -2159,6 +2165,7 @@ async fn a_pre_cache_push_is_retained_and_replayed_over_an_older_pull() {
         log_capable: std::collections::HashSet::new(),
         pull_capable: std::collections::HashSet::new(),
         node_downloads: HashMap::new(),
+        connected_at: HashMap::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
         fallback_inflight: HashMap::new(),
@@ -2289,6 +2296,7 @@ async fn a_stale_fallback_owner_stands_down_before_pulling() {
         log_capable: std::collections::HashSet::new(),
         pull_capable: std::collections::HashSet::new(),
         node_downloads: HashMap::new(),
+        connected_at: HashMap::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
         fallback_inflight: HashMap::new(),
@@ -2762,6 +2770,7 @@ async fn a_reused_worker_id_does_not_lend_its_domain_to_a_stale_route() {
         log_capable: std::collections::HashSet::new(),
         pull_capable: std::collections::HashSet::new(),
         node_downloads: HashMap::new(),
+        connected_at: HashMap::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
         fallback_inflight: HashMap::new(),
@@ -2882,6 +2891,7 @@ async fn a_stale_inventory_row_does_not_unadvertise_a_reused_worker_id() {
         log_capable: std::collections::HashSet::new(),
         pull_capable: std::collections::HashSet::new(),
         node_downloads: HashMap::new(),
+        connected_at: HashMap::new(),
         events_tx: tokio::sync::broadcast::channel(8).0,
         pending_pushes: HashMap::new(),
         fallback_inflight: HashMap::new(),
@@ -3316,4 +3326,157 @@ async fn retire_keeps_the_per_node_pull_status_lock_for_reuse() {
         "retire keeps the SAME mutex — re-admission reuses it, so a stale \
          retire can never delete a fresh poll's allocation"
     );
+}
+
+// ─── NQ passive network stats: unit tests ────────────────────────────────
+
+/// `build_network_stats` covers all three branches. Fail-on-revert: flip any
+/// branch (e.g. Direct→Degraded, Relay→Healthy, disconnected leaking a
+/// sample) and a case here fires.
+#[test]
+fn build_network_stats_direct_is_healthy_with_live_counters() {
+    use crate::node::transport::NetworkSample;
+    use crate::remote::{LinkPath, LinkState};
+    let s = NetworkSample {
+        path: LinkPath::Direct,
+        rtt_ms: Some(7),
+        lost_packets: 2,
+        sent_datagrams: 100,
+        bytes_tx: 4096,
+        bytes_rx: 8192,
+    };
+    let stats = build_network_stats(true, Some(s), Some(1234));
+    assert_eq!(stats.state, LinkState::Healthy);
+    assert_eq!(stats.path, Some(LinkPath::Direct));
+    assert_eq!(stats.rtt_ms, Some(7));
+    assert_eq!(stats.lost_packets, 2);
+    assert_eq!(stats.sent_datagrams, 100);
+    assert_eq!(stats.bytes_tx, 4096);
+    assert_eq!(stats.bytes_rx, 8192);
+    assert_eq!(stats.uptime_ms, Some(1234));
+}
+
+#[test]
+fn build_network_stats_relay_is_degraded_not_healthy() {
+    use crate::node::transport::NetworkSample;
+    use crate::remote::{LinkPath, LinkState};
+    let s = NetworkSample {
+        path: LinkPath::Relay,
+        rtt_ms: Some(50),
+        lost_packets: 0,
+        sent_datagrams: 10,
+        bytes_tx: 0,
+        bytes_rx: 0,
+    };
+    let stats = build_network_stats(true, Some(s), Some(1));
+    // Relay MUST classify Degraded — the design's motivating case (a live
+    // link with low RTT still counts as Degraded because iroh fell back off
+    // the direct path).
+    assert_eq!(stats.state, LinkState::Degraded);
+    assert_eq!(stats.path, Some(LinkPath::Relay));
+    assert_eq!(stats.rtt_ms, Some(50));
+}
+
+#[test]
+fn build_network_stats_connected_but_no_selected_path_is_degraded() {
+    use crate::remote::LinkState;
+    // Mid-handshake / migration: connected but iroh has no selected path.
+    let stats = build_network_stats(true, None, Some(42));
+    assert_eq!(stats.state, LinkState::Degraded);
+    assert_eq!(stats.path, None);
+    assert_eq!(stats.rtt_ms, None);
+    assert_eq!(stats.uptime_ms, Some(42));
+    // Counters MUST be zero — there is no sample to draw them from.
+    assert_eq!(stats.lost_packets, 0);
+    assert_eq!(stats.bytes_tx, 0);
+}
+
+#[test]
+fn build_network_stats_disconnected_zeroes_everything_and_drops_uptime() {
+    use crate::node::transport::NetworkSample;
+    use crate::remote::{LinkPath, LinkState};
+    let leaked = NetworkSample {
+        path: LinkPath::Direct,
+        rtt_ms: Some(9),
+        lost_packets: 99,
+        sent_datagrams: 999,
+        bytes_tx: 1,
+        bytes_rx: 1,
+    };
+    // Even if the caller passes a lingering sample or uptime, the
+    // disconnected branch MUST wipe them — otherwise the UI shows live-looking
+    // stats for a dead node.
+    let stats = build_network_stats(false, Some(leaked), Some(9_999));
+    assert_eq!(stats.state, LinkState::Disconnected);
+    assert_eq!(stats.path, None);
+    assert_eq!(stats.rtt_ms, None);
+    assert_eq!(stats.lost_packets, 0);
+    assert_eq!(stats.bytes_tx, 0);
+    assert_eq!(stats.uptime_ms, None);
+}
+
+/// `retire` clears the node's `connected_at` origin — otherwise a re-pair
+/// would inherit a stale uptime stamp from a prior generation of the same
+/// endpoint id. Whitebox test via a FleetActor literal (same pattern as
+/// the other actor-state tests). Fail-on-revert: delete the
+/// `self.connected_at.remove(node)` line in `retire` and this assert fires.
+#[tokio::test]
+async fn retire_clears_connected_at() {
+    let mut actor = FleetActor {
+        nodes: HashMap::new(),
+        routes: HashMap::new(),
+        node_ids: NodeIdAllocator::default(),
+        inventories: HashMap::new(),
+        chat_refreshes: HashMap::new(),
+        chat_refresh_gen: 0,
+        software_versions: HashMap::new(),
+        update_failures: HashMap::new(),
+        event_nodes: std::collections::HashSet::new(),
+        targets: HashMap::new(),
+        variants: HashMap::new(),
+        update_capable: std::collections::HashSet::new(),
+        version_capable: std::collections::HashSet::new(),
+        log_capable: std::collections::HashSet::new(),
+        pull_capable: std::collections::HashSet::new(),
+        node_downloads: HashMap::new(),
+        connected_at: HashMap::new(),
+        events_tx: tokio::sync::broadcast::channel(8).0,
+        pending_pushes: HashMap::new(),
+        fallback_inflight: HashMap::new(),
+        fallback_gen: 0,
+        versions: HashMap::new(),
+        epochs: HashMap::new(),
+        bus: Arc::new(crate::log_bus::LogBus::new()),
+        admit_gen: 0,
+    };
+    let peer = "endpoint-x".to_string();
+    actor
+        .connected_at
+        .insert(peer.clone(), std::time::Instant::now());
+    assert!(actor.connected_at.contains_key(&peer));
+    actor.retire(&peer);
+    assert!(
+        !actor.connected_at.contains_key(&peer),
+        "retire must drop the uptime origin so a re-admit stamps a fresh one"
+    );
+}
+
+/// `HubFleet::network_stats` for an unknown/unpaired node returns the
+/// Disconnected snapshot (not None). None is reserved for actor-gone —
+/// enforced at the type level by the wrapper's `Option` return; not
+/// separately unit-tested because triggering actor-death mid-call from
+/// unit-test scope requires racing the drop of the fleet's mailbox
+/// sender, which the crate does not expose.
+#[tokio::test]
+async fn net_stats_unknown_node_reports_disconnected_with_no_uptime() {
+    use crate::remote::LinkState;
+    let fleet = Arc::new(HubFleet::new(Arc::new(crate::log_bus::LogBus::new())));
+    let stats = fleet
+        .network_stats("never-paired")
+        .await
+        .expect("actor alive");
+    assert_eq!(stats.state, LinkState::Disconnected);
+    assert_eq!(stats.path, None);
+    assert_eq!(stats.uptime_ms, None);
+    assert_eq!(stats.lost_packets, 0);
 }
