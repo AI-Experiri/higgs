@@ -179,6 +179,15 @@ pub struct NodeView {
     /// empty for a connected node or the local card.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub offline_help: Vec<String>,
+    /// Passive network snapshot — the SAME `NetworkStats` that
+    /// [`crate::api::Higgs::network_stats`] returns for this endpoint, sampled
+    /// atomically with the rest of this view on the fleet actor. Included in
+    /// every fleet snapshot so a UI can render a link badge from
+    /// `link.state` (`Healthy` / `Degraded` / `Disconnected`) without a
+    /// second RPC per node. For the local card the serve layer prepends a
+    /// default (Disconnected) stub — the local machine has no iroh path.
+    #[serde(default)]
+    pub link: crate::remote::NetworkStats,
 }
 }
 
@@ -353,6 +362,13 @@ enum FleetMsg {
     Transport {
         node: NodeKey,
         reply: oneshot::Sender<Result<Arc<NodeTransport>, HiggsError>>,
+    },
+    /// Passive network snapshot for `node`: live iroh sample (path/RTT/counters),
+    /// inferred label, and this-connection uptime. Handled on the actor so the
+    /// sample and the uptime origin are read consistently.
+    NetworkStats {
+        node: NodeKey,
+        reply: oneshot::Sender<crate::remote::NetworkStats>,
     },
     /// ATOMIC snapshot for the downloads status poll: the node's CURRENT transport paired
     /// with whether THAT connection advertised `pull_status`. One actor message, so a
@@ -676,6 +692,70 @@ impl PulledAt {
     }
 }
 
+/// Pure formatter that shapes the actor-scoped facts (`connected`, an
+/// optional live iroh sample, this-connection uptime) into the wire
+/// [`crate::remote::NetworkStats`] the UI renders as a link badge.
+/// Reads-and-formats, does not compute anything — the same shape used by
+/// `nodes_view()` (fleet snapshot) and `HubFleet::network_stats(node)`
+/// (per-node RPC), so the classifier stays single-sourced. Sibling of
+/// `nodes_view` in naming.
+///
+/// Accepted design residuals (all inherent to on-demand passive sampling):
+///
+/// 1. Relay classifies `Degraded` regardless of measured RTT — the label
+///    encodes topology, not quality. A low-RTT relay is intentionally
+///    surfaced the same as a slow one; adding an RTT threshold is out of
+///    scope (user directive: three states, no numeric thresholds).
+/// 2. The `(true, None)` → Degraded arm fires only when `network_sample()`
+///    finds no selected path. `admit_inner` runs post-HELLO on the
+///    already-established QUIC connection, so a path IS selected by
+///    admit time — this arm does NOT fire on fresh admit. It fires
+///    during a mid-migration window (one path deselected, the next not
+///    yet selected) and briefly between a QUIC close and the fleet
+///    actor processing `DropTransportIf`. Both are self-correcting on
+///    the next poll (or on `Disconnected` after `DropTransportIf` lands
+///    within one mailbox turn).
+/// 3. `network_sample()` runs on the actor thread so the sample is
+///    consistent with `nodes`/`connected_at`. Iroh's internal synchronization
+///    on `paths()`/`stats()` is opaque; if a call blocks briefly it stalls
+///    the mailbox behind it. Deemed acceptable — iroh reads are small
+///    hashmap/atomic accesses in practice — over the alternative (sample
+///    off-actor, lose the admit/drop atomicity guarantee).
+fn get_passive_link_stats(
+    connected: bool,
+    sample: Option<crate::node::transport::NetworkSample>,
+    uptime_ms: Option<u64>,
+) -> crate::remote::NetworkStats {
+    use crate::remote::{LinkPath, LinkState, NetworkStats};
+    match (connected, sample) {
+        (true, Some(s)) => {
+            let state = match s.path {
+                LinkPath::Direct => LinkState::Healthy,
+                LinkPath::Relay => LinkState::Degraded,
+            };
+            NetworkStats {
+                path: Some(s.path),
+                rtt_ms: s.rtt_ms,
+                lost_packets: s.lost_packets,
+                sent_datagrams: s.sent_datagrams,
+                bytes_tx: s.bytes_tx,
+                bytes_rx: s.bytes_rx,
+                uptime_ms,
+                state,
+            }
+        }
+        (true, None) => NetworkStats {
+            uptime_ms,
+            state: LinkState::Degraded,
+            ..Default::default()
+        },
+        (false, _) => NetworkStats {
+            state: LinkState::Disconnected,
+            ..Default::default()
+        },
+    }
+}
+
 struct FleetActor {
     /// Currently-connected nodes → their live transport (absent while disconnected).
     nodes: HashMap<NodeKey, Arc<NodeTransport>>,
@@ -751,6 +831,12 @@ struct FleetActor {
     /// guarded). Overwritten per (re)admission, removed at retire; served
     /// in `nodes_view` only while connected.
     node_downloads: HashMap<NodeKey, Vec<crate::remote::HelloDownload>>,
+    /// Passive NQ bookkeeping: monotonic instant when each currently-connected
+    /// node was admitted. Uptime (`now - connected_at`) is what
+    /// `network_stats` exposes as `uptime_ms`. Populated on admit; cleared on
+    /// drop / DisconnectAll / retire. Monotonic (`Instant`) so clock skew /
+    /// NTP steps cannot make it read negative.
+    connected_at: HashMap<NodeKey, std::time::Instant>,
     /// Per-node lifecycle generation, bumped on every load/unload/kill/route-drop. A
     /// `refresh_inventory` only commits its (possibly stale) result if this is unchanged
     /// since it started — so a slow connect-time fetch can't clobber a newer state.
@@ -843,6 +929,9 @@ impl FleetActor {
                     node,
                     "higgs: node connection dropped; transport removed (routes kept)"
                 );
+                // Passive NQ: clear the uptime origin for this node — the next
+                // admit stamps a fresh one so uptime resets on reconnect.
+                self.connected_at.remove(node);
                 // Close so a wedged-but-open connection's close-watcher wakes and releases its
                 // Arc (otherwise it would wait on `closed()` forever).
                 t.close();
@@ -929,6 +1018,7 @@ impl FleetActor {
         self.log_capable.remove(node);
         self.pull_capable.remove(node);
         self.node_downloads.remove(node);
+        self.connected_at.remove(node);
         self.pending_pushes.remove(node);
         self.fallback_inflight.remove(node);
         // Drop any chat-refresh debounce slot too: a retired node needs no
@@ -973,6 +1063,19 @@ impl FleetActor {
                             inv
                         });
                 let connected = self.nodes.contains_key(&endpoint_id);
+                // Passive NQ: sample the same way the standalone
+                // `Higgs::network_stats` call does, but INLINE with the
+                // rest of the snapshot so every fleet view carries a
+                // fresh link badge without a second RPC per node.
+                let link_sample = self
+                    .nodes
+                    .get(&endpoint_id)
+                    .and_then(|t| t.network_sample());
+                let link_uptime = self
+                    .connected_at
+                    .get(&endpoint_id)
+                    .map(|t| u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX));
+                let link = get_passive_link_stats(connected, link_sample, link_uptime);
                 NodeView {
                     node_id: node_id.0,
                     connected,
@@ -1006,6 +1109,7 @@ impl FleetActor {
                     update_failed: self.update_failures.get(&endpoint_id).cloned(),
                     target: self.targets.get(&endpoint_id).cloned(),
                     variant: self.variants.get(&endpoint_id).cloned(),
+                    link,
                     endpoint_id,
                 }
             })
@@ -1130,6 +1234,16 @@ impl Actor for FleetActor {
                         detail: "node not connected".into(),
                     }
                 }));
+            }
+            FleetMsg::NetworkStats { node, reply } => {
+                let uptime_ms = self
+                    .connected_at
+                    .get(&node)
+                    .map(|t| u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX));
+                let sample = self.nodes.get(&node).and_then(|t| t.network_sample());
+                let stats =
+                    get_passive_link_stats(self.nodes.contains_key(&node), sample, uptime_ms);
+                let _ = reply.send(stats);
             }
             FleetMsg::PullStatusHandle { node, reply } => {
                 let _ = reply.send(
@@ -1305,6 +1419,11 @@ impl Actor for FleetActor {
                         self.pull_capable.remove(&node);
                     }
                     let replaced = self.nodes.insert(node.clone(), transport);
+                    // Passive NQ: stamp the uptime origin for this connection.
+                    // Overwrites any prior stamp (a reconnect resets uptime),
+                    // and cleared on drop / DisconnectAll / retire.
+                    self.connected_at
+                        .insert(node.clone(), std::time::Instant::now());
                     // Announced HERE, atomic with the insert (T10 r4 #1) — a
                     // wrapper-side emit could interleave with a racing retire's
                     // NodeDropped in the wrong order.
@@ -1379,6 +1498,9 @@ impl Actor for FleetActor {
                 // wakes) but KEEP routes/inventories/node-ids — same "routes survive a dropped
                 // connection" contract as `drop_transport_if`, applied to every node at once.
                 let drained: Vec<(NodeKey, Arc<NodeTransport>)> = self.nodes.drain().collect();
+                // Passive NQ: uptime resets on kill-switch teardown too — clear
+                // ALL origins alongside the transports drained above.
+                self.connected_at.clear();
                 for (node, t) in drained {
                     tracing::info!(
                         node,
@@ -1856,6 +1978,7 @@ impl HubFleet {
             log_capable: HashSet::new(),
             pull_capable: HashSet::new(),
             node_downloads: HashMap::new(),
+            connected_at: HashMap::new(),
             versions: HashMap::new(),
             epochs: HashMap::new(),
             bus: bus_for_actor,
@@ -2616,6 +2739,20 @@ impl HubFleet {
         self.ask(|reply| FleetMsg::NodeIds { reply })
             .await
             .unwrap_or_default()
+    }
+
+    /// Passive network stats + inferred label + connection uptime for `node`.
+    /// Samples iroh ON DEMAND on the actor thread (no probe traffic; the
+    /// sample and the uptime read are consistent w.r.t. admit/drop). Returns
+    /// a `Disconnected` snapshot when the node isn't currently connected;
+    /// returns `None` only if the fleet actor has died (mailbox failure), so
+    /// the caller can distinguish "unpaired" from "hub tearing down".
+    pub async fn network_stats(&self, node: &str) -> Option<crate::remote::NetworkStats> {
+        self.ask(|reply| FleetMsg::NetworkStats {
+            node: node.to_string(),
+            reply,
+        })
+        .await
     }
 
     /// The live transport for a node, or HG027 if it isn't currently connected.

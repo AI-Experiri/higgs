@@ -19,6 +19,24 @@ from it.
 
 ## [Unreleased]
 
+## [0.1.0-beta.12] - 2026-08-19
+
+### Added
+
+- **Passive network stats + inferred label (NQ).** New crate-level
+  `Higgs::network_stats(node) -> Option<NetworkStats>` samples iroh's
+  currently-selected path ON DEMAND (no probe traffic, no cache, no
+  subscription) and returns the path kind (`Direct` / `Relay`), RTT,
+  per-path counters (`lost_packets` / `sent_datagrams` / `bytes_tx` /
+  `bytes_rx`), the current connection's `uptime_ms`, and an inferred
+  `LinkState` (`Healthy` for Direct, `Degraded` for Relay or mid-migration,
+  `Disconnected` when unpaired / dropped). Sample and uptime are read
+  atomically on the fleet actor thread from ONE `Path::stats()` snapshot,
+  so no cross-snapshot torn reads exist. Wire additions: `LinkPath`,
+  `LinkState`, and `NetworkStats` in `crate::remote` (with matching
+  const-object TS bindings). `None` from the wrapper only when the hub
+  is off or the actor is unreachable.
+
 ## [0.1.0-beta.11] - 2026-08-17
 
 ### Added
