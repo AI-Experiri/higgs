@@ -65,8 +65,8 @@ async fn network_stats_live_admit_then_retire() {
     let hub_id = hub_ep.id().to_string();
     let node_id = node_ep.id().to_string();
 
-    let allow_path = std::env::temp_dir()
-        .join(format!("higgs-nq-allow-{}.json", std::process::id()));
+    let allow_path =
+        std::env::temp_dir().join(format!("higgs-nq-allow-{}.json", std::process::id()));
     let _ = std::fs::remove_file(&allow_path);
     let mut allow = Allowlist::load(&allow_path).unwrap();
     let mut tokens = PairingTokens::new();
@@ -78,9 +78,7 @@ async fn network_stats_live_admit_then_retire() {
     let dial_task = tokio::spawn({
         let node_ep = node_ep.clone();
         let node_id = node_id.clone();
-        async move {
-            connect_node(&node_ep, hub_addr, node_id, String::new(), Some(tok)).await
-        }
+        async move { connect_node(&node_ep, hub_addr, node_id, String::new(), Some(tok)).await }
     });
 
     let incoming = tokio::time::timeout(Duration::from_secs(30), hub_ep.accept())
@@ -133,10 +131,7 @@ async fn network_stats_live_admit_then_retire() {
     // test against tiny reorderings).
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let stats = higgs
-        .network_stats(&peer)
-        .await
-        .expect("fleet actor alive");
+    let stats = higgs.network_stats(&peer).await.expect("fleet actor alive");
     assert_ne!(
         stats.state,
         LinkState::Disconnected,
@@ -152,10 +147,7 @@ async fn network_stats_live_admit_then_retire() {
 
     // Retire → Disconnected snapshot; no uptime, no path.
     fleet.retire(&peer).await;
-    let stats = higgs
-        .network_stats(&peer)
-        .await
-        .expect("fleet actor alive");
+    let stats = higgs.network_stats(&peer).await.expect("fleet actor alive");
     assert_eq!(stats.state, LinkState::Disconnected);
     assert_eq!(stats.uptime_ms, None);
     assert_eq!(stats.path, None);
