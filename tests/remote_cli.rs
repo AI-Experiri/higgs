@@ -63,8 +63,8 @@ fn node_daemon_bare_without_saved_hubs_waits_for_pairing() {
         .args(["--node"])
         .env("HIGGS_HOME", home.path())
         .env("HIGGS_IROH_LOCAL", "1")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn higgs --node");
     std::thread::sleep(Duration::from_secs(2));
@@ -101,21 +101,26 @@ fn node_daemon_bare_without_saved_hubs_waits_for_pairing() {
         status.success(),
         "SIGTERM during the wait must be a GRACEFUL exit 0 (trial committed), got {status:?}"
     );
-    let mut stdout = String::new();
-    if let Some(mut out) = child.stdout.take() {
-        let _ = out.read_to_string(&mut stdout);
+    // Daemon logs land on stderr via tracing (fmt::layer writes there).
+    let mut stderr = String::new();
+    if let Some(mut err) = child.stderr.take() {
+        let _ = err.read_to_string(&mut stderr);
     }
+    // Specific to the wait-for-pair event, not any tracing line — guards
+    // against the event being dropped or renamed. (Structured field values
+    // are ANSI-colored under `fmt::layer()`, so match on the event name
+    // rather than a `field=value` substring.)
     assert!(
-        stdout.contains("higgs node"),
-        "prints node identity: {stdout}"
+        stderr.contains("daemon_wait_for_pair"),
+        "wait-for-pair event fires: {stderr}"
     );
     assert!(
-        stdout.contains("waiting to be paired"),
-        "prints the waiting hint: {stdout}"
+        stderr.contains("waiting to be paired"),
+        "prints the waiting hint: {stderr}"
     );
     assert!(
-        stdout.contains("higgs --node <ticket>"),
-        "hint includes the pairing command: {stdout}"
+        stderr.contains("higgs --node <ticket>"),
+        "hint includes the pairing command: {stderr}"
     );
 }
 
@@ -257,6 +262,9 @@ async fn node_connect_dials_and_pairs_with_a_hub() {
         "node connect exits 0: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // `higgs node connect <ticket> <token>` is a one-shot interactive CLI
+    // command — its `paired with hub …` line is the command's return value,
+    // legitimately on stdout via println! (not tracing).
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("paired with hub"),
@@ -326,11 +334,11 @@ async fn run_node_until_paired(home: &Path, args: &[&str]) -> tokio::process::Ch
         .args(&full)
         .env("HIGGS_HOME", home)
         .env("HIGGS_IROH_LOCAL", "1")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn higgs --node");
-    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let mut lines = BufReader::new(child.stderr.take().unwrap()).lines();
     let paired = tokio::time::timeout(Duration::from_secs(30), async {
         while let Ok(Some(line)) = lines.next_line().await {
             if line.contains("paired with hub") {
