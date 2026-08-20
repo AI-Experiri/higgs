@@ -810,12 +810,12 @@ async fn node_daemon_wait_loop_exits_on_corrupt_config() {
         .arg("--node")
         .env("HIGGS_HOME", home.path())
         .env("HIGGS_IROH_LOCAL", "1")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .expect("spawn higgs --node");
-    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let mut lines = BufReader::new(child.stderr.take().unwrap()).lines();
     assert!(
         read_until(&mut lines, "waiting to be paired", 30)
             .await
@@ -905,15 +905,14 @@ async fn node_daemon_wait_detects_pairing_then_reports_reconnect_diagnostics() {
         .arg("--node")
         .env("HIGGS_HOME", home.path())
         .env("HIGGS_IROH_LOCAL", "1")
-        .stdout(Stdio::piped())
+        .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn install-shaped higgs --node");
-    let mut out_lines = BufReader::new(child.stdout.take().unwrap()).lines();
     let mut err_lines = BufReader::new(child.stderr.take().unwrap()).lines();
 
     assert!(
-        read_until(&mut out_lines, "waiting to be paired", 30)
+        read_until(&mut err_lines, "waiting to be paired", 30)
             .await
             .is_some(),
         "the bare daemon entered the pairing wait"
@@ -931,13 +930,13 @@ async fn node_daemon_wait_detects_pairing_then_reports_reconnect_diagnostics() {
     cfg.save(&cfg_path).expect("persist the pairing");
 
     assert!(
-        read_until(&mut out_lines, "hub pairing detected", 30)
+        read_until(&mut err_lines, "hub pairing detected", 30)
             .await
             .is_some(),
         "the wait loop detected the persisted pairing"
     );
     assert!(
-        read_until(&mut out_lines, "paired with hub", 60)
+        read_until(&mut err_lines, "paired with hub", 60)
             .await
             .is_some(),
         "the daemon connected to the hub"
