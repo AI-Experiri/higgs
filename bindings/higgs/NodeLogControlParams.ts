@@ -2,10 +2,17 @@
 
 /**
  * [`M_NODE_LOG_LEVEL`] request params (hub → node): flip the node daemon's
- * `LogBus.verbose` gate LIVE. `None` = keep the current value; a bool
- * value overrides it (`true` admits DEBUG/TRACE into the `LogSource::Serve`
- * stream, `false` restores the INFO+ gate). This is the only knob — the
- * section badge that appears at the start of each log line is set at write
- * time by the tracing target, not by the wire.
+ * `LogBus` runtime toggles LIVE. Every field is optional — `None` = keep the
+ * current value; `Some(v)` overrides. All three flags travel over the same
+ * op so the hub applies them atomically per request; the section badge that
+ * appears at the start of each log line is set at write time by the tracing
+ * target, not by the wire.
+ *
+ * - `verbose` (NL-V) admits DEBUG/TRACE into the `LogSource::Serve` stream
+ *   when `true`, restores the INFO+ gate when `false`.
+ * - `log_incoming_tokens` (NL-VX) governs the serve layer's opt-in prompt-
+ *   content line (redact-by-default when off).
+ * - `log_show_fields` (NL-VX) governs the un-redacted DEBUG mode that emits
+ *   every non-message structured field (including prompt content).
  */
-export type NodeLogControlParams = { verbose?: boolean, };
+export type NodeLogControlParams = { verbose?: boolean, log_incoming_tokens?: boolean, log_show_fields?: boolean, };
