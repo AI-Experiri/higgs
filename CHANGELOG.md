@@ -19,6 +19,27 @@ from it.
 
 ## [Unreleased]
 
+## [0.1.0-beta.13] - 2026-08-19
+
+### Fixed
+
+- **Node daemon lifecycle events stream live in the per-node log pane.**
+  During a hub-pushed self-update, the operator watching the jigglebot
+  per-node log terminal previously saw only two lines ("node daemon
+  starting" + "connected to hub"); the ~8 interesting events between
+  (drain start, worker unloads, drain complete, re-exec, boot-guard,
+  hub reconnect) were emitted via `println!`/`eprintln!` from the
+  daemon serve loop in `cli.rs` — bypassing LogBus and `M_NODE_LOGS`
+  entirely. They only reached `node.log` via systemd/launchd's stdout
+  capture, invisible to any operator watching remotely. Two changes fix
+  the routing: the tracing `fmt::layer` now writes to stderr (was
+  stdout by default), and every daemon-runtime print is now
+  `tracing::info!/warn!/error!` with `target: "higgs::node"` and a
+  stable `event=` field. Interactive one-shot CLI paths (`higgs link
+  pair`, `higgs node connect`, `higgs --version`, the enrollment
+  wizard) intentionally keep `println!`/`eprintln!` — their stdout IS
+  the shell contract for scripts and pipes.
+
 ## [0.1.0-beta.12] - 2026-08-19
 
 ### Added

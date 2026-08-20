@@ -2947,7 +2947,12 @@ fn persist_hub(cfg_path: &Path, hello: &HelloResult, ticket: &str) {
     let mut cfg = match InstanceConfig::load(cfg_path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("higgs node: could not load config to save hub: {e}");
+            tracing::warn!(
+                target: "higgs::node",
+                event = "config_load_failed",
+                error = %e,
+                "could not load config to save hub"
+            );
             return;
         }
     };
@@ -2961,7 +2966,12 @@ fn persist_hub(cfg_path: &Path, hello: &HelloResult, ticket: &str) {
         last_used_ms: now_ms(),
     });
     if let Err(e) = cfg.save(cfg_path) {
-        eprintln!("higgs node: failed to save hub to config: {e}");
+        tracing::warn!(
+            target: "higgs::node",
+            event = "config_save_failed",
+            error = %e,
+            "failed to save hub to config"
+        );
     }
 }
 
@@ -3159,10 +3169,12 @@ fn run_node_daemon_body(args: &[String], confirm_bin: &Option<std::path::PathBuf
             Some(hub) => (hub.ticket.clone(), None),
             None => {
                 let name = name_or_init(Role::Node, &id, &crate::system::hostname())?;
-                println!("higgs node   : {name} ({id})");
-                println!(
-                    "no saved hub yet — waiting to be paired (run: higgs --node <ticket> \
-                     <token>)"
+                tracing::info!(
+                    target: "higgs::node",
+                    event = "daemon_wait_for_pair",
+                    node = %name,
+                    endpoint_id = %id,
+                    "no saved hub yet — waiting to be paired (run: higgs --node <ticket> <token>)"
                 );
                 // An operator stop during the wait is a GRACEFUL shutdown, not a crash —
                 // commit the trial before exiting so the recorded boot attempt above
@@ -3185,14 +3197,22 @@ fn run_node_daemon_body(args: &[String], confirm_bin: &Option<std::path::PathBuf
                         env!("CARGO_PKG_VERSION"),
                     ) {
                         // Mirror the serve path: untrackable health must not run a trial.
-                        eprintln!("higgs node: self-update boot-counter write failed ({e})");
+                        tracing::warn!(
+                            target: "higgs::node",
+                            event = "boot_counter_write_failed",
+                            error = %e,
+                            "self-update boot-counter write failed"
+                        );
                         if let Ok(Some(prev)) = crate::node::self_update::force_rollback_trial(
                             bin,
                             env!("CARGO_PKG_VERSION"),
                         ) {
-                            eprintln!(
-                                "higgs node: could not track the update's health (disk \
-                                 full?) — rolled back to {prev}. Restart to run it."
+                            tracing::error!(
+                                target: "higgs::node",
+                                event = "self_update_health_rollback",
+                                rolled_back_to = %prev,
+                                "could not track the update's health (disk full?) — rolled \
+                                 back. Restart to run it."
                             );
                             return Ok(());
                         }
@@ -3210,7 +3230,11 @@ fn run_node_daemon_body(args: &[String], confirm_bin: &Option<std::path::PathBuf
                                 env!("CARGO_PKG_VERSION"),
                             );
                         }
-                        println!("higgs node: stopped while waiting to be paired");
+                        tracing::info!(
+                            target: "higgs::node",
+                            event = "daemon_stopped_pre_pair",
+                            "stopped while waiting to be paired"
+                        );
                         return Ok(());
                     }
                     // Same health rule as the serve loop: a trialed binary that simply
@@ -3255,7 +3279,11 @@ fn run_node_daemon_body(args: &[String], confirm_bin: &Option<std::path::PathBuf
                         }
                     };
                     if let Some(hub) = fresh.default_saved_hub() {
-                        println!("hub pairing detected — connecting");
+                        tracing::info!(
+                            target: "higgs::node",
+                            event = "daemon_pairing_detected",
+                            "hub pairing detected — connecting"
+                        );
                         // The flag handler STAYS installed — the serve path's tokio
                         // shutdown_listener replaces the disposition, and the async
                         // block re-checks the flag after the boot record, so a stop
@@ -3263,8 +3291,15 @@ fn run_node_daemon_body(args: &[String], confirm_bin: &Option<std::path::PathBuf
                         break (hub.ticket.clone(), None);
                     }
                     // A quiet reminder every ~5 minutes, not two lines per second.
+                    // Emitted at info! (not debug!) so the default production filter
+                    // admits it — matching the pre-sweep println!'s always-visible
+                    // behavior; the ~5-minute cadence keeps it from being noisy.
                     if polls.is_multiple_of(HUB_WAIT_REMIND_EVERY) {
-                        println!("still waiting to be paired — run: higgs --node <ticket> <token>");
+                        tracing::info!(
+                            target: "higgs::node",
+                            event = "daemon_wait_reminder",
+                            "still waiting to be paired — run: higgs --node <ticket> <token>"
+                        );
                     }
                 }
             }
@@ -3310,13 +3345,21 @@ fn run_node_daemon_body(args: &[String], confirm_bin: &Option<std::path::PathBuf
             if let Err(e) =
                 crate::node::self_update::record_boot_attempt(bin, env!("CARGO_PKG_VERSION"))
             {
-                eprintln!("higgs node: self-update boot-counter write failed ({e})");
+                tracing::warn!(
+                    target: "higgs::node",
+                    event = "boot_counter_write_failed",
+                    error = %e,
+                    "self-update boot-counter write failed"
+                );
                 if let Ok(Some(prev)) =
                     crate::node::self_update::force_rollback_trial(bin, env!("CARGO_PKG_VERSION"))
                 {
-                    eprintln!(
-                        "higgs node: could not track the update's health (disk full?) — rolled \
-                         back to {prev}. Restart to run it."
+                    tracing::error!(
+                        target: "higgs::node",
+                        event = "self_update_health_rollback",
+                        rolled_back_to = %prev,
+                        "could not track the update's health (disk full?) — rolled back. \
+                         Restart to run it."
                     );
                     return Ok(false); // not an update restart — exit; the next start runs `prev`
                 }
@@ -3329,7 +3372,11 @@ fn run_node_daemon_body(args: &[String], confirm_bin: &Option<std::path::PathBuf
             if let Some(bin) = confirm_bin {
                 let _ = crate::node::self_update::confirm_alive(bin, env!("CARGO_PKG_VERSION"));
             }
-            println!("higgs node: stopped while waiting to be paired");
+            tracing::info!(
+                target: "higgs::node",
+                event = "daemon_stopped_pre_pair",
+                "stopped while waiting to be paired"
+            );
             return Ok(false);
         }
         let sk = load_or_create_secret(&key_path()?)?;
@@ -3368,7 +3415,13 @@ fn run_node_daemon_body(args: &[String], confirm_bin: &Option<std::path::PathBuf
             idle_ttl: crate::node::runtime::DEFAULT_IDLE_TTL,
         }));
         if !pairing {
-            println!("higgs node   : {name} ({self_id}); connecting to hub…");
+            tracing::info!(
+                target: "higgs::node",
+                event = "daemon_connecting",
+                node = %name,
+                endpoint_id = %self_id,
+                "connecting to hub"
+            );
         }
 
         // Self-update "N seconds alive" commit: if a trial for this version is pending,
@@ -3416,6 +3469,15 @@ fn run_node_daemon_body(args: &[String], confirm_bin: &Option<std::path::PathBuf
         // success with a node service installed, it hands the connection to the service and
         // EXITS — never a second foreground node flapping against the service with the same
         // identity. Without a service it stays up as a clearly-labeled foreground node.
+        //
+        // INTERACTIVE-CLI BY DESIGN — `println!`/`eprintln!` intentionally kept in this
+        // block. `pairing=true` fires only on a user-typed
+        // `higgs --node <ticket> [token]` invocation (systemd/launchd reconnects pass no
+        // ticket → this block is skipped). The output here is a colored preflight wizard
+        // for the operator's TERMINAL (colored `style.*` helpers, boxed check tables); the
+        // NODE-LOG hygiene rule applies to the DAEMON serve loop below, not this
+        // enrollment UX. Do NOT sweep to tracing — it would strip the colors and rewrite
+        // the operator's interactive checklist into a wall of structured events.
         if pairing {
             let style = crate::node::preflight::Style::auto();
             println!("higgs node   : {name} ({self_id})");
@@ -3654,15 +3716,17 @@ fn run_node_daemon_body(args: &[String], confirm_bin: &Option<std::path::PathBuf
                             if watch_supersede
                                 && probe.close_reason().is_some_and(|e| close_is_supersede(&e))
                             {
-                                println!(
+                                tracing::info!(
+                                    target: "higgs::node",
+                                    event = "daemon_service_takeover",
                                     "node service took over the pairing — exiting \
                                      (the service is connected to your hub)"
                                 );
                                 break 'serve crate::node::self_update::ShutdownCause::Operator;
                             }
-                            eprintln!("hub connection closed; reconnecting…");
                             tracing::info!(
                                 target: "higgs::node",
+                                event = "hub_connection_closed",
                                 "hub connection closed; reconnecting"
                             );
                         }
@@ -3692,33 +3756,28 @@ fn run_node_daemon_body(args: &[String], confirm_bin: &Option<std::path::PathBuf
                                     );
                                 }
                             }
-                            println!(
+                            // One tracing event is what the daemon emits on
+                            // admission — visible to file, LogBus, and any
+                            // M_NODE_LOGS subscriber. No separate println.
+                            tracing::info!(
+                                target: "higgs::node",
+                                event = "paired_with_hub",
+                                hub_id = %hello.node_id,
+                                hub_name = %crate::remote::sanitize_display(&hello.hub_name),
+                                protocol = hello.agreed_version,
                                 "paired with hub {} ({}) (protocol v{})",
                                 crate::remote::sanitize_display(&hello.hub_name),
                                 hello.node_id,
                                 hello.agreed_version
                             );
-                            // NL-V: mirror the operator-facing lifecycle onto
-                            // the LogBus so `M_NODE_LOGS` subscribers (Fleet
-                            // node terminal) see connect/disconnect for an
-                            // otherwise-idle node. `println!` alone bypasses
-                            // tracing entirely. `higgs::node` target so the
-                            // section filter can subset lifecycle events.
-                            tracing::info!(
-                                target: "higgs::node",
-                                hub_id = %hello.node_id,
-                                hub_name = %crate::remote::sanitize_display(&hello.hub_name),
-                                protocol = hello.agreed_version,
-                                "connected to hub"
-                            );
                             tokio::select! {
                                 cause = &mut shutdown => break 'serve cause,
                                 _ = crate::node::serve_node(conn, node.clone()) => {
-                                    eprintln!("hub connection closed; reconnecting…");
-                            tracing::info!(
-                                target: "higgs::node",
-                                "hub connection closed; reconnecting"
-                            );
+                                    tracing::info!(
+                                        target: "higgs::node",
+                                        event = "hub_connection_closed",
+                                        "hub connection closed; reconnecting"
+                                    );
                                 }
                             }
                         }
@@ -3726,30 +3785,45 @@ fn run_node_daemon_body(args: &[String], confirm_bin: &Option<std::path::PathBuf
                             connect_failures += 1;
                             // The FULL cause chain — the top-level line alone
                             // ("timed out") says nothing an operator can act on.
-                            eprintln!(
-                                "higgs node: connect failed (attempt {connect_failures}): {}",
-                                error_chain(&e)
+                            tracing::warn!(
+                                target: "higgs::node",
+                                event = "connect_failed",
+                                attempt = connect_failures,
+                                error = %error_chain(&e),
+                                "connect failed"
                             );
                             // Roughly once a minute of failures, say what to
                             // CHECK — the operator tailing this log is usually
                             // remote and cannot see this machine's screen.
                             if connect_failures == 3 || connect_failures.is_multiple_of(20) {
-                                eprintln!(
-                                    "higgs node: still unreachable after {connect_failures} attempts — check:"
-                                );
+                                // Two cfg-selected `vec![]` literals so neither `mut` nor
+                                // `vec_init_then_push` is triggered — the macOS arm
+                                // prepends the Local-Network permission line.
                                 #[cfg(target_os = "macos")]
-                                eprintln!(
-                                    "  • {}",
+                                let hints: Vec<String> = vec![
                                     crate::node::fleet::macos_lna_advice(
-                                        "On THIS machine's own screen (not SSH)"
-                                    )
-                                );
-                                eprintln!(
-                                    "  • the hub must be up and reachable (its Fleet tab shows \
+                                        "On THIS machine's own screen (not SSH)",
+                                    ),
+                                    "the hub must be up and reachable (its Fleet tab shows \
                                      'Hub active')"
-                                );
-                                eprintln!(
-                                    "  • full checklist: docs/pairing-preflight-checklist.md"
+                                        .to_string(),
+                                    "full checklist: docs/pairing-preflight-checklist.md"
+                                        .to_string(),
+                                ];
+                                #[cfg(not(target_os = "macos"))]
+                                let hints: Vec<String> = vec![
+                                    "the hub must be up and reachable (its Fleet tab shows \
+                                     'Hub active')"
+                                        .to_string(),
+                                    "full checklist: docs/pairing-preflight-checklist.md"
+                                        .to_string(),
+                                ];
+                                tracing::warn!(
+                                    target: "higgs::node",
+                                    event = "connect_unreachable_advice",
+                                    attempts = connect_failures,
+                                    hints = ?hints,
+                                    "still unreachable after {connect_failures} attempts — check the hints"
                                 );
                             }
                         }
@@ -3795,33 +3869,56 @@ fn run_node_daemon_body(args: &[String], confirm_bin: &Option<std::path::PathBuf
         // SIGTERM during the drain would be caught by tokio's still-installed handler yet observed
         // by no one, and the node would re-exec against the operator's wishes.
         if update_restart {
-            println!("higgs node: staged update — draining in-flight generations…");
+            tracing::info!(
+                target: "higgs::node",
+                event = "update_drain_start",
+                deadline_s = UPDATE_DRAIN_DEADLINE.as_secs(),
+                "staged update — draining in-flight generations"
+            );
             let drain = node.drain_until_idle(Duration::from_millis(500), UPDATE_DRAIN_DEADLINE);
             match crate::node::self_update::drain_with_operator_override(operator.as_mut(), drain)
                 .await
             {
                 // The drain ran to completion (or its deadline): still an update restart, re-exec.
                 Some(drained) => {
-                    if !drained {
-                        eprintln!(
-                            "higgs node: drain deadline ({}s) reached — stopping the remaining \
-                             generations",
-                            UPDATE_DRAIN_DEADLINE.as_secs()
+                    if drained {
+                        tracing::info!(
+                            target: "higgs::node",
+                            event = "update_drain_complete",
+                            "drain complete — all in-flight generations finished"
+                        );
+                    } else {
+                        tracing::warn!(
+                            target: "higgs::node",
+                            event = "update_drain_deadline",
+                            deadline_s = UPDATE_DRAIN_DEADLINE.as_secs(),
+                            "drain deadline reached — stopping the remaining generations"
                         );
                     }
                 }
                 // An operator stop landed mid-drain: abandon the re-exec, stop promptly.
                 None => {
-                    eprintln!(
-                        "higgs node: operator stop during the update drain — stopping now; the \
-                         staged update activates on the next start"
+                    tracing::warn!(
+                        target: "higgs::node",
+                        event = "update_drain_aborted",
+                        "operator stop during the update drain — stopping now; the staged \
+                         update activates on the next start"
                     );
                     update_restart = false;
                 }
             }
         }
-        println!("higgs node: draining resident workers…");
+        tracing::info!(
+            target: "higgs::node",
+            event = "workers_shutdown_start",
+            "draining resident workers"
+        );
         node.shutdown_all().await;
+        tracing::info!(
+            target: "higgs::node",
+            event = "workers_shutdown_complete",
+            "resident workers stopped"
+        );
         // FINAL operator gate before committing to the re-exec (P4b (c)): `shutdown_all` reaps
         // workers for BOTH an operator stop and an update restart, so it always runs to completion
         // — but it can take a few seconds, and a SIGTERM delivered while it ran is buffered by
@@ -3832,8 +3929,10 @@ fn run_node_daemon_body(args: &[String], confirm_bin: &Option<std::path::PathBuf
         if update_restart
             && crate::node::self_update::operator_stop_pending(operator.as_mut()).await
         {
-            eprintln!(
-                "higgs node: operator stop during teardown — stopping now; the staged update \
+            tracing::warn!(
+                target: "higgs::node",
+                event = "update_operator_stop_during_teardown",
+                "operator stop during teardown — stopping now; the staged update \
                  activates on the next start"
             );
             update_restart = false;
@@ -3855,17 +3954,21 @@ fn run_node_daemon_body(args: &[String], confirm_bin: &Option<std::path::PathBuf
             if let Some(bin) = self_update_bin_dir() {
                 use std::os::unix::process::CommandExt;
                 let target = bin.join("current/higgs");
-                eprintln!(
-                    "higgs node: re-executing {} to activate the staged update",
-                    target.display()
+                tracing::info!(
+                    target: "higgs::node",
+                    event = "self_update_reexec",
+                    binary = %target.display(),
+                    "re-executing to activate the staged update"
                 );
                 let err = std::process::Command::new(&target)
                     .arg("--node")
                     .args(args)
                     .exec();
-                eprintln!(
-                    "higgs node: re-exec failed ({err}) — exiting; the next start runs the \
-                     staged update"
+                tracing::error!(
+                    target: "higgs::node",
+                    event = "self_update_reexec_failed",
+                    error = %err,
+                    "re-exec failed — exiting; the next start runs the staged update"
                 );
             }
         }
