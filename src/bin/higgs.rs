@@ -84,7 +84,16 @@ fn main() {
     higgs::LogBus::install_global(log_bus.clone());
     tracing_subscriber::registry()
         .with(higgs::HiggsLogLayer::new(log_bus).with_filter(higgs::log_filter()))
-        .with(tracing_subscriber::fmt::layer().with_filter(env()))
+        // stderr, not stdout — daemon TRACING is not a CLI return value.
+        // Interactive CLI commands still use `println!`/`eprintln!` for their
+        // output (pairing tokens, service manifests, --version): those are
+        // the program's stdout-as-data contract. Under systemd/launchd both
+        // streams land in node.log, so operators see the same content.
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_filter(env()),
+        )
         .init();
 
     // Fleet subcommands (iroh). Each runs to completion and exits.
