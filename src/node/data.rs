@@ -53,6 +53,26 @@ pub(crate) async fn relay_chat(
         }
     };
 
+    // NL-VX: opt-in prompt-content logging on the iroh-relay path. `serve/v1.rs`
+    // already emits an equivalent line for chats hitting the local /v1 handler
+    // on this node — without this call, flipping `log_incoming_tokens` from the
+    // UI for a REMOTELY-loaded worker was silently a no-op (the relay path
+    // never touched the flag). The wording is IDENTICAL to /v1's
+    // ("higgs: incoming <model> — N chars: <preview>"), so a Log Terminal
+    // reader can grep the same substring across routes; the tracing target
+    // still differs (`higgs::serve` → badge `[serve]` on /v1 vs
+    // `higgs::node::data` → badge `[node]` here), which is by design — the
+    // badge reflects the code path that observed the request.
+    if crate::log_bus::LogBus::global()
+        .as_deref()
+        .is_some_and(crate::log_bus::LogBus::log_incoming_tokens)
+    {
+        tracing::info!(
+            "{}",
+            incoming_message_from_wire(&params.model, &params.messages_json)
+        );
+    }
+
     // Apply the worker's own defaults for omitted optional params (1024 / 0.7), so a
     // remote chat with no max_tokens generates normally instead of zero tokens.
     // Remote sampling forwarding is DEFERRED: the hub→node wire carries only
@@ -611,6 +631,70 @@ async fn reply_err(
 /// boundary code.
 fn hg_data(e: &HiggsError) -> Option<serde_json::Value> {
     crate::node::worker_origin_code_data(e)
+}
+
+/// Character cap on the incoming-prompt preview line. Kept in sync with
+/// `serve::v1::INCOMING_PREVIEW_CHARS` so a Log Terminal reader sees the
+/// same wording for local `/v1` and iroh-relayed chats. Not deduplicated
+/// with `serve/v1.rs`'s private helper — that path takes typed OpenAI
+/// messages, this path only has the raw wire JSON string, so a shared
+/// helper would push a JSON round-trip onto the /v1 hot path just to keep
+/// two 30-line functions in one file.
+pub(crate) const INCOMING_PREVIEW_CHARS: usize = 800;
+
+/// Build the "higgs: incoming <model> — N chars: <preview>" line from the
+/// wire's `messages_json`: parse the array, extract each message's
+/// `content` (string or `[{type=text,text=…}, …]` blocks), space-join, then
+/// cap. A malformed body (non-JSON, non-array, wrong shape) degrades to an
+/// empty flattened string so a bad prompt still LOGS SOMETHING (`0 chars`)
+/// rather than swallowing the toggle entirely. Char-based cap (not byte)
+/// preserves UTF-8 boundaries.
+pub(crate) fn incoming_message_from_wire(model: &str, messages_json: &str) -> String {
+    let flat = serde_json::from_str::<serde_json::Value>(messages_json)
+        .ok()
+        .and_then(|v| v.as_array().cloned())
+        .map(|msgs| {
+            msgs.iter()
+                .filter_map(extract_message_text)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+    let chars = flat.chars().count();
+    let preview: String = if chars > INCOMING_PREVIEW_CHARS {
+        let head: String = flat.chars().take(INCOMING_PREVIEW_CHARS).collect();
+        format!("{head}…")
+    } else {
+        flat
+    };
+    format!("higgs: incoming {model} — {chars} chars: {preview}")
+}
+
+/// Pull the human-readable text out of one wire message. Supports both
+/// OpenAI shapes: `content` as a plain string, or as an array of typed
+/// content parts where `{type="text", text="…"}` parts contribute their
+/// `text`. Non-text parts (image_url, etc.) are skipped — this is a
+/// preview for logging, not a lossless reconstruction.
+fn extract_message_text(msg: &serde_json::Value) -> Option<String> {
+    let content = msg.get("content")?;
+    if let Some(s) = content.as_str() {
+        return Some(s.to_owned());
+    }
+    if let Some(parts) = content.as_array() {
+        let joined: String = parts
+            .iter()
+            .filter_map(|p| {
+                let is_text = p.get("type").and_then(|t| t.as_str()) == Some("text");
+                is_text
+                    .then(|| p.get("text").and_then(|t| t.as_str()))
+                    .flatten()
+                    .map(str::to_owned)
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        return Some(joined);
+    }
+    None
 }
 
 #[cfg(test)]

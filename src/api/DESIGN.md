@@ -193,11 +193,14 @@ discipline. Summary:
   any outcome. They are SEPARATE so remote traffic can't grow node tasks unbounded AND so
   it doesn't entangle the idle reaper's "acquire all LOCAL permits to unload" logic.
 - **Atomics** (`AtomicBool`/`AtomicU64`, always set/read in isolation, never across an
-  `.await`): the serve-layer toggles `log_incoming_tokens`, `jit_enabled`,
-  `auto_unload_idle`, `idle_ttl_minutes`, `serving_enabled`, plus `shutting_down`
-  (set once by `stop`; polled by the Turbotune cancel hook), `lan_override` (the
-  manual LAN-exposure override for an embedder serving through its own stack) and
-  `next_serve_id` (the monotonic id source for the serve registry).
+  `.await`): the serve-layer toggles `jit_enabled`, `auto_unload_idle`,
+  `idle_ttl_minutes`, `serving_enabled`, plus `shutting_down` (set once by `stop`;
+  polled by the Turbotune cancel hook), `lan_override` (the manual LAN-exposure
+  override for an embedder serving through its own stack) and `next_serve_id`
+  (the monotonic id source for the serve registry). `log_incoming_tokens` used
+  to live here too but now lives on `LogBus` (parallel to `show_fields`), so the
+  node-side control dispatcher can flip it via `LogBus::global()` on behalf of a
+  remotely-loaded worker (NL-VX).
   `lan_exposed` is NOT an atomic — it is computed: `lan_override` OR any live
   non-loopback listener in the `serves` registry below.
 - **`parking_lot::Mutex<…>`** — held only across synchronous work, NEVER across an
