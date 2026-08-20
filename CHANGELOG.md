@@ -19,6 +19,8 @@ from it.
 
 ## [Unreleased]
 
+## [0.1.0-beta.13] - 2026-08-19
+
 ### Fixed
 
 - **Node daemon lifecycle events stream live in the per-node log pane.**
