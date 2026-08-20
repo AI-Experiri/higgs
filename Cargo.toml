@@ -1,6 +1,6 @@
 [package]
 name = "higgs"
-version = "0.1.0-beta.13"
+version = "0.1.0-beta.14"
 edition = "2021"
 description = "In-app local model runtime: OpenAI-compatible serving over llama.cpp with crash-isolated worker"
 license = "MIT"

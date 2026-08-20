@@ -19,6 +19,8 @@ from it.
 
 ## [Unreleased]
 
+## [0.1.0-beta.14] - 2026-08-20
+
 ### Added
 
 - **Per-node runtime toggles for `log_incoming_tokens` and `log_show_fields`
