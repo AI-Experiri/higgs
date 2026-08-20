@@ -374,3 +374,81 @@ fn a_case_variant_ledger_row_is_suppressed_by_the_live_registry_entry() {
         }
     }
 }
+
+// NL-VX: helpers for the relay-path incoming-prompt line. The relay hot path
+// itself is exercised in `tests/node_log_control.rs`; these are the pure
+// string-flattening tests that don't need iroh + a spawned node.
+
+#[test]
+fn incoming_message_from_wire_flattens_string_content() {
+    let wire = serde_json::to_string(&serde_json::json!([
+        { "role": "system",  "content": "sys" },
+        { "role": "user",    "content": "hello world" },
+    ]))
+    .unwrap();
+    let line = incoming_message_from_wire("org/mdl", &wire);
+    // "sys hello world" = 15 chars; format must match the /v1 wording exactly
+    // so a Log Terminal reader can't distinguish local vs relay routes.
+    assert_eq!(line, "higgs: incoming org/mdl — 15 chars: sys hello world");
+}
+
+#[test]
+fn incoming_message_from_wire_flattens_typed_content_parts() {
+    // OpenAI vision/multi-part shape: `content` is an array of typed parts.
+    // Text parts contribute their `text`; other kinds (image_url) are skipped
+    // — the preview is a peek, not a lossless reconstruction.
+    let wire = serde_json::to_string(&serde_json::json!([
+        {
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "describe this" },
+                { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAA" } },
+                { "type": "text", "text": "please" }
+            ]
+        }
+    ]))
+    .unwrap();
+    let line = incoming_message_from_wire("org/mdl", &wire);
+    assert_eq!(
+        line,
+        "higgs: incoming org/mdl — 20 chars: describe this please"
+    );
+}
+
+#[test]
+fn incoming_message_from_wire_caps_long_prompts_at_char_boundary() {
+    // A 1000-char prompt must be capped to INCOMING_PREVIEW_CHARS + "…"
+    // (char count = 800 + 1); `chars` MUST report the pre-cap length so an
+    // operator can see how much prompt was truncated.
+    let big = "a".repeat(1000);
+    let wire = serde_json::to_string(&serde_json::json!([
+        { "role": "user", "content": big }
+    ]))
+    .unwrap();
+    let line = incoming_message_from_wire("org/mdl", &wire);
+    assert!(
+        line.starts_with("higgs: incoming org/mdl — 1000 chars: "),
+        "chars reports pre-cap length: {line}"
+    );
+    assert!(
+        line.ends_with('…'),
+        "long preview ends with the ellipsis: {line}"
+    );
+    // 800 'a' + one '…' char = 801 chars in the preview portion.
+    let preview = line
+        .split_once("chars: ")
+        .expect("`chars: ` separator present")
+        .1;
+    assert_eq!(preview.chars().count(), INCOMING_PREVIEW_CHARS + 1);
+}
+
+#[test]
+fn incoming_message_from_wire_degrades_on_malformed_body() {
+    // A bad JSON body still LOGS SOMETHING (0 chars) so a user who flipped
+    // the toggle isn't left wondering whether their toggle worked at all.
+    let line = incoming_message_from_wire("org/mdl", "not json at all");
+    assert_eq!(line, "higgs: incoming org/mdl — 0 chars: ");
+
+    let line = incoming_message_from_wire("org/mdl", r#"{"not":"an array"}"#);
+    assert_eq!(line, "higgs: incoming org/mdl — 0 chars: ");
+}

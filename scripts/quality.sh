@@ -75,6 +75,20 @@ run_check "clippy" cargo clippy --all-targets -- -D warnings
 step "cargo test"
 run_check "tests" cargo test
 
+# ── Duplicate diagnostic codes ───────────────────────────
+
+# HG codes are higgs's operator-facing error identifiers; every failure mode
+# gets its own (CLAUDE.md task #36 DIAG). Two variants sharing a code silently
+# confuse downstream tooling (jigglebot classifies by code) — this pass fails
+# fast on any collision.
+step 'duplicate diagnostic codes'
+if python3 "$PROJECT_DIR/scripts/check_diag_codes.py"; then
+    log "✓ diag codes (no duplicates in src/)"
+else
+    err "✗ duplicate diagnostic code"
+    FAILED=1
+fi
+
 # ── Const-enum bindings (TsConstEnum) ────────────────────
 
 # Unit-variant enums emit a const-OBJECT (`higgs_const_enum!` → TsConstEnum) instead

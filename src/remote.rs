@@ -766,25 +766,41 @@ pub fn negotiate_version(
 
 higgs_ts! {
 /// [`M_NODE_LOG_LEVEL`] request params (hub → node): flip the node daemon's
-/// `LogBus.verbose` gate LIVE. `None` = keep the current value; a bool
-/// value overrides it (`true` admits DEBUG/TRACE into the `LogSource::Serve`
-/// stream, `false` restores the INFO+ gate). This is the only knob — the
-/// section badge that appears at the start of each log line is set at write
-/// time by the tracing target, not by the wire.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// `LogBus` runtime toggles LIVE. Every field is optional — `None` = keep the
+/// current value; `Some(v)` overrides. All three flags travel over the same
+/// op so the hub applies them atomically per request; the section badge that
+/// appears at the start of each log line is set at write time by the tracing
+/// target, not by the wire.
+///
+/// - `verbose` (NL-V) admits DEBUG/TRACE into the `LogSource::Serve` stream
+///   when `true`, restores the INFO+ gate when `false`.
+/// - `log_incoming_tokens` (NL-VX) governs the serve layer's opt-in prompt-
+///   content line (redact-by-default when off).
+/// - `log_show_fields` (NL-VX) governs the un-redacted DEBUG mode that emits
+///   every non-message structured field (including prompt content).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NodeLogControlParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub verbose: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub log_incoming_tokens: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub log_show_fields: Option<bool>,
 }
 }
 
 higgs_ts! {
-/// [`M_NODE_LOG_LEVEL`] reply: the EFFECTIVE post-apply verbosity on the
-/// node. Echoed so a caller stays in sync with the daemon's actual state.
+/// [`M_NODE_LOG_LEVEL`] reply: the EFFECTIVE post-apply state of every
+/// runtime log toggle on the node. Echoed so a caller stays in sync with the
+/// daemon's actual state (including the fields it did NOT touch this call).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NodeLogControlReply {
     pub verbose: bool,
+    pub log_incoming_tokens: bool,
+    pub log_show_fields: bool,
 }
 }
 
