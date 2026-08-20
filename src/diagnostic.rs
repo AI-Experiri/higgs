@@ -28,7 +28,11 @@ use snafu::Snafu;
 #[non_exhaustive]
 pub enum HiggsError {
     /// A configured model directory could not be read during scan.
-    #[snafu(display("[HG001] model dir unreadable: {path}: {source}"))]
+    #[snafu(display(
+        "[HG001] model dir unreadable: {path}: {source} — verify the path exists \
+         and higgs has read permission; if it is a scan root you no longer use, \
+         remove it from config.json's `model_dirs` and restart"
+    ))]
     #[diagnostic(code(HG001))]
     ModelDirUnreadable {
         path: String,
@@ -36,7 +40,10 @@ pub enum HiggsError {
     },
 
     /// Requested model id is not present in any scanned source.
-    #[snafu(display("[HG002] model not found on disk: {id}"))]
+    #[snafu(display(
+        "[HG002] model not found on disk: {id} — check the id spelling against \
+         `/v1/models`, or download it (`higgs models search`) to a scanned dir"
+    ))]
     #[diagnostic(code(HG002))]
     ModelNotFound { id: String },
 
@@ -65,7 +72,11 @@ pub enum HiggsError {
     ModelNotLoaded { id: String },
 
     /// llama.cpp failed to load the model file.
-    #[snafu(display("[HG004] engine failed to load {id}: {reason}"))]
+    #[snafu(display(
+        "[HG004] engine failed to load {id}: {reason} — verify the GGUF is intact \
+         (re-download if truncated/corrupt); if it loaded before, reload with a \
+         smaller ctx_len / fewer gpu_layers to relieve VRAM/RAM pressure"
+    ))]
     #[diagnostic(code(HG004), severity(Error))]
     EngineLoadFailed { id: String, reason: String },
 
@@ -84,12 +95,20 @@ pub enum HiggsError {
     },
 
     /// The worker process could not be spawned.
-    #[snafu(display("[HG006] worker spawn failed: {source}"))]
+    #[snafu(display(
+        "[HG006] worker spawn failed: {source} — verify the higgs binary is \
+         executable and its path is discoverable; check disk space + file limits, \
+         then retry the request (the supervisor auto-restarts on the next call)"
+    ))]
     #[diagnostic(code(HG006), severity(Error))]
     WorkerSpawnFailed { source: std::io::Error },
 
     /// The worker died or its stdio closed mid-request.
-    #[snafu(display("[HG007] worker unavailable: {context}"))]
+    #[snafu(display(
+        "[HG007] worker unavailable: {context} — retry the request; the supervisor \
+         auto-restarts a dead worker on the next call, so a transient crash \
+         self-heals (if it persists check the worker logs for the underlying fault)"
+    ))]
     #[diagnostic(code(HG007))]
     WorkerDead { context: String },
 
@@ -106,7 +125,11 @@ pub enum HiggsError {
     /// The worker returned a JSON-RPC error for a request. `worker_code` carries
     /// the worker's own origin diagnostic code (e.g. `"HG005"`) when present, so
     /// the HTTP boundary can map to the true status; `None` falls back to 500.
-    #[snafu(display("[HG009] worker error on {method}: {message}"))]
+    #[snafu(display(
+        "[HG009] worker error on {method}: {message} — consult the worker's own \
+         diagnostic code carried in `worker_code` (map to its HG entry) for the \
+         specific remediation; retry if it looks transient"
+    ))]
     #[diagnostic(code(HG009))]
     WorkerRpc {
         method: String,
@@ -115,7 +138,11 @@ pub enum HiggsError {
     },
 
     /// An Ollama manifest existed but could not be resolved to a GGUF blob.
-    #[snafu(display("[HG010] ollama manifest invalid: {path}: {detail}"))]
+    #[snafu(display(
+        "[HG010] ollama manifest invalid: {path}: {detail} — re-pull the model with \
+         `ollama pull <id>` to regenerate its manifest, or point higgs directly at \
+         the GGUF file via `model_dirs`"
+    ))]
     #[diagnostic(code(HG010))]
     OllamaManifestInvalid { path: String, detail: String },
 
@@ -134,7 +161,10 @@ pub enum HiggsError {
     /// the serve layer (HTTP 403) as a DNS-rebinding defense — a no-auth
     /// loopback server must not honor requests addressed to an arbitrary
     /// hostname a malicious page may have rebound to `127.0.0.1`.
-    #[snafu(display("[HG012] forbidden host: {host}"))]
+    #[snafu(display(
+        "[HG012] forbidden host: {host} — reach higgs at `127.0.0.1` / `localhost` \
+         or a hostname you added to the Host allowlist (Server Settings → CORS/Host)"
+    ))]
     #[diagnostic(code(HG012))]
     ForbiddenHost { host: String },
 
@@ -143,7 +173,10 @@ pub enum HiggsError {
     /// worker, so a malformed request never reaches generation. `param` names
     /// the offending field; `detail` states the accepted range. Ranges mirror
     /// vllm `SamplingParams._verify_args`.
-    #[snafu(display("[HG013] invalid sampling parameter {param}: {detail}"))]
+    #[snafu(display(
+        "[HG013] invalid sampling parameter {param}: {detail} — correct the value \
+         to fit the accepted range and resend the request"
+    ))]
     #[diagnostic(code(HG013))]
     InvalidSamplingParam { param: String, detail: String },
 
@@ -152,7 +185,9 @@ pub enum HiggsError {
     /// loopback server can't be flooded. A capacity signal (vllm/ollama queue
     /// limit), not a permanent failure — the client may retry.
     #[snafu(display(
-        "[HG014] server busy: {in_flight} concurrent inference requests in flight (max {max})"
+        "[HG014] server busy: {in_flight} concurrent inference requests in flight \
+         (max {max}) — back off and retry; if this recurs, raise the concurrency \
+         limit or add another node so the fleet can absorb the load"
     ))]
     #[diagnostic(code(HG014))]
     ServerBusy { in_flight: usize, max: usize },
@@ -161,7 +196,11 @@ pub enum HiggsError {
     /// scanned source directory. Rejected on the load path (HTTP 400) as a
     /// path-traversal guard — a `..`/absolute id must never escape the
     /// read-only scan roots. `id` is the rejected value; `reason` states why.
-    #[snafu(display("[HG015] invalid model id {id}: {reason}"))]
+    #[snafu(display(
+        "[HG015] invalid model id {id}: {reason} — send an id from `/v1/models` \
+         (or the `org/model` form under a scanned root); no `..`, absolute paths, \
+         or non-ASCII"
+    ))]
     #[diagnostic(code(HG015))]
     InvalidModelId { id: String, reason: String },
 
@@ -171,7 +210,11 @@ pub enum HiggsError {
     /// duration (the HTTP layer deliberately does not time the SSE stream).
     ///
     /// [`CHAT_RPC_TIMEOUT`]: crate::supervisor::CHAT_RPC_TIMEOUT
-    #[snafu(display("[HG016] chat RPC timed out after {elapsed:?}"))]
+    #[snafu(display(
+        "[HG016] chat RPC timed out after {elapsed:?} — retry; if it recurs, \
+         shorten the prompt, lower max_tokens, or check for a wedged worker \
+         (the supervisor's next call auto-restarts a dead one)"
+    ))]
     #[diagnostic(code(HG016))]
     ChatTimeout { elapsed: std::time::Duration },
 
@@ -186,7 +229,10 @@ pub enum HiggsError {
     ///
     /// [`MEMORY_HEADROOM_FRACTION`]: crate::api::MEMORY_HEADROOM_FRACTION
     #[snafu(display(
-        "[HG017] insufficient memory to load {id}: need ~{needed_bytes} bytes, only {available_bytes} available (headroom {headroom_fraction})"
+        "[HG017] insufficient memory to load {id}: need ~{needed_bytes} bytes, only \
+         {available_bytes} available (headroom {headroom_fraction}) — unload another \
+         model, free system memory, or pick a smaller / more-quantized model that \
+         fits the safe headroom"
     ))]
     #[diagnostic(code(HG017))]
     InsufficientMemory {
@@ -224,7 +270,10 @@ pub enum HiggsError {
     /// and its `HG020` code are KEPT (not deleted/renumbered) to honor the
     /// append-only code policy: downstream consumers that matched on `HG020` keep
     /// a stable, documented meaning rather than seeing the code silently reused.
-    #[snafu(display("[HG020] probe worker failed: {context}"))]
+    #[snafu(display(
+        "[HG020] probe worker failed: {context} — retired code, never emitted by \
+         current builds (loadability is learned only at actual load); no action needed"
+    ))]
     #[diagnostic(code(HG020))]
     ProbeWorkerFailed { context: String },
 
@@ -233,13 +282,21 @@ pub enum HiggsError {
     /// A device-enumeration infrastructure failure — surfaced as an empty device
     /// list so the `system` control-op still returns hardware/runtime rather than
     /// failing; `context` names the stage that failed.
-    #[snafu(display("[HG021] sysinfo worker failed: {context}"))]
+    #[snafu(display(
+        "[HG021] sysinfo worker failed: {context} — retry; the device list is \
+         populated on the next successful sysinfo probe. If it persists, check the \
+         worker binary is present and executable"
+    ))]
     #[diagnostic(code(HG021))]
     SysinfoWorkerFailed { context: String },
 
     /// A presented pairing token was expired, already used, or unknown. Non-fatal:
     /// the dialing node is turned away but the hub keeps listening (§7.1).
-    #[snafu(display("[HG022] pairing token invalid (expired, used, or unknown): {detail}"))]
+    #[snafu(display(
+        "[HG022] pairing token invalid (expired, used, or unknown): {detail} — mint \
+         a fresh token on the hub (`higgs pair`) and retry from the node (`higgs \
+         --node <ticket> <token>`); tokens are single-use and time-limited"
+    ))]
     #[diagnostic(code(HG022))]
     PairingTokenInvalid { detail: String },
 
@@ -247,7 +304,9 @@ pub enum HiggsError {
     /// returns this then closes the stream, telling the node's UI "you must update"
     /// rather than "network broke" (§4.1).
     #[snafu(display(
-        "[HG023] no agreed protocol version: peer speaks {peer:?}, we accept {ours:?}"
+        "[HG023] no agreed protocol version: peer speaks {peer:?}, we accept \
+         {ours:?} — upgrade both higgs peers to versions whose protocol vectors \
+         overlap (typically the newest release on both sides)"
     ))]
     #[diagnostic(code(HG023), severity(Error))]
     VersionMismatch { peer: Vec<u32>, ours: Vec<u32> },
@@ -255,7 +314,9 @@ pub enum HiggsError {
     /// The peer is not in the allowlist and presented no valid pairing token. The
     /// one path that admits a new id is a valid token; otherwise this. Non-fatal (§7.1).
     #[snafu(display(
-        "[HG024] peer {endpoint_id} is not in the allowlist and presented no valid pairing token"
+        "[HG024] peer {endpoint_id} is not in the allowlist and presented no valid \
+         pairing token — pair the node with a fresh token from the hub (`higgs pair` \
+         → `higgs --node <ticket> <token>`) to add it to the allowlist"
     ))]
     #[diagnostic(code(HG024))]
     NotAllowlisted { endpoint_id: String },
@@ -263,7 +324,9 @@ pub enum HiggsError {
     /// QUIC/TLS completed but the peer sent no HELLO within the deadline — a
     /// pre-auth-DoS guard that bounds half-open admitted connections (§3.2.1). Non-fatal.
     #[snafu(display(
-        "[HG028] peer {endpoint_id} completed QUIC but sent no HELLO within {window}s; dropped"
+        "[HG028] peer {endpoint_id} completed QUIC but sent no HELLO within \
+         {window}s; dropped — retry the connect; a persistent stall means the \
+         peer's higgs is wedged or version-mismatched, restart it and check its logs"
     ))]
     #[diagnostic(code(HG028))]
     HandshakeStalled { endpoint_id: String, window: u64 },
@@ -294,7 +357,11 @@ pub enum HiggsError {
     /// file: the download writes a temp and renames only on success. This is the GENERIC
     /// download umbrella; the HuggingFace-hub client path (`src/hub.rs`) classifies failures
     /// into the specific `HG029`–`HG035` codes below — `HG025` remains the fallback umbrella.
-    #[snafu(display("[HG025] model download failed for {repo}/{file}: {detail}"))]
+    #[snafu(display(
+        "[HG025] model download failed for {repo}/{file}: {detail} — retry; if it \
+         persists check network + free disk space in `~/.higgs/models/`, or place \
+         the file there manually"
+    ))]
     #[diagnostic(code(HG025))]
     DownloadFailed {
         repo: String,
@@ -310,13 +377,21 @@ pub enum HiggsError {
     /// Auth/permission was refused for a repo — it is gated or private and no
     /// valid `HF_TOKEN` was presented (HTTP 401/403). Actionable: set `HF_TOKEN`
     /// (or `~/.cache/huggingface/token`) and accept the model's license.
-    #[snafu(display("[HG029] HuggingFace auth failed for {repo}: {detail}"))]
+    #[snafu(display(
+        "[HG029] HuggingFace auth failed for {repo}: {detail} — set `HF_TOKEN` \
+         (or write it to `~/.cache/huggingface/token`) with a token that has \
+         access, and accept the model's license on huggingface.co"
+    ))]
     #[diagnostic(code(HG029))]
     HubAuthFailed { repo: String, detail: String },
 
     /// A repo, revision, or file does not exist on the hub (HTTP 404). `resource`
     /// names what was missing (the repo id, a revision, or a file path).
-    #[snafu(display("[HG030] HuggingFace resource not found ({resource}) in {repo}: {detail}"))]
+    #[snafu(display(
+        "[HG030] HuggingFace resource not found ({resource}) in {repo}: {detail} — \
+         check the repo/file/revision spelling on huggingface.co; if it is gated, \
+         accept the license on your account then retry"
+    ))]
     #[diagnostic(code(HG030))]
     HubResourceNotFound {
         repo: String,
@@ -326,13 +401,21 @@ pub enum HiggsError {
 
     /// The hub rate-limited the request (HTTP 429). Transient and retryable —
     /// back off and retry; not a permanent failure.
-    #[snafu(display("[HG031] HuggingFace rate-limited for {repo}: {detail}"))]
+    #[snafu(display(
+        "[HG031] HuggingFace rate-limited for {repo}: {detail} — back off and \
+         retry; this is transient (an authenticated `HF_TOKEN` also raises the \
+         per-minute quota)"
+    ))]
     #[diagnostic(code(HG031))]
     HubRateLimited { repo: String, detail: String },
 
     /// The hub returned an unexpected HTTP status (e.g. 5xx) that is neither
     /// auth, not-found, nor rate-limit. `status` is the numeric code.
-    #[snafu(display("[HG032] HuggingFace HTTP {status} for {repo}: {detail}"))]
+    #[snafu(display(
+        "[HG032] HuggingFace HTTP {status} for {repo}: {detail} — retry (5xx is \
+         usually transient); if it persists check status.huggingface.co and file \
+         a higgs bug with the {status} + detail if it looks like a client bug"
+    ))]
     #[diagnostic(code(HG032))]
     HubHttpStatus {
         repo: String,
@@ -342,7 +425,10 @@ pub enum HiggsError {
 
     /// A network/transport error reaching huggingface.co — DNS, connection
     /// refused, TLS, or a timeout. Transient and retryable.
-    #[snafu(display("[HG033] HuggingFace transport error for {repo}: {detail}"))]
+    #[snafu(display(
+        "[HG033] HuggingFace transport error for {repo}: {detail} — retry; check \
+         network connectivity, DNS, and any proxy settings if it persists"
+    ))]
     #[diagnostic(code(HG033))]
     HubTransport { repo: String, detail: String },
 
@@ -360,7 +446,11 @@ pub enum HiggsError {
     /// Any other hub-client failure not covered above — a JSON/diff parse error,
     /// a malformed URL/parameter, a cache-config error, or an internal client
     /// error. Carries the underlying detail verbatim.
-    #[snafu(display("[HG035] HuggingFace client error for {repo}: {detail}"))]
+    #[snafu(display(
+        "[HG035] HuggingFace client error for {repo}: {detail} — retry; if it \
+         persists, file a higgs bug with the detail (this is the catch-all bucket \
+         for parse / URL / cache-config errors from the hub client)"
+    ))]
     #[diagnostic(code(HG035))]
     HubClient { repo: String, detail: String },
 
@@ -369,7 +459,10 @@ pub enum HiggsError {
     /// `primary` carries the hub failure's own `[HGxxx]` code+message;
     /// `fallback` carries the fallback's detail, so neither path's diagnosis is lost.
     #[snafu(display(
-        "[HG036] HuggingFace fetch exhausted for {repo}/{file} — primary: {primary}; fallback: {fallback}"
+        "[HG036] HuggingFace fetch exhausted for {repo}/{file} — primary: \
+         {primary}; fallback: {fallback} — resolve the underlying class \
+         (consult HG029-HG035 above) then retry; if the file is available \
+         out-of-band, place it in `~/.higgs/models/{repo}/{file}` directly"
     ))]
     #[diagnostic(code(HG036))]
     HubFetchExhausted {
@@ -798,7 +891,8 @@ pub enum HiggsError {
     /// limit of async cancel semantics (see [`cancellable_pull`]'s two-regime
     /// contract); the truth on disk is not affected.
     #[snafu(display(
-        "[HG091] cancel requested but download for {repo}/{file} completed first — the file is on disk"
+        "[HG091] cancel requested but download for {repo}/{file} completed first — \
+         the file is on disk; no action needed (delete it if you don't want it)"
     ))]
     #[diagnostic(code(HG091), severity(Warning))]
     CancelLostToCompletion { repo: String, file: String },
@@ -826,7 +920,11 @@ pub enum HiggsError {
     /// model entry (`HiggsModel::enrich_error`) so the UI can explain the blank
     /// header fields instead of showing the model as genuinely sparse. Non-fatal —
     /// a corrupt or mid-download GGUF never aborts the scan.
-    #[snafu(display("[HG070] GGUF enrichment failed for {path}: {reason}"))]
+    #[snafu(display(
+        "[HG070] GGUF enrichment failed for {path}: {reason} — verify the file is \
+         intact (re-download if truncated); if the file is complete but still fails \
+         to parse, file a higgs bug with this line and the file size"
+    ))]
     #[diagnostic(code(HG070))]
     GgufEnrichFailed { path: String, reason: String },
 

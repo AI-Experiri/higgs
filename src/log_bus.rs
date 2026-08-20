@@ -204,6 +204,12 @@ pub struct LogBus {
     /// dump (keeping warnings/errors); when `true` it streams every worker line.
     /// Lives here so the drain (which holds only the bus) can read it.
     verbose: std::sync::atomic::AtomicBool,
+    /// "Log Incoming Tokens" toggle, OFF by default. Read by the serve layer
+    /// (`serve/v1.rs`) to decide whether to emit the redact-by-default
+    /// incoming-prompt line. Lives on the bus (not on `Higgs`) so a node-side
+    /// dispatcher — which only holds a `LogBus` — can flip it via
+    /// [`LogBus::global`] on behalf of a remote worker, mirroring `show_fields`.
+    log_incoming_tokens: std::sync::atomic::AtomicBool,
 }
 
 /// The PROCESS-GLOBAL bus — the one bound to the global tracing subscriber in
@@ -247,6 +253,7 @@ impl LogBus {
             // caller to bump their subscriber filter — this flag governs the
             // Serve ring's promotion of DEBUG events into the follow stream.
             verbose: std::sync::atomic::AtomicBool::new(true),
+            log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -271,6 +278,19 @@ impl LogBus {
     /// Toggle "Verbose Logging" at runtime.
     pub fn set_verbose(&self, v: bool) {
         self.verbose.store(v, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether "Log Incoming Tokens" is on — the serve layer's prompt-content
+    /// log line. Off by default (redact policy).
+    pub fn log_incoming_tokens(&self) -> bool {
+        self.log_incoming_tokens
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Toggle "Log Incoming Tokens" at runtime.
+    pub fn set_log_incoming_tokens(&self, v: bool) {
+        self.log_incoming_tokens
+            .store(v, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Append `text` to its `source` history ring (evicting that ring's oldest

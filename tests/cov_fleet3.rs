@@ -1592,6 +1592,7 @@ async fn fleet_set_node_log_level_wraps_pre_nlv_method_not_found() {
             &peer,
             higgs::remote::NodeLogControlParams {
                 verbose: Some(true),
+                ..Default::default()
             },
         )
         .await

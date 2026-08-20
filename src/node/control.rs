@@ -96,21 +96,32 @@ pub async fn dispatch_node_control(rt: &NodeRuntime, req: RpcRequest) -> RpcResp
                 ),
             }
         }
-        // NL-V runtime verbose gate. Applies to the process-global `LogBus`
-        // installed at startup — the same bus `M_NODE_LOGS` follows, so
-        // effects are immediate. Absence of the global bus (a test-only
-        // embed) is an INTERNAL_ERROR rather than a silent success:
-        // reporting an EFFECTIVE state we never applied would lie to the UI.
+        // NL-V/NL-VX runtime log-toggle op. Applies to the process-global
+        // `LogBus` installed at startup — the same bus `M_NODE_LOGS` follows,
+        // so effects are immediate. Every field is optional; only the ones
+        // present mutate. The reply echoes the EFFECTIVE post-apply state of
+        // ALL fields so the caller stays in sync (including flags this call
+        // did not touch). Absence of the global bus (a test-only embed) is
+        // an INTERNAL_ERROR rather than a silent success: reporting an
+        // EFFECTIVE state we never applied would lie to the UI.
         M_NODE_LOG_LEVEL => match parse::<NodeLogControlParams>(&req) {
             Ok(params) => match crate::log_bus::LogBus::global() {
                 Some(bus) => {
                     if let Some(v) = params.verbose {
                         bus.set_verbose(v);
                     }
+                    if let Some(v) = params.log_incoming_tokens {
+                        bus.set_log_incoming_tokens(v);
+                    }
+                    if let Some(v) = params.log_show_fields {
+                        bus.set_show_fields(v);
+                    }
                     ok(
                         id,
                         NodeLogControlReply {
                             verbose: bus.verbose(),
+                            log_incoming_tokens: bus.log_incoming_tokens(),
+                            log_show_fields: bus.show_fields(),
                         },
                     )
                 }

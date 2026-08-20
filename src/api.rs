@@ -113,14 +113,6 @@ pub struct Higgs {
     /// a local model resident — see `chat_stream`). `None` until a fleet is installed is not
     /// needed: the gate exists always; it's only used on the remote branch.
     remote_gate: Arc<tokio::sync::Semaphore>,
-    /// Runtime "Log Incoming Tokens" toggle for the serve layer. When `true`, the
-    /// chat path emits an extra INFO `higgs:`-target line per request carrying the
-    /// (capped) flattened incoming prompt CONTENT so the Developer Logs show the
-    /// actual prompt. This is the explicit OPT-IN that overrides the redact-by-
-    /// default policy (no prompt content at info); default `false`, so the
-    /// redaction policy is unchanged unless the user turns this on. A plain atomic
-    /// — set/read in isolation, no critical section, never across `.await`.
-    log_incoming_tokens: std::sync::atomic::AtomicBool,
     /// Runtime "Just-in-Time loading" toggle for the serve layer. When `true`
     /// (the default), a chat request for a scanned-but-unloaded model triggers an
     /// on-demand additive [`load`](Self::load) (a fresh worker alongside any
@@ -782,7 +774,6 @@ impl Higgs {
             lifecycle: tokio::sync::Mutex::new(()),
             inference_gate: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_INFERENCE)),
             remote_gate: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_INFERENCE)),
-            log_incoming_tokens: std::sync::atomic::AtomicBool::new(false),
             jit_enabled: std::sync::atomic::AtomicBool::new(true),
             // Mirror the node's idle defaults (auto-unload on, 60-min TTL) so the
             // Server-Settings getters read the same values the node reaper enforces.
@@ -1562,16 +1553,17 @@ impl Higgs {
     }
 
     /// Whether serve-layer "Log Incoming Tokens" is on (the incoming-prompt line).
+    /// Lives on the [`LogBus`] so a node-side control dispatcher — which only
+    /// holds the process-global bus — can flip it on behalf of a remote worker,
+    /// mirroring how [`log_show_fields`](Self::log_show_fields) is plumbed.
     pub fn log_incoming_tokens(&self) -> bool {
-        self.log_incoming_tokens
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.local.bus().log_incoming_tokens()
     }
 
     /// Turn serve-layer "Log Incoming Tokens" on or off at runtime. Enabling it
     /// opts into logging prompt CONTENT, overriding the redact-by-default policy.
     pub fn set_log_incoming_tokens(&self, v: bool) {
-        self.log_incoming_tokens
-            .store(v, std::sync::atomic::Ordering::Relaxed);
+        self.local.bus().set_log_incoming_tokens(v);
     }
 
     /// Whether the Developer Logs are in un-redacted DEBUG mode — the log layer

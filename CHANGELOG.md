@@ -19,6 +19,39 @@ from it.
 
 ## [Unreleased]
 
+### Added
+
+- **Per-node runtime toggles for `log_incoming_tokens` and `log_show_fields`
+  (NL-VX).** `NodeLogControlParams` / `NodeLogControlReply` gained the two
+  remaining Log Terminal controls, so flipping "Log Incoming Tokens" or
+  "Show log fields" for a remotely-loaded worker now behaves identically to
+  the local `/v1` path. Under the hood, `log_incoming_tokens` moved from a
+  struct-local atomic on `Higgs` to `LogBus` (mirroring `show_fields`) so
+  the node-side dispatcher can flip it via `LogBus::global()`. Facade
+  callers see no change — `Higgs::log_incoming_tokens()` /
+  `set_log_incoming_tokens()` still work exactly the same, they just
+  delegate to the bus now.
+- **`scripts/check_diag_codes.py`** — a fast quality-gate step that scans
+  every `#[diagnostic(code(X))]` under `src/` and fails on duplicate HG
+  codes, so a copy-pasted code can never silently claim a second meaning.
+
+### Fixed
+
+- **`log_incoming_tokens` was a silent no-op on iroh-relayed chats.** The
+  only reader was `serve/v1.rs`, which never sees hub → iroh chats — so a
+  user who flipped the toggle for a remotely-loaded worker got the reply
+  saying it applied, but no line ever landed in the Log Terminal.
+  `node/data.rs::relay_chat` now emits the same `higgs: incoming <model> —
+  N chars: <preview>` line the /v1 handler does, gated on the same bus flag.
+
+### Improved
+
+- **Remediation text on 27 HG codes** that previously said only what
+  happened, without saying what to do about it. HG001, HG002, HG004,
+  HG006-HG010, HG012-HG017, HG020-HG025, HG028-HG036, HG070, HG091 now
+  read like the ones that always had inline guidance (HG005, HG011,
+  HG038, …) — the error itself tells the operator the next step.
+
 ## [0.1.0-beta.13] - 2026-08-19
 
 ### Fixed
