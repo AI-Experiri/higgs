@@ -92,6 +92,80 @@ fn legacy_inventory_worker_decodes_without_stats() {
     .expect("stats row decodes");
     assert_eq!(full.ctx_len, Some(256));
     assert_eq!(full.in_flight, Some(1));
+    // The pre-model_info row also decodes cleanly — `model_info` is
+    // `serde(default)` so a pre-r-N node payload without the key stays
+    // wire-compatible with a current hub (the whole point of Option<T>).
+    assert!(full.model_info.is_none(), "no key present → None");
+}
+
+/// NL-VX successor: the full-parity `model_info` on an inventory row
+/// round-trips (every static `HiggsModel` fact a LOCAL client sees flows
+/// through), and the wire skip-attrs on `HiggsModel` (`path` is on the
+/// wire, `chat_template` is `serde(skip)`) behave as documented.
+#[test]
+fn inventory_worker_carries_full_model_info_round_trip() {
+    use crate::worker::models::{HiggsModel, HiggsModelSource, ModelDomain};
+    let full = HiggsModel {
+        id: "org/model".into(),
+        path: "/tmp/models/org/model/f.gguf".into(),
+        size_bytes: 1024,
+        quant: Some("Q4_K_M".into()),
+        source: HiggsModelSource::LmStudio,
+        arch: Some("llama".into()),
+        ctx_train: Some(4096),
+        block_count: Some(32),
+        head_count: Some(32),
+        head_count_kv: Some(8),
+        embedding_length: Some(4096),
+        expert_count: None,
+        has_chat_template: true,
+        domain: ModelDomain::Llm,
+        supports_tools: true,
+        supports_reasoning: false,
+        gguf_components: vec![],
+        enrich_error: None,
+        chat_template: Some("SECRET-HOST-ONLY".into()),
+    };
+    let row = InventoryWorker {
+        worker_id: 9,
+        model: "org/model".into(),
+        served_id: String::new(),
+        ctx_len: Some(2048),
+        gpu_layers: None,
+        domain: ModelDomain::Llm,
+        threads: None,
+        loaded_at_ms: Some(1),
+        idle_ms: Some(0),
+        in_flight: Some(0),
+        model_info: Some(full.clone()),
+    };
+    let wire = serde_json::to_string(&row).expect("serialize");
+    // `chat_template` is `serde(skip)` on HiggsModel → must not appear on the wire.
+    assert!(
+        !wire.contains("SECRET-HOST-ONLY"),
+        "chat_template stays host-only: {wire}"
+    );
+    let back: InventoryWorker = serde_json::from_str(&wire).expect("decode");
+    let info = back.model_info.expect("model_info round-trips");
+    assert_eq!(info.id, full.id);
+    assert_eq!(info.quant, full.quant);
+    assert_eq!(info.arch, full.arch);
+    assert_eq!(info.ctx_train, full.ctx_train);
+    assert_eq!(info.block_count, full.block_count);
+    assert_eq!(info.head_count_kv, full.head_count_kv);
+    assert_eq!(info.embedding_length, full.embedding_length);
+    assert!(info.has_chat_template);
+    assert!(info.supports_tools);
+    assert!(!info.supports_reasoning);
+    // path DOES ride the wire (HiggsModel has no `serde(skip)` on it) —
+    // documented in InventoryWorker's doc comment; the hub simply ignores
+    // it as a node-local string.
+    assert_eq!(info.path, full.path);
+    // chat_template drops through the wire hop (per `serde(skip)`).
+    assert!(
+        info.chat_template.is_none(),
+        "chat_template does NOT survive the wire"
+    );
 }
 
 #[test]
