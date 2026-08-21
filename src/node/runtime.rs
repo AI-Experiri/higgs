@@ -376,6 +376,17 @@ struct LoadFacts {
     domain: crate::worker::models::ModelDomain,
     /// The GGUF arch at load time, for the [HG079] diagnostic.
     arch: Option<String>,
+    /// The full scan-cache view of the model at LOAD TIME — snapshotted here
+    /// so the inventory `M_NODE_INVENTORY` reply can carry every static fact
+    /// a LOCAL client sees from `HiggsModel` (quant, ctx_train, block/head
+    /// counts, has_chat_template, supports_tools/reasoning, gguf_components,
+    /// enrich_error, source, embedding_length, expert_count, size_bytes)
+    /// without a snapshot-time scan-cache lookup racing a rescan.
+    ///
+    /// Kept alongside the curated `arch`/`domain` (which existing gates read)
+    /// rather than replacing them: the gates want typed access that survives
+    /// a `None` snapshot from a pre-r-N node payload.
+    model_info: Option<crate::worker::models::HiggsModel>,
 }
 
 /// Wall-clock ms since the Unix epoch (0 if the clock predates it).
@@ -436,6 +447,7 @@ impl NodeActor {
                             .get(&id)
                             .map(|t| t.elapsed().as_millis() as u64),
                         in_flight: Some(self.in_flight.get(&id).copied().unwrap_or(0)),
+                        model_info: facts.and_then(|f| f.model_info.clone()),
                     }
                 })
             })
@@ -922,6 +934,10 @@ struct ResolvedModel {
     ctx_train: Option<u64>,
     domain: crate::worker::models::ModelDomain,
     arch: Option<String>,
+    /// The full scan-cache view — snapshotted here so `do_load` can hand it to
+    /// `LoadFacts`, which the inventory reply carries as `InventoryWorker.model_info`.
+    /// Cloned once at resolve; the store is dropped when the scan task ends.
+    full: crate::worker::models::HiggsModel,
 }
 
 async fn resolve_model(config: &NodeConfig, id: &str) -> Result<ResolvedModel, HiggsError> {
@@ -932,12 +948,24 @@ async fn resolve_model(config: &NodeConfig, id: &str) -> Result<ResolvedModel, H
         store.scan(&lmstudio, &hf, &ollama)?;
         let resolved = store
             .get(&id)
-            .map(|m| ResolvedModel {
-                path: m.path.clone(),
-                size_bytes: m.size_bytes,
-                ctx_train: m.ctx_train,
-                domain: m.domain,
-                arch: m.arch.clone(),
+            .map(|m| {
+                let mut full = m.clone();
+                // `chat_template` is `serde(skip)` on `HiggsModel` — it never
+                // rides the wire, and after `resolve_model` returns nothing
+                // else on the daemon reads it. Null it out here so
+                // `LoadFacts.model_info` (which we hold for the worker's
+                // whole life) doesn't retain the multi-KB template string
+                // per resident worker — the reason it's `skip` on the wire
+                // is the same reason it's dead weight in memory here.
+                full.chat_template = None;
+                ResolvedModel {
+                    path: m.path.clone(),
+                    size_bytes: m.size_bytes,
+                    ctx_train: m.ctx_train,
+                    domain: m.domain,
+                    arch: m.arch.clone(),
+                    full,
+                }
             })
             .ok_or_else(|| HiggsError::ModelNotFound { id: id.clone() })?;
         let roots: Vec<PathBuf> = lmstudio.into_iter().chain(hf).chain(ollama).collect();
@@ -1127,6 +1155,7 @@ async fn do_load(
         loaded_at_ms: unix_ms(),
         domain: resolved.domain,
         arch: resolved.arch,
+        model_info: Some(resolved.full),
     };
     Ok((sup, loaded, facts))
 }
