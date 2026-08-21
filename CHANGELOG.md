@@ -19,6 +19,8 @@ from it.
 
 ## [Unreleased]
 
+## [0.1.0-beta.15] - 2026-08-21
+
 ### Added
 
 - **Full-parity `model_info` on `InventoryWorker`.** A hub subscriber of
