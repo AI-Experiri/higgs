@@ -19,6 +19,24 @@ from it.
 
 ## [Unreleased]
 
+### Added
+
+- **Full-parity `model_info` on `InventoryWorker`.** A hub subscriber of
+  `M_NODE_INVENTORY` now sees every rich `HiggsModel` fact for a remote
+  resident worker's file — the same set a LOCAL client sees: `quant`,
+  `arch`, `ctx_train`, `block_count`, `head_count`, `head_count_kv`,
+  `embedding_length`, `expert_count`, `has_chat_template`,
+  `supports_tools`, `supports_reasoning`, `gguf_components`,
+  `enrich_error`, `source`, `size_bytes`. Shape: one additional optional
+  field `model_info: Option<HiggsModel>` — additive, `serde(default)`, so
+  pre-r-N nodes stay wire-compatible and future `HiggsModel` field
+  additions flow through this hop without another wire change.
+  Snapshotted onto `LoadFacts` at load time (from `resolve_model`'s
+  scanned entry) so `snapshot_workers` never races a rescan; the
+  multi-KB `chat_template` is nulled before retention (matching the
+  `serve/control.rs` idiom) so a loaded worker's inventory row doesn't
+  keep the template alive.
+
 ## [0.1.0-beta.14] - 2026-08-20
 
 ### Added
