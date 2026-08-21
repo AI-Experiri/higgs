@@ -511,7 +511,13 @@ pub struct UpdateFailed {
 higgs_ts! {
 /// One resident worker in a node's [`NodeInventory`]: its node-local id and the model it
 /// currently serves, plus the hub-assigned `/v1` served id.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// `PartialEq`/`Eq` intentionally dropped when the `model_info` field was added: `HiggsModel`
+/// carries a `Vec<GgufComponent>` and other nested types not required to be structurally
+/// comparable, and no callsite actually compared whole `InventoryWorker` values (field-level
+/// asserts throughout). Removing the derives keeps `Option<HiggsModel>` embeddable without
+/// forcing `PartialEq` down the whole scan-model tree.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InventoryWorker {
     pub worker_id: u32,
     pub model: String,
@@ -571,6 +577,24 @@ pub struct InventoryWorker {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub in_flight: Option<u32>,
+    /// The full scan-cache view of the model this worker is serving — the same
+    /// `HiggsModel` a LOCAL client sees via the models catalog, so a remote
+    /// worker's row can render quant / arch / ctx_train / block+head counts /
+    /// gguf_components / has_chat_template / supports_tools / supports_reasoning
+    /// / enrich_error / source WITHOUT the hub second-guessing (or the flat
+    /// `InventoryWorker` fields drifting from `HiggsModel` as it grows).
+    ///
+    /// Snapshotted onto `LoadFacts` when the load resolved the file, so a
+    /// concurrent rescan / delete / re-download after load cannot mutate what
+    /// this worker's row reports about the file it actually loaded. `None`
+    /// only from a pre-r-N node that didn't send it (`serde(default)`, additive).
+    /// `HiggsModel.chat_template` is `serde(skip)` so the multi-KB template
+    /// stays host-only; `HiggsModel.path` DOES ride (it is not `serde(skip)`)
+    /// and the hub treats it as a node-local string — visible for diagnostics,
+    /// meaningless to open on any other host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub model_info: Option<crate::worker::models::HiggsModel>,
 }
 }
 
