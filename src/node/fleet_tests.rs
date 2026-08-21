@@ -1689,6 +1689,7 @@ async fn pushed_worker_snapshot_merges_under_the_seq_guard() {
             loaded_at_ms: Some(1),
             idle_ms: Some(0),
             in_flight: Some(in_flight),
+            model_info: None,
         }
     }
     let commit_workers = |node: &str, seq: u64, in_flight: u32| {
@@ -1994,6 +1995,7 @@ async fn pushes_from_a_replaced_connection_are_dropped() {
             loaded_at_ms: None,
             idle_ms: Some(0),
             in_flight: Some(in_flight),
+            model_info: None,
         }],
     };
     // A buffered push from the OLD connection (process A, high seq) arrives late:
@@ -2224,6 +2226,7 @@ async fn a_pre_cache_push_is_retained_and_replayed_over_an_older_pull() {
                     loaded_at_ms: None,
                     idle_ms: Some(0),
                     in_flight: Some(0),
+                    model_info: None,
                 }],
                 snapshot_seq: Some(5),
                 hardware: crate::system::HardwareInfo {
@@ -2799,6 +2802,7 @@ async fn a_reused_worker_id_does_not_lend_its_domain_to_a_stale_route() {
             idle_ms: Some(0),
             in_flight: Some(0),
             domain: crate::worker::models::ModelDomain::Embedding,
+            model_info: None,
         }],
         snapshot_seq: Some(1),
         hardware: crate::system::HardwareInfo {
@@ -2922,6 +2926,7 @@ async fn a_stale_inventory_row_does_not_unadvertise_a_reused_worker_id() {
             idle_ms: Some(0),
             in_flight: Some(0),
             domain: crate::worker::models::ModelDomain::Embedding,
+            model_info: None,
         }],
         snapshot_seq: Some(1),
         hardware: crate::system::HardwareInfo {
